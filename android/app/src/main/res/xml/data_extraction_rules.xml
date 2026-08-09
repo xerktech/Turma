@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Backup + device-transfer rules for API 31+ (`android:dataExtractionRules`).
+
+     Same reasoning as backup_rules.xml: the hub password can sit in PLAINTEXT
+     app-private prefs whenever EncryptedSharedPreferences can't be created, and
+     backup/transfer moves private storage off the device (XERK-235). Exclude
+     both prefs files from cloud backup AND from device-to-device transfer. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="turma_prefs.xml" />
+        <exclude domain="sharedpref" path="turma_secure_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="turma_prefs.xml" />
+        <exclude domain="sharedpref" path="turma_secure_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>

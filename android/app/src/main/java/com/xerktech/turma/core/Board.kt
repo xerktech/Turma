@@ -8,6 +8,7 @@ import com.xerktech.turma.model.CreateType
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
+import com.xerktech.turma.model.RepoOption
 
 /**
  * Cross-org Jira board derivation — a pure port of `turma/public/board.js`
@@ -267,6 +268,13 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     // probe's default label. Collected over EVERY reporting host, like hostOpts.
     val modelAvail = LinkedHashMap<String, LinkedHashSet<String>>()
     val modelDefault = LinkedHashMap<String, Pair<String, String>>()  // site -> (at, defaultLabel)
+    // site -> repo name -> picker option, collected over EVERY reporting host —
+    // like hostOpts above, and for the same reason board.js gives: the blocks
+    // that survive the byUser dedupe are one per (site, user), and the COMMON
+    // case is an org whose hosts all poll as the same user. Collected in the
+    // winners loop below it saw exactly one of them, so the picker offered
+    // whichever host polled last and a repo cloned only on another vanished.
+    val repoOptsBySite = LinkedHashMap<String, LinkedHashMap<String, RepoOption>>()
     for (a in agents) {
         val j = a.jira ?: continue
         if (j.siteKey.isBlank()) continue
@@ -282,6 +290,14 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
             val cur = modelDefault[j.siteKey]
             if (cur == null || mb.at >= cur.first) modelDefault[j.siteKey] = mb.at to mb.defaultLabel
         }
+        // `cloned` is host-relative and a cloned copy wins the dedupe: "someone
+        // here has it" is the useful claim, and a pin fans out to every host.
+        val ro = repoOptsBySite.getOrPut(j.siteKey) { LinkedHashMap() }
+        for (o in j.repoOptions) {
+            if (o.name.isBlank()) continue
+            val seen = ro[o.name]
+            if (seen == null || (o.cloned && !seen.cloned)) ro[o.name] = o
+        }
         val k = j.siteKey + "\u0000" + j.user
         val prev = byUser[k]
         if (prev == null || j.fetchedAt > prev.j.fetchedAt) byUser[k] = Block(j, a.online)
@@ -292,10 +308,22 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     val out = ArrayList<BoardSite>()
     for ((site, blocks) in bySite) {
         val sorted = blocks.sortedByDescending { it.j.fetchedAt }
-        val seen = HashSet<String>()
-        val tickets = ArrayList<JiraTicket>()
-        for (b in sorted) for (t in b.j.tickets) if (seen.add(t.key)) tickets.add(t)
+        // Dedupe by the ticket's OWN `updated`, not by which block was fetched
+        // more recently (board.js mergeSites). Two users polling one site can
+        // each carry a different copy, and the freshest BLOCK is not
+        // necessarily the freshest TICKET — first-wins showed the stale
+        // summary and the stale column (XERK-235).
+        val byKey = LinkedHashMap<String, JiraTicket>()
+        for (b in sorted) for (t in b.j.tickets) {
+            if (t.key.isBlank()) continue
+            val seen = byKey[t.key]
+            if (seen == null || t.updated > seen.updated) byKey[t.key] = t
+        }
+        val tickets = ArrayList(byKey.values)
         val newest = sorted.first().j
+        // Unioned over every reporting host in the first loop above — see
+        // repoOptsBySite for why it cannot be collected here.
+        val repoOpts = repoOptsBySite[site] ?: LinkedHashMap()
         out.add(
             BoardSite(
                 siteKey = site,
@@ -306,11 +334,20 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                 error = sorted.firstNotNullOfOrNull { it.j.error },
                 fetchedAt = newest.fetchedAt,
                 tickets = tickets,
-                repoOptions = newest.repoOptions,
+                // Cloned repos first (the ones you can work in today), then by
+                // name — the picker's own order, so it doesn't inherit the
+                // scan's (board.js).
+                repoOptions = repoOpts.values
+                    .sortedWith(compareByDescending<RepoOption> { it.cloned }
+                        // board.js sorts with localeCompare, which is
+                        // case-INSENSITIVE; ordinal compareTo put every
+                        // capitalised repo ahead of every lowercase one.
+                        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }),
                 // Online hosts first (the ones a pin routes to today), then by
                 // name — the picker's own order (board.js hostOptions sort).
                 hostOptions = (hostOpts[site]?.values ?: emptyList())
-                    .sortedWith(compareByDescending<HostOption> { it.online }.thenBy { it.name }),
+                    .sortedWith(compareByDescending<HostOption> { it.online }
+                        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }),
                 models = BoardModels(
                     available = (modelAvail[site]?.toList() ?: emptyList()).sorted(),
                     defaultLabel = modelDefault[site]?.second ?: "",
@@ -388,9 +425,44 @@ fun orgColorIndex(siteKey: String, allKeys: List<String>, pins: Map<String, Int>
  * board.js `ageStr`. Blank for a missing/unparseable stamp, so a caller can
  * append it or not without a null dance.
  */
+/**
+ * Milliseconds for an ISO-8601 timestamp the board can actually receive, or
+ * null.
+ *
+ * `Instant.parse` alone only accepts the extended offset form (`+00:00`/`Z`),
+ * but Jira Cloud stamps `updated` in the BASIC form — `2026-08-08T12:34:56.789+0000`
+ * — which it rejects. `Date.parse` on the web accepts both, so every Jira
+ * ticket's age chip rendered blank on Android while Azure's Zulu timestamps
+ * worked, which is why Azure-only testing never saw it (XERK-235).
+ *
+ * Input with NO offset (`2026-08-08T12:34:56`, `2026-08-08`) deliberately
+ * returns null and renders a blank chip, where the web's `Date.parse` would
+ * guess the viewer's local zone. No tracker emits it — Jira Cloud and Azure
+ * always stamp an offset and the agent stamps Zulu — and guessing would make
+ * two phones in different zones disagree about the same ticket's age.
+ */
+internal fun parseIsoMs(iso: String): Long? {
+    runCatching { return java.time.Instant.parse(iso).toEpochMilli() }
+    return runCatching {
+        java.time.OffsetDateTime
+            .parse(iso, java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+            .toInstant().toEpochMilli()
+    }.getOrNull() ?: runCatching {
+        // Basic-format offset (+0000 / -0500), Jira Cloud's spelling.
+        java.time.OffsetDateTime.parse(
+            iso,
+            java.time.format.DateTimeFormatterBuilder()
+                .appendPattern("yyyy-MM-dd'T'HH:mm:ss")
+                .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 0, 9, true)
+                .appendPattern("XX")
+                .toFormatter(),
+        ).toInstant().toEpochMilli()
+    }.getOrNull()
+}
+
 fun ageStr(iso: String, nowMs: Long = System.currentTimeMillis()): String {
     if (iso.isBlank()) return ""
-    val t = runCatching { java.time.Instant.parse(iso).toEpochMilli() }.getOrNull() ?: return ""
+    val t = parseIsoMs(iso) ?: return ""
     val s = ((nowMs - t) / 1000).coerceAtLeast(0)
     return when {
         s < 60 -> "now"

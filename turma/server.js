@@ -341,13 +341,37 @@ try {
 } catch {
   /* first boot or no volume mounted */
 }
+// The state blob, or null when it cannot be produced. JSON.stringify throws
+// RangeError once the aggregate passes V8's ~512 MiB string ceiling, and it runs
+// inside the save TIMER — an unguarded throw is an uncaught exception on the
+// main loop, so the whole hub exits, taking every host's control plane with it
+// and losing the very file the save exists to protect. Failing to save is
+// survivable; dying is not (XERK-235). Lifted out of scheduleSave so the
+// failure path is reachable from a test.
+function serializeAgentsForSave() {
+  try {
+    return JSON.stringify(agents);
+  } catch (e) {
+    console.error(`state save skipped — could not serialize agent state: ${e.message}`);
+    return null;
+  }
+}
+
 let saveTimer = null;
 function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
+    // JSON.stringify throws RangeError once the aggregate passes V8's ~512 MiB
+    // string ceiling. It runs INSIDE this timer callback, so an unguarded throw
+    // is an uncaught exception on the main loop — the whole hub exits, taking
+    // every host's control plane with it, and state.json is the one thing the
+    // crash was supposed to protect. Failing to save is survivable; dying is
+    // not (XERK-235).
+    const blob = serializeAgentsForSave();
+    if (blob === null) return;
     fs.mkdir(path.dirname(STATE_FILE), { recursive: true }, () => {
-      fs.writeFile(STATE_FILE, JSON.stringify(agents), (err) => {
+      fs.writeFile(STATE_FILE, blob, (err) => {
         if (err) console.error(`state save failed: ${err.message}`);
       });
     });
@@ -747,6 +771,30 @@ function buildAgentsCache() {
   });
   const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
   agentsCache = { body, etag };
+  lastGoodAgentsCache = agentsCache;
+  return agentsCache;
+}
+
+// `buildAgentsCache` stringifies the whole fleet, so it can still throw past
+// V8's string ceiling however well the per-record bound holds. Unguarded that
+// reached the route's generic catch as a 400 — to EVERY dashboard, Android and
+// glasses client, and permanently, because the records that caused it live for
+// PRUNE_AFTER_MS. Serving the last good payload (or an empty fleet) keeps the
+// UI alive and puts the reason in the log (XERK-235).
+let lastGoodAgentsCache = null;
+function safeAgentsCache() {
+  try {
+    return buildAgentsCache();
+  } catch (e) {
+    console.error(`agents payload could not be serialized: ${e.message}`);
+    // The route calls this as `agentsCache || safeAgentsCache()`, so the live
+    // cache is null by the time we get here — the last good payload has to be
+    // remembered separately or this branch is dead and every host vanishes from
+    // the dashboard, which is a more alarming failure than the one it replaces.
+    if (lastGoodAgentsCache) return lastGoodAgentsCache;
+    const body = JSON.stringify({ now: Date.now(), agents: [], error: "payload too large" });
+    return { body, etag: '"' + crypto.createHash("sha1").update(body).digest("base64") + '"' };
+  }
   return agentsCache;
 }
 
@@ -1508,17 +1556,149 @@ function findSession(sessionId) {
   return null;
 }
 
-function readBody(req) {
+// Default cap for a JSON body. Generous, because the expensive one is the
+// heartbeat (below) and everything else is small.
+const BODY_MAX = 1 << 20; // 1 MiB
+
+// A heartbeat is not a user request: it carries the agent's on-demand
+// `historyResults`, which at the documented FULL block caps (HISTORY_MAX_MSGS
+// entries × BLOCK_TEXT_CHARS_FULL, plus base64 SendUserFile images) reaches
+// ~5 MiB on an ordinary "open the chat history" click. At 1 MiB the hub
+// destroyed the socket, the agent saw ECONNRESET rather than a status code,
+// and — because it holds staged results until a POST succeeds — re-sent the
+// same oversized body every beat, so the host stayed offline forever with
+// nothing logged (XERK-235).
+const HEARTBEAT_MAX = 32 << 20; // 32 MiB
+
+// Longest prompt/label/baseRef a queued spawn may carry. A queued command is
+// re-serialized into every /api/agents response, every SSE broadcast and
+// state.json, and an offline host never acks — so an unbounded field is a
+// fleet-wide cost that grows without limit (XERK-235). Comfortably above any
+// real task prompt; /api/trigger applies its own 10k cap on prompt alone.
+const SPAWN_FIELD_MAX = 100000;
+
+// Top-level keys a heartbeat is known to carry — the agent's own payload plus
+// the on-demand `*Results` deliveries, which the handler extracts and deletes
+// from the payload itself before the spread. Anything else is bounded by
+// HEARTBEAT_UNKNOWN_MAX (see sanitizeHeartbeat).
+const HEARTBEAT_KNOWN_KEYS = new Set([
+  "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
+  "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
+  "gitSources", "github", "inputMaxChars", "jira", "logTail", "memory",
+  "models", "prunes", "repoUsage", "repos", "reposRoot", "sessions",
+  "startedAt", "uploadMaxBytes", "usage",
+  "historyResults", "subagentHistoryResults", "jiraIssueResults",
+  "ticketStatusResults", "createMetaResults", "createTicketResults",
+]);
+
+// How much an UNRECOGNISED heartbeat key may contribute to the persisted
+// record. Deliberately a size bound rather than a drop: agents are routinely
+// newer than the hub, so a field this hub has not learned about yet must still
+// pass through to the clients that have (the `github` block is exactly that
+// contract). Bounding instead of allowlisting keeps that forward compatibility
+// while closing the amplification.
+const HEARTBEAT_UNKNOWN_MAX = 64 << 10; // 64 KiB
+
+// The ceiling on ONE host's record as it appears in the fleet payload. The
+// per-key bound above is necessary but not sufficient: it left KNOWN keys
+// unbounded (30 MiB under `sessions` amplified just as well) and it had no
+// aggregate, so 400 unknown keys each just under the per-key limit added 25 MiB
+// through the very path meant to stop it. Enough of those and `buildAgentsCache`
+// throws past V8's ~512 MiB string ceiling, which answered 400 to every
+// dashboard, Android and glasses client — permanently, since records live 7
+// days. Bounding the whole record closes known keys, unknown keys and the
+// aggregate in one place (XERK-235).
+//
+// Measured EXCLUDING the on-demand caches, which `serializeAgent` strips from
+// the payload and which are separately bounded by count: a legitimate ~5 MiB
+// `/history` delivery lands there and must not cost the host its heartbeat.
+const AGENT_RECORD_MAX = 8 << 20; // 8 MiB
+
+// Which hosts are already over half the ceiling, so the warning above fires on
+// the crossing rather than on every beat.
+const recordSizeWarned = new Map();
+
+// The cache keys `serializeAgent` strips; see AGENT_RECORD_MAX.
+const AGENT_CACHE_KEYS = [
+  "history", "subagentHistory", "jiraIssues", "statusResults",
+  "createMeta", "createTypes", "createResults", "resultWaits",
+];
+
+// The serialized size of what this record contributes to /api/agents.
+function agentRecordSize(record) {
+  try {
+    return JSON.stringify(record, (k, v) =>
+      AGENT_CACHE_KEYS.includes(k) && v && typeof v === "object" ? undefined : v
+    ).length;
+  } catch {
+    return Infinity; // circular or unserializable — it cannot be persisted anyway
+  }
+}
+
+// Drop unrecognised keys that are too large to be a plausible new field.
+//
+// `agents[key] = {...payload}` persisted the WHOLE payload with no bound, so a
+// single beat under the (32 MiB) transport cap could park 30 MiB on the record
+// — re-serialized into state.json, every /api/agents response and every SSE
+// frame from then on. Enough distinct hosts doing that pushed the aggregate
+// past V8's ~512 MiB string ceiling, which threw inside the save timer and
+// exited the whole hub. All agents share one token, so one buggy or
+// compromised agent could take down the fleet's control plane (XERK-235).
+function sanitizeHeartbeat(payload, key) {
+  if (!payload || typeof payload !== "object") return payload;
+  for (const k of Object.keys(payload)) {
+    if (HEARTBEAT_KNOWN_KEYS.has(k)) continue;
+    let size = 0;
+    try {
+      size = JSON.stringify(payload[k] ?? null).length;
+    } catch {
+      size = Infinity; // circular or unserializable — cannot persist it anyway
+    }
+    if (size > HEARTBEAT_UNKNOWN_MAX) {
+      console.error(
+        `heartbeat from ${key}: dropped unknown field ${JSON.stringify(k)} ` +
+          `(${size} bytes, limit ${HEARTBEAT_UNKNOWN_MAX})`
+      );
+      delete payload[k];
+    }
+  }
+  return payload;
+}
+
+// Thrown past the cap so a route can answer 413 instead of leaking a generic
+// 400 (or, worse, nothing at all).
+class BodyTooLarge extends Error {
+  constructor(cap) {
+    super("body too large");
+    this.tooLarge = true;
+    this.cap = cap;
+  }
+}
+
+// Collect a request body as a string. Past `cap` it keeps DRAINING for a while
+// rather than destroying the socket: draining is what lets the route write a
+// 413 on the same connection, where a mid-body destroy reaches the client as a
+// socket hang-up with no status to branch on. Same rule readRawBody follows.
+function readBody(req, cap = BODY_MAX) {
   return new Promise((resolve, reject) => {
     let data = "";
+    let len = 0;
+    let over = false;
     req.on("data", (c) => {
-      data += c;
-      if (data.length > 1 << 20) {
-        reject(new Error("body too large"));
-        req.destroy();
+      len += c.length;
+      if (over) {
+        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        return;
       }
+      if (len > cap) {
+        over = true;
+        data = ""; // release it — it is not going to be used
+        reject(new BodyTooLarge(cap));
+        return;
+      }
+      data += c;
     });
-    req.on("end", () => resolve(data));
+    req.on("end", () => { if (!over) resolve(data); });
     req.on("error", reject);
   });
 }
@@ -1777,11 +1957,20 @@ function fmtDur(ms) {
 // WORKING_WINDOW_MS (the agent reports the age at beat time; we add the
 // staleness since the host's last beat) — when paneBusy wasn't reported (older
 // agent, or the pane couldn't be captured). `lastSeen` is the host's last beat.
+// Two rules the web's `liveState` applies, in ITS order, which this mirror did
+// not (XERK-235):
+//  - no transcript yet is IDLE, decided BEFORE paneBusy is consulted;
+//  - working requires the HOST to be online. paneBusy is a value on a record the
+//    host last pushed, so a host that dies mid-turn leaves `paneBusy:true` behind
+//    and its session reads WORKING forever. Here that also meant `readyForReview`
+//    short-circuited, so the operator's phone never buzzed for exactly the
+//    stranded work that most needs a look.
 function sessionWorking(session, lastSeen, now) {
   const s = session.session;
-  if (s?.paneBusy != null) return s.paneBusy;
   const age = s?.transcriptAgeSec;
   if (age == null) return false;
+  if (now - (lastSeen || 0) >= OFFLINE_AFTER_MS) return false;
+  if (s?.paneBusy != null) return s.paneBusy;
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
 }
 
@@ -3085,7 +3274,7 @@ const server = http.createServer(async (req, res) => {
     // the body+ETag and revalidates with If-None-Match on its next poll. The
     // history cache is excluded from the payload (see serializeAgent).
     if (req.method === "GET" && url.pathname === "/api/agents") {
-      const cached = agentsCache || buildAgentsCache();
+      const cached = agentsCache || safeAgentsCache();
       if ((req.headers["if-none-match"] || "") === cached.etag) {
         res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache" });
         return res.end();
@@ -3099,7 +3288,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
-      const payload = JSON.parse((await readBody(req)) || "{}");
+      const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX)) || "{}");
+      const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
       normalizeUsage(payload);
@@ -3108,6 +3298,15 @@ const server = http.createServer(async (req, res) => {
       // fallback if the host name couldn't be read.
       const key = payload.device || payload.agentId;
       if (!key) return json(res, 400, { error: "device/agentId required" });
+      // `agents` is a plain object keyed by host name, so a non-string or a
+      // prototype key is not a host: `__proto__` 200'd while the beat was
+      // silently discarded (and replaced the registry's prototype), and an
+      // object key landed as "[object Object]" (XERK-235). Refuse it loudly —
+      // a beat the hub throws away must never report success.
+      if (typeof key !== "string" || key.length > 200 ||
+          key === "__proto__" || key === "constructor" || key === "prototype") {
+        return json(res, 400, { error: "device must be a plain host name" });
+      }
       const prev = agents[key] || {};
       // At-least-once command delivery: drop any queued command the agent
       // reports as executed; keep re-sending the rest until acked.
@@ -3184,6 +3383,35 @@ const server = http.createServer(async (req, res) => {
         resultWaits: prev.resultWaits || {},
         unsupported: prev.unsupported || {},
       });
+      // The whole-record ceiling, checked BEFORE the ingests run. The caches are
+      // aliased from `prev` (`history: prev.history || {}`), so ingesting first
+      // and then restoring `prev` restored an object the ingests had already
+      // mutated — a refused beat still poisoned the caches and its content came
+      // back out of /history with a 413 on the wire.
+      const recordSize = agentRecordSize(next);
+      // Visible BEFORE it 413s. Measured against the operator's real fleet the
+      // largest record is 0.30 MiB, so half the ceiling means something has
+      // changed shape (~158 repos or ~83 sessions on one host). Logged on the
+      // CROSSING EDGE only, and re-armed when it drops back: beats arrive every
+      // ~8s, so warning per-beat would be ~10,800 lines a day, forever, for a
+      // host that legitimately settles above the line.
+      const overHalf = recordSize > AGENT_RECORD_MAX / 2 && recordSize <= AGENT_RECORD_MAX;
+      if (overHalf && !recordSizeWarned.get(key)) {
+        console.warn(
+          `heartbeat from ${key}: record is ${recordSize} bytes, over half the ` +
+            `${AGENT_RECORD_MAX} limit`
+        );
+      }
+      recordSizeWarned.set(key, overHalf);
+      if (recordSize > AGENT_RECORD_MAX) {
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        console.error(
+          `heartbeat from ${key}: record is ${recordSize} bytes, over the ` +
+            `${AGENT_RECORD_MAX} limit — beat refused`
+        );
+        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+      }
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
@@ -3540,10 +3768,25 @@ const server = http.createServer(async (req, res) => {
       // queues exactly {type:"spawn", repo} as before.
       if (req.method === "POST" && parts.length === 4) {
         const body = JSON.parse((await readBody(req)) || "{}");
-        if (!body.repo) return json(res, 400, { error: "repo required" });
+        // Only `!body.repo` was checked, so an object/array/number went to the
+        // agent verbatim (XERK-235). /api/trigger already gets this right.
+        if (!body.repo || typeof body.repo !== "string") {
+          return json(res, 400, { error: "repo required" });
+        }
         const cmd = { type: "spawn", repo: body.repo };
         for (const f of ["prompt", "label", "baseRef", "model", "permissionMode"]) {
-          if (body[f] != null && body[f] !== "") cmd[f] = body[f];
+          if (body[f] != null && body[f] !== "") {
+            if (typeof body[f] !== "string") {
+              return json(res, 400, { error: `${f} must be a string` });
+            }
+            // The queue is re-serialized into every /api/agents response, every
+            // SSE frame and state.json, so an unbounded prompt/label is a
+            // fleet-wide cost, not just this command's.
+            if (body[f].length > SPAWN_FIELD_MAX) {
+              return json(res, 413, { error: `${f} too long`, limit: SPAWN_FIELD_MAX });
+            }
+            cmd[f] = body[f];
+          }
         }
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
@@ -4293,14 +4536,17 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "not a valid issue key" });
       }
       const body = JSON.parse((await readBody(req)) || "{}");
+      // Reject a non-string `model` FIRST. Coercing it to "" made `auto` true,
+      // so {model:12345} silently RELEASED an existing pin and answered 200 —
+      // the opposite of what the caller asked for (XERK-235).
+      if (body.model != null && typeof body.model !== "string") {
+        return json(res, 400, { error: "body needs {model} or {auto:true}" });
+      }
       const raw = typeof body.model === "string" ? body.model.trim().toLowerCase() : "";
       // "default" is the release value in model's clothing — treat it as {auto},
       // so the picker's "Default" option and an explicit {auto:true} land the same
       // "drop the pin" outcome rather than storing a "default" alias to resolve.
       const auto = body.auto === true || raw === "default" || raw === "";
-      if (!auto && typeof body.model !== "string") {
-        return json(res, 400, { error: "body needs {model} or {auto:true}" });
-      }
       if (!Object.values(agents).some(
         (a) => a && a.jira && a.jira.siteKey === siteKey)) {
         return json(res, 404, { error: "no host reports that Jira org" });
@@ -4368,6 +4614,13 @@ const server = http.createServer(async (req, res) => {
 
     json(res, 404, { error: "not found" });
   } catch (err) {
+    // An oversized body must come back as a status the caller can branch on.
+    // The socket is still open here precisely because readBody drained instead
+    // of destroying it (XERK-235).
+    if (err && err.tooLarge) {
+      if (!res.writableEnded) json(res, 413, { error: "body too large", limit: err.cap });
+      return;
+    }
     json(res, 400, { error: err.message });
   }
 });
@@ -4721,6 +4974,12 @@ if (process.env.TURMA_TEST) {
     // to the fleet scan. Exported so a test can stage exactly that (XERK-241).
     cmdHosts,
     invalidateAgentsCache,
+    serializeAgentsForSave,
+    // XERK-235 heartbeat/record bounds — a QA pass removed each of these
+    // and the suite stayed green, so they are exported to be pinned.
+    sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
+    HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+
     queueCommand,
     findSession,
     wsAccept,

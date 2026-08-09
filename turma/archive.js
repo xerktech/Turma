@@ -33,6 +33,11 @@ const ARCHIVE_DB = process.env.ARCHIVE_DB || path.join(ARCHIVE_DIR, "index.db");
 // token-only. A bump recreates the tables and refills them from the files.
 const SCHEMA_VERSION = 2;
 
+// The largest byte offset a transcript may claim (1 TiB). Far above any real
+// conversation, far below the 2^53 point where a stored value stops being
+// readable back as a JS number. See the cursor guard in appendDelta.
+const MAX_TRANSCRIPT_BYTES = 1024 ** 4;
+
 // ---- filename / path building ----------------------------------------------
 
 // Sanitize a component to a safe, flat token. Every character outside the
@@ -167,6 +172,21 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   const row = db.prepare("SELECT bytesStored, filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
   const have = row ? row.bytesStored : 0;
   if (Number(startOffset) !== have) return { bytesStored: have };
+  // The cursor only ever moves forward. Without this an endOffset BELOW
+  // startOffset rewound bytesStored, and the next chunk re-ingested a range
+  // already stored — duplicating it in the canonical .jsonl, the msgCount and
+  // the FTS index at once. This store is the durable record that outlives the
+  // host, so a corruption here is not recoverable from the agent (XERK-235).
+  // The upper bound matters as much as the lower one. bytesStored goes into a
+  // SQLite INTEGER column, so an endOffset past 2^53 is stored faithfully and
+  // then throws "Value is too large to be represented as a JavaScript number"
+  // on every subsequent read — bricking that transcript's ingest permanently,
+  // with the poison chunk left as its last archived content. The agent chooses
+  // transcriptId, so one misbehaving agent could brick any of them.
+  const end = Number(endOffset);
+  if (!Number.isFinite(end) || end < have || end > MAX_TRANSCRIPT_BYTES) {
+    return { bytesStored: have };
+  }
 
   const full = { ...meta, host, transcriptId };
   let relPath = row && row.filePath ? row.filePath : archiveRelPath(transcriptId, full);

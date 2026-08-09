@@ -331,7 +331,11 @@ function renderSessionBottom(state: AppState, sess: SessionScreenState): BottomM
   const s = findSessionLocal(state, sess.hostKey, sess.sessionId);
   const focus = sess.focus;
   const mic: MicState = sess.mic;
-  const live = s ? liveState(s) : "idle";
+  // Pass the host: unlike the home list this screen is not pre-gated on
+  // `agent.online`, so without it a dead host's session reads "working"
+  // forever here (XERK-235).
+  const host = findAgentLocal(state, sess.hostKey);
+  const live = s ? liveState(s, typeof host?.lastSeen === "number" ? host.lastSeen : undefined) : "idle";
   const status = statusLabel({ mic, live });
   const focused = focus === "bottom";
 

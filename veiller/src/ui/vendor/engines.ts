@@ -7,7 +7,16 @@
 // load — only function definitions + a `window.Turma*` / `module.exports`
 // assignment), so importing them for their pure functions is safe. The copies
 // under vendor/*.cjs must stay byte-identical to turma/public/*.js — vendor.test
-// asserts it, so CI fails the moment they drift.
+// compares them against the real files, and veiller-ci.yml triggers on those
+// sources as well as on veiller/**, so CI fails the moment they drift. Both
+// halves are load-bearing: the test was once pinned to a hash of the copy
+// itself, and the workflow once ignored turma/**, so drift went unseen either
+// way (XERK-235).
+//
+// vendor/chat.css carries the styles for what these render. It is hand-extracted
+// from the inline <style> in turma/public/sessions.html and NO test guards it —
+// when you re-copy chat.cjs, check whether new markup (a new class) needs a rule
+// carried across too.
 
 // The vendored files are classic-script CJS (module.exports). The glasses
 // package is type:module, so they carry the .cjs extension to be read as CJS by

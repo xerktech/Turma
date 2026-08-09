@@ -212,8 +212,16 @@
      so the shutdown reads as deliberate rather than a card blinking out. */
   .sess.killing { border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); animation: killing-pulse 1.1s ease-in-out infinite; }
   @keyframes killing-pulse { 0%, 100% { opacity: 0.85; } 50% { opacity: 0.5; } }
-  .sess-hd { display: flex; align-items: center; gap: 8px; }
-  .sess-hd .sid { font-family: var(--font-mono); font-weight: 600; font-size: 13px; flex: 0 0 auto; }
+  /* wrap + min-width:0: the header holds a 36-char monospace session id, a
+     summary up to SUMMARY_MAX_CHARS, and a PR badge. With the id set
+     `flex: 0 0 auto` none of it could shrink, so the grid track sized to the
+     widest card's min-content and the whole DASHBOARD scrolled sideways — 1576px
+     against a 375px phone viewport, most of it blank (XERK-235). */
+  .sess-hd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+  .sess-hd .sid {
+    font-family: var(--font-mono); font-weight: 600; font-size: 13px;
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   /* Auto task summary: the prominent few-word "name" the agent derives from the
      session's initial prompt. Takes the middle space so the badge (margin-left:
      auto) still pins right; when absent the badge's auto margin preserves the old
@@ -618,7 +626,7 @@ function restartBtn(a) {
   const armed = confirming.has("ra::" + a.key);
   return `<button class="host-restart btn-sm${armed ? " confirm" : ""}"`
     + ` title="Restart this host's agent (running sessions are re-adopted)"`
-    + ` onclick="restartHost('${esc(a.key)}')">${armed ? "Confirm restart" : "↻ Restart"}</button>`;
+    + ` onclick="restartHost('${escJs(a.key)}')">${armed ? "Confirm restart" : "↻ Restart"}</button>`;
 }
 // Board (Jira/Azure DevOps) reachability chip for a host header (XERK-156): a red
 // pill when the configured tracker's last poll failed — most often because the
@@ -635,6 +643,46 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[c]);
+}
+// A URL for an `href`, or "#" if it is not one we will navigate to.
+//
+// esc() escapes the TEXT but says nothing about the SCHEME, so an agent- or
+// tracker-supplied `javascript:` URL was rendered into a real anchor. Chrome
+// happens to block javascript: into a new browsing context, so `target="_blank"`
+// was the only thing standing between this and a second XSS — which is not a
+// defence, it is a coincidence (XERK-235). http(s) and mailto only.
+function safeUrl(u) {
+  const s = String(u ?? "").trim();
+  return /^(https?:|mailto:)/i.test(s) ? esc(s) : "#";
+}
+// Escape a value for a JS STRING LITERAL that sits inside an HTML attribute —
+// i.e. every `onclick="f('${...}')"` handler below.
+//
+// esc() is the wrong tool there and gives no protection at all: it turns `'`
+// into `&#39;`, but the HTML parser decodes entities in an attribute value
+// BEFORE the handler source is compiled, so the quote comes back and the
+// string closes. A repo directory name (raw os.listdir output, no validation)
+// or a transcript id containing `');...//` therefore executed attacker JS in
+// the operator's authenticated browser with no interaction at all (XERK-235).
+//
+// Everything dangerous becomes a backslash escape built from safe characters,
+// so the result is inert in a JS string AND in an HTML attribute, single- or
+// double-quoted. Use escJs inside handler attributes; esc everywhere else.
+function escJs(s) {
+  return String(s ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\x27")
+    .replace(/"/g, "\\x22")
+    .replace(/&/g, "\\x26")
+    .replace(/</g, "\\x3C")
+    .replace(/>/g, "\\x3E")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    // A raw NUL is rewritten to U+FFFD by the HTML tokenizer, so the handler
+    // would receive corrupted data rather than the value it was given.
+    .replace(/\0/g, "\\x00")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 function totalTokens(u) {
   return u ? u.input + u.output + u.cacheWrite + u.cacheRead : null;
@@ -677,7 +725,7 @@ function repoLink(remote, name) {
   const m = href.match(/^git@([^:]+):(.+?)(\.git)?$/);
   if (m) href = `https://${m[1]}/${m[2]}`;
   return /^https?:\/\//.test(href)
-    ? `<a href="${esc(href.replace(/\.git$/, ""))}" target="_blank" rel="noopener">${nm}</a>`
+    ? `<a href="${safeUrl(href.replace(/\.git$/, ""))}" target="_blank" rel="noopener">${nm}</a>`
     : nm;
 }
 
@@ -758,7 +806,7 @@ function prBadgeHtml(pr) {
   const ready = prReady(pr);
   const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
   const chk = mark ? ` <span class="pr-ready ${ready}" title="${esc(prReadyTitle(pr))}">${mark}</span>` : "";
-  return `<a class="pr-badge ${cls}" href="${esc(url)}" target="_blank" rel="noopener" title="${esc(pr.title || url)}">`
+  return `<a class="pr-badge ${cls}" href="${safeUrl(url)}" target="_blank" rel="noopener" title="${esc(pr.title || url)}">`
     + `<span class="pr-dot"></span>${esc(num)}${label ? " " + esc(label) : ""}${chk}</a>`;
 }
 
@@ -771,17 +819,22 @@ function prBadgeHtml(pr) {
 // the host's last heartbeat (host.lastSeen).
 function liveState(sess, host, now) {
   const s = sess.session;
-  if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
-  const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
-  if (s.question)
+  // Both waiting checks come FIRST, ahead of the no-transcript return — the
+  // order sessions.html uses. A question raised on the very first turn arrives
+  // before Claude Code has written a transcript, so `transcriptAgeSec == null`
+  // and the card read "no transcript yet": the question was invisible on the
+  // Dashboard while the Sessions page showed it correctly (XERK-235).
+  if (s && s.question)
     return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
   // A blocking TUI dialog (tool permission / plan approval) is the same thing
   // for the operator, and MUST be checked before the working read: while one is
   // up the pane shows no interrupt hint, so paneBusy reads false and the
   // session would otherwise be labelled plain "idle" while it waits on a human.
-  if (s.panePrompt && s.panePrompt.prompt)
+  if (s && s.panePrompt && s.panePrompt.prompt)
     return { label: "waiting for your answer", cls: "sess-wait",
              question: s.panePrompt.prompt, busy: true };
+  if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
+  const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)
     : (host.online && age < 90 * 1000);
@@ -849,7 +902,12 @@ function render(data) {
   const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));
   const online = agents.filter(a => a.online);
   const running = sess.filter(x => x.s.status === "running");
-  const waiting = sess.filter(x => x.s.status === "running" && x.s.session && x.s.session.question);
+  // A pane prompt blocks on a human exactly as a question does — liveState
+  // above says so, and so does the Sessions page's own count. Counting only
+  // `question` made this tile disagree with the card directly beneath it
+  // (XERK-235).
+  const waiting = sess.filter(x => x.s.status === "running" && x.s.session &&
+    (x.s.session.question || (x.s.session.panePrompt && x.s.session.panePrompt.prompt)));
   // Token tiles read each host's persistent `usage` block — which the agent
   // aggregates from EVERY transcript on the box — rather than summing the live
   // session list, so killed, deleted and pruned work still counts toward the
@@ -953,11 +1011,11 @@ function hostCard(a, now) {
     </div>
     <div class="repos">${cloneBar(a)}${reposHtml}</div>
     ${a.logTail ? `<details class="logs" ${openLogs.has(a.key) ? "open" : ""}
-        ontoggle="logToggle('${esc(a.key)}', this.open)">
+        ontoggle="logToggle('${escJs(a.key)}', this.open)">
       <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
     </details>` : ""}
     ${(a.online || a.updating) ? "" : `<div class="actions">
-      <button onclick="removeHost('${esc(a.key)}')">Remove host</button>
+      <button onclick="removeHost('${escJs(a.key)}')">Remove host</button>
     </div>`}`;
 
   // When collapsed, surface the session count alongside the name so the row still
@@ -982,7 +1040,7 @@ function hostCard(a, now) {
 
   return `<div class="host-card ${cardState} ${collapsed ? "collapsed" : ""}"${orgTintStyle(a)}>
     <div class="host-top">
-      <button class="host-name" onclick="hostToggle('${esc(a.key)}')"
+      <button class="host-name" onclick="hostToggle('${escJs(a.key)}')"
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
         <span class="caret">▼</span>
         <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
@@ -1061,7 +1119,7 @@ function cloneBar(a) {
     ? "Clone a repo"
     : `Clone from ${esc(one.label || "GitHub")}${one.user ? ` <span class="clone-note">as ${esc(one.user)}</span>` : ""}`;
   const header = `<button class="clone-toggle" aria-expanded="${open}"
-      title="${open ? "Collapse" : "Expand"} clone panel" onclick="cloneToggle('${esc(a.key)}')">
+      title="${open ? "Collapse" : "Expand"} clone panel" onclick="cloneToggle('${escJs(a.key)}')">
     <span class="caret">▼</span>
     <span class="clone-label">${label}</span>
   </button>`;
@@ -1103,7 +1161,7 @@ function cloneBody(a, sources, hid) {
       const checked = picks[pickKey] ? " checked" : "";
       return `<label class="clone-opt${here ? " here" : ""}">
         <input type="checkbox"${checked}${here || dis ? " disabled" : ""}
-          onchange="clonePick('${esc(a.key)}','${esc(pickKey)}',this.checked)">
+          onchange="clonePick('${escJs(a.key)}','${escJs(pickKey)}',this.checked)">
         <span>${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</span>
       </label>`;
     }).join("");
@@ -1125,7 +1183,7 @@ function cloneBody(a, sources, hid) {
     : groups;
   const searchBox = total
     ? `<input id="clone-search-${hid}" class="clone-search" type="text" placeholder="Search repos…"
-        value="${esc(d.search || "")}" ${dis} oninput="cloneSearch('${esc(a.key)}',this.value)">`
+        value="${esc(d.search || "")}" ${dis} oninput="cloneSearch('${escJs(a.key)}',this.value)">`
     : "";
   const n = clonePickCount(a.key);
   const off = dis ? "1" : "0";
@@ -1135,10 +1193,10 @@ function cloneBody(a, sources, hid) {
       <div id="clone-list-${hid}" class="clone-list">${listInner}</div>
     </div>
     <input id="clone-input-${hid}" type="text" placeholder="or owner/repo" value="${esc(d.text || "")}"
-      ${dis} oninput="cloneText('${esc(a.key)}',this.value)"
-      onkeydown="if(event.key==='Enter'){event.preventDefault();cloneRepo('${esc(a.key)}');}">
+      ${dis} oninput="cloneText('${escJs(a.key)}',this.value)"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();cloneRepo('${escJs(a.key)}');}">
     <button id="clone-btn-${hid}" class="primary btn-sm" data-off="${off}" ${dis || n === 0 ? "disabled" : ""}
-      onclick="cloneRepo('${esc(a.key)}')">${n > 1 ? `Clone ${n}` : "Clone"}</button>
+      onclick="cloneRepo('${escJs(a.key)}')">${n > 1 ? `Clone ${n}` : "Clone"}</button>
     <span id="clone-count-${hid}" class="clone-count">${n ? `${n} selected` : ""}</span>
   </div>`;
 }
@@ -1160,7 +1218,7 @@ function repoBlock(a, repo, sessList, now) {
   // blank and hitting Start spawns instantly with today's defaults, so the old
   // one-click bare-spawn path is just the empty-composer case.
   const spawnBtn = canSpawn
-    ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();toggleComposer('${esc(rkey)}','${esc(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : composerOpen.has(rkey) ? "− New session" : "+ New session"}</button>`
+    ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();toggleComposer('${escJs(rkey)}','${escJs(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : composerOpen.has(rkey) ? "− New session" : "+ New session"}</button>`
     : "";
   const ghost = spawning ? ghostCard() : "";
   const body = (sessList.length || spawning)
@@ -1181,7 +1239,7 @@ function repoBlock(a, repo, sessList, now) {
   const resumeCount = resumable ? resumable.length : legacyClosed.length;
   const canResume = a.online && !repo.missing && resumeCount > 0;
   const resumeBtn = canResume
-    ? `<button class="btn-sm" onclick="event.preventDefault();event.stopPropagation();toggleResume('${esc(rkey)}')">${resumeOpen.has(rkey) ? "Resume ▴" : "Resume ▾"}</button>`
+    ? `<button class="btn-sm" onclick="event.preventDefault();event.stopPropagation();toggleResume('${escJs(rkey)}')">${resumeOpen.has(rkey) ? "Resume ▴" : "Resume ▾"}</button>`
     : "";
   // Prune: sweep this repo's merged worktrees + branches (non-root only). Arms
   // on first click, confirms on the second; a busy spinner until the result lands.
@@ -1189,7 +1247,7 @@ function repoBlock(a, repo, sessList, now) {
   const pruneArmed = confirming.has("prune::" + a.key + "::" + repo.name);
   const canPrune = a.online && !repo.missing && !repo.isRoot;
   const pruneBtn = canPrune
-    ? `<button class="btn-sm ${pruneArmed ? "confirm" : ""}" title="Remove merged branches and worktrees" ${pruning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();pruneRepo('${esc(a.key)}','${esc(repo.name)}')">${pruning ? '<span class="spin"></span> Pruning…' : pruneArmed ? "Confirm prune" : "Prune"}</button>`
+    ? `<button class="btn-sm ${pruneArmed ? "confirm" : ""}" title="Remove merged branches and worktrees" ${pruning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();pruneRepo('${escJs(a.key)}','${escJs(repo.name)}')">${pruning ? '<span class="spin"></span> Pruning…' : pruneArmed ? "Confirm prune" : "Prune"}</button>`
     : "";
   const pruneRes = (a.prunes || []).find(p => p.repo === repo.name);
   const pruneNote = pruneRes
@@ -1205,7 +1263,7 @@ function repoBlock(a, repo, sessList, now) {
           return `<div class="resume-item">
             <span class="sid${r.summary ? "" : " mono"}" title="${esc(r.transcriptId)}">${esc(r.summary || r.transcriptId)}</span>
             <span><b>${esc(r.origin || (r.root ? "repos root" : "worktree"))}</b> · ended ${r.endedTs ? esc(ago(now - Date.parse(r.endedTs))) : "–"}</span>
-            <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeTranscript('${esc(a.key)}','${esc(r.transcriptId)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
+            <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeTranscript('${escJs(a.key)}','${escJs(r.transcriptId)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
           </div>`;
         }
         // Legacy path: a killed session from closedSessions (older agent).
@@ -1216,14 +1274,14 @@ function repoBlock(a, repo, sessList, now) {
           ${c.summary && c.label ? `<span class="lbl">${esc(c.label)}</span>` : ""}
           <span><b>${c.root ? "repos root" : esc(worktreeName(c))}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
           <span>${esc(c.rcName || "")}</span>
-          <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeSession('${esc(a.key)}','${esc(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
+          <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeSession('${escJs(a.key)}','${escJs(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
         </div>`;
       }).join("")}</div>`
     : "";
 
   const composerPanel = canSpawn && composerOpen.has(rkey) ? composer(a, repo, rkey, spawning) : "";
 
-  return `<details class="repo" ${collapsed ? "" : "open"} ontoggle="repoToggle('${esc(rkey)}', this.open)">
+  return `<details class="repo" ${collapsed ? "" : "open"} ontoggle="repoToggle('${escJs(rkey)}', this.open)">
     <summary class="repo-head">
       <span class="r-name">${repo.isRoot ? "⌂ Repos root" : repoLink(repo.remote, repo.name)}</span>
       ${meta}
@@ -1267,7 +1325,11 @@ function modelChoices(a, remembered) {
 function composer(a, repo, rk, spawning) {
   const d = composerDraft.get(rk) || {};
   const o = loadOpts(repo.name);
-  const key = esc(a.key), rn = esc(repo.name);
+  // Both of these are only ever interpolated into inline handlers (`submit`
+  // below, and the ontoggle/onchange attributes), so they need the JS-string
+  // escaper, not the text one. Going through a local variable is exactly how
+  // these sites survived the first conversion pass.
+  const key = escJs(a.key), rn = escJs(repo.name);
   // Base-branch choices: the default branch (latest main — the fork point for a
   // new session) first, then the repo's current HEAD and other branches and any
   // remembered choice, de-duped. Falls back to the repo's current branch.
@@ -1286,32 +1348,32 @@ function composer(a, repo, rk, spawning) {
     <div>
       <label>Task</label>
       <textarea id="${cid(rk, "task")}" placeholder="Describe the task, or leave blank to start an empty session."
-        oninput="draftSet('${esc(rk)}','task',this.value)"
+        oninput="draftSet('${escJs(rk)}','task',this.value)"
         onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();${submit};}">${esc(d.task || "")}</textarea>
     </div>
     <div>
       <label>Label <span class="hint">(optional)</span></label>
       <input id="${cid(rk, "label")}" type="text" placeholder="e.g. fix login bug" value="${esc(d.label || "")}"
-        oninput="onLabelInput('${esc(rk)}',this)">
+        oninput="onLabelInput('${escJs(rk)}',this)">
     </div>
-    <details class="opts" ${optsExpanded ? "open" : ""} ontoggle="onOptionsToggle('${esc(rk)}','${rn}',this.open)">
+    <details class="opts" ${optsExpanded ? "open" : ""} ontoggle="onOptionsToggle('${escJs(rk)}','${rn}',this.open)">
       <summary>${optsExpanded ? "▾" : "▸"} Options</summary>
       <div class="opts-grid">
         ${repo.isRoot ? "" : `<div class="full">
           <label>Base branch <span class="hint">(fork point; latest is fetched)</span></label>
-          <select id="${cid(rk, "base")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+          <select id="${cid(rk, "base")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${bases.map(b => opt(b, b, selBase)).join("")}
           </select>
         </div>`}
         <div>
           <label>Model</label>
-          <select id="${cid(rk, "model")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+          <select id="${cid(rk, "model")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${modelChoices(a, selModel).map(m => opt(m.value, m.label, selModel)).join("")}
           </select>
         </div>
         <div>
           <label>Permission mode</label>
-          <select id="${cid(rk, "perm")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+          <select id="${cid(rk, "perm")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${opt("auto", "auto", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
           </select>
         </div>
@@ -1333,7 +1395,9 @@ function sessCard(a, s, now) {
   const rKey = "sr::" + a.key + "::" + s.id;
   const kKey = "sk::" + a.key + "::" + s.id;
   const dKey = "sd::" + a.key + "::" + s.id;
-  const id = esc(s.id), key = esc(a.key);
+  // `id` renders as TEXT (the .sid span) and `idJs`/`key` go into handlers —
+  // two contexts, two escapers. Do not collapse them.
+  const id = esc(s.id), idJs = escJs(s.id), key = escJs(a.key);
 
   // Delete/kill guard copy. Kill keeps the worktree on disk (nothing is lost —
   // it's resumable). Delete removes the worktree, but the app owns no branch, so
@@ -1360,24 +1424,24 @@ function sessCard(a, s, now) {
   } else if (st === "running") {
     actions =
       (canAttach
-        ? `<button class="primary btn-sm" onclick="location.href='/sessions?session=${encodeURIComponent(s.id)}'">Attach ▸</button>`
+        ? `<button class="primary btn-sm" onclick="location.href='/sessions?session=${escJs(encodeURIComponent(s.id))}'">Attach ▸</button>`
         : `<button class="btn-sm" disabled title="${a.updating ? "Host is updating — terminal will return shortly" : "Terminal tunnel offline"}">Attach</button>`) +
-      `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
+      `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${idJs}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
       // Stop the session and drop it from the hub — but KEEP its worktree on
       // disk (uncommitted work survives) and its usage history, so it stays
       // resumable. Delete (which removes the worktree) only appears on already-
       // stopped/errored cards below.
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${idJs}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
   } else if (st === "queued") {
     // Waiting for a slot / clone / the root slot. It has no worktree yet, so the
     // only thing to do is cancel it — Kill drops the queued record.
     actions =
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm cancel" : "Cancel"}</button>`;
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${idJs}')">${confirming.has(kKey) ? "Confirm cancel" : "Cancel"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
-      `<button class="primary btn-sm" ${a.online ? "" : "disabled"} onclick="sessStart('${key}','${id}')">Start</button>` +
-      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? esc(delConfirm) : "Delete"}</button>`;
+      `<button class="primary btn-sm" ${a.online ? "" : "disabled"} onclick="sessStart('${key}','${idJs}')">Start</button>` +
+      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${idJs}')">${confirming.has(dKey) ? esc(delConfirm) : "Delete"}</button>`;
   }
 
   // PR links this session opened, with state + CI checks. Prefer the agent's

@@ -122,8 +122,12 @@ function orgTintStyle(colorMap: Map<string, string>, siteKey: string): string {
   return c ? ` style="--org:${c}"` : "";
 }
 
-function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean, tint: string): string {
-  const st = liveState(s);
+function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean,
+                        tint: string, hostLastSeen?: number, now?: number): string {
+  // The host arguments matter here as much as in the grouping above: without
+  // them a card sitting under "Ready for review" labelled ITSELF "working",
+  // disagreeing with its own heading (XERK-235).
+  const st = liveState(s, hostLastSeen, now);
   const name = sessionName(s);
   const q = s.session?.question;
   const stateRow =
@@ -175,7 +179,7 @@ function endedCardHtml(hostLabel: string, s: SessionInfo, tint: string): string 
   );
 }
 
-interface Row { hostKey: string; hostLabel: string; s: SessionInfo; siteKey: string; }
+interface Row { hostKey: string; hostLabel: string; s: SessionInfo; siteKey: string; lastSeen?: number; }
 
 export function sessionsBodyHtml(state: AppState): string {
   const agents = filterAgents(state.agents, state.orgFilter);
@@ -192,15 +196,21 @@ export function sessionsBodyHtml(state: AppState): string {
     const hostLabel = a.device ?? a.key;
     const siteKey = siteKeyOf(a);
     for (const s of a.sessions ?? []) {
-      const row = { hostKey: a.key, hostLabel, s, siteKey };
+      const row = { hostKey: a.key, hostLabel, s, siteKey,
+                    lastSeen: typeof a.lastSeen === "number" ? a.lastSeen : undefined };
       if (s.status === "queued") queued.push(row);
       else if (s.status === "running") running.push(row);
       else ended.push(row); // stopped / error records still in the registry
     }
-    for (const s of a.closedSessions ?? []) ended.push({ hostKey: a.key, hostLabel, s: s as unknown as SessionInfo, siteKey });
+    for (const s of a.closedSessions ?? []) ended.push({ hostKey: a.key, hostLabel,
+      s: s as unknown as SessionInfo, siteKey,
+      lastSeen: typeof a.lastSeen === "number" ? a.lastSeen : undefined });
   }
-  const active = running.filter((r) => ["working", "waiting"].includes(liveState(r.s)));
-  const idle = running.filter((r) => !["working", "waiting"].includes(liveState(r.s)));
+  // The host arguments are what make the online gate apply at all — a dead
+  // host's stale paneBusy otherwise reads WORKING forever (XERK-235).
+  const now = Date.now();
+  const active = running.filter((r) => ["working", "waiting"].includes(liveState(r.s, r.lastSeen, now)));
+  const idle = running.filter((r) => !["working", "waiting"].includes(liveState(r.s, r.lastSeen, now)));
   const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
   [active, idle, queued, ended].forEach((l) => l.sort(byCreated));
 
@@ -213,8 +223,8 @@ export function sessionsBodyHtml(state: AppState): string {
       : "";
 
   const body =
-    section("Active", active, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
-    section("Idle", idle, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
+    section("Active", active, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r), r.lastSeen, now)) +
+    section("Idle", idle, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r), r.lastSeen, now)) +
     section("Queued", queued, (r) => queuedCardHtml(r.hostKey, r.hostLabel, r.s, tintOf(r))) +
     section("Ended", ended.slice(0, 20), (r) => endedCardHtml(r.hostLabel, r.s, tintOf(r)), "ph-ended-section");
 
@@ -291,6 +301,10 @@ export function sessionViewHtml(state: AppState, verbosity: VerbosityPreset, sho
     `<div class="ph-verbbar">${verbBtns}</div>` +
     `<div class="chat-scroll" id="ph-transcript"></div>` +
     questionBox +
+    // Why a send can fail, said out loud. The box used to be cleared before
+    // the POST and every rejection swallowed, so a message the hub REFUSED
+    // (413 "too long", 401, host offline) vanished with no trace (XERK-235).
+    `<div class="ph-senderr" id="ph-senderr" hidden></div>` +
     `<div class="ph-compose">` +
     `<textarea class="ph-input" id="ph-input" rows="1" placeholder="Message…"></textarea>` +
     `<button class="ph-stop" data-stop="1" hidden>◼ Stop</button>` +

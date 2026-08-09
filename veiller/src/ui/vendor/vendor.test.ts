@@ -1,28 +1,31 @@
 import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createHash } from "node:crypto";
 import { Board, Chat, renderTranscript } from "./engines.ts";
 
-// The vendored engines must stay byte-identical to the web source of truth
-// (turma/public/chat.js and board.js @ Turma main 24437fc / v0.6.45), so the
-// phone renders exactly what the web/Android show and never silently drifts.
+// The vendored engines must stay byte-identical to the web source of truth, so
+// the phone renders exactly what the web/Android show and never silently
+// drifts. Re-copy `turma/public/<name>.js` -> `vendor/<name>.cjs` if this fails.
 //
-// Veiller-port adaptation of upstream vendor.test.ts: the Turma repo isn't
-// checkable-out at this monorepo's CI time, so instead of comparing against
-// `../../../turma/public/<name>.js` the copied-at-port-time sha256 hashes are
-// baked in. Re-copy from turma/public/ AND update the hash when upstream
-// changes.
-const pinned: [string, string][] = [
-  ["chat.cjs", "0f4ce3e96016784b81884d25c0a54d1a7dace27bc302ce67a035ef6715633226"],
-  ["board.cjs", "b7a587f405ec5f2eb0a080fb716b8da721edef086bd9948195944570e34636a1"],
+// This used to compare each file against a sha256 baked in when it was copied,
+// on the premise that "the Turma repo isn't checkable-out at this monorepo's CI
+// time". That premise was wrong — veiller lives INSIDE the Turma repo — and the
+// pin made the test self-referential: it hashed the vendored file against a
+// constant derived from that same file, so it could only ever catch someone
+// editing the copy, never the upstream moving. It stayed green through seven
+// commits of chat.js drift and two of board.js (XERK-235). Compare against the
+// real file; `veiller-ci.yml`'s path filter covers both sides of the pair.
+const pairs: [string, string][] = [
+  ["chat.cjs", "../../../../turma/public/chat.js"],
+  ["board.cjs", "../../../../turma/public/board.js"],
 ];
 
 describe("vendored engines", () => {
-  for (const [vendored, sha] of pinned) {
-    it(`${vendored} matches its recorded turma/public source hash`, () => {
-      const v = readFileSync(fileURLToPath(new URL(vendored, import.meta.url)));
-      expect(createHash("sha256").update(v).digest("hex")).toBe(sha);
+  for (const [vendored, source] of pairs) {
+    it(`${vendored} is byte-identical to its turma/public source`, () => {
+      const v = readFileSync(fileURLToPath(new URL(vendored, import.meta.url)), "utf8");
+      const s = readFileSync(fileURLToPath(new URL(source, import.meta.url)), "utf8");
+      expect(v).toBe(s);
     });
   }
 

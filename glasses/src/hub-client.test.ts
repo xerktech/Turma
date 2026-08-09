@@ -13,6 +13,46 @@ function fakeFetch(body: unknown, status = 200) {
   })) as unknown as typeof fetch;
 }
 
+describe("HubClient request timeout (XERK-235)", () => {
+  // fetch has no timeout of its own, and App.poll() re-arms only in its
+  // `finally`. A hub that accepts the connection and never answers therefore
+  // left the promise unsettled and killed the poll loop PERMANENTLY — the
+  // glasses froze on stale content with no "hub unreachable" flash, where
+  // every other failure mode recovers within one poll. Veiller already fixed
+  // this for its background context (XERK-215); this is the lens's guard.
+  it("rejects a never-settling request instead of hanging forever", async () => {
+    vi.useFakeTimers();
+    try {
+      const hang = vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: hang, timeoutMs: 1000 });
+
+      const pending = client.listAgents();
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(pending).rejects.toThrow(/timed out/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not fire once a response has already arrived", async () => {
+    vi.useFakeTimers();
+    try {
+      const payload = { now: 1, agents: [] };
+      const client = new HubClient({ config, fetchFn: fakeFetch(payload), timeoutMs: 1000 });
+      await expect(client.listAgents()).resolves.toEqual(payload);
+      await vi.advanceTimersByTimeAsync(5000); // the timer must be cleared
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("HubClient", () => {
   it("listAgents GETs /api/agents with the Basic auth header", async () => {
     const payload = { now: 123, agents: [] };

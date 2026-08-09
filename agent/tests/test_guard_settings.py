@@ -30,9 +30,9 @@ class TestGuardSettings(unittest.TestCase):
 
     def test_denies_credential_writes(self):
         deny = ha.build_guard_settings()["permissions"]["deny"]
-        self.assertIn("Write(~/.ssh/**)", deny)
+        self.assertIn("Edit(~/.ssh/**)", deny)
         self.assertIn("Edit(~/.claude/**)", deny)
-        self.assertIn("Write(~/.aws/**)", deny)
+        self.assertIn("Edit(~/.aws/**)", deny)
 
     def test_denies_cloud_cli_credential_writes(self):
         # The cloud CLIs the image bundles authenticate off the HOST's mounted
@@ -41,9 +41,7 @@ class TestGuardSettings(unittest.TestCase):
         deny = ha.build_guard_settings()["permissions"]["deny"]
         for rule in (
             "Edit(~/.azure/**)",
-            "Write(~/.azure/**)",
             "Edit(~/.terraform.d/**)",
-            "Write(~/.terraform.d/**)",
         ):
             self.assertIn(rule, deny)
 
@@ -52,7 +50,16 @@ class TestGuardSettings(unittest.TestCase):
         # session, so the agent must not edit that file either.
         deny = ha.build_guard_settings()["permissions"]["deny"]
         self.assertIn("Edit(~/.git-credentials)", deny)
-        self.assertIn("Write(~/.git-credentials)", deny)
+
+    def test_no_write_rules_claude_code_rejects(self):
+        """`Write(path)` deny rules are rejected at startup, one warning each.
+
+        Edit(path) already covers every file-editing tool, so a Write twin buys
+        nothing and costs seven lines of noise in every session's pane. Verified
+        against a live guard-settings.json with claude 2.1.226 (XERK-235).
+        """
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        self.assertEqual([r for r in deny if r.startswith("Write(")], [])
 
     def test_guard_script_path_points_at_bundled_hook(self):
         path = ha.guard_script_path()

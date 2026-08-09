@@ -112,6 +112,9 @@ const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking,
+  invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
+  serializeAgentsForSave,
+  HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -805,6 +808,212 @@ for (const finalState of ["MERGED", "CLOSED"]) {
   });
 }
 
+// --- heartbeat / record bounds (XERK-235) ------------------------------------
+// A QA pass removed each of these guards in turn and the suite stayed green
+// every time. They are the difference between one buggy agent and a fleet-wide
+// outage, so each is pinned by name here.
+
+test("sanitizeHeartbeat drops an oversized UNKNOWN key and keeps known ones", () => {
+  const big = "A".repeat(HEARTBEAT_UNKNOWN_MAX + 1);
+  const p = sanitizeHeartbeat(
+    { device: "h", junk: big, sessions: [{ id: "s1" }], smallExtra: "ok" },
+    "h",
+  );
+  assert.equal(p.junk, undefined, "an oversized unknown key must be dropped");
+  assert.equal(p.smallExtra, "ok", "a SMALL unknown key must pass through — agents are often newer than the hub");
+  assert.deepEqual(p.sessions, [{ id: "s1" }]);
+});
+
+test("agentRecordSize bounds known keys too, and ignores the stripped caches", () => {
+  const big = "A".repeat(9 << 20);
+  // A known key is just as good an amplifier as an unknown one.
+  assert.ok(agentRecordSize({ device: "h", sessions: big }) > AGENT_RECORD_MAX);
+  // ...but the on-demand caches are excluded: serializeAgent strips them, and a
+  // legitimate ~5 MiB /history delivery lands there and must not cost the host
+  // its heartbeat.
+  assert.ok(agentRecordSize({ device: "h", history: { s1: { entries: big } } }) < AGENT_RECORD_MAX);
+  // Many small unknown keys must not sum past the ceiling unnoticed: the
+  // per-key bound had no aggregate, and 400 of them added 25 MiB.
+  const many = { device: "h" };
+  for (let i = 0; i < 400; i++) many[`k${i}`] = "B".repeat(HEARTBEAT_UNKNOWN_MAX - 100);
+  assert.ok(agentRecordSize(many) > AGENT_RECORD_MAX);
+});
+
+test("safeAgentsCache serves something rather than failing the fleet payload", () => {
+  // Unguarded, a serialization failure here reached the route's generic catch
+  // as a 400 — to every dashboard, Android and glasses client, and permanently,
+  // because the records causing it live for PRUNE_AFTER_MS.
+  // A host must actually be present, or "last good == degraded" is vacuously
+  // true and the assertion below proves nothing.
+  agents["cache-witness"] = { key: "cache-witness", device: "cache-witness", lastSeen: Date.now() };
+  invalidateAgentsCache();
+  const good = safeAgentsCache();
+  assert.ok(good && typeof good.body === "string" && good.etag);
+  assert.doesNotThrow(() => JSON.parse(good.body));
+  assert.ok(JSON.parse(good.body).agents.length > 0, "the fixture must put a host in the payload");
+
+  // Now make it actually throw. A circular record is the cheap stand-in for the
+  // RangeError a >512 MiB fleet produces — same catch, same degraded path.
+  const boom = { key: "boom-host", device: "boom-host", lastSeen: Date.now() };
+  boom.self = boom;
+  agents["boom-host"] = boom;
+  try {
+    assert.throws(() => JSON.stringify(agents), "the fixture must really be unserializable");
+    const degraded = safeAgentsCache();
+    assert.ok(degraded && typeof degraded.body === "string" && degraded.etag,
+      "a serialization failure must still produce a payload");
+    assert.doesNotThrow(() => JSON.parse(degraded.body),
+      "the degraded payload must be valid JSON, not a 400");
+    // It must be the LAST GOOD payload, not an empty fleet: deleting the
+    // last-good branch still yields valid JSON, so asserting only that would
+    // let every host silently vanish from the dashboard.
+    assert.deepEqual(
+      JSON.parse(degraded.body).agents, JSON.parse(good.body).agents,
+      "the degraded payload must be the last good fleet, not an empty one",
+    );
+
+    // The SAVE path has the same failure and a worse consequence: this runs
+    // inside a timer, so an unguarded throw exits the whole hub.
+    assert.equal(serializeAgentsForSave(), null,
+      "an unserializable fleet must skip the save, not throw out of the timer");
+  } finally {
+    delete agents["boom-host"];
+    delete agents["cache-witness"];
+    invalidateAgentsCache();
+  }
+  // ...and it recovers once the offending record is gone.
+  assert.doesNotThrow(() => JSON.parse(safeAgentsCache().body));
+  assert.equal(typeof serializeAgentsForSave(), "string", "a healthy fleet still saves");
+});
+
+test("sessionWorking: a dead host's session is not still working (XERK-235)", () => {
+  // paneBusy is a value on the record the host LAST PUSHED, so a host that dies
+  // mid-turn leaves paneBusy:true behind. Without the online gate its session
+  // read working forever — which made readyForReview short-circuit, so the
+  // operator's phone never buzzed for exactly the stranded work that needs it.
+  const now = 1_000_000;
+  const sess = { id: "s1", status: "running",
+                 session: { paneBusy: true, transcriptAgeSec: 5 } };
+  assert.equal(sessionWorking(sess, now - 10_000, now), true);   // host alive
+  assert.equal(sessionWorking(sess, now - 600_000, now), false); // host gone
+  // And no transcript yet is idle BEFORE paneBusy is consulted, the web's order.
+  assert.equal(
+    sessionWorking({ id: "s2", status: "running", session: { paneBusy: true } }, now, now),
+    false,
+  );
+  // A dead host's finished work therefore reaches Ready for review.
+  const done = { paneBusy: true, transcriptAgeSec: 5,
+                 lastRole: "assistant", lastHasToolUse: false };
+  const stranded = { id: "s3", status: "running", session: done };
+  assert.equal(
+    readyForReview(stranded, sessionWorking(stranded, now - 600_000, now)),
+    true,
+  );
+});
+
+// The bounds above are asserted through the ROUTE, not just their helpers.
+// A QA pass deleted each guard at its point of use and the suite stayed green
+// for three of five — including the whole-record bound, whose removal
+// reinstated the original 30 MiB amplification with 830/0 reported (XERK-235).
+
+test("http: /api/agents degrades instead of 400ing when the fleet cannot serialize", async () => {
+  // The failure this replaces was permanent: buildAgentsCache threw past V8's
+  // string ceiling, the route's generic catch answered 400 to every dashboard,
+  // Android and glasses client, and the records causing it live for a week.
+  const boom = { key: "boom-route", device: "boom-route", lastSeen: Date.now() };
+  boom.self = boom; // circular: the cheap stand-in for the RangeError
+  agents["boom-route"] = boom;
+  invalidateAgentsCache();
+  try {
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    assert.equal(res.status, 200, "a serialization failure must not 400 the whole fleet");
+    assert.doesNotThrow(() => JSON.parse(res.raw));
+  } finally {
+    delete agents["boom-route"];
+    invalidateAgentsCache();
+  }
+  // ...and it recovers once the offending record is gone.
+  const after = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(after.status, 200);
+});
+
+test("http: an oversized record is refused and leaves the prior beat intact", async () => {
+  const host = "bound-host";
+  const good = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, repos: [{ name: "r1" }], sessions: [{ id: "s1", status: "running" }] },
+  });
+  assert.equal(good.status, 200);
+
+  // A KNOWN key is just as good an amplifier as an unknown one.
+  const fat = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: "A".repeat(AGENT_RECORD_MAX + 1024) },
+  });
+  assert.equal(fat.status, 413);
+  assert.equal(fat.body.limit, AGENT_RECORD_MAX);
+
+  // ...and the good record is still the one being served.
+  const a = agents[host];
+  assert.deepEqual(a.repos, [{ name: "r1" }]);
+  assert.equal(typeof a.sessions === "string", false, "the refused beat must not have landed");
+
+  // Many small unknown keys must not sum past the ceiling either: the per-key
+  // bound had no aggregate, and 400 of them added 25 MiB.
+  const many = { device: host };
+  for (let i = 0; i < 400; i++) many[`k${i}`] = "B".repeat(HEARTBEAT_UNKNOWN_MAX - 100);
+  assert.equal((await request("POST", "/api/heartbeat", { headers: agentHeaders, body: many })).status, 413);
+  assert.deepEqual(agents[host].repos, [{ name: "r1" }]);
+});
+
+test("http: a refused beat does not leak into the on-demand caches", async () => {
+  // The caches are aliased from the previous record, and the ingests used to
+  // run BEFORE the size check — so a 413 on the wire still served the refused
+  // beat's content back out of /history.
+  const host = "leak-host";
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: { device: host, sessions: [{ id: "leaked", status: "running" }] },
+  })).status, 200);
+
+  const refused = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host,
+      sessions: "A".repeat(AGENT_RECORD_MAX + 1024),
+      historyResults: [{ sessionId: "leaked", cmdId: "c1",
+                         entries: [{ uuid: "u", role: "user", text: "LEAKED-THROUGH-A-413" }] }],
+    },
+  });
+  assert.equal(refused.status, 413);
+  const hist = await request("GET", `/api/agents/${host}/sessions/leaked/history`, { headers: userHeaders });
+  assert.equal(hist.raw.includes("LEAKED-THROUGH-A-413"), false,
+    "a refused beat's history must not be served");
+});
+
+test("http: the on-demand deliveries are ingested but never persisted", async () => {
+  const host = "transient-host";
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host, sessions: [{ id: "s9", status: "running" }],
+      historyResults: [{ sessionId: "s9", cmdId: "c9",
+                         entries: [{ uuid: "u9", role: "user", text: "HISTORY-BODY" }] }],
+    },
+  })).status, 200);
+
+  // Served by its own route...
+  const hist = await request("GET", `/api/agents/${host}/sessions/s9/history`, { headers: userHeaders });
+  assert.equal(hist.raw.includes("HISTORY-BODY"), true);
+  // ...but not a second, unbounded copy on the record or in the fleet payload.
+  for (const k of ["historyResults", "subagentHistoryResults", "jiraIssueResults",
+                   "ticketStatusResults", "createMetaResults", "createTicketResults"]) {
+    assert.equal(agents[host][k], undefined, `${k} must not persist on the record`);
+  }
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(fleet.raw.includes("HISTORY-BODY"), false,
+    "the fleet payload must not carry a history delivery");
+});
+
 test("readyForReview: the qualifiers, and the one thing that un-qualifies", () => {
   const sess = (session, extra = {}) => ({ id: "s1", status: "running", session, ...extra });
   const done = { lastRole: "assistant", lastHasToolUse: false };
@@ -1171,6 +1380,75 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
     (await request("POST", "/api/heartbeat", { body: {}, headers: agentHeaders })).status,
     400 // device/agentId required
   );
+});
+
+// ---- XERK-235: defects a full QA pass found ---------------------------------
+
+test("http: a fat heartbeat gets a 413 it can act on, not a dropped socket", async () => {
+  // A /history result at the documented FULL block caps reaches ~5 MiB, and the
+  // hub used to req.destroy() past 1 MiB — so the agent saw ECONNRESET with no
+  // status to branch on, kept the staged results, and re-sent the same body
+  // every beat. The host stayed offline forever with nothing logged.
+  const fat = {
+    device: "fat-host",
+    historyResults: [{ sessionId: "s1", entries: [{ text: "x".repeat(3 << 20) }] }],
+  };
+  const res = await request("POST", "/api/heartbeat", { body: fat, headers: agentHeaders });
+  assert.equal(res.status, 200, "a multi-MiB heartbeat is legitimate and must be accepted");
+
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.ok(
+    list.body.agents.some((a) => a.key === "fat-host"),
+    "the host must actually register, not silently vanish"
+  );
+});
+
+test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare reset", async () => {
+  const huge = { device: "huge-host", pad: "y".repeat(33 << 20) };
+  // `connection: close`: past cap + drain slack the hub destroys the socket, and
+  // node's default agent keep-alives, so a pooled-and-doomed socket would fail
+  // the NEXT test with a bogus "socket hang up".
+  const res = await request("POST", "/api/heartbeat", {
+    body: huge, headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(res.body.error, "body too large");
+  assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
+});
+
+test("http: a heartbeat whose device is not a plain host name is refused, not silently dropped", async () => {
+  // `__proto__` 200'd while the beat was discarded AND the registry's prototype
+  // was replaced; an object key landed as "[object Object]".
+  for (const device of ["__proto__", "constructor", "prototype"]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 400, `${device} must be refused`);
+  }
+  for (const device of [{ a: 1 }, ["x"], 12]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 400, `${JSON.stringify(device)} must be refused`);
+  }
+  // The prototype must be intact: a route reading agents[x].commands would
+  // otherwise find one on every unknown host.
+  const probe = await request("POST", "/api/agents/never-seen/sessions/x/kill", { headers: userHeaders });
+  assert.equal(probe.status, 404);
+});
+
+test("http: spawn validates repo and bounds its queued fields", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "spawn-val", repos: [{ name: "r1" }] }, headers: agentHeaders });
+  for (const repo of [{ a: 1 }, ["x"], 12]) {
+    const res = await request("POST", "/api/agents/spawn-val/sessions", {
+      body: { repo }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, `repo ${JSON.stringify(repo)} must be refused`);
+  }
+  const big = await request("POST", "/api/agents/spawn-val/sessions", {
+    body: { repo: "r1", prompt: "P".repeat(100001) }, headers: userHeaders,
+  });
+  assert.equal(big.status, 413, "an unbounded prompt rides every /api/agents response and SSE frame");
+  const ok = await request("POST", "/api/agents/spawn-val/sessions", {
+    body: { repo: "r1", prompt: "do the thing" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
 });
 
 // ---- Jira board page + heartbeat block ----------------------------------------

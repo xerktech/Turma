@@ -23,6 +23,10 @@
   const HISTORY_MAX_RETRIES = 12;
   const STOP_SUPPRESS_MS = 4000;    // how long a clicked Stop overrides the busy read
   const ACTION_FAIL_MS = 2000;      // how long the compose button shows a failure
+  // Files one message may carry (XERK-234). Mirrors the hub's
+  // UPLOAD_MAX_PER_MESSAGE, which refuses past it — this only keeps the composer
+  // from staging a message the hub was always going to reject.
+  const MAX_ATTACHMENTS = 10;
 
   const PRESETS = {
     concise: { thinking: false, tools: false, outputs: false },
@@ -117,8 +121,27 @@
   // bare esc() and linkify() produce identical output for link/image-free text.
   // Used for prose surfaces (message bubbles, thinking traces); tool input/output
   // <pre> blocks stay raw esc().
+  // Only http(s)/mailto reaches an href; anything else becomes "#". The linkify
+  // pass already restricts what it matches, but `anchor` is ALSO called directly
+  // for a pr_link entry (buildItems), whose URL comes off the wire — and
+  // `target="_blank"` is not a defence, it just happens to make Chrome refuse
+  // the navigation. Mirrors safeUrl in index.html/sessions.html (XERK-235).
+  function safeUrl(u) {
+    // Tab/CR/LF are REMOVED by the URL parser before it parses, so they must be
+    // removed here too or the checks below see a different string than the
+    // browser will (`/<tab>/evil` parses as `//evil`).
+    const s = String(u ?? "").replace(/[\t\r\n]/g, "").trim();
+    if (/^(https?:|mailto:)/i.test(s)) return esc(s);
+    // Root-relative is allowed — the ticket chip points at Turma's OWN board
+    // (/board?ticket=…), not out to the tracker. But only when the second
+    // character cannot begin an authority: a leading `//` is protocol-relative,
+    // and in a special scheme the parser treats `\` exactly as `/`, so `/\evil`
+    // resolves to http://evil just as `//evil` does.
+    if (/^\/(?![/\\])/.test(s)) return esc(s);
+    return "#";
+  }
   function anchor(url, label) {
-    return '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
+    return '<a href="' + safeUrl(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
   }
   // An inline image (a markdown ![alt](url), or a raw SVG turned into a data URI
   // by svgToImg). The src is restricted to http(s) and data:image/* at the call
@@ -1497,7 +1520,7 @@
     const ready = prReady(pr);
     const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
     const chk = mark ? ' <span class="pr-ready ' + ready + '" title="' + esc(prReadyTitle(pr)) + '">' + mark + "</span>" : "";
-    return '<a class="pr-badge ' + cls + '" href="' + esc(url) +
+    return '<a class="pr-badge ' + cls + '" href="' + safeUrl(url) +
       '" target="_blank" rel="noopener" title="' + esc(pr.title || url) + '">' +
       '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + "</a>";
   }
@@ -1526,7 +1549,7 @@
     const href = "/board?ticket=" + encodeURIComponent(t.key) +
       (t.siteKey ? "&site=" + encodeURIComponent(t.siteKey) : "");
     return '<span class="cc-opt cc-ticket">' +
-      '<a class="jira-chip" href="' + esc(href) + '"' +
+      '<a class="jira-chip" href="' + safeUrl(href) + '"' +
       ' title="' + esc(tip || t.key) + '">' + esc(t.key) + "</a></span>";
   }
   // fromPoll: a background heartbeat repaint — don't yank an open menu shut.
@@ -1773,6 +1796,186 @@
     } catch {} finally { expandInFlight = false; }
   }
 
+  // ---- file attachments (XERK-234) ------------------------------------------
+  // Files the operator staged for the NEXT message. Each is uploaded to the hub
+  // the moment it is picked — so Send is instant, and a file too big or a host
+  // too old is refused while there is still something to look at rather than at
+  // the end of a message the operator thought they'd sent.
+  //
+  // Shape: {key, name, size, status:"uploading"|"ready"|"error", uploadId, error}
+  let attachments = [];
+  let attachSeq = 0;
+
+  function fmtBytes(n) {
+    const b = Number(n) || 0;
+    if (b < 1024) return b + " B";
+    if (b < 1024 * 1024) return Math.round(b / 1024) + " KB";
+    return (b / (1024 * 1024)).toFixed(b < 10 * 1024 * 1024 ? 1 : 0) + " MB";
+  }
+
+  // The largest file the OPEN session's host will take, 0 when it can't take one
+  // (an agent that predates attachments reports no `uploadMaxBytes` — see the
+  // hub's uploadCapFor). 0 is what hides the 📎 rather than letting the operator
+  // attach into a void.
+  function attachCap(a) {
+    const n = Number((a || agent || {}).uploadMaxBytes);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  function attachEnabled() { return attachCap() > 0; }
+
+  function attachmentsHtml(list) {
+    return (list || []).map((f) => {
+      const cls = f.status === "error" ? " att-error"
+        : f.status === "uploading" ? " att-uploading" : "";
+      const meta = f.status === "error" ? esc(f.error || "failed")
+        : f.status === "uploading" ? "uploading…" : fmtBytes(f.size);
+      return `<span class="att-chip${cls}" title="${esc(f.name)}">` +
+        `<span class="att-name">${esc(f.name)}</span>` +
+        `<span class="att-size">${meta}</span>` +
+        `<button class="att-x" title="Remove" data-att="${esc(f.key)}">✕</button></span>`;
+    }).join("");
+  }
+
+  // Paint every strip on the page (chat's and the terminal's), the same way
+  // updateComposeAction paints every Send — the two bars send through one
+  // endpoint and must never disagree about what is attached.
+  function renderAttachments() {
+    const html = attachmentsHtml(attachments);
+    for (const el of document.querySelectorAll(".compose-attach")) {
+      if (el.innerHTML !== html) el.innerHTML = html;
+    }
+    const clip = $("chatClip");
+    if (clip) {
+      clip.hidden = !attachEnabled();
+      // A pending question is answered THROUGH the compose box (POST .../answer,
+      // which carries no attachments), so attaching is off while one is up.
+      clip.disabled = questionActive;
+      clip.title = questionActive
+        ? "Answer the question first — an answer can't carry a file"
+        : "Attach images or documents";
+    }
+  }
+
+  function removeAttachment(key) {
+    attachments = attachments.filter((f) => f.key !== key);
+    renderAttachments();
+  }
+
+  function clearAttachments() { attachments = []; renderAttachments(); }
+
+  // Stage files and start their uploads. Called by the 📎 picker, a drop on the
+  // transcript, and a paste carrying files (a screenshot off the clipboard).
+  function attachFiles(files) {
+    const list = Array.from(files || []).filter(Boolean);
+    if (!list.length || !hostKey || !sessionId) return;
+    const cap = attachCap();
+    if (!cap) { actionFailed("Host too old for files"); return; }
+    for (const file of list) {
+      if (attachments.length >= MAX_ATTACHMENTS) {
+        actionFailed(`Max ${MAX_ATTACHMENTS} files`);
+        break;
+      }
+      const rec = {
+        key: "a" + (++attachSeq),
+        name: file.name || "upload",
+        size: file.size || 0,
+        status: file.size > cap ? "error" : "uploading",
+        error: file.size > cap ? `too big — max ${fmtBytes(cap)}` : "",
+        uploadId: "",
+      };
+      attachments.push(rec);
+      if (rec.status !== "error") uploadOne(rec, file);
+    }
+    renderAttachments();
+  }
+
+  async function uploadOne(rec, file) {
+    // The session this upload belongs to: if the operator walks to another
+    // session mid-upload the reply is stale, and its chip is already gone.
+    const forSession = sessionId, forHost = hostKey;
+    try {
+      const url = "/api/agents/" + enc(forHost) + "/sessions/" + enc(forSession) +
+        "/uploads?name=" + encodeURIComponent(rec.name);
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: file,
+      });
+      const reply = await r.json().catch(() => null);
+      if (!r.ok) throw new Error((reply && reply.error) || ("upload failed (" + r.status + ")"));
+      if (forSession !== sessionId || !attachments.includes(rec)) return;
+      rec.uploadId = reply.uploadId;
+      rec.name = reply.name || rec.name;   // the name it will land under
+      rec.size = reply.size || rec.size;
+      rec.status = "ready";
+    } catch (e) {
+      if (forSession !== sessionId || !attachments.includes(rec)) return;
+      rec.status = "error";
+      rec.error = (e && e.message) || "upload failed";
+    }
+    renderAttachments();
+  }
+
+  // Wire the picker/drop/paste entry points once. The picker is one <input> for
+  // the page (sessions.html), reset after every pick so re-choosing the same
+  // file still fires `change`.
+  function openFilePicker() {
+    const inp = $("chatFilePicker");
+    if (!inp || !attachEnabled() || questionActive) return;
+    inp.value = "";
+    inp.click();
+  }
+
+  function wireAttachDrop() {
+    const wrap = document.querySelector(".chat-scroll-wrap");
+    if (!wrap || wrap.dataset.attWired) return;
+    wrap.dataset.attWired = "1";
+    const has = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || [])
+      .includes("Files");
+    wrap.addEventListener("dragover", (e) => {
+      if (!has(e) || !attachEnabled()) return;
+      e.preventDefault();
+      wrap.classList.add("att-drop");
+    });
+    wrap.addEventListener("dragleave", (e) => {
+      if (e.target === wrap) wrap.classList.remove("att-drop");
+    });
+    wrap.addEventListener("drop", (e) => {
+      wrap.classList.remove("att-drop");
+      if (!has(e) || !attachEnabled()) return;
+      e.preventDefault();
+      attachFiles(e.dataTransfer.files);
+    });
+    // One delegated handler for every chip's ✕, on both strips.
+    document.addEventListener("click", (e) => {
+      const x = e.target.closest && e.target.closest(".att-x[data-att]");
+      if (!x) return;
+      e.preventDefault();
+      removeAttachment(x.getAttribute("data-att"));
+    });
+  }
+
+  // A paste carrying files (a screenshot, a dragged-in doc) attaches them; a
+  // paste of plain text is left alone so the textarea handles it normally.
+  function composePaste(e) {
+    const files = (e && e.clipboardData && e.clipboardData.files) || null;
+    if (!files || !files.length || !attachEnabled() || questionActive) return;
+    e.preventDefault();
+    attachFiles(files);
+  }
+
+  /**
+   * The staged uploadIds for the message about to be sent, or null when one is
+   * still uploading / failed — the caller then holds the message rather than
+   * sending it with a file silently missing. `[]` means simply nothing attached.
+   */
+  function readyUploadIds() {
+    if (!attachments.length) return [];
+    if (attachments.some((f) => f.status === "uploading")) return null;
+    if (attachments.some((f) => f.status === "error")) return null;
+    return attachments.map((f) => f.uploadId).filter(Boolean);
+  }
+
   // ---- compose (typed prompt, or custom question answer) --------------------
   function autoGrow() {
     const inp = $("chatInput");
@@ -1796,21 +1999,37 @@
   // label carries the hub's `limit` when it sent one: "too long" without a
   // number leaves the operator guessing how much to cut.
   const TOO_LONG = "Message too long";
-  function sendFailure(status, limit) {
+  // A staged attachment aged out of the hub's relay (XERK-234). Like "too long"
+  // this is a refusal the operator can act on — re-attach and send again — so it
+  // gets its own wording rather than the generic "Send failed".
+  const ATT_GONE = "Attachment expired — re-attach";
+  function sendFailure(status, limit, error) {
+    if (status === 404 && /attachment/i.test(error || "")) return ATT_GONE;
     if (status !== 413) return String(status);
     const n = Number(limit);
     return n > 0 ? `Too long — max ${n.toLocaleString()}` : TOO_LONG;
   }
   function isTooLong(msg) {
-    return msg === TOO_LONG || /^Too long — max /.test(msg || "");
+    return msg === TOO_LONG || msg === ATT_GONE || /^Too long — max /.test(msg || "");
   }
   async function send() {
     const inp = $("chatInput");
     if (!inp || !hostKey || !sessionId) return;
     const text = inp.value;
-    if (!text.trim()) return;
-    inp.value = ""; autoGrow(); inp.focus();
     const wasAnswer = questionActive;
+    // Attachments ride a plain message only (an /answer carries no files), and
+    // a message can be attachments alone — but never one that is still on its
+    // way up, which would arrive with the file missing and nothing said.
+    const uploadIds = wasAnswer ? [] : readyUploadIds();
+    if (!wasAnswer && uploadIds === null) {
+      actionFailed(attachments.some((f) => f.status === "error")
+        ? "Remove the failed file" : "Files still uploading");
+      return;
+    }
+    if (!text.trim() && !(uploadIds && uploadIds.length)) return;
+    inp.value = ""; autoGrow(); inp.focus();
+    const sentAttachments = wasAnswer ? [] : attachments.slice();
+    if (!wasAnswer) clearAttachments();
     try {
       let url, body;
       if (wasAnswer) {
@@ -1824,16 +2043,24 @@
       } else {
         url = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/input";
         body = { text };
+        if (uploadIds.length) body.uploadIds = uploadIds;
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       if (!r.ok) {
         const err = await r.json().catch(() => null);
-        throw new Error(sendFailure(r.status, err && err.limit));
+        throw new Error(sendFailure(r.status, err && err.limit, err && err.error));
       }
       if (typeof fastPoll === "function") fastPoll();
     } catch (e) {
       if (wasAnswer) { answeredQuestion = null; if (sess) updateQuestion(sess); }
       if (!inp.value.trim()) { inp.value = text; autoGrow(); }
+      // Put the chips back with the text: the operator is going to press Send
+      // again, and re-picking the files by hand is not something a failed POST
+      // should cost them. The staged uploads live on the hub for 20 minutes.
+      if (sentAttachments.length && !attachments.length) {
+        attachments = sentAttachments;
+        renderAttachments();
+      }
       actionFailed(isTooLong(e && e.message) ? e.message : "Send failed");
     }
   }
@@ -1969,6 +2196,8 @@
     renderVerbosityControl();
     renderComposeOpts();
     wireScrollDelegation();
+    wireAttachDrop();
+    clearAttachments();  // files are staged per session, never carried across
     updateQuestion(s);
     // Instant paint from the heartbeat's cached (text-only) tail, then upgrade.
     const seed = (s && s.session && s.session.tail) || [];
@@ -1990,6 +2219,7 @@
     panePromptActive = false; answeredPanePrompt = null;
     stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false;
+    clearAttachments();
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
@@ -2004,13 +2234,22 @@
     setHeader(s, agent);
     updateQuestion(s);
     renderComposeOpts(true);
+    // The host payload carries `uploadMaxBytes`, so the 📎 can only appear once
+    // a beat has been seen — repaint the strip on every one.
+    renderAttachments();
   }
 
   if (typeof window !== "undefined") {
     window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
       // sendFailure/isTooLong are shared with the terminal composer so the two
       // compose bars word a refusal identically (XERK-227).
-      isBusy, stop, actionFailed, sendFailure, isTooLong };
+      isBusy, stop, actionFailed, sendFailure, isTooLong,
+      // The terminal composer sends through the same /input, so it reads the
+      // staged attachments from here rather than keeping a second list
+      // (XERK-234).
+      readyUploadIds, clearAttachments, hasAttachments: () => attachments.length > 0,
+      attachError: () => (attachments.some((f) => f.status === "error")
+        ? "Remove the failed file" : "Files still uploading") };
     // Global handlers referenced by the chat pane's inline HTML attributes.
     window.autoGrowChatInput = autoGrow;
     // Enter always sends, exactly like the button: a queued message is a
@@ -2023,6 +2262,11 @@
     window.chatComposeAction = function () { send(); };
     window.chatComposeStop = function () { stop(); };
     window.chatJumpBottom = jumpToBottom;
+    // File attachments (XERK-234): the composer's 📎, the picker's change, and
+    // a paste that carries files.
+    window.chatComposeAttach = openFilePicker;
+    window.chatFilesPicked = function (e) { attachFiles(e && e.target && e.target.files); };
+    window.chatComposePaste = composePaste;
   }
 
   // Expose the pure core (merge + item building) for Node unit tests. Harmless
@@ -2033,6 +2277,10 @@
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction, isToolBullet, sendFailure, isTooLong, TOO_LONG,
+      attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, attachFiles,
+      clearAttachments, MAX_ATTACHMENTS,
+      __setAttachments: (a) => { attachments = a; },
+      __attachments: () => attachments,
       // Drive the real `turn`-frame classifier (see applyTurn): the ws onmessage
       // hands it frame.text verbatim, so the flicker tests exercise it directly.
       __applyTurn: (t) => { applyTurn(t); },

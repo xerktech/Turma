@@ -2454,10 +2454,21 @@ class ManagerMixin:
             self.run_stdin_calls.append((cmd, data))
             return self.run_stdin_ok
 
+        # Ports the test wants _alloc_port to see as already bound. Real probing
+        # is stubbed by default: _alloc_port skips ports that are actually
+        # listening (XERK-235), and on a host running its own agent the real
+        # TTYD_PORT_BASE range IS bound — without this, allocation results would
+        # depend on whoever else is on the box.
+        self.bound_ports = set()
+
+        def fake_port_open(port, host="127.0.0.1", timeout=0.3):
+            return port in self.bound_ports
+
         for name, value in [
             ("run", fake_run),
             ("run_ok", fake_run_ok),
             ("run_stdin", fake_run_stdin),
+            ("_port_open", fake_port_open),
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
@@ -3554,6 +3565,38 @@ class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
             json.dump({"id": "notalist"}, f)
         self.assertEqual(self.make_manager().registry, [])
 
+    def test_damaged_registry_is_quarantined_not_eaten(self):
+        """A damaged registry must survive its own recovery (XERK-235).
+
+        Returning [] silently meant the next beat's save() overwrote the
+        damaged file with `[]`: every session went unmanaged with tmux, ttyd
+        and its port still live, nothing logged, and the evidence gone.
+        """
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        for body in ('[{"id":"f5951","repo":"alpha","status":"run',
+                     "this is not json at all",
+                     '{"id": "x"}'):
+            with self.subTest(body=body[:20]):
+                with open(ha.REGISTRY_PATH, "w") as f:
+                    f.write(body)
+                sm = self.make_manager()
+                self.assertEqual(sm.registry, [])
+                kept = [n for n in os.listdir(ha.REGISTRY_DIR)
+                        if n.startswith("sessions.json.corrupt.")]
+                self.assertTrue(kept, "the damaged registry was not preserved")
+                with open(os.path.join(ha.REGISTRY_DIR, kept[0])) as f:
+                    self.assertEqual(f.read(), body)
+                for n in kept:
+                    os.remove(os.path.join(ha.REGISTRY_DIR, n))
+
+    def test_missing_registry_is_not_quarantined(self):
+        """First boot is not a corruption — it must leave no scary artifact."""
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        self.assertEqual(self.make_manager().registry, [])
+        self.assertEqual(
+            [n for n in os.listdir(ha.REGISTRY_DIR) if ".corrupt." in n], []
+        )
+
 
 class TestPortAndIdAllocation(ManagerMixin, unittest.TestCase):
     def test_alloc_port_from_base(self):
@@ -3566,6 +3609,26 @@ class TestPortAndIdAllocation(ManagerMixin, unittest.TestCase):
         sm.registry = [{"id": "a", "ttydPort": base}, {"id": "b", "ttydPort": base + 2}]
         self.assertEqual(sm._alloc_port(), base + 1)
         sm.registry.append({"id": "c", "ttydPort": base + 1})
+        self.assertEqual(sm._alloc_port(), base + 3)
+
+    def test_alloc_port_skips_a_port_something_else_already_holds(self):
+        """A port the registry doesn't know about is still taken (XERK-235).
+
+        A ttyd orphaned by a lost registry, a second agent, or an unrelated
+        service holds the bind. ttyd's failure to take it is silent, so the
+        session's terminal would 404 for its whole life — or worse, the orphan
+        answers on it and serves ANOTHER session's pane.
+        """
+        sm = self.make_manager()
+        base = ha.TTYD_PORT_BASE
+        self.bound_ports = {base, base + 1}
+        self.assertEqual(sm._alloc_port(), base + 2)
+
+    def test_alloc_port_skips_registry_and_bound_together(self):
+        sm = self.make_manager()
+        base = ha.TTYD_PORT_BASE
+        sm.registry = [{"id": "a", "ttydPort": base + 2}]
+        self.bound_ports = {base, base + 1}
         self.assertEqual(sm._alloc_port(), base + 3)
 
     def test_new_id_avoids_existing(self):

@@ -1408,9 +1408,9 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   through to the finished-turn signal. Both are **transcript timestamps** — the conversation's clock,
   not the mtime a synced `~/.claude` inflates. False when unanswerable (older agent included), erring
   toward parking over a wrong claim.
-- Four mirrors must agree: `sessions.html`, `server.js`, `core/Sessions.kt` (`rankRunning` →
-  `LiveGroups`), `glasses/src/sessions.ts`. The card says WHY it qualified, on the accent `.dot.review`.
-  Tests: `sessions.test.js`, `readyForReview` in `server.test.js`, `TestPrsLanded`, android
+- FIVE mirrors must agree: `sessions.html`, `server.js`, `core/Sessions.kt` (`rankRunning` →
+  `LiveGroups`), `glasses/src/sessions.ts` and veiller's FORK of it. The card says WHY it qualified,
+  on `.dot.review`. Tests: `sessions.test.js`, `readyForReview` in `server.test.js`, `TestPrsLanded`,
   `SessionsTest`.
 
 #### Ended sessions
@@ -1761,9 +1761,8 @@ triage list, each with a reason); anything unlisted still fails.
   `entrypoint.sh`'s preflight only LOGS which stores it found, keying on a **login-marker file** never
   the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's build-time
   smoke test drops the stores it creates.
-- The guard's `permissions.deny` protects `~/.azure` and `~/.terraform.d` alongside `~/.aws`/`~/.ssh`
-  (shared by every session, so editing one breaks the others). Tests:
-  `test_entrypoint.sh` (cloud-creds cases), `test_guard_settings.py`.
+- `permissions.deny` protects those stores — see Safety guard. Tests: `test_entrypoint.sh`
+  (cloud-creds cases), `test_guard_settings.py`.
 
 ### The agent image's Android toolchain
 
@@ -1847,21 +1846,20 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
 
 - Sessions run hands-off, so every launch passes `--settings` a generated file
   (`build_guard_settings()` → `~/.turma/guard-settings.json`) wiring a `PreToolUse` hook over Bash —
-  `agent/hooks/guard.py`, stdlib-only, at `/usr/local/bin/hooks/guard.py` — plus `permissions.deny`
-  rules protecting host credential stores (`~/.ssh`, `~/.aws`, `~/.claude`, `~/.config/gcloud`; deny
-  wins even under bypass).
-- The guard hard-denies only three narrow categories, each with a reason the agent self-corrects from:
+  `agent/hooks/guard.py`, stdlib-only at `/usr/local/bin/hooks/guard.py` — plus `permissions.deny`
+  rules on host credential stores (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.terraform.d`, `~/.claude`,
+  `~/.config/gcloud`; shared by every session, so deny wins even under bypass).
+- It hard-denies three narrow categories, each with a reason the agent self-corrects from:
   - **destructive** — `rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes, recursive
     `chmod`/`chown` of system roots, protected-branch history destruction, `DROP DATABASE|TABLE`;
   - **policy** — push to / delete `main`/`master`, or self-merging a PR/MR (`gh pr merge`,
     `glab mr merge`, an ADO complete/auto-complete — work lands via a PR a human merges);
   - **attribution** — AI self-attribution trailers in commit/PR messages.
-- Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) is untouched. A specific command
-  can be allowlisted via `$TURMA_TOOL_GRANTS` (CSV of `Bash(<cmd>)`); attribution toggles via
-  `$TURMA_NO_ATTRIBUTION=0`.
-- Fails open on malformed input; an unwritable settings file still launches the session (without it).
-  Adapted from an equivalent hook outside this repo; keep the two in rough sync. Tests:
-  `test_guard.py`, `test_guard_settings.py`.
+- Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) is untouched; allowlist a command
+  via `$TURMA_TOOL_GRANTS` (CSV of `Bash(<cmd>)`), attribution via `$TURMA_NO_ATTRIBUTION=0`.
+- It classifies what the SHELL runs, **never the raw string** — `qa.md` §6.1 is the rule and its limits.
+- Fails open on malformed input; an unwritable settings file still launches the session. Keep in sync
+  with the twin hook outside this repo. Tests: `test_guard.py`, `test_guard_settings.py`.
 
 ### AskUserQuestion answer bridge
 

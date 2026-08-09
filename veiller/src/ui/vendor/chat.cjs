@@ -23,6 +23,10 @@
   const HISTORY_MAX_RETRIES = 12;
   const STOP_SUPPRESS_MS = 4000;    // how long a clicked Stop overrides the busy read
   const ACTION_FAIL_MS = 2000;      // how long the compose button shows a failure
+  // Files one message may carry (XERK-234). Mirrors the hub's
+  // UPLOAD_MAX_PER_MESSAGE, which refuses past it — this only keeps the composer
+  // from staging a message the hub was always going to reject.
+  const MAX_ATTACHMENTS = 10;
 
   const PRESETS = {
     concise: { thinking: false, tools: false, outputs: false },
@@ -108,33 +112,74 @@
   }
   function enc(s) { return encodeURIComponent(s); }
 
-  // Turn plain transcript text into HTML with clickable links. Bare http(s)
-  // URLs and markdown [text](url) links (http/https only) become <a> tags that
-  // open in a new tab; every other run of text is HTML-escaped exactly like
-  // esc(). Only http/https is ever linkified (no javascript:/data: hrefs), and
-  // both the label and the href are escaped, so this is as injection-safe as
-  // esc() — a bare esc() and linkify() produce identical output for link-free
-  // text. Used for prose surfaces (message bubbles, thinking traces); tool
-  // input/output <pre> blocks stay raw esc().
+  // Turn plain transcript text into HTML with clickable links and inline images.
+  // A markdown image ![alt](url) becomes an <img> (XERK-221); bare http(s) URLs
+  // and markdown [text](url) links (http/https only) become <a> tags that open
+  // in a new tab; every other run of text is HTML-escaped exactly like esc().
+  // Only http/https is ever linkified (no javascript:/data: hrefs), and both the
+  // label and the href are escaped, so this is as injection-safe as esc() — a
+  // bare esc() and linkify() produce identical output for link/image-free text.
+  // Used for prose surfaces (message bubbles, thinking traces); tool input/output
+  // <pre> blocks stay raw esc().
+  // Only http(s)/mailto reaches an href; anything else becomes "#". The linkify
+  // pass already restricts what it matches, but `anchor` is ALSO called directly
+  // for a pr_link entry (buildItems), whose URL comes off the wire — and
+  // `target="_blank"` is not a defence, it just happens to make Chrome refuse
+  // the navigation. Mirrors safeUrl in index.html/sessions.html (XERK-235).
+  function safeUrl(u) {
+    // Tab/CR/LF are REMOVED by the URL parser before it parses, so they must be
+    // removed here too or the checks below see a different string than the
+    // browser will (`/<tab>/evil` parses as `//evil`).
+    const s = String(u ?? "").replace(/[\t\r\n]/g, "").trim();
+    if (/^(https?:|mailto:)/i.test(s)) return esc(s);
+    // Root-relative is allowed — the ticket chip points at Turma's OWN board
+    // (/board?ticket=…), not out to the tracker. But only when the second
+    // character cannot begin an authority: a leading `//` is protocol-relative,
+    // and in a special scheme the parser treats `\` exactly as `/`, so `/\evil`
+    // resolves to http://evil just as `//evil` does.
+    if (/^\/(?![/\\])/.test(s)) return esc(s);
+    return "#";
+  }
   function anchor(url, label) {
-    return '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
+    return '<a href="' + safeUrl(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
+  }
+  // An inline image (a markdown ![alt](url), or a raw SVG turned into a data URI
+  // by svgToImg). The src is restricted to http(s) and data:image/* at the call
+  // site, so this never emits a script-bearing scheme; a data:image/svg+xml is
+  // safe here because SVG loaded through <img> runs in the browser's secure
+  // static mode (no scripts, no external fetches). Both attrs are esc()'d.
+  function imgTag(url, alt, cls) {
+    return '<img class="md-img' + (cls ? " " + cls : "") + '" src="' + esc(url) +
+      '" alt="' + esc(alt || "") + '" loading="lazy">';
+  }
+  // Render raw SVG source as an image (XERK-221). The markup is URL-encoded into a
+  // data:image/svg+xml URI and shown through <img>, NOT injected into the DOM: an
+  // <img>-embedded SVG runs in secure static mode, so a <script>/onload/foreignObject
+  // in agent- or tool-emitted SVG can never execute or fetch. encodeURIComponent
+  // leaves the result free of <, >, ", & (all percent-encoded), so it's inert in
+  // the attribute; esc() is applied for uniformity with every other src above.
+  function svgToImg(svg) {
+    return imgTag("data:image/svg+xml," + encodeURIComponent(String(svg).trim()), "", "md-svg");
   }
   function linkify(text) {
     const s = String(text == null ? "" : text);
-    // Markdown link, OR a bare http(s) URL.
-    const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
+    // Markdown image (http(s) or data:image/* src), a markdown link, OR a bare
+    // http(s) URL — image tried first so its leading `!` isn't left as stray text.
+    const re = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
     let out = "", last = 0, m;
     while ((m = re.exec(s))) {
       out += esc(s.slice(last, m.index));
-      if (m[2]) {
-        out += anchor(m[2], m[1]);            // [label](url)
+      if (m[2] != null) {
+        out += imgTag(m[2], m[1]);            // ![alt](url)
+      } else if (m[4]) {
+        out += anchor(m[4], m[3]);            // [label](url)
       } else {
         // Bare URL: peel trailing sentence punctuation, markdown emphasis
         // markers (e.g. a URL wrapped in **bold**), and typographic quotes
         // (Claude often emits curly ‘’ “” around URLs) back out of the link,
         // and a trailing ')' only when it isn't part of the URL (e.g. a URL
         // wrapped in parens) — keep it for balanced ones like /wiki/Foo_(bar).
-        let url = m[3], trail = "";
+        let url = m[5], trail = "";
         const tp = /[.,;:!?'"*_‘’“”]+$/.exec(url);
         if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
         if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
@@ -261,6 +306,28 @@
     return out;
   }
 
+  // ---- raw (non-fenced) SVG blocks ------------------------------------------
+  // Lift a standalone <svg>…</svg> block out of prose and render it as an image
+  // (XERK-221), passing the surrounding text through renderTables() unchanged. A
+  // block only qualifies when its <svg> opens at the START of a line — so a
+  // `<svg>` mentioned inside an inline `code` span or mid-sentence stays text —
+  // and it must reach a </svg>; an unterminated one (mid-stream reveal) falls
+  // through as escaped text until its closer lands. renderProse() lifts fenced
+  // code out first, so a fenced SVG is handled there, never here.
+  function renderSvgAndText(text) {
+    const s = String(text == null ? "" : text);
+    if (!/<svg[\s>]/i.test(s)) return renderTables(s); // no <svg → nothing to lift out
+    const re = /(^|\n)[ \t]*(<svg[\s>][\s\S]*?<\/svg\s*>)/gi;
+    let out = "", last = 0, m;
+    while ((m = re.exec(s))) {
+      out += renderTables(s.slice(last, m.index) + m[1]); // keep the boundary newline
+      out += svgToImg(m[2]);
+      last = m.index + m[0].length;
+    }
+    out += renderTables(s.slice(last));
+    return out;
+  }
+
   // ---- fenced code blocks ---------------------------------------------------
   // A ``` fence opens a code block that runs to the next fence of at least the
   // same length (or, unterminated, to the end of the text — which is the normal
@@ -339,12 +406,17 @@
     writeClipboard(text).then(function () { flash("copied"); }, function () { flash("failed"); });
     return true;
   }
+  // A fenced block whose entire body is one <svg>…</svg> document renders as an
+  // image, not code (XERK-221) — catches ```svg, ```xml/```html-wrapped SVG, and a
+  // bare ``` fence around SVG alike, without disturbing a fence that merely
+  // contains an <svg> among other content.
+  const SVG_FENCE = /^\s*<svg[\s>][\s\S]*<\/svg\s*>\s*$/i;
   function renderProse(text) {
     const s = String(text == null ? "" : text);
-    if (s.indexOf("```") < 0) return renderTables(s); // no fence → nothing to lift out
+    if (s.indexOf("```") < 0) return renderSvgAndText(s); // no fence → still scan for raw SVG
     const lines = s.split("\n");
     let out = "", i = 0, buf = [];
-    const flush = () => { if (buf.length) { out += renderTables(buf.join("\n")); buf = []; } };
+    const flush = () => { if (buf.length) { out += renderSvgAndText(buf.join("\n")); buf = []; } };
     while (i < lines.length) {
       const open = FENCE_OPEN.exec(lines[i]);
       if (open) {
@@ -353,7 +425,8 @@
         const body = [];
         while (i < lines.length && !fenceCloses(lines[i], open[1])) { body.push(lines[i]); i++; }
         i++; // consume the closer; past the end already for an unterminated block
-        out += renderCode(open[2], body.join("\n"));
+        const bodyStr = body.join("\n");
+        out += SVG_FENCE.test(bodyStr) ? svgToImg(bodyStr) : renderCode(open[2], bodyStr);
         continue;
       }
       buf.push(lines[i]); i++;
@@ -536,8 +609,12 @@
       w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
         (b.args || "").length + (b.summary || "").length + (b.result || "").length +
         (b.desc || "").length + (b.content || "").length + (b.plan || "").length +
-        (b.url || "").length +
-        (b.edit ? (b.edit.old || "").length + (b.edit.new || "").length : 0);
+        (b.url || "").length + (b.caption || "").length +
+        (b.edit ? (b.edit.old || "").length + (b.edit.new || "").length : 0) +
+        // Embedded SendUserFile previews (XERK-221): count them so an image-bearing
+        // copy outweighs a degraded reload (file since deleted → a name-only chip).
+        (Array.isArray(b.files) ? b.files.reduce((s, f) =>
+          s + (f ? (f.src || "").length + (f.html || "").length + (f.name || "").length : 0), 0) : 0);
     }
     return w;
   }
@@ -622,6 +699,10 @@
           if (b.edit) act.edit = { old: b.edit.old || "", new: b.edit.new || "", replaceAll: !!b.edit.replaceAll };
           if (b.content) act.content = b.content;
           if (b.plan) act.plan = b.plan;
+          // SendUserFile inline preview (XERK-221): rendered images/SVG/HTML the
+          // session delivered, embedded on the block by the agent.
+          if (Array.isArray(b.files) && b.files.length) act.files = b.files;
+          if (b.caption) act.caption = b.caption;
           items.push(act);
         } else if (b.t === "tool_result") {
           if (b.forId && toolUseIds.has(b.forId)) continue; // folded into its tool_use card
@@ -743,15 +824,54 @@
   }
   function actionKey(a, gk, idx) { return a.id ? ("act:" + a.id) : ("act:" + gk + ":" + idx); }
 
+  // SendUserFile inline previews (XERK-221): the image/SVG/HTML files a session
+  // delivered, embedded on the block by the agent. An image renders through the
+  // same <img> path as prose images (a data:image/svg+xml SVG in secure static
+  // mode); an HTML page renders in a FULLY sandboxed iframe — `sandbox` with no
+  // tokens forbids scripts, same-origin, forms and navigation, so an agent- or
+  // tool-authored page can't run code or reach the hub, and srcdoc is esc()'d so
+  // it can't break out of the attribute. A non-renderable/oversize file (kind
+  // "file") shows as a name chip. The src scheme is re-checked here (defence in
+  // depth) so only data:image/* and http(s) ever reach an <img>.
+  function renderToolFiles(files, caption) {
+    let out = '<div class="tool-files">';
+    for (const f of files) {
+      if (!f || typeof f !== "object") continue;
+      const name = esc(f.name || "file");
+      if (f.kind === "image" && typeof f.src === "string" && /^(data:image\/|https?:)/i.test(f.src)) {
+        const svg = /^data:image\/svg\+xml/i.test(f.src);
+        out += '<figure class="tool-file"><img class="md-img' + (svg ? " md-svg" : "") +
+          '" src="' + esc(f.src) + '" alt="' + name + '" loading="lazy">' +
+          '<figcaption>' + name + "</figcaption></figure>";
+      } else if (f.kind === "html" && typeof f.html === "string") {
+        out += '<figure class="tool-file"><iframe class="md-embed" sandbox referrerpolicy="no-referrer"' +
+          ' loading="lazy" title="' + name + '" srcdoc="' + esc(f.html) + '"></iframe>' +
+          '<figcaption>' + name + "</figcaption></figure>";
+      } else {
+        out += '<div class="tool-file file"><span class="tool-file-name">📎 ' + name + "</span></div>";
+      }
+    }
+    out += "</div>";
+    if (caption) out += '<div class="tool-caption">' + renderInline(caption) + "</div>";
+    return out;
+  }
+
   function renderActionCard(it, key) {
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
-    // A plan card's salient line is the plan itself, not the raw input JSON the
-    // summary would otherwise fall back to.
-    const argSrc = it.plan || it.input;
-    const argOne = argSrc ? esc(argSrc.split("\n")[0]) : "";
+    // A plan card's salient line is the plan itself; a SendUserFile card's is its
+    // caption or a file count — not the raw input JSON either would fall back to.
+    const argSrc = it.plan || (it.files ? "" : it.input);
+    let argOne = argSrc ? esc(argSrc.split("\n")[0]) : "";
+    if (it.files && !argOne) {
+      argOne = esc(it.caption ? it.caption.split("\n")[0]
+        : it.files.length + (it.files.length === 1 ? " file" : " files"));
+    }
     const descOne = it.desc ? '<span class="tool-desc">' + esc(it.desc.split("\n")[0]) + "</span>" : "";
     let body = "";
-    if (it.input && !it.plan) {
+    // A SendUserFile delivery renders its files (the point of the card); its raw
+    // input JSON would just be the same paths, so it's suppressed when files show.
+    if (it.files) body += renderToolFiles(it.files, it.caption);
+    if (it.input && !it.plan && !it.files) {
       body += '<div class="tool-block"><div class="tool-label">input</div><pre>' +
         esc(it.input) + "</pre>" + truncBtn(it.entryId, it.inputTrunc) + "</div>";
     }
@@ -782,10 +902,11 @@
     if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
     const taskCls = it.task ? " task" : "";
     const icon = it.task ? '<span class="tool-glyph">◆</span>' : '<span class="tool-dot"></span>';
-    // A plan is the thing the operator is asked to approve: open by default.
+    // A plan (approval) and a SendUserFile delivery (its files ARE the point) are
+    // open by default; other tool cards follow the verbosity preset.
     return '<details class="action-card' + (statusCls ? " " + statusCls : "") + taskCls + '" data-dkey="' + esc(key) +
       '" data-uuid="' + esc(it.entryId) + '"' +
-      openAttr(key, it.plan ? true : verbosity.show.outputs) + ">" +
+      openAttr(key, (it.plan || it.files) ? true : verbosity.show.outputs) + ">" +
       "<summary>" + icon + '<span class="tool-name">' + esc(it.name) + "</span>" +
       '<span class="tool-arg">' + argOne + "</span>" + descOne + "</summary>" +
       '<div class="tool-body">' + body + "</div></details>";
@@ -876,9 +997,13 @@
       while (j < items.length && items[j].kind === "action") j++;
       const run = items.slice(i, j);
       const gk = "grp:" + (run[0].id || g++);
-      // Concise mode (tools hidden) omits tool actions entirely — no card, no
-      // collapsed box. Otherwise render each action as its own card.
-      if (verbosity.show.tools) out.push(run.map((a, idx) => renderActionCard(a, actionKey(a, gk, idx))).join(""));
+      // Concise mode (tools hidden) omits tool mechanics — but a SendUserFile
+      // DELIVERY (a card carrying rendered files) is user-facing content, not a
+      // tool detail, so it renders in every verbosity (XERK-221). Otherwise show
+      // each action as its own card.
+      out.push(run.map((a, idx) =>
+        (verbosity.show.tools || (a.files && a.files.length))
+          ? renderActionCard(a, actionKey(a, gk, idx)) : "").join(""));
       i = j;
     }
     return out.join("");
@@ -1387,15 +1512,15 @@
   // One PR badge (state colour + #number + merge-readiness mark), linked to the PR.
   function prBadge(pr) {
     const url = pr.url || "";
-    const m = url.match(/\/pull\/(\d+)|\/-\/merge_requests\/(\d+)/);
-    const num = pr.number ? "#" + pr.number : (m ? "#" + (m[1] || m[2]) : "PR");
+    const m = url.match(/\/pull\/(\d+)|\/-\/merge_requests\/(\d+)|\/pullrequest\/(\d+)/i);
+    const num = pr.number ? "#" + pr.number : (m ? "#" + (m[1] || m[2] || m[3]) : "PR");
     const state = String(pr.state || "").toUpperCase();
     const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
     const label = state ? state[0] + state.slice(1).toLowerCase() : "";
     const ready = prReady(pr);
     const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
     const chk = mark ? ' <span class="pr-ready ' + ready + '" title="' + esc(prReadyTitle(pr)) + '">' + mark + "</span>" : "";
-    return '<a class="pr-badge ' + cls + '" href="' + esc(url) +
+    return '<a class="pr-badge ' + cls + '" href="' + safeUrl(url) +
       '" target="_blank" rel="noopener" title="' + esc(pr.title || url) + '">' +
       '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + "</a>";
   }
@@ -1424,7 +1549,7 @@
     const href = "/board?ticket=" + encodeURIComponent(t.key) +
       (t.siteKey ? "&site=" + encodeURIComponent(t.siteKey) : "");
     return '<span class="cc-opt cc-ticket">' +
-      '<a class="jira-chip" href="' + esc(href) + '"' +
+      '<a class="jira-chip" href="' + safeUrl(href) + '"' +
       ' title="' + esc(tip || t.key) + '">' + esc(t.key) + "</a></span>";
   }
   // fromPoll: a background heartbeat repaint — don't yank an open menu shut.
@@ -1671,6 +1796,186 @@
     } catch {} finally { expandInFlight = false; }
   }
 
+  // ---- file attachments (XERK-234) ------------------------------------------
+  // Files the operator staged for the NEXT message. Each is uploaded to the hub
+  // the moment it is picked — so Send is instant, and a file too big or a host
+  // too old is refused while there is still something to look at rather than at
+  // the end of a message the operator thought they'd sent.
+  //
+  // Shape: {key, name, size, status:"uploading"|"ready"|"error", uploadId, error}
+  let attachments = [];
+  let attachSeq = 0;
+
+  function fmtBytes(n) {
+    const b = Number(n) || 0;
+    if (b < 1024) return b + " B";
+    if (b < 1024 * 1024) return Math.round(b / 1024) + " KB";
+    return (b / (1024 * 1024)).toFixed(b < 10 * 1024 * 1024 ? 1 : 0) + " MB";
+  }
+
+  // The largest file the OPEN session's host will take, 0 when it can't take one
+  // (an agent that predates attachments reports no `uploadMaxBytes` — see the
+  // hub's uploadCapFor). 0 is what hides the 📎 rather than letting the operator
+  // attach into a void.
+  function attachCap(a) {
+    const n = Number((a || agent || {}).uploadMaxBytes);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  function attachEnabled() { return attachCap() > 0; }
+
+  function attachmentsHtml(list) {
+    return (list || []).map((f) => {
+      const cls = f.status === "error" ? " att-error"
+        : f.status === "uploading" ? " att-uploading" : "";
+      const meta = f.status === "error" ? esc(f.error || "failed")
+        : f.status === "uploading" ? "uploading…" : fmtBytes(f.size);
+      return `<span class="att-chip${cls}" title="${esc(f.name)}">` +
+        `<span class="att-name">${esc(f.name)}</span>` +
+        `<span class="att-size">${meta}</span>` +
+        `<button class="att-x" title="Remove" data-att="${esc(f.key)}">✕</button></span>`;
+    }).join("");
+  }
+
+  // Paint every strip on the page (chat's and the terminal's), the same way
+  // updateComposeAction paints every Send — the two bars send through one
+  // endpoint and must never disagree about what is attached.
+  function renderAttachments() {
+    const html = attachmentsHtml(attachments);
+    for (const el of document.querySelectorAll(".compose-attach")) {
+      if (el.innerHTML !== html) el.innerHTML = html;
+    }
+    const clip = $("chatClip");
+    if (clip) {
+      clip.hidden = !attachEnabled();
+      // A pending question is answered THROUGH the compose box (POST .../answer,
+      // which carries no attachments), so attaching is off while one is up.
+      clip.disabled = questionActive;
+      clip.title = questionActive
+        ? "Answer the question first — an answer can't carry a file"
+        : "Attach images or documents";
+    }
+  }
+
+  function removeAttachment(key) {
+    attachments = attachments.filter((f) => f.key !== key);
+    renderAttachments();
+  }
+
+  function clearAttachments() { attachments = []; renderAttachments(); }
+
+  // Stage files and start their uploads. Called by the 📎 picker, a drop on the
+  // transcript, and a paste carrying files (a screenshot off the clipboard).
+  function attachFiles(files) {
+    const list = Array.from(files || []).filter(Boolean);
+    if (!list.length || !hostKey || !sessionId) return;
+    const cap = attachCap();
+    if (!cap) { actionFailed("Host too old for files"); return; }
+    for (const file of list) {
+      if (attachments.length >= MAX_ATTACHMENTS) {
+        actionFailed(`Max ${MAX_ATTACHMENTS} files`);
+        break;
+      }
+      const rec = {
+        key: "a" + (++attachSeq),
+        name: file.name || "upload",
+        size: file.size || 0,
+        status: file.size > cap ? "error" : "uploading",
+        error: file.size > cap ? `too big — max ${fmtBytes(cap)}` : "",
+        uploadId: "",
+      };
+      attachments.push(rec);
+      if (rec.status !== "error") uploadOne(rec, file);
+    }
+    renderAttachments();
+  }
+
+  async function uploadOne(rec, file) {
+    // The session this upload belongs to: if the operator walks to another
+    // session mid-upload the reply is stale, and its chip is already gone.
+    const forSession = sessionId, forHost = hostKey;
+    try {
+      const url = "/api/agents/" + enc(forHost) + "/sessions/" + enc(forSession) +
+        "/uploads?name=" + encodeURIComponent(rec.name);
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: file,
+      });
+      const reply = await r.json().catch(() => null);
+      if (!r.ok) throw new Error((reply && reply.error) || ("upload failed (" + r.status + ")"));
+      if (forSession !== sessionId || !attachments.includes(rec)) return;
+      rec.uploadId = reply.uploadId;
+      rec.name = reply.name || rec.name;   // the name it will land under
+      rec.size = reply.size || rec.size;
+      rec.status = "ready";
+    } catch (e) {
+      if (forSession !== sessionId || !attachments.includes(rec)) return;
+      rec.status = "error";
+      rec.error = (e && e.message) || "upload failed";
+    }
+    renderAttachments();
+  }
+
+  // Wire the picker/drop/paste entry points once. The picker is one <input> for
+  // the page (sessions.html), reset after every pick so re-choosing the same
+  // file still fires `change`.
+  function openFilePicker() {
+    const inp = $("chatFilePicker");
+    if (!inp || !attachEnabled() || questionActive) return;
+    inp.value = "";
+    inp.click();
+  }
+
+  function wireAttachDrop() {
+    const wrap = document.querySelector(".chat-scroll-wrap");
+    if (!wrap || wrap.dataset.attWired) return;
+    wrap.dataset.attWired = "1";
+    const has = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || [])
+      .includes("Files");
+    wrap.addEventListener("dragover", (e) => {
+      if (!has(e) || !attachEnabled()) return;
+      e.preventDefault();
+      wrap.classList.add("att-drop");
+    });
+    wrap.addEventListener("dragleave", (e) => {
+      if (e.target === wrap) wrap.classList.remove("att-drop");
+    });
+    wrap.addEventListener("drop", (e) => {
+      wrap.classList.remove("att-drop");
+      if (!has(e) || !attachEnabled()) return;
+      e.preventDefault();
+      attachFiles(e.dataTransfer.files);
+    });
+    // One delegated handler for every chip's ✕, on both strips.
+    document.addEventListener("click", (e) => {
+      const x = e.target.closest && e.target.closest(".att-x[data-att]");
+      if (!x) return;
+      e.preventDefault();
+      removeAttachment(x.getAttribute("data-att"));
+    });
+  }
+
+  // A paste carrying files (a screenshot, a dragged-in doc) attaches them; a
+  // paste of plain text is left alone so the textarea handles it normally.
+  function composePaste(e) {
+    const files = (e && e.clipboardData && e.clipboardData.files) || null;
+    if (!files || !files.length || !attachEnabled() || questionActive) return;
+    e.preventDefault();
+    attachFiles(files);
+  }
+
+  /**
+   * The staged uploadIds for the message about to be sent, or null when one is
+   * still uploading / failed — the caller then holds the message rather than
+   * sending it with a file silently missing. `[]` means simply nothing attached.
+   */
+  function readyUploadIds() {
+    if (!attachments.length) return [];
+    if (attachments.some((f) => f.status === "uploading")) return null;
+    if (attachments.some((f) => f.status === "error")) return null;
+    return attachments.map((f) => f.uploadId).filter(Boolean);
+  }
+
   // ---- compose (typed prompt, or custom question answer) --------------------
   function autoGrow() {
     const inp = $("chatInput");
@@ -1686,13 +1991,45 @@
     inp.style.height = "auto";
     inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
   }
+  // The hub rejects a message past the receiving host's character cap with a 413
+  // (XERK-227). That is the one send failure the operator can act on — the text
+  // is still in the box, it just has to be split — so it gets its own label
+  // instead of the generic "Send failed", which reads as "the hub is down".
+  // The cap is per host (an agent too old to paste takes far less), so the
+  // label carries the hub's `limit` when it sent one: "too long" without a
+  // number leaves the operator guessing how much to cut.
+  const TOO_LONG = "Message too long";
+  // A staged attachment aged out of the hub's relay (XERK-234). Like "too long"
+  // this is a refusal the operator can act on — re-attach and send again — so it
+  // gets its own wording rather than the generic "Send failed".
+  const ATT_GONE = "Attachment expired — re-attach";
+  function sendFailure(status, limit, error) {
+    if (status === 404 && /attachment/i.test(error || "")) return ATT_GONE;
+    if (status !== 413) return String(status);
+    const n = Number(limit);
+    return n > 0 ? `Too long — max ${n.toLocaleString()}` : TOO_LONG;
+  }
+  function isTooLong(msg) {
+    return msg === TOO_LONG || msg === ATT_GONE || /^Too long — max /.test(msg || "");
+  }
   async function send() {
     const inp = $("chatInput");
     if (!inp || !hostKey || !sessionId) return;
     const text = inp.value;
-    if (!text.trim()) return;
-    inp.value = ""; autoGrow(); inp.focus();
     const wasAnswer = questionActive;
+    // Attachments ride a plain message only (an /answer carries no files), and
+    // a message can be attachments alone — but never one that is still on its
+    // way up, which would arrive with the file missing and nothing said.
+    const uploadIds = wasAnswer ? [] : readyUploadIds();
+    if (!wasAnswer && uploadIds === null) {
+      actionFailed(attachments.some((f) => f.status === "error")
+        ? "Remove the failed file" : "Files still uploading");
+      return;
+    }
+    if (!text.trim() && !(uploadIds && uploadIds.length)) return;
+    inp.value = ""; autoGrow(); inp.focus();
+    const sentAttachments = wasAnswer ? [] : attachments.slice();
+    if (!wasAnswer) clearAttachments();
     try {
       let url, body;
       if (wasAnswer) {
@@ -1706,14 +2043,25 @@
       } else {
         url = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/input";
         body = { text };
+        if (uploadIds.length) body.uploadIds = uploadIds;
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error(String(r.status));
+      if (!r.ok) {
+        const err = await r.json().catch(() => null);
+        throw new Error(sendFailure(r.status, err && err.limit, err && err.error));
+      }
       if (typeof fastPoll === "function") fastPoll();
-    } catch {
+    } catch (e) {
       if (wasAnswer) { answeredQuestion = null; if (sess) updateQuestion(sess); }
       if (!inp.value.trim()) { inp.value = text; autoGrow(); }
-      actionFailed("Send failed");
+      // Put the chips back with the text: the operator is going to press Send
+      // again, and re-picking the files by hand is not something a failed POST
+      // should cost them. The staged uploads live on the hub for 20 minutes.
+      if (sentAttachments.length && !attachments.length) {
+        attachments = sentAttachments;
+        renderAttachments();
+      }
+      actionFailed(isTooLong(e && e.message) ? e.message : "Send failed");
     }
   }
 
@@ -1848,6 +2196,8 @@
     renderVerbosityControl();
     renderComposeOpts();
     wireScrollDelegation();
+    wireAttachDrop();
+    clearAttachments();  // files are staged per session, never carried across
     updateQuestion(s);
     // Instant paint from the heartbeat's cached (text-only) tail, then upgrade.
     const seed = (s && s.session && s.session.tail) || [];
@@ -1869,6 +2219,7 @@
     panePromptActive = false; answeredPanePrompt = null;
     stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false;
+    clearAttachments();
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
@@ -1883,11 +2234,22 @@
     setHeader(s, agent);
     updateQuestion(s);
     renderComposeOpts(true);
+    // The host payload carries `uploadMaxBytes`, so the 📎 can only appear once
+    // a beat has been seen — repaint the strip on every one.
+    renderAttachments();
   }
 
   if (typeof window !== "undefined") {
     window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
-      isBusy, stop, actionFailed };
+      // sendFailure/isTooLong are shared with the terminal composer so the two
+      // compose bars word a refusal identically (XERK-227).
+      isBusy, stop, actionFailed, sendFailure, isTooLong,
+      // The terminal composer sends through the same /input, so it reads the
+      // staged attachments from here rather than keeping a second list
+      // (XERK-234).
+      readyUploadIds, clearAttachments, hasAttachments: () => attachments.length > 0,
+      attachError: () => (attachments.some((f) => f.status === "error")
+        ? "Remove the failed file" : "Files still uploading") };
     // Global handlers referenced by the chat pane's inline HTML attributes.
     window.autoGrowChatInput = autoGrow;
     // Enter always sends, exactly like the button: a queued message is a
@@ -1900,6 +2262,11 @@
     window.chatComposeAction = function () { send(); };
     window.chatComposeStop = function () { stop(); };
     window.chatJumpBottom = jumpToBottom;
+    // File attachments (XERK-234): the composer's 📎, the picker's change, and
+    // a paste that carries files.
+    window.chatComposeAttach = openFilePicker;
+    window.chatFilesPicked = function (e) { attachFiles(e && e.target && e.target.files); };
+    window.chatComposePaste = composePaste;
   }
 
   // Expose the pure core (merge + item building) for Node unit tests. Harmless
@@ -1909,7 +2276,11 @@
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
-      isBusy, updateComposeAction, isToolBullet,
+      isBusy, updateComposeAction, isToolBullet, sendFailure, isTooLong, TOO_LONG,
+      attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, attachFiles,
+      clearAttachments, MAX_ATTACHMENTS,
+      __setAttachments: (a) => { attachments = a; },
+      __attachments: () => attachments,
       // Drive the real `turn`-frame classifier (see applyTurn): the ws onmessage
       // hands it frame.text verbatim, so the flicker tests exercise it directly.
       __applyTurn: (t) => { applyTurn(t); },

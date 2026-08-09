@@ -9,6 +9,7 @@ import com.xerktech.turma.model.JiraBlock
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
+import com.xerktech.turma.model.RepoOption
 import com.xerktech.turma.model.StatusOption
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -78,6 +79,106 @@ class BoardTest {
         val site = mergeSites(listOf(stale, fresh)).single()
         assertEquals(listOf("NEW"), site.tickets.map { it.key })
         assertEquals("2026-07-16T05:00:00Z", site.fetchedAt)
+    }
+
+    // ---- XERK-235: divergences from board.js found by a QA parity audit ----
+
+    @Test fun `ticket dedupe keeps the freshest UPDATED, not the freshest block`() {
+        // First-wins over blocks sorted by fetchedAt showed the stale summary
+        // and the stale column whenever two users polled one site and the
+        // fresher BLOCK carried the older TICKET (board.js keeps the newer
+        // t.updated).
+        val a1 = agent("h1", true, JiraBlock(
+            siteKey = "org", user = "u1", fetchedAt = "2026-08-08T12:00:00Z",
+            tickets = listOf(JiraTicket(key = "P-1", statusCategory = "todo",
+                summary = "OLD", updated = "2026-08-01T00:00:00Z")),
+        ))
+        val a2 = agent("h2", true, JiraBlock(
+            siteKey = "org", user = "u2", fetchedAt = "2026-08-08T11:00:00Z",
+            tickets = listOf(JiraTicket(key = "P-1", statusCategory = "inprogress",
+                summary = "NEW", updated = "2026-08-08T00:00:00Z")),
+        ))
+        val t = mergeSites(listOf(a1, a2)).single().tickets.single()
+        assertEquals("NEW", t.summary)
+        assertEquals("inprogress", t.statusCategory)
+    }
+
+    @Test fun `repoOptions union every host of the org, cloned first`() {
+        // Taking only the freshest block's list meant the picker offered
+        // whichever host polled Jira last, and a repo cloned only on the other
+        // vanished from the dropdown.
+        val a1 = agent("h1", true, JiraBlock(
+            siteKey = "org", user = "u1", fetchedAt = "2026-08-08T12:00:00Z",
+            repoOptions = listOf(RepoOption(name = "zeta", cloned = false)),
+        ))
+        val a2 = agent("h2", true, JiraBlock(
+            siteKey = "org", user = "u2", fetchedAt = "2026-08-08T11:00:00Z",
+            repoOptions = listOf(RepoOption(name = "alpha", cloned = true)),
+        ))
+        val opts = mergeSites(listOf(a1, a2)).single().repoOptions
+        assertEquals(listOf("alpha", "zeta"), opts.map { it.name })
+    }
+
+    @Test fun `repoOptions union hosts polling as the SAME tracker user`() {
+        // The case board.js calls the common one, and the case the two tests
+        // around this one cannot see: they use different `user`s, so byUser keeps
+        // both blocks and the union appears to work wherever it is collected.
+        // With one user, byUser keeps ONE block — so collecting the union from
+        // the winners dropped every repo cloned on any other host (XERK-235).
+        val a1 = agent("h1", true, JiraBlock(
+            siteKey = "org", user = "mal@acme.io", fetchedAt = "2026-08-08T12:00:00Z",
+            repoOptions = listOf(RepoOption(name = "only-on-A", cloned = true)),
+        ))
+        val a2 = agent("h2", true, JiraBlock(
+            siteKey = "org", user = "mal@acme.io", fetchedAt = "2026-08-08T13:00:00Z",
+            repoOptions = listOf(RepoOption(name = "only-on-B", cloned = true)),
+        ))
+        val opts = mergeSites(listOf(a1, a2)).single().repoOptions
+        assertEquals(listOf("only-on-A", "only-on-B"), opts.map { it.name }.sorted())
+    }
+
+    @Test fun `picker ordering is case-insensitive, as board_js localeCompare is`() {
+        // board.js sorts with localeCompare; ordinal compareTo put every
+        // capitalised repo ahead of every lowercase one, so the two pickers
+        // listed the same repos in a different order (XERK-235).
+        val a = agent("h1", true, JiraBlock(
+            siteKey = "org", user = "u1", fetchedAt = "2026-08-08T12:00:00Z",
+            repoOptions = listOf(
+                RepoOption(name = "Turma", cloned = true),
+                RepoOption(name = "agent-notes", cloned = true),
+                RepoOption(name = "DockerOps", cloned = true),
+            ),
+        ))
+        assertEquals(
+            listOf("agent-notes", "DockerOps", "Turma"),
+            mergeSites(listOf(a)).single().repoOptions.map { it.name },
+        )
+    }
+
+    @Test fun `a cloned copy wins the repoOptions dedupe`() {
+        val a1 = agent("h1", true, JiraBlock(
+            siteKey = "org", user = "u1", fetchedAt = "2026-08-08T12:00:00Z",
+            repoOptions = listOf(RepoOption(name = "r", cloned = false)),
+        ))
+        val a2 = agent("h2", true, JiraBlock(
+            siteKey = "org", user = "u2", fetchedAt = "2026-08-08T11:00:00Z",
+            repoOptions = listOf(RepoOption(name = "r", cloned = true)),
+        ))
+        assertTrue(mergeSites(listOf(a1, a2)).single().repoOptions.single().cloned)
+    }
+
+    @Test fun `ageStr reads Jira Cloud's basic-format offset, not just Zulu`() {
+        // Instant.parse rejects `+0000`, which is exactly how Jira Cloud stamps
+        // `updated` — so every Jira ticket's age chip rendered blank, while
+        // Azure's Zulu timestamps worked. That is why Azure-only testing never
+        // saw it. Date.parse (the web) accepts both.
+        val now = java.time.Instant.parse("2026-08-08T12:40:00Z").toEpochMilli()
+        assertEquals("5m", ageStr("2026-08-08T12:34:56.789+0000", now))
+        assertEquals("5m", ageStr("2026-08-08T12:34:56Z", now))
+        assertEquals("5m", ageStr("2026-08-08T12:34:56.789+00:00", now))
+        assertEquals("5m", ageStr("2026-08-08T13:34:56.789+0100", now))
+        assertEquals("", ageStr("not a date", now))
+        assertEquals("", ageStr("", now))
     }
 
     @Test fun `agents with no jira or blank siteKey are ignored`() {

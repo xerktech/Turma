@@ -27,6 +27,27 @@ function session(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 describe("liveState", () => {
+  // XERK-235: two rules the web applies and this mirror did not. paneBusy is a
+  // value on the record the host last pushed, so a host that dies mid-turn left
+  // its session reading "working" forever — and so never reached Ready for
+  // review, which is exactly where stranded work belongs.
+  it("is 'idle' when the host has gone offline, even with paneBusy true", () => {
+    const s = session({ session: signals({ paneBusy: true, transcriptAgeSec: 5 }) });
+    const now = 1_000_000;
+    expect(liveState(s, now - 10_000, now)).toBe("working");
+    expect(liveState(s, now - 600_000, now)).toBe("idle");
+  });
+
+  it("is 'idle' before a transcript exists, whatever paneBusy says", () => {
+    const s = session({ session: signals({ paneBusy: true, transcriptAgeSec: null }) });
+    expect(liveState(s, Date.now(), Date.now())).toBe("idle");
+  });
+
+  it("keeps the old behaviour when no host is supplied", () => {
+    const s = session({ session: signals({ paneBusy: true, transcriptAgeSec: 5 }) });
+    expect(liveState(s)).toBe("working");
+  });
+
   it("is 'error' when status is error, regardless of session signals", () => {
     const s = session({ status: "error", session: signals({ question: "pick one" }) });
     expect(liveState(s)).toBe("error");

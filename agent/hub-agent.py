@@ -719,23 +719,22 @@ _GUARD_ALLOW_PATH_RULES = [
     "Read(~/.turma/uploads/**)",
 ]
 
+# `Edit(path)` is the ONLY spelling file permission checks honour, and it covers
+# every file-editing tool (Write and NotebookEdit included). A paired
+# `Write(path)` rule is not merely redundant: Claude Code rejects it at startup
+# and prints a warning per rule, so each session's pane opened with seven lines
+# of noise — the first thing the operator sees, in the same pane the agent
+# scrapes for its busy/mode signals. Do not add `Write(...)` twins back.
 _GUARD_DENY_PATH_RULES = [
     "Edit(~/.ssh/**)",
-    "Write(~/.ssh/**)",
     "Edit(~/.aws/**)",
-    "Write(~/.aws/**)",
     "Edit(~/.azure/**)",
-    "Write(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
-    "Write(~/.terraform.d/**)",
     "Edit(~/.claude/**)",
-    "Write(~/.claude/**)",
     "Edit(~/.config/gcloud/**)",
-    "Write(~/.config/gcloud/**)",
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
     "Edit(~/.git-credentials)",
-    "Write(~/.git-credentials)",
 ]
 
 # Operator-supplied extra permissions. Claude Code does NOT read a *user-level*
@@ -7521,7 +7520,11 @@ def clean_summary(raw):
         return None
     line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     line = re.sub(r"[\"'`]+", " ", line)
-    line = re.sub(r"[.\s]+$", "", line).strip()
+    # rstrip, NOT re.sub(r"[.\s]+$", ...): that pattern backtracks quadratically
+    # on a long run of trailing whitespace, and this runs on unbounded `claude
+    # -p` output ON THE HEARTBEAT THREAD — 50k trailing spaces stalled every
+    # session's beat for ~10s (XERK-235). rstrip is O(n) and does the same job.
+    line = line.rstrip(". \t\n\r\f\v").strip()
     if not line:
         return None
     capped = " ".join(line.split()[:SUMMARY_MAX_WORDS])[:SUMMARY_MAX_CHARS].strip()
@@ -7774,12 +7777,40 @@ class SessionManager:
     # --- registry persistence ---------------------------------------------
 
     def _load_list(self, path):
+        """Load a persisted list, quarantining a damaged file instead of eating it.
+
+        A truncated or non-list `sessions.json` used to return [] silently, and
+        the next beat's save() overwrote the damaged file with `[]` — so every
+        session went unmanaged (tmux and ttyd still running, ports leaked) with
+        no log line, and the evidence was destroyed by the recovery (XERK-235).
+        The copy is what makes the loss diagnosable after the fact.
+        """
+        if not os.path.exists(path):
+            return []
         try:
             with open(path) as f:
                 data = json.load(f)
-            return data if isinstance(data, list) else []
-        except (OSError, ValueError):
+            if isinstance(data, list):
+                return data
+            bad = f"not a list ({type(data).__name__})"
+        except OSError as e:
+            # Unreadable rather than corrupt — don't quarantine, we may not be
+            # able to read it next beat either and there's nothing to preserve.
+            print(f"[hub-agent] WARNING: cannot read {path} ({e}); "
+                  "continuing with an empty list", file=sys.stderr, flush=True)
             return []
+        except ValueError as e:
+            bad = str(e)
+        quarantine = f"{path}.corrupt.{int(time.time())}"
+        try:
+            shutil.copy2(path, quarantine)
+        except OSError:
+            quarantine = "(copy failed)"
+        print(f"[hub-agent] WARNING: {path} is unusable ({bad}); "
+              f"kept a copy at {quarantine}. Any session it described is now "
+              "unmanaged — check `tmux ls` for orphans.",
+              file=sys.stderr, flush=True)
+        return []
 
     def save(self):
         try:
@@ -8458,9 +8489,18 @@ class SessionManager:
                 return sid
 
     def _alloc_port(self):
+        """A free ttyd port: unclaimed in the registry AND not actually bound.
+
+        The registry alone is not enough. Anything holding a port this manager
+        doesn't know about — a ttyd orphaned by a lost/corrupt registry, a
+        second agent on the host, an unrelated service — still owns the bind,
+        and ttyd's failure to take it is silent (stderr goes to DEVNULL). The
+        session then serves ANOTHER session's terminal on its port, or none,
+        for its whole life with nothing logged (XERK-235).
+        """
         used = {s.get("ttydPort") for s in self.registry if s.get("ttydPort")}
         p = TTYD_PORT_BASE
-        while p in used:
+        while p in used or _port_open(p):
             p += 1
         return p
 

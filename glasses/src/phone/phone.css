@@ -315,6 +315,15 @@
 }
 .ph-rename-row { display: flex; gap: 8px; justify-content: flex-end; }
 
+/* Why a send failed, above the compose row (XERK-235). Hidden via [hidden]
+   until there is something to say. */
+.ph-senderr {
+  flex: none; padding: 6px 12px; font-size: 12px; line-height: 1.4;
+  color: var(--critical, #d33); background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+.ph-senderr[hidden] { display: none; }
+
 /* Compose */
 .ph-compose {
   flex: none; display: flex; align-items: flex-end; gap: 8px;

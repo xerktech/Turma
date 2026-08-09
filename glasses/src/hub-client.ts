@@ -32,6 +32,41 @@ export class HttpError extends Error {
 export interface HubClientOptions {
   config: Config;
   fetchFn?: typeof fetch;
+  /** Per-request ceiling; 0 disables. Defaults to HUB_FETCH_TIMEOUT_MS. */
+  timeoutMs?: number;
+}
+
+// How long any single hub request may hang before it is treated as failed.
+//
+// fetch has NO timeout of its own, and App.poll() re-arms only in its
+// `finally`. So a hub that accepts the connection and never answers (a wedged
+// origin, an edge holding the socket open, a lost native round-trip) left the
+// promise unsettled and killed the poll loop PERMANENTLY — the glasses froze
+// on stale content with no "hub unreachable" flash at all, where every other
+// failure mode recovers within one poll.
+//
+// Veiller already fixed exactly this for its background JSContext (XERK-215,
+// veiller/src/background/net.ts); this is the same guard for the lens, applied
+// where every request funnels through instead of at one call site.
+export const HUB_FETCH_TIMEOUT_MS = 30_000;
+
+/** Race `base` against a timer so a never-settling fetch becomes a normal error. */
+export function timeoutFetch(
+  base: typeof fetch,
+  timeoutMs: number = HUB_FETCH_TIMEOUT_MS,
+): typeof fetch {
+  if (!timeoutMs || timeoutMs <= 0) return base;
+  const wrapped = (input: unknown, init?: RequestInit): Promise<Response> =>
+    new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`hub fetch timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      base(input as never, init).then(
+        (res) => { clearTimeout(timer); resolve(res); },
+        (err) => { clearTimeout(timer); reject(err); },
+      );
+    });
+  return wrapped as unknown as typeof fetch;
 }
 
 // Typed REST client for the hub API (`turma/server.js`). Every method
@@ -42,9 +77,12 @@ export class HubClient {
   private readonly config: Config;
   private readonly fetchFn: typeof fetch;
 
-  constructor({ config, fetchFn }: HubClientOptions) {
+  constructor({ config, fetchFn, timeoutMs }: HubClientOptions) {
     this.config = config;
-    this.fetchFn = fetchFn ?? globalThis.fetch.bind(globalThis);
+    this.fetchFn = timeoutFetch(
+      fetchFn ?? globalThis.fetch.bind(globalThis),
+      timeoutMs ?? HUB_FETCH_TIMEOUT_MS,
+    );
   }
 
   private url(path: string): string {
