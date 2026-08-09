@@ -671,6 +671,53 @@ class TestKnownBypasses(unittest.TestCase):
         # ...while the escaped-path form still denies.
         self.assertIsNotNone(guard.is_destructive("rm -rf \\/etc"))
 
+    def test_a_wrapper_option_value_is_not_an_operand(self):
+        """`ssh -i key host rm -rf /etc` — the VALUE ate the host slot.
+
+        Counting operands without knowing which options consume a value made
+        `key` the host, so the command was never found. `ssh -i key host …` and
+        `docker exec -u root c …` are ordinary spellings, not evasion.
+        """
+        for cmd in ("ssh -i key host rm -rf /etc", "ssh -p 2222 host rm -rf /etc",
+                    "ssh -o StrictHostKeyChecking=no host rm -rf /etc",
+                    "ssh -l root host rm -rf /etc",
+                    "docker exec -u root c rm -rf /etc",
+                    "docker exec -w /app c rm -rf /etc",
+                    "docker exec -e K=V c rm -rf /etc",
+                    "docker --context foo exec c rm -rf /etc",
+                    "kubectl -n ns exec pod rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ("ssh -i ~/.ssh/id_rsa host 'uptime'", "docker exec -u node c npm test"):
+            with self.subTest(allowed=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_a_wrapper_argument_is_not_automatically_a_command(self):
+        """The E1 mistake, reinstated for wrappers and removed again.
+
+        Expanding every whitespace-bearing argument reads a quoted MESSAGE as a
+        command: `ssh host git commit -m 'rm -rf /etc is banned'` denied. Only
+        the command POSITION is a command — single-vs-multi, as eval does it.
+        """
+        for cmd in ("docker run --rm alpine echo 'rm -rf /etc'",
+                    "ssh host git commit -m 'rm -rf /etc is banned'",
+                    "kubectl exec pod -- echo 'rm -rf /etc'",
+                    "docker run --label 'rm -rf /etc is bad' img",
+                    "ssh host logger 'rm -rf /etc completed'",
+                    "docker run -e 'CMD=rm -rf /etc' img"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_a_quoted_pipe_is_not_a_pipeline_stage(self):
+        """The inner pipeline split was still naive, so a quoted `|` split and
+        the text after it became an executing stage."""
+        drop_tb, drop_db = "DROP" + " TABLE", "DROP" + " DATABASE"
+        self.assertIsNone(guard.is_destructive(f"echo '{drop_tb} | psql -c x' > f"))
+        # ...while real pipelines keep their verdicts.
+        self.assertIsNotNone(guard.is_destructive(f"echo '{drop_db} p' | mysql"))
+        self.assertIsNotNone(guard.is_destructive(f"echo '{drop_db} p' | docker exec -i db psql"))
+        self.assertIsNone(guard.is_destructive(f"cat schema.sql | grep '{drop_tb}'"))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 

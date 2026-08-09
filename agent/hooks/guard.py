@@ -594,13 +594,16 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             # Only two shapes are treated as the command, to keep an ordinary
             # `--label 'x=y z'` from being read as one: everything after `--`,
             # and any single argument that is itself a command line.
+            # Single-vs-multi, exactly as `eval` does it. NOT "every argument
+            # containing whitespace": that is the construct removed from eval
+            # two rounds ago, and it reads `ssh host git commit -m 'rm -rf /etc
+            # is banned'` as a destructive command.
             inner_cmd = _wrapper_command(prog, rest)
-            if inner_cmd:
+            if len(inner_cmd) == 1 and re.search(r"\s", inner_cmd[0]):
+                out.extend(_expand_segments(inner_cmd[0], depth + 1))
+            elif inner_cmd:
                 out.extend(_expand_segments(
                     " ".join(shlex.quote(t) for t in inner_cmd), depth + 1))
-            for tok in rest:
-                if tok.strip() and re.search(r"\s", tok):
-                    out.extend(_expand_segments(tok, depth + 1))
         elif prog == "xargs" and rest:
             # Drop xargs' own leading options, keep the command and ITS flags,
             # then append what the pipeline will feed it as operands. An option
@@ -1114,15 +1117,35 @@ _EXEC_WRAPPER_OPERANDS = {
     "docker-compose": 2, "flatpak": 2, "distrobox": 2, "lxc": 2, "incus": 2,
 }
 
+# Wrapper options that consume the NEXT token as their value. Without these the
+# VALUE eats an operand slot and the command is missed entirely: `ssh -i key
+# host rm -rf /etc` counted `key` as the host and returned `['host','rm',…]`.
+# Same shape, and the same reason, as _PREFIX_OPTS_WITH_VALUE.
+_EXEC_WRAPPER_OPTS_WITH_VALUE = {
+    "ssh": {"-i", "-p", "-o", "-l", "-F", "-c", "-m", "-b", "-D", "-L", "-R",
+            "-W", "-e", "-E", "-I", "-J", "-Q", "-S", "-w"},
+    "docker": {"-u", "--user", "-w", "--workdir", "-e", "--env", "--context",
+               "--config", "-H", "--host", "--detach-keys", "--env-file"},
+    "podman": {"-u", "--user", "-w", "--workdir", "-e", "--env"},
+    "kubectl": {"-n", "--namespace", "--context", "--cluster", "--user", "-c",
+                "--container", "--kubeconfig", "--as"},
+    "oc": {"-n", "--namespace", "--context", "-c", "--container"},
+}
+
 
 def _wrapper_command(prog: str, rest: list[str]) -> list[str]:
     """The command a wrapper runs, in its unquoted form, or []."""
     if "--" in rest:
         return rest[rest.index("--") + 1:]
     remaining = _EXEC_WRAPPER_OPERANDS.get(prog, 1)
+    takes_value = _EXEC_WRAPPER_OPTS_WITH_VALUE.get(prog, set())
     i = 0
     while i < len(rest) and remaining > 0:
-        if not rest[i].startswith("-"):
+        tok = rest[i]
+        if tok.startswith("-"):
+            if "=" not in tok and tok in takes_value:
+                i += 1  # its value is not an operand
+        else:
             remaining -= 1
         i += 1
     return rest[i:] if remaining == 0 else []
@@ -1196,7 +1219,7 @@ def _destructive_database(command: str) -> str | None:
                                         include_pipe=False):
         if not _DB_DESTRUCTION.search(pipeline):
             continue
-        for stage in pipeline.split("|"):
+        for stage in _split_on_operators(pipeline, include_pipe=True):
             toks = _strip_prefixes(_tokenize(_unwrap_group(_SUBST_RE.sub(" ", stage))))
             if _stage_executes_sql(toks):
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
