@@ -52,6 +52,7 @@ import fnmatch
 import functools
 import json
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -128,6 +129,27 @@ def _subst_inner(m: "re.Match[str]") -> str:
     return next((g for g in m.groups() if g), "")
 
 
+# Stands in for a substitution whose OUTPUT cannot be known. It must be
+# non-empty and path-shaped-but-harmless: blanking a substitution left
+# `rm -rf "$(mktemp -d)"` with an empty target, and an empty target read as the
+# filesystem root — refusing the standard temp-dir cleanup idiom.
+_OPAQUE_SUBST = "turma_substituted_value"
+
+
+def _subst_text(m: "re.Match[str]") -> str:
+    """What a substitution CONTRIBUTES to the command line around it.
+
+    `rm -rf $(echo /etc)` deletes /etc, and erasing the substitution erased the
+    target with it — an easier spelling than the `eval "$(echo …)"` form. Where
+    the inner command only prints its arguments, those arguments ARE the text;
+    anything else is opaque.
+    """
+    toks = _tokenize(_subst_inner(m))
+    if toks and _basename(toks[0]) in _ECHO_PROGS:
+        return " ".join(toks[1:])
+    return _OPAQUE_SUBST
+
+
 # How deep the expansion recurses before giving up (a guard against a
 # pathological nest, not a security boundary).
 _MAX_EXPAND_DEPTH = 6
@@ -149,7 +171,46 @@ _VAR_ASSIGN_RE = re.compile(
     r"(?:^|[;\n&|]|\bexport\s+)\s*([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&\n]+)"
 )
 _FOR_IN_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
-_VAR_USE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+# `$NAME`, `${NAME}`, and the operator forms — `${d%/}`, `${d#x}`, `${d:0:4}`,
+# `${nope:-/etc}`. The operator matters less than the value it operates on: a
+# one-character `${d%/}` was enough to walk around the loop-variable fix.
+_VAR_USE_RE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# The expansion operators, longest spelling first so `##` never matches as `#`.
+_VAR_OP_RE = re.compile(r"^(##|#|%%|%|:-|:=|:\+|-|=|\+|//|/|:)(.*)$", re.DOTALL)
+
+# The operators that supply a literal when the name is UNSET. These need no
+# assignment anywhere, so `rm -rf ${nope:-/etc}` names /etc outright.
+_VAR_DEFAULT_OPS = {":-", "-", ":=", "="}
+
+
+def _apply_var_op(value: str, op: str, arg: str) -> str:
+    """Apply a `${name<op><arg>}` expansion to a known value.
+
+    Only the literal cases are modelled — enough that a one-character operator
+    cannot walk around a path rule (`${d%/}` was exactly that). A pattern we
+    cannot evaluate leaves the value alone rather than guessing.
+    """
+    arg = arg.strip("'\"")
+    if op in ("#", "##"):
+        pat = arg.replace("*", "")
+        return value[len(pat):] if pat and value.startswith(pat) else value
+    if op in ("%", "%%"):
+        pat = arg.replace("*", "")
+        return value[: -len(pat)] if pat and value.endswith(pat) else value
+    if op in ("/", "//"):
+        pat, _, rep = arg.partition("/")
+        return value.replace(pat, rep, -1 if op == "//" else 1) if pat else value
+    if op == ":":
+        bits = arg.split(":")
+        try:
+            start = int(bits[0])
+            return value[start: start + int(bits[1])] if len(bits) > 1 else value[start:]
+        except (ValueError, IndexError):
+            return value
+    return value
 
 
 def _decode_ansi_c(command: str) -> str:
@@ -199,13 +260,19 @@ def _substitute_vars(command: str) -> str:
     Only names this very command assigns are substituted — an unresolved
     `$TMPDIR` is left alone rather than guessed at.
     """
+    # NB: no early return on an empty map — `${nope:-/etc}` needs no assignment.
     vals = _var_values(command)
-    if not vals:
-        return command
 
     def rep(m: "re.Match[str]") -> str:
-        got = vals.get(m.group(1) or m.group(2) or "")
-        return " ".join(got) if got else m.group(0)
+        name = m.group(1) or m.group(3) or ""
+        got = vals.get(name)
+        op = _VAR_OP_RE.match(m.group(2) or "")
+        if got:
+            value = got[0] if len(got) == 1 else " ".join(got)
+            return _apply_var_op(value, op.group(1), op.group(2)) if op else value
+        if op and op.group(1) in _VAR_DEFAULT_OPS:
+            return op.group(2)
+        return m.group(0)
 
     return _VAR_USE_RE.sub(rep, command)
 
@@ -329,10 +396,15 @@ def _basename(prog: str) -> str:
 
 
 # xargs options that consume the NEXT token as their value.
+#
+# `-i` and `-e` are deliberately NOT here, and neither are `--replace`/`--eof`:
+# their values are OPTIONAL and must be ATTACHED (`-i{}`, `--replace={}`), so
+# `xargs -i rm -rf {}` passes `rm` as the COMMAND. Listing them ate the `rm` and
+# reopened the very bypass the `-I` fix closed.
 _XARGS_OPTS_WITH_VALUE = {
-    "-I", "-i", "-n", "-L", "-P", "-s", "-d", "-E", "-e", "-a",
-    "--replace", "--max-args", "--max-lines", "--max-procs", "--max-chars",
-    "--delimiter", "--arg-file", "--eof",
+    "-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a",
+    "--max-args", "--max-lines", "--max-procs", "--max-chars",
+    "--delimiter", "--arg-file",
 }
 
 
@@ -398,16 +470,10 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             inner = _subst_inner(m)
             if inner.strip():
                 out.extend(_expand_segments(inner, depth + 1))
-        # `eval "$(echo rm -rf /etc)"` runs what the substitution PRINTED, so the
-        # loop above (which only sees the `echo`) is not enough — peel the echo
-        # off and expand its arguments as the command they become.
-        pre = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", raw)))
-        if pre and _basename(pre[0]) == "eval":
-            for m in _SUBST_RE.finditer(raw):
-                inner_tokens = _tokenize(_subst_inner(m))
-                if inner_tokens and _basename(inner_tokens[0]) in _ECHO_PROGS:
-                    out.extend(_expand_segments(" ".join(inner_tokens[1:]), depth + 1))
-        seg = _unwrap_group(_SUBST_RE.sub(" ", raw))
+        # A substitution also CONTRIBUTES text where it sits — `$(echo …)` is
+        # what `eval "$(echo rm -rf /etc)"` runs and what `rm -rf $(echo /etc)`
+        # deletes. Both fall out of substituting rather than erasing.
+        seg = _unwrap_group(_SUBST_RE.sub(_subst_text, raw))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
@@ -424,10 +490,21 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             if i >= 0 and i + 1 < len(rest):
                 out.extend(_expand_segments(rest[i + 1], depth + 1))
         elif prog == "eval" and rest:
-            out.extend(_expand_segments(" ".join(rest), depth + 1))
+            # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain
+            # ITERATIVELY — recursing once per `eval` burned the depth budget,
+            # and exhausting it used to fail open.
+            inner = rest
+            while inner and _basename(inner[0]) == "eval":
+                inner = inner[1:]
+            if inner:
+                out.extend(_expand_segments(" ".join(inner), depth + 1))
         elif prog == "trap" and rest:
-            # `trap 'rm -rf /etc' EXIT` runs its handler on the way out.
-            out.extend(_expand_segments(rest[0], depth + 1))
+            # `trap 'rm -rf /etc' EXIT` runs its handler on the way out. Scan
+            # every non-flag argument, not just the first: `trap -- '<cmd>' EXIT`
+            # displaces the handler by one and hid it completely.
+            for tok in rest:
+                if not tok.startswith("-"):
+                    out.extend(_expand_segments(tok, depth + 1))
         elif prog == "xargs" and rest:
             # Drop xargs' own leading options, keep the command and ITS flags,
             # then append what the pipeline will feed it as operands. An option
@@ -499,7 +576,12 @@ def _norm_path(tok: str) -> str:
     t = tok.strip().strip('"').strip("'")
     # `//etc` and `/etc//` address exactly what `/etc` does; the shell collapses
     # repeated separators and so must this, or `rm -rf //etc` reads as unmatched.
+    # Done before normpath, which POSIX requires to PRESERVE exactly two.
     t = re.sub(r"/{2,}", "/", t)
+    # `/./etc` and `/tmp/../etc` also name /etc. Only for real paths — normpath
+    # on a bare word would turn "" into "." and lose the empty-token case.
+    if "/" in t and not t.startswith("~"):
+        t = posixpath.normpath(t) + ("/" if t.endswith("/") and t != "/" else "")
     # Windows drive root (C:\ , C:/ , c:) and Windows system dirs.
     return t
 
@@ -525,7 +607,15 @@ def _is_dangerous_path(tok: str) -> bool:
     raw = _norm_path(tok)
     low = raw.lower().rstrip("/").rstrip("\\")
     bare = raw.lower()
+    if not raw.strip():
+        # Nothing is named at all. This must NOT read as the filesystem root:
+        # an unknown substitution used to collapse to "" and take this branch.
+        return False
     if bare in _HOME_TOKENS or low in _HOME_TOKENS:
+        return True
+    # `~root` / `~someuser` expand to that account's home, and `/root` is itself
+    # a system root.
+    if re.match(r"^~[a-z0-9_][a-z0-9_.-]*/?$", low):
         return True
     if raw in ("/", "/*") or low == "":
         # "" results from rstrip of "/" — i.e. the filesystem root.
@@ -890,20 +980,46 @@ _TEXT_PROGS = {
 _DB_CLIENTS = {
     "psql", "mysql", "mariadb", "mysqldump", "sqlite3", "sqlite", "mongo",
     "mongosh", "cqlsh", "sqlcmd", "clickhouse-client", "cockroach", "usql",
-    "duckdb", "impala-shell", "beeline", "snowsql",
+    "duckdb", "impala-shell", "beeline", "snowsql", "pgcli", "mycli",
+    "dropdb", "dropuser",
+}
+
+# Programs that RUN another program, carrying the real client in their
+# arguments. The agent image ships all of these.
+_EXEC_WRAPPERS = {
+    "docker", "podman", "kubectl", "oc", "ssh", "nsenter", "chroot",
+    "docker-compose", "flatpak", "distrobox", "lxc", "incus",
 }
 
 
-def _executes_sql(prog: str) -> bool:
-    """True if text reaching `prog` gets run as SQL (or as shell, which may)."""
-    return prog in _DB_CLIENTS or prog in _SHELL_PROGS
+def _stage_executes_sql(tokens: list[str]) -> bool:
+    """True if SQL reaching this command would actually be EXECUTED.
+
+    Deliberately narrow on both sides. A text tool never executes what it is
+    handed, so `grep -rn 'DROP TABLE' migrations/` is fine; but "not a text
+    tool" was far too wide the other way — it refused `python3 -c "print('DROP
+    TABLE')"`, `make lint  # catches DROP TABLE`, and even a `gh issue create`
+    whose TITLE proposed blocking the statement. All it takes is naming the
+    thing. A wrapper is checked through to its arguments, so
+    `docker exec -i db psql` is still the database client it runs.
+    """
+    if not tokens:
+        return False
+    prog = _basename(tokens[0])
+    if prog in _DB_CLIENTS or prog in _SHELL_PROGS:
+        return True
+    if prog in _TEXT_PROGS:
+        return False
+    if prog in _EXEC_WRAPPERS:
+        return any(_basename(t) in _DB_CLIENTS for t in tokens[1:])
+    return False
 
 
 def _destructive_database(command: str) -> str | None:
     for tokens, segment in _expand_segments(command):
         if not _DB_DESTRUCTION.search(segment):
             continue
-        if _basename(tokens[0]) in _TEXT_PROGS:
+        if not _stage_executes_sql(tokens):
             continue
         return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     # A pipeline is ONE statement crossing several segments: in
@@ -916,7 +1032,7 @@ def _destructive_database(command: str) -> str | None:
             continue
         for stage in pipeline.split("|"):
             toks = _strip_prefixes(_tokenize(_unwrap_group(_SUBST_RE.sub(" ", stage))))
-            if toks and _executes_sql(_basename(toks[0])):
+            if _stage_executes_sql(toks):
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     # A heredoc body is data, but `psql <<EOF ... DROP DATABASE x; ... EOF` is
     # still the statement being executed — judge it by the command it feeds.
@@ -924,7 +1040,7 @@ def _destructive_database(command: str) -> str | None:
         if not _DB_DESTRUCTION.search(body):
             continue
         for tokens, _seg in _expand_segments(owner):
-            if _executes_sql(_basename(tokens[0])):
+            if _stage_executes_sql(tokens):
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     return None
 

@@ -342,6 +342,113 @@ class TestKnownBypasses(unittest.TestCase):
                 self.assertIsNone(guard.is_destructive(cmd))
                 self.assertIsNone(guard.policy_reason(cmd))
 
+    # --- second QA gate (XERK-235) -------------------------------------
+    #
+    # An adversarial pass over the fixes above found that several of them were
+    # incomplete in a way that reopened the family they closed, and that three
+    # behaviours had become WORSE than origin/main. Each case is pinned here.
+
+    def test_xargs_optional_value_options_do_not_eat_the_command(self):
+        """`-i`/`-e` take an OPTIONAL, ATTACHED value — they are not `-I`.
+
+        Listing them as value-taking made xargs eat `rm` as the option's value,
+        reopening the bypass the `-I` fix had just closed, and losing `-e`
+        coverage origin/main had.
+        """
+        for cmd in ("echo /etc | xargs -i rm -rf {}",
+                    "echo x | xargs -e rm -rf /etc",
+                    "echo /etc | xargs --replace rm -rf {}"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_eval_chains_collapse_instead_of_exhausting_the_depth(self):
+        """`eval eval … rm -rf /etc` is valid shell and ran the rm.
+
+        Recursing once per `eval` spent the depth budget, and exhausting it
+        returned no segments at all — i.e. it failed OPEN.
+        """
+        for n in (1, 2, 6, 7, 20):
+            with self.subTest(evals=n):
+                self.assertIsNotNone(guard.is_destructive("eval " * n + "rm -rf /etc"))
+
+    def test_trap_handler_is_found_past_leading_arguments(self):
+        for cmd in ("trap -- 'rm -rf /etc' EXIT",
+                    "trap -p 'rm -rf /etc' EXIT",
+                    "trap 'rm -rf /etc' EXIT"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_a_substitution_contributes_its_text(self):
+        """Erasing a substitution erased the TARGET standing in it.
+
+        `rm -rf $(echo /etc)` is a simpler spelling than the `eval "$(echo …)"`
+        form that was caught, and it deletes exactly the same directory.
+        """
+        for cmd in ("rm -rf $(echo /etc)", "rm -rf `echo /etc`",
+                    "rm -rf $(printf /etc)", "rm -rf /et$(echo c)",
+                    "chown -R nobody $(echo /etc)",
+                    'eval "$(echo rm -rf /etc)"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_an_unknowable_substitution_is_not_the_filesystem_root(self):
+        """The temp-dir cleanup idiom must not read as `rm -rf /`.
+
+        Blanking a substitution left an EMPTY target, and an empty target took
+        the "" branch that means the filesystem root.
+        """
+        for cmd in ('rm -rf "$(mktemp -d)"', 'rm -r "$(mktemp -d)"',
+                    'rm -rf "$(go env GOCACHE)"', 'rm -rf "`mktemp -d`"',
+                    'rm -rf ""', 'rm -rf "$(pwd)/build"',
+                    "trap 'rm -rf \"$(mktemp -d)\"' EXIT"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_parameter_expansion_operators_are_applied(self):
+        """A one-character operator was enough to walk around the path rules."""
+        for cmd in ("rm -rf ${nope:-/etc}",
+                    "for d in /etc/; do rm -rf ${d%/}; done",
+                    "d=x/etc; rm -rf ${d#x}",
+                    "d=/xtc; rm -rf ${d//x/e}",
+                    "d=/etcXXX; rm -rf ${d:0:4}"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_path_normalisation_covers_dot_segments_and_named_homes(self):
+        for cmd in ("rm -rf /./etc", "rm -rf /tmp/../etc", "rm -rf /.//etc",
+                    "chmod -R 777 /./etc", "rm -rf ~root"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        # ...without dragging ordinary relative paths in with them.
+        for cmd in ("rm -rf ./build", "rm -rf src/../dist", "rm -rf ~/scratch/x"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_sql_is_judged_on_execution_not_on_mention(self):
+        """The rule was "deny unless the program is a text tool", which is far
+        too wide: it refused a `python3 -c` that PRINTS the statement, a shell
+        COMMENT mentioning it, and a `gh issue create` whose title proposed
+        blocking it. Both halves are pinned — a wrapper is still followed
+        through to the client it runs.
+        """
+        drop_db, drop_tb = "DROP" + " DATABASE", "DROP" + " TABLE"
+        for cmd in (f"echo '{drop_db} prod' | docker exec -i db psql",
+                    f"echo '{drop_db} prod' | kubectl exec -i pod -- psql",
+                    f"echo '{drop_db} prod' | ssh dbhost psql",
+                    f"echo '{drop_db} prod' | pgcli",
+                    f"docker exec db psql -c '{drop_db} prod'",
+                    "dropdb prod"):
+            with self.subTest(executes=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in (f"python3 -c \"print('{drop_tb}')\"",
+                    f"node -e \"console.log('{drop_tb}')\"",
+                    f"make lint  # catches {drop_tb} in migrations",
+                    f"npm run test -- --grep '{drop_tb}'",
+                    f"gh issue create --title 'Guard should block {drop_db}'",
+                    f"terraform plan -var 'sql={drop_tb}'"):
+            with self.subTest(mentions=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 
