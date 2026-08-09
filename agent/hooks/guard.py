@@ -65,7 +65,46 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
 
 # Privilege-escalation prefixes we strip before classifying the real command
 # (a destructive command is destructive with or without `sudo`).
-_PREFIX_WORDS = {"sudo", "doas", "runas", "command", "nohup", "time", "exec", "env"}
+_PREFIX_WORDS = {
+    "sudo",
+    "doas",
+    "runas",
+    "command",
+    "nohup",
+    "time",
+    "exec",
+    "env",
+    "eval",
+    "nice",
+    "ionice",
+    "chrt",
+    "setsid",
+    "stdbuf",
+    "unbuffer",
+    "timeout",
+    "xargs",
+}
+
+# Wrapper flags that consume the FOLLOWING token as their own argument, so the
+# real command starts one token later (`sudo -u root rm …`, `nice -n 5 rm …`).
+_PREFIX_OPTS_WITH_ARG = {"-u", "-g", "-n", "-o"}
+
+# Wrappers taking a bare numeric operand before the command (`timeout 5 rm …`).
+_ARG_TAKING_PREFIXES = {"timeout", "nice", "ionice", "chrt"}
+_DURATION = re.compile(r"^\d+(\.\d+)?[smhd]?$")
+
+# Programs whose `-c` argument is a whole separate command string. Without
+# descending into it, `bash -lc 'rm -rf /etc'` reads as a plain `bash` call and
+# every rule below sees nothing. A login shell (`-l`) also re-sources the
+# profile and resets PATH, which is what defeats PATH-based `rm` shims.
+_SHELL_WORDS = {"sh", "bash", "zsh", "dash", "ksh", "ash", "su"}
+
+# Shell options taking their own argument, skipped while hunting for `-c`
+# (`bash -o pipefail -c '…'`).
+_SHELL_OPTS_WITH_ARG = {"-o", "+o", "-O", "+O"}
+
+# Depth cap so `bash -c "bash -c '…'"` terminates.
+_MAX_UNWRAP_DEPTH = 3
 
 
 def _split_segments(command: str) -> list[str]:
@@ -81,14 +120,53 @@ def _tokenize(segment: str) -> list[str]:
 
 
 def _strip_prefixes(tokens: list[str]) -> list[str]:
-    """Drop leading env-assignments and wrapper words (sudo/env/...)."""
+    """Drop leading env-assignments and wrapper words (sudo/env/timeout/...)."""
     out = list(tokens)
     while out:
         head = out[0]
-        if _ENV_ASSIGN.match(head) or head in _PREFIX_WORDS:
-            out.pop(0)
+        if not (_ENV_ASSIGN.match(head) or head in _PREFIX_WORDS):
+            break
+        takes_operand = head in _ARG_TAKING_PREFIXES
+        out.pop(0)
+        # The wrapper's own options (and operand) sit between it and the real
+        # command. Only ever consumed directly after a recognised wrapper, so
+        # a bare `rm -rf /` can't have its flags eaten.
+        while out:
+            if out[0].startswith("-"):
+                opt = out.pop(0)
+                if opt in _PREFIX_OPTS_WITH_ARG and out:
+                    out.pop(0)
+                continue
+            if takes_operand and _DURATION.match(out[0]):
+                out.pop(0)
+                takes_operand = False
+                continue
+            break
+    return out
+
+
+def _shell_payloads(tokens: list[str]) -> list[str]:
+    """The command string a shell wrapper carries via `-c`, if any."""
+    if not tokens or _basename(tokens[0]) not in _SHELL_WORDS:
+        return []
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _SHELL_OPTS_WITH_ARG:
+            i += 2
             continue
-        break
+        # `-c`, or a combined short cluster carrying it (`-lc`, `-ec`, `-xc`).
+        if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+            return [tokens[i + 1]] if i + 1 < len(tokens) else []
+        i += 1
+    return []
+
+
+def _nested_commands(command: str) -> list[str]:
+    """Every command string nested inside a shell wrapper in ``command``."""
+    out: list[str] = []
+    for segment in _split_segments(command):
+        out.extend(_shell_payloads(_strip_prefixes(_tokenize(segment))))
     return out
 
 
@@ -364,7 +442,7 @@ def _azdo_completes_pr(tokens: list[str]) -> bool:
     return False
 
 
-def policy_reason(command: str) -> str | None:
+def policy_reason(command: str, _depth: int = 0) -> str | None:
     """Return a reason if ``command`` violates the PR workflow policy.
 
     Hard rules (no override): work lands via a pull request, so the agent may
@@ -402,6 +480,13 @@ def policy_reason(command: str) -> str | None:
                 "do not push to main/master directly — push a feature "
                 "branch and open a pull request for review"
             )
+    # Same reason as is_destructive: `bash -lc 'git push origin main'` hides
+    # the real command inside a quoted argument.
+    if _depth < _MAX_UNWRAP_DEPTH:
+        for inner in _nested_commands(command):
+            reason = policy_reason(inner, _depth + 1)
+            if reason:
+                return reason
     return None
 
 
@@ -435,7 +520,7 @@ def _destructive_database(command: str) -> str | None:
     return None
 
 
-def is_destructive(command: str) -> str | None:
+def is_destructive(command: str, _depth: int = 0) -> str | None:
     """Return a human reason if ``command`` is catastrophic, else ``None``."""
     # Fork bombs contain the `;`/`|` we segment on, so match the whole string.
     reason = _destructive_forkbomb(command)
@@ -455,6 +540,13 @@ def is_destructive(command: str) -> str | None:
             _destructive_disk_power(tokens, segment),
             _destructive_powershell_remove(segment),
         ):
+            if reason:
+                return reason
+    # A shell wrapper's `-c` payload is a command in its own right; classify it
+    # too, else every rule above is one `bash -c '…'` away from irrelevant.
+    if _depth < _MAX_UNWRAP_DEPTH:
+        for inner in _nested_commands(command):
+            reason = is_destructive(inner, _depth + 1)
             if reason:
                 return reason
     return None

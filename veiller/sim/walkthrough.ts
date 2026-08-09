@@ -47,11 +47,12 @@ function screen(sim: SimulatorInstance): string {
   return sim.lensText().join("\n");
 }
 
-const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
 /** True when `label` is the row the cursor is on. */
 function onRow(sim: SimulatorInstance, label: string): boolean {
-  return new RegExp(`> ${escapeRe(label)}`).test(screen(sim));
+  // Plain substring test, not a built RegExp: `label` was fully escaped
+  // before interpolating, so the pattern was always a literal — and a
+  // dynamic RegExp trips the ReDoS SAST rule for no benefit.
+  return screen(sim).includes(`> ${label}`);
 }
 
 /**
