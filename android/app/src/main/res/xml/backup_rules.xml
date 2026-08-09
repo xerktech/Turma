@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Auto Backup rules for API 23-30 (`android:fullBackupContent`).
+
+     The hub password lives in these prefs. Normally it is in
+     EncryptedSharedPreferences, but Config.build() deliberately falls back to
+     PLAINTEXT app-private prefs when the keystore is unavailable, so the app
+     still starts rather than dying in Application.onCreate. Private storage
+     bounds that exposure — except that auto-backup and `adb backup` lift
+     private storage OFF the device, which is exactly the boundary the fallback
+     was relying on (XERK-235).
+
+     So both prefs files are excluded from backup. Losing them on restore just
+     means re-entering the hub URL and password. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="turma_prefs.xml" />
+    <exclude domain="sharedpref" path="turma_secure_prefs.xml" />
+</full-backup-content>

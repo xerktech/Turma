@@ -80,6 +80,24 @@ fun buildItems(
     revealShown: Int = -1,
 ): List<ChatItem> {
     val out = ArrayList<ChatItem>()
+    // Pair tool_result -> tool_use by forId across the WHOLE conversation, not
+    // within one entry: the agent emits a call's result in the NEXT (user-role)
+    // entry, never beside the call (hub-agent.py _entry_blocks), so a per-entry
+    // map pairs nothing and every card renders empty beside a duplicate.
+    // Last result wins, deliberately: a Skill call reports twice under one id —
+    // a "Launching skill: <name>" stub, then the body — and the body is what a
+    // reader opening the card wants (chat.js buildItems).
+    val resultsByForId = HashMap<String, ToolResultBlock>()
+    val toolUseIds = HashSet<String>()
+    for (entry in entries) {
+        for (block in entry.blocks) {
+            when (block) {
+                is ToolUseBlock -> if (block.id.isNotEmpty()) toolUseIds.add(block.id)
+                is ToolResultBlock -> if (block.forId.isNotEmpty()) resultsByForId[block.forId] = block
+                else -> {}
+            }
+        }
+    }
     for (entry in entries) {
         val revealThis = entry.key == revealNewestId
         if (entry.blocks.isEmpty()) {
@@ -94,30 +112,35 @@ fun buildItems(
             }
             continue
         }
-        // Pair tool_result → tool_use by forId; leftover results render standalone.
-        val resultsByForId = entry.blocks.filterIsInstance<ToolResultBlock>()
-            .filter { it.forId.isNotEmpty() }
-            .associateBy { it.forId }
-        val consumed = HashSet<String>()
+        // Consecutive text blocks are ONE bubble, flushed by any other block —
+        // the web accumulates `msg.text += b.text` and flushes the same way, so
+        // a turn split across blocks must not render as several bubbles.
+        var pending: StringBuilder? = null
+        fun flushText() {
+            val text = pending?.toString()
+            pending = null
+            if (!text.isNullOrBlank()) {
+                out.add(
+                    ChatItem.Bubble(
+                        entry.key, entry.role, text,
+                        revealLen = if (revealThis) revealShown else -1,
+                    )
+                )
+            }
+        }
         for (block in entry.blocks) {
             when (block) {
-                is TextBlock -> if (block.text.isNotBlank()) {
-                    out.add(
-                        ChatItem.Bubble(
-                            entry.key, entry.role, block.text,
-                            revealLen = if (revealThis) revealShown else -1,
-                        )
-                    )
-                }
+                is TextBlock -> (pending ?: StringBuilder().also { pending = it }).append(block.text)
                 is ThinkingBlock -> if (prefs.thinking && block.text.isNotBlank()) {
+                    flushText()
                     out.add(ChatItem.Thinking(entry.key, block.text))
                 }
                 // A SendUserFile delivery (a block carrying rendered files) is
                 // user-facing content, not a tool mechanic, so it shows in EVERY
                 // verbosity — even Concise, which hides ordinary tool cards (XERK-221).
                 is ToolUseBlock -> if (prefs.toolCalls || block.files.isNotEmpty()) {
+                    flushText()
                     val res = resultsByForId[block.id]
-                    if (res != null) consumed.add(block.id)
                     out.add(
                         ChatItem.Tool(
                             entry.key,
@@ -130,22 +153,29 @@ fun buildItems(
                         )
                     )
                 }
-                is TaskNotificationBlock -> out.add(
-                    ChatItem.TaskNote(entry.key, block.summary, block.status, block.result)
-                )
-                is ToolResultBlock -> { /* folded above; orphans handled below */ }
+                is TaskNotificationBlock -> {
+                    flushText()
+                    out.add(ChatItem.TaskNote(entry.key, block.summary, block.status, block.result))
+                }
+                // A result whose call is anywhere in the conversation folded into
+                // that card above. Anything left is an orphan — keep it, so a
+                // result-only turn isn't dropped (matching _entry_blocks).
+                is ToolResultBlock -> {
+                    val paired = block.forId.isNotEmpty() && block.forId in toolUseIds
+                    if (!paired && prefs.toolOutputs && block.text.isNotBlank()) {
+                        flushText()
+                        out.add(
+                            ChatItem.Tool(
+                                entry.key, name = "result", input = "",
+                                result = block.text, isError = block.isError,
+                            )
+                        )
+                    }
+                }
                 else -> { /* unknown block: skip */ }
             }
         }
-        // Orphan tool_result (no matching tool_use in this entry) — keep it so a
-        // result-only turn isn't dropped, matching _entry_blocks inclusion.
-        if (prefs.toolOutputs) {
-            for (block in entry.blocks) {
-                if (block is ToolResultBlock && block.forId !in consumed && block.text.isNotBlank()) {
-                    out.add(ChatItem.Tool(entry.key, name = "result", input = "", result = block.text, isError = block.isError))
-                }
-            }
-        }
+        flushText()
     }
     return out
 }

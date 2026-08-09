@@ -83,7 +83,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    // buildConfig: AGP 8 stops generating BuildConfig unless asked. It is what
+    // lets debug-only behaviour actually be debug-only — see TerminalScreen's
+    // setWebContentsDebuggingEnabled (XERK-235).
+    buildFeatures { compose = true; buildConfig = true }
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }

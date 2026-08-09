@@ -13,11 +13,28 @@ import kotlin.math.max
 
 private const val WORKING_WINDOW_MS = 90_000L
 
-/** Is this session actively working? paneBusy is authoritative; else freshness. */
+/** Mirrors the hub's OFFLINE_AFTER_MS (turma/server.js): beats arrive every ~20s. */
+private const val OFFLINE_AFTER_MS = 75_000L
+
+/**
+ * Is this session actively working? paneBusy is authoritative; else freshness.
+ *
+ * Two rules the web applies and this did not (XERK-235), in the web's own
+ * order (`liveState`, sessions.html):
+ *  - no transcript yet is IDLE, decided BEFORE paneBusy is consulted;
+ *  - working requires the HOST to be online. paneBusy is a value on a record
+ *    the host last pushed, so a host that dies mid-turn leaves `paneBusy:true`
+ *    behind and its session read WORKING forever — which also kept it out of
+ *    Ready for review, where a dead host's unfinished work belongs.
+ */
 fun sessionWorking(session: SessionInfo, agentLastSeen: Long, now: Long): Boolean {
     val s = session.session ?: return false
-    s.paneBusy?.let { return it }
     val age = s.transcriptAgeSec ?: return false
+    // `host.online` on the web, computed the same way the hub does — derived
+    // here rather than threaded through every call site so the rule cannot be
+    // forgotten at one of them.
+    if (now - agentLastSeen >= OFFLINE_AFTER_MS) return false
+    s.paneBusy?.let { return it }
     return (age * 1000).toLong() + max(0, now - agentLastSeen) < WORKING_WINDOW_MS
 }
 

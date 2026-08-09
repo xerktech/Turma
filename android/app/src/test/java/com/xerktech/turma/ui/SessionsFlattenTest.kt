@@ -47,9 +47,14 @@ class SessionsFlattenTest {
 
     // ---- rankRunning (Ready for review / Active / Idle, XERK-73 + XERK-224) --
 
+    // ageSec defaults to a WRITTEN transcript: a session with no transcript at
+    // all is idle ("no transcript yet") whatever paneBusy says, which the web
+    // decides before it reads paneBusy (sessions.html liveState). Leaving the
+    // default at null made every fixture below exercise that edge instead of
+    // the rule it was written for (XERK-235).
     private fun flat(
         id: String, status: String = "running",
-        question: String = "", paneBusy: Boolean? = null, ageSec: Double? = null,
+        question: String = "", paneBusy: Boolean? = null, ageSec: Double? = 2.0,
         lastRole: String = "", prs: List<com.xerktech.turma.model.PrInfo> = emptyList(),
     ) = FlatSession(
         host = "h", device = "BOX", online = true, hostLastSeen = 1_000L,
@@ -99,18 +104,56 @@ class SessionsFlattenTest {
         assertEquals(listOf("mergedOne", "quietOne"), groups.idle.map { it.flat.session.id }.sorted())
     }
 
-    @Test fun `rankRunning orders freshest-first within a kind, null age first`() {
+    @Test fun `rankRunning orders freshest-first within a kind`() {
         val (_, active, _) = rankRunning(
             listOf(
                 flat("stale", paneBusy = true, ageSec = 90.0),
                 flat("fresh", paneBusy = true, ageSec = 3.0),
-                flat("brandNew", paneBusy = true, ageSec = null), // no transcript yet
             ),
             now = 1_000L,
         )
-        // Same kind (all working): smallest age first, and a null age (never
-        // written) sorts ahead of any aged one — exactly the web's `?? -1`.
-        assertEquals(listOf("brandNew", "fresh", "stale"), active.map { it.flat.session.id })
+        assertEquals(listOf("fresh", "stale"), active.map { it.flat.session.id })
+    }
+
+    @Test fun `a null age sorts ahead of any aged one, exactly as the web's ?? -1`() {
+        // These land in IDLE, not Active — a session with no transcript is
+        // "no transcript yet", never working. The sort is what's under test.
+        val (_, _, idle) = rankRunning(
+            listOf(
+                flat("stale", paneBusy = false, ageSec = 90.0),
+                flat("fresh", paneBusy = false, ageSec = 3.0),
+                flat("brandNew", paneBusy = false, ageSec = null),
+            ),
+            now = 1_000L,
+        )
+        assertEquals(listOf("brandNew", "fresh", "stale"), idle.map { it.flat.session.id })
+    }
+
+    @Test fun `no transcript yet is idle even while paneBusy says working (XERK-235)`() {
+        // paneBusy is a value on the record the host last pushed. The web reads
+        // the no-transcript branch FIRST (sessions.html liveState); Android read
+        // paneBusy first, so a session that had never written a transcript
+        // reported WORKING where the web said idle.
+        val groups = rankRunning(
+            listOf(flat("brandNew", paneBusy = true, ageSec = null)),
+            now = 1_000L,
+        )
+        assertTrue(groups.active.isEmpty())
+        assertEquals(listOf("brandNew"), groups.idle.map { it.flat.session.id })
+    }
+
+    @Test fun `an offline host's session stops reading WORKING (XERK-235)`() {
+        // A host that dies mid-turn leaves paneBusy:true behind on its last
+        // record. The web gates working on host.online; Android did not, so
+        // such a session read WORKING forever — and never surfaced in Ready
+        // for review, which is where a dead host's unfinished work belongs.
+        val stale = flat("wasWorking", paneBusy = true, ageSec = 5.0, lastRole = "assistant")
+        val groups = rankRunning(listOf(stale), now = 1_000L + 120_000L)
+        assertTrue(groups.active.isEmpty())
+        assertEquals(
+            listOf("wasWorking"),
+            (groups.review + groups.idle).map { it.flat.session.id },
+        )
     }
 
     // ---- spawnTargets (the New-session picker's source list) -----------------

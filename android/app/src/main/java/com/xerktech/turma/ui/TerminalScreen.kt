@@ -2,6 +2,7 @@ package com.xerktech.turma.ui
 
 import android.annotation.SuppressLint
 import android.graphics.Color as AndroidColor
+import com.xerktech.turma.BuildConfig
 import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
@@ -130,7 +131,12 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
                                 // they make the WebView size the layout viewport from content,
                                 // which collapses ttyd's height:100% terminal to ~1 row.
                             }
-                            WebView.setWebContentsDebuggingEnabled(true)
+                            // Debug builds only. Unconditional, this shipped in
+                            // every RELEASE APK the in-app updater installs, so
+                            // anyone with ADB access to the device could attach
+                            // DevTools to a WebView holding the planted hub
+                            // session cookie and the live terminal (XERK-235).
+                            if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                             webChromeClient = object : WebChromeClient() {
                                 override fun onConsoleMessage(m: ConsoleMessage): Boolean {

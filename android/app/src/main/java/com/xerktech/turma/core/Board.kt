@@ -8,6 +8,7 @@ import com.xerktech.turma.model.CreateType
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
+import com.xerktech.turma.model.RepoOption
 
 /**
  * Cross-org Jira board derivation — a pure port of `turma/public/board.js`
@@ -292,10 +293,31 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     val out = ArrayList<BoardSite>()
     for ((site, blocks) in bySite) {
         val sorted = blocks.sortedByDescending { it.j.fetchedAt }
-        val seen = HashSet<String>()
-        val tickets = ArrayList<JiraTicket>()
-        for (b in sorted) for (t in b.j.tickets) if (seen.add(t.key)) tickets.add(t)
+        // Dedupe by the ticket's OWN `updated`, not by which block was fetched
+        // more recently (board.js mergeSites). Two users polling one site can
+        // each carry a different copy, and the freshest BLOCK is not
+        // necessarily the freshest TICKET — first-wins showed the stale
+        // summary and the stale column (XERK-235).
+        val byKey = LinkedHashMap<String, JiraTicket>()
+        for (b in sorted) for (t in b.j.tickets) {
+            if (t.key.isBlank()) continue
+            val seen = byKey[t.key]
+            if (seen == null || t.updated > seen.updated) byKey[t.key] = t
+        }
+        val tickets = ArrayList(byKey.values)
         val newest = sorted.first().j
+        // Union repoOptions over EVERY block of the site, exactly as the web
+        // does — taking only `newest`'s meant the picker offered whichever host
+        // polled Jira last, and a repo cloned only on the other vanished from
+        // the dropdown. `cloned` is host-relative and a cloned copy wins the
+        // dedupe: "someone here has it" is the useful claim, and the pin fans
+        // out to every host anyway.
+        val repoOpts = LinkedHashMap<String, RepoOption>()
+        for (b in sorted) for (o in b.j.repoOptions) {
+            if (o.name.isBlank()) continue
+            val seen = repoOpts[o.name]
+            if (seen == null || (o.cloned && !seen.cloned)) repoOpts[o.name] = o
+        }
         out.add(
             BoardSite(
                 siteKey = site,
@@ -306,7 +328,11 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                 error = sorted.firstNotNullOfOrNull { it.j.error },
                 fetchedAt = newest.fetchedAt,
                 tickets = tickets,
-                repoOptions = newest.repoOptions,
+                // Cloned repos first (the ones you can work in today), then by
+                // name — the picker's own order, so it doesn't inherit the
+                // scan's (board.js).
+                repoOptions = repoOpts.values
+                    .sortedWith(compareByDescending<RepoOption> { it.cloned }.thenBy { it.name }),
                 // Online hosts first (the ones a pin routes to today), then by
                 // name — the picker's own order (board.js hostOptions sort).
                 hostOptions = (hostOpts[site]?.values ?: emptyList())
@@ -388,9 +414,38 @@ fun orgColorIndex(siteKey: String, allKeys: List<String>, pins: Map<String, Int>
  * board.js `ageStr`. Blank for a missing/unparseable stamp, so a caller can
  * append it or not without a null dance.
  */
+/**
+ * Milliseconds for an ISO-8601 timestamp the board can actually receive, or
+ * null.
+ *
+ * `Instant.parse` alone only accepts the extended offset form (`+00:00`/`Z`),
+ * but Jira Cloud stamps `updated` in the BASIC form — `2026-08-08T12:34:56.789+0000`
+ * — which it rejects. `Date.parse` on the web accepts both, so every Jira
+ * ticket's age chip rendered blank on Android while Azure's Zulu timestamps
+ * worked, which is why Azure-only testing never saw it (XERK-235).
+ */
+internal fun parseIsoMs(iso: String): Long? {
+    runCatching { return java.time.Instant.parse(iso).toEpochMilli() }
+    return runCatching {
+        java.time.OffsetDateTime
+            .parse(iso, java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+            .toInstant().toEpochMilli()
+    }.getOrNull() ?: runCatching {
+        // Basic-format offset (+0000 / -0500), Jira Cloud's spelling.
+        java.time.OffsetDateTime.parse(
+            iso,
+            java.time.format.DateTimeFormatterBuilder()
+                .appendPattern("yyyy-MM-dd'T'HH:mm:ss")
+                .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 0, 9, true)
+                .appendPattern("XX")
+                .toFormatter(),
+        ).toInstant().toEpochMilli()
+    }.getOrNull()
+}
+
 fun ageStr(iso: String, nowMs: Long = System.currentTimeMillis()): String {
     if (iso.isBlank()) return ""
-    val t = runCatching { java.time.Instant.parse(iso).toEpochMilli() }.getOrNull() ?: return ""
+    val t = parseIsoMs(iso) ?: return ""
     val s = ((nowMs - t) / 1000).coerceAtLeast(0)
     return when {
         s < 60 -> "now"

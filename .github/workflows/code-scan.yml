@@ -29,6 +29,12 @@ on:
     paths:
       - "agent/**"
       - "turma/**"
+      # Semgrep scans the whole tree (no path arg), so android/ was covered
+      # only incidentally — when some OTHER component's PR happened to trigger
+      # this workflow. An Android-only PR ran zero SAST, while
+      # AndroidManifest.xml and net/WsUrls.kt both carry `nosemgrep`
+      # annotations written on the assumption that it runs (XERK-235).
+      - "android/**"
       - ".github/scripts/**"
       # Every workflow, not just this one: Semgrep's shell-injection rules read
       # the workflows themselves, so scoping this to code-scan.yml meant a
