@@ -2832,6 +2832,158 @@ test("http: creating a ticket 404s an org nobody reports", async () => {
   assert.equal(res.status, 404);
 });
 
+// ---- multi-agent orgs: create routing and polling (XERK-241) ----------------
+// An org polled by several hosts must not let a SIBLING host's state decide the
+// answer for a create that ran somewhere else.
+
+test("XERK-241: an offline sibling host doesn't fail a create that ran on the online one", async () => {
+  // The reported bug: the poll picked the FIRST host reporting the org for its
+  // offline check, so an offline sibling 503'd every create the online host was
+  // busy running — and each retry made another real ticket.
+  const site = "mx1.atlassian.net";
+  await jiraBeat("mx1-down", site);
+  await jiraBeat("mx1-up", site);
+  agents["mx1-down"].lastSeen = Date.now() - 90 * 1000; // the host that's down
+
+  const res = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "New thing" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "mx1-up");
+
+  // While the online host works, the poll must read as pending — not as a
+  // failure borrowed from the host that never ran it.
+  const pending = await request("GET", `/api/jira/${site}/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(pending.status, 202);
+
+  await jiraBeat("mx1-up", site, {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: "ENG-1", url: "u", error: null }],
+  });
+  const done = await request("GET", `/api/jira/${site}/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.key, "ENG-1");
+});
+
+test("XERK-241: the create's OWN host going offline is still reported", async () => {
+  const site = "mx2.atlassian.net";
+  await jiraBeat("mx2-a", site);
+  await jiraBeat("mx2-b", site);
+  const res = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "Doomed" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  agents[res.body.host].lastSeen = Date.now() - 90 * 1000; // the host that took it dies
+  const out = await request("GET", `/api/jira/${site}/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 503);
+  assert.match(out.body.error, /went offline/);
+});
+
+test("XERK-241: a repeated identical create is single-flighted, not duplicated", async () => {
+  const site = "mx3.atlassian.net";
+  await jiraBeat("mx3", site);
+  const body = { project: "ENG", issueType: "1", summary: "Same thing", description: "d" };
+  const one = await request("POST", `/api/jira/${site}/tickets`, { body, headers: userHeaders });
+  const two = await request("POST", `/api/jira/${site}/tickets`, { body, headers: userHeaders });
+  assert.equal(two.status, 200);
+  assert.equal(two.body.cmdId, one.body.cmdId, "a retry while the first is in flight must reuse it");
+
+  // Exactly one create command reaches the agent.
+  const beat = await jiraBeat("mx3", site);
+  assert.equal(beat.body.commands.filter((c) => c.type === "createTicket").length, 1);
+
+  // A DIFFERENT title is its own create.
+  const other = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { ...body, summary: "Other thing" }, headers: userHeaders,
+  });
+  assert.notEqual(other.body.cmdId, one.body.cmdId);
+
+  // And once the first has an outcome, an identical create is allowed again.
+  await jiraBeat("mx3", site, {
+    createTicketResults: [{ cmdId: one.body.cmdId, key: "ENG-2", url: "u", error: null }],
+  });
+  const again = await request("POST", `/api/jira/${site}/tickets`, { body, headers: userHeaders });
+  assert.notEqual(again.body.cmdId, one.body.cmdId);
+});
+
+test("XERK-241: board work routes to a host whose tracker poll actually works", async () => {
+  // "One of the hosts was down" — a host can heartbeat while its Jira polling
+  // fails (available:false). Map order must not pin every read and write to it.
+  const site = "mx4.atlassian.net";
+  await request("POST", "/api/heartbeat", {
+    body: { device: "mx4-sick", jira: { available: false, configured: true, siteKey: site, user: "u", tickets: [] } },
+    headers: agentHeaders,
+  });
+  await jiraBeat("mx4-ok", site);
+
+  const res = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "Route me" }, headers: userHeaders,
+  });
+  assert.equal(res.body.host, "mx4-ok");
+
+  const meta = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+  assert.equal(meta.status, 202);
+  assert.ok((agents["mx4-ok"].commands || []).some((c) => c.type === "boardCreateMeta"));
+});
+
+test("XERK-241: a create abandoned on a dead host is withdrawn, not left to fire later", async () => {
+  // The 503 sends the operator back to remake the ticket, so the undelivered
+  // create must not still be waiting in the dead host's queue.
+  const site = "mx6.atlassian.net";
+  await jiraBeat("mx6", site);
+  const res = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "Stranded" }, headers: userHeaders,
+  });
+  assert.equal((agents.mx6.commands || []).filter((c) => c.type === "createTicket").length, 1);
+
+  agents.mx6.lastSeen = Date.now() - 90 * 1000;
+  const out = await request("GET", `/api/jira/${site}/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 503);
+  assert.equal((agents.mx6.commands || []).filter((c) => c.type === "createTicket").length, 0);
+
+  // And the retry is a fresh create, not a rejoin of the stranded one.
+  agents.mx6.lastSeen = Date.now();
+  const again = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "Stranded" }, headers: userHeaders,
+  });
+  assert.equal(again.status, 200);
+  assert.notEqual(again.body.cmdId, res.body.cmdId);
+});
+
+test("XERK-241: a status change is polled off the host that ran it", async () => {
+  const site = "mx7.atlassian.net";
+  await jiraBeat("mx7-a", site);
+  const post = await request("POST", `/api/jira/${site}/ENG-1/status`, {
+    body: { value: "31" }, headers: userHeaders,
+  });
+  assert.equal(post.status, 202);
+  await jiraBeat("mx7-a", site, {
+    ticketStatusResults: [{ cmdId: post.body.cmdId, ok: true, status: "Done", statusCategory: "done" }],
+  });
+  // A second host of the org joins and out-ranks the first (whose tracker poll
+  // has since started failing). The outcome still comes from the host that ran it.
+  await jiraBeat("mx7-b", site);
+  agents["mx7-a"].jira.available = false;
+  const out = await request("GET", `/api/jira/${site}/ENG-1/status?cmdId=${post.body.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 200);
+  assert.equal(out.body.ok, true);
+  assert.equal(out.body.status, "Done");
+});
+
+test("XERK-241: consecutive creates spread across an org's healthy hosts", async () => {
+  const site = "mx5.atlassian.net";
+  await jiraBeat("mx5-a", site);
+  await jiraBeat("mx5-b", site);
+  const hosts = [];
+  for (let i = 0; i < 4; i++) {
+    const r = await request("POST", `/api/jira/${site}/tickets`, {
+      body: { project: "ENG", issueType: "1", summary: `T${i}` }, headers: userHeaders,
+    });
+    hosts.push(r.body.host);
+  }
+  assert.ok(hosts.includes("mx5-a") && hosts.includes("mx5-b"),
+    `creates stacked on one host: ${hosts.join(",")}`);
+});
+
 test("http: the create caches are stripped from the /api/agents payload", async () => {
   await jiraBeat("cm4", "cm4.atlassian.net", {
     createMetaResults: [{ project: null, projects: [{ key: "E", name: "E" }], labels: [], source: "jira", error: null }],

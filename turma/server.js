@@ -782,6 +782,22 @@ function queueCommand(key, cmd) {
   return cmdId;
 }
 
+// Withdraw a queued command the hub has given up on, if the agent hasn't taken
+// it yet (XERK-241). Delivery is at-least-once and irreversible, so this is only
+// ever a no-op or a cancellation of something UNDELIVERED — the presence of the
+// cmdId in the queue is what proves it never ran. Returns whether it was there.
+function dropQueuedCommand(key, cmdId) {
+  const a = agents[key];
+  if (!a || !a.commands) return false;
+  const before = a.commands.length;
+  a.commands = a.commands.filter((c) => !c || c.cmdId !== cmdId);
+  if (a.commands.length === before) return false;
+  delete (a.resultWaits || {})[cmdId];
+  scheduleSave();
+  publishAgent(key);
+  return true;
+}
+
 // An agent's org, or "" if it reports none — the one predicate that partitions
 // the fleet (see org.js siteKeyOf). A migration may only cross hosts that share
 // this, so two hosts of one Jira org can trade sessions but no session ever
@@ -1145,19 +1161,151 @@ function isIssueKey(k) {
   return /^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(k) || /^[0-9]+$/.test(k);
 }
 
-// Which HOST should answer for a Jira org (siteKey): a host whose `jira` block
-// reports that site — preferring an ONLINE one, since an offline host's queued
-// command would sit undelivered until it returns. null when no host covers the
-// org (or the only ones that do are offline, and `requireOnline`).
-function findJiraHost(siteKey, requireOnline) {
+// Every host whose `jira` block reports this org, best first (XERK-241). An org
+// is routinely polled by SEVERAL hosts, and until this ranking existed the pick
+// was whichever one happened to sit first in the agents map — so one sick host
+// could absorb every board read and write for its org for as long as it stayed
+// in that slot.
+//
+// Two health signals, in order, because they fail differently:
+//   - ONLINE (heartbeating): a command queued onto a silent host sits undelivered
+//     until it returns, so an offline host can only ever serve its own cache.
+//   - `jira.available`: the host's LAST TRACKER POLL SUCCEEDED. A host can
+//     heartbeat perfectly while its creds/network to Jira are broken — online
+//     but unable to answer a single board request. `available` is only trusted
+//     when the host says so explicitly; an agent that omits it ranks with the
+//     healthy (never assume a gap is a failure).
+// Ties keep insertion order, so the pick is stable and deterministic.
+function jiraHostPool(siteKey, requireOnline) {
   const now = Date.now();
-  let stale = null;
+  const pool = [];
   for (const [key, a] of Object.entries(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
-    if (now - (a.lastSeen || 0) < OFFLINE_AFTER_MS) return key;
-    stale = stale || key;
+    const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+    if (requireOnline && !online) continue;
+    pool.push({ key, online, healthy: a.jira.available !== false });
   }
-  return requireOnline ? null : stale;
+  // Stable sort (Array#sort is stable in Node), so equal-scoring hosts stay in
+  // insertion order and the pick doesn't wander between requests.
+  pool.sort((x, y) => (y.online - x.online) || (y.healthy - x.healthy));
+  return pool.map((p) => p.key);
+}
+
+// Which single HOST should answer for a Jira org — the head of that pool.
+// null when no host covers the org (or the only ones that do are offline, and
+// `requireOnline`). Deliberately STICKY rather than rotating: the read paths
+// cache per host (createMeta, createTypes, jiraIssues), so spreading reads would
+// just multiply cache misses. Writes use pickBoardWriteHost below.
+function findJiraHost(siteKey, requireOnline) {
+  return jiraHostPool(siteKey, requireOnline)[0] || null;
+}
+
+// Which HOST should run a board WRITE (create a ticket, change a status) for an
+// org with several agents (XERK-241). Same health ranking as above, but the
+// equally-healthy leaders are taken ROUND-ROBIN instead of always the first.
+//
+// The point isn't throughput — a create is one REST call. It's that a retry
+// lands somewhere ELSE: when a host is failing in a way its heartbeat doesn't
+// show, hammering the same one repeats the same failure, while rotating gets the
+// operator a working host on the next attempt. Rotation is confined to hosts of
+// the TOP health tier, so a sick host is never re-elected just because its turn
+// came round.
+const boardWriteTurn = new Map(); // siteKey -> next index into its healthy leaders
+function pickBoardWriteHost(siteKey) {
+  const pool = jiraHostPool(siteKey, true);
+  if (!pool.length) return null;
+  const top = agents[pool[0]].jira.available !== false;
+  const leaders = pool.filter((k) => (agents[k].jira.available !== false) === top);
+  const n = (boardWriteTurn.get(siteKey) || 0) % leaders.length;
+  boardWriteTurn.set(siteKey, (n + 1) % leaders.length);
+  return leaders[n];
+}
+
+// Which HOST a queued board command was routed to (XERK-241). A create/status
+// poll carries only its cmdId, and reading the outcome off the WRONG host of a
+// multi-agent org is what made a healthy create report a failure: the poll took
+// the org's first host for its offline check, so an offline sibling 503'd every
+// create the online host was busy running — and each retry made another ticket.
+//
+// Kept hub-side because ownership must outlive every per-agent trace of the
+// command: the queue entry goes on the ack, the resultWait with it, and the
+// result cache ages out. Bounded and TTL'd; a hub restart mid-create simply
+// falls back to the fleet scan, which is what the poll did before.
+const cmdHosts = new Map(); // cmdId -> {host, at}
+const CMD_HOST_TTL_MS = 30 * 60 * 1000;
+const CMD_HOST_MAX = 200;
+function rememberCmdHost(cmdId, host) {
+  const now = Date.now();
+  for (const [id, e] of cmdHosts) {
+    if (now - e.at > CMD_HOST_TTL_MS) cmdHosts.delete(id);
+  }
+  cmdHosts.set(cmdId, { host, at: now });
+  while (cmdHosts.size > CMD_HOST_MAX) cmdHosts.delete(cmdHosts.keys().next().value);
+}
+// The recorded owner if it still reports the org, else any host of the org that
+// already holds the command or its outcome — an equivalent answer that also
+// covers a hub restart. null when nothing claims it.
+function commandHost(siteKey, cmdId, resultKey) {
+  const owner = (cmdHosts.get(cmdId) || {}).host;
+  const claims = (a) => (a.commands || []).some((c) => c && c.cmdId === cmdId) ||
+    !!(a.resultWaits || {})[cmdId] || !!(a[resultKey] || {})[cmdId];
+  if (owner && agents[owner] && agents[owner].jira &&
+      agents[owner].jira.siteKey === siteKey) return owner;
+  for (const [key, a] of Object.entries(agents)) {
+    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    if (claims(a)) return key;
+  }
+  return null;
+}
+
+// The create still awaiting an outcome for this exact (org, project, type,
+// title), if there is one (XERK-241). What actually cost the operator four
+// tickets was a retry loop: the create kept succeeding and kept LOOKING like it
+// had failed, so each attempt made a real ticket. A retry that arrives while the
+// first is unresolved rejoins it instead of opening a second write.
+//
+// Held hub-side rather than read off the agent's queue, because the queue entry
+// disappears the moment the agent ACKS — precisely the window a retry lands in.
+// Bounded by a TTL comfortably past the client's own poll deadline, so a create
+// whose outcome never comes back stops blocking repeats rather than wedging the
+// title forever; the entry is dropped as soon as an outcome exists.
+const createInFlight = new Map(); // fingerprint -> {cmdId, host, at}
+const CREATE_INFLIGHT_TTL_MS = 2 * 60 * 1000;
+const createFp = (siteKey, project, issueType, summary) =>
+  [siteKey, project, issueType, summary].join("\u0000");
+function findCreateInFlight(siteKey, project, issueType, summary) {
+  const now = Date.now();
+  for (const [fp, e] of createInFlight) {
+    if (now - e.at > CREATE_INFLIGHT_TTL_MS) createInFlight.delete(fp);
+  }
+  const e = createInFlight.get(createFp(siteKey, project, issueType, summary));
+  if (!e) return null;
+  const a = agents[e.host];
+  // Resolved (or its host is gone): it's a finished piece of work, so an
+  // identical create from here is a deliberate second ticket.
+  if (!a || (a.createResults || {})[e.cmdId]) return null;
+  // Nor is it in flight once it can no longer produce an outcome — the host has
+  // gone quiet holding it, or has proven it doesn't implement createTicket at
+  // all (XERK-151). Rejoining either would hand the retry a cmdId that never
+  // answers; letting it through re-routes or refuses on its own merits.
+  if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) return null;
+  if (agentGapError(a, "createTicket", "create tickets")) return null;
+  return e;
+}
+// Stop treating a create as in flight. Called where the hub REPORTS a create as
+// failed: from that moment the operator is expected to try again, so the retry
+// must open a new write rather than rejoin the one just written off.
+function forgetCreateInFlight(cmdId) {
+  for (const [fp, e] of createInFlight) {
+    if (e.cmdId === cmdId) createInFlight.delete(fp);
+  }
+}
+function rememberCreateInFlight(siteKey, project, issueType, summary, cmdId, host) {
+  createInFlight.set(createFp(siteKey, project, issueType, summary),
+    { cmdId, host, at: Date.now() });
+  while (createInFlight.size > CMD_HOST_MAX) {
+    createInFlight.delete(createInFlight.keys().next().value);
+  }
 }
 
 // The repo an org's board says a ticket belongs in, as triaged by whichever host
@@ -3654,7 +3802,16 @@ const server = http.createServer(async (req, res) => {
       if (!summary) return json(res, 400, { error: "a title is required" });
       if (!project) return json(res, 400, { error: "a project is required" });
       if (!issueType) return json(res, 400, { error: "an issue type is required" });
-      const key = findJiraHost(siteKey, true);
+      // Single-flight an identical create that's still IN FLIGHT anywhere in the
+      // org (XERK-241): the reported failure had the operator retrying a create
+      // that was in fact succeeding, ending with four copies of one ticket. A
+      // retry of the same (project, type, title) while the first has no outcome
+      // yet is a retry, not a second ticket, so it rejoins the first cmdId. Once
+      // that create RESOLVES, an identical one is a new ticket again — deliberate
+      // repeats stay possible.
+      const inFlight = findCreateInFlight(siteKey, project, issueType, summary);
+      if (inFlight) return json(res, 200, { ok: true, cmdId: inFlight.cmdId, host: inFlight.host });
+      const key = pickBoardWriteHost(siteKey);
       if (!key) {
         return findJiraHost(siteKey, false)
           ? json(res, 503, { error: "no online host reports that org" })
@@ -3668,6 +3825,8 @@ const server = http.createServer(async (req, res) => {
         type: "createTicket", project, issueType, summary, description, labels,
       });
       awaitResult(agents[key], cmdId, "createTicket");
+      rememberCmdHost(cmdId, key);
+      rememberCreateInFlight(siteKey, project, issueType, summary, cmdId, key);
       return json(res, 200, { ok: true, cmdId, host: key });
     }
 
@@ -3676,24 +3835,41 @@ const server = http.createServer(async (req, res) => {
     // (the create was routed to one, but which one is the client's to not know):
     // 200 with {key,url} on success, 200 with {error} on a create failure, 202
     // while the agent hasn't reported the outcome yet.
+    //
+    // The "gave up" verdict is the one thing that must NOT be answered by just
+    // any host of the org (XERK-241): only the host that actually took this
+    // create can say it died holding it. Reading a sibling's liveness instead
+    // reported a perfectly healthy create as failed for every org with an
+    // offline second host — and the retries it invited each made another ticket.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
         parts.length === 5 && parts[3] === "tickets") {
       const siteKey = decodeURIComponent(parts[2]);
       const cmdId = decodeURIComponent(parts[4]);
-      let found = null, host = null;
+      let found = null, anyHost = null;
       for (const [k, a] of Object.entries(agents)) {
         if (!a.jira || a.jira.siteKey !== siteKey) continue;
-        host = host || k;
+        anyHost = anyHost || k;
         const r = (a.createResults || {})[cmdId];
         if (r) { found = r; break; }
       }
-      if (!host) return json(res, 404, { error: "no host reports that org" });
+      if (!anyHost) return json(res, 404, { error: "no host reports that org" });
       if (found) {
         return json(res, 200, found.error
           ? { error: found.error }
           : { key: found.key, url: found.url, warning: found.warning || null });
       }
-      if (Date.now() - (agents[host].lastSeen || 0) >= OFFLINE_AFTER_MS) {
+      // Unowned (a hub restart lost the mapping, or a cmdId that was never ours)
+      // stays pending: an unanswerable poll times out client-side, which is far
+      // cheaper than a wrong failure the operator answers by retrying.
+      const owner = commandHost(siteKey, cmdId, "createResults");
+      if (owner && Date.now() - (agents[owner].lastSeen || 0) >= OFFLINE_AFTER_MS) {
+        // Telling the operator this create failed invites them to make the
+        // ticket again — so a create still sitting UNDELIVERED in the dead
+        // host's queue must not fire whenever it wakes up and add a duplicate
+        // to the one they just remade. Only the undelivered case is dropped:
+        // still being in the queue is proof the agent never took it.
+        dropQueuedCommand(owner, cmdId);
+        forgetCreateInFlight(cmdId);
         return json(res, 503, { error: "the host went offline before the ticket was created" });
       }
       return json(res, 202, { pending: true });
@@ -3774,6 +3950,10 @@ const server = http.createServer(async (req, res) => {
       if (!findJiraHost(siteKey, false)) {
         return json(res, 404, { error: "no host reports that org" });
       }
+      // Health-ranked but deliberately NOT rotated the way a create is
+      // (XERK-241): this route's single-flight looks for the pending change in
+      // ONE host's queue, so spreading consecutive changes across the org's
+      // agents would let a double-click fire two transitions on one ticket.
       const key = findJiraHost(siteKey, true);
       if (!key) return json(res, 503, { error: "no online host reports that org" });
       // Same refusal as the create route: an agent predating XERK-138 acks this
@@ -3785,6 +3965,7 @@ const server = http.createServer(async (req, res) => {
       const cmdId = pending ? pending.cmdId
         : queueCommand(key, { type: "setTicketStatus", issueKey, value, category });
       if (!pending) awaitResult(agents[key], cmdId, "setTicketStatus");
+      rememberCmdHost(cmdId, key);
       return json(res, 202, { ok: true, cmdId, host: key });
     }
 
@@ -3802,7 +3983,13 @@ const server = http.createServer(async (req, res) => {
       }
       const cmdId = url.searchParams.get("cmdId");
       if (!cmdId) return json(res, 400, { error: "cmdId required" });
-      const key = findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
+      // The outcome is on the host that RAN the change, which in a multi-agent
+      // org needn't be the one this poll would otherwise land on (XERK-241) —
+      // e.g. the host that took it went offline, or its tracker poll started
+      // failing, and the ranking has since moved on to a sibling that never saw
+      // the command and would report pending forever.
+      const key = commandHost(siteKey, cmdId, "statusResults")
+        || findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
       if (!key) return json(res, 404, { error: "no host reports that org" });
       const r = (agents[key].statusResults || {})[cmdId];
       if (!r) return json(res, 200, { pending: true });

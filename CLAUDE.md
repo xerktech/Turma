@@ -1007,8 +1007,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The **"New ticket"** button opens a modal to create a ticket (title, description, labels) on an org's
   tracker — source-agnostic across Jira and Azure DevOps, hidden until an org reports. It lives in the
   **shared site header** (`newticket.js` → nav.js's `#hdrNewTicket` slot, XERK-150), not the board
-  toolbar; it is fed the beat by `TurmaNewTicket.update(data)`, with the form HTML in `board.js`. It
-  routes to an **ONLINE** host of the org, on the usual command → staged result → poll pattern:
+  toolbar; fed the beat by `TurmaNewTicket.update(data)`, form HTML in `board.js`. It routes to an
+  ONLINE host of the org (ranked, below) on the command → staged result → poll pattern:
   - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
     `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
     across every project. Cached per host, 202-polled.
@@ -1016,27 +1016,30 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     `{cmdId, key, url, error, warning}`; polled at `GET .../tickets/<cmdId>` (`createResults`). All three
     caches are stripped from the fleet payload.
 - The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure an identity
-  ladder, below) so it lands on the board — best-effort, and reported. Agent dispatch: `create_board_issue`/`board_create_meta`/`board_issue_types` (`create_jira_issue` POSTs
+  ladder, below) so it lands on the board — best-effort, and reported. Agent dispatch:
+  `create_board_issue`/`board_create_meta`/`board_issue_types` (`create_jira_issue` POSTs
   `/rest/api/3/issue`, plain-text→ADF via `_text_to_adf`; `create_azure_issue` POSTs a JSON-Patch work
   item, `;`-joined `System.Tags`). Jira labels split on whitespace+commas (spaces forbidden), Azure tags
-  on commas.
-- Android has the same feature (＋ in the shared `ScreenHeader` → `CreateTicketSheet`): `source` on
-  `JiraBlock`/`BoardSite`, the endpoints in `net/HubApi.kt`, the
-  `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in `core/Board.kt`.
+  on commas. Android matches it (＋ in `ScreenHeader` → `CreateTicketSheet`): `source` on
+  `JiraBlock`/`BoardSite`, endpoints in `net/HubApi.kt`,
+  `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` in `core/Board.kt`.
+- **An org's hosts are health-ranked (`jiraHostPool`: online, then `jira.available`) and a create is
+  OWNED by the host that took it** (XERK-241): a SIBLING's liveness 503'd healthy creates, and every
+  retry that invited made a real ticket. The poll reads only the owner (`commandHost`) and withdraws an
+  UNDELIVERED create; an identical unresolved one rejoins it; creates round-robin (`pickBoardWriteHost`).
 - **A refusal carries the tracker's own words; a create bends to the TYPE and IDENTITY** (XERK-151):
   `_http_error_detail` keeps the body urllib's `HTTPError` drops (else every refusal reads "HTTP Error
   400: Bad Request"); the description goes in the field the type HAS (`_azure_description_field`: the
-  Agile/Scrum **Bug** has ReproSteps, not Description); and assignment walks a **ladder** of spellings,
-  then unassigned, keeping the FIRST error and re-sending only after a 4xx (proof nothing was created).
-- **The ladder's best candidate is HARVESTED, not guessed**: `_azure_mine_identities` reads
-  `System.AssignedTo` off an item the board's `@Me` WIQL returns — a value this server has already
-  resolved — ahead of the `AZDO_USER`/connection-data guesses; `_azure_identity_strings` then spells
-  each four ways, an on-prem collection routinely taking only one. Cached, empty included, so nothing
-  assigned yet falls through until one lands. An unassigned success `warning`s with the tracker's own
-  refusal, never "set `AZDO_USER`" — already a candidate.
-- **Any new shared `/*.js` must be registered in `server.js`'s `STATIC_ASSETS`** (it's an allowlist, not
-  a directory serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the
-  module, and every page's render, down. `newticket.test.js` guards both.
+  Agile/Scrum **Bug** has ReproSteps, not Description); assignment walks a **ladder** of spellings then
+  unassigned, keeping the FIRST error and re-sending only after a 4xx (proof nothing was created). That
+  ladder's best candidate is **HARVESTED, not guessed** — `_azure_mine_identities` reads
+  `System.AssignedTo` off an item the board's `@Me` WIQL returns, ahead of the `AZDO_USER`/connection-
+  data guesses; `_azure_identity_strings` spells each four ways (on-prem often takes one). Cached, empty
+  included, so nothing assigned yet falls through until one lands; an unassigned success `warning`s with
+  the tracker's own refusal, never "set `AZDO_USER`" — already a candidate.
+- **Any new shared `/*.js` must be in `server.js`'s `STATIC_ASSETS`** (an allowlist, not a directory
+  serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module, and every
+  page's render, down. `newticket.test.js` guards both.
 - Tests: `TestCreateAzureIssue`/`TestAzure*Identit*`/`TestHttpErrorDetail` in `test_hub_agent.py`;
   `server.test.js`; `createFormHtml` in `board.test.js`; `newticket.test.js`; android `BoardTest.kt`.
 
@@ -1045,9 +1048,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Each card shows the **repo the agent triaged the ticket to** (`repoChipHtml`, from `repoGuess`) in
   three states: **cloned** on the reporting host is a plain actionable chip, one only in the org's `gh`
   listing is **dashed**, a ticket the model declined is a muted italic **"no repo"** — and no
-  `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits"). The rationale is the tooltip and
-  the detail panel's Repo row (`repoFieldHtml`, reading `t.repoGuess` directly — the guess exists only on
-  the heartbeat ticket, not the on-demand Jira fetch), which is where it is **corrected by hand**.
+  `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits"). The rationale is the tooltip
+  and the detail panel's Repo row (`repoFieldHtml`, reading `t.repoGuess` directly — the guess exists
+  only on the heartbeat ticket, not the on-demand fetch), where it is **corrected by hand**.
 
 #### Starting a session on a ticket
 
@@ -1063,13 +1066,12 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - In-flight state clears on **evidence**, not a timer: a session reporting the spawn's `cmdId`, or the
   command clearing from the host's queue (which covers a spawn the agent REFUSED).
 - The press is acknowledged **instantly and survives leaving the board** (XERK-18): the button acts on
-  **`pointerdown`** (fired before any re-render — the board `innerHTML`-replaces every beat) with `click`
-  as the keyboard path, both entering through `startFrom` where the pending guard makes a double-fire a
-  no-op; `startSession` sets pending and repaints **synchronously, before the fetch** (`cmdId`/`host` fill
-  in on reply); the POST uses **`keepalive: true`** so it outlives the page. `sweepStarts`' verdict is
-  `B.startSweepVerdict` (pure, unit-tested): a cmdId-less pending always holds, and "command gone" counts
-  as acked only once the command was **seen present** (`sawCmd`) — the SSE-fallback poll may not yet have
-  seen a just-queued one.
+  **`pointerdown`** (fired before any re-render — the board `innerHTML`-replaces every beat), `click`
+  the keyboard path, both via `startFrom` whose pending guard no-ops a double-fire; `startSession` sets
+  pending and repaints **synchronously, before the fetch** (`cmdId`/`host` fill in on reply); the POST
+  is **`keepalive: true`** so it outlives the page. `sweepStarts`' verdict is `B.startSweepVerdict`
+  (pure, unit-tested): a cmdId-less pending always holds, and "command gone" counts as acked only once
+  the command was **seen present** (`sawCmd`) — the SSE poll may not yet have seen a just-queued one.
 - Tests: `server.test.js`, `startSweepVerdict` in `board.test.js`.
 
 ##### Splitting ticket sessions across an org's agents (XERK-14)
@@ -1119,10 +1121,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     attempts and drops the record; an in-flight command concludes nothing; only a still-session-less
     ticket with nothing in flight, past its backoff, is retried. A queued session reports its `ticket`
     from the first beat, so a slow spawn is never mistaken for a failed one.
-- Nothing is written to Jira.
-- Tests: `server.test.js`, `autoStartOn` in
-  `board.test.js` and android `BoardTest.kt`, `test_no_agent_side_auto_start_flag` in
-  `TestSetJiraRepo`.
+- Tests: `server.test.js`, `autoStartOn` in `board.test.js` and android `BoardTest.kt`,
+  `test_no_agent_side_auto_start_flag` in `TestSetJiraRepo`.
 
 ##### Auto-stopping Done tickets (XERK-45, XERK-161)
 
@@ -1167,8 +1167,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - **Clicking a card expands it into a detail panel** (`detailHtml`) with the full description, comments,
   people, parent, and labels, painted instantly from the card's heartbeat fields then filled from
-  `GET /api/jira/<siteKey>/<issueKey>`, which routes to a host reporting that org (preferring online),
-  serves a fresh cached copy, or queues a `jiraIssue` command and 202s so the client polls
+  `GET /api/jira/<siteKey>/<issueKey>` — routed to a host reporting that org (preferring online),
+  serving a fresh cached copy or queueing a `jiraIssue` command and 202-ing for the client to poll
   (`ingestJiraIssues`, cached by `JIRA_ISSUE_FRESH_MS`/`_MAX_AGE_MS`/`_MAX`, stripped from `/api/agents`).
   An offline-only org serves its last copy flagged `stale`; a cached `error` is kept so a doomed fetch
   isn't re-queued. The fetched copy wins field-by-field; its text is already plain, so the panel escapes
@@ -1235,9 +1235,8 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 
 ##### Changing the status by hand (XERK-138)
 
-- The Status row is the **one board field that writes BACK to Jira/Azure** — every other detail control
-  writes a hub/agent ledger. A picker of the statuses the ticket can move to, "keep current" first as the
-  no-op.
+- The Status row is the **one detail control that writes BACK to Jira/Azure**. A picker of the statuses
+  the ticket can move to, "keep current" first as the no-op.
 - **The options are the board's own, fetched with the issue, not a fixed list.** The detail carries
   `statusOptions` (`[{id, name, category}]`): Jira's available **transitions** (labelled by the resulting
   status, valued by transition id — from `expand=transitions`), or Azure's **states** for the work-item
@@ -1298,15 +1297,15 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 
 #### Refresh button
 
-- `POST /api/jira/refresh` fans a `refreshJira` out to every Jira-configured host (the board is a *merge*
-  of every host's block), deduped so a mashed button costs one poll per host. It targets the block's
-  `configured` flag (creds present) rather than `available` (a poll succeeded), because a failing host
-  reports `available=false`/`siteKey=null` — exactly the host a retry is for. `siteKey` is the older-agent
+- `POST /api/jira/refresh` fans a `refreshJira` out to every Jira-**`configured`** host (the board is a
+  *merge* of every host's block), deduped so a mashed button costs one poll per host. `configured`
+  (creds present) not `available` (a poll succeeded), because a failing host reports
+  `available=false`/`siteKey=null` — exactly the host a retry is for; `siteKey` is the older-agent
   fallback.
 - It resolves on real fleet state: holds until the queued command clears from the targeted hosts'
   records (`jiraRefreshPending`, which covers a poll that FAILED and left `fetchedAt` untouched), with
-  `newestFetchedAt` as a second signal and a 45s timeout. It reports "Refresh failed" only when EVERY
-  targeted host errored (`jiraRefreshFailed`).
+  `newestFetchedAt` as a second signal and a 45s timeout. "Refresh failed" only when EVERY targeted
+  host errored (`jiraRefreshFailed`).
 
 ### Sessions page (`/sessions`)
 
