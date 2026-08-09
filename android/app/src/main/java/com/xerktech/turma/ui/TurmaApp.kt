@@ -21,7 +21,6 @@ import java.net.URLEncoder
 
 object Routes {
     const val LOGIN = "login"
-    const val ARCHIVE = "archive"
     fun chat(host: String, session: String) = "chat/${enc(host)}/${enc(session)}"
     fun terminal(host: String, session: String) = "terminal/${enc(host)}/${enc(session)}"
     /** Read-only review of an ended session by transcript id — what a board
@@ -126,7 +125,6 @@ fun TurmaApp(
                 wide = wide,
                 onNavigate = goTab,
                 onTerminal = { h, s -> nav.navigate(Routes.terminal(h, s)) },
-                onOpenArchive = { nav.navigate(Routes.ARCHIVE) },
             )
         }
         composable(TopDest.BOARD.route) {
@@ -169,12 +167,6 @@ fun TurmaApp(
             val host = entry.arguments?.getString("host").orEmpty()
             val session = entry.arguments?.getString("session").orEmpty()
             TerminalScreen(host = host, sessionId = session, onBack = { nav.popBackStack() })
-        }
-        // Full-history archive + FTS search. The web reaches this from the
-        // Sessions sidebar's "Search all session history…" box; here it's the
-        // search action on the Sessions header (see SessionsRoute onOpenArchive).
-        composable(Routes.ARCHIVE) {
-            ArchiveScreen(onBack = { nav.popBackStack() })
         }
         // An ended session's read-only review, reached from a board ticket chip
         // (the Sessions pane composes EndedSessionView inline instead).

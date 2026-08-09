@@ -11,6 +11,8 @@ docker/tmux/git needed.
 
 import base64
 import datetime
+import gzip
+import http.server
 import importlib.util
 import io
 import json
@@ -21,6 +23,8 @@ import signal
 import struct
 import sys
 import tempfile
+import threading
+import tracemalloc
 import time
 import unittest
 import urllib.error
@@ -4805,6 +4809,476 @@ class TestStoreUploads(ManagerMixin, unittest.TestCase):
             paths, failed = sm._store_uploads(sess, items)
         self.assertEqual(len(paths), ha.UPLOAD_MAX_PER_MESSAGE)
         self.assertEqual(failed, [])
+
+
+class TestFetchBoardAttachment(unittest.TestCase):
+    """Pulling one attachment's BYTES off the configured tracker (XERK-242) —
+    the one tracker request that carries a credential to a URL out of a ticket."""
+
+    JIRA = dict(JIRA_SITE="myorg.atlassian.net", JIRA_EMAIL="e@x.c", JIRA_TOKEN="t",
+                AZDO_URL="", AZDO_TOKEN="")
+
+    def _opened(self, blob, *, capture=None, encoding=None, length=None):
+        """Stand in for the module opener, recording the request it was given.
+        Shaped like the HTTPResponse the real one returns: read1 + headers.
+        `length` sets a Content-Length the body need not match (a truncated
+        download); omitted, it stands for a chunked reply that declares none."""
+        hdrs = {"Content-Encoding": encoding} if encoding else {}
+        if length is not None:
+            hdrs["Content-Length"] = str(length)
+
+        class Resp(io.BytesIO):
+            headers = hdrs
+
+        def fake_open(req, timeout=None):
+            if capture is not None:
+                capture.append(req)
+            return Resp(blob)
+        return mock.patch.object(ha._ATTACH_OPENER, "open", fake_open)
+
+    def test_fetches_with_the_tracker_credential(self):
+        seen = []
+        with mock.patch.multiple(ha, **self.JIRA), self._opened(b"PNG", capture=seen):
+            blob = ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/rest/api/3/attachment/content/1", 1000)
+        self.assertEqual(blob, b"PNG")
+        self.assertTrue(seen[0].get_header("Authorization").startswith("Basic "))
+
+    def test_a_url_off_the_tracker_is_refused_before_it_is_requested(self):
+        # The URL comes out of a tracker response, but it is the only ticket field
+        # we turn into an outbound request holding a credential — so a server that
+        # is compromised or simply wrong must not be able to aim it elsewhere.
+        for url in ("https://evil.example/steal",
+                    "http://169.254.169.254/latest/meta-data/",
+                    "file:///etc/passwd", "", None):
+            with mock.patch.multiple(ha, **self.JIRA), \
+                 mock.patch.object(ha._ATTACH_OPENER, "open") as opener:
+                self.assertIsNone(ha.fetch_board_attachment(url, 1000))
+                opener.assert_not_called()
+
+    def test_a_body_past_the_cap_is_not_returned(self):
+        with mock.patch.multiple(ha, **self.JIRA), self._opened(b"x" * 11):
+            self.assertIsNone(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 10))
+
+    def test_a_transport_failure_is_none_not_an_exception(self):
+        # It runs inside a spawn: a dead attachment must cost the file, not the
+        # session.
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha._ATTACH_OPENER, "open", side_effect=OSError("boom")):
+            self.assertIsNone(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 10))
+
+    def test_azure_uses_the_board_pat_and_its_own_host(self):
+        seen = []
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://tfs.co:8080/tfs/Coll",
+                                 AZDO_TOKEN="pat"), \
+             self._opened(b"LOG", capture=seen):
+            self.assertEqual(ha.fetch_board_attachment(
+                "https://tfs.co:8080/tfs/Coll/_apis/wit/attachments/a", 100), b"LOG")
+        self.assertEqual(seen[0].get_header("Authorization"),
+                         "Basic " + base64.b64encode(b":pat").decode())
+
+    def _req(self):
+        return urllib.request.Request(
+            "https://myorg.atlassian.net/rest/api/3/attachment/content/1",
+            headers={"Authorization": "Basic secret", "User-Agent": "turma-agent/1.0"})
+
+    def test_the_credential_does_not_follow_a_cross_host_redirect(self):
+        # Jira answers /attachment/content with a 30x to a media CDN. urllib
+        # copies headers onto the redirected request verbatim, which would hand
+        # our Basic auth to that third party (and break the presigned fetch).
+        # A public IP literal, not a hostname: getaddrinfo on a literal needs no
+        # DNS, so this asserts the policy rather than the runner's resolver (this
+        # dev box's resolver answers NXDOMAIN with a public address, CI's won't).
+        h, req = ha._StripAuthRedirect(), self._req()
+        with mock.patch.multiple(ha, **self.JIRA):
+            away = h.redirect_request(req, None, 302, "Found", {},
+                                      "https://93.184.216.34/blob?sig=1")
+            self.assertIsNone(away.get_header("Authorization"))
+            self.assertEqual(away.get_header("User-agent"), "turma-agent/1.0")
+            # Still the tracker: the credential is what the next hop needs.
+            same = h.redirect_request(req, None, 302, "Found", {},
+                                      "https://myorg.atlassian.net/elsewhere")
+            self.assertEqual(same.get_header("Authorization"), "Basic secret")
+
+    def test_a_downgrade_to_http_on_the_same_host_still_drops_it(self):
+        # Same host is NOT the same trust: without the scheme in the compare,
+        # a 302 to http:// puts the tracker's Basic auth on the wire in clear.
+        h, req = ha._StripAuthRedirect(), self._req()
+        with mock.patch.multiple(ha, **self.JIRA):
+            down = h.redirect_request(req, None, 302, "Found", {},
+                                      "http://myorg.atlassian.net/rest/x")
+        self.assertIsNone(down.get_header("Authorization"))
+
+    def test_a_redirect_the_tracker_may_not_aim_at_is_refused(self):
+        # The initial URL is tracker-only, but a 30x is the tracker choosing a
+        # second URL — unpoliced, it is an arbitrary read (cloud metadata, the
+        # LAN, localhost) whose body then lands where the prompt says to read it.
+        h, req = ha._StripAuthRedirect(), self._req()
+        with mock.patch.multiple(ha, **self.JIRA):
+            for bad in ("http://169.254.169.254/latest/meta-data/",
+                        "http://127.0.0.1:8300/api/agents",
+                        "http://10.10.10.20/pool/secrets",
+                        "ftp://media.example/blob",
+                        "file:///etc/passwd"):
+                with self.assertRaises(urllib.error.HTTPError, msg=bad):
+                    h.redirect_request(req, None, 302, "Found", {}, bad)
+
+    def test_a_redirect_to_a_name_that_will_not_resolve_is_refused(self):
+        # This gates a URL the TRACKER chose, so "can't tell" must not mean "go".
+        h, req = ha._StripAuthRedirect(), self._req()
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha.socket, "getaddrinfo",
+                               side_effect=OSError("NXDOMAIN")):
+            with self.assertRaises(urllib.error.HTTPError):
+                h.redirect_request(req, None, 302, "Found", {}, "https://cdn.example/x")
+
+    def test_host_is_public_reads_every_resolved_address(self):
+        # A name resolving to both a public and a private address is not public:
+        # which one urllib connects to isn't ours to choose.
+        def resolved(*addrs):
+            return [(0, 0, 0, "", (a, 0)) for a in addrs]
+        with mock.patch.object(ha.socket, "getaddrinfo",
+                               return_value=resolved("93.184.216.34")):
+            self.assertTrue(ha._host_is_public("cdn.example"))
+        for private in ("169.254.169.254", "127.0.0.1", "10.10.10.20",
+                        "192.168.1.5", "172.16.0.1", "::1", "fd00::1",
+                        "0.0.0.0", "224.0.0.1",
+                        "100.64.0.1",            # carrier NAT, not "private"
+                        "::ffff:10.0.0.1"):      # v4-mapped, still the LAN
+            with mock.patch.object(ha.socket, "getaddrinfo",
+                                   return_value=resolved("93.184.216.34", private)):
+                self.assertFalse(ha._host_is_public("cdn.example"), private)
+
+    def test_a_tracker_on_a_private_address_can_still_redirect_to_itself(self):
+        # A self-hosted TFS/Jira routinely IS a private address, so the policy
+        # is "public, OR back to the configured tracker" — not "public".
+        h = ha._StripAuthRedirect()
+        req = urllib.request.Request("http://10.10.10.20/tfs/Coll/_apis/wit/x",
+                                     headers={"Authorization": "Basic secret"})
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="http://10.10.10.20/tfs/Coll",
+                                 AZDO_TOKEN="pat"):
+            back = h.redirect_request(req, None, 302, "Found", {},
+                                      "http://10.10.10.20/tfs/Coll/blob")
+        self.assertEqual(back.get_header("Authorization"), "Basic secret")
+
+    def test_a_content_encoded_body_is_decoded_not_written_raw(self):
+        # We ask for identity, so this is a proxy compressing anyway; undecoded,
+        # a .png lands on disk as a gzip stream and nothing says so.
+        seen = []
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(gzip.compress(b"PNGDATA"), capture=seen, encoding="gzip"):
+            blob = ha.fetch_board_attachment("https://myorg.atlassian.net/x", 1000)
+        self.assertEqual(blob, b"PNGDATA")
+        self.assertEqual(seen[0].get_header("Accept-encoding"), "identity")
+
+    def test_an_undecodable_encoding_is_a_miss_not_a_corrupt_file(self):
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(b"\x00\x01", encoding="br"):
+            self.assertIsNone(
+                ha.fetch_board_attachment("https://myorg.atlassian.net/x", 1000))
+
+    def test_a_compression_bomb_is_refused_without_inflating_it(self):
+        """The byte cap has to bound what comes OUT, not just what comes in.
+
+        gzip does ~1000:1 on repetitive data, so a body well under the wire cap
+        inflates to gigabytes — and a one-shot decompress allocates all of it
+        before any size check can run, on the manager's own process. Measured
+        here by peak allocation, because "it returned None" would also be true
+        of an implementation that inflated the whole bomb first and then
+        rejected it."""
+        bomb = gzip.compress(b"\0" * (64 << 20))          # 64 MiB -> ~64 KiB
+        self.assertLess(len(bomb), 1 << 20, "fixture isn't a bomb")
+        tracemalloc.start()
+        try:
+            with mock.patch.multiple(ha, **self.JIRA), \
+                 self._opened(bomb, encoding="gzip"):
+                blob = ha.fetch_board_attachment(
+                    "https://myorg.atlassian.net/x", 1 << 20)   # 1 MiB cap
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertIsNone(blob)
+        # A few MiB of slack over the 1 MiB cap; the unbounded version peaked
+        # at hundreds of MiB for this fixture.
+        self.assertLess(peak, 8 << 20, f"inflated {peak} bytes before refusing")
+
+    def test_a_compressed_body_inside_the_cap_still_arrives_whole(self):
+        body = bytes(range(256)) * 200          # 51200 bytes, compressible
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(gzip.compress(body), encoding="gzip"):
+            self.assertEqual(
+                ha.fetch_board_attachment("https://myorg.atlassian.net/x",
+                                          len(body)), body)
+
+    def test_a_body_that_ends_early_is_a_miss_not_a_truncated_file(self):
+        # A half-written screenshot the prompt then tells the session to read is
+        # worse than a named miss — the call this repo already makes for an
+        # over-long message. Both framings: a short body under Content-Length,
+        # and a compressed stream that ends before its end marker.
+        body = b"A" * 1000
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(b"A" * 400, length=1000):
+            self.assertIsNone(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 5000))
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(gzip.compress(body)[:20], encoding="gzip"):
+            self.assertIsNone(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 5000))
+
+    def test_a_body_with_no_length_to_check_against_is_taken_as_it_comes(self):
+        # Chunked transfer-encoding carries no Content-Length; a complete body
+        # must not read as truncated just because there is nothing to compare.
+        body = b"A" * 1000
+        with mock.patch.multiple(ha, **self.JIRA), self._opened(body):
+            self.assertEqual(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 5000), body)
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(gzip.compress(body), encoding="gzip"):
+            self.assertEqual(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 5000), body)
+
+    def test_a_compressed_body_whose_WIRE_size_is_over_the_cap_is_refused(self):
+        # The cap bounds both sides, and this is the case only the WIRE bound
+        # catches: incompressible bytes gzip to slightly MORE than themselves, so
+        # the body decodes to exactly the cap while costing more than it on the
+        # wire. Without that bound it reads to the end and is accepted.
+        body = os.urandom(1000)                       # gzips to ~1023
+        packed = gzip.compress(body)
+        self.assertGreater(len(packed), 1000, "fixture isn't incompressible")
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(packed, encoding="gzip"):
+            self.assertIsNone(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 1000))
+
+    def test_an_unconfigured_board_is_not_a_redirect_wildcard(self):
+        # board_attachment_host() is "" with no board, and "" must not match a
+        # netloc-less URL. Unreachable through fetch_board_attachment, which
+        # refuses every URL in that state — this pins the belt, not the braces.
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""):
+            self.assertEqual(ha.board_attachment_host(), "")
+            self.assertFalse(ha.attachment_redirect_ok("http:///x"))
+            # ...and with no tracker to be exempt, a private target is still
+            # judged on its address rather than waved through.
+            self.assertFalse(ha.attachment_redirect_ok("http://127.0.0.1/y"))
+
+    def test_the_cap_still_wins_over_the_completeness_check(self):
+        # Stopping at the cap IS a short read; it must stay "too big", not
+        # become "truncated" (and must not be accepted because it looks short).
+        with mock.patch.multiple(ha, **self.JIRA), \
+             self._opened(b"A" * 5000, length=5000):
+            self.assertIsNone(ha.fetch_board_attachment(
+                "https://myorg.atlassian.net/x", 1000))
+
+
+class TestStoreTicketAttachments(ManagerMixin, unittest.TestCase):
+    """A ticket's own files -> this session's uploads directory (XERK-242)."""
+
+    def _sess(self, sm, sid="abcde"):
+        sess = {"id": sid, "status": "running", "tmuxName": f"agent-{sid}"}
+        sm.registry = [sess]
+        return sess
+
+    def _att(self, name="shot.png", size=10, url="https://s/1"):
+        return {"name": name, "size": size, "url": url, "mime": "image/png"}
+
+    def test_files_land_under_the_session_and_not_in_the_worktree(self):
+        # Same tree a chat attachment lands in: out of the repo (a file there
+        # reads as uncommitted work) and pre-approved for Read by the guard.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(ha, "fetch_board_attachment", return_value=b"PNGDATA"):
+            paths, failed = sm._store_ticket_attachments(sess, [self._att()])
+        self.assertEqual(failed, [])
+        self.assertEqual(paths, [os.path.join(ha.UPLOADS_DIR, "abcde", "shot.png")])
+        with open(paths[0], "rb") as fh:
+            self.assertEqual(fh.read(), b"PNGDATA")
+
+    def test_a_traversing_name_still_lands_inside_the_uploads_dir(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(ha, "fetch_board_attachment", return_value=b"x"):
+            paths, _ = sm._store_ticket_attachments(
+                sess, [self._att(name="../../../../etc/cron.d/evil")])
+        self.assertEqual(paths, [os.path.join(ha.UPLOADS_DIR, "abcde", "evil")])
+
+    def test_the_files_are_readable_only_by_the_agent(self):
+        # A host's sessions share one HOME; another user having a session's
+        # ticket files (or being able to drop one in) is not something to leave
+        # to the ambient umask.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(ha, "fetch_board_attachment", return_value=b"x"):
+            paths, _ = sm._store_ticket_attachments(sess, [self._att()])
+        self.assertEqual(os.stat(paths[0]).st_mode & 0o777, 0o600)
+        self.assertEqual(
+            os.stat(ha.upload_dir_for("abcde")).st_mode & 0o777, 0o700)
+
+    def test_it_never_writes_over_a_file_that_appeared_underneath_it(self):
+        # _unique_upload_path asks exists() and _write_new_file then opens: the
+        # gap is a real one. O_EXCL is what closes it — and it is the ONLY case
+        # that distinguishes O_EXCL from O_NOFOLLOW, since either flag alone
+        # covers the dangling-symlink case above.
+        os.makedirs(ha.UPLOADS_DIR, mode=0o700, exist_ok=True)
+        taken = os.path.join(ha.UPLOADS_DIR, "taken.png")
+        with open(taken, "wb") as fh:
+            fh.write(b"WAS HERE FIRST")
+        with self.assertRaises(FileExistsError):
+            ha._write_new_file(taken, b"CLOBBER")
+        with open(taken, "rb") as fh:
+            self.assertEqual(fh.read(), b"WAS HERE FIRST")
+
+    def test_a_dangling_symlink_is_not_written_through(self):
+        # os.path.exists() follows symlinks, so _unique_upload_path reads a
+        # dangling one as a free name; a plain open() would then create its
+        # TARGET, outside the uploads tree entirely.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        dirpath = ha.upload_dir_for("abcde")
+        os.makedirs(dirpath, mode=0o700, exist_ok=True)
+        victim = os.path.join(self.tmp, "victim.txt")
+        os.symlink(victim, os.path.join(dirpath, "shot.png"))
+        with mock.patch.object(ha, "fetch_board_attachment", return_value=b"PWNED"):
+            paths, failed = sm._store_ticket_attachments(sess, [self._att()])
+        self.assertFalse(os.path.exists(victim))
+        self.assertEqual(failed, ["shot.png"])
+        self.assertEqual(paths, [])
+
+    def test_a_download_failure_is_named_not_dropped(self):
+        # A screenshot the ticket is built around is exactly what the session
+        # needs to know it is missing.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(ha, "fetch_board_attachment",
+                               side_effect=[b"ok", None]):
+            paths, failed = sm._store_ticket_attachments(
+                sess, [self._att("a.png"), self._att("b.pdf")])
+        self.assertEqual([os.path.basename(p) for p in paths], ["a.png"])
+        self.assertEqual(failed, ["b.pdf"])
+
+    def test_a_file_whose_reported_size_is_too_big_is_never_downloaded(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(ha, "fetch_board_attachment") as fetch:
+            paths, failed = sm._store_ticket_attachments(
+                sess, [self._att("huge.mov", size=ha.TICKET_ATTACH_MAX_BYTES + 1)])
+            fetch.assert_not_called()
+        self.assertEqual((paths, failed), ([], ["huge.mov"]))
+
+    def test_the_total_budget_stops_a_ticket_full_of_big_files(self):
+        # Nobody picked these file by file, so the caps are the point.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        items = [self._att(f"f{i}.bin", size=600) for i in range(3)]
+        with mock.patch.multiple(ha, TICKET_ATTACH_MAX_BYTES=1000,
+                                 TICKET_ATTACH_TOTAL_BYTES=1000), \
+             mock.patch.object(ha, "fetch_board_attachment",
+                               side_effect=lambda url, cap, timeout=None, deadline=None: b"x" * 600):
+            paths, failed = sm._store_ticket_attachments(sess, items)
+        self.assertEqual([os.path.basename(p) for p in paths], ["f0.bin"])
+        self.assertEqual(failed, ["f1.bin", "f2.bin"])
+
+    def test_a_trickling_tracker_cannot_hold_the_manager_loop(self):
+        """The deadline is a real bound, proven over a real socket.
+
+        This runs on the manager's ONE loop, inside a spawn, so a tracker that
+        keeps the download alive stalls every session on the host and the hub
+        calls it offline after 75s. A socket timeout does NOT bound this: it caps
+        the wait for the NEXT byte, and a server dribbling bytes under the byte
+        cap resets it forever. So this drives an actual trickling HTTP server
+        rather than a mocked `fetch_board_attachment` — mocking the download here
+        would only assert that we compute a number, which is what let the
+        unbounded read ship green in the first place."""
+        served = threading.Event()
+
+        class Trickle(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(1 << 20))  # a lie it never finishes
+                self.end_headers()
+                served.set()
+                try:
+                    # ~100s of trickle: the server must OUTLIVE the assertion
+                    # below, or a regression's blocking read simply completes
+                    # under the threshold and the test passes on the bug. Costs
+                    # nothing when the code is right — the agent hangs up at its
+                    # 2s deadline and this write raises straight into the except.
+                    for _ in range(2000):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                        time.sleep(0.05)      # under every byte cap, indefinitely
+                except Exception:
+                    pass                      # the agent hung up: the point
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        base = f"http://127.0.0.1:{srv.server_address[1]}/Coll"
+
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        items = [{"name": f"f{i}.bin", "size": None, "url": f"{base}/a{i}"}
+                 for i in range(3)]
+        started = time.monotonic()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL=base, AZDO_TOKEN="pat",
+                                 TICKET_ATTACH_DEADLINE_SEC=2,
+                                 TICKET_ATTACH_TIMEOUT_SEC=2):
+            paths, failed = sm._store_ticket_attachments(sess, items)
+        took = time.monotonic() - started
+        self.assertTrue(served.is_set())            # it really did connect
+        self.assertLess(took, 15, f"took {took:.1f}s against a 2s budget")
+        self.assertEqual(paths, [])
+        self.assertEqual(failed, ["f0.bin", "f1.bin", "f2.bin"])  # each one named
+
+    def test_a_silent_tracker_is_bounded_too(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        items = [self._att(f"f{i}.png") for i in range(5)]
+        elapsed, timeouts, deadlines = [0.0], [], []
+
+        def slow(url, cap, timeout=None, deadline=None):
+            timeouts.append(timeout)
+            deadlines.append(deadline)
+            elapsed[0] += timeout          # every one of them times out
+            return None
+        with mock.patch.multiple(ha, TICKET_ATTACH_DEADLINE_SEC=6,
+                                 TICKET_ATTACH_TIMEOUT_SEC=4), \
+             mock.patch.object(ha.time, "monotonic", lambda: elapsed[0]), \
+             mock.patch.object(ha, "fetch_board_attachment", slow):
+            paths, failed = sm._store_ticket_attachments(sess, items)
+        self.assertEqual(paths, [])
+        self.assertEqual(len(failed), 5)             # every file is named
+        self.assertEqual(timeouts, [4, 2])           # clamped to the budget left
+        # The batch deadline is handed DOWN, so one download can't outlast it.
+        self.assertEqual(deadlines, [6, 6])
+        self.assertLessEqual(elapsed[0], 6)
+
+    def test_no_more_than_the_count_cap_is_fetched(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        items = [self._att(f"f{i}.png") for i in range(ha.TICKET_ATTACH_MAX + 5)]
+        with mock.patch.object(ha, "fetch_board_attachment", return_value=b"x"):
+            paths, failed = sm._store_ticket_attachments(sess, items)
+        self.assertEqual(len(paths), ha.TICKET_ATTACH_MAX)
+        self.assertEqual(failed, [])
+
+    def test_nothing_to_fetch_costs_nothing(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        for empty in (None, [], ["junk"]):
+            self.assertEqual(sm._store_ticket_attachments(sess, empty), ([], []))
+        self.assertFalse(os.path.isdir(ha.upload_dir_for("abcde")))
 
 
 class TestSendInputUploads(ManagerMixin, unittest.TestCase):
@@ -10072,6 +10546,50 @@ class TestShapeIssueDetail(unittest.TestCase):
         self.assertEqual(ha._shape_issue_detail(payload, "s")["statusOptions"],
                          [{"id": "5", "name": "Ready", "category": "todo"}])
 
+    def test_attachments_carry_what_a_download_needs(self):
+        # XERK-242: the ticket's own files ride the detail so spawn_ticket can
+        # fetch them for a session that has no board creds of its own.
+        d = ha._shape_issue_detail(_issue_detail_payload(fields={"attachment": [
+            {"id": "1", "filename": "shot.png", "size": 1234,
+             "mimeType": "image/png",
+             "content": "https://myorg.atlassian.net/rest/api/3/attachment/content/1"},
+        ]}), "myorg.atlassian.net")
+        self.assertEqual(d["attachments"], [{
+            "name": "shot.png", "size": 1234, "mime": "image/png",
+            "url": "https://myorg.atlassian.net/rest/api/3/attachment/content/1",
+        }])
+
+    def test_attachments_default_empty_and_skip_unfetchable(self):
+        self.assertEqual(
+            ha._shape_issue_detail(_issue_detail_payload(), "s")["attachments"], [])
+        # No name or no URL is nothing to fetch and nothing to call it.
+        d = ha._shape_issue_detail(_issue_detail_payload(fields={"attachment": [
+            "junk", {"filename": "no-url.png"}, {"content": "https://s/1"},
+            {"filename": "ok.pdf", "content": "https://s/2"},
+        ]}), "s")
+        self.assertEqual([a["name"] for a in d["attachments"]], ["ok.pdf"])
+        self.assertIsNone(d["attachments"][0]["size"])
+
+    def test_the_cap_keeps_the_NEWEST_and_says_how_many_it_dropped(self):
+        # Both trackers list attachments oldest-first, so keeping the first N
+        # would drop exactly the screenshot someone just added because the ticket
+        # is about it. And the count before the cap rides along, so nothing is
+        # dropped SILENTLY — the prompt can't state a quietly wrong total.
+        n = ha.TICKET_ATTACH_MAX + 5
+        many = [{"filename": f"f{i}.png", "content": f"https://s/{i}"} for i in range(n)]
+        d = ha._shape_issue_detail(_issue_detail_payload(fields={"attachment": many}), "s")
+        self.assertEqual(len(d["attachments"]), ha.TICKET_ATTACH_MAX)
+        self.assertEqual(d["attachments"][-1]["name"], f"f{n - 1}.png")   # newest kept
+        self.assertEqual(d["attachments"][0]["name"], f"f{n - ha.TICKET_ATTACH_MAX}.png")
+        self.assertEqual(d["attachmentTotal"], n)
+
+    def test_the_total_counts_only_fetchable_entries(self):
+        d = ha._shape_issue_detail(_issue_detail_payload(fields={"attachment": [
+            "junk", {"filename": "no-url.png"},
+            {"filename": "ok.pdf", "content": "https://s/2"},
+        ]}), "s")
+        self.assertEqual(d["attachmentTotal"], 1)
+
 
 class TestFetchJiraIssue(unittest.TestCase):
     def test_requests_the_issue_with_detail_fields(self):
@@ -10090,6 +10608,9 @@ class TestFetchJiraIssue(unittest.TestCase):
         # The available status changes come back with the issue (XERK-138), not
         # in a second round trip.
         self.assertEqual(seen["params"]["expand"], "transitions")
+        # The ticket's attachments ride the same GET (XERK-242) — without the
+        # field asked for, Jira sends none and a session sees no files at all.
+        self.assertIn("attachment", seen["params"]["fields"])
         self.assertEqual(d["key"], "ENG-42")
         self.assertEqual(d["url"], "https://myorg.atlassian.net/browse/ENG-42")
 
@@ -10452,6 +10973,42 @@ class TestFetchAzureIssue(unittest.TestCase):
             d = ha.fetch_azure_issue("42")
         self.assertEqual(d["comments"], [])
         self.assertEqual(d["commentTotal"], 0)
+
+    def test_attached_files_come_off_the_relations(self):
+        # XERK-242: Azure keeps attachments as work-item relations, not a field —
+        # and the item carries other relation kinds that are not files.
+        wi = _azure_wi(42, "Active")
+        wi["relations"] = [
+            {"rel": "System.LinkTypes.Hierarchy-Reverse", "url": "https://x/1"},
+            {"rel": "AttachedFile",
+             "url": "https://dev.azure.com/org/_apis/wit/attachments/abc",
+             "attributes": {"name": "trace.log", "resourceSize": 88}},
+        ]
+
+        def req(path, params, body=None):
+            if path == "/_apis/wit/workitems/42":
+                return wi
+            raise RuntimeError("no comments")
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            d = ha.fetch_azure_issue("42")
+        self.assertEqual(d["attachments"], [{
+            "name": "trace.log", "size": 88, "mime": None,
+            "url": "https://dev.azure.com/org/_apis/wit/attachments/abc",
+        }])
+
+    def test_no_relations_is_no_attachments(self):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/workitems/42":
+                return _azure_wi(42, "Active")
+            raise RuntimeError("no comments")
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            self.assertEqual(ha.fetch_azure_issue("42")["attachments"], [])
 
 
 class TestBoardSourceDispatch(unittest.TestCase):
@@ -12606,8 +13163,59 @@ class TestBuildTicketPrompt(unittest.TestCase):
         # It's built from a network response; a shape surprise must not take the
         # spawn (and with it the manager's beat) down.
         for junk in (None, {}, {"comments": [None, "x"], "labels": "nope"},
-                     {"key": "P-1", "comments": [{}]}):
+                     {"key": "P-1", "comments": [{}]},
+                     {"key": "P-1", "attachments": "nope"},
+                     {"key": "P-1", "attachments": [None, "x"]}):
             self.assertIsInstance(ha.build_ticket_prompt(junk), str)
+
+    # --- attachments (XERK-242) ---------------------------------------------
+
+    def _with_files(self, **over):
+        return self._detail(attachments=[{"name": "shot.png", "url": "https://s/1"}],
+                            attachmentTotal=1, **over)
+
+    def test_it_reports_the_ticket_s_real_total_not_what_landed(self):
+        # "2 files are attached to this ticket" when 3 are, or when 25 are and
+        # the cap kept 10, is a count the session has no way to check.
+        d = self._detail(
+            attachments=[{"name": f"f{i}.png", "url": f"https://s/{i}"} for i in range(3)],
+            attachmentTotal=25)
+        p = ha.build_ticket_prompt(d, (["/u/f1.png"], ["f2.png"]))
+        self.assertIn("This ticket has 25 attached files", p)
+        self.assertIn("22 oldest are not listed", p)   # dropped by the cap, said so
+        self.assertIn("f2.png", p)                     # the miss is still named
+
+    def test_a_detail_with_no_total_falls_back_to_what_it_carries(self):
+        # An older agent's cached detail has no attachmentTotal.
+        d = self._detail(attachments=[{"name": "a.png", "url": "https://s/1"}])
+        p = ha.build_ticket_prompt(d, (["/u/a.png"], []))
+        self.assertIn("This ticket has 1 attached file.", p)
+        self.assertNotIn("not listed here", p)
+
+    def test_downloaded_attachments_are_named_by_their_path_on_disk(self):
+        p = ha.build_ticket_prompt(
+            self._with_files(), (["/root/.turma/uploads/abc/shot.png"], []))
+        self.assertIn("## Attachments", p)
+        self.assertIn("/root/.turma/uploads/abc/shot.png", p)
+        # The section sits ahead of the closing instruction, so the last thing
+        # the session reads is still what to do.
+        self.assertLess(p.index("## Attachments"), p.index("Start by working out"))
+
+    def test_a_file_that_could_not_be_downloaded_is_still_named(self):
+        p = ha.build_ticket_prompt(self._with_files(), ([], ["shot.png"]))
+        self.assertIn("shot.png", p)
+        self.assertIn("could not be downloaded", p)
+
+    def test_a_ticket_with_no_files_gets_no_section(self):
+        self.assertNotIn("## Attachments",
+                         ha.build_ticket_prompt(self._detail(), ([], [])))
+
+    def test_files_are_named_without_paths_when_none_were_fetched(self):
+        # No download attempted: say the files exist and where to get them,
+        # rather than claiming paths that aren't there.
+        p = ha.build_ticket_prompt(self._with_files())
+        self.assertIn("shot.png", p)
+        self.assertIn("NOT on this machine", p)
 
 
 class TestSpawnTicket(ManagerMixin, unittest.TestCase):
@@ -12693,6 +13301,58 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
             sm.spawn_ticket("PROJ-7")
         cmd = self._launches()[-1][-1]
         self.assertIn("the board is broken", cmd)
+
+    def test_the_ticket_files_are_downloaded_and_their_paths_ride_the_prompt(self):
+        # XERK-242: the session has no board creds, so a ticket's screenshots are
+        # fetched FOR it and land where its Read is already pre-approved.
+        sm = self.make_ticket_manager()
+        detail = self._detail(attachments=[
+            {"name": "shot.png", "url": f"https://{self.SITE}/rest/api/3/"
+                                        "attachment/content/1", "size": 3}])
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: detail), \
+             mock.patch.object(ha, "fetch_board_attachment", return_value=b"PNG"):
+            sm.spawn_ticket("PROJ-7")
+        sid = sm.registry[0]["id"]
+        landed = os.path.join(ha.UPLOADS_DIR, sid, "shot.png")
+        self.assertTrue(os.path.exists(landed))
+        self.assertIn(landed, self._launches()[-1][-1])
+        # ...and out of the worktree, which prune/delete read as held work.
+        self.assertFalse(landed.startswith(sm.registry[0]["worktreePath"]))
+
+    def test_a_queued_ticket_downloads_its_files_when_it_is_provisioned(self):
+        # The paths are keyed on the session id, so a session that waited on a
+        # clone still gets them — under ITS id, not a placeholder.
+        sm = self.make_ticket_manager(repo="Elsewhere")
+        sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")]["nameWithOwner"] = \
+            "xerktech/Elsewhere"
+        sm.clone = lambda nwo, source=None: None
+        detail = self._detail(attachments=[
+            {"name": "spec.pdf", "url": f"https://{self.SITE}/x", "size": 3}])
+        # An awaiting-clone session's repoPath is built from REPOS_ROOT, which
+        # ManagerMixin does NOT redirect — it is the production default, and this
+        # is the one test that CREATES that directory rather than just naming it.
+        with mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git")), \
+             mock.patch.object(ha, "fetch_jira_issue", lambda k: detail), \
+             mock.patch.object(ha, "fetch_board_attachment") as fetch:
+            sm.spawn_ticket("PROJ-7")
+            fetch.assert_not_called()          # nothing fetched while it queues
+            sess = sm.registry[0]
+            os.makedirs(os.path.join(sess["repoPath"], ".git"), exist_ok=True)
+            fetch.return_value = b"PDF"
+            sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        self.assertIn(os.path.join(ha.UPLOADS_DIR, sess["id"], "spec.pdf"),
+                      self._launches()[-1][-1])
+
+    def test_an_undownloadable_file_costs_the_file_not_the_session(self):
+        sm = self.make_ticket_manager()
+        detail = self._detail(attachments=[
+            {"name": "shot.png", "url": f"https://{self.SITE}/x"}])
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: detail), \
+             mock.patch.object(ha, "fetch_board_attachment", return_value=None):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry[0]["status"], "running")
+        self.assertIn("could not be downloaded", self._launches()[-1][-1])
 
     def test_the_reserved_branch_rides_the_system_prompt(self):
         sm = self.make_ticket_manager()

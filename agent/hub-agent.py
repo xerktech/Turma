@@ -43,6 +43,7 @@ import base64
 import datetime
 import html
 import io
+import ipaddress
 import json
 import os
 import re
@@ -349,6 +350,32 @@ UPLOAD_RETENTION_SEC = int(os.environ.get("TURMA_UPLOAD_RETENTION_SEC", str(30 *
 # name arriving over the wire must never be able to escape UPLOADS_DIR.
 UPLOAD_NAME_BAD_RE = re.compile(r"[^A-Za-z0-9._ ()+-]")
 UPLOAD_NAME_MAX = 100
+# Ticket attachments (XERK-242). A ticket's own screenshots and files are part of
+# what it asks for, and the session has no board creds to go and fetch them with
+# — so they are pulled off the tracker at spawn and written into that session's
+# uploads directory, exactly where a chat attachment lands, and their paths go in
+# the initial prompt. Bounded separately from the composer's: nobody chose these
+# file by file, so a ticket carrying a 200 MB capture must not stall a spawn.
+TICKET_ATTACH_MAX = int(os.environ.get("TURMA_TICKET_ATTACH_MAX", "10"))
+TICKET_ATTACH_MAX_BYTES = int(
+    os.environ.get("TURMA_TICKET_ATTACH_MAX_BYTES", str(1 << 24)))   # 16 MiB each
+TICKET_ATTACH_TOTAL_BYTES = int(
+    os.environ.get("TURMA_TICKET_ATTACH_TOTAL_BYTES", str(1 << 26)))  # 64 MiB total
+TICKET_ATTACH_TIMEOUT_SEC = int(
+    os.environ.get("TURMA_TICKET_ATTACH_TIMEOUT_SEC", "20"))
+# ...and a HARD wall-clock budget for the whole batch, not just per file. This
+# runs on the manager's one loop, inside a spawn, so a tracker that stays on the
+# line would otherwise hold the beat and take the host OFFLINE (the hub gives up
+# at 75s). Everything else the loop blocks on is bounded the same way —
+# FETCH_TIMEOUT_SEC, JIRA_TIMEOUT_SEC. The timeout above is NOT what enforces
+# this: it caps the wait for the next byte, which a server dribbling bytes resets
+# forever. fetch_board_attachment's chunked read is what makes this a real bound.
+TICKET_ATTACH_DEADLINE_SEC = int(
+    os.environ.get("TURMA_TICKET_ATTACH_DEADLINE_SEC", "40"))
+# How much of a body one read1() may ask for. Small enough that a trickling
+# server is cut off promptly by the deadline check between chunks, big enough
+# that a real download costs a handful of iterations per MiB.
+ATTACH_CHUNK_BYTES = 1 << 16
 # Operator messages are EXEMPT from the history window (XERK-186): a
 # tool-heavy session fills HISTORY_MAX_MSGS with tool_use/tool_result turns in
 # minutes, evicting the few messages the operator actually typed — measured
@@ -4257,6 +4284,27 @@ def upload_dir_for(session_id):
     return os.path.join(UPLOADS_DIR, safe_upload_name(session_id))
 
 
+def _write_new_file(path, blob):
+    """Write `blob` to a file this call CREATES, 0600, or raise.
+
+    O_EXCL|O_NOFOLLOW rather than open(path, "wb"): `_unique_upload_path` asks
+    os.path.exists(), which FOLLOWS a symlink, so a dangling one in the uploads
+    tree reads as a free name and a plain write would create its target instead.
+    Creating the file outright is also what makes the mode 0600 from the start
+    rather than for the moment after the bytes land."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(blob)
+    except Exception:
+        # Don't leave a half-written file behind under a name the prompt names.
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        raise
+
+
 def _unique_upload_path(dirpath, name):
     """`dirpath/name`, suffixed `-2`, `-3`, … if that name is already taken.
     Attaching screenshot.png twice must not have the second silently replace the
@@ -5121,6 +5169,247 @@ def _write_was_refused(err):
     return isinstance(code, int) and 400 <= code < 500
 
 
+# --- Attachment download (XERK-242) --------------------------------------------
+# The one path that fetches BYTES rather than JSON off a tracker. It is separate
+# from _board_urlopen for two reasons: the reply is binary and must be read under
+# a byte cap, and an attachment download is the one tracker request that leaves
+# the tracker's host — Jira answers /attachment/content with a 30x to a media CDN.
+
+def _url_host(url):
+    """A URL's lowercase host[:port], '' if it has none."""
+    try:
+        return urllib.parse.urlsplit(str(url or "")).netloc.lower()
+    except Exception:
+        return ""
+
+
+def board_attachment_host():
+    """The one host this agent will fetch an attachment from: the configured
+    tracker's. Every attachment URL we act on is checked against it — the URLs
+    come out of a tracker response, but they are the only field in a ticket that
+    we turn into an outbound request carrying a credential, so a compromised or
+    misbehaving server must not be able to point that request anywhere else."""
+    if board_source() == "azure":
+        return _url_host(azure_base())
+    return normalize_jira_site(JIRA_SITE)
+
+
+def _host_is_public(hostname):
+    """Whether `hostname` resolves ONLY to addresses outside the ranges an
+    attachment fetch has no business reaching — loopback, link-local (which is
+    where cloud instance metadata lives), private, reserved, multicast.
+
+    Deny on anything we can't resolve or can't parse: this gates a redirect the
+    TRACKER chose, so "don't know" must not mean "go ahead"."""
+    if not hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            return False
+        # is_global, not `not is_private`: it is the one flag that also excludes
+        # carrier-NAT (100.64/10), benchmarking and documentation space, and it
+        # reads an IPv4-mapped IPv6 address (::ffff:10.0.0.1) as what it maps to.
+        # Multicast is excluded separately — 224.0.0.0/4 counts as global.
+        if not ip.is_global or ip.is_multicast:
+            return False
+    return True
+
+
+def attachment_redirect_ok(newurl):
+    """Whether an attachment download may FOLLOW `newurl`.
+
+    Following a redirect off the tracker is required, not optional — Jira answers
+    /attachment/content with a 30x to a media CDN — so the initial URL's
+    tracker-only check cannot simply be repeated here. What is enforced instead:
+      - http/https only (urllib's own redirect check would also permit ftp:, and
+        the opener carries an FTP handler);
+      - back to the tracker is always fine, INCLUDING a tracker on a private
+        address, which a self-hosted TFS/Jira routinely is;
+      - anywhere else must be a public address, so a tracker cannot turn this
+        into a read of 169.254.169.254, a neighbour on the LAN, or localhost.
+
+    Known limit: we resolve the name and http.client then resolves it AGAIN to
+    connect, so a tracker that also runs low-TTL DNS can answer the two calls
+    differently. Closing that needs connecting to a pinned address with an
+    explicit Host header, which urllib doesn't offer; it is left open knowingly,
+    since reaching it means already controlling the configured tracker.
+    """
+    parts = urllib.parse.urlsplit(str(newurl or ""))
+    if parts.scheme not in ("http", "https"):
+        return False
+    # `and host` so an unconfigured board (host "") isn't a wildcard matching a
+    # netloc-less URL — belt to fetch_board_attachment's braces.
+    host = board_attachment_host()
+    if host and parts.netloc.lower() == host:
+        return True
+    try:
+        return _host_is_public(parts.hostname)
+    except Exception:
+        return False
+
+
+class _StripAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Police an attachment redirect: where it may go, and what it may carry.
+
+    urllib copies a request's headers onto the redirected one verbatim, so the
+    default behaviour would hand our Jira Basic auth to the CDN the download
+    redirects to — which both leaks the credential to a third party and (since
+    the presigned URL carries its own auth) is what makes the fetch fail.
+
+    The credential survives only a redirect that stays on the SAME ORIGIN —
+    scheme included, so an `https -> http` hop on one host drops it rather than
+    putting the tracker's Basic auth on the wire in cleartext. Where the hop may
+    point at all is attachment_redirect_ok's business; a refused target raises,
+    which fetch_board_attachment turns into a named miss like any other failure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not attachment_redirect_ok(newurl):
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                f"refused redirect to {str(newurl)[:120]}", headers, fp)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _url_origin(req.full_url) != _url_origin(newurl):
+            for h in ("Authorization", "Proxy-authorization", "Cookie"):
+                new.remove_header(h)
+        return new
+
+
+def _url_origin(url):
+    """(scheme, host[:port]) — what "the same place" means for carrying a
+    credential. The SCHEME is part of it: https://h and http://h are the same
+    host but not the same trust, and a downgrade is how a credential ends up in
+    cleartext."""
+    try:
+        p = urllib.parse.urlsplit(str(url or ""))
+        return (p.scheme.lower(), p.netloc.lower())
+    except Exception:
+        return ("", "")
+
+
+_ATTACH_OPENER = urllib.request.build_opener(_StripAuthRedirect())
+
+
+def _attachment_decoder(encoding):
+    """An INCREMENTAL decompressor for a content-encoded body, or None when the
+    body is already what it says. Raises on an encoding we can't undo.
+
+    Incremental, and fed a `max_length` per chunk by the read loop, because the
+    byte cap has to bound what comes OUT. Bounding only the compressed body is
+    no bound at all: gzip does ~1000:1 on repetitive data, so 2 MB on the wire
+    inflates to gigabytes, and a one-shot `gzip.decompress` allocates all of it
+    before any size check can run — on the manager's own process, which is PID 1
+    in the container and dies to the OOM killer rather than raising.
+
+    We ask for `identity`, so this only fires for a proxy or self-hosted front
+    end that compressed anyway — which is exactly a party we don't control."""
+    enc = (encoding or "").strip().lower()
+    if enc in ("", "identity"):
+        return None
+    if enc == "gzip":
+        return zlib.decompressobj(16 + zlib.MAX_WBITS)
+    if enc == "deflate":
+        return zlib.decompressobj()
+    raise ValueError(f"unsupported Content-Encoding {enc!r}")
+
+
+def fetch_board_attachment(url, max_bytes, timeout=None, deadline=None):
+    """One attachment's bytes off the configured tracker, or None.
+
+    Total and best-effort: every failure (a rejected URL, a refused redirect, an
+    HTTP error, a timeout, a body past `max_bytes`) returns None and logs,
+    because the caller NAMES a file that didn't arrive rather than pretending it
+    did.
+
+    `deadline` (a time.monotonic() stamp) is a HARD stop, and the read loop is
+    what makes it one. A socket timeout bounds only how long we wait for the
+    NEXT byte, and one `read(n)` blocks until it has all n — so a server that
+    dribbles bytes under every byte cap resets the clock forever and holds the
+    manager's one loop with it. Reading a chunk at a time off `read1` (at most
+    one underlying read, returns what has arrived) puts a deadline check between
+    chunks, so a trickle is cut off instead of waited out. One byte past
+    `max_bytes` is fetched deliberately: it is how an oversized body is detected
+    rather than silently clipped to the cap."""
+    host = board_attachment_host()
+    parts = urllib.parse.urlsplit(str(url or ""))
+    if parts.scheme not in ("http", "https") or not host or parts.netloc.lower() != host:
+        log(f"attachment refused: {str(url)[:120]!r} is not on {host or '(no tracker)'}")
+        return None
+    if board_source() == "azure":
+        auth = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    else:
+        auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "*/*",
+        # Ask for the bytes as they are: nothing downstream inflates a body, and
+        # a silently-gzipped .png is worse than a slightly bigger download.
+        "Accept-Encoding": "identity",
+        "User-Agent": "turma-agent/1.0",
+    }, method="GET")
+    per_read = timeout or TICKET_ATTACH_TIMEOUT_SEC
+    if deadline is None:
+        deadline = time.monotonic() + per_read
+    try:
+        with _ATTACH_OPENER.open(req, timeout=per_read) as resp:
+            dec = _attachment_decoder(resp.headers.get("Content-Encoding"))
+            # `want` bounds BOTH sides: the bytes off the wire, and — when the
+            # body is compressed — the bytes they inflate to. `raw` is the wire
+            # count, `got` the count that ends up on disk.
+            want, raw, got = max_bytes + 1, 0, 0
+            chunks = []
+            while raw < want and got < want:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"past the download budget with {got} bytes read")
+                chunk = resp.read1(min(ATTACH_CHUNK_BYTES, want - raw))
+                if not chunk:
+                    break
+                raw += len(chunk)
+                if dec is None:
+                    chunks.append(chunk)
+                    got += len(chunk)
+                    continue
+                piece = dec.decompress(chunk, want - got)
+                chunks.append(piece)
+                got += len(piece)
+                if dec.unconsumed_tail:
+                    # The decompressor stopped at max_length with input left:
+                    # this body inflates past the cap. Refuse it here rather
+                    # than let the next chunk allocate the rest of the bomb.
+                    got = want
+                    break
+            blob = b"".join(chunks)
+            # A body that stopped early is a TRUNCATED file, and a half-written
+            # screenshot the session is told to read is worse than a named miss
+            # (the same call this repo makes for an over-long message). Only
+            # checked when we didn't stop deliberately at the cap: there, the
+            # short read IS the point. A stream with neither a length nor an
+            # end marker can't be judged, and is taken at face value.
+            if len(blob) <= max_bytes:
+                declared = resp.headers.get("Content-Length")
+                if dec is not None and not dec.eof:
+                    raise ValueError("compressed body ended mid-stream")
+                if (declared or "").strip().isdigit() and raw != int(declared):
+                    raise ValueError(
+                        f"body ended at {raw} of {declared} bytes")
+    except Exception as e:
+        log(f"attachment download failed ({str(url)[:120]}): {e}")
+        return None
+    if len(blob) > max_bytes:
+        log(f"attachment {str(url)[:120]} is past {max_bytes} bytes; skipping it")
+        return None
+    return blob
+
+
 def jira_req(path, params, body=None):
     """One authenticated request against the configured Jira Cloud site, parsed
     JSON out. GET when `body` is None, else a JSON POST — the board's status
@@ -5369,10 +5658,44 @@ def _jira_status_options(key):
     return _shape_transitions(data.get("transitions"))
 
 
+def _shape_attachments(raw, name_of, size_of, url_of, mime_of=None):
+    """The source-agnostic attachment list a detail carries (XERK-242):
+    ([{name, size, url, mime}], total) — capped at TICKET_ATTACH_MAX, and the
+    count BEFORE the cap beside it.
+
+    Only what a download needs plus what names it in the prompt — deliberately
+    NOT the bytes, which are fetched once, at spawn, by the session that will
+    read them. An entry missing a name or a URL is dropped from both counts:
+    there is nothing to fetch and nothing to call it.
+
+    The cap keeps the NEWEST, as the comment shaping does: both trackers list
+    attachments oldest-first, so keeping the first N would drop exactly the
+    screenshot someone added because the ticket is about it. `total` is reported
+    so nothing is dropped SILENTLY — the prompt says how many it isn't showing
+    rather than stating a count that is quietly wrong."""
+    usable = []
+    for a in raw or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(name_of(a) or "").strip()
+        url = str(url_of(a) or "").strip()
+        if not name or not url:
+            continue
+        size = size_of(a)
+        usable.append({
+            "name": name[:UPLOAD_NAME_MAX * 2],
+            "url": url,
+            "size": size if isinstance(size, int) else None,
+            "mime": (str(mime_of(a))[:100] if mime_of and mime_of(a) else None),
+        })
+    return usable[-TICKET_ATTACH_MAX:], len(usable)
+
+
 def _shape_issue_detail(issue, site_key):
     """One raw REST-v3 GET-issue response -> the card shape plus everything the
-    expanded view adds: description, comments, people, full labels, and the
-    available status transitions (from the `transitions` expansion)."""
+    expanded view adds: description, comments, people, full labels, the
+    available status transitions (from the `transitions` expansion), and the
+    ticket's attachments."""
     detail = _shape_issue(issue, site_key)
     fields = issue.get("fields") or {}
 
@@ -5416,6 +5739,15 @@ def _shape_issue_detail(issue, site_key):
     total = block.get("total")
     detail["commentTotal"] = total if isinstance(total, int) else len(comments)
     detail["statusOptions"] = _shape_transitions(issue.get("transitions"))
+    # `content` is the authenticated download URL Jira hands out for the file;
+    # it covers inline images too, which are ordinary attachments referenced by
+    # a media node in the description's ADF.
+    detail["attachments"], detail["attachmentTotal"] = _shape_attachments(
+        fields.get("attachment"),
+        name_of=lambda a: a.get("filename"),
+        size_of=lambda a: a.get("size"),
+        url_of=lambda a: a.get("content"),
+        mime_of=lambda a: a.get("mimeType"))
     detail["fetchedAt"] = now_iso()
     return detail
 
@@ -5430,7 +5762,7 @@ def fetch_jira_issue(key):
         f"/rest/api/3/issue/{urllib.parse.quote(key)}",
         {"fields": "summary,status,priority,issuetype,updated,created,duedate,"
                    "labels,project,parent,description,reporter,assignee,"
-                   "resolution,comment",
+                   "resolution,comment,attachment",
          "expand": "transitions"},
     )
     return _shape_issue_detail(data, site_key)
@@ -5975,6 +6307,16 @@ def _shape_azure_detail(wi, comments_data, site_key, base):
     detail["comments"] = comments
     total = (comments_data or {}).get("totalCount")
     detail["commentTotal"] = total if isinstance(total, int) else len(comments)
+    # Azure keeps attachments as work-item RELATIONS rather than a field: the
+    # `AttachedFile` ones ($expand=all brings them back), whose `url` is the
+    # attachments endpoint and whose name/size live under `attributes`.
+    rel = [r for r in (wi.get("relations") or [])
+           if isinstance(r, dict) and r.get("rel") == "AttachedFile"]
+    detail["attachments"], detail["attachmentTotal"] = _shape_attachments(
+        rel,
+        name_of=lambda r: (r.get("attributes") or {}).get("name"),
+        size_of=lambda r: (r.get("attributes") or {}).get("resourceSize"),
+        url_of=lambda r: r.get("url"))
     detail["fetchedAt"] = now_iso()
     return detail
 
@@ -6567,15 +6909,63 @@ def branch_names(repo_path):
     return names
 
 
-def build_ticket_prompt(detail):
+def _ticket_attachment_lines(detail, attachments):
+    """The prompt's `## Attachments` section, or [] when the ticket has none.
+
+    `attachments` is _store_ticket_attachments' (paths, failed_names): the files
+    that landed on disk, and the ones that didn't. Like a chat attachment, a file
+    is NAMED rather than dropped when it fails — a screenshot the ticket is built
+    around is exactly what the session needs to know it is missing. `None` means
+    no download was attempted at all, so the files are named without paths.
+
+    Nothing is inlined; the session reads them with its ordinary tools, and an
+    image is a Read away because they land under the pre-approved uploads tree."""
+    d = detail or {}
+    have = [a for a in d.get("attachments") or [] if isinstance(a, dict)]
+    if not have:
+        return []
+    # What the ticket really carries, which is not always what we shaped: the
+    # detail keeps only the newest TICKET_ATTACH_MAX. Saying so is the point —
+    # a count that quietly means "the ones we kept" is a lie the session can't
+    # check. Older agents/details carry no total; then what we have IS all of it.
+    total = d.get("attachmentTotal")
+    total = total if isinstance(total, int) and total >= len(have) else len(have)
+    lines = ["", "## Attachments", ""]
+    lines.append(f"This ticket has {total} attached file"
+                 f"{'' if total == 1 else 's'}.")
+    if attachments is None:
+        lines.append("They are NOT on this machine — open them from the ticket"
+                     " URL above if you need them:")
+        lines += [f"- {a.get('name')}" for a in have]
+    else:
+        paths, failed = attachments
+        if paths:
+            lines.append(
+                "%s downloaded to this machine; read %s from disk (images"
+                " included):" % ("One is" if len(paths) == 1 else f"{len(paths)} are",
+                                 "it" if len(paths) == 1 else "them"))
+            lines += [f"- {p}" for p in paths]
+        for name in failed or []:
+            lines.append(f"- {name} — could not be downloaded; open it from the"
+                         " ticket URL above.")
+    dropped = total - len(have)
+    if dropped > 0:
+        lines.append(f"\n_The {dropped} oldest are not listed here — they are in"
+                     " the ticket._")
+    return lines
+
+
+def build_ticket_prompt(detail, attachments=None):
     """A fetched ticket -> the initial task prompt for its session: everything the
     agent would otherwise have to go and read, inlined.
 
     The session has no board creds of its own (they live in the manager's env, not
     the worktree), so this text is all it will ever see of the ticket — hence the
     header saying plainly that it's a spawn-time snapshot and pointing at the URL
-    for the live copy. Caps mirror the detail fetch's own (description and comment
-    bodies are already clipped agent-side by the shaping)."""
+    for the live copy, and hence the ticket's own attachments being fetched FOR it
+    (XERK-242) rather than left behind a login it doesn't have. Caps mirror the
+    detail fetch's own (description and comment bodies are already clipped
+    agent-side by the shaping)."""
     d = detail or {}
     key = d.get("key") or ""
     summary = (d.get("summary") or "").strip()
@@ -6639,6 +7029,8 @@ def build_ticket_prompt(detail):
             when = c.get("created") or ""
             body = (c.get("body") or "").strip() or "_(empty)_"
             out.append(f"**{who}**{f' — {when}' if when else ''}\n{body}\n")
+
+    out += _ticket_attachment_lines(d, attachments)
 
     out += [
         "",
@@ -8469,8 +8861,8 @@ class SessionManager:
     # --- lifecycle (executed container-side; see CONTRACT) ----------------
 
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
-              model=None, permission_mode=None, ticket=None, cmd_id=None,
-              await_clone=None, await_clone_owner=None):
+              model=None, permission_mode=None, ticket=None, ticket_detail=None,
+              cmd_id=None, await_clone=None, await_clone_owner=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -8486,6 +8878,12 @@ class SessionManager:
         session. It is carried on the record rather than acted on here: it names
         the session, rides the heartbeat so the board can link ticket -> session,
         and its reserved `branch` is what _launch_tmux tells the agent to use.
+
+        ticket_detail is the fetched ticket that prompt would be built FROM, and
+        a ticket spawn passes it INSTEAD of prompt: the prompt names the ticket's
+        downloaded attachments (XERK-242), whose paths are keyed on the session
+        id minted here, so it can only be built once provisioning starts — which
+        for a queued session is a beat or an on-demand clone later.
 
         cmd_id is the hub's queued-command id. The session id is minted HERE, so
         the hub has no handle on the session it just asked for until a later
@@ -8596,6 +8994,8 @@ class SessionManager:
         # _provision_session.
         sess["_pendingBaseRef"] = base_ref
         sess["_pendingPrompt"] = prompt
+        if ticket_detail is not None:
+            sess["_pendingTicketDetail"] = ticket_detail
         if reason:
             sess["queuedReason"] = reason
             sess["queuedAt"] = now_iso()
@@ -8625,6 +9025,7 @@ class SessionManager:
         ticket = sess.get("ticket") or None
         base_ref = sess.pop("_pendingBaseRef", None)
         prompt = sess.pop("_pendingPrompt", None)
+        ticket_detail = sess.pop("_pendingTicketDetail", None)
         try:
             resolved_base = None
             if not is_root:
@@ -8642,6 +9043,14 @@ class SessionManager:
             # Shed the queue markers — the record is a live session now.
             for k in ("queuedReason", "queuedAt", "awaitClone", "awaitCloneOwner"):
                 sess.pop(k, None)
+            if ticket_detail is not None:
+                # A ticket session's prompt is built HERE rather than at spawn,
+                # because it names the files just pulled off the tracker into
+                # this session's own uploads dir (XERK-242).
+                prompt = build_ticket_prompt(
+                    ticket_detail,
+                    self._store_ticket_attachments(
+                        sess, ticket_detail.get("attachments")))
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
             # Record the worktree -> repo attribution so this session's token
@@ -8818,7 +9227,10 @@ class SessionManager:
         # so a Jira ticket record is byte-for-byte what it always was.
         if branch_base != key:
             ticket["branchBase"] = branch_base
-        self.spawn(repo_name, prompt=build_ticket_prompt(detail), ticket=ticket,
+        # The ticket text goes as the DETAIL, not as a built prompt: the prompt
+        # names the attachments this ticket's session downloads for itself, and
+        # those land under the session id spawn() is about to mint (XERK-242).
+        self.spawn(repo_name, ticket_detail=detail, ticket=ticket,
                    model=model, cmd_id=cmd_id, await_clone=await_clone,
                    await_clone_owner=(entry.get("nameWithOwner") if await_clone
                                       else None))
@@ -9397,14 +9809,77 @@ class SessionManager:
                 continue
             path = _unique_upload_path(dirpath, name)
             try:
-                with open(path, "wb") as fh:
-                    fh.write(blob)
-                os.chmod(path, 0o600)
+                _write_new_file(path, blob)
                 paths.append(path)
                 log(f"session {sess['id']}: attached {len(blob)} bytes as {path}")
             except Exception as e:
                 log(f"upload {item.get('id')}: write to {path} failed: {e}")
                 failed.append(name)
+        return paths, failed
+
+    def _store_ticket_attachments(self, sess, attachments):
+        """Pull a ticket's own files off the tracker into this session's uploads
+        directory (XERK-242), returning (paths, failed_names) like _store_uploads.
+
+        Same destination as a chat attachment on purpose: ~/.turma/uploads/<id>,
+        never the worktree (a file dropped in the repo reads as the uncommitted
+        work `prune`/`delete` key on), pre-approved for Read by the guard, and
+        already swept/deleted with the session that owns it.
+
+        Nobody picked these file by file — a ticket can carry a screen recording
+        as easily as a screenshot — so the caps are the point: at most
+        TICKET_ATTACH_MAX files, TICKET_ATTACH_MAX_BYTES each and
+        TICKET_ATTACH_TOTAL_BYTES together, all of it inside one
+        TICKET_ATTACH_DEADLINE_SEC wall clock (this blocks the manager's beat).
+        A file whose REPORTED size is already past the cap is skipped without
+        spending the download. Total by construction: this runs inside a spawn,
+        and a ticket whose files can't be fetched still gets its session (with
+        the misses named in the prompt)."""
+        items = [a for a in (attachments or []) if isinstance(a, dict)][:TICKET_ATTACH_MAX]
+        if not items:
+            return [], []
+        paths, failed, budget = [], [], TICKET_ATTACH_TOTAL_BYTES
+        deadline = time.monotonic() + TICKET_ATTACH_DEADLINE_SEC
+        dirpath = upload_dir_for(sess["id"])
+        try:
+            os.makedirs(dirpath, mode=0o700, exist_ok=True)
+        except Exception as e:
+            log(f"ticket attachments: cannot create the directory for session "
+                f"{sess.get('id')}: {e}")
+            return [], [safe_upload_name(a.get("name")) for a in items]
+        for item in items:
+            name = safe_upload_name(item.get("name"))
+            size = item.get("size")
+            cap = min(TICKET_ATTACH_MAX_BYTES, budget)
+            if isinstance(size, int) and size > cap:
+                log(f"ticket attachment {name}: {size} bytes is past the "
+                    f"{cap}-byte budget; not downloading it")
+                failed.append(name)
+                continue
+            left = deadline - time.monotonic()
+            if left <= 0:
+                log(f"ticket attachment {name}: past the "
+                    f"{TICKET_ATTACH_DEADLINE_SEC}s download budget; skipping it")
+                failed.append(name)
+                continue
+            # Both bounds go in: the per-file timeout caps how long we wait for
+            # the next byte, `deadline` caps the batch however slowly they come.
+            blob = fetch_board_attachment(
+                item.get("url"), cap, timeout=min(TICKET_ATTACH_TIMEOUT_SEC, left),
+                deadline=deadline)
+            if blob is None:
+                failed.append(name)
+                continue
+            path = _unique_upload_path(dirpath, name)
+            try:
+                _write_new_file(path, blob)
+            except Exception as e:
+                log(f"ticket attachment {name}: write to {path} failed: {e}")
+                failed.append(name)
+                continue
+            budget -= len(blob)
+            paths.append(path)
+            log(f"session {sess['id']}: ticket attachment {len(blob)} bytes as {path}")
         return paths, failed
 
     def _sweep_uploads(self):
