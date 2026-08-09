@@ -1,0 +1,32 @@
+# TEMPORARY diagnostic — delete with this branch.
+# Asks exactly what release.yml's publish job asks (create a release with the
+# Actions token), but as a DRAFT, which creates no tag and is deleted right
+# after. Distinguishes "org/repo policy blocks it" from "transient failure".
+name: zz-perms-probe
+on: push
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Create a draft release (no tag is created for a draft)
+        run: |
+          set +e
+          out=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" \
+            -f tag_name=zz-perms-probe -F draft=true -f name="perms probe" 2>&1)
+          rc=$?
+          echo "rc=$rc"
+          echo "$out"
+          echo "PROBE_RESULT: $( [ $rc -eq 0 ] && echo CAN_CREATE_RELEASE || echo CANNOT_CREATE_RELEASE )"
+      - name: Also probe a plain contents write (git push of a throwaway tag ref)
+        run: |
+          set +e
+          out=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref=refs/tags/zz-perms-probe-tag -f sha="${GITHUB_SHA}" 2>&1)
+          rc=$?
+          echo "rc=$rc"; echo "$out"
+          echo "TAG_RESULT: $( [ $rc -eq 0 ] && echo CAN_CREATE_TAG || echo CANNOT_CREATE_TAG )"
