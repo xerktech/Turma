@@ -101,6 +101,29 @@ test("ingestChunk: the cursor never rewinds, so a range can't be ingested twice 
     [ent("junk", "user", "nope")]);
   assert.equal(junk.bytesStored, 160);
   assert.equal(fs.readFileSync(file, "utf8").trim().split("\n").length, before);
+
+  // ...and neither must a HUGE one. The guard had a lower bound and no upper
+  // one, so an endOffset past 2^53 was stored into the SQLite INTEGER column
+  // and then threw "Value is too large to be represented as a JavaScript
+  // number" on every subsequent read — bricking that transcript's ingest
+  // permanently, with the poison chunk left as its last archived content. The
+  // agent chooses transcriptId, so any transcript was reachable (XERK-235).
+  for (const bad of [9007199254740992, 2 ** 53, 1e21, Infinity, "1e21", -0]) {
+    const poison = archive.ingestChunk("nas", "t1", { ...META }, 160, bad,
+      [ent("poison", "user", "poison")]);
+    assert.equal(poison.bytesStored, 160, `endOffset ${bad} must be refused`);
+  }
+  // The transcript still ingests afterwards — the whole point of refusing.
+  // On its OWN transcript, so this assertion doesn't move the shared fixture's
+  // line count out from under the tests below it.
+  archive.ingestChunk("nas", "tbound", { ...META }, 0, 10,
+    [ent("b1", "user", "first")]);
+  const poisoned = archive.ingestChunk("nas", "tbound", { ...META }, 10, 2 ** 53,
+    [ent("b2", "user", "poison")]);
+  assert.equal(poisoned.bytesStored, 10, "the huge cursor must be refused");
+  const ok = archive.ingestChunk("nas", "tbound", { ...META }, 10, 20,
+    [ent("b3", "user", "still ingesting")]);
+  assert.equal(ok.bytesStored, 20, "a legitimate chunk must still land after a refused one");
 });
 
 test("searchArchive: ranked, <mark>-highlighted snippets, repo/host filters", () => {

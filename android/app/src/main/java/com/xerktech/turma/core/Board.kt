@@ -338,11 +338,16 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                 // name — the picker's own order, so it doesn't inherit the
                 // scan's (board.js).
                 repoOptions = repoOpts.values
-                    .sortedWith(compareByDescending<RepoOption> { it.cloned }.thenBy { it.name }),
+                    .sortedWith(compareByDescending<RepoOption> { it.cloned }
+                        // board.js sorts with localeCompare, which is
+                        // case-INSENSITIVE; ordinal compareTo put every
+                        // capitalised repo ahead of every lowercase one.
+                        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }),
                 // Online hosts first (the ones a pin routes to today), then by
                 // name — the picker's own order (board.js hostOptions sort).
                 hostOptions = (hostOpts[site]?.values ?: emptyList())
-                    .sortedWith(compareByDescending<HostOption> { it.online }.thenBy { it.name }),
+                    .sortedWith(compareByDescending<HostOption> { it.online }
+                        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }),
                 models = BoardModels(
                     available = (modelAvail[site]?.toList() ?: emptyList()).sorted(),
                     defaultLabel = modelDefault[site]?.second ?: "",

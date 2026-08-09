@@ -127,12 +127,18 @@
   // `target="_blank"` is not a defence, it just happens to make Chrome refuse
   // the navigation. Mirrors safeUrl in index.html/sessions.html (XERK-235).
   function safeUrl(u) {
-    const s = String(u ?? "").trim();
+    // Tab/CR/LF are REMOVED by the URL parser before it parses, so they must be
+    // removed here too or the checks below see a different string than the
+    // browser will (`/<tab>/evil` parses as `//evil`).
+    const s = String(u ?? "").replace(/[\t\r\n]/g, "").trim();
+    if (/^(https?:|mailto:)/i.test(s)) return esc(s);
     // Root-relative is allowed — the ticket chip points at Turma's OWN board
-    // (/board?ticket=…), not out to the tracker. `//host` is NOT: that is
-    // protocol-relative and navigates off-origin.
-    if (s.startsWith("/") && !s.startsWith("//")) return esc(s);
-    return /^(https?:|mailto:)/i.test(s) ? esc(s) : "#";
+    // (/board?ticket=…), not out to the tracker. But only when the second
+    // character cannot begin an authority: a leading `//` is protocol-relative,
+    // and in a special scheme the parser treats `\` exactly as `/`, so `/\evil`
+    // resolves to http://evil just as `//evil` does.
+    if (/^\/(?![/\\])/.test(s)) return esc(s);
+    return "#";
   }
   function anchor(url, label) {
     return '<a href="' + safeUrl(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";

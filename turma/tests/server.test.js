@@ -109,6 +109,8 @@ const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking,
+  sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
+  HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, HEARTBEAT_TRANSIENT_KEYS,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -801,6 +803,54 @@ for (const finalState of ["MERGED", "CLOSED"]) {
     assert.deepEqual(dismisses(), []); // retracted once, on the edge
   });
 }
+
+// --- heartbeat / record bounds (XERK-235) ------------------------------------
+// A QA pass removed each of these guards in turn and the suite stayed green
+// every time. They are the difference between one buggy agent and a fleet-wide
+// outage, so each is pinned by name here.
+
+test("sanitizeHeartbeat drops an oversized UNKNOWN key and keeps known ones", () => {
+  const big = "A".repeat(HEARTBEAT_UNKNOWN_MAX + 1);
+  const p = sanitizeHeartbeat(
+    { device: "h", junk: big, sessions: [{ id: "s1" }], smallExtra: "ok" },
+    "h",
+  );
+  assert.equal(p.junk, undefined, "an oversized unknown key must be dropped");
+  assert.equal(p.smallExtra, "ok", "a SMALL unknown key must pass through — agents are often newer than the hub");
+  assert.deepEqual(p.sessions, [{ id: "s1" }]);
+});
+
+test("agentRecordSize bounds known keys too, and ignores the stripped caches", () => {
+  const big = "A".repeat(9 << 20);
+  // A known key is just as good an amplifier as an unknown one.
+  assert.ok(agentRecordSize({ device: "h", sessions: big }) > AGENT_RECORD_MAX);
+  // ...but the on-demand caches are excluded: serializeAgent strips them, and a
+  // legitimate ~5 MiB /history delivery lands there and must not cost the host
+  // its heartbeat.
+  assert.ok(agentRecordSize({ device: "h", history: { s1: { entries: big } } }) < AGENT_RECORD_MAX);
+  // Many small unknown keys must not sum past the ceiling unnoticed: the
+  // per-key bound had no aggregate, and 400 of them added 25 MiB.
+  const many = { device: "h" };
+  for (let i = 0; i < 400; i++) many[`k${i}`] = "B".repeat(HEARTBEAT_UNKNOWN_MAX - 100);
+  assert.ok(agentRecordSize(many) > AGENT_RECORD_MAX);
+});
+
+test("HEARTBEAT_TRANSIENT_KEYS names every on-demand delivery", () => {
+  // Each is folded into its own BOUNDED cache and must not also survive on the
+  // record, where it would be an unbounded duplicate re-serialized forever.
+  for (const k of ["historyResults", "subagentHistoryResults", "jiraIssueResults",
+                   "ticketStatusResults", "createMetaResults", "createTicketResults"]) {
+    assert.ok(HEARTBEAT_TRANSIENT_KEYS.includes(k), `${k} must be dropped after ingest`);
+  }
+});
+
+test("safeAgentsCache serves something rather than failing the fleet payload", () => {
+  // Unguarded, a RangeError here reached the route's generic catch as a 400 —
+  // to every dashboard, Android and glasses client, and permanently.
+  const cached = safeAgentsCache();
+  assert.ok(cached && typeof cached.body === "string" && cached.etag);
+  assert.doesNotThrow(() => JSON.parse(cached.body));
+});
 
 test("sessionWorking: a dead host's session is not still working (XERK-235)", () => {
   // paneBusy is a value on the record the host LAST PUSHED, so a host that dies

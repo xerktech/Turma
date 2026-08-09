@@ -507,11 +507,16 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
                 #    `eval bash -c 'rm -rf /etc'` into `bash -c rm -rf /etc`,
                 #    where `-c`'s argument is the bare word `rm`.
                 out.extend(_expand_segments(" ".join(shlex.quote(t) for t in inner), depth + 1))
-                # 2. Each token that is itself a command line. A quoted script is
-                #    one token and keeps that shape whatever follows it.
-                for tok in inner:
-                    if tok.strip() and re.search(r"\s", tok):
-                        out.extend(_expand_segments(tok, depth + 1))
+                # 2. The FIRST token, when it is itself a command line. A quoted
+                #    script is one token and keeps that shape whatever follows
+                #    it, so this covers the redirection case above.
+                #    Only the first: in `eval <cmd> <args…>` the trailing tokens
+                #    are ARGUMENTS, and expanding those classified
+                #    `eval echo 'rm -rf /etc'` — which prints text and deletes
+                #    nothing — as destructive. That is the "commit message
+                #    mentioning rm -rf" class this file exists not to refuse.
+                if inner[0].strip() and re.search(r"\s", inner[0]):
+                    out.extend(_expand_segments(inner[0], depth + 1))
         elif prog == "trap" and rest:
             # `trap 'rm -rf /etc' EXIT` runs its handler on the way out. Scan
             # every non-flag argument, not just the first: `trap -- '<cmd>' EXIT`
@@ -1023,7 +1028,7 @@ _EXEC_WRAPPERS = {
 }
 
 
-def _stage_executes_sql(tokens: list[str]) -> bool:
+def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
     """True if SQL reaching this command would actually be EXECUTED.
 
     Deliberately narrow on both sides. A text tool never executes what it is
@@ -1034,7 +1039,10 @@ def _stage_executes_sql(tokens: list[str]) -> bool:
     thing. A wrapper is checked through to its arguments, so
     `docker exec -i db psql` is still the database client it runs.
     """
-    if not tokens:
+    # Each level strips a wrapper or a `-c`, so this terminates on its own; the
+    # cap is a backstop against a pathological nest, not a security boundary
+    # (the outer _expand_segments has its own).
+    if not tokens or depth > _MAX_EXPAND_DEPTH:
         return False
     prog = _basename(tokens[0])
     if prog in _DB_CLIENTS:
@@ -1047,7 +1055,7 @@ def _stage_executes_sql(tokens: list[str]) -> bool:
         # runs grep. With no `-c` it reads stdin, so a pipeline into it does.
         i = _shell_c_index(tokens[1:])
         if i >= 0 and i + 1 < len(tokens[1:]):
-            return _stage_executes_sql(_tokenize(tokens[1:][i + 1]))
+            return _stage_executes_sql(_tokenize(tokens[1:][i + 1]), depth + 1)
         return True
     if prog in _EXEC_WRAPPERS:
         # Skip the wrapper's own options and target, then classify the command it
@@ -1056,9 +1064,9 @@ def _stage_executes_sql(tokens: list[str]) -> bool:
         for idx in range(1, len(tokens)):
             base = _basename(tokens[idx])
             if base in _DB_CLIENTS or base in _SHELL_PROGS:
-                return _stage_executes_sql(tokens[idx:])
+                return _stage_executes_sql(tokens[idx:], depth + 1)
             words = _tokenize(tokens[idx])
-            if len(words) > 1 and _stage_executes_sql(words):
+            if len(words) > 1 and _stage_executes_sql(words, depth + 1):
                 return True
     return False
 

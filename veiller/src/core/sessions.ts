@@ -12,21 +12,36 @@ export type LiveState = "working" | "waiting" | "idle" | "stopped" | "error" | "
 export type DisplayState = LiveState | "pending";
 
 const WORKING_WINDOW_MS = 90 * 1000;
+// Mirrors the hub's OFFLINE_AFTER_MS: beats arrive every ~20s.
+const OFFLINE_AFTER_MS = 75 * 1000;
 
 // Precedence: error > stopped > waiting > working > idle. "working" is read
 // straight off the session's TUI (paneBusy: the "esc to interrupt" hint is on
 // screen iff the model is actively working), falling back to transcript
 // freshness only when the agent didn't report paneBusy (older agent, or the
 // pane couldn't be captured).
-export function liveState(s: SessionInfo): LiveState {
+export function liveState(
+  s: SessionInfo,
+  hostLastSeen?: number,
+  now?: number,
+): LiveState {
   if (s.status === "error") return "error";
   if (s.status === "stopped") return "stopped";
   if (s.status === "queued") return "queued"; // port fix: see LiveState note above
   const live = s.session;
   if (live?.question) return "waiting";
+  // Two rules the web applies, in its order (XERK-235): no transcript yet is
+  // IDLE before paneBusy is consulted, and working requires the HOST to be
+  // online — paneBusy is a value on the record the host last pushed, so a host
+  // that dies mid-turn reads WORKING forever. Both host arguments are optional
+  // so a caller that cannot supply them keeps the old behaviour.
+  if (live?.transcriptAgeSec == null) return "idle";
+  if (hostLastSeen != null && (now ?? Date.now()) - hostLastSeen >= OFFLINE_AFTER_MS) {
+    return "idle";
+  }
   const working = live?.paneBusy != null
     ? live.paneBusy
-    : (live?.transcriptAgeSec != null && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS);
+    : live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS;
   return working ? "working" : "idle";
 }
 

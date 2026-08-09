@@ -748,6 +748,25 @@ function buildAgentsCache() {
   return agentsCache;
 }
 
+// `buildAgentsCache` stringifies the whole fleet, so it can still throw past
+// V8's string ceiling however well the per-record bound holds. Unguarded that
+// reached the route's generic catch as a 400 — to EVERY dashboard, Android and
+// glasses client, and permanently, because the records that caused it live for
+// PRUNE_AFTER_MS. Serving the last good payload (or an empty fleet) keeps the
+// UI alive and puts the reason in the log (XERK-235).
+function safeAgentsCache() {
+  const last = agentsCache;
+  try {
+    return buildAgentsCache();
+  } catch (e) {
+    console.error(`agents payload could not be serialized: ${e.message}`);
+    if (last) return last;
+    const body = JSON.stringify({ now: Date.now(), agents: [], error: "payload too large" });
+    return { body, etag: '"' + crypto.createHash("sha1").update(body).digest("base64") + '"' };
+  }
+  return agentsCache;
+}
+
 // Push one Server-Sent Event to every open /api/events stream (best-effort; a
 // dead stream is dropped on its next failed write and by its "close" handler).
 function sseBroadcast(event, dataObj) {
@@ -1341,6 +1360,38 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
 // contract). Bounding instead of allowlisting keeps that forward compatibility
 // while closing the amplification.
 const HEARTBEAT_UNKNOWN_MAX = 64 << 10; // 64 KiB
+
+// The ceiling on ONE host's record as it appears in the fleet payload. The
+// per-key bound above is necessary but not sufficient: it left KNOWN keys
+// unbounded (30 MiB under `sessions` amplified just as well) and it had no
+// aggregate, so 400 unknown keys each just under the per-key limit added 25 MiB
+// through the very path meant to stop it. Enough of those and `buildAgentsCache`
+// throws past V8's ~512 MiB string ceiling, which answered 400 to every
+// dashboard, Android and glasses client — permanently, since records live 7
+// days. Bounding the whole record closes known keys, unknown keys and the
+// aggregate in one place (XERK-235).
+//
+// Measured EXCLUDING the on-demand caches, which `serializeAgent` strips from
+// the payload and which are separately bounded by count: a legitimate ~5 MiB
+// `/history` delivery lands there and must not cost the host its heartbeat.
+const AGENT_RECORD_MAX = 8 << 20; // 8 MiB
+
+// The cache keys `serializeAgent` strips; see AGENT_RECORD_MAX.
+const AGENT_CACHE_KEYS = [
+  "history", "subagentHistory", "jiraIssues", "statusResults",
+  "createMeta", "createTypes", "createResults", "resultWaits",
+];
+
+// The serialized size of what this record contributes to /api/agents.
+function agentRecordSize(record) {
+  try {
+    return JSON.stringify(record, (k, v) =>
+      AGENT_CACHE_KEYS.includes(k) && v && typeof v === "object" ? undefined : v
+    ).length;
+  } catch {
+    return Infinity; // circular or unserializable — it cannot be persisted anyway
+  }
+}
 
 // Drop unrecognised keys that are too large to be a plausible new field.
 //
@@ -2981,7 +3032,7 @@ const server = http.createServer(async (req, res) => {
     // the body+ETag and revalidates with If-None-Match on its next poll. The
     // history cache is excluded from the payload (see serializeAgent).
     if (req.method === "GET" && url.pathname === "/api/agents") {
-      const cached = agentsCache || buildAgentsCache();
+      const cached = agentsCache || safeAgentsCache();
       if ((req.headers["if-none-match"] || "") === cached.etag) {
         res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache" });
         return res.end();
@@ -3104,6 +3155,20 @@ const server = http.createServer(async (req, res) => {
       // every SSE frame, forever. A single ~5 MiB history delivery therefore
       // became a permanent per-host tax (XERK-235).
       for (const k of HEARTBEAT_TRANSIENT_KEYS) delete next[k];
+      // The whole-record ceiling. Refuse the beat rather than persist it: the
+      // previous record stays, so the host degrades to "stale" instead of
+      // poisoning the fleet payload for a week, and the 413 tells the agent
+      // exactly what happened.
+      const recordSize = agentRecordSize(next);
+      if (recordSize > AGENT_RECORD_MAX) {
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        console.error(
+          `heartbeat from ${key}: record is ${recordSize} bytes, over the ` +
+            `${AGENT_RECORD_MAX} limit — beat refused`
+        );
+        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+      }
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);
@@ -4588,6 +4653,11 @@ if (process.env.TURMA_TEST) {
     server,
     agents,
     invalidateAgentsCache,
+    // XERK-235 heartbeat/record bounds — a QA pass removed each of these
+    // and the suite stayed green, so they are exported to be pinned.
+    sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
+    HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, HEARTBEAT_TRANSIENT_KEYS,
+
     queueCommand,
     findSession,
     wsAccept,

@@ -56,19 +56,32 @@ class SecurityGuardsTest {
 
         val stores = listOf("turma_prefs", "turma_secure_prefs")
 
+        // Assert on the whole <exclude> ELEMENT, not merely that the filename
+        // appears. Flipping <exclude> to <include> keeps every name present and
+        // INVERTS the meaning — under include semantics Android backs up only
+        // the listed paths, making these two files the only things backed up.
+        // A name-presence check stayed green through exactly that mutation.
+        fun excludes(xml: String, store: String) =
+            Regex("""<exclude[^>]*domain\s*=\s*"sharedpref"[^>]*path\s*=\s*"$store\.xml"""")
+                .containsMatchIn(xml)
+
         val backup = repoFile("src/main/res/xml/backup_rules.xml").readText()
+        assertFalse("backup_rules.xml must not use <include> — it inverts the rule",
+            backup.contains("<include"))
         for (s in stores) {
-            assertTrue("backup_rules.xml must exclude $s", backup.contains(s))
+            assertTrue("backup_rules.xml must <exclude> $s.xml from sharedpref", excludes(backup, s))
         }
 
         // API 31+ splits the two directions; an entry under only one of them
         // still leaks through the other.
         val extraction = repoFile("src/main/res/xml/data_extraction_rules.xml").readText()
+        assertFalse("data_extraction_rules.xml must not use <include> — it inverts the rule",
+            extraction.contains("<include"))
         for (section in listOf("cloud-backup", "device-transfer")) {
             val body = extraction.substringAfter("<$section", "").substringBefore("</$section>", "")
             assertFalse("data_extraction_rules.xml is missing a <$section> section", body.isEmpty())
             for (s in stores) {
-                assertTrue("<$section> must exclude $s", body.contains(s))
+                assertTrue("<$section> must <exclude> $s.xml from sharedpref", excludes(body, s))
             }
         }
     }

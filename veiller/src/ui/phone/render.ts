@@ -175,7 +175,7 @@ function endedCardHtml(hostLabel: string, s: SessionInfo, tint: string): string 
   );
 }
 
-interface Row { hostKey: string; hostLabel: string; s: SessionInfo; siteKey: string; }
+interface Row { hostKey: string; hostLabel: string; s: SessionInfo; siteKey: string; lastSeen?: number; }
 
 export function sessionsBodyHtml(state: AppState): string {
   const agents = filterAgents(state.agents, state.orgFilter);
@@ -192,15 +192,21 @@ export function sessionsBodyHtml(state: AppState): string {
     const hostLabel = a.device ?? a.key;
     const siteKey = siteKeyOf(a);
     for (const s of a.sessions ?? []) {
-      const row = { hostKey: a.key, hostLabel, s, siteKey };
+      const row = { hostKey: a.key, hostLabel, s, siteKey,
+                    lastSeen: typeof a.lastSeen === "number" ? a.lastSeen : undefined };
       if (s.status === "queued") queued.push(row);
       else if (s.status === "running") running.push(row);
       else ended.push(row); // stopped / error records still in the registry
     }
-    for (const s of a.closedSessions ?? []) ended.push({ hostKey: a.key, hostLabel, s: s as unknown as SessionInfo, siteKey });
+    for (const s of a.closedSessions ?? []) ended.push({ hostKey: a.key, hostLabel,
+      s: s as unknown as SessionInfo, siteKey,
+      lastSeen: typeof a.lastSeen === "number" ? a.lastSeen : undefined });
   }
-  const active = running.filter((r) => ["working", "waiting"].includes(liveState(r.s)));
-  const idle = running.filter((r) => !["working", "waiting"].includes(liveState(r.s)));
+  // The host arguments are what make the online gate apply at all — a dead
+  // host's stale paneBusy otherwise reads WORKING forever (XERK-235).
+  const now = Date.now();
+  const active = running.filter((r) => ["working", "waiting"].includes(liveState(r.s, r.lastSeen, now)));
+  const idle = running.filter((r) => !["working", "waiting"].includes(liveState(r.s, r.lastSeen, now)));
   const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
   [active, idle, queued, ended].forEach((l) => l.sort(byCreated));
 

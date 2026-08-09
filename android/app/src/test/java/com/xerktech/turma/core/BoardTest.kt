@@ -137,6 +137,24 @@ class BoardTest {
         assertEquals(listOf("only-on-A", "only-on-B"), opts.map { it.name }.sorted())
     }
 
+    @Test fun `picker ordering is case-insensitive, as board_js localeCompare is`() {
+        // board.js sorts with localeCompare; ordinal compareTo put every
+        // capitalised repo ahead of every lowercase one, so the two pickers
+        // listed the same repos in a different order (XERK-235).
+        val a = agent("h1", true, JiraBlock(
+            siteKey = "org", user = "u1", fetchedAt = "2026-08-08T12:00:00Z",
+            repoOptions = listOf(
+                RepoOption(name = "Turma", cloned = true),
+                RepoOption(name = "agent-notes", cloned = true),
+                RepoOption(name = "DockerOps", cloned = true),
+            ),
+        ))
+        assertEquals(
+            listOf("agent-notes", "DockerOps", "Turma"),
+            mergeSites(listOf(a)).single().repoOptions.map { it.name },
+        )
+    }
+
     @Test fun `a cloned copy wins the repoOptions dedupe`() {
         val a1 = agent("h1", true, JiraBlock(
             siteKey = "org", user = "u1", fetchedAt = "2026-08-08T12:00:00Z",

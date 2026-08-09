@@ -521,6 +521,25 @@ class TestKnownBypasses(unittest.TestCase):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         self.assertIsNone(guard.is_destructive("eval 'echo hi' > /dev/null"))
 
+    def test_eval_arguments_are_not_commands(self):
+        """`eval echo 'rm -rf /etc'` PRINTS text; it deletes nothing.
+
+        Expanding every whitespace-bearing token treated trailing ARGUMENTS as
+        commands, reintroducing the "commit message mentioning rm -rf" class
+        behind eval. Only the first token can be the command.
+        """
+        for cmd in ("eval echo 'rm -rf /etc'",
+                    "eval git commit -m 'rm -rf /etc is banned'",
+                    "eval printf '%s\\n' 'rm -rf /etc'",
+                    "eval logger 'rm -rf /etc completed'",
+                    "eval echo 'chmod -R 777 / would be bad'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+        self.assertIsNone(guard.policy_reason("eval echo 'git push origin main is blocked'"))
+        # ...while the command position still resolves.
+        self.assertIsNotNone(guard.is_destructive("eval 'rm -rf /etc' > /dev/null"))
+        self.assertIsNotNone(guard.is_destructive("eval bash -c 'rm -rf /etc'"))
+
     def test_a_shell_is_judged_on_what_it_runs(self):
         """Concluding from the shell's PRESENCE denied ordinary work.
 
