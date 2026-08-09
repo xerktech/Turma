@@ -312,8 +312,66 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
     return "\n".join(kept), bodies
 
 
+def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
+    """Split on shell operators that are NOT inside quotes.
+
+    Splitting the raw string severed a quoted script mid-quote, so a shell's
+    `-c` argument was reduced to its first WORD and the rest became a segment of
+    its own: `bash -c 'rm -rf /etc; echo done'` became
+    `["bash -c 'rm", "-rf /etc", "echo done'"]`, and `-c`'s argument was the bare
+    token `'rm`. It only ever fired when the destructive command came FIRST
+    inside the quotes, which is why every existing test — all of which write
+    `bash -c 'cd /tmp; rm -rf /etc'` — missed it (XERK-235).
+
+    Stripping stray quotes in the tokenizer instead is NOT the fix: it turns
+    `rg -n 'shutdown|reboot' ansible/` into a power-state command.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            # Inside double quotes a backslash escapes the next character;
+            # inside single quotes it does not, and nothing ends them but `'`.
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                buf.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        if command[i:i + 2] in ("&&", "||"):
+            out.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in (";", "\n", "&") or (include_pipe and ch == "|"):
+            out.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return [seg.strip() for seg in out if seg.strip()]
+
+
 def _split_segments(command: str) -> list[str]:
-    return [seg.strip() for seg in _SEGMENT_SPLIT.split(command) if seg.strip()]
+    return _split_on_operators(command, include_pipe=True)
 
 
 def _unwrap_group(segment: str) -> str:
@@ -1039,11 +1097,16 @@ def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
     thing. A wrapper is checked through to its arguments, so
     `docker exec -i db psql` is still the database client it runs.
     """
-    # Each level strips a wrapper or a `-c`, so this terminates on its own; the
-    # cap is a backstop against a pathological nest, not a security boundary
-    # (the outer _expand_segments has its own).
-    if not tokens or depth > _MAX_EXPAND_DEPTH:
+    if not tokens:
         return False
+    # Each level strips a wrapper or a `-c`, so this terminates on its own; the
+    # cap is a backstop against a pathological nest. It fails CLOSED, unlike
+    # _expand_segments: that returns a LIST and exhaustion means "no more
+    # commands found", whereas this returns a verdict on text already known to
+    # contain a database drop, so "ran out of budget deciding" should deny.
+    # Measured to change no verdict either way — real commands reach depth 0-2.
+    if depth > _MAX_EXPAND_DEPTH:
+        return True
     prog = _basename(tokens[0])
     if prog in _DB_CLIENTS:
         return True
@@ -1083,7 +1146,8 @@ def _destructive_database(command: str) -> str | None:
     # stage while the stage that executes it carries no SQL of its own, so
     # judging stages separately cleared both halves. Judge the pipeline whole —
     # it is destructive if any stage is something other than a text tool.
-    for pipeline in _PIPELINE_SPLIT.split(_split_heredocs(_prenormalise(command))[0]):
+    for pipeline in _split_on_operators(_split_heredocs(_prenormalise(command))[0],
+                                        include_pipe=False):
         if not _DB_DESTRUCTION.search(pipeline):
             continue
         for stage in pipeline.split("|"):

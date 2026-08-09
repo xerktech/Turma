@@ -1382,6 +1382,10 @@ const HEARTBEAT_UNKNOWN_MAX = 64 << 10; // 64 KiB
 // `/history` delivery lands there and must not cost the host its heartbeat.
 const AGENT_RECORD_MAX = 8 << 20; // 8 MiB
 
+// Which hosts are already over half the ceiling, so the warning above fires on
+// the crossing rather than on every beat.
+const recordSizeWarned = new Map();
+
 // The cache keys `serializeAgent` strips; see AGENT_RECORD_MAX.
 const AGENT_CACHE_KEYS = [
   "history", "subagentHistory", "jiraIssues", "statusResults",
@@ -3153,15 +3157,20 @@ const server = http.createServer(async (req, res) => {
       // mutated — a refused beat still poisoned the caches and its content came
       // back out of /history with a 413 on the wire.
       const recordSize = agentRecordSize(next);
-      if (recordSize > AGENT_RECORD_MAX / 2 && recordSize <= AGENT_RECORD_MAX) {
-        // Visible BEFORE it 413s. Measured against the operator's real fleet the
-        // largest record is 0.30 MiB, so half the ceiling means something has
-        // changed shape (~316 repos or ~165 sessions on one host).
+      // Visible BEFORE it 413s. Measured against the operator's real fleet the
+      // largest record is 0.30 MiB, so half the ceiling means something has
+      // changed shape (~158 repos or ~83 sessions on one host). Logged on the
+      // CROSSING EDGE only, and re-armed when it drops back: beats arrive every
+      // ~8s, so warning per-beat would be ~10,800 lines a day, forever, for a
+      // host that legitimately settles above the line.
+      const overHalf = recordSize > AGENT_RECORD_MAX / 2 && recordSize <= AGENT_RECORD_MAX;
+      if (overHalf && !recordSizeWarned.get(key)) {
         console.warn(
           `heartbeat from ${key}: record is ${recordSize} bytes, over half the ` +
             `${AGENT_RECORD_MAX} limit`
         );
       }
+      recordSizeWarned.set(key, overHalf);
       if (recordSize > AGENT_RECORD_MAX) {
         if (prev && Object.keys(prev).length) agents[key] = prev;
         else delete agents[key];

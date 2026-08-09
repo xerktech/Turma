@@ -579,6 +579,43 @@ class TestKnownBypasses(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
+    def test_segments_are_not_split_inside_quotes(self):
+        """A quoted script must survive segmentation whole.
+
+        Splitting the RAW string severed it mid-quote, so a shell's `-c`
+        argument was reduced to its FIRST WORD and the rest became a segment of
+        its own — `bash -c 'rm -rf /etc; echo done'` classified as the program
+        `'rm`. It fired only when the destructive command came FIRST inside the
+        quotes, and every existing test wrote `bash -c 'cd /tmp; rm -rf /etc'`,
+        which is why it survived origin/main untouched (XERK-235).
+        """
+        self.assertEqual(
+            guard._split_segments("bash -c 'rm -rf /etc; echo done'"),
+            ["bash -c 'rm -rf /etc; echo done'"],
+        )
+        for cmd in ("bash -c 'rm -rf /etc; echo done'",
+                    "bash -c 'rm -rf /etc && echo ok'",
+                    "bash -c 'rm -rf /etc | tee log'",
+                    "sh -c 'chmod -R 777 /; echo x'",
+                    "eval 'rm -rf /etc; echo done'",
+                    'bash -c "rm -rf /etc; echo done"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ("bash -c 'gh pr merge 1; echo done'",
+                    "bash -c 'echo a; git push origin main'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.policy_reason(cmd))
+
+    def test_a_quoted_operator_is_not_a_command_boundary(self):
+        """The other direction: stripping quotes to fix the above turns
+        `rg -n 'shutdown|reboot' ansible/` into a power-state command."""
+        for cmd in ("rg -n 'shutdown|reboot' ansible/", "grep -n 'a;b' f",
+                    "echo 'a && b'", "git commit -m 'fix; and more'",
+                    "bash -c 'npm run build; npm test'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 
