@@ -773,6 +773,40 @@ class TestKnownBypasses(unittest.TestCase):
         # to `a`, and denying it was a false positive.
         self.assertIsNone(guard.is_destructive("ssh host 'a' 'rm -rf /etc'"))
 
+    def test_a_container_named_like_a_program_is_not_that_program(self):
+        """`reboot` is an ordinary container name in a homelab.
+
+        The disk/power rules match on argv[0] ALONE — no path, no argument — so
+        once the wrapper suffix pass started classifying every argv, a container
+        called `reboot` read as a power command. Suffix-derived candidates now
+        run only the rules that also require a dangerous PATH (XERK-235).
+        """
+        for cmd in ("docker run --name reboot alpine true", "docker exec reboot ls -la",
+                    "docker exec shutdown env", "kubectl exec halt -- ls",
+                    "docker run --name poweroff img true",
+                    "docker run --entrypoint shred img --help"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+        # ...while a real power command through a wrapper still denies, because
+        # that one is found at the command POSITION, not by the suffix pass.
+        self.assertIsNotNone(guard.is_destructive("ssh prod 'shutdown -h now'"))
+        self.assertIsNotNone(guard.is_destructive("shutdown -h now"))
+
+    def test_what_follows_a_printer_is_data(self):
+        """`ssh host echo rm -rf /etc` prints text; it deletes nothing."""
+        for cmd in ("docker run --rm alpine echo rm -rf /etc",
+                    "ssh host echo rm -rf /etc",
+                    "ssh host echo git push origin main",
+                    "docker run img printf 'x' rm -rf /etc",
+                    "ssh host logger rm -rf /etc failed"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+        # The printer's OWN suffix is still emitted, so a real command reached
+        # only by the suffix pass keeps working.
+        self.assertIsNotNone(
+            guard.policy_reason("ssh --madeup-flag v host git push origin main"))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 

@@ -614,12 +614,21 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             # option is a lost sharpening rather than a bypass. Safe to
             # over-approximate: a suffix starting in the wrong place yields a
             # program like `host` or a quoted message, which matches nothing.
+            stop = False
             for idx in range(len(rest)):
-                if rest[idx].startswith("-"):
+                if stop or rest[idx].startswith("-"):
                     continue
                 tail = _strip_prefixes(rest[idx:])
                 if len(tail) > 1:
-                    out.append((tail, seg))
+                    out.append((tail, seg, True))
+                # Everything after a program that only PRINTS is its arguments,
+                # not another command: `ssh host echo rm -rf /etc` prints text,
+                # and `docker run img printf 'x' rm -rf /etc` puts an argument
+                # between the two. The printer's own suffix is emitted first, so
+                # `ssh <unlisted-opt> v host git push origin main` still reaches
+                # the policy rule.
+                if _basename(rest[idx]) in _ARG_ONLY_PROGS:
+                    stop = True
         elif prog == "xargs" and rest:
             # Drop xargs' own leading options, keep the command and ITS flags,
             # then append what the pipeline will feed it as operands. An option
@@ -1036,7 +1045,7 @@ def policy_reason(command: str) -> str | None:
     not push to / delete `main`/`master` directly, and it may not merge any
     pull request — that is a human reviewer's call.
     """
-    for tokens, _segment in _expand_segments(command):
+    for tokens, _segment, *_flags in _expand_segments(command):
         prog = _basename(tokens[0])
         rest = tokens[1:]
         if prog == "git":
@@ -1137,12 +1146,17 @@ _EXEC_WRAPPER_OPERANDS = {
 # VALUE eats an operand slot and the command is missed entirely: `ssh -i key
 # host rm -rf /etc` counted `key` as the host and returned `['host','rm',…]`.
 # Same shape, and the same reason, as _PREFIX_OPTS_WITH_VALUE.
-# NB: this table is an OPTIMISATION, not a security boundary. It cannot be kept
-# complete — value-taking options are many and grow every release — so a miss
-# must not be a bypass. `_expand_segments` therefore also classifies every
-# non-option suffix of a wrapper's argv (see the wrapper branch), which finds the
-# command wherever it actually starts. The table only sharpens the ONE position
-# that gets the single-token-is-a-command-line reading.
+# This table cannot be kept complete — value-taking options are many and grow
+# every release — so `_expand_segments` also classifies every non-option SUFFIX
+# of a wrapper's argv, which finds an UNQUOTED command wherever it starts. For
+# that form a missing option costs sharpness, not safety.
+#
+# For a QUOTED command (`ssh -unlisted v host 'rm -rf /etc'`) the table IS still
+# the boundary: the command is one token, and only the position this table
+# identifies gets the single-token-is-a-command-line reading. A suffix pass
+# cannot help there — the difference between a quoted COMMAND and a quoted
+# MESSAGE (`ssh host git commit -m 'rm -rf /etc is banned'`) is precisely the
+# operand count. So do not delete an entry believing the suffix pass covers it.
 _EXEC_WRAPPER_OPTS_WITH_VALUE = {
     "ssh": {"-i", "-p", "-o", "-l", "-F", "-c", "-m", "-b", "-B", "-D", "-e",
             "-E", "-I", "-J", "-L", "-O", "-Q", "-R", "-S", "-W", "-w"},
@@ -1173,6 +1187,10 @@ _EXEC_WRAPPER_OPTS_WITH_VALUE = {
 # remote shell, rather than exec'd as an argv: `ssh host 'rm -rf /etc' 'b'`
 # really runs `rm -rf /etc b`. `docker exec`/`kubectl exec` do NOT join.
 _JOINING_WRAPPERS = {"ssh", "chroot"}
+
+# Programs whose remaining arguments are DATA. Used by the wrapper suffix pass
+# to stop treating later tokens as command starts.
+_ARG_ONLY_PROGS = _ECHO_PROGS | _TEXT_PROGS | {"logger", "notify-send", "say"}
 
 
 def _wrapper_command(prog: str, rest: list[str]) -> list[str]:
@@ -1252,7 +1270,7 @@ def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
 
 
 def _destructive_database(command: str) -> str | None:
-    for tokens, segment in _expand_segments(command):
+    for tokens, segment, *_flags in _expand_segments(command):
         if not _DB_DESTRUCTION.search(segment):
             continue
         if not _stage_executes_sql(tokens):
@@ -1276,7 +1294,7 @@ def _destructive_database(command: str) -> str | None:
     for owner, body in _split_heredocs(command)[1]:
         if not _DB_DESTRUCTION.search(body):
             continue
-        for tokens, _seg in _expand_segments(owner):
+        for tokens, _seg, *_flags in _expand_segments(owner):
             if _stage_executes_sql(tokens):
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     return None
@@ -1291,14 +1309,23 @@ def is_destructive(command: str) -> str | None:
     reason = _destructive_database(command)
     if reason:
         return reason
-    for tokens, segment in _expand_segments(command):
-        for reason in (
+    for tokens, segment, *flags in _expand_segments(command):
+        # A candidate recovered by the wrapper SUFFIX pass is a guess at where
+        # the command starts, so only the rules that also require a dangerous
+        # PATH run on it. `_destructive_disk_power` matches on argv[0] ALONE, and
+        # `reboot`/`shutdown`/`halt`/`shred` are ordinary container and pod
+        # names — `docker exec reboot ls` must not read as a power command
+        # (XERK-235).
+        from_suffix = bool(flags and flags[0])
+        checks = [
             _destructive_rm(tokens),
             _destructive_chmod_chown(tokens),
             _destructive_git(tokens, segment),
-            _destructive_disk_power(tokens, segment),
-            _destructive_powershell_remove(segment),
-        ):
+        ]
+        if not from_suffix:
+            checks.append(_destructive_disk_power(tokens, segment))
+            checks.append(_destructive_powershell_remove(segment))
+        for reason in checks:
             if reason:
                 return reason
     return None
