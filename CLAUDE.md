@@ -1640,7 +1640,7 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 - When you touch one of these web files, check its Android counterpart:
   - `index.html` → `ui/FleetScreen.kt` + `ui/FleetDialogs.kt`
   - `sessions.html` + `chat.js` → `ui/SessionsScreen.kt` + `ui/ChatScreen.kt` + `vm/ChatViewModel.kt`
-    (+ `ui/ArchiveScreen.kt` for the full-history search)
+    (its ONE box filters the live lists AND appends archive matches — `core/Search.kt`, XERK-243)
   - `board.js` + `board.html` → `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt`
   - `usage.html` → `ui/UsageScreen.kt`
   - `nav.js` → `ui/MainScaffold.kt` + `ui/TurmaApp.kt`

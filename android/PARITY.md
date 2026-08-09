@@ -14,7 +14,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 |-------------------------------|-------------------------------------------------------------------|
 | `index.html` (Dashboard)      | `ui/FleetScreen.kt`, `ui/FleetDialogs.kt`                          |
 | `sessions.html` + `chat.js`   | `ui/SessionsScreen.kt`, `ui/ChatScreen.kt`, `vm/ChatViewModel.kt` |
-| Sessions sidebar full-search  | `ui/ArchiveScreen.kt` (reached via the Sessions search action)     |
+| Sessions sidebar full-search  | `ui/SessionsScreen.kt`'s search box + "In history" section          |
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
@@ -106,9 +106,16 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   auto-follows the moved session onto its new host (`advanceMigrationFollow`); Android just lets it
   reappear in the session list on its new host (no stage to follow on a phone), so the "Moving…" card
   hint and the follow are web-only.
-- **Full-history archive search reachable.** `ui/ArchiveScreen.kt` was fully built but orphaned; it's
-  now a route reached from a search action on the Sessions header (the web puts this search in the
-  Sessions sidebar). The live Sessions box is relabeled "Filter these sessions" to distinguish it.
+- **One Sessions search box, doing both halves (XERK-243).** The web sidebar's single box searches the
+  archive only, hiding the live lists while a query is up. Android's box filters the live/queued/ended
+  lists as you type AND, past two characters, appends an "In history" section of archive full-text
+  matches below them — so one bar answers "which session is this?" whether the session is running or
+  ended years ago. Superseded the previous split (a Search action in the Sessions header opening a
+  separate `ui/ArchiveScreen.kt`, plus an on-page "Filter these sessions" field), which crowded the
+  header; that screen is gone and its search lives in `ui/SessionsScreen.kt` + `core/Search.kt`. The
+  web can adopt the merged box later; nothing was removed from it here. Also dropped with the screen:
+  its browse-all-archived list (`GET /api/archive`) — the Ended sessions section already lists the
+  fleet's ended work, and search reaches the rest.
 - **Dashboard summary tiles.** The six tiles (Hosts online / Running / Waiting on you / Tokens
   today·week·all-time + dominant model) atop the Fleet screen, from `core/Fleet.kt` (a pure port of
   index.html's reducers). Tested in `FleetTest`.
