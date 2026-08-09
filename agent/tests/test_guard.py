@@ -506,6 +506,60 @@ class TestKnownBypasses(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
+    # --- fourth QA gate (XERK-235) -----------------------------------------
+
+    def test_eval_is_not_branched_on_token_count(self):
+        """A redirection is a token but not argv.
+
+        Branching single-vs-multi on `len(inner)` sent `eval '<cmd>' > /dev/null`
+        down the argv path, where re-quoting folded the whole payload into one
+        word — the exact failure that re-quoting was added to prevent.
+        """
+        for cmd in ("eval 'rm -rf /etc' > /dev/null", "eval 'rm -rf /etc' 2>/dev/null",
+                    "eval 'rm -rf /etc' >/tmp/log 2>&1"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        self.assertIsNone(guard.is_destructive("eval 'echo hi' > /dev/null"))
+
+    def test_a_shell_is_judged_on_what_it_runs(self):
+        """Concluding from the shell's PRESENCE denied ordinary work.
+
+        `docker exec app sh -c 'grep …'` runs grep. Scanning every word of every
+        wrapper argument made any shell anywhere mean "executes SQL", so a
+        `DROP TABLE` search string denied — and `docker exec … sh -c` is one of
+        the most common commands in this repo's own world.
+        """
+        drop_tb, drop_db = "DROP" + " TABLE", "DROP" + " DATABASE"
+        for cmd in (f"docker exec app sh -c 'grep \"{drop_tb}\" /app/schema.sql'",
+                    f"docker exec app sh -c 'ls /data' # schema has {drop_tb}",
+                    f"docker run --rm alpine sh -c 'echo {drop_tb}'",
+                    f"bash -c 'grep \"{drop_tb}\" schema.sql'"):
+            with self.subTest(allowed=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+        # ...while a shell that really reaches a client, or reads stdin, does.
+        for cmd in (f"docker exec db sh -c 'psql -c \"{drop_db} p\"'",
+                    f"echo '{drop_db} p' | docker exec -i db sh",
+                    f"echo '{drop_db} p' | kubectl exec -i pod -- bash",
+                    f"bash -c \"psql -c '{drop_db} p'\""):
+            with self.subTest(denied=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_a_named_home_prefix_is_a_root_too(self):
+        for cmd in ("rm -rf ~root/$(cat t)", "rm -rf ~ubuntu/$(cat t)"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_an_ordinary_prefix_before_a_substitution_stays_allowed(self):
+        """The NEGATIVE side of the placeholder rule, which nothing pinned.
+
+        Widening the prefix test to "any prefix at all" passed every other test
+        here while re-breaking the whole mktemp class in a new form.
+        """
+        for cmd in ("rm -rf build/$(cat t)", "rm -rf /tmp/$(cat t)",
+                    "rm -rf ./$(cat t)", "rm -rf target/$(git rev-parse HEAD)"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 

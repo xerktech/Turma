@@ -496,18 +496,22 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             inner = rest
             while inner and _basename(inner[0]) == "eval":
                 inner = inner[1:]
-            if len(inner) == 1:
-                # `eval '<whole command>'` — the single token IS a command line,
-                # so it expands as written. Quoting it here would make the whole
-                # string one word and hide the command inside it.
-                out.extend(_expand_segments(inner[0], depth + 1))
-            elif inner:
-                # Several tokens are an argv, and shlex.split has already removed
-                # the quotes that grouped them. A plain join regrouped it wrongly:
-                # `eval bash -c 'rm -rf /etc'` became `bash -c rm -rf /etc`, where
-                # `-c`'s argument is the bare word `rm` and the target vanished.
-                # One eval was enough — this was never about the depth cap.
+            if inner:
+                # Two readings, both expanded — branching between them on token
+                # COUNT was wrong, because a redirection is a token too and
+                # `eval '<cmd>' > /dev/null` then took the argv branch, where
+                # quoting folded the payload into one word.
+                #
+                # 1. The whole argv, re-QUOTED so grouping survives: shlex.split
+                #    has already dropped the quotes, and a plain join turned
+                #    `eval bash -c 'rm -rf /etc'` into `bash -c rm -rf /etc`,
+                #    where `-c`'s argument is the bare word `rm`.
                 out.extend(_expand_segments(" ".join(shlex.quote(t) for t in inner), depth + 1))
+                # 2. Each token that is itself a command line. A quoted script is
+                #    one token and keeps that shape whatever follows it.
+                for tok in inner:
+                    if tok.strip() and re.search(r"\s", tok):
+                        out.extend(_expand_segments(tok, depth + 1))
         elif prog == "trap" and rest:
             # `trap 'rm -rf /etc' EXIT` runs its handler on the way out. Scan
             # every non-flag argument, not just the first: `trap -- '<cmd>' EXIT`
@@ -633,7 +637,10 @@ def _is_dangerous_path(tok: str) -> bool:
         prefix = low.split(_OPAQUE_SUBST)[0]
         stem = prefix.rstrip("/")
         if prefix and (stem == "" or stem == "~" or stem in _HOME_TOKENS
-                       or stem in _SYSTEM_ROOTS):
+                       or stem in _SYSTEM_ROOTS
+                       # `~root/` + empty output is `/root/` — the same case as
+                       # `~/`, which the bare-`~` test already covers.
+                       or re.match(r"^~[a-z0-9_][a-z0-9_.-]*$", stem)):
             return True
     if bare in _HOME_TOKENS or low in _HOME_TOKENS:
         return True
@@ -1030,20 +1037,29 @@ def _stage_executes_sql(tokens: list[str]) -> bool:
     if not tokens:
         return False
     prog = _basename(tokens[0])
-    if prog in _DB_CLIENTS or prog in _SHELL_PROGS:
+    if prog in _DB_CLIENTS:
         return True
     if prog in _TEXT_PROGS:
         return False
+    if prog in _SHELL_PROGS:
+        # A shell is only an executor of whatever it is GIVEN. Concluding from
+        # the shell alone denied `sh -c 'grep "DROP TABLE" schema.sql'`, which
+        # runs grep. With no `-c` it reads stdin, so a pipeline into it does.
+        i = _shell_c_index(tokens[1:])
+        if i >= 0 and i + 1 < len(tokens[1:]):
+            return _stage_executes_sql(_tokenize(tokens[1:][i + 1]))
+        return True
     if prog in _EXEC_WRAPPERS:
-        # The remote command usually arrives QUOTED, so it is a single token
-        # whose basename is the whole string (`ssh db 'psql -c "..."'`). Re-split
-        # each argument before testing it, and count a shell too — `docker exec
-        # -i db sh` runs whatever it is piped just as `sh` does at top level.
-        for tok in tokens[1:]:
-            for word in _tokenize(tok) or [tok]:
-                base = _basename(word)
-                if base in _DB_CLIENTS or base in _SHELL_PROGS:
-                    return True
+        # Skip the wrapper's own options and target, then classify the command it
+        # RUNS on its own terms. The remote command usually arrives quoted, as a
+        # single token whose basename is the whole string (`ssh db 'psql -c …'`).
+        for idx in range(1, len(tokens)):
+            base = _basename(tokens[idx])
+            if base in _DB_CLIENTS or base in _SHELL_PROGS:
+                return _stage_executes_sql(tokens[idx:])
+            words = _tokenize(tokens[idx])
+            if len(words) > 1 and _stage_executes_sql(words):
+                return True
     return False
 
 
