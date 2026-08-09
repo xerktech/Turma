@@ -160,6 +160,15 @@ class ChatItemsTest {
         assertEquals(4, (items.single() as ChatItem.Bubble).revealLen)
     }
 
+    @Test fun `an orphan result with EMPTY text still renders, as the web does`() {
+        // chat.js pushes the card and renders "(no output)"; an isNotBlank()
+        // guard here dropped it. The last divergence of 14 wire cases (XERK-235).
+        val e = TailEntry(id = "e9", role = "user",
+            blocks = listOf(ToolResultBlock(forId = "gone", text = "")))
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        assertEquals(1, items.filterIsInstance<ChatItem.Tool>().size)
+    }
+
     @Test fun `orphan tool_result is kept when outputs are shown`() {
         val e = TailEntry(id = "e5", role = "assistant", blocks = listOf(ToolResultBlock(forId = "gone", text = "leftover")))
         val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))

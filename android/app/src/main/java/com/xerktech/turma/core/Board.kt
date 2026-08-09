@@ -268,6 +268,13 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     // probe's default label. Collected over EVERY reporting host, like hostOpts.
     val modelAvail = LinkedHashMap<String, LinkedHashSet<String>>()
     val modelDefault = LinkedHashMap<String, Pair<String, String>>()  // site -> (at, defaultLabel)
+    // site -> repo name -> picker option, collected over EVERY reporting host —
+    // like hostOpts above, and for the same reason board.js gives: the blocks
+    // that survive the byUser dedupe are one per (site, user), and the COMMON
+    // case is an org whose hosts all poll as the same user. Collected in the
+    // winners loop below it saw exactly one of them, so the picker offered
+    // whichever host polled last and a repo cloned only on another vanished.
+    val repoOptsBySite = LinkedHashMap<String, LinkedHashMap<String, RepoOption>>()
     for (a in agents) {
         val j = a.jira ?: continue
         if (j.siteKey.isBlank()) continue
@@ -282,6 +289,14 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
             for (m in mb.available) if (m.isNotBlank() && m != "default") set.add(m)
             val cur = modelDefault[j.siteKey]
             if (cur == null || mb.at >= cur.first) modelDefault[j.siteKey] = mb.at to mb.defaultLabel
+        }
+        // `cloned` is host-relative and a cloned copy wins the dedupe: "someone
+        // here has it" is the useful claim, and a pin fans out to every host.
+        val ro = repoOptsBySite.getOrPut(j.siteKey) { LinkedHashMap() }
+        for (o in j.repoOptions) {
+            if (o.name.isBlank()) continue
+            val seen = ro[o.name]
+            if (seen == null || (o.cloned && !seen.cloned)) ro[o.name] = o
         }
         val k = j.siteKey + "\u0000" + j.user
         val prev = byUser[k]
@@ -306,18 +321,9 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
         }
         val tickets = ArrayList(byKey.values)
         val newest = sorted.first().j
-        // Union repoOptions over EVERY block of the site, exactly as the web
-        // does — taking only `newest`'s meant the picker offered whichever host
-        // polled Jira last, and a repo cloned only on the other vanished from
-        // the dropdown. `cloned` is host-relative and a cloned copy wins the
-        // dedupe: "someone here has it" is the useful claim, and the pin fans
-        // out to every host anyway.
-        val repoOpts = LinkedHashMap<String, RepoOption>()
-        for (b in sorted) for (o in b.j.repoOptions) {
-            if (o.name.isBlank()) continue
-            val seen = repoOpts[o.name]
-            if (seen == null || (o.cloned && !seen.cloned)) repoOpts[o.name] = o
-        }
+        // Unioned over every reporting host in the first loop above — see
+        // repoOptsBySite for why it cannot be collected here.
+        val repoOpts = repoOptsBySite[site] ?: LinkedHashMap()
         out.add(
             BoardSite(
                 siteKey = site,

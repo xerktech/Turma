@@ -496,8 +496,18 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             inner = rest
             while inner and _basename(inner[0]) == "eval":
                 inner = inner[1:]
-            if inner:
-                out.extend(_expand_segments(" ".join(inner), depth + 1))
+            if len(inner) == 1:
+                # `eval '<whole command>'` — the single token IS a command line,
+                # so it expands as written. Quoting it here would make the whole
+                # string one word and hide the command inside it.
+                out.extend(_expand_segments(inner[0], depth + 1))
+            elif inner:
+                # Several tokens are an argv, and shlex.split has already removed
+                # the quotes that grouped them. A plain join regrouped it wrongly:
+                # `eval bash -c 'rm -rf /etc'` became `bash -c rm -rf /etc`, where
+                # `-c`'s argument is the bare word `rm` and the target vanished.
+                # One eval was enough — this was never about the depth cap.
+                out.extend(_expand_segments(" ".join(shlex.quote(t) for t in inner), depth + 1))
         elif prog == "trap" and rest:
             # `trap 'rm -rf /etc' EXIT` runs its handler on the way out. Scan
             # every non-flag argument, not just the first: `trap -- '<cmd>' EXIT`
@@ -611,6 +621,20 @@ def _is_dangerous_path(tok: str) -> bool:
         # Nothing is named at all. This must NOT read as the filesystem root:
         # an unknown substitution used to collapse to "" and take this branch.
         return False
+    # `rm -rf /$(cat x)` IS `rm -rf /` when the substitution prints nothing, and
+    # `/` plus an unknown has no safe reading. The placeholder is harmless as a
+    # WHOLE token; appended to a root it must not launder it.
+    if _OPAQUE_SUBST in low:
+        # What PRECEDES the placeholder is the whole question. Nothing before it
+        # means the substitution is the entire target (`rm -rf "$(mktemp -d)"`),
+        # which is unknowable but not a root. A root before it is the dangerous
+        # case — hence the empty-prefix test happens BEFORE any rstrip, which
+        # would flatten `/` and `` to the same thing.
+        prefix = low.split(_OPAQUE_SUBST)[0]
+        stem = prefix.rstrip("/")
+        if prefix and (stem == "" or stem == "~" or stem in _HOME_TOKENS
+                       or stem in _SYSTEM_ROOTS):
+            return True
     if bare in _HOME_TOKENS or low in _HOME_TOKENS:
         return True
     # `~root` / `~someuser` expand to that account's home, and `/root` is itself
@@ -1011,7 +1035,15 @@ def _stage_executes_sql(tokens: list[str]) -> bool:
     if prog in _TEXT_PROGS:
         return False
     if prog in _EXEC_WRAPPERS:
-        return any(_basename(t) in _DB_CLIENTS for t in tokens[1:])
+        # The remote command usually arrives QUOTED, so it is a single token
+        # whose basename is the whole string (`ssh db 'psql -c "..."'`). Re-split
+        # each argument before testing it, and count a shell too — `docker exec
+        # -i db sh` runs whatever it is piped just as `sh` does at top level.
+        for tok in tokens[1:]:
+            for word in _tokenize(tok) or [tok]:
+                base = _basename(word)
+                if base in _DB_CLIENTS or base in _SHELL_PROGS:
+                    return True
     return False
 
 

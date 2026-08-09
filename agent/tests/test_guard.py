@@ -449,6 +449,63 @@ class TestKnownBypasses(unittest.TestCase):
             with self.subTest(mentions=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
+    # --- third QA gate (XERK-235): regressions the FIXES introduced ---------
+
+    def test_the_opaque_placeholder_cannot_launder_a_root(self):
+        """`rm -rf /$(cat x)` IS `rm -rf /` when the substitution prints nothing.
+
+        Substituting a placeholder instead of erasing fixed the mktemp false
+        positive, but a placeholder that is harmless as a whole token is NOT
+        harmless appended to a bare root.
+        """
+        for cmd in ("rm -rf /$(cat target.txt)", "rm -rf /$(basename /etc)",
+                    "rm -rf /`basename /etc`", "rm -rf ~/$(cat x)",
+                    "chmod -R 777 /$(cat t)", "chown -R nobody /$(cat t)"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        # ...while the whole-token case stays allowed (the D10 fix).
+        for cmd in ('rm -rf "$(mktemp -d)"', 'rm -rf "$(pwd)/build"',
+                    'rm -rf "$(go env GOCACHE)"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_opaque_placeholder_is_non_empty(self):
+        """The invariant the rule above turns on.
+
+        Setting it to "" passed every other test in this file while silently
+        restoring the empty-target-reads-as-root bug.
+        """
+        self.assertTrue(guard._OPAQUE_SUBST)
+        self.assertNotIn("/", guard._OPAQUE_SUBST)
+
+    def test_eval_requotes_when_it_rejoins(self):
+        """shlex.split strips the quotes, so a plain join regroups the argv.
+
+        `eval bash -c 'rm -rf /etc'` rejoined to `bash -c rm -rf /etc`, where
+        `-c`'s argument is the bare word `rm` and the target vanished. One eval
+        was enough — this was never about the depth cap.
+        """
+        for cmd in ("eval bash -c 'rm -rf /etc'", "eval sh -c 'rm -rf /etc'",
+                    "eval eval bash -c 'rm -rf /etc'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        self.assertIsNone(guard.is_destructive("eval bash -c 'npm run build'"))
+
+    def test_a_wrapper_carrying_a_quoted_remote_command(self):
+        """`ssh db 'psql -c "..."'` is ONE token whose basename is the whole
+        string, so a per-token client test never matched it — and a shell run by
+        a wrapper executes what it is piped just as a top-level shell does.
+        """
+        drop_db = "DROP" + " DATABASE"
+        for cmd in (f"ssh dbhost 'psql -c \"{drop_db} p\"'",
+                    f"docker exec db sh -c 'psql -c \"{drop_db} p\"'",
+                    f"echo '{drop_db} p' | docker exec -i db sh"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ("ssh host 'uptime'", "docker exec app sh -c 'ls /'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 

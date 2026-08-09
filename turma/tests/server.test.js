@@ -802,6 +802,31 @@ for (const finalState of ["MERGED", "CLOSED"]) {
   });
 }
 
+test("sessionWorking: a dead host's session is not still working (XERK-235)", () => {
+  // paneBusy is a value on the record the host LAST PUSHED, so a host that dies
+  // mid-turn leaves paneBusy:true behind. Without the online gate its session
+  // read working forever — which made readyForReview short-circuit, so the
+  // operator's phone never buzzed for exactly the stranded work that needs it.
+  const now = 1_000_000;
+  const sess = { id: "s1", status: "running",
+                 session: { paneBusy: true, transcriptAgeSec: 5 } };
+  assert.equal(sessionWorking(sess, now - 10_000, now), true);   // host alive
+  assert.equal(sessionWorking(sess, now - 600_000, now), false); // host gone
+  // And no transcript yet is idle BEFORE paneBusy is consulted, the web's order.
+  assert.equal(
+    sessionWorking({ id: "s2", status: "running", session: { paneBusy: true } }, now, now),
+    false,
+  );
+  // A dead host's finished work therefore reaches Ready for review.
+  const done = { paneBusy: true, transcriptAgeSec: 5,
+                 lastRole: "assistant", lastHasToolUse: false };
+  const stranded = { id: "s3", status: "running", session: done };
+  assert.equal(
+    readyForReview(stranded, sessionWorking(stranded, now - 600_000, now)),
+    true,
+  );
+});
+
 test("readyForReview: the qualifiers, and the one thing that un-qualifies", () => {
   const sess = (session, extra = {}) => ({ id: "s1", status: "running", session, ...extra });
   const done = { lastRole: "assistant", lastHasToolUse: false };

@@ -1191,7 +1191,8 @@ function onOptChange(rk, repo) {
 function composer(a, repo, rk, spawning) {
   const d = composerDraft.get(rk) || {};
   const o = loadOpts(repo.name);
-  const key = esc(a.key), rn = esc(repo.name);
+  // Handler-only, like index.html's composer — JS-string escaper, not the text one.
+  const key = escJs(a.key), rn = escJs(repo.name);
   const bases = [];
   for (const b of [repo.defaultBranch, repo.branch, ...(repo.branches || []), o.baseRef]) {
     if (b && !bases.includes(b)) bases.push(b);
@@ -1329,6 +1330,9 @@ function escJs(s) {
     .replace(/>/g, "\\x3E")
     .replace(/\r/g, "\\r")
     .replace(/\n/g, "\\n")
+    // A raw NUL is rewritten to U+FFFD by the HTML tokenizer, so the handler
+    // would receive corrupted data rather than the value it was given.
+    .replace(/\0/g, "\\x00")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
 }
@@ -1857,7 +1861,10 @@ function moveMenu(a, s) {
 // clears the name back to the label/worktree fallback. The text lives in
 // renameDraft so the re-render can't wipe it mid-type.
 function renameCard(a, s) {
-  const done = `submitRename('${esc(a.key)}','${esc(s.id)}')`;
+  // `done` IS a handler body (onkeydown + onclick below), so both values need
+  // the JS-string escaper. Reaching a handler through a local variable is how
+  // this site survived the first conversion pass.
+  const done = `submitRename('${escJs(a.key)}','${escJs(s.id)}')`;
   return `<div class="s-rename" onclick="event.stopPropagation()">
     <input id="${renFieldId(s.id)}" value="${esc(renameDraft)}" maxlength="48"
       placeholder="${esc(sessMeta(s) || s.id)}" aria-label="Session name"

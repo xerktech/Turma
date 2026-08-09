@@ -119,6 +119,24 @@ class BoardTest {
         assertEquals(listOf("alpha", "zeta"), opts.map { it.name })
     }
 
+    @Test fun `repoOptions union hosts polling as the SAME tracker user`() {
+        // The case board.js calls the common one, and the case the two tests
+        // around this one cannot see: they use different `user`s, so byUser keeps
+        // both blocks and the union appears to work wherever it is collected.
+        // With one user, byUser keeps ONE block — so collecting the union from
+        // the winners dropped every repo cloned on any other host (XERK-235).
+        val a1 = agent("h1", true, JiraBlock(
+            siteKey = "org", user = "mal@acme.io", fetchedAt = "2026-08-08T12:00:00Z",
+            repoOptions = listOf(RepoOption(name = "only-on-A", cloned = true)),
+        ))
+        val a2 = agent("h2", true, JiraBlock(
+            siteKey = "org", user = "mal@acme.io", fetchedAt = "2026-08-08T13:00:00Z",
+            repoOptions = listOf(RepoOption(name = "only-on-B", cloned = true)),
+        ))
+        val opts = mergeSites(listOf(a1, a2)).single().repoOptions
+        assertEquals(listOf("only-on-A", "only-on-B"), opts.map { it.name }.sorted())
+    }
+
     @Test fun `a cloned copy wins the repoOptions dedupe`() {
         val a1 = agent("h1", true, JiraBlock(
             siteKey = "org", user = "u1", fetchedAt = "2026-08-08T12:00:00Z",

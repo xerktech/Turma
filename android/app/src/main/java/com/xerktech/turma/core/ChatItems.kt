@@ -162,7 +162,11 @@ fun buildItems(
                 // result-only turn isn't dropped (matching _entry_blocks).
                 is ToolResultBlock -> {
                     val paired = block.forId.isNotEmpty() && block.forId in toolUseIds
-                    if (!paired && prefs.toolOutputs && block.text.isNotBlank()) {
+                    // No isNotBlank() guard: chat.js pushes the orphan card
+                    // regardless and renders "(no output)". Dropping the empty
+                    // one was the last divergence out of 14 producer-generated
+                    // wire cases (XERK-235).
+                    if (!paired && prefs.toolOutputs) {
                         flushText()
                         out.add(
                             ChatItem.Tool(

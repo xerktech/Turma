@@ -105,4 +105,51 @@ for (const page of PAGES) {
     assert.deepEqual(bad, [],
       "an on*= handler must use escJs; esc() is entity escaping and does not survive attribute decoding");
   });
+
+  // The check above only ever saw a DIRECT `esc(` inside the attribute — and
+  // every site that actually shipped the XSS reached the handler through a
+  // local variable (`const key = esc(a.key)`, then `onclick="…('${key}')"`).
+  // 20 vulnerable handlers passed it. Follow the variables too (XERK-235).
+  test(`${page}: no inline handler interpolates an esc()-assigned variable`, () => {
+    const html = fs.readFileSync(path.join(__dirname, "..", "public", page), "utf8");
+
+    // Names bound to esc(...) output: `const a = esc(x), b = esc(y);` and
+    // `let s = \`…${esc(x)}…\`` (a pre-built handler-body string).
+    const tainted = new Set();
+    for (const m of html.matchAll(
+      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?![^;\n]*escJs\()[^;\n]*?(?<![A-Za-z0-9_])esc\(/g
+    )) tainted.add(m[1]);
+    for (const m of html.matchAll(
+      /,\s*([A-Za-z_$][\w$]*)\s*=\s*(?![^;,\n]*escJs\()[^;,\n]*?(?<![A-Za-z0-9_])esc\(/g
+    )) tainted.add(m[1]);
+
+    const bad = [];
+    for (const m of html.matchAll(/on[a-z]+="[^"]*"/g)) {
+      for (const ref of m[0].matchAll(/\$\{\s*([A-Za-z_$][\w$]*)\s*\}/g)) {
+        if (tainted.has(ref[1])) bad.push(`${ref[1]} in ${m[0].slice(0, 100)}`);
+      }
+    }
+    assert.deepEqual(bad, [],
+      "a handler interpolated a variable holding esc() output — it needs escJs, " +
+      "whichever side of the assignment the escaping happens on");
+  });
+
+  // Guards the guard: the detector above must actually see the shipped shape.
+  test(`${page}: the variable-indirection detector is not vacuous`, () => {
+    const sample = [
+      'function f(a, repo) {',
+      '  const key = esc(a.key), rn = esc(repo.name);',
+      '  return `<button onclick="go(\'${key}\',\'${rn}\')">x</button>`;',
+      "}",
+    ].join("\n");
+    const tainted = new Set();
+    for (const m of sample.matchAll(
+      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?![^;\n]*escJs\()[^;\n]*?(?<![A-Za-z0-9_])esc\(/g
+    )) tainted.add(m[1]);
+    for (const m of sample.matchAll(
+      /,\s*([A-Za-z_$][\w$]*)\s*=\s*(?![^;,\n]*escJs\()[^;,\n]*?(?<![A-Za-z0-9_])esc\(/g
+    )) tainted.add(m[1]);
+    assert.ok(tainted.has("key") && tainted.has("rn"),
+      "the detector must flag both halves of a comma-declared esc() assignment");
+  });
 }

@@ -678,6 +678,9 @@ function escJs(s) {
     .replace(/>/g, "\\x3E")
     .replace(/\r/g, "\\r")
     .replace(/\n/g, "\\n")
+    // A raw NUL is rewritten to U+FFFD by the HTML tokenizer, so the handler
+    // would receive corrupted data rather than the value it was given.
+    .replace(/\0/g, "\\x00")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
 }
@@ -1322,7 +1325,11 @@ function modelChoices(a, remembered) {
 function composer(a, repo, rk, spawning) {
   const d = composerDraft.get(rk) || {};
   const o = loadOpts(repo.name);
-  const key = esc(a.key), rn = esc(repo.name);
+  // Both of these are only ever interpolated into inline handlers (`submit`
+  // below, and the ontoggle/onchange attributes), so they need the JS-string
+  // escaper, not the text one. Going through a local variable is exactly how
+  // these sites survived the first conversion pass.
+  const key = escJs(a.key), rn = escJs(repo.name);
   // Base-branch choices: the default branch (latest main — the fork point for a
   // new session) first, then the repo's current HEAD and other branches and any
   // remembered choice, de-duped. Falls back to the repo's current branch.
@@ -1388,7 +1395,9 @@ function sessCard(a, s, now) {
   const rKey = "sr::" + a.key + "::" + s.id;
   const kKey = "sk::" + a.key + "::" + s.id;
   const dKey = "sd::" + a.key + "::" + s.id;
-  const id = esc(s.id), key = esc(a.key);
+  // `id` renders as TEXT (the .sid span) and `idJs`/`key` go into handlers —
+  // two contexts, two escapers. Do not collapse them.
+  const id = esc(s.id), idJs = escJs(s.id), key = escJs(a.key);
 
   // Delete/kill guard copy. Kill keeps the worktree on disk (nothing is lost —
   // it's resumable). Delete removes the worktree, but the app owns no branch, so
@@ -1415,24 +1424,24 @@ function sessCard(a, s, now) {
   } else if (st === "running") {
     actions =
       (canAttach
-        ? `<button class="primary btn-sm" onclick="location.href='/sessions?session=${encodeURIComponent(s.id)}'">Attach ▸</button>`
+        ? `<button class="primary btn-sm" onclick="location.href='/sessions?session=${escJs(encodeURIComponent(s.id))}'">Attach ▸</button>`
         : `<button class="btn-sm" disabled title="${a.updating ? "Host is updating — terminal will return shortly" : "Terminal tunnel offline"}">Attach</button>`) +
-      `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
+      `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${idJs}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
       // Stop the session and drop it from the hub — but KEEP its worktree on
       // disk (uncommitted work survives) and its usage history, so it stays
       // resumable. Delete (which removes the worktree) only appears on already-
       // stopped/errored cards below.
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${idJs}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
   } else if (st === "queued") {
     // Waiting for a slot / clone / the root slot. It has no worktree yet, so the
     // only thing to do is cancel it — Kill drops the queued record.
     actions =
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm cancel" : "Cancel"}</button>`;
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${idJs}')">${confirming.has(kKey) ? "Confirm cancel" : "Cancel"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
-      `<button class="primary btn-sm" ${a.online ? "" : "disabled"} onclick="sessStart('${key}','${id}')">Start</button>` +
-      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? esc(delConfirm) : "Delete"}</button>`;
+      `<button class="primary btn-sm" ${a.online ? "" : "disabled"} onclick="sessStart('${key}','${idJs}')">Start</button>` +
+      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${idJs}')">${confirming.has(dKey) ? esc(delConfirm) : "Delete"}</button>`;
   }
 
   // PR links this session opened, with state + CI checks. Prefer the agent's

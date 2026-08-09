@@ -346,8 +346,21 @@ function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
+    // JSON.stringify throws RangeError once the aggregate passes V8's ~512 MiB
+    // string ceiling. It runs INSIDE this timer callback, so an unguarded throw
+    // is an uncaught exception on the main loop — the whole hub exits, taking
+    // every host's control plane with it, and state.json is the one thing the
+    // crash was supposed to protect. Failing to save is survivable; dying is
+    // not (XERK-235).
+    let blob;
+    try {
+      blob = JSON.stringify(agents);
+    } catch (e) {
+      console.error(`state save skipped — could not serialize agent state: ${e.message}`);
+      return;
+    }
     fs.mkdir(path.dirname(STATE_FILE), { recursive: true }, () => {
-      fs.writeFile(STATE_FILE, JSON.stringify(agents), (err) => {
+      fs.writeFile(STATE_FILE, blob, (err) => {
         if (err) console.error(`state save failed: ${err.message}`);
       });
     });
@@ -1297,6 +1310,68 @@ const HEARTBEAT_MAX = 32 << 20; // 32 MiB
 // real task prompt; /api/trigger applies its own 10k cap on prompt alone.
 const SPAWN_FIELD_MAX = 100000;
 
+// On-demand deliveries the heartbeat carries. Each is ingested into its own
+// bounded cache on the record; the raw key must then be dropped, or the
+// `...payload` spread keeps an unbounded duplicate of it alive forever.
+const HEARTBEAT_TRANSIENT_KEYS = [
+  "historyResults",
+  "subagentHistoryResults",
+  "jiraIssueResults",
+  "ticketStatusResults",
+  "createMetaResults",
+  "createTicketResults",
+];
+
+// Top-level keys a heartbeat is known to carry — the agent's own payload plus
+// the on-demand deliveries above. Anything else is bounded by
+// HEARTBEAT_UNKNOWN_MAX (see sanitizeHeartbeat).
+const HEARTBEAT_KNOWN_KEYS = new Set([
+  "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
+  "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
+  "gitSources", "github", "inputMaxChars", "jira", "logTail", "memory",
+  "models", "prunes", "repoUsage", "repos", "reposRoot", "sessions",
+  "startedAt", "uploadMaxBytes", "usage",
+  ...HEARTBEAT_TRANSIENT_KEYS,
+]);
+
+// How much an UNRECOGNISED heartbeat key may contribute to the persisted
+// record. Deliberately a size bound rather than a drop: agents are routinely
+// newer than the hub, so a field this hub has not learned about yet must still
+// pass through to the clients that have (the `github` block is exactly that
+// contract). Bounding instead of allowlisting keeps that forward compatibility
+// while closing the amplification.
+const HEARTBEAT_UNKNOWN_MAX = 64 << 10; // 64 KiB
+
+// Drop unrecognised keys that are too large to be a plausible new field.
+//
+// `agents[key] = {...payload}` persisted the WHOLE payload with no bound, so a
+// single beat under the (32 MiB) transport cap could park 30 MiB on the record
+// — re-serialized into state.json, every /api/agents response and every SSE
+// frame from then on. Enough distinct hosts doing that pushed the aggregate
+// past V8's ~512 MiB string ceiling, which threw inside the save timer and
+// exited the whole hub. All agents share one token, so one buggy or
+// compromised agent could take down the fleet's control plane (XERK-235).
+function sanitizeHeartbeat(payload, key) {
+  if (!payload || typeof payload !== "object") return payload;
+  for (const k of Object.keys(payload)) {
+    if (HEARTBEAT_KNOWN_KEYS.has(k)) continue;
+    let size = 0;
+    try {
+      size = JSON.stringify(payload[k] ?? null).length;
+    } catch {
+      size = Infinity; // circular or unserializable — cannot persist it anyway
+    }
+    if (size > HEARTBEAT_UNKNOWN_MAX) {
+      console.error(
+        `heartbeat from ${key}: dropped unknown field ${JSON.stringify(k)} ` +
+          `(${size} bytes, limit ${HEARTBEAT_UNKNOWN_MAX})`
+      );
+      delete payload[k];
+    }
+  }
+  return payload;
+}
+
 // Thrown past the cap so a route can answer 413 instead of leaking a generic
 // 400 (or, worse, nothing at all).
 class BodyTooLarge extends Error {
@@ -1589,11 +1664,20 @@ function fmtDur(ms) {
 // WORKING_WINDOW_MS (the agent reports the age at beat time; we add the
 // staleness since the host's last beat) — when paneBusy wasn't reported (older
 // agent, or the pane couldn't be captured). `lastSeen` is the host's last beat.
+// Two rules the web's `liveState` applies, in ITS order, which this mirror did
+// not (XERK-235):
+//  - no transcript yet is IDLE, decided BEFORE paneBusy is consulted;
+//  - working requires the HOST to be online. paneBusy is a value on a record the
+//    host last pushed, so a host that dies mid-turn leaves `paneBusy:true` behind
+//    and its session reads WORKING forever. Here that also meant `readyForReview`
+//    short-circuited, so the operator's phone never buzzed for exactly the
+//    stranded work that most needs a look.
 function sessionWorking(session, lastSeen, now) {
   const s = session.session;
-  if (s?.paneBusy != null) return s.paneBusy;
   const age = s?.transcriptAgeSec;
   if (age == null) return false;
+  if (now - (lastSeen || 0) >= OFFLINE_AFTER_MS) return false;
+  if (s?.paneBusy != null) return s.paneBusy;
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
 }
 
@@ -2911,7 +2995,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
-      const payload = JSON.parse((await readBody(req, HEARTBEAT_MAX)) || "{}");
+      const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX)) || "{}");
+      const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
       normalizeUsage(payload);
@@ -3011,6 +3096,14 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
+      // Every `*Results` key above has now been folded into its own BOUNDED
+      // cache, and those caches are what the routes serve. The raw copies came
+      // in through the `...payload` spread, so leaving them on the record keeps
+      // a second, UNBOUNDED copy of the largest thing a heartbeat carries — one
+      // that is re-serialized into state.json, every /api/agents response and
+      // every SSE frame, forever. A single ~5 MiB history delivery therefore
+      // became a permanent per-host tax (XERK-235).
+      for (const k of HEARTBEAT_TRANSIENT_KEYS) delete next[k];
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);

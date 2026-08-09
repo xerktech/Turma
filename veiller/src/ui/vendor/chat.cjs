@@ -121,8 +121,21 @@
   // bare esc() and linkify() produce identical output for link/image-free text.
   // Used for prose surfaces (message bubbles, thinking traces); tool input/output
   // <pre> blocks stay raw esc().
+  // Only http(s)/mailto reaches an href; anything else becomes "#". The linkify
+  // pass already restricts what it matches, but `anchor` is ALSO called directly
+  // for a pr_link entry (buildItems), whose URL comes off the wire — and
+  // `target="_blank"` is not a defence, it just happens to make Chrome refuse
+  // the navigation. Mirrors safeUrl in index.html/sessions.html (XERK-235).
+  function safeUrl(u) {
+    const s = String(u ?? "").trim();
+    // Root-relative is allowed — the ticket chip points at Turma's OWN board
+    // (/board?ticket=…), not out to the tracker. `//host` is NOT: that is
+    // protocol-relative and navigates off-origin.
+    if (s.startsWith("/") && !s.startsWith("//")) return esc(s);
+    return /^(https?:|mailto:)/i.test(s) ? esc(s) : "#";
+  }
   function anchor(url, label) {
-    return '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
+    return '<a href="' + safeUrl(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
   }
   // An inline image (a markdown ![alt](url), or a raw SVG turned into a data URI
   // by svgToImg). The src is restricted to http(s) and data:image/* at the call
@@ -1501,7 +1514,7 @@
     const ready = prReady(pr);
     const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
     const chk = mark ? ' <span class="pr-ready ' + ready + '" title="' + esc(prReadyTitle(pr)) + '">' + mark + "</span>" : "";
-    return '<a class="pr-badge ' + cls + '" href="' + esc(url) +
+    return '<a class="pr-badge ' + cls + '" href="' + safeUrl(url) +
       '" target="_blank" rel="noopener" title="' + esc(pr.title || url) + '">' +
       '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + "</a>";
   }
@@ -1530,7 +1543,7 @@
     const href = "/board?ticket=" + encodeURIComponent(t.key) +
       (t.siteKey ? "&site=" + encodeURIComponent(t.siteKey) : "");
     return '<span class="cc-opt cc-ticket">' +
-      '<a class="jira-chip" href="' + esc(href) + '"' +
+      '<a class="jira-chip" href="' + safeUrl(href) + '"' +
       ' title="' + esc(tip || t.key) + '">' + esc(t.key) + "</a></span>";
   }
   // fromPoll: a background heartbeat repaint — don't yank an open menu shut.
