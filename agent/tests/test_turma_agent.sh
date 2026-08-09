@@ -335,5 +335,23 @@ fi
 pkill -f "$WORK/svc-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 
+# systemd does NOT export HOME to a SYSTEM-scope service. install.sh injects an
+# `Environment=HOME=` line when it writes one, but a unit produced any other way
+# leaves it unset — and the launcher runs under `set -u`, so the first `$HOME`
+# aborted it with a bare "HOME: unbound variable". systemd restarted it, it died
+# again, and five rounds tripped StartLimitBurst and left the agent STOPPED with
+# no retry: that is how the truenas host lost its agent for 7.5 hours.
+echo "case: HOME unset (system-scope unit) does not kill the launcher"
+out="$(env -u HOME PATH="$WORK/svc-bin:/usr/bin:/bin" "$PREFIX/bin/turma-agent" --preflight 2>&1 || true)"
+case "$out" in
+  *"unbound variable"*) fail "launcher still dies with HOME unset: $out" ;;
+  *"HOME was unset"*)   ok "derived a HOME and said so" ;;
+  *)                    fail "expected a HOME-was-unset notice, got: $out" ;;
+esac
+case "$out" in
+  *"preflight"*) ok "carried on into preflight rather than aborting" ;;
+  *)             fail "launcher did not reach preflight with HOME unset: $out" ;;
+esac
+
 if [ "$FAILED" = 0 ]; then echo "all turma-agent launcher tests passed"; else echo "FAILURES"; fi
 exit "$FAILED"

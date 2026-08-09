@@ -266,6 +266,62 @@ class TestWrapperUnwrapping(unittest.TestCase):
         self.assertIsNone(guard.is_destructive(cmd))
 
 
+class TestAgentServiceProtection(unittest.TestCase):
+    """A session must not stop the manager that supervises it.
+
+    Restarting `turma-agent` kills the manager of EVERY session on the host,
+    including the one issuing the command, and the session cannot bring it back.
+    systemd will not either: five rapid restarts trip StartLimitBurst and leave
+    the unit stopped with no retry — which is how the truenas host lost its
+    agent for 7.5 hours, silently, while the tunnel stayed up and the terminals
+    kept working.
+    """
+
+    DOWN = [
+        "systemctl restart turma-agent",
+        "systemctl stop turma-agent",
+        "systemctl restart turma-agent.service",
+        "systemctl --user restart turma-agent",
+        "systemctl disable turma-agent",
+        "systemctl mask turma-agent",
+        "systemctl kill turma-agent",
+        "sudo systemctl restart turma-agent",
+        "systemctl stop turma-agent-update.timer",
+        "turma-agentctl restart",
+        "turma-agentctl stop",
+        "pkill -f hub-agent.py",
+        "killall -9 turma-agent",
+        "bash -lc 'systemctl restart turma-agent'",
+        "systemctl restart nginx && systemctl restart turma-agent",
+    ]
+
+    # Looking at your own agent stays allowed, and other services are not this
+    # rule's business — it is deliberately narrow.
+    OK = [
+        "systemctl status turma-agent",
+        "systemctl is-active turma-agent",
+        "systemctl show turma-agent -p KillMode",
+        "systemctl cat turma-agent",
+        "journalctl -u turma-agent -n 50",
+        "turma-agentctl status",
+        "systemctl restart nginx",
+        "systemctl stop docker",
+        "sudo systemctl restart sshd",
+        "pkill -f my-daemon",
+        "killall node",
+    ]
+
+    def test_taking_the_agent_down_is_denied(self):
+        for cmd in self.DOWN:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_reading_it_and_other_services_stay_allowed(self):
+        for cmd in self.OK:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+
 class TestDecide(unittest.TestCase):
     def test_allows_non_bash(self):
         self.assertEqual(
