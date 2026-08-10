@@ -48,6 +48,25 @@ describe("liveState", () => {
     expect(liveState(s)).toBe("working");
   });
 
+  // XERK-245: a session that delegated work and ended its own turn paints no
+  // interrupt hint, so paneBusy reads false while a background agent is still
+  // running — and the glyph said idle for work in progress.
+  it("is 'working' while background agents run, even with paneBusy false", () => {
+    const s = session({ session: signals({
+      paneBusy: false, transcriptAgeSec: 999,
+      agents: [{ type: "qa", label: "QA the parity change" }],
+    }) });
+    const now = 1_000_000;
+    expect(liveState(s, now - 10_000, now)).toBe("working");
+    // An empty list is "no agents", not "can't tell"; an older agent sends none.
+    expect(liveState(session({ session: signals({ paneBusy: false, transcriptAgeSec: 999, agents: [] }) }),
+      now - 10_000, now)).toBe("idle");
+    expect(liveState(session({ session: signals({ paneBusy: false, transcriptAgeSec: 999 }) }),
+      now - 10_000, now)).toBe("idle");
+    // Behind the offline gate, like paneBusy.
+    expect(liveState(s, now - 600_000, now)).toBe("idle");
+  });
+
   it("is 'error' when status is error, regardless of session signals", () => {
     const s = session({ status: "error", session: signals({ question: "pick one" }) });
     expect(liveState(s)).toBe("error");

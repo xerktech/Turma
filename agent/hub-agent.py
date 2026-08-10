@@ -4204,15 +4204,72 @@ def parse_pane_prompt(cap):
     return None
 
 
+# The TUI's agent-manager rows, painted below the input box's bottom rule for
+# exactly as long as agents are LIVE: a radio glyph (◉/● = the one in focus,
+# ○/◯ = a background agent), the agent type, then — for a subagent — its short
+# description, separated from the type by the TUI's 2+-space gutter. Mirrors
+# AGENT_ROW_RE / parseAgentList in tunnel-agent.js (parity contract).
+PANE_RULE_RE = re.compile(r"^─{20,}$")
+PANE_AGENT_ROW_RE = re.compile(r"^\s*([◉●◯○])\s+(\S.*?)\s*$")
+PANE_AGENT_GUTTER_RE = re.compile(r"\s{2,}")
+
+
+def parse_pane_agents(cap):
+    """The live agent rows off a pane capture, as [{sel, type, label}].
+
+    Scanned ONLY below the input box (after the last ─ rule), which is both
+    where the TUI paints them and what keeps the column-0 ● assistant-text
+    bullet from reading as a focused agent. Empty for a capture with no rows —
+    the TUI collapses the list to a "← for agents" hint the moment the last
+    agent finishes, so presence is an exact "an agent is running right now"."""
+    lines = str(cap or "").replace("\r", "").split("\n")
+    bottom = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if PANE_RULE_RE.match(lines[i].strip()):
+            bottom = i
+            break
+    if bottom < 0:
+        return []
+    agents = []
+    for raw in lines[bottom + 1:]:
+        m = PANE_AGENT_ROW_RE.match(raw)
+        if not m:
+            continue
+        parts = PANE_AGENT_GUTTER_RE.split(m.group(2))
+        atype = parts[0].strip()
+        if not atype:
+            continue
+        agents.append({
+            "sel": m.group(1) in "◉●",
+            "type": atype,
+            "label": " ".join(parts[1:]).strip(),
+        })
+    return agents
+
+
+def live_subagents(cap):
+    """The BACKGROUND agents this session is running, as [{type, label}].
+
+    `main` is the session's own conversation — already every surface's subject —
+    so it is dropped here and this list is non-empty only when the session has
+    delegated work still in flight. That makes it the missing half of the
+    working/idle read (XERK-245): a session whose main turn has ended while a
+    background agent keeps going shows no interrupt hint, so `paneBusy` reads
+    False and every status surface called it idle while it was still working."""
+    return [{"type": a["type"], "label": a["label"]}
+            for a in parse_pane_agents(cap) if a["type"] != "main"]
+
+
 def _pane_status(tmux_name, state):
-    """(paneBusy, modeActual, panePrompt) for one beat: the busy half goes
-    through _stable_pane_busy's busy->idle flicker suppression (hence `state`),
-    the mode and blocking-dialog halves read one shared capture."""
+    """(paneBusy, modeActual, panePrompt, agents) for one beat: the busy half
+    goes through _stable_pane_busy's busy->idle flicker suppression (hence
+    `state`), the mode, blocking-dialog and agent-list halves read one shared
+    capture."""
     if not tmux_name:
-        return None, None, None
+        return None, None, None, []
     busy = _stable_pane_busy(tmux_name, state)
     cap = _capture_pane(tmux_name)
-    return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
+    return busy, parse_pane_mode(cap), parse_pane_prompt(cap), live_subagents(cap)
 
 
 def _capture_pane(tmux_name):
@@ -4419,7 +4476,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
-    pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
+    pane_busy, mode_actual, pane_prompt, pane_agents = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
@@ -4438,6 +4495,13 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # suppresses the busy hint — so without this read the session looks idle
         # while it waits on a human. See parse_pane_prompt.
         "panePrompt": pane_prompt,
+        # The background agents this session has in flight, [{type, label}]
+        # (empty when none). The OTHER thing paneBusy cannot see: a session that
+        # delegated work and ended its own turn keeps no interrupt hint, so it
+        # read idle on every surface while an agent was still working. Every
+        # working/idle mirror ORs this with paneBusy; an agent predating the
+        # field sends none, which reads as "can't tell", i.e. today's behaviour.
+        "agents": pane_agents,
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,

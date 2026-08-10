@@ -670,7 +670,7 @@ test("parsePaneLiveTurn: thinking (no assistant text yet) -> generating, empty t
     "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
   ].join("\n");
   assert.deepEqual(parsePaneLiveTurn(pane), {
-    generating: true, text: "", status: { verb: "Honking", up: "", down: "", elapsed: "" },
+    generating: true, text: "", status: { verb: "Honking", up: "", down: "", elapsed: "" }, agents: [],
   });
 });
 
@@ -686,7 +686,7 @@ test("parsePaneLiveTurn: completed turn (no 'esc to interrupt') -> not generatin
     RULE,
     "  ⏵⏵ bypass permissions on · ← for agents",
   ].join("\n");
-  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null });
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null, agents: [] });
 });
 
 // XERK-130: a pane once viewed from a narrow client (a phone) stays ~54
@@ -753,7 +753,7 @@ test("parsePaneLiveTurn: an idle narrow pane (completed-turn line, no hint) stay
     NARROW_RULE,
     "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
   ].join("\n");
-  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null });
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null, agents: [] });
 });
 
 // Claude Code ≥2.1 paints its collapsed tool-activity summary as prose-shaped
@@ -1034,7 +1034,7 @@ test("liveTurnDecision: steady idle emits without holding", () => {
 
 test("parsePaneLiveTurn: ignores the right-aligned effort indicator, empty pane", () => {
   const { parsePaneLiveTurn } = require("../tunnel-agent.js");
-  assert.deepEqual(parsePaneLiveTurn(""), { generating: false, text: "", status: null });
+  assert.deepEqual(parsePaneLiveTurn(""), { generating: false, text: "", status: null, agents: [] });
   // The "● high · /effort" indicator is right-aligned (leading spaces), so a
   // pane that only has it — and no real turn — yields no assistant text.
   const pane = [
@@ -1044,7 +1044,7 @@ test("parsePaneLiveTurn: ignores the right-aligned effort indicator, empty pane"
     RULE,
     "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
   ].join("\n");
-  assert.deepEqual(parsePaneLiveTurn(pane), { generating: true, text: "", status: null });
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: true, text: "", status: null, agents: [] });
 });
 
 // Regression: the working-status line's verb + token counters must NOT bleed
@@ -1264,6 +1264,66 @@ test("parsePaneLiveTurn: no agent-manager list -> status without agents key", ()
   ].join("\n");
   const r = parsePaneLiveTurn(pane);
   assert.ok(r.status && !("agents" in r.status), "no expanded list -> no agents key");
+  assert.deepEqual(r.agents, [], "and nothing on the frame either");
+});
+
+// XERK-245. A real capture of the state the whole change is about: the main
+// turn has ENDED (no interrupt hint, and "Waiting for 1 background agent to
+// finish" has no ellipsis, so the spinner rule can't match it either) while a
+// background agent keeps working. The list must survive that, because it is
+// exactly when the operator can no longer tell the session apart from an idle
+// one — the chat's agent list used to blink out the instant the turn ended.
+const PANE_BG_AGENT = [
+  "● Launched.",
+  "",
+  "✻ Waiting for 1 background agent to finish",
+  "",
+  RULE,
+  "❯ ",
+  RULE,
+  "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents · ↓ to manage",
+  "",
+  "  ● main",
+  "  ◯ Explore  Map and summarize all JS files            41s · ↓ 93.9k tokens",
+].join("\n");
+
+test("parsePaneLiveTurn: an idle pane still reports its live background agents", () => {
+  const { parsePaneLiveTurn, paneShowsBusy } = require("../tunnel-agent.js");
+  const r = parsePaneLiveTurn(PANE_BG_AGENT);
+  assert.equal(r.generating, false, "the turn really has ended");
+  assert.equal(r.status, null, "so nothing may fake a running turn (Stop stays hidden)");
+  assert.deepEqual(r.agents, [
+    { sel: true, type: "main", label: "" },
+    { sel: false, type: "Explore",
+      label: "Map and summarize all JS files 41s · ↓ 93.9k tokens" },
+  ]);
+});
+
+test("parsePaneLiveTurn: mirrors hub-agent.py's parse_pane_agents on that pane", () => {
+  // Parity contract (CLAUDE.md): the same capture must yield the same rows in
+  // both implementations. The Python side asserts this fixture's result in
+  // TestParsePaneAgents (test_hub_agent.py); keep the two in step.
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const subagents = parsePaneLiveTurn(PANE_BG_AGENT).agents
+    .filter((a) => a.type !== "main")
+    .map((a) => ({ type: a.type, label: a.label }));
+  assert.deepEqual(subagents, [
+    { type: "Explore", label: "Map and summarize all JS files 41s · ↓ 93.9k tokens" },
+  ]);
+});
+
+test("parsePaneLiveTurn: the list clears once the last agent finishes", () => {
+  // The TUI collapses it back to the "← for agents" hint, which is what makes
+  // presence an exact "an agent is running right now".
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "✻ Brewed for 9s",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+  ].join("\n");
+  assert.deepEqual(parsePaneLiveTurn(pane).agents, []);
 });
 
 // ---- control-channel liveness ----------------------------------------------

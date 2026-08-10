@@ -488,6 +488,43 @@ test("sessionWorking: paneBusy is authoritative over transcript freshness", () =
   assert.equal(sessionWorking({ session: { paneBusy: null, transcriptAgeSec: 0 } }, now, now), true);
 });
 
+// XERK-245: a session that delegated work and ended its own turn paints no
+// interrupt hint, so paneBusy says false while a background agent is plainly
+// still running. `agents` is the signal that says so.
+test("sessionWorking: live background agents work even with paneBusy false", () => {
+  const now = Date.now();
+  const bg = { paneBusy: false, transcriptAgeSec: 999, agents: [{ type: "qa", label: "QA it" }] };
+  assert.equal(sessionWorking({ session: bg }, now, now), true);
+  // An empty list is "no agents", not "can't tell" — paneBusy still decides.
+  assert.equal(
+    sessionWorking({ session: { paneBusy: false, transcriptAgeSec: 999, agents: [] } }, now, now),
+    false);
+  // An agent predating the field sends none: behaviour is exactly as it was.
+  assert.equal(
+    sessionWorking({ session: { paneBusy: false, transcriptAgeSec: 999 } }, now, now), false);
+  // It stays BEHIND the offline and no-transcript rules, like paneBusy: a host
+  // that died mid-run must not leave its sessions reading working forever.
+  assert.equal(sessionWorking({ session: bg }, now - 120000, now), false);
+  assert.equal(sessionWorking({ session: { agents: bg.agents } }, now, now), false);
+});
+
+test("readyForReview: a session waiting on background agents is not ready", () => {
+  // The regression this closes: the turn ends the moment the agent is launched,
+  // leaving lastRole=assistant with no tool call — which qualified the session
+  // as Ready for review and buzzed the operator's phone mid-run.
+  const now = Date.now();
+  const session = {
+    status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "qa", label: "QA the parity change" }] },
+  };
+  assert.equal(sessionWorking(session, now, now), true);
+  assert.equal(readyForReview(session, sessionWorking(session, now, now)), false);
+  // Once the agent finishes the list empties and it qualifies as it always did.
+  session.session.agents = [];
+  assert.equal(readyForReview(session, sessionWorking(session, now, now)), true);
+});
+
 // ---- heartbeatAlerts (edge-triggered) ------------------------------------------
 
 // Drives a beat sequence the way the heartbeat handler does: alerts

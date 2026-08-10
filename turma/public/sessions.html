@@ -1393,12 +1393,32 @@ function liveState(sess, host, now) {
     return { kind: "waiting", label: "waiting for your answer", question: s.panePrompt.prompt };
   if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
+  // Background agents are the other thing paneBusy cannot see (XERK-245): a
+  // session that delegated work and ended its own turn shows no interrupt hint,
+  // so it read plain "idle" while an agent was still running — and worse, it
+  // qualified as Ready for review, buzzing the operator's phone mid-run. Behind
+  // the host-online gate for the same reason paneBusy is.
+  if (host.online && liveAgentCount(s))
+    return { kind: "working", label: agentWorkLabel(s), detail: "last write " + ago(age) };
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)
     : (host.online && age < 90 * 1000);
   if (working)
     return { kind: "working", label: "working", detail: "last write " + ago(age) };
   return { kind: "idle", label: "idle", detail: "last write " + ago(age) };
+}
+
+// How many background agents the session has in flight, off the TUI's own live
+// agent list (the agent reports it as `session.agents`). An agent predating the
+// field reports none, which reads as "can't tell", leaving that host as it was.
+function liveAgentCount(s) {
+  return Array.isArray(s?.agents) ? s.agents.length : 0;
+}
+// "working" with the reason, so a card that would otherwise read idle says what
+// is actually running: "1 background agent" / "3 background agents".
+function agentWorkLabel(s) {
+  const n = liveAgentCount(s);
+  return n === 1 ? "1 background agent" : n + " background agents";
 }
 
 // Has this PR left the operator's plate? MERGED and CLOSED are the two end

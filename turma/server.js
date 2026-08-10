@@ -1965,11 +1965,29 @@ function fmtDur(ms) {
 //    and its session reads WORKING forever. Here that also meant `readyForReview`
 //    short-circuited, so the operator's phone never buzzed for exactly the
 //    stranded work that most needs a look.
+// Does this session have background agents in flight? The agent reports the
+// TUI's own live agent list (`live_subagents`, hub-agent.py), which is non-empty
+// for exactly as long as delegated work is running (XERK-245).
+//
+// It is checked AHEAD of paneBusy in every working/idle mirror, and only ever
+// adds working — a session that ended its own turn to wait on a background agent
+// paints no interrupt hint, so paneBusy says False while it is plainly still
+// working. It stays BEHIND the offline and no-transcript rules, which paneBusy
+// also loses to: this is a value on the record a host last pushed, so a host
+// that dies mid-run must not leave its sessions reading working forever.
+//
+// An agent predating the field sends none, which reads as "can't tell" and
+// leaves that host's behaviour exactly as it was — never as "no agents".
+function hasLiveAgents(s) {
+  return Array.isArray(s?.agents) && s.agents.length > 0;
+}
+
 function sessionWorking(session, lastSeen, now) {
   const s = session.session;
   const age = s?.transcriptAgeSec;
   if (age == null) return false;
   if (now - (lastSeen || 0) >= OFFLINE_AFTER_MS) return false;
+  if (hasLiveAgents(s)) return true;
   if (s?.paneBusy != null) return s.paneBusy;
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
 }
@@ -4722,7 +4740,12 @@ server.on("upgrade", async (req, socket, head) => {
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
           queued: Array.isArray(msg.queued) ? msg.queued : [] });
       } else if (msg && msg.turn && typeof msg.text === "string") {
-        liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null });
+        // `agents` = the session's live agent list, which outlives the turn
+        // (a background agent keeps running after the main one stops), so it
+        // rides beside `status` rather than inside it; absent from agents
+        // predating it, and the chat then falls back to `status.agents`.
+        liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null,
+          agents: Array.isArray(msg.agents) ? msg.agents : null });
       }
     });
     socket.on("data", parse);
@@ -4990,6 +5013,7 @@ if (process.env.TURMA_TEST) {
     prAlertDecision,
     readyForReview,
     sessionWorking,
+    hasLiveAgents,
     safeUploadName,
     uploadCapFor,
     uploads,

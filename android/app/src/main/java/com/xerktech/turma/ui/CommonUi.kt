@@ -48,6 +48,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.LiveState
+import com.xerktech.turma.core.hasLiveAgents
+import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
 import com.xerktech.turma.ui.theme.TurmaColors
 
@@ -259,6 +261,20 @@ fun liveStateLabel(state: LiveState): String = when (state) {
     LiveState.WAITING -> "waiting"
     LiveState.IDLE -> "idle"
     LiveState.STOPPED -> "stopped"
+}
+
+/**
+ * The same word, except that a session working because of BACKGROUND AGENTS
+ * rather than its own turn says which — matching the web's `agentWorkLabel`
+ * (sessions.html). Without it a session whose own turn has ended reads a bare
+ * "working" with nothing on screen explaining what is still running (XERK-245).
+ */
+fun liveStateLabel(state: LiveState, live: LiveSignals?): String {
+    if (state == LiveState.WORKING && hasLiveAgents(live)) {
+        val n = live?.agents?.size ?: 0
+        return if (n == 1) "1 background agent" else "$n background agents"
+    }
+    return liveStateLabel(state)
 }
 
 /**

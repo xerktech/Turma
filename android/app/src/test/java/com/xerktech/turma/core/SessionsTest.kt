@@ -20,6 +20,42 @@ class SessionsTest {
         assertEquals(LiveState.IDLE, liveState(s, now, now))
     }
 
+    // XERK-245: a session that delegated work and ended its own turn paints no
+    // interrupt hint, so paneBusy reads false while a background agent is still
+    // running — and the card said idle, and it qualified as Ready for review,
+    // buzzing the phone mid-run.
+    @Test fun `live background agents mean working even with paneBusy false`() {
+        val bg = LiveSignals(
+            paneBusy = false, transcriptAgeSec = 999.0,
+            agents = listOf(com.xerktech.turma.model.LiveAgent(type = "qa", label = "QA it")),
+        )
+        val s = SessionInfo(status = "running", session = bg)
+        assertEquals(LiveState.WORKING, liveState(s, now, now))
+        // Behind the offline gate, like paneBusy: a host that died mid-run must
+        // not leave its sessions reading working forever.
+        assertEquals(LiveState.IDLE, liveState(s, now - 120_000L, now))
+        // An empty list is "no agents"; an older agent reports none at all.
+        assertEquals(
+            LiveState.IDLE,
+            liveState(SessionInfo(status = "running",
+                session = LiveSignals(paneBusy = false, transcriptAgeSec = 999.0)), now, now),
+        )
+    }
+
+    @Test fun `a session waiting on background agents is not ready for review`() {
+        val bg = SessionInfo(
+            status = "running",
+            session = LiveSignals(
+                paneBusy = false, transcriptAgeSec = 5.0, lastRole = "assistant",
+                agents = listOf(com.xerktech.turma.model.LiveAgent(type = "qa", label = "QA it")),
+            ),
+        )
+        assertEquals(false, readyForReview(bg, liveState(bg, now, now)))
+        // Once the agent finishes the list empties and it qualifies as before.
+        val done = bg.copy(session = bg.session!!.copy(agents = emptyList()))
+        assertEquals(true, readyForReview(done, liveState(done, now, now)))
+    }
+
     // ---- readyForReview (XERK-224) ------------------------------------------
     // The port of the web's rule (turma/public/sessions.html), which the hub's
     // ready-for-review alert mirrors again — all three decide the same group.

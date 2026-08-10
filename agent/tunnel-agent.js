@@ -919,7 +919,6 @@ function paneShowsBusy(raw) {
 
 function parsePaneLiveTurn(pane) {
   const raw = String(pane || "").replace(/\r/g, "");
-  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null };
   const lines = raw.split("\n");
   const isRule = (l) => /^─{20,}$/.test(l.trim());
   // Drop the whole bottom input box (its top border ─, the ❯ prompt line(s),
@@ -931,6 +930,20 @@ function parsePaneLiveTurn(pane) {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (isRule(lines[i])) { bottom = i; break; }
   }
+  // The agent-manager list, when live, is painted BELOW the input box (after
+  // `bottom`, the box's bottom rule) alongside the mode line — a region the
+  // convo slice below intentionally drops. Parse it there so the assistant
+  // block can't swallow it and the column-0 ● bullet can't fake a row.
+  //
+  // Read BEFORE the busy check, and returned whether or not a turn is running
+  // (XERK-245). The TUI paints these rows for exactly as long as agents are
+  // LIVE — including after the main turn ends with a BACKGROUND agent still
+  // going, where the pane reads "Waiting for N background agent to finish" and
+  // carries no interrupt hint. That is the case this parse exists to catch: the
+  // session looks idle on every surface while an agent is still working, and
+  // the chat's agent list used to blink out the moment the turn ended.
+  const agents = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
+  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null, agents };
   let end = lines.length;
   if (bottom >= 0) {
     end = bottom;
@@ -966,11 +979,8 @@ function parsePaneLiveTurn(pane) {
       if (h) status.hint = h;
     }
   }
-  // The agent-manager list, when expanded, is painted BELOW the input box
-  // (after `bottom`, the box's bottom rule) alongside the mode line — a region
-  // the convo slice above intentionally drops. Parse it there so the assistant
-  // block can't swallow it and the column-0 ● bullet can't fake a row.
-  const agents = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
+  // Kept on `status` as well as on the frame: it is where the chat's pinned bar
+  // has always read the list from, and an older hub forwards only `status`.
   if (agents.length) {
     status = status || { verb: "", up: "", down: "", elapsed: "" };
     status.agents = agents;
@@ -981,7 +991,7 @@ function parsePaneLiveTurn(pane) {
     if (/^●\s/.test(convo[i])) { start = i; break; }
     if (/^❯/.test(convo[i])) break; // hit the user prompt -> no text yet
   }
-  if (start < 0) return { generating: true, text: "", status }; // thinking; no text yet
+  if (start < 0) return { generating: true, text: "", status, agents }; // thinking; no text yet
   const block = [];
   for (let i = start; i < convo.length; i++) {
     const l = convo[i];
@@ -994,7 +1004,7 @@ function parsePaneLiveTurn(pane) {
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
   // and the transcript delivers the authoritative structure on completion.
   const text = stripActivityTail(block.join(" ").replace(/\s+/g, " ").trim());
-  return { generating: true, text, status };
+  return { generating: true, text, status, agents };
 }
 
 // Suppress a single-frame busy->idle blip in the live turn scrape. Claude Code
@@ -1028,7 +1038,8 @@ function captureLiveTurn(sessionId, cb) {
     "tmux",
     ["capture-pane", "-p", "-t", `agent-${sessionId}`],
     { timeout: 2000, maxBuffer: 1 << 20 },
-    (err, stdout) => cb(err ? { generating: false, text: "", status: null } : parsePaneLiveTurn(stdout))
+    (err, stdout) => cb(err ? { generating: false, text: "", status: null, agents: [] }
+                            : parsePaneLiveTurn(stdout))
   );
 }
 
@@ -1155,9 +1166,20 @@ function pollWatcher(sessionId) {
     // binary and silently report no matches for anything in it (the same
     // reason the tests keep ESC as String.fromCharCode(27)).
     const key = text + "\u0000" + (status ? JSON.stringify(status) : "");
-    if (key !== w.lastTurn) {
-      w.lastTurn = key;
-      sendControl({ turn: sessionId, text, status });
+    // The live agent list rides the FRAME, not `status`, because the two answer
+    // different questions and stop being true at different moments (XERK-245):
+    // `status` is "a turn is running" — it drives the chat's Stop button, so it
+    // must clear the instant the turn ends — while agents stay live past that,
+    // which is exactly when the operator most needs to see them. Sending them
+    // inside `status` would either hide them or fake a running turn.
+    const agents = Array.isArray(live.agents) ? live.agents : [];
+    // They join the dedup key for the same reason `status` does: a background
+    // agent's row ticks (elapsed, tokens) while the text and status hold still,
+    // and without this the list would freeze on whatever its first frame said.
+    const frameKey = key + (agents.length ? JSON.stringify(agents) : "");
+    if (frameKey !== w.lastTurn) {
+      w.lastTurn = frameKey;
+      sendControl({ turn: sessionId, text, status, agents });
     }
   });
 }

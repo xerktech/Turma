@@ -549,6 +549,11 @@ data class WorkInfo(
 @Serializable
 data class LiveSignals(
     val paneBusy: Boolean? = null,
+    // The background agents this session has in flight, off the TUI's own live
+    // agent list. Non-empty means delegated work is still running even when
+    // paneBusy is false — the session ended its own turn to wait on them
+    // (XERK-245). Empty from older agents, which reads as "can't tell".
+    val agents: List<LiveAgent> = emptyList(),
     val transcriptAgeSec: Double? = null,
     val lastRole: String = "",
     val lastHasToolUse: Boolean = false,
@@ -571,6 +576,13 @@ data class QuestionOption(
     val label: String = "",
     val description: String = "",
     val preview: String = "",
+)
+
+/** One background agent a running session has in flight (`LiveSignals.agents`). */
+@Serializable
+data class LiveAgent(
+    val type: String = "",
+    val label: String = "",
 )
 
 @Serializable

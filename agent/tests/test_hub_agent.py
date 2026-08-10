@@ -1483,7 +1483,7 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         prompt = {"prompt": "Do you want to proceed?",
                   "options": [{"number": 1, "label": "Yes", "selected": True}]}
         with mock.patch.object(ha, "_pane_status",
-                               return_value=(True, "plan", prompt)) as ps:
+                               return_value=(True, "plan", prompt, [])) as ps:
             rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
         self.assertIs(rep["paneBusy"], True)
         self.assertEqual(rep["modeActual"], "plan")
@@ -1495,11 +1495,31 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
     def test_pane_reads_reported_without_transcript(self):
         # No transcript yet — the pane reads must still ride the early-return
         # path.
-        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None, [])):
             rep = ha.session_report("/absent/worktree", {}, "agent-abc")
         self.assertIs(rep["paneBusy"], False)
         self.assertEqual(rep["modeActual"], "auto")
         self.assertIsNone(rep["panePrompt"])
+        self.assertEqual(rep["agents"], [])
+
+    def test_background_agents_ride_the_report_while_the_pane_reads_idle(self):
+        # XERK-245: the pane the agent list exists for. The turn has ended, so
+        # paneBusy is False and every working/idle mirror would call this
+        # session idle — `agents` is the signal that says otherwise.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "Launched."}]}}])
+        with mock.patch.object(ha, "_capture_pane", return_value=PANE_BG_AGENT), \
+             mock.patch.object(ha, "_stable_pane_busy", return_value=False):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.assertIs(rep["paneBusy"], False)
+        self.assertEqual([a["type"] for a in rep["agents"]], ["Explore"])
+
+    def test_the_busy_read_alone_cannot_see_a_background_agent(self):
+        # Why `agents` had to be added rather than widening the busy read: this
+        # pane carries no interrupt hint, and "Waiting for 1 background agent to
+        # finish" has no ellipsis, so PANE_SPINNER_RE cannot match it either.
+        self.assertIs(ha._busy_from_capture(PANE_BG_AGENT), False)
 
     def test_pane_reads_default_none_without_tmux(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -6962,6 +6982,87 @@ class TestParsePaneMode(unittest.TestCase):
         self.assertIsNone(ha.parse_pane_mode(""))
         self.assertIsNone(ha.parse_pane_mode(None))
         self.assertIsNone(ha.parse_pane_mode("❯ \n  ? for shortcuts"))
+
+
+RULE = "─" * 60
+
+# A real capture (Claude Code v2.x) of the state XERK-245 is about: the main
+# turn has ENDED — no interrupt hint, no ellipsised spinner, so `_pane_busy`
+# reads False — while a background agent it launched keeps working. The TUI says
+# so on two lines the busy read cannot use, and paints the live agent rows below
+# the input box.
+PANE_BG_AGENT = "\n".join([
+    "● Launched.",
+    "",
+    "✻ Waiting for 1 background agent to finish",
+    "",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents · ↓ to manage",
+    "",
+    "  ● main",
+    "  ◯ Explore  Map and summarize all JS files            41s · ↓ 93.9k tokens",
+])
+
+# The same pane once that agent finishes: the TUI collapses the list back to the
+# "← for agents" hint, which is what makes the rows an exact liveness signal.
+PANE_NO_AGENTS = "\n".join([
+    "✻ Brewed for 9s",
+    "",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+])
+
+
+class TestParsePaneAgents(unittest.TestCase):
+    """parse_pane_agents / live_subagents — mirrors parseAgentList in
+    tunnel-agent.js (see the parity cases in tunnel-agent.test.js)."""
+
+    def test_rows_below_the_input_box(self):
+        self.assertEqual(ha.parse_pane_agents(PANE_BG_AGENT), [
+            {"sel": True, "type": "main", "label": ""},
+            {"sel": False, "type": "Explore",
+             "label": "Map and summarize all JS files 41s · ↓ 93.9k tokens"},
+        ])
+
+    def test_live_subagents_drops_main(self):
+        self.assertEqual(ha.live_subagents(PANE_BG_AGENT), [
+            {"type": "Explore",
+             "label": "Map and summarize all JS files 41s · ↓ 93.9k tokens"},
+        ])
+
+    def test_a_collapsed_list_reports_nothing(self):
+        # The whole point: presence means an agent is running RIGHT NOW.
+        self.assertEqual(ha.parse_pane_agents(PANE_NO_AGENTS), [])
+        self.assertEqual(ha.live_subagents(PANE_NO_AGENTS), [])
+
+    def test_main_alone_is_not_a_background_agent(self):
+        cap = "\n".join([RULE, "❯ ", RULE, "  ⏵⏵ auto mode on", "", "  ● main"])
+        self.assertEqual(ha.parse_pane_agents(cap),
+                         [{"sel": True, "type": "main", "label": ""}])
+        self.assertEqual(ha.live_subagents(cap), [])
+
+    def test_the_column_zero_assistant_bullet_is_not_a_row(self):
+        # A ● at column 0 ABOVE the input box is assistant text, not an agent —
+        # only the region below the box's bottom rule is scanned.
+        cap = "\n".join(["● I'll start by reading the file.", RULE, "❯ ", RULE,
+                         "  ⏵⏵ auto mode on"])
+        self.assertEqual(ha.parse_pane_agents(cap), [])
+
+    def test_alternate_radio_glyphs(self):
+        cap = "\n".join([RULE, "❯ ", RULE, "  ⏵⏵ auto mode on", "",
+                         "  ◉ qa  QA the parity change", "  ○ Explore  Map it"])
+        self.assertEqual([a["sel"] for a in ha.parse_pane_agents(cap)], [True, False])
+        self.assertEqual([a["type"] for a in ha.parse_pane_agents(cap)],
+                         ["qa", "Explore"])
+
+    def test_empty_and_unreadable_captures(self):
+        for cap in ("", None, "no rule anywhere\n  ● main"):
+            self.assertEqual(ha.parse_pane_agents(cap), [])
+            self.assertEqual(ha.live_subagents(cap), [])
 
 
 # What `claude -p "/model"` really prints (v2.1.214): the current default's

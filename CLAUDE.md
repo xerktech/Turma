@@ -197,6 +197,13 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.
+- **"Working" is `paneBusy` OR live background agents** (XERK-245), in every mirror of the read
+  (those five plus `turma/public/index.html`). A session that delegates work ENDS ITS OWN TURN: the
+  pane drops the interrupt hint, so `paneBusy` says False while an agent it launched keeps going —
+  which read idle everywhere AND qualified as ready-for-review, buzzing the operator mid-run. The
+  session's `agents[]` (the TUI's own live list, `live_subagents`) is the second input; it sits
+  BEHIND the offline and no-transcript gates, exactly like `paneBusy`, and an absent field means
+  "that agent can't tell", never "no agents".
 - **`_board_column` (py) mirrors `categoryOf` (`turma/public/board.js`)**, review carve-out included
   — the agent resolves a dropped column against its own options read, so a drift silently refuses
   valid drops. Tests: `TestBoardColumn`, `board.test.js`.

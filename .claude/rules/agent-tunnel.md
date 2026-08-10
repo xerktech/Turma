@@ -37,9 +37,13 @@ is in `CLAUDE.md`, and `.claude/rules/agent.md` carries the Python side.
 
 ### Live working footer and agent list
 
-- `parsePaneLiveTurn` → `{turn,text,status}`: the in-progress assistant text plus `status = {verb,
-  token counters, elapsed, hint}`; an expanded agent-manager list adds `status.agents[]`
-  (`parseAgentList`).
+- `parsePaneLiveTurn` → `{generating,text,status,agents}`: the in-progress assistant text plus
+  `status = {verb, token counters, elapsed, hint}` and the live agent rows (`parseAgentList`).
+- **`agents` is parsed before the busy check and rides the FRAME, not `status`** (XERK-245): the two
+  stop being true at different moments. `status` is "a turn is running" — it drives the chat's Stop
+  button, so it must clear the instant the turn ends — while a background agent keeps going past
+  that, which is exactly when the operator can no longer tell the session from an idle one. It stays
+  on `status` as well while generating, for an older hub that forwards only `status`.
 - **`turn` text only ever moves forward** (`resolveLiveText`): activity summaries strip off the
   REFLOWED tail (`stripActivityTail`); already-committed text is suppressed (`committedDupe`,
   skeleton compare — the pane renders markdown away); and UNCOMMITTED prose HOLDS through

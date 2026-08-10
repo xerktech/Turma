@@ -178,6 +178,44 @@ const finished = (id, summary, extra) => ({
 });
 const pr = (state, number = 7) => ({ url: `https://github.com/o/r/pull/${number}`, number, state });
 
+// XERK-245. A session that launches a background agent ends its own turn right
+// away: paneBusy goes false and the newest entry is plain assistant text with no
+// tool call — so it landed under Ready for review, buzzing the operator, while
+// the agent it delegated to was still working. The live agent list is what says
+// otherwise, and the card names what is running instead of reading "idle".
+test("background agents keep a session Active and name what is running", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    running("11111", "Delegating Task", {
+      paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "qa", label: "QA the parity change" }],
+    }),
+  ]);
+  render({ now, agents: [h] });
+
+  assert.match(els.active.innerHTML, /Active <span class="count">1<\/span>/);
+  assert.ok(els.active.innerHTML.includes("Delegating Task"));
+  assert.ok(els.active.innerHTML.includes("1 background agent"),
+    "the card says what is running, not a bare 'working'");
+  assert.ok(!els.review.innerHTML.includes("Delegating Task"),
+    "not ready for review while an agent it launched is still going");
+});
+
+test("background agents: the count is pluralized, and an empty list changes nothing", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    running("11111", "Fan Out", {
+      paneBusy: false, transcriptAgeSec: 5,
+      agents: [{ type: "qa", label: "QA it" }, { type: "Explore", label: "Map it" }],
+    }),
+    // An agent predating the field reports none: unchanged, still Idle.
+    idle("22222", "Quiet Task"),
+  ]);
+  render({ now, agents: [h] });
+  assert.ok(els.active.innerHTML.includes("2 background agents"));
+  assert.ok(els.idle.innerHTML.includes("Quiet Task"));
+});
+
 test("running sessions split: working -> Active, quiet-with-nothing-pending -> Idle", () => {
   const { render, els } = loadPage();
   const { now, host: h } = host([
