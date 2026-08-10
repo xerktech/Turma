@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Tenir gpt-oss (LiteLLM gateway)",
+      "options": {
+        "baseURL": "{env:TURMA_LOCAL_BASE_URL}",
+        "apiKey": "{env:TURMA_LOCAL_API_KEY}"
+      },
+      "models": {
+        "gpt-oss:120b": {
+          "name": "gpt-oss 120b",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": { "context": 65536, "output": 8192 }
+        }
+      }
+    }
+  },
+  "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" }
+}

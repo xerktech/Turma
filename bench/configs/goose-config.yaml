@@ -1,0 +1,10 @@
+# Goose config for the bench. OPENAI_API_KEY / OPENAI_HOST are supplied by the
+# environment, so no credential is written here.
+GOOSE_PROVIDER: openai
+GOOSE_MODEL: "gpt-oss:120b"
+GOOSE_MODE: auto
+extensions:
+  developer:
+    enabled: true
+    name: developer
+    type: builtin
