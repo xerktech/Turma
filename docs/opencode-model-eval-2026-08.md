@@ -189,10 +189,13 @@ bring-up on WSL2.
 
 **Recommendation: keep Ollama, tuned for multi-tenant use.**
 
-1. In `tenir-gpu.yaml`: `OLLAMA_CONTEXT_LENGTH=65536`,
+1. In `tenir-gpu.yaml`: `OLLAMA_CONTEXT_LENGTH=81920` (65536 when this was
+   written; raised 2026-08-10, see the window sizing section),
    `OLLAMA_NUM_PARALLEL=8`, keep `OLLAMA_KEEP_ALIVE=-1` and the pinned image.
    Quality at this config is already validated — the August cue-replay
-   baseline ran on 0.32.5 at 65536 ctx and reproduced the July scorecard.
+   baseline ran on 0.32.5 at 65536 ctx and reproduced the July scorecard, and
+   the window change kept f16 KV and the same weights, so it does not move
+   numerics.
 2. Cap concurrently *generating* coding agents (Turma-side) at ~2–3 during
    active listening hours — measured cue p50 stays in the 6–8 s band there,
    vs 13 s at 6 coders. Agents idle between tool calls cost nothing; the cap
@@ -267,6 +270,10 @@ session crossing 64K would be silently truncated server-side instead of
 compacted. Fixed to 65536 in the shipped config. Compaction is affordable:
 prefill measures ~6,100 tok/s, so a worst-case 60K re-prefill costs ~10 s.
 
+Both numbers moved to **81920** on 2026-08-10 (DockerOps
+`compose/tenir-gpu.yaml`, see the window section below). The declared limit
+must keep tracking the server — that coupling is the bug above.
+
 ### Prefix caching: already solved, nothing to tune
 
 Ollama 0.32.5's runner does LCP slot selection with idle-slot state
@@ -288,6 +295,70 @@ cheap on this stack.
 - **`num_batch` 2048**: prefill 5,700–5,800 tok/s vs ~6,100 at the default
   512. Dead end.
 - DockerOps PR #132 records both rejections next to the knobs they concern.
+
+## Window sizing at f16 (2026-08-10)
+
+A follow-up asking the narrower question the q8 test left open: **how large
+can the window go without paying the dequant tax at all?**
+
+`OLLAMA_CONTEXT_LENGTH` is per SLOT, and Ollama allocates
+`n_ctx = ctx × OLLAMA_NUM_PARALLEL`, so window and concurrency multiply
+into one KV budget. gpt-oss-120b interleaves sliding-window (`n_swa=128`)
+and full-attention layers, so only 18 of its 36 layers hold a full cache:
+
+    18 layers × 8 kv-heads × 64 head-dim × 2 (K+V) × 2 B = 36,864 B / token
+
+That matched llama.cpp's own `CUDA0 KV buffer size` line to the MiB at
+three separate (ctx × slots) points, so the budget is predictable rather
+than empirical. Measured on the card:
+
+| ctx × slots | KV tokens | KV MiB | loaded | free | verdict |
+|---|---|---|---|---|---|
+| 65536 × 8 | 524,288 | 18,432 | 88.8 GB | 7.8 GB | the old setting |
+| **81920 × 8** | 655,360 | 23,040 | 93.2 GB | 3.4 GB | **shipped** |
+| 93184 × 7 | 652,288 | 22,932 | 93.3 GB | 3.3 GB | +14% window, −1 slot |
+| 131072 × 5 | 655,360 | 23,040 | 93.4 GB | 3.2 GB | native max, −3 slots |
+
+655,360 KV tokens is the practical ceiling — the ~3.3 GB it leaves is
+wanted, since this card also drives the host's Windows desktop.
+
+**The native 131072 is not reachable at f16 without surrendering slots.**
+131072 × 6 needs ~98 GB and does not load. And 131072 × 5 was the only
+config that looked worse on the guardrail (17.7 s median / 24.2 s max):
+6 coders plus a cue is 7 concurrent requests against 5 slots, so the cue
+queues — reaching the window by cutting slots trades exactly what the slots
+protect. 81920 × 8 was shipped because it is the largest window that
+changes nothing else: same slot count, same concurrency envelope the
+latency budget above was built on. Idle cue latency 4.20 s median /
+translation 0.56 s at 81920 × 8, versus 4.03 s / 0.59 s at 65536 × 8.
+Numerics are untouched (f16, same weights, same effort), so unlike the q8
+option this needs no cue replay.
+
+### Under-load latency on this host is not reproducible — read this first
+
+The "worst-case cue latency under 6 coding streams" guardrail **cannot
+currently discriminate between these configs.** An unchanged 65536 × 8
+produced medians of 10.55 s, 11.94 s, 22.45 s and 22.59 s on the same test
+within one session — a ~2× drift, wider than any gap between the four
+configs above.
+
+What is known about it:
+
+- It tracks **server uptime, not load or config**: the first run after a
+  container restart is always fast, and the instance degrades and stays
+  degraded. A restart resets it.
+- It is **not** GPU clocks, power, thermal throttling, or hidden
+  re-prefill. A fast run and a slow run were sampled side by side at
+  ~2,840 MHz SM, ~60% utilisation and ~420 W in both, and summed
+  server-side prefill was ~1–2k tokens in each. Same GPU work, ~3× fewer
+  tokens out.
+- It produces the nonsense result that 3 concurrent coders are *slower*
+  than 6 (23.9 s vs 10.6 s on the same config), which is how it was caught.
+
+Unexplained, and worth its own investigation — a stack that halves its
+throughput after some hours of use is a production concern independent of
+any window setting. Until then: **restart the container before
+benchmarking, and never read a single under-load number as signal.**
 
 ### Why gpt-oss never committed (transcript forensics)
 
@@ -327,8 +398,9 @@ until delivered or N attempts, not fire it once.
 Committed at the repo root:
 
 - `opencode.json` — provider `local` → `http://localhost:9402/v1`,
-  gpt-oss:120b with `reasoningEffort: medium`, declared context 65536
-  (matching the server), no temperature override, instructions
+  gpt-oss:120b with `reasoningEffort: medium`, declared context 81920
+  (matching the server — raised with it on 2026-08-10; see the window
+  sizing section), no temperature override, instructions
   `["CLAUDE.md", "OPENCODE_CONTRACT.md"]`.
 - `OPENCODE_CONTRACT.md` — unattended-run contract: exact tool list, every
   command via bash, always end with branch + commit, never end a turn with

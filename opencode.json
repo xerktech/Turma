@@ -11,7 +11,7 @@
           "tool_call": true,
           "reasoning": true,
           "options": { "reasoningEffort": "medium" },
-          "limit": { "context": 65536, "output": 8192 }
+          "limit": { "context": 81920, "output": 8192 }
         }
       }
     }
