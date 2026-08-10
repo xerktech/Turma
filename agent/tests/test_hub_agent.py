@@ -7206,6 +7206,84 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm._resume_at_cwd("t-1", cwd, extra={"modelSource": source, "model": "sonnet"})
         return sm.registry[-1] if sm.registry else {}
 
+    def test_resume_any_transcript_keeps_the_local_model(self):
+        """The DASHBOARD's Resume picker routes through resume_transcript, not
+        resume(), and passed no model source at all — so a killed failed-over
+        session came back on the exhausted subscription with no mark and no
+        error. The closed record already knew the answer."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "rrrrr")
+        os.makedirs(cwd, exist_ok=True)
+        sess.update({"worktreePath": cwd, "repo": "Turma",
+                     "repoPath": os.path.join(self.tmp, "Turma")})
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        tid = sess["claudeSessionId"]
+        open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        sm._remember_closed(sess)
+        sm.registry = []
+        sm.resume_transcript(tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "local")
+
+    def test_resume_any_foreign_transcript_defaults_to_subscription(self):
+        """No closed record means no answer — never a guess."""
+        sm = self.make_manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "fffff")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        tid = "22222222-2222-4222-8222-222222222222"
+        open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        sm.resume_transcript(tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
+
+    def test_closed_payload_reports_the_model_source(self):
+        """The Ended card's mark reads this field; without it the mark can never
+        render for a killed session — which is exactly when you are reading the
+        transcript and need to know which model wrote it."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma")})
+        sm._remember_closed(sess)
+        self.assertEqual(sm._closed_payload()[0]["modelSource"], "local")
+
+    def test_heartbeat_reports_the_capability_honestly(self):
+        """The hub and every composer gate on this; reporting available on a
+        host with no configuration would offer a switch that cannot work."""
+        sm = self.make_manager()
+        self.assertTrue(sm.build_payload(1)["localModel"]["available"])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="", LOCAL_MODEL_API_KEY=""):
+            body = sm.build_payload(1)
+        self.assertFalse(body["localModel"]["available"])
+        self.assertIsNone(body["localModel"]["model"])
+
+    def test_context_cap_rejects_an_absurd_window(self):
+        """Overstating the window is the exact failure the setting guards: the
+        agent compacts far too late and the server truncates the tail silently."""
+        with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": "999999999999"}):
+            self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 65536)
+        with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": "131072"}):
+            self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 131072)
+
+    def test_import_session_forwards_the_model_source(self):
+        """The agent half of the migration chain."""
+        sm = self.make_manager()
+        captured = {}
+        with mock.patch.object(sm, "_resume_at_cwd",
+                               side_effect=lambda *a, **k: captured.update(k)), \
+             mock.patch.object(sm, "_migration_download", return_value=b"x"), \
+             mock.patch.object(sm, "_unpack_transcript"), \
+             mock.patch.object(sm, "_resumable_cwd_class", return_value="worktree"), \
+             mock.patch.object(sm, "_localize_migrated_cwd",
+                               return_value=os.path.join(ha.WORKTREES_ROOT, "Turma", "iiiii")):
+            sm.import_session({
+                "migrationId": "aaaaaaaaaaaaaaaa", "repo": "Turma",
+                "transcriptId": "33333333-3333-4333-8333-333333333333",
+                "cwd": "/other/host/.turma/worktrees/Turma/iiiii",
+                "modelSource": "local"})
+        self.assertEqual((captured.get("extra") or {}).get("modelSource"), "local")
+
     def test_migrated_session_keeps_its_model_source(self):
         """The conversation moves; the model it was running against must move
         with it, or the move quietly undoes the failover."""

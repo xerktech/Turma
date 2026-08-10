@@ -105,12 +105,15 @@ Claude Code assumes 200k for a model it does not recognise and would compact far
 too late for a 64k window, and the tail then truncates server-side instead.
 
 Every relaunch path keeps the session's model source — restart, stop/start,
-resume-on-boot, queue drain, **resume of an ended session**, and **migration to
-another host**. The last two were missed on the first pass and silently returned
-a failed-over session to the exhausted subscription (restoring its `--model`
-alias with it). A migration re-validates against the TARGET's configuration, so
-moving onto a host with no local model falls back rather than launching at an
-endpoint that is not there.
+resume-on-boot, queue drain, resume of an ended session, **resume-any-transcript
+(the dashboard's Resume picker)**, and migration to another host. The last three
+were each missed on a successive pass and silently returned a failed-over
+session to the exhausted subscription, restoring its `--model` alias with it. Two
+rules keep it honest: the closed record carries the source so a resume can
+recover it, and a migration RE-VALIDATES against the target's own configuration,
+so moving onto a host with no local model falls back rather than launching at an
+endpoint that is not there. A transcript with no closed record (foreign or
+pruned) has no answer and correctly defaults to the subscription.
 
 ## Known limitations (found by the QA pass, accepted for this change)
 

@@ -125,16 +125,16 @@ function localModelAvailable(agent) {
   return Boolean(agent && agent.localModel && agent.localModel.available);
 }
 
-// Validate a spawn's optional modelSource the same way the switch route does.
-// Returns null when fine, else {status, error}. Spawning onto the local model is
-// how you start NEW work once usage is gone, so it gets the same enum check and
-// the same capability gate rather than failing later as an errored session card.
 // Which model source a host reports for one of its sessions, "" when unknown.
 function sessionModelSource(hostKey, sessionId) {
   const s = (agents[hostKey]?.sessions || []).find((x) => x.id === sessionId);
   return (s && s.modelSource) || "";
 }
 
+// Validate a spawn's optional modelSource the same way the switch route does.
+// Returns null when fine, else {status, error}. Spawning onto the local model is
+// how you start NEW work once usage is gone, so it gets the same enum check and
+// the same capability gate rather than failing later as an errored session card.
 function checkSpawnModelSource(cmd, hostKey) {
   if (cmd.modelSource == null) return null;
   if (!["subscription", "local"].includes(cmd.modelSource)) {
@@ -5042,6 +5042,10 @@ if (process.env.TURMA_TEST) {
     // In-memory by design, so a hub restart drops it and ownership falls back
     // to the fleet scan. Exported so a test can stage exactly that (XERK-241).
     cmdHosts,
+    // The heartbeat field allowlist. Exported so a test can hold the capability
+    // flags in it directly: dropping `localModel` would make the failover
+    // control vanish fleet-wide with every suite still green (XERK-246).
+    HEARTBEAT_KNOWN_KEYS,
     invalidateAgentsCache,
     serializeAgentsForSave,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these

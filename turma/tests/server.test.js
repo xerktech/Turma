@@ -6228,29 +6228,45 @@ test("http: /model refuses a session running on the self-hosted model", async ()
   assert.equal(ok.status, 200);
 });
 
-test("migration carries modelSource so a moved session stays failed over", async () => {
+test("heartbeat: localModel is a known key, not an unknown-field remnant", async () => {
+  // It is the capability flag the hub and every composer gate on. Dropping it
+  // from HEARTBEAT_KNOWN_KEYS would make the control vanish fleet-wide.
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
+});
+
+test("migration meta and the import command both carry modelSource", async () => {
+  // Three links in the chain (hub meta, importSession command, agent forward).
+  // The previous version of this test only asserted an export was queued, so
+  // dropping modelSource anywhere in the chain shipped green.
   await request("POST", "/api/heartbeat", {
     body: {
       device: "mv1", localModel: { available: true, model: "gpt-oss:120b" },
-      sessions: [{ id: "m1", repo: "R", status: "running", modelSource: "local",
-                   transcriptId: "t-1", conversation: true }],
-      repos: [{ name: "R" }],
+      repos: [{ name: "R", path: "/r" }],
+      sessions: [{
+        id: "m1", repo: "R", status: "running", modelSource: "local",
+        transcriptId: "44444444-4444-4444-8444-444444444444",
+        worktreePath: "/r/.turma/worktrees/R/m1", root: false,
+      }],
     },
     headers: agentHeaders,
   });
   await request("POST", "/api/heartbeat", {
-    body: { device: "mv2", localModel: { available: true }, repos: [{ name: "R" }] },
+    body: {
+      device: "mv2", localModel: { available: true, model: "gpt-oss:120b" },
+      repos: [{ name: "R", path: "/r" }], sessions: [],
+    },
     headers: agentHeaders,
   });
   const res = await request("POST", "/api/agents/mv1/sessions/m1/migrate", {
     body: { host: "mv2" }, headers: userHeaders,
   });
-  // Whether the move is accepted depends on eligibility rules beyond this test;
-  // what matters is that when it IS composed, the source is carried.
-  if (res.status === 200) {
-    const beat = await request("POST", "/api/heartbeat", {
-      body: { device: "mv1" }, headers: agentHeaders });
-    const exp = (beat.body.commands || []).find((c) => c.type === "exportSession");
-    assert.ok(exp, "export queued");
-  }
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const beat = await request("POST", "/api/heartbeat", {
+    body: { device: "mv1" }, headers: agentHeaders });
+  const exp = (beat.body.commands || []).find((c) => c.type === "exportSession");
+  assert.ok(exp, "export queued on the source");
+  // The meta the hub composed for the target must name the model source, or the
+  // moved session lands on the subscription.
+  const state = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.ok(state.status === 200);
 });

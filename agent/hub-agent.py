@@ -9617,7 +9617,17 @@ class SessionManager:
             return
         path = os.path.join(proj, transcript_id + ".jsonl")
         cwd = _transcript_cwd(path) or cwd_hint
-        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id)
+        # A resume-any of a session THIS host killed must keep the model it was
+        # running against (XERK-246). The dashboard's Resume picker routes here
+        # rather than through resume(), and the closed record already knows the
+        # answer — without this, resuming a failed-over session silently returns
+        # it to the exhausted subscription, which is the halt this exists to
+        # prevent. A transcript we have no closed record for (a foreign or
+        # pruned one) has no answer, and correctly defaults to subscription.
+        closed = next((c for c in self.closed
+                       if c.get("claudeSessionId") == transcript_id), None)
+        extra = {"modelSource": closed.get("modelSource")} if closed else None
+        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
     def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None):
         """Launch `claude --resume <transcript_id>` cwd'd at `cwd`, the shared
@@ -13120,6 +13130,10 @@ class SessionManager:
                 # and the label must not change just because the session was
                 # killed.
                 "summaryManual": c.get("summaryManual"),
+                # Which model this session RAN against (XERK-246). Reading an
+                # ended session's transcript is exactly when "which model wrote
+                # this" matters, and the Ended card's mark reads this field.
+                "modelSource": c.get("modelSource"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
                 # The Jira ticket this session was spawned to work. _remember_closed
