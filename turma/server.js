@@ -139,7 +139,7 @@ const WHISPER_URL =
   process.env.WHISPER_URL || (LITELLM_URL ? `${LITELLM_URL}/audio/transcriptions` : "");
 const WHISPER_MODEL = process.env.WHISPER_MODEL || "";
 const WHISPER_API_KEY = process.env.WHISPER_API_KEY || LITELLM_API_KEY;
-const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || "en";
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE ?? "en";
 const WHISPER_TIMEOUT_MS = parseInt(process.env.WHISPER_TIMEOUT_MS || "30000", 10);
 
 // A session counts as "working" while its transcript was written to within
