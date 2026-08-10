@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1297,6 +1297,90 @@ test("agentsHtml: subagents are buttons carrying type+label; 'main' is a plain m
   // subagent: a button with the data-attrs openSubagentView reads.
   assert.match(html, /<button type="button" class="cc-agent" data-atype="Explore" data-alabel="Explore Jira agent-side code">/);
   assert.match(html, /<span class="alabel">Explore Jira agent-side code<\/span>/);
+});
+
+// XERK-245: the status bar carries the agent list past the end of the turn.
+// `liveStatus` clears the instant a turn ends (it is what shows Stop), but a
+// background agent keeps running — and the bar used to vanish with it, leaving
+// the chat looking idle while work continued.
+function fakeStatusBar() {
+  const bar = { hidden: false, innerHTML: "", dataset: {}, addEventListener() {} };
+  global.document = {
+    getElementById: (id) => (id === "chatStatus" ? bar : null),
+    querySelectorAll: () => [],
+  };
+  return bar;
+}
+
+test("live status bar: agents keep the bar up after the turn ends", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([{ sel: true, type: "main", label: "" },
+                     { sel: false, type: "qa", label: "QA the parity change" }]);
+    updateLiveStatus();
+    assert.equal(bar.hidden, false, "the bar stays up while an agent runs");
+    assert.match(bar.innerHTML, /Background agents…/);
+    assert.match(bar.innerHTML, /QA the parity change/);
+    // The turn really has ended, so Stop must stay hidden.
+    assert.equal(isBusy(), false);
+  } finally { clearDom(); }
+});
+
+// `main` is the conversation already on screen. A list carrying only it means
+// nothing is delegated, so raising a "Background agents…" bar for it would claim
+// work that isn't running — the same carve-out live_subagents makes agent-side.
+test("live status bar: a main-only list does not claim background agents", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([{ sel: true, type: "main", label: "" }]);
+    updateLiveStatus();
+    assert.equal(bar.hidden, true);
+    assert.equal(bar.innerHTML, "");
+  } finally { clearDom(); }
+});
+
+// Rows arrive from a pane scrape via the hub; a buggy agent can send junk and it
+// must not throw (an uncaught TypeError costs that whole repaint).
+test("live status bar: junk rows are dropped, not thrown on", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([null, 7, {}, { type: "qa", label: "QA it" }]);
+    assert.doesNotThrow(() => updateLiveStatus());
+    assert.equal(bar.hidden, false);
+    assert.match(bar.innerHTML, /QA it/);
+    // ...and a list of nothing BUT junk raises no bar at all.
+    __setLiveAgents([null, {}, 7]);
+    assert.doesNotThrow(() => updateLiveStatus());
+    assert.equal(bar.hidden, true);
+  } finally { clearDom(); }
+});
+
+test("live status bar: no turn and no agents -> hidden, as before", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([]);
+    updateLiveStatus();
+    assert.equal(bar.hidden, true);
+    assert.equal(bar.innerHTML, "");
+  } finally { clearDom(); }
+});
+
+test("live status bar: a running turn renders verb, hint and agents together", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus({ verb: "Zesting", up: "1.2k", down: "340", elapsed: "12s",
+                      hint: "■ Port the stylesheet" });
+    __setLiveAgents([{ sel: false, type: "qa", label: "QA it" }]);
+    updateLiveStatus();
+    assert.match(bar.innerHTML, /Zesting…/);
+    assert.match(bar.innerHTML, /Port the stylesheet/);
+    assert.match(bar.innerHTML, /QA it/);
+    assert.ok(!/Background agents…/.test(bar.innerHTML), "the turn's own verb leads");
+  } finally { clearDom(); }
 });
 
 test("agentsHtml: escapes type + label (no attribute/markup injection)", () => {

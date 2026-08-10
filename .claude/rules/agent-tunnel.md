@@ -37,9 +37,22 @@ is in `CLAUDE.md`, and `.claude/rules/agent.md` carries the Python side.
 
 ### Live working footer and agent list
 
-- `parsePaneLiveTurn` → `{turn,text,status}`: the in-progress assistant text plus `status = {verb,
-  token counters, elapsed, hint}`; an expanded agent-manager list adds `status.agents[]`
-  (`parseAgentList`).
+- `parsePaneLiveTurn` → `{generating,text,status,agents}`: the in-progress assistant text plus
+  `status = {verb, token counters, elapsed, hint}` and the live agent rows (`parseAgentList`).
+- **`agents` rides the FRAME, not `status`** (XERK-245): the two stop being true at different
+  moments. `status` is "a turn is running" — it drives the chat's Stop button, so it must clear the
+  instant the turn ends — while a background agent keeps going past that, which is exactly when the
+  operator can no longer tell the session from an idle one.
+- **The frame's `agents` come from the TRANSCRIPT** (`scanAgentEntry`, folded from the same tail
+  parse into per-watcher `agentState` that persists across polls), never from the pane — see
+  `.claude/rules/agent.md` for the forged rows and the ~24s linger that ruled the pane out. Because
+  a tail window is a pure suffix, re-folding it is safe; and a stop already seen beats a later-read
+  launch, since the queued copy of a notification can sit at an earlier offset than the launch.
+- `__setControlSink` exists so a test can drive `startWatch` → `transcriptTail` → `pollWatcher` and
+  assert the emitted frame carries `agents`. Four independent cut points on that path were each
+  severable with a green CI before it existed.
+- The pane's footer rows still ride **`status.agents` while a turn runs**, for the live
+  elapsed/token counters the transcript cannot know. **Display only** — never liveness.
 - **`turn` text only ever moves forward** (`resolveLiveText`): activity summaries strip off the
   REFLOWED tail (`stripActivityTail`); already-committed text is suppressed (`committedDupe`,
   skeleton compare — the pane renders markdown away); and UNCOMMITTED prose HOLDS through

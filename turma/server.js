@@ -1662,6 +1662,18 @@ function sanitizeHeartbeat(payload, key) {
       delete payload[k];
     }
   }
+  // `sessions` is a KNOWN key, so the sweep above never looks inside it. Each
+  // session's live agent rows come from a pane scrape and are re-shaped and
+  // bounded here for the same reason the `turn` frame's are — the clients turn
+  // this list into a count and a label, and nothing else bounds it.
+  if (Array.isArray(payload.sessions)) {
+    for (const s of payload.sessions) {
+      const live = s && typeof s === "object" ? s.session : null;
+      if (live && typeof live === "object" && "agents" in live) {
+        live.agents = sanitizeLiveAgents(live.agents) || [];
+      }
+    }
+  }
   return payload;
 }
 
@@ -1965,11 +1977,52 @@ function fmtDur(ms) {
 //    and its session reads WORKING forever. Here that also meant `readyForReview`
 //    short-circuited, so the operator's phone never buzzed for exactly the
 //    stranded work that most needs a look.
+// The hub is the trust boundary between an agent's pane scrape and the browser,
+// so a `turn` frame's agent rows are re-shaped here rather than forwarded raw:
+// elements are coerced to {sel,type,label}, non-objects and empty types dropped,
+// and the list bounded. Unvalidated, one `null` element threw in `agentsHtml`
+// and cost that repaint; the cap matches the agent's own PANE_AGENTS_MAX.
+// `null` (not `[]`) for a frame with no `agents` key at all, so the chat can
+// tell "this agent can't report them" from "no agents are running".
+const LIVE_AGENTS_MAX = 32;
+const LIVE_AGENT_FIELD_MAX = 400;
+function sanitizeLiveAgents(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const a of raw) {
+    if (!a || typeof a !== "object") continue;
+    const type = String(a.type == null ? "" : a.type).slice(0, LIVE_AGENT_FIELD_MAX);
+    if (!type) continue;
+    out.push({ sel: !!a.sel, type,
+      label: String(a.label == null ? "" : a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
+    if (out.length >= LIVE_AGENTS_MAX) break;
+  }
+  return out;
+}
+
+// Does this session have background agents in flight? The agent reports the
+// TUI's own live agent list (`live_subagents`, hub-agent.py), which is non-empty
+// for exactly as long as delegated work is running (XERK-245).
+//
+// It is checked AHEAD of paneBusy in every working/idle mirror, and only ever
+// adds working — a session that ended its own turn to wait on a background agent
+// paints no interrupt hint, so paneBusy says False while it is plainly still
+// working. It stays BEHIND the offline and no-transcript rules, which paneBusy
+// also loses to: this is a value on the record a host last pushed, so a host
+// that dies mid-run must not leave its sessions reading working forever.
+//
+// An agent predating the field sends none, which reads as "can't tell" and
+// leaves that host's behaviour exactly as it was — never as "no agents".
+function hasLiveAgents(s) {
+  return Array.isArray(s?.agents) && s.agents.length > 0;
+}
+
 function sessionWorking(session, lastSeen, now) {
   const s = session.session;
   const age = s?.transcriptAgeSec;
   if (age == null) return false;
   if (now - (lastSeen || 0) >= OFFLINE_AFTER_MS) return false;
+  if (hasLiveAgents(s)) return true;
   if (s?.paneBusy != null) return s.paneBusy;
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
 }
@@ -4722,7 +4775,12 @@ server.on("upgrade", async (req, socket, head) => {
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
           queued: Array.isArray(msg.queued) ? msg.queued : [] });
       } else if (msg && msg.turn && typeof msg.text === "string") {
-        liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null });
+        // `agents` = the session's live agent list, which outlives the turn
+        // (a background agent keeps running after the main one stops), so it
+        // rides beside `status` rather than inside it; absent from agents
+        // predating it, and the chat then falls back to `status.agents`.
+        liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null,
+          agents: sanitizeLiveAgents(msg.agents) });
       }
     });
     socket.on("data", parse);
@@ -4990,6 +5048,8 @@ if (process.env.TURMA_TEST) {
     prAlertDecision,
     readyForReview,
     sessionWorking,
+    hasLiveAgents,
+    sanitizeLiveAgents,
     safeUploadName,
     uploadCapFor,
     uploads,

@@ -469,7 +469,7 @@ private fun SessionCard(
                 // State row: shutting down / live state / queued reason + since.
                 when {
                     killing -> Text("shutting down…", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
-                    st == "running" -> Text(liveStateLabel(state), style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    st == "running" -> Text(liveStateLabel(state, session.session), style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
                     st == "queued" -> {
                         val since = session.queuedAt.takeIf { it.isNotBlank() }
                             ?.let { " · " + com.xerktech.turma.core.ageStr(it, now) }.orEmpty()

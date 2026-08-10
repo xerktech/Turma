@@ -38,6 +38,11 @@ export interface LiveSignals {
   // hint on screen), false = resting, null = unknown (fall back to
   // transcriptAgeSec). Absent from older agents.
   paneBusy?: boolean | null;
+  // The background agents this session has in flight, off the TUI's own live
+  // agent list. Non-empty means delegated work is still running even when
+  // paneBusy is false — the session ended its own turn to wait on them
+  // (XERK-245). Absent from older agents, which reads as "can't tell".
+  agents?: { type: string; label: string }[];
   transcriptAgeSec: number | null;
   lastRole: string | null;
   lastHasToolUse: boolean;

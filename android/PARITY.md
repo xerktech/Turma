@@ -195,6 +195,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   field. `model/Models.kt`, `net/HubApi.kt`, `net/HubClient.kt`, `vm/ChatViewModel.kt`,
   `vm/SubagentViewModel.kt`, `ui/ChatScreen.kt`, `ui/SessionsScreen.kt`; decode locked
   in `AgentDecodeTest`.
+  - **The bar is no longer turn-scoped (XERK-245).** Delegating ENDS the session's own
+    turn, so gating it on `status` hid the agent list exactly when it mattered. The rows
+    now ride the frame (`TailFrame.agents` → `LiveEvent.Turn.agents` → `ChatState.liveAgents`),
+    and with no status behind them `BackgroundAgentsBar` renders the web's "Background
+    agents…" row. A `main`-only list raises nothing. Session cards say which is running
+    via `liveStateLabel(state, live)`, matching the web's `agentWorkLabel`.
 
 ## Done (XERK-78 installment — the P0 sweep)
 

@@ -50,6 +50,10 @@ data class ChatUiState(
     val entries: List<TailEntry> = emptyList(),
     val liveTurn: String = "",
     val turnStatus: TurnStatus? = null,
+    // The session's live agent list, held apart from turnStatus because it
+    // outlives the turn: a background agent keeps running after the main one
+    // stops, which is exactly when the bar used to vanish (XERK-245).
+    val liveAgents: List<com.xerktech.turma.model.AgentRow> = emptyList(),
     val reveal: RevealState = RevealState(),
     val verbosity: Verbosity = Verbosity.CONCISE,
     val connected: Boolean = false,
@@ -194,7 +198,13 @@ class ChatViewModel(
                     }
                     is LiveEvent.Turn -> _state.update {
                         // Empty text = turn committed; the tail owns it now.
-                        it.copy(liveTurn = ev.text, turnStatus = ev.status)
+                        // Prefer the frame's agent list; a hub/agent predating it
+                        // carries the list only on `status`, scoped to the turn.
+                        it.copy(
+                            liveTurn = ev.text,
+                            turnStatus = ev.status,
+                            liveAgents = ev.agents.ifEmpty { ev.status?.agents ?: emptyList() },
+                        )
                     }
                     // Clear the live status when the tail drops: a phone backgrounds
                     // sockets far more than a desktop tab, and a "Working…" spinner
@@ -203,7 +213,7 @@ class ChatViewModel(
                     // longer see should not be shown). It repopulates on reconnect.
                     is LiveEvent.Connected -> _state.update {
                         if (ev.up) it.copy(connected = true)
-                        else it.copy(connected = false, turnStatus = null)
+                        else it.copy(connected = false, turnStatus = null, liveAgents = emptyList())
                     }
                 }
             }

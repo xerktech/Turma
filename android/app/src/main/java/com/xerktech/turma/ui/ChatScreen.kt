@@ -202,7 +202,19 @@ fun ChatScreen(
                 // tip / active-task hint lines, and the live agent-manager list. Shown
                 // whenever a status frame is present (i.e. while generating) — the
                 // agent list can be non-empty even when the live text is blank.
-                state.turnStatus?.let { st -> LiveStatusBar(st, onOpenSubagent) }
+                //
+                // It ALSO stays up with no status at all while background agents run
+                // (XERK-245): delegating ends the session's own turn, so `status`
+                // clears while the work continues, and the bar used to vanish exactly
+                // when it was most needed. `main` is the conversation already on
+                // screen, so a list carrying only it does not raise the bar.
+                val bgAgents = state.liveAgents.any { it.type.isNotBlank() && it.type != "main" }
+                val st = state.turnStatus
+                when {
+                    st != null -> LiveStatusBar(st, state.liveAgents, onOpenSubagent)
+                    bgAgents -> BackgroundAgentsBar(state.liveAgents, onOpenSubagent)
+                    else -> {}
+                }
                 if (state.question.isNotBlank()) {
                     val opts = state.questionOptionsRich.ifEmpty {
                         state.questionOptions.map { com.xerktech.turma.model.QuestionOption(label = it) }
@@ -303,6 +315,7 @@ fun ChatScreen(
 @Composable
 private fun LiveStatusBar(
     status: com.xerktech.turma.model.TurnStatus,
+    liveAgents: List<com.xerktech.turma.model.AgentRow>,
     onOpenSubagent: (String, String) -> Unit,
 ) {
     Surface(
@@ -341,7 +354,41 @@ private fun LiveStatusBar(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            if (status.agents.isNotEmpty()) AgentsList(status.agents, onOpenSubagent)
+            // The frame's list wins; `status.agents` is the older-agent fallback.
+            val rows = liveAgents.ifEmpty { status.agents }
+            if (rows.isNotEmpty()) AgentsList(rows, onOpenSubagent)
+        }
+    }
+}
+
+/**
+ * The same bar with no running turn behind it: the session delegated work and
+ * ended its own turn, so there is no verb or token counter to show, but agents
+ * are still going (XERK-245). Mirrors the web's "Background agents…" row.
+ */
+@Composable
+private fun BackgroundAgentsBar(
+    agents: List<com.xerktech.turma.model.AgentRow>,
+    onOpenSubagent: (String, String) -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 2.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 7.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 2.dp)
+                Text(
+                    "Background agents…",
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            AgentsList(agents, onOpenSubagent)
         }
     }
 }

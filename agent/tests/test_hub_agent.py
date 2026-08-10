@@ -1500,6 +1500,40 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         self.assertIs(rep["paneBusy"], False)
         self.assertEqual(rep["modeActual"], "auto")
         self.assertIsNone(rep["panePrompt"])
+        self.assertEqual(rep["agents"], [])
+
+    def test_background_agents_ride_the_report_while_the_pane_reads_idle(self):
+        # XERK-245, the case the whole feature exists for: launching a
+        # background agent ENDS the session's own turn, so paneBusy is False and
+        # every working/idle mirror would call this idle. `agents` says
+        # otherwise, and comes from the transcript, not the screen.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "user", "message": {"content": "go"}}])
+        state = {}
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+            # The first beat primes the byte offsets to EOF, so the launch has to
+            # land after it — which is also what a real beat looks like.
+            ha.session_report(self.WORKDIR, state, "agent-abc")
+            write_jsonl(path, TASK_LAUNCH_ENTRIES + [
+                {"type": "assistant",
+                 "message": {"content": [{"type": "text", "text": "Launched."}]}}])
+            rep = ha.session_report(self.WORKDIR, state, "agent-abc")
+        self.assertIs(rep["paneBusy"], False)
+        self.assertEqual(rep["agents"], [{"type": "agent", "label": "QA the parity change"}])
+
+    def test_a_finished_agent_stops_being_reported(self):
+        # The measured reason the TUI footer cannot be the source: its rows
+        # linger ~24s past completion. The notification is the exact edge.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "user", "message": {"content": "go"}}])
+        state = {}
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+            ha.session_report(self.WORKDIR, state, "agent-abc")   # primes offsets
+            write_jsonl(path, TASK_LAUNCH_ENTRIES)
+            self.assertEqual(len(ha.session_report(self.WORKDIR, state, "agent-abc")["agents"]), 1)
+            write_jsonl(path, [task_notification_entry("agent-1", "completed")])
+            rep = ha.session_report(self.WORKDIR, state, "agent-abc")
+        self.assertEqual(rep["agents"], [])
 
     def test_pane_reads_default_none_without_tmux(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -1910,6 +1944,224 @@ TASK_NOTIFICATION = (
 )
 
 
+def task_notification_entry(task_id, status, carrier="queue-operation"):
+    """One transcript entry carrying a `<task-notification>`. The corpus shows
+    them on several carriers (queue-operation, user, attachment, assistant), so
+    the scan must not key on one — these fixtures cover the two commonest."""
+    text = (f"<task-notification>\n<task-id>{task_id}</task-id>\n"
+            f"<status>{status}</status>\n<summary>Agent finished</summary>\n"
+            "</task-notification>")
+    if carrier == "queue-operation":
+        return {"type": "queue-operation", "operation": "enqueue", "content": text}
+    return {"type": "user", "message": {"content": text}}
+
+
+# A background-agent launch exactly as Claude Code writes it today: the `Agent`
+# call, then the result entry whose STRUCTURED `toolUseResult` records the
+# launch. The prose beside it also says "agentId: …", but that text is NOT what
+# the scan keys on — see _async_launch.
+TASK_LAUNCH_ENTRIES = [
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Agent",
+         "input": {"description": "QA the parity change", "prompt": "...",
+                   "run_in_background": True}}]}},
+    {"type": "user",
+     "message": {"content": [
+         {"type": "tool_result", "tool_use_id": "toolu_1",
+          "content": "Async agent launched successfully. (internal metadata) "
+                     "agentId: agent-1 (internal ID - do not mention to user.)"}]},
+     "toolUseResult": {"isAsync": True, "status": "async_launched",
+                       "agentId": "agent-1", "description": "QA the parity change",
+                       "resolvedModel": "claude-opus-4-8"}},
+]
+
+
+class TestLiveAgentsScan(unittest.TestCase):
+    """_scan_agent_entry — which background agents are in flight, off the
+    transcript's own launch/stop edges. The TUI footer is NOT the source: its
+    rows are forgeable pane content AND linger ~24s past completion."""
+
+    def _scan(self, entries, state=None):
+        state = {} if state is None else state
+        for e in entries:
+            ha._scan_entry_line(json.dumps(e), state, {"prUrls": [], "modelActual": None})
+        return state
+
+    def test_a_launch_makes_an_agent_live_with_its_description(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "agent", "label": "QA the parity change"}])
+
+    def test_the_subagent_type_names_the_row_when_the_call_carries_one(self):
+        # Older `Task` calls do; today's background `Agent` calls do not.
+        entries = [dict(TASK_LAUNCH_ENTRIES[0]), TASK_LAUNCH_ENTRIES[1]]
+        entries[0] = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Task",
+             "input": {"subagent_type": "qa", "description": "QA the parity change"}}]}}
+        st = self._scan(entries)
+        self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "qa", "label": "QA the parity change"}])
+
+    def test_loose_agent_id_text_in_tool_output_registers_nothing(self):
+        # THE regression: `agentId:` appears in the OUTPUT of any tool that reads
+        # a transcript (grep/cat/Read). Keying on that text registered a live
+        # agent belonging to ANOTHER session, whose notification can never
+        # arrive here — a phantom that never clears. Worse than the pane's.
+        st = self._scan([
+            {"type": "user",
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "tb1",
+                  "content": "agentId: a3c02192c84d32f9f\nagentId: deadbeef"}]},
+             "toolUseResult": {"stdout": "agentId: a3c02192c84d32f9f",
+                               "stderr": "", "interrupted": False, "isImage": False}},
+        ])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_synchronous_subagent_result_registers_nothing(self):
+        # A foreground agent's result lands when it has ALREADY finished (its
+        # shape carries content/usage, never isAsync), so registering it would
+        # strand a live agent for work that is over.
+        st = self._scan([
+            {"type": "user",
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "ts1",
+                  "content": "Here is my report. agentId: sync-1"}]},
+             "toolUseResult": {"agentId": "sync-1", "agentType": "Explore",
+                               "content": "…", "status": "completed",
+                               "totalTokens": 1234, "usage": {}}},
+        ])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_background_workflow_counts_as_work_in_flight(self):
+        # `Workflow` writes `status:"async_launched"` with taskId/workflowName
+        # and NO isAsync. Requiring isAsync excluded it — and a background
+        # code-review/deep-research is the LONGEST-lived work on a host, so the
+        # session read idle for its whole duration. Its stop edge already worked.
+        st = self._scan([
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tw1", "name": "Workflow", "input": {}}]}},
+            {"type": "user",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "tw1"}]},
+             "toolUseResult": {"status": "async_launched", "taskId": "wsgju70jc",
+                               "taskType": "local_workflow", "workflowName": "code-review",
+                               "runId": "wf_eb4f", "summary": "Review the diff."}},
+        ])
+        self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "workflow", "label": "code-review"}])
+        self._scan([task_notification_entry("wsgju70jc", "completed")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_the_agent_tool_name_is_what_carries_the_type(self):
+        # The launch record never carries an agentType, so the type comes solely
+        # from the CALL's subagent_type — and the call is named `Agent` today.
+        # Matching `Task` only silently returns every row to a generic "agent".
+        entries = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Agent",
+                 "input": {"subagent_type": "Explore", "description": "Map it"}}]}},
+            {"type": "user",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1"}]},
+             "toolUseResult": {"isAsync": True, "status": "async_launched",
+                               "agentId": "agent-9", "description": "Map it"}},
+        ]
+        self.assertEqual(ha.live_agents_report(self._scan(entries)),
+                         [{"type": "Explore", "label": "Map it"}])
+
+    def test_a_notification_quoted_by_the_assistant_is_ignored(self):
+        # A session working on THIS feature quotes notifications in its own
+        # replies and fixtures; honouring those silently retires a running agent
+        # and makes its id permanently un-registerable.
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([{"type": "assistant", "message": {"content": [
+            {"type": "text", "text":
+             "<task-notification>\n<task-id>agent-1</task-id>\n"
+             "<status>completed</status>\n</task-notification>"}]}}], st)
+        self.assertEqual(len(ha.live_agents_report(st)), 1, "still live")
+
+    def test_a_stop_seen_before_its_launch_still_wins(self):
+        # Observed in real data: the queued copy of a notification lands at an
+        # EARLIER file offset than the launch it refers to (its timestamp is
+        # later). Registering on the launch would then never be undone.
+        st = self._scan([task_notification_entry("agent-1", "completed")])
+        self._scan(TASK_LAUNCH_ENTRIES, st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_the_notification_is_what_ends_it(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([task_notification_entry("agent-1", "completed")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_every_terminal_status_ends_it_and_both_carriers_are_read(self):
+        for status in ("completed", "failed", "killed", "stopped"):
+            for carrier in ("queue-operation", "user"):
+                st = self._scan(TASK_LAUNCH_ENTRIES)
+                self._scan([task_notification_entry("agent-1", status, carrier)], st)
+                self.assertEqual(ha.live_agents_report(st), [],
+                                 f"{status} via {carrier} must end it")
+
+    def test_a_non_terminal_status_must_not_clear_the_agent(self):
+        # Every status Claude Code writes today is terminal, so the gate guards
+        # against a future progress-style notification — which, unguarded, would
+        # retire an agent the moment it reported in while still running.
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([task_notification_entry("agent-1", "running")], st)
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+        self._scan([task_notification_entry("agent-1", "completed")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_notification_for_another_agent_leaves_this_one_running(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([task_notification_entry("someone-else", "completed")], st)
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+
+    def test_several_agents_are_tracked_independently(self):
+        entries = list(TASK_LAUNCH_ENTRIES) + [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_2", "name": "Task",
+                 "input": {"subagent_type": "Explore", "description": "Map it"}}]}},
+            {"type": "user",
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "toolu_2"}]},
+             "toolUseResult": {"isAsync": True, "status": "async_launched",
+                               "agentId": "agent-2", "description": "Map it"}},
+        ]
+        st = self._scan(entries)
+        self.assertEqual(sorted(a["label"] for a in ha.live_agents_report(st)),
+                         ["Map it", "QA the parity change"])
+        self._scan([task_notification_entry("agent-1", "completed")], st)
+        self.assertEqual([a["label"] for a in ha.live_agents_report(st)], ["Map it"])
+
+    def test_a_launch_whose_call_was_missed_still_counts(self):
+        # An agent restart primes the byte offsets to EOF, so the scan can see a
+        # launch record whose CALL it never read. The launch record carries the
+        # description itself, so the row is still named.
+        st = self._scan(TASK_LAUNCH_ENTRIES[1:])
+        self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "agent", "label": "QA the parity change"}])
+
+    def test_ordinary_traffic_moves_nothing(self):
+        st = self._scan([
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "talking about agentId: not-a-launch"}]}},
+            {"type": "user", "message": {"content": "just a prompt"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t9", "name": "Bash",
+                 "input": {"command": "echo hi"}}]}},
+        ])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_the_live_set_is_bounded(self):
+        entries = []
+        for i in range(200):
+            entries.append({"type": "user",
+                            "message": {"content": [
+                                {"type": "tool_result", "tool_use_id": f"t{i}"}]},
+                            "toolUseResult": {"isAsync": True, "status": "async_launched",
+                                              "agentId": f"a{i}", "description": f"job {i}"}})
+        st = self._scan(entries)
+        self.assertEqual(len(ha.live_agents_report(st)), ha.LIVE_AGENTS_MAX)
+
+
 class TestTaskNotification(unittest.TestCase):
     """A background Task/agent finishing arrives as a user-role `<task-notification>`
     turn; it must parse into a structured task_notification block (rendered as an
@@ -1922,6 +2174,9 @@ class TestTaskNotification(unittest.TestCase):
             "summary": 'Agent "Confirm merge semantics" finished',
             "status": "completed",
             "result": "The --settings file is merged as a higher-precedence layer.",
+            # The id is what makes this a usable STOPPED edge for the live-agent
+            # scan, not just display text (XERK-245).
+            "taskId": "af9e62627de15eaf4",
         })
 
     def test_non_notification_text_is_not_parsed(self):
@@ -8295,6 +8550,43 @@ class TestResolveSubagent(unittest.TestCase):
             f.write(json.dumps({"agentId": agent_id, "isSidechain": True,
                                 "message": {"content": "working"}}) + "\n")
         return main, sub
+
+    def _main_with_agent_call(self, agent_id, description):
+        """The same, but as today's `Agent` call: named `Agent`, and carrying NO
+        subagent_type — which is why the clicked row's type is the generic
+        "agent"."""
+        main = os.path.join(self.tmp, "main.jsonl")
+        tool_id = "toolu_" + agent_id
+        lines = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Agent",
+                 "input": {"description": description, "prompt": "go",
+                           "run_in_background": True}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": [
+                    {"type": "text",
+                     "text": f"Async agent launched successfully.\nagentId: {agent_id} (internal)"}]}]}},
+        ]
+        with open(main, "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+        subdir = os.path.join(self.tmp, "main", "subagents")
+        os.makedirs(subdir, exist_ok=True)
+        sub = os.path.join(subdir, f"agent-{agent_id}.jsonl")
+        with open(sub, "w") as f:
+            f.write(json.dumps({"agentId": agent_id, "isSidechain": True,
+                                "message": {"content": "working"}}) + "\n")
+        return main, sub
+
+    def test_resolves_todays_agent_call_via_the_wildcard_type(self):
+        # Only `Task` was matched here, so on today's transcripts NO clicked row
+        # resolved and every subagent view opened empty. A background launch
+        # carries no subagent_type, so the row's generic "agent" must act as a
+        # wildcard and let the description decide.
+        main, sub = self._main_with_agent_call("ag9001", "QA lifecycle probe")
+        self.assertEqual(ha._resolve_subagent(main, "agent", "QA lifecycle probe"), sub)
+        # A pane-truncated label still resolves through the same path.
+        self.assertEqual(ha._resolve_subagent(main, "agent", "QA lifecycle pro…"), sub)
 
     def test_resolves_exact_type_and_label(self):
         main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
