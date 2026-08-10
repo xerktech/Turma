@@ -3140,28 +3140,40 @@ LIVE_AGENTS_MAX = 32
 
 
 def _async_launch(entry):
-    """This entry's `toolUseResult` iff it is a BACKGROUND agent launch — the
-    structured record Claude Code writes beside the tool_result:
-    `{isAsync: true, status: "async_launched", agentId, description, …}`. Else
-    None.
+    """`{id, type, label}` iff this entry is a BACKGROUND WORK launch, else None.
+
+    Keyed on the structured record Claude Code writes beside the tool_result —
+    `{status: "async_launched", …}` — which across the corpus is produced by
+    exactly three tools and nothing else: `Agent` and `Task` (carrying
+    `agentId`/`description`) and `Workflow` (carrying `taskId`/`workflowName`,
+    and no `isAsync` at all).
 
     **Never scan loose text for `agentId:`.** That was tried and is exactly how a
     permanent phantom gets in: the string appears in the OUTPUT of any ordinary
     tool — a `grep`/`cat`/`Read` over a transcript, a QA fixture, another
     session's scratch file — and an id belonging to some other session can never
     receive its own notification here, so the phantom never clears. (The earlier
-    pane-scrape phantoms at least self-cleared.) The structured field cannot be
-    produced by a tool printing text.
-    It also settles two cases the text match got wrong: a SYNCHRONOUS subagent
-    result is already complete when it lands (its shape carries `content`/
-    `usage`, not `isAsync`) and must not register at all, and a `Bash` result
-    quoting an id is not a launch."""
+    pane-scrape phantoms at least self-cleared.) A structured field cannot be
+    produced by a tool printing text: `async_launched` appears on none of the
+    12k+ `Bash`, 3k `Read` or 4k `Edit` results, and no MCP tool writes a dict
+    `toolUseResult` at all.
+
+    It also excludes a SYNCHRONOUS subagent result, which is already finished
+    when it lands (its shape carries `content`/`usage`, and no `status`).
+    **`isAsync` is deliberately NOT required**: it would exclude `Workflow`,
+    whose background runs are the longest-lived work on a host — a session
+    running a background `code-review` read idle for its whole duration."""
     tur = entry.get("toolUseResult") if isinstance(entry, dict) else None
-    if not isinstance(tur, dict):
+    if not isinstance(tur, dict) or tur.get("status") != "async_launched":
         return None
-    if tur.get("isAsync") is not True or tur.get("status") != "async_launched":
+    ident = tur.get("agentId") or tur.get("taskId")
+    if not ident:
         return None
-    return tur if tur.get("agentId") else None
+    if tur.get("taskType") == "local_workflow":
+        return {"id": str(ident), "type": "workflow",
+                "label": str(tur.get("workflowName") or tur.get("summary") or "").strip()}
+    return {"id": str(ident), "type": str(tur.get("agentType") or "agent"),
+            "label": str(tur.get("description") or "").strip()}
 
 
 def _scan_agent_entry(entry, state):
@@ -3192,32 +3204,34 @@ def _scan_agent_entry(entry, state):
                         tasks.pop(next(iter(tasks)))
     launch = _async_launch(entry)
     if launch and len(live) < LIVE_AGENTS_MAX:
-        aid = str(launch["agentId"])
         # A notification can be WRITTEN BEFORE the launch it refers to (observed:
         # the queued copy lands at an earlier file offset than the launch, with a
         # LATER timestamp). Registering here would then never be undone, so a
         # stop already seen wins over a later-read launch.
-        if aid not in stopped:
+        if launch["id"] not in stopped:
             tool_id = None
             for block in (content if isinstance(content, list) else []):
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     tool_id = block.get("tool_use_id")
-            live[aid] = {
-                "type": tasks.get(tool_id) or str(launch.get("agentType") or "agent"),
-                "label": str(launch.get("description") or "").strip(),
-            }
-    # The notification can ride several entry shapes (a queued operation, the
-    # user turn it becomes once dequeued, an attachment), so the text is taken
-    # from wherever this entry carries it rather than from one field.
-    for text in _entry_texts_for_scan(entry):
-        tn = _parse_task_notification(text)
-        if not tn or not tn.get("taskId"):
-            continue
-        if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
-            live.pop(tn["taskId"], None)
-            if tn["taskId"] not in stopped:
-                stopped.append(tn["taskId"])
-                del stopped[:-LIVE_AGENTS_MAX * 4]
+            # The call's subagent_type is the only place a real agent TYPE
+            # appears — the launch record never carries one — so it wins when we
+            # saw the call.
+            live[launch["id"]] = {"type": tasks.get(tool_id) or launch["type"],
+                                  "label": launch["label"]}
+    # The notification rides a queued operation, the user turn it becomes once
+    # dequeued, or an attachment — never an ASSISTANT turn, which is skipped so
+    # that a session merely QUOTING a notification (this feature's own fixtures,
+    # say) cannot retire an agent that is still running.
+    if entry.get("type") != "assistant":
+        for text in _entry_texts_for_scan(entry):
+            tn = _parse_task_notification(text)
+            if not tn or not tn.get("taskId"):
+                continue
+            if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
+                live.pop(tn["taskId"], None)
+                if tn["taskId"] not in stopped:
+                    stopped.append(tn["taskId"])
+                    del stopped[:-LIVE_AGENTS_MAX * 4]
 
 
 def _entry_texts_for_scan(entry):

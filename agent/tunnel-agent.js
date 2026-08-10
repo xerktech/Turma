@@ -896,15 +896,22 @@ function parseAgentList(lines) {
 const AGENT_DONE_STATUSES = new Set(["completed", "failed", "killed", "stopped", "error"]);
 const LIVE_AGENTS_MAX = 32;
 
-// This entry's `toolUseResult` iff it is a BACKGROUND agent launch. Mirror of
+// `{id, type, label}` iff this entry is a BACKGROUND WORK launch. Mirror of
 // hub-agent.py's _async_launch — read there for why loose `agentId:` text must
 // never be the signal (a grep/cat of any transcript registers a permanent
-// phantom) and why a synchronous subagent result must not register at all.
+// phantom), why a synchronous subagent result must not register, and why
+// `isAsync` is deliberately not required (it would exclude `Workflow`).
 function asyncLaunch(entry) {
   const tur = entry && entry.toolUseResult;
-  if (!tur || typeof tur !== "object") return null;
-  if (tur.isAsync !== true || tur.status !== "async_launched") return null;
-  return tur.agentId ? tur : null;
+  if (!tur || typeof tur !== "object" || tur.status !== "async_launched") return null;
+  const ident = tur.agentId || tur.taskId;
+  if (!ident) return null;
+  if (tur.taskType === "local_workflow") {
+    return { id: String(ident), type: "workflow",
+             label: String(tur.workflowName || tur.summary || "").trim() };
+  }
+  return { id: String(ident), type: String(tur.agentType || "agent"),
+           label: String(tur.description || "").trim() };
 }
 
 function scanAgentEntry(entry, state) {
@@ -930,24 +937,23 @@ function scanAgentEntry(entry, state) {
     }
   }
   const launch = asyncLaunch(entry);
-  if (launch && live.size < LIVE_AGENTS_MAX) {
-    const aid = String(launch.agentId);
+  if (launch && live.size < LIVE_AGENTS_MAX && !stopped.has(launch.id)) {
     // A stop already seen wins over a later-read launch: a notification can be
-    // written at an EARLIER file offset than the launch it refers to.
-    if (!stopped.has(aid)) {
-      live.set(aid, {
-        type: tasks.get(toolId) || String(launch.agentType || "agent"),
-        label: String(launch.description || "").trim(),
-      });
-    }
+    // written at an EARLIER file offset than the launch it refers to. The
+    // call's subagent_type is the only place a real agent TYPE appears.
+    live.set(launch.id, { type: tasks.get(toolId) || launch.type, label: launch.label });
   }
-  for (const text of entryTextsForScan(entry)) {
-    const tn = parseTaskNotification(text);
-    if (!tn || !tn.taskId) continue;
-    if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
-      live.delete(tn.taskId);
-      stopped.add(tn.taskId);
-      while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
+  // Never an ASSISTANT turn — a session merely QUOTING a notification must not
+  // retire an agent that is still running.
+  if (entry.type !== "assistant") {
+    for (const text of entryTextsForScan(entry)) {
+      const tn = parseTaskNotification(text);
+      if (!tn || !tn.taskId) continue;
+      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
+        live.delete(tn.taskId);
+        stopped.add(tn.taskId);
+        while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
+      }
     }
   }
 }

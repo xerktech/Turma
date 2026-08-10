@@ -1330,6 +1330,45 @@ test("scanAgentEntry: a synchronous subagent result registers nothing", () => {
   assert.deepEqual(liveAgentsReport(st), []);
 });
 
+test("scanAgentEntry: a background workflow counts as work in flight", () => {
+  // `Workflow` writes status:"async_launched" with taskId and NO isAsync, and a
+  // background code-review is the longest-lived work on a host.
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll([{ type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "tw1" }] },
+    toolUseResult: { status: "async_launched", taskId: "wsgju70jc",
+                     taskType: "local_workflow", workflowName: "code-review",
+                     summary: "Review the diff." } }]);
+  assert.deepEqual(liveAgentsReport(st), [{ type: "workflow", label: "code-review" }]);
+  scanAll([notif("wsgju70jc", "completed")], st);
+  assert.deepEqual(liveAgentsReport(st), []);
+});
+
+test("scanAgentEntry: the `Agent` tool name is what carries the type", () => {
+  // The launch record has no agentType, so the type comes solely from the
+  // call's subagent_type — and the call is named `Agent` today, not `Task`.
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll([
+    { type: "assistant", message: { content: [
+      { type: "tool_use", id: "toolu_1", name: "Agent",
+        input: { subagent_type: "Explore", description: "Map it" } }] } },
+    { type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_1" }] },
+      toolUseResult: { isAsync: true, status: "async_launched",
+                       agentId: "agent-9", description: "Map it" } },
+  ]);
+  assert.deepEqual(liveAgentsReport(st), [{ type: "Explore", label: "Map it" }]);
+});
+
+test("scanAgentEntry: a notification quoted by the assistant is ignored", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll(LAUNCH_ENTRIES);
+  scanAll([{ type: "assistant", message: { content: [{ type: "text", text:
+    "<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n" +
+    "</task-notification>" }] } }], st);
+  assert.equal(liveAgentsReport(st).length, 1, "still live");
+});
+
 test("scanAgentEntry: a stop seen before its launch still wins", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
   const st = scanAll([notif("agent-1", "completed")]);

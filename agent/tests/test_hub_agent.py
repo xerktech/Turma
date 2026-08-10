@@ -2032,6 +2032,52 @@ class TestLiveAgentsScan(unittest.TestCase):
         ])
         self.assertEqual(ha.live_agents_report(st), [])
 
+    def test_a_background_workflow_counts_as_work_in_flight(self):
+        # `Workflow` writes `status:"async_launched"` with taskId/workflowName
+        # and NO isAsync. Requiring isAsync excluded it — and a background
+        # code-review/deep-research is the LONGEST-lived work on a host, so the
+        # session read idle for its whole duration. Its stop edge already worked.
+        st = self._scan([
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tw1", "name": "Workflow", "input": {}}]}},
+            {"type": "user",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "tw1"}]},
+             "toolUseResult": {"status": "async_launched", "taskId": "wsgju70jc",
+                               "taskType": "local_workflow", "workflowName": "code-review",
+                               "runId": "wf_eb4f", "summary": "Review the diff."}},
+        ])
+        self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "workflow", "label": "code-review"}])
+        self._scan([task_notification_entry("wsgju70jc", "completed")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_the_agent_tool_name_is_what_carries_the_type(self):
+        # The launch record never carries an agentType, so the type comes solely
+        # from the CALL's subagent_type — and the call is named `Agent` today.
+        # Matching `Task` only silently returns every row to a generic "agent".
+        entries = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Agent",
+                 "input": {"subagent_type": "Explore", "description": "Map it"}}]}},
+            {"type": "user",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1"}]},
+             "toolUseResult": {"isAsync": True, "status": "async_launched",
+                               "agentId": "agent-9", "description": "Map it"}},
+        ]
+        self.assertEqual(ha.live_agents_report(self._scan(entries)),
+                         [{"type": "Explore", "label": "Map it"}])
+
+    def test_a_notification_quoted_by_the_assistant_is_ignored(self):
+        # A session working on THIS feature quotes notifications in its own
+        # replies and fixtures; honouring those silently retires a running agent
+        # and makes its id permanently un-registerable.
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([{"type": "assistant", "message": {"content": [
+            {"type": "text", "text":
+             "<task-notification>\n<task-id>agent-1</task-id>\n"
+             "<status>completed</status>\n</task-notification>"}]}}], st)
+        self.assertEqual(len(ha.live_agents_report(st)), 1, "still live")
+
     def test_a_stop_seen_before_its_launch_still_wins(self):
         # Observed in real data: the queued copy of a notification lands at an
         # EARLIER file offset than the launch it refers to (its timestamp is
@@ -8504,6 +8550,43 @@ class TestResolveSubagent(unittest.TestCase):
             f.write(json.dumps({"agentId": agent_id, "isSidechain": True,
                                 "message": {"content": "working"}}) + "\n")
         return main, sub
+
+    def _main_with_agent_call(self, agent_id, description):
+        """The same, but as today's `Agent` call: named `Agent`, and carrying NO
+        subagent_type — which is why the clicked row's type is the generic
+        "agent"."""
+        main = os.path.join(self.tmp, "main.jsonl")
+        tool_id = "toolu_" + agent_id
+        lines = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Agent",
+                 "input": {"description": description, "prompt": "go",
+                           "run_in_background": True}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": [
+                    {"type": "text",
+                     "text": f"Async agent launched successfully.\nagentId: {agent_id} (internal)"}]}]}},
+        ]
+        with open(main, "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+        subdir = os.path.join(self.tmp, "main", "subagents")
+        os.makedirs(subdir, exist_ok=True)
+        sub = os.path.join(subdir, f"agent-{agent_id}.jsonl")
+        with open(sub, "w") as f:
+            f.write(json.dumps({"agentId": agent_id, "isSidechain": True,
+                                "message": {"content": "working"}}) + "\n")
+        return main, sub
+
+    def test_resolves_todays_agent_call_via_the_wildcard_type(self):
+        # Only `Task` was matched here, so on today's transcripts NO clicked row
+        # resolved and every subagent view opened empty. A background launch
+        # carries no subagent_type, so the row's generic "agent" must act as a
+        # wildcard and let the description decide.
+        main, sub = self._main_with_agent_call("ag9001", "QA lifecycle probe")
+        self.assertEqual(ha._resolve_subagent(main, "agent", "QA lifecycle probe"), sub)
+        # A pane-truncated label still resolves through the same path.
+        self.assertEqual(ha._resolve_subagent(main, "agent", "QA lifecycle pro…"), sub)
 
     def test_resolves_exact_type_and_label(self):
         main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
