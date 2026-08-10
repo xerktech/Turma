@@ -181,9 +181,11 @@ const TN_TAG_RE = {
   summary: /<summary>([\s\S]*?)<\/summary>/,
   status: /<status>([\s\S]*?)<\/status>/,
   result: /<result>([\s\S]*?)<\/result>/,
+  "task-id": /<task-id>([\s\S]*?)<\/task-id>/,
 };
 function tnTag(name, body) {
-  const m = TN_TAG_RE[name].exec(body);
+  const re = TN_TAG_RE[name];
+  const m = re ? re.exec(body) : null;
   return m ? m[1].replace(ANSI_RE, "").trim() : "";
 }
 function parseTaskNotification(text) {
@@ -191,7 +193,10 @@ function parseTaskNotification(text) {
   const m = TASK_NOTIFICATION_RE.exec(text);
   if (!m) return null;
   const body = m[1];
-  return { summary: tnTag("summary", body), status: tnTag("status", body), result: tnTag("result", body) };
+  // `taskId` is what makes this a usable STOPPED edge for the live-agent scan,
+  // not just display text (XERK-245). Mirrors _parse_task_notification.
+  return { summary: tnTag("summary", body), status: tnTag("status", body),
+           result: tnTag("result", body), taskId: tnTag("task-id", body) };
 }
 // Flatten a parsed task-notification to text-feed form (summary + result) —
 // mirror of hub-agent.py _tn_preview.
@@ -689,7 +694,7 @@ function queuedDisplay(queue) {
 // poll (same file, same mtime+size) — pollWatcher ticks this ~1s per session and
 // most ticks find nothing new. sessionTranscript already stat'd the candidates,
 // so one more stat of the winner is cheap next to re-reading the tail.
-function transcriptTail(worktreePath, cache, transcriptId) {
+function transcriptTail(worktreePath, cache, transcriptId, agentState) {
   const p = sessionTranscript(worktreePath, transcriptId);
   if (!p) {
     if (cache) { cache.path = null; cache.result = { entries: [], queued: [] }; }
@@ -707,6 +712,11 @@ function transcriptTail(worktreePath, cache, transcriptId) {
     let entry;
     try { entry = JSON.parse(raw); } catch { continue; }
     if (!entry || typeof entry !== "object") continue;
+    // Live background agents, folded from the SAME parse (XERK-245). The state
+    // persists across polls, so an entry scrolling out of the tail window never
+    // un-does what it established; and because a launch always precedes its own
+    // notification in the file, a window holding the launch holds the stop too.
+    if (agentState) scanAgentEntry(entry, agentState);
     if (entry.type === "queue-operation") { foldQueueOp(entry, queued); continue; }
     const text = entryText(entry);
     const blocks = entryBlocks(entry, BLOCK_CAPS_LIVE);
@@ -736,7 +746,14 @@ function transcriptTail(worktreePath, cache, transcriptId) {
 let controlWs = null;
 const watchers = new Map(); // sessionId -> { worktreePath, lastJson, timer }
 
+// Tests substitute a sink here so the whole watch -> tail -> frame path can be
+// driven without a socket. The four cut points between scanAgentEntry and the
+// wire (the agentState threading, the watcher seed, the frame's `agents`, and
+// this send) were each individually severable with a green CI until that path
+// was covered end to end.
+let controlSink = null;
 function sendControl(obj) {
+  if (controlSink) { controlSink(obj); return; }
   if (controlWs && controlWs.readyState === WebSocket.OPEN) {
     try { controlWs.send(JSON.stringify(obj)); } catch {}
   }
@@ -870,6 +887,95 @@ function parseAgentList(lines) {
   return agents;
 }
 
+// ---- live background agents, off the transcript (XERK-245) ------------------
+// Mirror of hub-agent.py's _scan_agent_entry / live_agents_report — read there
+// for why the TUI's footer list is NOT the source and must not become one
+// again: its rows are pane CONTENT (a quoted footer plus a composer-less
+// full-screen view forged them) and, measured on a live TUI, they LINGER ~24s
+// after an agent finishes, so no single capture can tell running from finished.
+const AGENT_DONE_STATUSES = new Set(["completed", "failed", "killed", "stopped", "error"]);
+const LIVE_AGENTS_MAX = 32;
+
+// `{id, type, label}` iff this entry is a BACKGROUND WORK launch. Mirror of
+// hub-agent.py's _async_launch — read there for why loose `agentId:` text must
+// never be the signal (a grep/cat of any transcript registers a permanent
+// phantom), why a synchronous subagent result must not register, and why
+// `isAsync` is deliberately not required (it would exclude `Workflow`).
+function asyncLaunch(entry) {
+  const tur = entry && entry.toolUseResult;
+  if (!tur || typeof tur !== "object" || tur.status !== "async_launched") return null;
+  const ident = tur.agentId || tur.taskId;
+  if (!ident) return null;
+  if (tur.taskType === "local_workflow") {
+    return { id: String(ident), type: "workflow",
+             label: String(tur.workflowName || tur.summary || "").trim() };
+  }
+  return { id: String(ident), type: String(tur.agentType || "agent"),
+           label: String(tur.description || "").trim() };
+}
+
+function scanAgentEntry(entry, state) {
+  if (!entry || typeof entry !== "object" || !state) return;
+  const live = state.live || (state.live = new Map());
+  const tasks = state.tasks || (state.tasks = new Map());
+  const stopped = state.stopped || (state.stopped = new Set());
+  const content = entry.message && entry.message.content;
+  let toolId = null;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      // `Agent` in current Claude Code, `Task` in older transcripts — both.
+      if (block.type === "tool_use" && (block.name === "Agent" || block.name === "Task") && block.id) {
+        const atype = String((block.input || {}).subagent_type || "").trim();
+        if (atype) {
+          tasks.set(block.id, atype);
+          while (tasks.size > LIVE_AGENTS_MAX * 4) tasks.delete(tasks.keys().next().value);
+        }
+      } else if (block.type === "tool_result") {
+        toolId = block.tool_use_id;
+      }
+    }
+  }
+  const launch = asyncLaunch(entry);
+  if (launch && live.size < LIVE_AGENTS_MAX && !stopped.has(launch.id)) {
+    // A stop already seen wins over a later-read launch: a notification can be
+    // written at an EARLIER file offset than the launch it refers to. The
+    // call's subagent_type is the only place a real agent TYPE appears.
+    live.set(launch.id, { type: tasks.get(toolId) || launch.type, label: launch.label });
+  }
+  // Never an ASSISTANT turn — a session merely QUOTING a notification must not
+  // retire an agent that is still running.
+  if (entry.type !== "assistant") {
+    for (const text of entryTextsForScan(entry)) {
+      const tn = parseTaskNotification(text);
+      if (!tn || !tn.taskId) continue;
+      if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
+        live.delete(tn.taskId);
+        stopped.add(tn.taskId);
+        while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
+      }
+    }
+  }
+}
+
+// The raw strings on one entry that could BE a `<task-notification>`: a
+// queue-operation's content, and any string/text-block message content.
+function entryTextsForScan(entry) {
+  const out = [];
+  if (typeof entry.content === "string") out.push(entry.content);
+  const content = entry.message && entry.message.content;
+  if (typeof content === "string") out.push(content);
+  else if (Array.isArray(content)) {
+    for (const b of content) if (b && typeof b.text === "string") out.push(b.text);
+  }
+  return out;
+}
+
+function liveAgentsReport(state) {
+  if (!state || !state.live) return [];
+  return [...state.live.values()].map((a) => ({ type: a.type, label: a.label }));
+}
+
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
 // kept verbatim from the TUI (e.g. up: "1.2k", down: "340", elapsed: "12s").
 // Absent fields come back as "". Order/format vary across Claude Code versions,
@@ -919,7 +1025,6 @@ function paneShowsBusy(raw) {
 
 function parsePaneLiveTurn(pane) {
   const raw = String(pane || "").replace(/\r/g, "");
-  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null };
   const lines = raw.split("\n");
   const isRule = (l) => /^─{20,}$/.test(l.trim());
   // Drop the whole bottom input box (its top border ─, the ❯ prompt line(s),
@@ -931,6 +1036,10 @@ function parsePaneLiveTurn(pane) {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (isRule(lines[i])) { bottom = i; break; }
   }
+  // Live background agents do NOT come from here — see scanAgentEntry. The
+  // footer's rows are pane content and linger ~24s past completion, so they
+  // cannot answer "is an agent running right now"; the transcript can.
+  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null, agents: [] };
   let end = lines.length;
   if (bottom >= 0) {
     end = bottom;
@@ -966,14 +1075,14 @@ function parsePaneLiveTurn(pane) {
       if (h) status.hint = h;
     }
   }
-  // The agent-manager list, when expanded, is painted BELOW the input box
-  // (after `bottom`, the box's bottom rule) alongside the mode line — a region
-  // the convo slice above intentionally drops. Parse it there so the assistant
-  // block can't swallow it and the column-0 ● bullet can't fake a row.
-  const agents = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
-  if (agents.length) {
+  // The pane's own footer rows still ride `status.agents` while a turn runs:
+  // they carry the live elapsed/token counters the transcript has no way to
+  // know, and an older hub forwards only `status`. They are DISPLAY ONLY —
+  // liveness is the transcript's answer (scanAgentEntry).
+  const paneRows = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
+  if (paneRows.length) {
     status = status || { verb: "", up: "", down: "", elapsed: "" };
-    status.agents = agents;
+    status.agents = paneRows;
   }
   // The in-progress assistant block starts at the last column-0 ● bullet.
   let start = -1;
@@ -981,7 +1090,7 @@ function parsePaneLiveTurn(pane) {
     if (/^●\s/.test(convo[i])) { start = i; break; }
     if (/^❯/.test(convo[i])) break; // hit the user prompt -> no text yet
   }
-  if (start < 0) return { generating: true, text: "", status }; // thinking; no text yet
+  if (start < 0) return { generating: true, text: "", status, agents: [] }; // thinking; no text yet
   const block = [];
   for (let i = start; i < convo.length; i++) {
     const l = convo[i];
@@ -994,7 +1103,7 @@ function parsePaneLiveTurn(pane) {
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
   // and the transcript delivers the authoritative structure on completion.
   const text = stripActivityTail(block.join(" ").replace(/\s+/g, " ").trim());
-  return { generating: true, text, status };
+  return { generating: true, text, status, agents: [] };
 }
 
 // Suppress a single-frame busy->idle blip in the live turn scrape. Claude Code
@@ -1028,7 +1137,8 @@ function captureLiveTurn(sessionId, cb) {
     "tmux",
     ["capture-pane", "-p", "-t", `agent-${sessionId}`],
     { timeout: 2000, maxBuffer: 1 << 20 },
-    (err, stdout) => cb(err ? { generating: false, text: "", status: null } : parsePaneLiveTurn(stdout))
+    (err, stdout) => cb(err ? { generating: false, text: "", status: null, agents: [] }
+                            : parsePaneLiveTurn(stdout))
   );
 }
 
@@ -1123,7 +1233,7 @@ function pollWatcher(sessionId) {
   //    queue op is a transcript line that changes NO entry — without it, the
   //    frame that reports "your prompt is queued" would never fire.
   let tail = null;
-  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId); }
+  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId, w.agentState); }
   catch { tail = null; }
   if (tail && (tail.entries.length || tail.queued.length)) {
     const json = JSON.stringify(tail);
@@ -1155,9 +1265,20 @@ function pollWatcher(sessionId) {
     // binary and silently report no matches for anything in it (the same
     // reason the tests keep ESC as String.fromCharCode(27)).
     const key = text + "\u0000" + (status ? JSON.stringify(status) : "");
-    if (key !== w.lastTurn) {
-      w.lastTurn = key;
-      sendControl({ turn: sessionId, text, status });
+    // The live agent list rides the FRAME, not `status`, because the two answer
+    // different questions and stop being true at different moments (XERK-245):
+    // `status` is "a turn is running" — it drives the chat's Stop button, so it
+    // must clear the instant the turn ends — while agents stay live past that,
+    // which is exactly when the operator most needs to see them. Sending them
+    // inside `status` would either hide them or fake a running turn.
+    const agents = liveAgentsReport(w.agentState);
+    // They join the dedup key for the same reason `status` does: a background
+    // agent's row ticks (elapsed, tokens) while the text and status hold still,
+    // and without this the list would freeze on whatever its first frame said.
+    const frameKey = key + (agents.length ? JSON.stringify(agents) : "");
+    if (frameKey !== w.lastTurn) {
+      w.lastTurn = frameKey;
+      sendControl({ turn: sessionId, text, status, agents });
     }
   });
 }
@@ -1181,6 +1302,9 @@ function startWatch(sessionId, worktreePath, transcriptId) {
     lastJson: null, lastTurn: "", timer: null,
     liveGen: false, livePending: false, // busy->idle blip hold; see liveTurnDecision
     heldText: "", // uncommitted prose held across paint gaps; see resolveLiveText
+    // Live background agents, accumulated from the transcript across polls
+    // (scanAgentEntry). Not derived from the pane — see that function.
+    agentState: { live: new Map(), tasks: new Map() },
     tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
@@ -1438,5 +1562,6 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport,
+    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }

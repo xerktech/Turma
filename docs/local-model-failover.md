@@ -29,7 +29,9 @@ the re-runnable replacement; see `bench/METHOD.md`.
 
 Six harnesses, 8 tasks mined from this repo's own merged history, one model
 (`gpt-oss:120b` via the gateway), identical prompts, identical 720 s cap,
-pristine worktree per run, scored only by the repo's own regression tests.
+pristine worktree per run, scored only by the repo's own regression tests. Run
+against the then-current **65536** per-slot window; DockerOps has since raised it
+to 81920, which should if anything help the harnesses that lost on context.
 
 | harness | solved | committed | median s | |
 |---|---|---|---|---|
@@ -102,7 +104,10 @@ denials re-implemented in a weaker permission system.
 
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` must match what the server really serves.
 Claude Code assumes 200k for a model it does not recognise and would compact far
-too late for a 64k window, and the tail then truncates server-side instead.
+too late, and the tail then truncates server-side instead. `LOCAL_MODEL_CONTEXT`
+defaults to the cue LLM's current per-slot window (**81920**, sized in
+`docs/opencode-model-eval-2026-08.md`); when DockerOps changes that window this
+default has to follow, or a session forfeits the extra room or overruns it.
 
 **Every path that creates or rebuilds a session record keeps its model source**
 — spawn, provision, queue drain, start, restart, resume of an ended session,
@@ -170,7 +175,7 @@ self-hosted model, not the Claude subscription.
   in the real local-session shape, authenticates against a non-Anthropic
   `/v1/messages` endpoint and completes multi-turn tool-using conversations with
   the safety guard intact. What is untested is the *model* — genuine refusals,
-  malformed or fenced tool JSON, truncation at 64k, latency, long-context
+  malformed or fenced tool JSON, truncation at the declared window, latency, long-context
   compaction. Exercise those the first time `LOCAL_MODEL_*` is set on a real
   host.
 - **A local session's model can't be changed from the chip** — by design, since

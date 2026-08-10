@@ -145,8 +145,9 @@ def harness_claude_local(prompt, env):
     env["ANTHROPIC_MODEL"] = MODEL
     env["ANTHROPIC_SMALL_FAST_MODEL"] = MODEL
     # Claude Code does not know this model's window and would otherwise assume
-    # 200k and compact far too late for a 64k server.
-    env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "65536"
+    # 200k and compact far too late. Tracks the server's real per-slot window
+    # (see docs/opencode-model-eval-2026-08.md's sizing).
+    env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = os.environ.get("TURMA_LOCAL_CONTEXT", "81920")
     # Isolated from the operator's real login: a bench run must never write to
     # the ~/.claude the fleet's sessions share. Overridable, and defaulted under
     # the runs directory rather than a machine-specific absolute path.

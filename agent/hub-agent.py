@@ -542,8 +542,11 @@ LOCAL_MODEL_BASE_URL = os.environ.get("LOCAL_MODEL_BASE_URL", "").strip()
 LOCAL_MODEL_API_KEY = os.environ.get("LOCAL_MODEL_API_KEY", "").strip()
 LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "gpt-oss:120b").strip()
 # Claude Code assumes a 200k window for a model it does not recognise and would
-# compact far too late for a 64k server — the tail then silently truncates
-# server-side instead of compacting. Must match what the server actually serves.
+# compact far too late — the tail then silently truncates server-side instead of
+# compacting. Must match what the server ACTUALLY serves: DockerOps sizes
+# Tenir-Ollama-Cue's per-slot window (81920 as of the sizing recorded in
+# docs/opencode-model-eval-2026-08.md), and this default tracks it. Overriding
+# it per host is what LOCAL_MODEL_CONTEXT is for.
 # No self-hosted context we would plausibly serve is larger than this; beyond it
 # a typo is likelier than an intent.
 MAX_LOCAL_MODEL_CONTEXT = 2_000_000
@@ -575,7 +578,7 @@ def _positive_int_env(name, default):
     return value
 
 
-LOCAL_MODEL_CONTEXT = _positive_int_env("LOCAL_MODEL_CONTEXT", 65536)
+LOCAL_MODEL_CONTEXT = _positive_int_env("LOCAL_MODEL_CONTEXT", 81920)
 # Where a session's model comes from. "subscription" is the mounted ~/.claude
 # login (the default, and what every existing session is); "local" is the
 # self-hosted model above.
@@ -2693,6 +2696,10 @@ def _parse_task_notification(text):
         "summary": _tn_tag("summary", body),
         "status": _tn_tag("status", body),
         "result": _tn_tag("result", body),
+        # Which background agent this is about — the same id its launch reported
+        # as `agentId:`. It is what makes the notification a usable STOPPED edge
+        # for the live-agent scan (XERK-245), not just display text.
+        "taskId": _tn_tag("task-id", body),
     }
 
 
@@ -3299,6 +3306,155 @@ def _scan_entry_line(raw, state, report):
         return
     _scan_pr_entry(entry, state, report)
     _scan_model_entry(entry, report)
+    _scan_agent_entry(entry, state)
+
+
+# ---- live background agents, off the transcript (XERK-245) -------------------
+#
+# WHICH background agents this session has in flight. The transcript records
+# BOTH edges exactly, so this is derived from data rather than inferred from the
+# screen:
+#
+#   started  a Task tool_use ({subagent_type, description}) whose paired
+#            tool_result says "Async agent launched successfully … agentId: X"
+#   stopped  a <task-notification> carrying <task-id>X</task-id> and a terminal
+#            <status> (completed / failed / killed / stopped)
+#
+# **The TUI's footer list is NOT the source and must not become one again.** It
+# was, and it failed twice: its rows are pane CONTENT, so a quoted footer plus a
+# composer-less full-screen view forged them (a session named after a sentence,
+# reading "working" forever and held out of Ready for review) — and, measured on
+# a live TUI, the rows LINGER ~24s after an agent finishes, so a single capture
+# cannot tell a running agent from a just-finished one at all. Same reason
+# pending questions come from the ask.py bridge and never from scraping.
+#
+# Failure direction is EMPTY: a launch this scan never saw (an agent restart
+# primes the byte offsets to EOF) reports no agents, which is the behaviour that
+# predates the feature. A phantom would instead strand work silently.
+# Every status Claude Code writes is terminal — "the agent stopped" — so the set
+# is a guard against a future non-terminal one, not a filter of today's.
+AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "error"})
+# One session's fan-out is a handful; this bounds a pathological transcript.
+LIVE_AGENTS_MAX = 32
+
+
+def _async_launch(entry):
+    """`{id, type, label}` iff this entry is a BACKGROUND WORK launch, else None.
+
+    Keyed on the structured record Claude Code writes beside the tool_result —
+    `{status: "async_launched", …}` — which across the corpus is produced by
+    exactly three tools and nothing else: `Agent` and `Task` (carrying
+    `agentId`/`description`) and `Workflow` (carrying `taskId`/`workflowName`,
+    and no `isAsync` at all).
+
+    **Never scan loose text for `agentId:`.** That was tried and is exactly how a
+    permanent phantom gets in: the string appears in the OUTPUT of any ordinary
+    tool — a `grep`/`cat`/`Read` over a transcript, a QA fixture, another
+    session's scratch file — and an id belonging to some other session can never
+    receive its own notification here, so the phantom never clears. (The earlier
+    pane-scrape phantoms at least self-cleared.) A structured field cannot be
+    produced by a tool printing text: `async_launched` appears on none of the
+    12k+ `Bash`, 3k `Read` or 4k `Edit` results, and no MCP tool writes a dict
+    `toolUseResult` at all.
+
+    It also excludes a SYNCHRONOUS subagent result, which is already finished
+    when it lands (its shape carries `content`/`usage`, and no `status`).
+    **`isAsync` is deliberately NOT required**: it would exclude `Workflow`,
+    whose background runs are the longest-lived work on a host — a session
+    running a background `code-review` read idle for its whole duration."""
+    tur = entry.get("toolUseResult") if isinstance(entry, dict) else None
+    if not isinstance(tur, dict) or tur.get("status") != "async_launched":
+        return None
+    ident = tur.get("agentId") or tur.get("taskId")
+    if not ident:
+        return None
+    if tur.get("taskType") == "local_workflow":
+        return {"id": str(ident), "type": "workflow",
+                "label": str(tur.get("workflowName") or tur.get("summary") or "").strip()}
+    return {"id": str(ident), "type": str(tur.get("agentType") or "agent"),
+            "label": str(tur.get("description") or "").strip()}
+
+
+def _scan_agent_entry(entry, state):
+    """Fold one transcript entry into `state["liveAgents"]` ({id: {type,label}}).
+
+    The launch's own record carries the description, so the only thing kept from
+    the CALL is the agent type, which lives on the tool_use input and not on the
+    result. The tool is named `Agent` in current Claude Code and `Task` in older
+    transcripts — **both count**; keying on `Task` alone made every real launch
+    fall back to an unnamed row."""
+    live = state.setdefault("liveAgents", {})
+    tasks = state.setdefault("agentTasks", {})
+    stopped = state.setdefault("stoppedAgents", [])
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
+                inp = block.get("input") or {}
+                atype = str(inp.get("subagent_type") or "").strip()
+                if block.get("id") and atype:
+                    tasks[block["id"]] = atype
+                    # Bounded: a long conversation would otherwise accumulate one
+                    # entry per launch for the life of the session.
+                    while len(tasks) > LIVE_AGENTS_MAX * 4:
+                        tasks.pop(next(iter(tasks)))
+    launch = _async_launch(entry)
+    if launch and len(live) < LIVE_AGENTS_MAX:
+        # A notification can be WRITTEN BEFORE the launch it refers to (observed:
+        # the queued copy lands at an earlier file offset than the launch, with a
+        # LATER timestamp). Registering here would then never be undone, so a
+        # stop already seen wins over a later-read launch.
+        if launch["id"] not in stopped:
+            tool_id = None
+            for block in (content if isinstance(content, list) else []):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_id = block.get("tool_use_id")
+            # The call's subagent_type is the only place a real agent TYPE
+            # appears — the launch record never carries one — so it wins when we
+            # saw the call.
+            live[launch["id"]] = {"type": tasks.get(tool_id) or launch["type"],
+                                  "label": launch["label"]}
+    # The notification rides a queued operation, the user turn it becomes once
+    # dequeued, or an attachment — never an ASSISTANT turn, which is skipped so
+    # that a session merely QUOTING a notification (this feature's own fixtures,
+    # say) cannot retire an agent that is still running.
+    if entry.get("type") != "assistant":
+        for text in _entry_texts_for_scan(entry):
+            tn = _parse_task_notification(text)
+            if not tn or not tn.get("taskId"):
+                continue
+            if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
+                live.pop(tn["taskId"], None)
+                if tn["taskId"] not in stopped:
+                    stopped.append(tn["taskId"])
+                    del stopped[:-LIVE_AGENTS_MAX * 4]
+
+
+def _entry_texts_for_scan(entry):
+    """The raw strings on one entry that could BE a `<task-notification>`: a
+    queue-operation's content, and any string/text-block message content."""
+    out = []
+    if isinstance(entry.get("content"), str):
+        out.append(entry["content"])
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        out.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                out.append(block["text"])
+    return out
+
+
+def live_agents_report(state):
+    """`state["liveAgents"]` as the heartbeat's [{type, label}] (no ids: they are
+    internal, and the chat resolves a row back to its transcript by type+label)."""
+    return [{"type": a["type"], "label": a["label"]}
+            for a in (state.get("liveAgents") or {}).values()]
 
 
 def _entry_blocks(entry, caps):
@@ -3957,11 +4113,18 @@ def _resolve_subagent(main_path, agent_type, label):
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use" and block.get("name") == "Task":
+            # `Agent` is the tool's current name and `Task` the older one; only
+            # `Task` was matched here, so on today's transcripts NO clicked row
+            # resolved and every subagent view opened empty.
+            if block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
                 inp = block.get("input") or {}
                 have_type = str(inp.get("subagent_type") or "").strip()
-                if have_type == want_type or (type_trunc and
-                                              have_type.startswith(want_type)):
+                # A background launch carries NO subagent_type, so its row's type
+                # is the generic "agent" the scan falls back to. Matching that
+                # against the call's (absent) type resolves nothing, so treat it
+                # as a wildcard and let the description alone decide.
+                if (want_type == "agent" or have_type == want_type
+                        or (type_trunc and have_type.startswith(want_type))):
                     tasks.append((block.get("id"),
                                   str(inp.get("description") or "").strip()))
             elif block.get("type") == "tool_result":
@@ -4403,7 +4566,10 @@ def parse_pane_prompt(cap):
 def _pane_status(tmux_name, state):
     """(paneBusy, modeActual, panePrompt) for one beat: the busy half goes
     through _stable_pane_busy's busy->idle flicker suppression (hence `state`),
-    the mode and blocking-dialog halves read one shared capture."""
+    the mode and blocking-dialog halves read one shared capture.
+
+    Live background agents are deliberately NOT read here — see
+    _scan_agent_entry for why the pane cannot answer that question."""
     if not tmux_name:
         return None, None, None
     busy = _stable_pane_busy(tmux_name, state)
@@ -4634,6 +4800,15 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # suppresses the busy hint — so without this read the session looks idle
         # while it waits on a human. See parse_pane_prompt.
         "panePrompt": pane_prompt,
+        # The background agents this session has in flight, [{type, label}]
+        # (empty when none), derived from the transcript's own launch/stop edges
+        # — see _scan_agent_entry. The OTHER thing paneBusy cannot see: a session
+        # that delegated work and ended its own turn keeps no interrupt hint, so
+        # it read idle on every surface while an agent was still working. Every
+        # working/idle mirror ORs this with paneBusy; an agent predating the
+        # field sends none, which reads as "can't tell", i.e. today's behaviour.
+        # Filled by _finish() once the incremental scan has run this beat.
+        "agents": [],
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
@@ -4654,6 +4829,11 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     }
 
     def _finish():
+        # Live background agents, accumulated across beats by _scan_agent_entry
+        # into `state`. Reported on EVERY exit path (including the ones that
+        # never reach a transcript this beat), so a session with agents still in
+        # flight keeps reporting them on a beat that appended nothing.
+        report["agents"] = live_agents_report(state)
         # The ask.py PreToolUse bridge publishes a request file for exactly as
         # long as a question is actually blocking the tool call, so it's the
         # authoritative pending signal — prefer it over the transcript scan

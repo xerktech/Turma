@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
 import com.xerktech.turma.model.SessionInfo
 import kotlin.math.max
@@ -34,9 +35,21 @@ fun sessionWorking(session: SessionInfo, agentLastSeen: Long, now: Long): Boolea
     // here rather than threaded through every call site so the rule cannot be
     // forgotten at one of them.
     if (now - agentLastSeen >= OFFLINE_AFTER_MS) return false
+    // Background agents are what paneBusy cannot see (XERK-245): a session that
+    // delegated work and ended its own turn paints no interrupt hint, so it read
+    // idle while an agent was still running — and qualified as Ready for review,
+    // buzzing the phone mid-run. Behind the offline gate for the same reason
+    // paneBusy is: this too is a value on the record a host last pushed.
+    if (hasLiveAgents(s)) return true
     s.paneBusy?.let { return it }
     return (age * 1000).toLong() + max(0, now - agentLastSeen) < WORKING_WINDOW_MS
 }
+
+/**
+ * Does this session have background agents in flight? Older agents report none,
+ * which reads as "can't tell" and leaves the paneBusy behaviour untouched.
+ */
+fun hasLiveAgents(s: LiveSignals?): Boolean = !(s?.agents.isNullOrEmpty())
 
 enum class LiveState { WORKING, IDLE, WAITING, STOPPED }
 

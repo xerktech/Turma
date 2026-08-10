@@ -197,6 +197,15 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.
+- **"Working" is `paneBusy` OR live background agents** (XERK-245), in every mirror of the read
+  (those five plus `turma/public/index.html`). A session that delegates work ENDS ITS OWN TURN: the
+  pane drops the interrupt hint, so `paneBusy` says False while an agent it launched keeps going —
+  which read idle everywhere AND qualified as ready-for-review, buzzing the operator mid-run. The
+  session's `agents[]` is the second input; it sits BEHIND the offline and no-transcript gates,
+  exactly like `paneBusy`, and an absent field means "that agent can't tell", never "no agents".
+  **It comes from the TRANSCRIPT** (`_scan_agent_entry`: `agentId:` on launch, `<task-notification>`
+  on stop), never from the TUI's footer rows — those are forgeable pane content and linger ~24s past
+  completion, so they cannot answer "is one running right now".
 - **`_board_column` (py) mirrors `categoryOf` (`turma/public/board.js`)**, review carve-out included
   — the agent resolves a dropped column against its own options read, so a drift silently refuses
   valid drops. Tests: `TestBoardColumn`, `board.test.js`.
@@ -282,7 +291,8 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   resume/restart of a failed-over session stays failed over instead of silently returning to the
   exhausted subscription.
 - `LOCAL_MODEL_CONTEXT` must match what the server really serves: Claude Code assumes 200k for a
-  model it doesn't recognise and would compact far too late, truncating server-side instead.
+  model it doesn't recognise and would compact far too late, truncating server-side instead. The
+  default tracks the cue LLM's per-slot window, which DockerOps sizes — when that moves, this moves.
 - **It is a fallback, not a peer** — the local model solved 4/8 of the bench Claude would be expected
   to clear. The UI marks a `local` session so nobody has to wonder which model wrote a turn.
 - **Automatic delegation to the local model is deliberately NOT shipped**; the token arithmetic

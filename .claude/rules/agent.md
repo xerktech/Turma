@@ -180,6 +180,47 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     repaint's sub-frame gap reads idle mid-turn. Busy is trusted instantly; idle re-confirms once
     after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), **only on the busy→idle EDGE**. Tests:
     `TestStablePaneBusy`.
+- **`agents` is the other half of the activity read** (XERK-245): the background agents in flight,
+  folded by `_scan_agent_entry` into the per-session `state` from the transcript's own two edges —
+  the launch entry's **structured `toolUseResult`** (`status:"async_launched"` — **started**), and a
+  `<task-notification>` carrying `<task-id>X</task-id>` with a terminal `<status>` (**stopped**).
+  - It exists because **`paneBusy` cannot see delegated work**: launching a background agent ENDS
+    the main turn, and the pane then says "Waiting for N background agent to finish" — no interrupt
+    hint, and no ellipsis for `PANE_SPINNER_RE`. **Do not widen the busy read to cover it**;
+    `paneBusy` means the session's OWN turn is running, which is what the chat's Stop button and
+    `_poll_pending_inputs`' idle gate key on.
+  - **The TUI's footer list is NOT the source and must not become one again.** It was, twice, and
+    failed twice: those rows are pane CONTENT, so a quoted footer plus a composer-less full-screen
+    view (`/status`, `/model`, ctrl+o) forged them — a session named after a sentence, reading
+    "working" forever and held out of Ready for review; and, measured on a live TUI, **the rows
+    linger ~24s after an agent finishes**, so no single capture can tell running from just-finished.
+    Same reason pending questions come from the `ask.py` bridge and never from scraping.
+  - **Never scan loose `agentId:` TEXT.** That string is in the OUTPUT of any tool that reads a
+    transcript (`grep`/`cat`/`Read`, a QA fixture, another session's scratch), and an id from
+    another session can never receive its notification here — a phantom that NEVER clears, worse
+    than the pane rows. The structured field cannot be produced by a tool printing text, and it also
+    excludes a SYNCHRONOUS subagent result, which is already finished when it lands.
+  - **`status:"async_launched"` is the whole gate — do NOT also require `isAsync`.** Across the
+    corpus that status is written by exactly three tools (`Agent`, `Task`, `Workflow`) and by
+    nothing else, so it is sufficient; `isAsync` is absent on `Workflow`, whose background runs
+    (`code-review`, `deep-research`) are the LONGEST-lived work on a host — requiring it left those
+    sessions reading idle for their whole duration. A workflow reports `type:"workflow"` +
+    `workflowName`; its stop edge is the same notification.
+  - **The tool is named `Agent` now and `Task` in older transcripts — match both.** Keying on `Task`
+    alone left every real launch unnamed (and `_resolve_subagent` had the same bug, so no clicked
+    row resolved). A background launch carries no `subagent_type`, so the row's type falls back to
+    `agent` and `_resolve_subagent` treats that as a wildcard, matching on the description.
+  - **A stop already seen beats a later-read launch** (`stoppedAgents`): the queued copy of a
+    notification can sit at an EARLIER file offset than the launch it refers to.
+  - **An ASSISTANT turn is never a notification carrier** (real ones ride `queue-operation`/`user`),
+    so a session merely QUOTING one — this feature's own fixtures, say — cannot retire a running
+    agent and make its id permanently un-registerable.
+  - **Failure direction is EMPTY.** A launch this scan never saw — an agent restart primes the byte
+    offsets to EOF — reports no agents, i.e. the behaviour that predates the feature. A phantom
+    instead strands work silently. Bounded by `LIVE_AGENTS_MAX`.
+  - Reported on **every** `session_report` exit path (in `_finish`), so a beat that appended nothing
+    still reports agents still in flight. Mirrors `scanAgentEntry`/`liveAgentsReport` in
+    `tunnel-agent.js`. Tests: `TestLiveAgentsScan`.
 - `modeActual` — the mode the TUI is REALLY in, off the footer marker (glyph-anchored so quoted text
   can't match; read beside the stable busy in `_pane_status`). `_session_payload` **reconciles the
   stored `permissionMode` to it** each beat, since the operator can cycle by hand. Tests:

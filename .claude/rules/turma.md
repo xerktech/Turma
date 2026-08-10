@@ -221,6 +221,11 @@ auto-start/auto-stop and the two tracker writes.
   live `status` frame: the spinner verb + ↑/↓ token counters + elapsed, and Claude Code's rotating
   tip/active-task hint. When background agents run it shows a clickable **agent list**
   (`agentsHtml`: `main` a plain marker, each subagent a button carrying its type + description).
+- **The bar outlives the turn when agents are still running** (XERK-245): `liveStatus` clears the
+  moment the turn ends (it is what shows Stop), so the list is held in its own `liveAgents` off the
+  frame's `agents` — falling back to `status.agents` for an older agent — and the bar then renders
+  just the list under a "Background agents…" spinner. Without that split it either vanished mid-run
+  or would have faked a running turn.
 - Clicking a subagent opens its transcript read-only in the right stage (`openSubagentView` → `GET
   /api/agents/<host>/sessions/<id>/subagents/history?type=&label=`, reusing the archive viewer +
   chat engine), with **Back** returning to the live session.
@@ -237,6 +242,10 @@ auto-start/auto-stop and the two tracker writes.
 
 - The live sessions split three ways in reading order — **Ready for review** (stopped, waiting on
   YOU), **Active** (working), **Idle** (quiet).
+- **A session running background agents is Active, and its card names them** ("1 background agent",
+  `agentWorkLabel`; Android's `liveStateLabel(state, live)` matches). It is `liveState`, not
+  `readyForReview`, that this changes — the working branch already disqualifies it — which is what
+  stops the ready-for-review alert firing the instant work is delegated. See `CLAUDE.md`.
 - `readyForReview(s, live)` is **derived from the signals alone** — there is no "I've reviewed this"
   action. It qualifies on a pending question/pane prompt (blocked on a human, so the busy read
   doesn't matter; it leads the section), a PR that hasn't landed, or a **finished turn**
