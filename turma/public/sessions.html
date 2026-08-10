@@ -1036,6 +1036,7 @@ function toggleComposer(rkey, repo) {
   if (composerOpen.has(rkey)) composerOpen.delete(rkey);
   else {
     composerOpen.add(rkey);
+    collapsedRepos.delete(rkey);
     if (loadOpts(repo).optionsExpanded) optionsOpen.add(rkey); else optionsOpen.delete(rkey);
   }
   render(cache);
