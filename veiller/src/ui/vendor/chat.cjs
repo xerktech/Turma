@@ -447,6 +447,12 @@
   let queuedPrompts = [];
   let liveTurn = "";                // in-progress assistant text (pane scrape), "" when idle
   let liveStatus = null;            // {verb,up,down,elapsed} working indicator, null when idle
+  // The session's live agent list, kept SEPARATE from liveStatus because the two
+  // stop being true at different moments (XERK-245): liveStatus clears the
+  // instant the turn ends (it is what shows Stop), while a background agent
+  // keeps running past that — the exact stretch where the operator most needs to
+  // see what is still going, and where the list used to blink out.
+  let liveAgents = [];
   let ws = null, backoffIdx = 0, wsRetryTimer = null;
   let pollTimer = null;
   // Whether the reader is following the tail. True on open (so we land at the
@@ -535,6 +541,11 @@
         // pinned below the scroll, not woven into the streamed text — so it stops
         // flickering in and out of the message as the TUI spinner animates.
         liveStatus = frame.status || null;
+        // Prefer the frame's own list; an agent/hub predating it carries the
+        // list only on `status`, where it lives just for the running turn.
+        liveAgents = Array.isArray(frame.agents)
+          ? frame.agents
+          : (frame.status && Array.isArray(frame.status.agents) ? frame.status.agents : []);
         repaint();
       }
     };
@@ -1121,7 +1132,20 @@
     const bar = $("chatStatus");
     if (!bar) return;
     const st = liveStatus;
-    if (!st) { bar.hidden = true; bar.innerHTML = ""; return; }
+    // The bar survives the end of the turn when background agents are still
+    // running (XERK-245) — it then carries just the agent list under a spinner
+    // saying so, rather than vanishing and leaving the page looking idle while
+    // work continues. `st` stays the turn's own indicator, so Stop is unaffected.
+    const agents = agentsHtml(liveAgents);
+    if (!st) {
+      if (!agents) { bar.hidden = true; bar.innerHTML = ""; return; }
+      bar.hidden = false;
+      bar.innerHTML =
+        '<div class="cc-row"><span class="cc-spin"></span>' +
+        '<span class="verb">Background agents…</span></div>' + agents;
+      wireAgentDelegation(bar);
+      return;
+    }
     const verb = esc(st.verb || "Working");
     const toks =
       (st.up ? '<span class="tok up">↑ ' + esc(st.up) + "</span>" : "") +
@@ -1139,7 +1163,7 @@
       '<span class="verb">' + verb + "…</span>" +
       '<span class="toks">' + elapsed + toks + "</span></div>" +
       hint +
-      agentsHtml(st.agents);
+      agents;
     wireAgentDelegation(bar);
   }
 
@@ -2184,7 +2208,8 @@
     gen++;
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
-    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
+    reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
@@ -2215,7 +2240,8 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
-    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
+    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
+    questionActive = false; answeredQuestion = null;
     panePromptActive = false; answeredPanePrompt = null;
     stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false;
@@ -2276,7 +2302,7 @@
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
-      isBusy, updateComposeAction, isToolBullet, sendFailure, isTooLong, TOO_LONG,
+      isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
       attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, attachFiles,
       clearAttachments, MAX_ATTACHMENTS,
       __setAttachments: (a) => { attachments = a; },
@@ -2285,6 +2311,7 @@
       // hands it frame.text verbatim, so the flicker tests exercise it directly.
       __applyTurn: (t) => { applyTurn(t); },
       __setLiveStatus: (st) => { liveStatus = st; },
+      __setLiveAgents: (a) => { liveAgents = Array.isArray(a) ? a : []; },
       __stopPending: (t) => { stopPendingAt = t; },
       modelChipLabel, modeChipValue,
       __setSess: (s) => { sess = s; },

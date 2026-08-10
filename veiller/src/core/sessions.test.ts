@@ -69,6 +69,32 @@ describe("liveState", () => {
     expect(liveState(s)).toBe("idle");
   });
 
+  // XERK-245: a session that delegated work and ended its own turn paints no
+  // interrupt hint, so paneBusy reads false while a background agent is still
+  // running — and the glyph said idle for work in progress.
+  it("is 'working' while background agents run, even with paneBusy false", () => {
+    const s = session({
+      status: "running",
+      session: signals({
+        paneBusy: false, transcriptAgeSec: 999,
+        agents: [{ type: "qa", label: "QA the parity change" }],
+      }),
+    });
+    expect(liveState(s)).toBe("working");
+    // An empty list is "no agents"; an older agent reports none at all.
+    expect(liveState(session({
+      status: "running",
+      session: signals({ paneBusy: false, transcriptAgeSec: 999, agents: [] }),
+    }))).toBe("idle");
+    expect(liveState(session({
+      status: "running",
+      session: signals({ paneBusy: false, transcriptAgeSec: 999 }),
+    }))).toBe("idle");
+    // Behind the offline gate, like paneBusy.
+    const now = 1_000_000;
+    expect(liveState(s, now - 600_000, now)).toBe("idle");
+  });
+
   it("still yields to a pending question when paneBusy is true", () => {
     const s = session({
       status: "running",

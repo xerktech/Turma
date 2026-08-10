@@ -39,10 +39,21 @@ export function liveState(
   if (hostLastSeen != null && (now ?? Date.now()) - hostLastSeen >= OFFLINE_AFTER_MS) {
     return "idle";
   }
+  // Background agents are what paneBusy cannot see (XERK-245): a session that
+  // delegated work and ended its own turn paints no interrupt hint, so it read
+  // idle here while an agent was still running. Checked after the offline gate
+  // for the same reason paneBusy is — this too is a value on a pushed record.
+  if (hasLiveAgents(live)) return "working";
   const working = live?.paneBusy != null
     ? live.paneBusy
     : live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS;
   return working ? "working" : "idle";
+}
+
+// Does the session have background agents in flight? Older agents report none,
+// which reads as "can't tell" and leaves the paneBusy behaviour untouched.
+export function hasLiveAgents(live: SessionInfo["session"]): boolean {
+  return (live?.agents?.length ?? 0) > 0;
 }
 
 // Leading status icon on each home-menu session row — chosen to be
