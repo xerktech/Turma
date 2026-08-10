@@ -8195,7 +8195,7 @@ class SessionManager:
                     if text is None and not blocks:
                         continue
                     entries.append({
-                        "uuid": entry.get("uuid"),
+                        "uuid": _entry_id(entry),
                         "role": _entry_role(entry),
                         "ts": entry.get("timestamp"),
                         "text": text or "",
