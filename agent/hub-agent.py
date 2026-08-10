@@ -544,6 +544,11 @@ LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "gpt-oss:120b").strip()
 # Claude Code assumes a 200k window for a model it does not recognise and would
 # compact far too late for a 64k server — the tail then silently truncates
 # server-side instead of compacting. Must match what the server actually serves.
+# No self-hosted context we would plausibly serve is larger than this; beyond it
+# a typo is likelier than an intent.
+MAX_LOCAL_MODEL_CONTEXT = 2_000_000
+
+
 def _positive_int_env(name, default):
     """Read a positive int from the environment, falling back on junk.
 
@@ -560,6 +565,12 @@ def _positive_int_env(name, default):
         return default
     if value <= 0:
         log(f"{name}={value} must be positive — using {default}")
+        return default
+    if value > MAX_LOCAL_MODEL_CONTEXT:
+        # Overstating the window is the exact failure this setting exists to
+        # prevent: Claude Code compacts far too late and the server truncates
+        # the tail silently instead.
+        log(f"{name}={value} exceeds {MAX_LOCAL_MODEL_CONTEXT} — using {default}")
         return default
     return value
 
@@ -621,7 +632,9 @@ def write_local_model_env(path):
 
     Rewritten on every launch, so a rotated key or a changed endpoint takes
     effect without an agent restart."""
-    tmp = path + ".tmp"
+    # Per-process temp name: a shared one makes two concurrent writers race on
+    # os.replace, and the loser raises FileNotFoundError mid-launch.
+    tmp = f"{path}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
         for pair in local_model_env_pairs():
@@ -635,15 +648,14 @@ def write_local_model_env(path):
 def local_model_env_pairs():
     """`KEY=VALUE` settings that repoint Claude Code at the self-hosted model.
 
-    Passed to `tmux new-session -e` rather than written into the shared guard
-    settings file, because the choice is PER SESSION: one session can fail over
-    while its neighbours stay on the subscription. `-e` (not a command-line
-    prefix) because one of these is a credential and a command line is
-    world-readable via /proc — see the call site in _launch_tmux.
+    Written to a 0600 file by write_local_model_env and SOURCED by the launch
+    line — never a command-line prefix and never `tmux -e`, both of which put
+    the credential into a process's argv where /proc makes it world-readable.
 
-    No shell quoting here: these are argv values handed straight to tmux, never
-    parsed by a shell. LOCAL_MODEL_NAME is charset-checked by
-    local_model_configured(), which gates every call site."""
+    Kept out of the shared guard settings file because the choice is PER
+    SESSION: one session can fail over while its neighbours stay on the
+    subscription. Quoting is applied by the writer, since these end up in a
+    file a shell reads."""
     return [
         f"ANTHROPIC_BASE_URL={_messages_api_base(LOCAL_MODEL_BASE_URL)}",
         f"ANTHROPIC_AUTH_TOKEN={LOCAL_MODEL_API_KEY}",
@@ -9414,6 +9426,11 @@ class SessionManager:
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
             "summaryManual", "model", "permissionMode", "root", "ticket",
+            # Which model this session was running against (XERK-246). Without
+            # it a resume silently returns a failed-over session to the
+            # exhausted subscription — and restores its --model alias, which the
+            # gateway refuses — with no mark and no error.
+            "modelSource",
             # Which conversation this session WAS. Carried so a resume rejoins
             # its own rather than whatever now happens to be newest in a shared
             # project dir (root sessions share one) — see _launch_tmux.
@@ -9547,6 +9564,9 @@ class SessionManager:
             "ttydPort": self._alloc_port(),  # old port may be taken by now
             "model": rec.get("model"),
             "permissionMode": rec.get("permissionMode") or "auto",
+            # Resuming an ended session keeps whichever model it was running
+            # against; usage has not come back just because it was killed.
+            "modelSource": rec.get("modelSource") or "subscription",
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
             "stoppedAt": None,
@@ -9665,6 +9685,14 @@ class SessionManager:
             "ttydPort": self._alloc_port(),
             "model": extra.get("model"),
             "permissionMode": extra.get("permissionMode") or "auto",
+            # A migrated (or resumed-any) session keeps the model it was running
+            # against. Validated rather than trusted: it crosses a host boundary,
+            # and the TARGET may have no local model configured even though the
+            # source did — in which case this falls back to the subscription
+            # instead of launching against an endpoint that isn't there.
+            "modelSource": (resolve_model_source(extra.get("modelSource"))
+                            if extra.get("modelSource") in MODEL_SOURCES
+                            and local_model_configured() else "subscription"),
             "baseRef": None,
             "status": "running",
             "createdAt": now_iso(),
@@ -9776,6 +9804,7 @@ class SessionManager:
             "label": cmd.get("label"),
             "model": cmd.get("model"),
             "permissionMode": cmd.get("permissionMode"),
+            "modelSource": cmd.get("modelSource"),
             "migratedFrom": cmd.get("migratedFrom"),
         }
         self._resume_at_cwd(transcript_id, cwd,
@@ -13009,8 +13038,9 @@ class SessionManager:
             # self-hosted model it failed over to). Always present, so a client
             # never has to infer "not local" from an absent field.
             "modelSource": sess.get("modelSource") or "subscription",
-            # When it last moved, so a client can say "failed over 10m ago"
-            # rather than only "local". Absent on a session that never switched.
+            # When it last moved, so the UI's mark can say WHEN a session failed
+            # over rather than only that it did. Absent on a session that never
+            # switched.
             "modelSourceAt": sess.get("modelSourceAt"),
             # The permission modes this session's live Shift+Tab cycle can reach
             # (base modes + whichever optional it was launched into) — the hub's

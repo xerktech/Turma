@@ -4284,6 +4284,35 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
         self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
 
+    def test_spawn_onto_the_local_model(self):
+        """Starting NEW work on the local model matters as much as failing an
+        existing session over: once usage is gone you cannot spawn either. A
+        regression making every spawn subscription-only shipped green before
+        this test existed."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY="sk-abc",
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"):
+            sm.spawn("Turma", model_source="local")
+            sess = sm.registry[-1]
+            self.assertEqual(sess["modelSource"], "local")
+            cmd = next(c[-1] for c in self.run_ok_calls if "new-session" in c)
+            self.assertIn("local-model.env", cmd)
+
+    def test_spawn_onto_local_refused_without_configuration(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="", LOCAL_MODEL_API_KEY=""):
+            sm.spawn("Turma", model_source="local")
+        self.assertEqual(sm.registry[-1]["status"], "error")
+
+    def test_spawn_defaults_to_the_subscription(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
+
     def test_spawn_threads_all_options(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
@@ -7148,6 +7177,47 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
             sm.set_model_source("abcde", "local")
         self.assertEqual(sess["modelSource"], "subscription")
         self.assertEqual(sess["status"], "error")
+
+    def test_kill_then_resume_stays_on_the_local_model(self):
+        """Usage has not come back just because the session was killed. A resume
+        that drops modelSource silently returns the session to the exhausted
+        subscription AND restores its --model alias, which the gateway refuses —
+        with no mark and no error. Refuted the documented invariant once."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                     "model": "sonnet"})
+        os.makedirs(sess["repoPath"], exist_ok=True)
+        sm._remember_closed(sess)
+        self.assertEqual(sm.closed[0].get("modelSource"), "local")
+        sm.registry = []
+        sm.resume(sess["id"])
+        revived = sm._find(sess["id"])
+        self.assertEqual(revived["modelSource"], "local")
+        self.assertNotIn("--model", self._launches()[-1])
+
+    def _migrate_in(self, sm, source):
+        """Run the shared migration/resume-any record build for a moved session."""
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "mmmmm")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        open(os.path.join(proj, "t-1.jsonl"), "w").write("{}\n")
+        sm._resume_at_cwd("t-1", cwd, extra={"modelSource": source, "model": "sonnet"})
+        return sm.registry[-1] if sm.registry else {}
+
+    def test_migrated_session_keeps_its_model_source(self):
+        """The conversation moves; the model it was running against must move
+        with it, or the move quietly undoes the failover."""
+        sm = self.make_manager()
+        self.assertEqual(self._migrate_in(sm, "local")["modelSource"], "local")
+
+    def test_migration_to_a_host_without_a_local_model_falls_back(self):
+        """It crosses a host boundary: the TARGET may have no local model even
+        though the source did, and launching at an endpoint that isn't there is
+        worse than landing on the subscription."""
+        sm = self.make_manager(configured=False)
+        self.assertEqual(self._migrate_in(sm, "local")["modelSource"], "subscription")
 
     def test_noop_for_non_running_session(self):
         sm = self.make_manager()

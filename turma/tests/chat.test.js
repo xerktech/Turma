@@ -1613,11 +1613,11 @@ test("model source: defaults to subscription when the agent never says", () => {
 test("model source: an in-flight switch paints the target, not the stale beat", () => {
   __setSess({ id: "s1", modelSource: "subscription" });
   __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
-  __setModelSourcePending({ value: "local", at: Date.now() });
+  __setModelSourcePending({ value: "local", at: Date.now(), sessionId: "s1" });
   assert.equal(currentModelSource(), "local");
   assert.equal(modelSourceLabel(), "gpt-oss:120b");
   // A stale memo must not pin the chip forever if the switch never lands.
-  __setModelSourcePending({ value: "local", at: Date.now() - 120000 });
+  __setModelSourcePending({ value: "local", at: Date.now() - 120000, sessionId: "s1" });
   assert.equal(currentModelSource(), "subscription");
   __setModelSourcePending(null);
 });
@@ -1654,4 +1654,17 @@ test("model source: a local session's model chip is fixed, not a picker", () => 
   assert.equal(currentModelSource(), "local");
   __setSess({ id: "s1", modelSource: "subscription" });
   assert.equal(currentModelSource(), "subscription");
+});
+
+test("model source: a memo with no session id is not honoured blindly", () => {
+  // The read-site guard tolerated a session-less memo, so dropping the
+  // sessionId from setSessionModelSource escaped every test. A memo must know
+  // whose it is.
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setSess({ id: "AAAAA", modelSource: "subscription" });
+  __setModelSourcePending({ value: "local", at: Date.now() });   // no sessionId
+  const painted = currentModelSource();
+  __setModelSourcePending(null);
+  assert.equal(painted, "subscription",
+    "a memo that cannot prove which session it belongs to must not paint one");
 });

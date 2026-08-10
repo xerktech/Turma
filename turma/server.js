@@ -129,6 +129,12 @@ function localModelAvailable(agent) {
 // Returns null when fine, else {status, error}. Spawning onto the local model is
 // how you start NEW work once usage is gone, so it gets the same enum check and
 // the same capability gate rather than failing later as an errored session card.
+// Which model source a host reports for one of its sessions, "" when unknown.
+function sessionModelSource(hostKey, sessionId) {
+  const s = (agents[hostKey]?.sessions || []).find((x) => x.id === sessionId);
+  return (s && s.modelSource) || "";
+}
+
 function checkSpawnModelSource(cmd, hostKey) {
   if (cmd.modelSource == null) return null;
   if (!["subscription", "local"].includes(cmd.modelSource)) {
@@ -943,6 +949,11 @@ function startMigration(srcHost, s, targetHost) {
     meta: {
       model: s.model || null,
       permissionMode: s.permissionMode || null,
+      // Which model the moved session was running against (XERK-246). The
+      // target re-validates it against its OWN local-model configuration, so a
+      // move onto a host without one falls back rather than launching at an
+      // endpoint that isn't there.
+      modelSource: s.modelSource || null,
       summary: s.summary || null,
       summaryManual: s.summaryManual || null,
       label: s.label || null,
@@ -3558,6 +3569,7 @@ const server = http.createServer(async (req, res) => {
         repo: m.repo,
         model: m.meta.model,
         permissionMode: m.meta.permissionMode,
+        modelSource: m.meta.modelSource,
         summary: m.meta.summary,
         summaryManual: m.meta.summaryManual,
         label: m.meta.label,
@@ -3966,6 +3978,13 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse((await readBody(req)) || "{}");
         const model = typeof body.model === "string" ? body.model : "";
         if (!model) return json(res, 400, { error: "model required" });
+        // A session on the self-hosted model takes its model from the host
+        // configuration; the agent refuses this and every alias the picker could
+        // offer is one the gateway rejects. Refuse here too, so the mirror case
+        // of /model-source's 409 is not a silent 200 for an out-of-parity client.
+        if (sessionModelSource(key, sessionId) === "local") {
+          return json(res, 409, { error: "session runs on the self-hosted model" });
+        }
         if (model.length > 60 || !/^[a-z0-9.[\]-]+$/i.test(model))
           return json(res, 400, { error: "invalid model" });
         const cmdId = queueCommand(key, { type: "setModel", sessionId, model });

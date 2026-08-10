@@ -337,7 +337,11 @@ those are marked `[MODEL]`.
   Gate it on the host's `localModel.available`, exactly as the 📎 gates on `uploadMaxBytes` — an
   agent that reports nothing cannot do it. Field: `session.modelSource`
   (`"subscription"`/`"local"`). This matters on a phone precisely when it matters most: usage runs
-  out while you are away from a desk.
+  out while you are away from a desk. Three parts, all missing: the compose-bar selector, the mark
+  on live AND ended session cards, and a **"Run against" option in the spawn composer** (without the
+  last one you can fail existing sessions over from the phone but cannot start new work once usage
+  is gone). Note the web hides the model picker entirely for a local session — every alias it could
+  offer is one the gateway refuses.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
 - ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
   see Done above; the read-only review itself was XERK-70).

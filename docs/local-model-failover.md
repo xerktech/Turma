@@ -104,6 +104,14 @@ denials re-implemented in a weaker permission system.
 Claude Code assumes 200k for a model it does not recognise and would compact far
 too late for a 64k window, and the tail then truncates server-side instead.
 
+Every relaunch path keeps the session's model source — restart, stop/start,
+resume-on-boot, queue drain, **resume of an ended session**, and **migration to
+another host**. The last two were missed on the first pass and silently returned
+a failed-over session to the exhausted subscription (restoring its `--model`
+alias with it). A migration re-validates against the TARGET's configuration, so
+moving onto a host with no local model falls back rather than launching at an
+endpoint that is not there.
+
 ## Known limitations (found by the QA pass, accepted for this change)
 
 - **Ticket sessions are subscription-only.** `spawn_ticket` doesn't take a model
@@ -122,6 +130,9 @@ too late for a 64k window, and the tail then truncates server-side instead.
 - **Rapid toggling isn't single-flighted.** Two clicks queue two commands; unlike
   migration there is no per-session in-flight lock, so a sub→local→sub burst can
   produce back-to-back relaunches.
+- **The spawn composer's "Run against" select has no Android counterpart** yet;
+  `android/PARITY.md` records the chat-bar control and the mark, and this adds a
+  third gap on the same screen.
 - **A local session's model can't be changed from the chip** — by design, since
   every row the picker offers is a Claude alias the gateway refuses. The chip
   states the fixed model instead. Switch back to the subscription to choose one.

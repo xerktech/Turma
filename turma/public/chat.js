@@ -1620,8 +1620,10 @@
     // memo paints a subscription session as local (the exact confusion the mark
     // exists to prevent) and swallows its own switch click via the
     // `value === currentModelSource()` early-return in setSessionModelSource.
-    const mine = modelSourcePending &&
-      (!modelSourcePending.sessionId || modelSourcePending.sessionId === sessionId);
+    // A memo must prove WHICH session it belongs to. Tolerating a session-less
+    // one re-opens the leak this guard exists to close (and let a regression
+    // that stopped recording the id ship green).
+    const mine = modelSourcePending && modelSourcePending.sessionId === sessionId;
     if (mine && Date.now() - modelSourcePending.at < 60000) return modelSourcePending.value;
     return (sess && sess.modelSource) || "subscription";
   }

@@ -1839,7 +1839,8 @@ function activeCard({ a, s, live }) {
         <div class="state-row">
           <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
-            esc("Running on this host's self-hosted model, not the Claude subscription")
+            esc("Running on this host's self-hosted model, not the Claude subscription"
+                + (s.modelSourceAt ? ` — since ${new Date(s.modelSourceAt).toLocaleString()}` : ""))
           }">🏠 local</span>` : ""}
           ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
         </div>
@@ -1935,6 +1936,9 @@ function endedRow(e) {
         <div class="meta"><span class="id">${esc(endedRowId(e))}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
         <div class="state-row">
           <div class="state">${esc(state)}</div>
+          ${s.modelSource === "local" ? `<span class="local-mark" title="${
+            esc("Ran on this host's self-hosted model, not the Claude subscription")
+          }">🏠 local</span>` : ""}
           ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
         </div>
         ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
