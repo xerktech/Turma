@@ -1519,7 +1519,7 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
                  "message": {"content": [{"type": "text", "text": "Launched."}]}}])
             rep = ha.session_report(self.WORKDIR, state, "agent-abc")
         self.assertIs(rep["paneBusy"], False)
-        self.assertEqual(rep["agents"], [{"type": "qa", "label": "QA the parity change"}])
+        self.assertEqual(rep["agents"], [{"type": "agent", "label": "QA the parity change"}])
 
     def test_a_finished_agent_stops_being_reported(self):
         # The measured reason the TUI footer cannot be the source: its rows
@@ -1956,17 +1956,23 @@ def task_notification_entry(task_id, status, carrier="queue-operation"):
     return {"type": "user", "message": {"content": text}}
 
 
-# A background-agent launch exactly as Claude Code writes it: the Task call
-# (which names the work) and, separately, the result that names the agent id.
+# A background-agent launch exactly as Claude Code writes it today: the `Agent`
+# call, then the result entry whose STRUCTURED `toolUseResult` records the
+# launch. The prose beside it also says "agentId: …", but that text is NOT what
+# the scan keys on — see _async_launch.
 TASK_LAUNCH_ENTRIES = [
     {"type": "assistant", "message": {"content": [
-        {"type": "tool_use", "id": "toolu_1", "name": "Task",
-         "input": {"subagent_type": "qa", "description": "QA the parity change",
-                   "prompt": "..."}}]}},
-    {"type": "user", "message": {"content": [
-        {"type": "tool_result", "tool_use_id": "toolu_1",
-         "content": "Async agent launched successfully. (internal metadata) "
-                    "agentId: agent-1 (internal ID - do not mention to user.)"}]}},
+        {"type": "tool_use", "id": "toolu_1", "name": "Agent",
+         "input": {"description": "QA the parity change", "prompt": "...",
+                   "run_in_background": True}}]}},
+    {"type": "user",
+     "message": {"content": [
+         {"type": "tool_result", "tool_use_id": "toolu_1",
+          "content": "Async agent launched successfully. (internal metadata) "
+                     "agentId: agent-1 (internal ID - do not mention to user.)"}]},
+     "toolUseResult": {"isAsync": True, "status": "async_launched",
+                       "agentId": "agent-1", "description": "QA the parity change",
+                       "resolvedModel": "claude-opus-4-8"}},
 ]
 
 
@@ -1981,10 +1987,58 @@ class TestLiveAgentsScan(unittest.TestCase):
             ha._scan_entry_line(json.dumps(e), state, {"prUrls": [], "modelActual": None})
         return state
 
-    def test_a_launch_makes_an_agent_live_with_its_task_description(self):
+    def test_a_launch_makes_an_agent_live_with_its_description(self):
         st = self._scan(TASK_LAUNCH_ENTRIES)
         self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "agent", "label": "QA the parity change"}])
+
+    def test_the_subagent_type_names_the_row_when_the_call_carries_one(self):
+        # Older `Task` calls do; today's background `Agent` calls do not.
+        entries = [dict(TASK_LAUNCH_ENTRIES[0]), TASK_LAUNCH_ENTRIES[1]]
+        entries[0] = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Task",
+             "input": {"subagent_type": "qa", "description": "QA the parity change"}}]}}
+        st = self._scan(entries)
+        self.assertEqual(ha.live_agents_report(st),
                          [{"type": "qa", "label": "QA the parity change"}])
+
+    def test_loose_agent_id_text_in_tool_output_registers_nothing(self):
+        # THE regression: `agentId:` appears in the OUTPUT of any tool that reads
+        # a transcript (grep/cat/Read). Keying on that text registered a live
+        # agent belonging to ANOTHER session, whose notification can never
+        # arrive here — a phantom that never clears. Worse than the pane's.
+        st = self._scan([
+            {"type": "user",
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "tb1",
+                  "content": "agentId: a3c02192c84d32f9f\nagentId: deadbeef"}]},
+             "toolUseResult": {"stdout": "agentId: a3c02192c84d32f9f",
+                               "stderr": "", "interrupted": False, "isImage": False}},
+        ])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_synchronous_subagent_result_registers_nothing(self):
+        # A foreground agent's result lands when it has ALREADY finished (its
+        # shape carries content/usage, never isAsync), so registering it would
+        # strand a live agent for work that is over.
+        st = self._scan([
+            {"type": "user",
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "ts1",
+                  "content": "Here is my report. agentId: sync-1"}]},
+             "toolUseResult": {"agentId": "sync-1", "agentType": "Explore",
+                               "content": "…", "status": "completed",
+                               "totalTokens": 1234, "usage": {}}},
+        ])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_a_stop_seen_before_its_launch_still_wins(self):
+        # Observed in real data: the queued copy of a notification lands at an
+        # EARLIER file offset than the launch it refers to (its timestamp is
+        # later). Registering on the launch would then never be undone.
+        st = self._scan([task_notification_entry("agent-1", "completed")])
+        self._scan(TASK_LAUNCH_ENTRIES, st)
+        self.assertEqual(ha.live_agents_report(st), [])
 
     def test_the_notification_is_what_ends_it(self):
         st = self._scan(TASK_LAUNCH_ENTRIES)
@@ -1999,6 +2053,16 @@ class TestLiveAgentsScan(unittest.TestCase):
                 self.assertEqual(ha.live_agents_report(st), [],
                                  f"{status} via {carrier} must end it")
 
+    def test_a_non_terminal_status_must_not_clear_the_agent(self):
+        # Every status Claude Code writes today is terminal, so the gate guards
+        # against a future progress-style notification — which, unguarded, would
+        # retire an agent the moment it reported in while still running.
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([task_notification_entry("agent-1", "running")], st)
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+        self._scan([task_notification_entry("agent-1", "completed")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
     def test_a_notification_for_another_agent_leaves_this_one_running(self):
         st = self._scan(TASK_LAUNCH_ENTRIES)
         self._scan([task_notification_entry("someone-else", "completed")], st)
@@ -2009,22 +2073,25 @@ class TestLiveAgentsScan(unittest.TestCase):
             {"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "toolu_2", "name": "Task",
                  "input": {"subagent_type": "Explore", "description": "Map it"}}]}},
-            {"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "toolu_2",
-                 "content": "Async agent launched successfully. agentId: agent-2"}]}},
+            {"type": "user",
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "toolu_2"}]},
+             "toolUseResult": {"isAsync": True, "status": "async_launched",
+                               "agentId": "agent-2", "description": "Map it"}},
         ]
         st = self._scan(entries)
-        self.assertEqual(sorted(a["type"] for a in ha.live_agents_report(st)),
-                         ["Explore", "qa"])
+        self.assertEqual(sorted(a["label"] for a in ha.live_agents_report(st)),
+                         ["Map it", "QA the parity change"])
         self._scan([task_notification_entry("agent-1", "completed")], st)
-        self.assertEqual([a["type"] for a in ha.live_agents_report(st)], ["Explore"])
+        self.assertEqual([a["label"] for a in ha.live_agents_report(st)], ["Map it"])
 
-    def test_a_launch_whose_task_call_was_missed_still_counts(self):
+    def test_a_launch_whose_call_was_missed_still_counts(self):
         # An agent restart primes the byte offsets to EOF, so the scan can see a
-        # result whose call it never read. It must still report the agent —
-        # unnamed rather than invisible.
+        # launch record whose CALL it never read. The launch record carries the
+        # description itself, so the row is still named.
         st = self._scan(TASK_LAUNCH_ENTRIES[1:])
-        self.assertEqual(ha.live_agents_report(st), [{"type": "agent", "label": ""}])
+        self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "agent", "label": "QA the parity change"}])
 
     def test_ordinary_traffic_moves_nothing(self):
         st = self._scan([
@@ -2040,9 +2107,11 @@ class TestLiveAgentsScan(unittest.TestCase):
     def test_the_live_set_is_bounded(self):
         entries = []
         for i in range(200):
-            entries.append({"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": f"t{i}",
-                 "content": f"Async agent launched successfully. agentId: a{i}"}]}})
+            entries.append({"type": "user",
+                            "message": {"content": [
+                                {"type": "tool_result", "tool_use_id": f"t{i}"}]},
+                            "toolUseResult": {"isAsync": True, "status": "async_launched",
+                                              "agentId": f"a{i}", "description": f"job {i}"}})
         st = self._scan(entries)
         self.assertEqual(len(ha.live_agents_report(st)), ha.LIVE_AGENTS_MAX)
 

@@ -746,7 +746,14 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
 let controlWs = null;
 const watchers = new Map(); // sessionId -> { worktreePath, lastJson, timer }
 
+// Tests substitute a sink here so the whole watch -> tail -> frame path can be
+// driven without a socket. The four cut points between scanAgentEntry and the
+// wire (the agentState threading, the watcher seed, the frame's `agents`, and
+// this send) were each individually severable with a green CI until that path
+// was covered end to end.
+let controlSink = null;
 function sendControl(obj) {
+  if (controlSink) { controlSink(obj); return; }
   if (controlWs && controlWs.readyState === WebSocket.OPEN) {
     try { controlWs.send(JSON.stringify(obj)); } catch {}
   }
@@ -886,37 +893,62 @@ function parseAgentList(lines) {
 // again: its rows are pane CONTENT (a quoted footer plus a composer-less
 // full-screen view forged them) and, measured on a live TUI, they LINGER ~24s
 // after an agent finishes, so no single capture can tell running from finished.
-const AGENT_LAUNCH_RE = /agentId:\s*([A-Za-z0-9_-]+)/;
 const AGENT_DONE_STATUSES = new Set(["completed", "failed", "killed", "stopped", "error"]);
 const LIVE_AGENTS_MAX = 32;
+
+// This entry's `toolUseResult` iff it is a BACKGROUND agent launch. Mirror of
+// hub-agent.py's _async_launch — read there for why loose `agentId:` text must
+// never be the signal (a grep/cat of any transcript registers a permanent
+// phantom) and why a synchronous subagent result must not register at all.
+function asyncLaunch(entry) {
+  const tur = entry && entry.toolUseResult;
+  if (!tur || typeof tur !== "object") return null;
+  if (tur.isAsync !== true || tur.status !== "async_launched") return null;
+  return tur.agentId ? tur : null;
+}
 
 function scanAgentEntry(entry, state) {
   if (!entry || typeof entry !== "object" || !state) return;
   const live = state.live || (state.live = new Map());
   const tasks = state.tasks || (state.tasks = new Map());
+  const stopped = state.stopped || (state.stopped = new Set());
   const content = entry.message && entry.message.content;
+  let toolId = null;
   if (Array.isArray(content)) {
     for (const block of content) {
       if (!block || typeof block !== "object") continue;
-      if (block.type === "tool_use" && block.name === "Task" && block.id) {
-        const inp = block.input || {};
-        tasks.set(block.id, {
-          type: String(inp.subagent_type || "agent").trim() || "agent",
-          label: String(inp.description || "").trim(),
-        });
-        while (tasks.size > LIVE_AGENTS_MAX * 4) tasks.delete(tasks.keys().next().value);
-      } else if (block.type === "tool_result") {
-        const m = AGENT_LAUNCH_RE.exec(toolResultText(block.content));
-        if (m && live.size < LIVE_AGENTS_MAX) {
-          live.set(m[1], tasks.get(block.tool_use_id) || { type: "agent", label: "" });
+      // `Agent` in current Claude Code, `Task` in older transcripts — both.
+      if (block.type === "tool_use" && (block.name === "Agent" || block.name === "Task") && block.id) {
+        const atype = String((block.input || {}).subagent_type || "").trim();
+        if (atype) {
+          tasks.set(block.id, atype);
+          while (tasks.size > LIVE_AGENTS_MAX * 4) tasks.delete(tasks.keys().next().value);
         }
+      } else if (block.type === "tool_result") {
+        toolId = block.tool_use_id;
       }
+    }
+  }
+  const launch = asyncLaunch(entry);
+  if (launch && live.size < LIVE_AGENTS_MAX) {
+    const aid = String(launch.agentId);
+    // A stop already seen wins over a later-read launch: a notification can be
+    // written at an EARLIER file offset than the launch it refers to.
+    if (!stopped.has(aid)) {
+      live.set(aid, {
+        type: tasks.get(toolId) || String(launch.agentType || "agent"),
+        label: String(launch.description || "").trim(),
+      });
     }
   }
   for (const text of entryTextsForScan(entry)) {
     const tn = parseTaskNotification(text);
     if (!tn || !tn.taskId) continue;
-    if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) live.delete(tn.taskId);
+    if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) {
+      live.delete(tn.taskId);
+      stopped.add(tn.taskId);
+      while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
+    }
   }
 }
 
@@ -1524,5 +1556,6 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport,
+    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }

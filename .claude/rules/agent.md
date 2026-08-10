@@ -148,8 +148,9 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     `TestStablePaneBusy`.
 - **`agents` is the other half of the activity read** (XERK-245): the background agents in flight,
   folded by `_scan_agent_entry` into the per-session `state` from the transcript's own two edges —
-  a Task `tool_use` whose result says `agentId: X` (**started**), and a `<task-notification>`
-  carrying `<task-id>X</task-id>` with a terminal `<status>` (**stopped**).
+  the launch entry's **structured `toolUseResult`** (`{isAsync:true, status:"async_launched",
+  agentId, description}` — **started**), and a `<task-notification>` carrying `<task-id>X</task-id>`
+  with a terminal `<status>` (**stopped**).
   - It exists because **`paneBusy` cannot see delegated work**: launching a background agent ENDS
     the main turn, and the pane then says "Waiting for N background agent to finish" — no interrupt
     hint, and no ellipsis for `PANE_SPINNER_RE`. **Do not widen the busy read to cover it**;
@@ -161,6 +162,17 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     "working" forever and held out of Ready for review; and, measured on a live TUI, **the rows
     linger ~24s after an agent finishes**, so no single capture can tell running from just-finished.
     Same reason pending questions come from the `ask.py` bridge and never from scraping.
+  - **Never scan loose `agentId:` TEXT.** That string is in the OUTPUT of any tool that reads a
+    transcript (`grep`/`cat`/`Read`, a QA fixture, another session's scratch), and an id from
+    another session can never receive its notification here — a phantom that NEVER clears, worse
+    than the pane rows. The structured field cannot be produced by a tool printing text, and it also
+    excludes a SYNCHRONOUS subagent result, which is already finished when it lands.
+  - **The tool is named `Agent` now and `Task` in older transcripts — match both.** Keying on `Task`
+    alone left every real launch unnamed (and `_resolve_subagent` had the same bug, so no clicked
+    row resolved). A background launch carries no `subagent_type`, so the row's type falls back to
+    `agent` and `_resolve_subagent` treats that as a wildcard, matching on the description.
+  - **A stop already seen beats a later-read launch** (`stoppedAgents`): the queued copy of a
+    notification can sit at an EARLIER file offset than the launch it refers to.
   - **Failure direction is EMPTY.** A launch this scan never saw — an agent restart primes the byte
     offsets to EOF — reports no agents, i.e. the behaviour that predates the feature. A phantom
     instead strands work silently. Bounded by `LIVE_AGENTS_MAX`.

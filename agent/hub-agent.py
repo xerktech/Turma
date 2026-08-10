@@ -3132,7 +3132,6 @@ def _scan_entry_line(raw, state, report):
 # Failure direction is EMPTY: a launch this scan never saw (an agent restart
 # primes the byte offsets to EOF) reports no agents, which is the behaviour that
 # predates the feature. A phantom would instead strand work silently.
-AGENT_LAUNCH_RE = re.compile(r"agentId:\s*([A-Za-z0-9_-]+)")
 # Every status Claude Code writes is terminal — "the agent stopped" — so the set
 # is a guard against a future non-terminal one, not a filter of today's.
 AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "error"})
@@ -3140,36 +3139,73 @@ AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "er
 LIVE_AGENTS_MAX = 32
 
 
+def _async_launch(entry):
+    """This entry's `toolUseResult` iff it is a BACKGROUND agent launch — the
+    structured record Claude Code writes beside the tool_result:
+    `{isAsync: true, status: "async_launched", agentId, description, …}`. Else
+    None.
+
+    **Never scan loose text for `agentId:`.** That was tried and is exactly how a
+    permanent phantom gets in: the string appears in the OUTPUT of any ordinary
+    tool — a `grep`/`cat`/`Read` over a transcript, a QA fixture, another
+    session's scratch file — and an id belonging to some other session can never
+    receive its own notification here, so the phantom never clears. (The earlier
+    pane-scrape phantoms at least self-cleared.) The structured field cannot be
+    produced by a tool printing text.
+    It also settles two cases the text match got wrong: a SYNCHRONOUS subagent
+    result is already complete when it lands (its shape carries `content`/
+    `usage`, not `isAsync`) and must not register at all, and a `Bash` result
+    quoting an id is not a launch."""
+    tur = entry.get("toolUseResult") if isinstance(entry, dict) else None
+    if not isinstance(tur, dict):
+        return None
+    if tur.get("isAsync") is not True or tur.get("status") != "async_launched":
+        return None
+    return tur if tur.get("agentId") else None
+
+
 def _scan_agent_entry(entry, state):
     """Fold one transcript entry into `state["liveAgents"]` ({id: {type,label}}).
 
-    Task tool_use blocks are remembered by tool_use id (`state["agentTasks"]`)
-    because the launch RESULT — the block naming the agentId — is a separate
-    block, and often a separate entry, from the call that describes the work."""
+    The launch's own record carries the description, so the only thing kept from
+    the CALL is the agent type, which lives on the tool_use input and not on the
+    result. The tool is named `Agent` in current Claude Code and `Task` in older
+    transcripts — **both count**; keying on `Task` alone made every real launch
+    fall back to an unnamed row."""
     live = state.setdefault("liveAgents", {})
     tasks = state.setdefault("agentTasks", {})
+    stopped = state.setdefault("stoppedAgents", [])
     msg = entry.get("message") if isinstance(entry, dict) else None
     content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, list):
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use" and block.get("name") == "Task":
+            if block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
                 inp = block.get("input") or {}
-                if block.get("id"):
-                    tasks[block["id"]] = {
-                        "type": str(inp.get("subagent_type") or "agent").strip() or "agent",
-                        "label": str(inp.get("description") or "").strip(),
-                    }
+                atype = str(inp.get("subagent_type") or "").strip()
+                if block.get("id") and atype:
+                    tasks[block["id"]] = atype
                     # Bounded: a long conversation would otherwise accumulate one
-                    # entry per Task call for the life of the session.
+                    # entry per launch for the life of the session.
                     while len(tasks) > LIVE_AGENTS_MAX * 4:
                         tasks.pop(next(iter(tasks)))
-            elif block.get("type") == "tool_result":
-                m = AGENT_LAUNCH_RE.search(_tool_result_text(block.get("content")))
-                if m and len(live) < LIVE_AGENTS_MAX:
-                    task = tasks.get(block.get("tool_use_id")) or {"type": "agent", "label": ""}
-                    live[m.group(1)] = dict(task)
+    launch = _async_launch(entry)
+    if launch and len(live) < LIVE_AGENTS_MAX:
+        aid = str(launch["agentId"])
+        # A notification can be WRITTEN BEFORE the launch it refers to (observed:
+        # the queued copy lands at an earlier file offset than the launch, with a
+        # LATER timestamp). Registering here would then never be undone, so a
+        # stop already seen wins over a later-read launch.
+        if aid not in stopped:
+            tool_id = None
+            for block in (content if isinstance(content, list) else []):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_id = block.get("tool_use_id")
+            live[aid] = {
+                "type": tasks.get(tool_id) or str(launch.get("agentType") or "agent"),
+                "label": str(launch.get("description") or "").strip(),
+            }
     # The notification can ride several entry shapes (a queued operation, the
     # user turn it becomes once dequeued, an attachment), so the text is taken
     # from wherever this entry carries it rather than from one field.
@@ -3179,6 +3215,9 @@ def _scan_agent_entry(entry, state):
             continue
         if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
             live.pop(tn["taskId"], None)
+            if tn["taskId"] not in stopped:
+                stopped.append(tn["taskId"])
+                del stopped[:-LIVE_AGENTS_MAX * 4]
 
 
 def _entry_texts_for_scan(entry):
@@ -3861,11 +3900,18 @@ def _resolve_subagent(main_path, agent_type, label):
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use" and block.get("name") == "Task":
+            # `Agent` is the tool's current name and `Task` the older one; only
+            # `Task` was matched here, so on today's transcripts NO clicked row
+            # resolved and every subagent view opened empty.
+            if block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
                 inp = block.get("input") or {}
                 have_type = str(inp.get("subagent_type") or "").strip()
-                if have_type == want_type or (type_trunc and
-                                              have_type.startswith(want_type)):
+                # A background launch carries NO subagent_type, so its row's type
+                # is the generic "agent" the scan falls back to. Matching that
+                # against the call's (absent) type resolves nothing, so treat it
+                # as a wildcard and let the description alone decide.
+                if (want_type == "agent" or have_type == want_type
+                        or (type_trunc and have_type.startswith(want_type))):
                     tasks.append((block.get("id"),
                                   str(inp.get("description") or "").strip()))
             elif block.get("type") == "tool_result":

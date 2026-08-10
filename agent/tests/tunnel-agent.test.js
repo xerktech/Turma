@@ -1279,11 +1279,13 @@ test("parsePaneLiveTurn: no agent-manager list -> status without agents key", ()
 
 const LAUNCH_ENTRIES = [
   { type: "assistant", message: { content: [
-    { type: "tool_use", id: "toolu_1", name: "Task",
-      input: { subagent_type: "qa", description: "QA the parity change" } }] } },
-  { type: "user", message: { content: [
-    { type: "tool_result", tool_use_id: "toolu_1",
-      content: "Async agent launched successfully. agentId: agent-1 (internal ID)" }] } },
+    { type: "tool_use", id: "toolu_1", name: "Agent",
+      input: { description: "QA the parity change", run_in_background: true } }] } },
+  { type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "toolu_1",
+      content: "Async agent launched successfully. agentId: agent-1 (internal ID)" }] },
+    toolUseResult: { isAsync: true, status: "async_launched", agentId: "agent-1",
+                     description: "QA the parity change" } },
 ];
 const notif = (taskId, status, carrier) => {
   const text = `<task-notification>\n<task-id>${taskId}</task-id>\n` +
@@ -1299,10 +1301,40 @@ function scanAll(entries, state) {
   return st;
 }
 
-test("scanAgentEntry: a launch makes an agent live, named by its Task call", () => {
+test("scanAgentEntry: a launch makes an agent live, named by its own record", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
   assert.deepEqual(liveAgentsReport(scanAll(LAUNCH_ENTRIES)),
-    [{ type: "qa", label: "QA the parity change" }]);
+    [{ type: "agent", label: "QA the parity change" }]);
+});
+
+// THE regression this design had to close: `agentId:` appears in the OUTPUT of
+// any tool that reads a transcript, and an id from ANOTHER session can never
+// receive its notification here — so a text match registered a phantom that
+// never cleared. Worse than the pane rows it replaced, which self-cleared.
+test("scanAgentEntry: loose agentId text in tool output registers nothing", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll([{ type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "tb1",
+      content: "agentId: a3c02192c84d32f9f\nagentId: deadbeef" }] },
+    toolUseResult: { stdout: "agentId: a3c02192c84d32f9f", stderr: "", interrupted: false } }]);
+  assert.deepEqual(liveAgentsReport(st), []);
+});
+
+test("scanAgentEntry: a synchronous subagent result registers nothing", () => {
+  // Its result lands when it has already finished (content/usage, no isAsync).
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll([{ type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "ts1", content: "report" }] },
+    toolUseResult: { agentId: "sync-1", agentType: "Explore", content: "…",
+                     status: "completed", totalTokens: 12 } }]);
+  assert.deepEqual(liveAgentsReport(st), []);
+});
+
+test("scanAgentEntry: a stop seen before its launch still wins", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll([notif("agent-1", "completed")]);
+  scanAll(LAUNCH_ENTRIES, st);
+  assert.deepEqual(liveAgentsReport(st), []);
 });
 
 test("scanAgentEntry: the notification is what ends it, on either carrier", () => {
@@ -1314,6 +1346,18 @@ test("scanAgentEntry: the notification is what ends it, on either carrier", () =
       assert.deepEqual(liveAgentsReport(st), [], `${status} via ${carrier}`);
     }
   }
+});
+
+test("scanAgentEntry: a NON-terminal status must not clear the agent", () => {
+  // Every status Claude Code writes today is terminal, so the gate is a guard
+  // against a future progress-style notification — which, unguarded, would
+  // retire an agent that is still running the moment it reported in.
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll(LAUNCH_ENTRIES);
+  scanAll([notif("agent-1", "running")], st);
+  assert.equal(liveAgentsReport(st).length, 1, "still live");
+  scanAll([notif("agent-1", "completed")], st);
+  assert.deepEqual(liveAgentsReport(st), []);
 });
 
 test("scanAgentEntry: another agent's notification leaves this one running", () => {
@@ -1335,21 +1379,22 @@ test("scanAgentEntry: ordinary traffic moves nothing", () => {
   assert.deepEqual(liveAgentsReport(st), []);
 });
 
-test("scanAgentEntry: a launch whose Task call was missed still counts", () => {
-  // An agent restart primes past the call; the agent must be reported unnamed
-  // rather than invisible.
+test("scanAgentEntry: a launch whose call was missed still counts, and is named", () => {
+  // An agent restart primes past the call; the launch record carries the
+  // description itself, so the row is still named.
   const { liveAgentsReport } = require("../tunnel-agent.js");
   assert.deepEqual(liveAgentsReport(scanAll(LAUNCH_ENTRIES.slice(1))),
-    [{ type: "agent", label: "" }]);
+    [{ type: "agent", label: "QA the parity change" }]);
 });
 
 test("scanAgentEntry: the live set is bounded", () => {
   const { liveAgentsReport } = require("../tunnel-agent.js");
   const entries = [];
   for (let i = 0; i < 200; i++) {
-    entries.push({ type: "user", message: { content: [
-      { type: "tool_result", tool_use_id: `t${i}`,
-        content: `Async agent launched successfully. agentId: a${i}` }] } });
+    entries.push({ type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: `t${i}` }] },
+      toolUseResult: { isAsync: true, status: "async_launched",
+                       agentId: `a${i}`, description: `job ${i}` } });
   }
   assert.equal(liveAgentsReport(scanAll(entries)).length, 32);
 });
@@ -1486,5 +1531,63 @@ test("control channel: a hub that never app-pings is left alone (no reconnect lo
   } finally {
     child.kill();
     hub.srv.close();
+  }
+});
+
+// ---- the whole wire path: watch -> transcript -> `turn` frame ---------------
+// A mutation pass severed this in four independent places — the agentState
+// threading into transcriptTail, the watcher's seed, pollWatcher reading the
+// scan, and the frame's `agents` — and CI stayed green through every one,
+// because scanAgentEntry and liveAgentsReport were only ever tested in
+// isolation. Nothing asserted they were connected to anything. This does.
+test("watch -> transcript -> frame: the turn frame carries the live agents", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wire-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const slug = mod.projectSlug(work);
+  const proj = path.join(PROJECTS_ROOT, slug);
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "11111111-2222-3333-4444-555555555555";
+  const tpath = path.join(proj, `${tid}.jsonl`);
+  const write = (...entries) =>
+    fs.appendFileSync(tpath, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  write({ type: "user", message: { content: "go" } });
+  write({ type: "assistant", message: { content: [
+    { type: "tool_use", id: "tu1", name: "Agent",
+      input: { description: "QA the parity change", run_in_background: true } }] } });
+  write({ type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "launched" }] },
+    toolUseResult: { isAsync: true, status: "async_launched", agentId: "ag-1",
+                     description: "QA the parity change" } });
+
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  try {
+    mod.startWatch("sess-wire", work, tid);
+    mod.pollWatcher("sess-wire");
+    // captureLiveTurn shells out to tmux; with no pane it errors and the frame
+    // reports a finished turn — which is exactly the state under test.
+    await new Promise((r) => setTimeout(r, 400));
+    const turn = frames.find((f) => f.turn === "sess-wire");
+    assert.ok(turn, "a turn frame was emitted");
+    assert.equal(turn.status, null, "no running turn");
+    assert.deepEqual(turn.agents, [{ type: "agent", label: "QA the parity change" }],
+      "the frame carries the transcript's live agents");
+
+    // ...and the notification clears it on the next poll.
+    write({ type: "queue-operation", operation: "enqueue", content:
+      "<task-notification>\n<task-id>ag-1</task-id>\n<status>completed</status>\n" +
+      "<summary>Agent finished</summary>\n</task-notification>" });
+    frames.length = 0;
+    mod.pollWatcher("sess-wire");
+    await new Promise((r) => setTimeout(r, 400));
+    const after = frames.find((f) => f.turn === "sess-wire");
+    assert.ok(after, "a second turn frame was emitted");
+    assert.deepEqual(after.agents, [], "the finished agent is gone");
+  } finally {
+    mod.stopWatch("sess-wire");
+    mod.__setControlSink(null);
   }
 });
