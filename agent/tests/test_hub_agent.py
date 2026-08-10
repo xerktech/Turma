@@ -7301,6 +7301,16 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         self.addCleanup(p.stop)
         return sm
 
+    def _repo_on_disk(self, name="Turma"):
+        """Make scan_repos() actually see the repo.
+
+        _resume_at_cwd refuses a cwd whose repo is not in scan_repos(), so a
+        fixture that only creates the worktree silently produces no session at
+        all. Locally that passed on ambient state; CI has none, which is how it
+        was caught."""
+        os.makedirs(os.path.join(ha.REPOS_ROOT, name, ".git"), exist_ok=True)
+        return os.path.join(ha.REPOS_ROOT, name)
+
     def _session(self, sm, source="subscription", status="running"):
         sess = {"id": "abcde", "status": status, "tmuxName": "agent-abcde",
                 "worktreePath": os.path.join(self.tmp, "wt"),
@@ -7546,6 +7556,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         being asserted — otherwise _launch_tmux's fallback demotes an
         unconfigured host anyway and the re-validation could be deleted without
         a single test noticing."""
+        self._repo_on_disk()
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "mmmmm")
         os.makedirs(cwd, exist_ok=True)
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
@@ -7564,6 +7575,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         error. The closed record already knew the answer."""
         sm = self.make_manager()
         sess = self._session(sm, source="local")
+        self._repo_on_disk()
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "rrrrr")
         os.makedirs(cwd, exist_ok=True)
         sess.update({"worktreePath": cwd, "repo": "Turma",
@@ -7585,6 +7597,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         lineage, so the worktree answers for all of them."""
         sm = self.make_manager()
         sess = self._session(sm, source="local")
+        self._repo_on_disk()
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "ppppp")
         os.makedirs(cwd, exist_ok=True)
         sess.update({"worktreePath": cwd, "repo": "Turma",
@@ -7605,6 +7618,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         subscription and killed again would be resumed onto the local model
         anyway. The last thing the operator chose is the answer."""
         sm = self.make_manager()
+        self._repo_on_disk()
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "lllll")
         os.makedirs(cwd, exist_ok=True)
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
@@ -7632,6 +7646,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         their mind — here, putting work back on the local model after they moved
         it off. No "clear context" needed: kill, resume, switch back, kill."""
         sm = self.make_manager()
+        self._repo_on_disk()
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "ddddd")
         os.makedirs(cwd, exist_ok=True)
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
@@ -7659,6 +7674,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
     def test_resume_any_foreign_transcript_defaults_to_subscription(self):
         """No closed record means no answer — never a guess."""
         sm = self.make_manager()
+        self._repo_on_disk()
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "fffff")
         os.makedirs(cwd, exist_ok=True)
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
