@@ -124,6 +124,25 @@ A transcript with no closed record at all (foreign or pruned) has no answer and
 correctly defaults to the subscription. `--model` is suppressed for a local
 session at the single launch choke point, so it cannot diverge per route.
 
+### What the credential protection is, and is not
+
+The gateway key goes to a 0600 file the launch line sources, never into any
+argv — `/proc/<pid>/cmdline` is world-readable, so a command-line prefix (or
+`tmux -e`) hands the key to every uid on the host. That is the threat this
+closes, and it is closed: verified by scanning every process on the host.
+
+`_GUARD_DENY_PATH_RULES` also denies `Read` on the file, which stops a casual
+`cat` and holds even under `bypassPermissions`. **It is not containment.** A
+local session necessarily holds the same secret in its own environment as
+`ANTHROPIC_AUTH_TOKEN` — that is how it authenticates — so `echo
+$ANTHROPIC_AUTH_TOKEN` reads it in one call, and QA confirmed several ordinary
+shell forms (`sh -c`, a relative path, a symlink, `python3 -c`) reach the file
+itself. Do not rely on the deny as a boundary. Keeping the token out of child
+environments would need Claude Code's `apiKeyHelper`; that is a follow-up.
+
+The key is scoped to one model group on the gateway, so its blast radius is the
+self-hosted model, not the Claude subscription.
+
 ## Known limitations (found by the QA pass, accepted for this change)
 
 - **Ticket sessions are subscription-only.** `spawn_ticket` doesn't take a model
@@ -145,6 +164,15 @@ session at the single launch choke point, so it cannot diverge per route.
 - **The spawn composer's "Run against" select has no Android counterpart** yet;
   `android/PARITY.md` records the chat-bar control and the mark, and this adds a
   third gap on the same screen.
+- **Real-model behaviour is unexercised.** No key available during development
+  could reach `gpt-oss:120b` (the one on the host is scoped to `parakeet`), so
+  what six QA passes proved is the *wiring*: the real `claude` binary, launched
+  in the real local-session shape, authenticates against a non-Anthropic
+  `/v1/messages` endpoint and completes multi-turn tool-using conversations with
+  the safety guard intact. What is untested is the *model* — genuine refusals,
+  malformed or fenced tool JSON, truncation at 64k, latency, long-context
+  compaction. Exercise those the first time `LOCAL_MODEL_*` is set on a real
+  host.
 - **A local session's model can't be changed from the chip** — by design, since
   every row the picker offers is a Claude alias the gateway refuses. The chip
   states the fixed model instead. Switch back to the subscription to choose one.

@@ -7370,6 +7370,37 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm.resume_transcript(orphan_tid, cwd)
         self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
 
+    def test_resume_any_prefers_the_latest_record_for_a_REUSED_transcript_id(self):
+        """A resume-any PINS the resumed transcript id onto the session it
+        creates, so killing that one leaves a SECOND closed record with the same
+        id. Append-order answers with the state before the operator last changed
+        their mind — here, putting work back on the local model after they moved
+        it off. No "clear context" needed: kill, resume, switch back, kill."""
+        sm = self.make_manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "ddddd")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        tid = "99999999-9999-4999-8999-999999999999"
+        open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        base = {"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                "worktreePath": cwd, "status": "running", "rcName": "r",
+                "tmuxName": "t", "ttydPort": 7700, "claudeSessionId": tid}
+        sm._remember_closed({**base, "id": "aaaaa", "modelSource": "local"})
+        sm._remember_closed({**base, "id": "bbbbb", "modelSource": "subscription"})
+        sm.registry = []
+        sm.resume_transcript(tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
+
+    def test_switch_to_local_drops_a_deferred_model_pick(self):
+        """set_model refuses a local session, so a pick waiting for an idle pane
+        would sit heartbeat-visible and then vanish unexplained."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["pendingModel"] = "opus"
+        sm.set_model_source("abcde", "local")
+        self.assertNotIn("pendingModel", sess)
+
     def test_resume_any_foreign_transcript_defaults_to_subscription(self):
         """No closed record means no answer — never a guess."""
         sm = self.make_manager()

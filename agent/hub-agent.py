@@ -650,8 +650,11 @@ def write_local_model_env(path):
     keeps it out of every argv; only the PATH is ever visible there.
 
     0600 stops OTHER uids, not the sessions themselves — they run as the uid
-    that owns this file. `_GUARD_DENY_PATH_RULES` denies Read on it for that
-    reason, since the file's whole content is the secret.
+    that owns this file. `_GUARD_DENY_PATH_RULES` denies Read on it, which stops
+    a casual `cat` but is NOT containment: a local session holds the same secret
+    in its own environment as ANTHROPIC_AUTH_TOKEN, because that is how it
+    authenticates. The threat this file actually closes is the world-readable
+    argv one.
 
     Rewritten on every launch, so a rotated key or a changed endpoint takes
     effect without an agent restart."""
@@ -915,11 +918,17 @@ _GUARD_DENY_PATH_RULES = [
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
     "Edit(~/.git-credentials)",
-    # The self-hosted gateway credential (XERK-246). READ, not Edit: unlike the
-    # stores above — which a session could only misuse by writing — this file's
-    # whole content IS the secret, and sessions run as the same uid that owns
-    # it. tmux keeps LOCAL_MODEL_API_KEY out of session environments, so this
-    # file is the only path to it from inside a session.
+    # The self-hosted gateway credential (XERK-246). READ, not just Edit: unlike
+    # the stores above — which a session could only misuse by writing — this
+    # file's whole content IS the secret, and sessions run as the same uid that
+    # owns it.
+    #
+    # Defense in depth against a CASUAL read, and nothing more. A local session
+    # necessarily has the same secret in its own environment as
+    # ANTHROPIC_AUTH_TOKEN (that is how it authenticates), so `echo
+    # $ANTHROPIC_AUTH_TOKEN` reads it in one call and no permission rule can
+    # change that. Do not treat this line as containment. Keeping the token out
+    # of child environments would need Claude Code's apiKeyHelper.
     "Read(~/.turma/local-model.env)",
     "Edit(~/.turma/local-model.env)",
 ]
@@ -9687,7 +9696,12 @@ class SessionManager:
         # the exhausted subscription. Every conversation in a worktree belongs
         # to the same lineage, so the closed record for that worktree is the
         # answer for all of them.
-        closed = next((c for c in self.closed
+        # NEWEST first, for the same reason as the worktree fallback below: a
+        # resume-any PINS the resumed transcript id onto the session it creates,
+        # so killing that session leaves a SECOND closed record carrying the
+        # same id. Append-order would answer with the first one, which is the
+        # state before the operator last changed their mind.
+        closed = next((c for c in reversed(self.closed)
                        if c.get("claudeSessionId") == transcript_id), None)
         if closed is None and cwd:
             # NEWEST first: self.closed is append-ordered, so a plain next()
