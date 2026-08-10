@@ -1483,7 +1483,7 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         prompt = {"prompt": "Do you want to proceed?",
                   "options": [{"number": 1, "label": "Yes", "selected": True}]}
         with mock.patch.object(ha, "_pane_status",
-                               return_value=(True, "plan", prompt, [])) as ps:
+                               return_value=(True, "plan", prompt)) as ps:
             rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
         self.assertIs(rep["paneBusy"], True)
         self.assertEqual(rep["modeActual"], "plan")
@@ -1495,7 +1495,7 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
     def test_pane_reads_reported_without_transcript(self):
         # No transcript yet — the pane reads must still ride the early-return
         # path.
-        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None, [])):
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
             rep = ha.session_report("/absent/worktree", {}, "agent-abc")
         self.assertIs(rep["paneBusy"], False)
         self.assertEqual(rep["modeActual"], "auto")
@@ -1503,23 +1503,37 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["agents"], [])
 
     def test_background_agents_ride_the_report_while_the_pane_reads_idle(self):
-        # XERK-245: the pane the agent list exists for. The turn has ended, so
-        # paneBusy is False and every working/idle mirror would call this
-        # session idle — `agents` is the signal that says otherwise.
+        # XERK-245, the case the whole feature exists for: launching a
+        # background agent ENDS the session's own turn, so paneBusy is False and
+        # every working/idle mirror would call this idle. `agents` says
+        # otherwise, and comes from the transcript, not the screen.
         path = os.path.join(self.proj, "s.jsonl")
-        write_jsonl(path, [{"type": "assistant",
-                            "message": {"content": [{"type": "text", "text": "Launched."}]}}])
-        with mock.patch.object(ha, "_capture_pane", return_value=PANE_BG_AGENT), \
-             mock.patch.object(ha, "_stable_pane_busy", return_value=False):
-            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        write_jsonl(path, [{"type": "user", "message": {"content": "go"}}])
+        state = {}
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+            # The first beat primes the byte offsets to EOF, so the launch has to
+            # land after it — which is also what a real beat looks like.
+            ha.session_report(self.WORKDIR, state, "agent-abc")
+            write_jsonl(path, TASK_LAUNCH_ENTRIES + [
+                {"type": "assistant",
+                 "message": {"content": [{"type": "text", "text": "Launched."}]}}])
+            rep = ha.session_report(self.WORKDIR, state, "agent-abc")
         self.assertIs(rep["paneBusy"], False)
-        self.assertEqual([a["type"] for a in rep["agents"]], ["Explore"])
+        self.assertEqual(rep["agents"], [{"type": "qa", "label": "QA the parity change"}])
 
-    def test_the_busy_read_alone_cannot_see_a_background_agent(self):
-        # Why `agents` had to be added rather than widening the busy read: this
-        # pane carries no interrupt hint, and "Waiting for 1 background agent to
-        # finish" has no ellipsis, so PANE_SPINNER_RE cannot match it either.
-        self.assertIs(ha._busy_from_capture(PANE_BG_AGENT), False)
+    def test_a_finished_agent_stops_being_reported(self):
+        # The measured reason the TUI footer cannot be the source: its rows
+        # linger ~24s past completion. The notification is the exact edge.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "user", "message": {"content": "go"}}])
+        state = {}
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+            ha.session_report(self.WORKDIR, state, "agent-abc")   # primes offsets
+            write_jsonl(path, TASK_LAUNCH_ENTRIES)
+            self.assertEqual(len(ha.session_report(self.WORKDIR, state, "agent-abc")["agents"]), 1)
+            write_jsonl(path, [task_notification_entry("agent-1", "completed")])
+            rep = ha.session_report(self.WORKDIR, state, "agent-abc")
+        self.assertEqual(rep["agents"], [])
 
     def test_pane_reads_default_none_without_tmux(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -1930,6 +1944,109 @@ TASK_NOTIFICATION = (
 )
 
 
+def task_notification_entry(task_id, status, carrier="queue-operation"):
+    """One transcript entry carrying a `<task-notification>`. The corpus shows
+    them on several carriers (queue-operation, user, attachment, assistant), so
+    the scan must not key on one — these fixtures cover the two commonest."""
+    text = (f"<task-notification>\n<task-id>{task_id}</task-id>\n"
+            f"<status>{status}</status>\n<summary>Agent finished</summary>\n"
+            "</task-notification>")
+    if carrier == "queue-operation":
+        return {"type": "queue-operation", "operation": "enqueue", "content": text}
+    return {"type": "user", "message": {"content": text}}
+
+
+# A background-agent launch exactly as Claude Code writes it: the Task call
+# (which names the work) and, separately, the result that names the agent id.
+TASK_LAUNCH_ENTRIES = [
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Task",
+         "input": {"subagent_type": "qa", "description": "QA the parity change",
+                   "prompt": "..."}}]}},
+    {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "content": "Async agent launched successfully. (internal metadata) "
+                    "agentId: agent-1 (internal ID - do not mention to user.)"}]}},
+]
+
+
+class TestLiveAgentsScan(unittest.TestCase):
+    """_scan_agent_entry — which background agents are in flight, off the
+    transcript's own launch/stop edges. The TUI footer is NOT the source: its
+    rows are forgeable pane content AND linger ~24s past completion."""
+
+    def _scan(self, entries, state=None):
+        state = {} if state is None else state
+        for e in entries:
+            ha._scan_entry_line(json.dumps(e), state, {"prUrls": [], "modelActual": None})
+        return state
+
+    def test_a_launch_makes_an_agent_live_with_its_task_description(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self.assertEqual(ha.live_agents_report(st),
+                         [{"type": "qa", "label": "QA the parity change"}])
+
+    def test_the_notification_is_what_ends_it(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([task_notification_entry("agent-1", "completed")], st)
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_every_terminal_status_ends_it_and_both_carriers_are_read(self):
+        for status in ("completed", "failed", "killed", "stopped"):
+            for carrier in ("queue-operation", "user"):
+                st = self._scan(TASK_LAUNCH_ENTRIES)
+                self._scan([task_notification_entry("agent-1", status, carrier)], st)
+                self.assertEqual(ha.live_agents_report(st), [],
+                                 f"{status} via {carrier} must end it")
+
+    def test_a_notification_for_another_agent_leaves_this_one_running(self):
+        st = self._scan(TASK_LAUNCH_ENTRIES)
+        self._scan([task_notification_entry("someone-else", "completed")], st)
+        self.assertEqual(len(ha.live_agents_report(st)), 1)
+
+    def test_several_agents_are_tracked_independently(self):
+        entries = list(TASK_LAUNCH_ENTRIES) + [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_2", "name": "Task",
+                 "input": {"subagent_type": "Explore", "description": "Map it"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_2",
+                 "content": "Async agent launched successfully. agentId: agent-2"}]}},
+        ]
+        st = self._scan(entries)
+        self.assertEqual(sorted(a["type"] for a in ha.live_agents_report(st)),
+                         ["Explore", "qa"])
+        self._scan([task_notification_entry("agent-1", "completed")], st)
+        self.assertEqual([a["type"] for a in ha.live_agents_report(st)], ["Explore"])
+
+    def test_a_launch_whose_task_call_was_missed_still_counts(self):
+        # An agent restart primes the byte offsets to EOF, so the scan can see a
+        # result whose call it never read. It must still report the agent —
+        # unnamed rather than invisible.
+        st = self._scan(TASK_LAUNCH_ENTRIES[1:])
+        self.assertEqual(ha.live_agents_report(st), [{"type": "agent", "label": ""}])
+
+    def test_ordinary_traffic_moves_nothing(self):
+        st = self._scan([
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "talking about agentId: not-a-launch"}]}},
+            {"type": "user", "message": {"content": "just a prompt"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t9", "name": "Bash",
+                 "input": {"command": "echo hi"}}]}},
+        ])
+        self.assertEqual(ha.live_agents_report(st), [])
+
+    def test_the_live_set_is_bounded(self):
+        entries = []
+        for i in range(200):
+            entries.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}",
+                 "content": f"Async agent launched successfully. agentId: a{i}"}]}})
+        st = self._scan(entries)
+        self.assertEqual(len(ha.live_agents_report(st)), ha.LIVE_AGENTS_MAX)
+
+
 class TestTaskNotification(unittest.TestCase):
     """A background Task/agent finishing arrives as a user-role `<task-notification>`
     turn; it must parse into a structured task_notification block (rendered as an
@@ -1942,6 +2059,9 @@ class TestTaskNotification(unittest.TestCase):
             "summary": 'Agent "Confirm merge semantics" finished',
             "status": "completed",
             "result": "The --settings file is merged as a higher-precedence layer.",
+            # The id is what makes this a usable STOPPED edge for the live-agent
+            # scan, not just display text (XERK-245).
+            "taskId": "af9e62627de15eaf4",
         })
 
     def test_non_notification_text_is_not_parsed(self):
@@ -6982,168 +7102,6 @@ class TestParsePaneMode(unittest.TestCase):
         self.assertIsNone(ha.parse_pane_mode(""))
         self.assertIsNone(ha.parse_pane_mode(None))
         self.assertIsNone(ha.parse_pane_mode("❯ \n  ? for shortcuts"))
-
-
-RULE = "─" * 60
-
-# A real capture (Claude Code v2.x) of the state XERK-245 is about: the main
-# turn has ENDED — no interrupt hint, no ellipsised spinner, so `_pane_busy`
-# reads False — while a background agent it launched keeps working. The TUI says
-# so on two lines the busy read cannot use, and paints the live agent rows below
-# the input box.
-PANE_BG_AGENT = "\n".join([
-    "● Launched.",
-    "",
-    "✻ Waiting for 1 background agent to finish",
-    "",
-    RULE,
-    "❯ ",
-    RULE,
-    "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents · ↓ to manage",
-    "",
-    "  ● main",
-    "  ◯ Explore  Map and summarize all JS files            41s · ↓ 93.9k tokens",
-])
-
-# The same pane once that agent finishes: the TUI collapses the list back to the
-# "← for agents" hint, which is what makes the rows an exact liveness signal.
-PANE_NO_AGENTS = "\n".join([
-    "✻ Brewed for 9s",
-    "",
-    RULE,
-    "❯ ",
-    RULE,
-    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
-])
-
-
-class TestParsePaneAgents(unittest.TestCase):
-    """parse_pane_agents / live_subagents — mirrors parseAgentList in
-    tunnel-agent.js (see the parity cases in tunnel-agent.test.js)."""
-
-    def test_rows_below_the_input_box(self):
-        self.assertEqual(ha.parse_pane_agents(PANE_BG_AGENT), [
-            {"sel": True, "type": "main", "label": ""},
-            {"sel": False, "type": "Explore",
-             "label": "Map and summarize all JS files 41s · ↓ 93.9k tokens"},
-        ])
-
-    def test_live_subagents_drops_main(self):
-        self.assertEqual(ha.live_subagents(PANE_BG_AGENT), [
-            {"type": "Explore",
-             "label": "Map and summarize all JS files 41s · ↓ 93.9k tokens"},
-        ])
-
-    def test_a_collapsed_list_reports_nothing(self):
-        # The whole point: presence means an agent is running RIGHT NOW.
-        self.assertEqual(ha.parse_pane_agents(PANE_NO_AGENTS), [])
-        self.assertEqual(ha.live_subagents(PANE_NO_AGENTS), [])
-
-    def test_main_alone_is_not_a_background_agent(self):
-        cap = "\n".join([RULE, "❯ ", RULE, "  ⏵⏵ auto mode on", "", "  ● main"])
-        self.assertEqual(ha.parse_pane_agents(cap),
-                         [{"sel": True, "type": "main", "label": ""}])
-        self.assertEqual(ha.live_subagents(cap), [])
-
-    def test_the_column_zero_assistant_bullet_is_not_a_row(self):
-        # A ● at column 0 ABOVE the input box is assistant text, not an agent —
-        # only the region below the box's bottom rule is scanned.
-        cap = "\n".join(["● I'll start by reading the file.", RULE, "❯ ", RULE,
-                         "  ⏵⏵ auto mode on"])
-        self.assertEqual(ha.parse_pane_agents(cap), [])
-
-    def test_alternate_radio_glyphs(self):
-        cap = "\n".join([RULE, "❯ ", RULE, "  ⏵⏵ auto mode on", "",
-                         "  ◉ qa  QA the parity change", "  ○ Explore  Map it"])
-        self.assertEqual([a["sel"] for a in ha.parse_pane_agents(cap)], [True, False])
-        self.assertEqual([a["type"] for a in ha.parse_pane_agents(cap)],
-                         ["qa", "Explore"])
-
-    def test_empty_and_unreadable_captures(self):
-        for cap in ("", None, "no rule anywhere\n  ● main"):
-            self.assertEqual(ha.parse_pane_agents(cap), [])
-            self.assertEqual(ha.live_subagents(cap), [])
-
-    def test_a_composer_less_full_screen_view_yields_nothing(self):
-        # Trimmed from a REAL capture that reproduced the defect: a tool result
-        # whose continuation lines are bare rules, the assistant's reply, then
-        # `/status` — a full-screen view with no composer. Anchoring on "the
-        # last ─ rule" made that reply's own ● bullet a focused agent named
-        # after the sentence, i.e. "working" forever with review suppressed.
-        cap = "\n".join([
-            "❯ print six 30-char rules",
-            "● I'll print them.",
-            "  ⎿  " + "─" * 30,
-            "     " + "─" * 30,
-            "     " + "─" * 30,
-            "     … +3 lines",
-            "",
-            "● Six 30-char rules, as expected. Still nothing for me to act on.",
-            "",
-            "✻ Sautéed for 1s",
-            "",
-            "❯ /status",
-            "",
-            "   Settings  Status   Config   Usage   Stats",
-            "   Version:          2.1.226",
-            "",
-            "   Esc to cancel",
-        ])
-        self.assertEqual(ha.parse_pane_agents(cap), [])
-        self.assertEqual(ha.live_subagents(cap), [])
-
-    def test_a_dialogs_own_bullets_below_a_stray_rule_are_not_rows(self):
-        cap = "\n".join([
-            "● Here is the plan.",
-            "  ⎿  " + "─" * 40,
-            "     " + "─" * 40,
-            "",
-            "  Select effort",
-            "  ● High effort (default) ←/→ to adjust",
-            "  ○ Low effort",
-        ])
-        self.assertEqual(ha.parse_pane_agents(cap), [])
-
-    def test_bom_in_the_rows_keeps_parity_with_the_js_mirror(self):
-        # Python's \s does not match U+FEFF and JavaScript's does; tmux passes
-        # those bytes through, so both sides strip it before matching.
-        cap = "\n".join([
-            "─" * 60, "❯ ", "─" * 60,
-            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
-            "",
-            "  ﻿◯ qa﻿  QA the change",
-        ])
-        self.assertEqual(ha.parse_pane_agents(cap),
-                         [{"sel": False, "type": "qa", "label": "QA the change"}])
-
-    def test_the_row_list_is_bounded(self):
-        rows = [f"  ◯ a{i}  label {i}" for i in range(500)]
-        cap = "\n".join(["  ⏵⏵ auto mode on (shift+tab to cycle)", ""] + rows)
-        self.assertEqual(len(ha.parse_pane_agents(cap)), ha.PANE_AGENTS_MAX)
-
-    def test_vanishing_rows_are_confirmed_before_they_are_believed(self):
-        # _stable_pane_agents mirrors _stable_pane_busy's asymmetry: rows
-        # appearing are trusted instantly, rows VANISHING are re-read once. A
-        # single capture landing in a repaint gap would otherwise report "no
-        # agents" for a whole 20s beat and re-fire the ready-for-review alert
-        # this feature exists to hold back.
-        state = {}
-        self.assertEqual(
-            [a["type"] for a in ha._stable_pane_agents(PANE_BG_AGENT, "agent-x", state)],
-            ["Explore"])
-        # The rows blink out for one capture, but the re-read still sees them.
-        with mock.patch.object(ha, "_capture_pane", return_value=PANE_BG_AGENT) as cap:
-            again = ha._stable_pane_agents(PANE_NO_AGENTS, "agent-x", state)
-        self.assertEqual([a["type"] for a in again], ["Explore"])
-        self.assertEqual(cap.call_count, 1, "re-read once, on the edge only")
-        # A confirmed disappearance is believed, and costs no re-read next beat.
-        with mock.patch.object(ha, "_capture_pane", return_value=PANE_NO_AGENTS):
-            self.assertEqual(ha._stable_pane_agents(PANE_NO_AGENTS, "agent-x", state), [])
-        with mock.patch.object(ha, "_capture_pane") as cap2:
-            self.assertEqual(ha._stable_pane_agents(PANE_NO_AGENTS, "agent-x", state), [])
-        self.assertEqual(cap2.call_count, 0, "steady empty pays nothing")
-        # A failed capture reports nothing and leaves the memory alone.
-        self.assertEqual(ha._stable_pane_agents(None, "agent-x", state), [])
 
 
 # What `claude -p "/model"` really prints (v2.1.214): the current default's

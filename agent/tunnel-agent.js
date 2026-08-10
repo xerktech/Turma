@@ -181,9 +181,11 @@ const TN_TAG_RE = {
   summary: /<summary>([\s\S]*?)<\/summary>/,
   status: /<status>([\s\S]*?)<\/status>/,
   result: /<result>([\s\S]*?)<\/result>/,
+  "task-id": /<task-id>([\s\S]*?)<\/task-id>/,
 };
 function tnTag(name, body) {
-  const m = TN_TAG_RE[name].exec(body);
+  const re = TN_TAG_RE[name];
+  const m = re ? re.exec(body) : null;
   return m ? m[1].replace(ANSI_RE, "").trim() : "";
 }
 function parseTaskNotification(text) {
@@ -191,7 +193,10 @@ function parseTaskNotification(text) {
   const m = TASK_NOTIFICATION_RE.exec(text);
   if (!m) return null;
   const body = m[1];
-  return { summary: tnTag("summary", body), status: tnTag("status", body), result: tnTag("result", body) };
+  // `taskId` is what makes this a usable STOPPED edge for the live-agent scan,
+  // not just display text (XERK-245). Mirrors _parse_task_notification.
+  return { summary: tnTag("summary", body), status: tnTag("status", body),
+           result: tnTag("result", body), taskId: tnTag("task-id", body) };
 }
 // Flatten a parsed task-notification to text-feed form (summary + result) —
 // mirror of hub-agent.py _tn_preview.
@@ -689,7 +694,7 @@ function queuedDisplay(queue) {
 // poll (same file, same mtime+size) — pollWatcher ticks this ~1s per session and
 // most ticks find nothing new. sessionTranscript already stat'd the candidates,
 // so one more stat of the winner is cheap next to re-reading the tail.
-function transcriptTail(worktreePath, cache, transcriptId) {
+function transcriptTail(worktreePath, cache, transcriptId, agentState) {
   const p = sessionTranscript(worktreePath, transcriptId);
   if (!p) {
     if (cache) { cache.path = null; cache.result = { entries: [], queued: [] }; }
@@ -707,6 +712,11 @@ function transcriptTail(worktreePath, cache, transcriptId) {
     let entry;
     try { entry = JSON.parse(raw); } catch { continue; }
     if (!entry || typeof entry !== "object") continue;
+    // Live background agents, folded from the SAME parse (XERK-245). The state
+    // persists across polls, so an entry scrolling out of the tail window never
+    // un-does what it established; and because a launch always precedes its own
+    // notification in the file, a window holding the launch holds the stop too.
+    if (agentState) scanAgentEntry(entry, agentState);
     if (entry.type === "queue-operation") { foldQueueOp(entry, queued); continue; }
     const text = entryText(entry);
     const blocks = entryBlocks(entry, BLOCK_CAPS_LIVE);
@@ -853,20 +863,10 @@ function isChecklistLine(l) {
 // in the footer region (below the input box) — see parsePaneLiveTurn — so the
 // column-0 ● assistant-text bullet can never be mistaken for a focused agent.
 const AGENT_ROW_RE = /^\s*([◉●◯○])\s+(\S.*?)\s*$/;
-// The composer's mode-marker footer — the ONLY landmark that reliably means
-// "the input box is on screen", and so the anchor the agent rows are found
-// under. Mirrors PANE_MODE_RE in hub-agent.py (parity contract).
-const PANE_MODE_MARKER_RE =
-  /[⏸⏵]+\s+(?:bypass permissions|accept edits|plan mode|auto mode|manual mode) on/;
-// A pane is 220x50 and the TUI lists a handful of agents; this only bites a
-// malformed capture, and bounds what reaches the wire. Mirrors PANE_AGENTS_MAX.
-const PANE_AGENTS_MAX = 32;
 function parseAgentList(lines) {
   const agents = [];
   for (const raw of lines || []) {
-    // U+FEFF is stripped for parity: JS's \s matches it and Python's does not,
-    // and `capture-pane` passes those bytes through untouched.
-    const m = AGENT_ROW_RE.exec(String(raw == null ? "" : raw).replace(/﻿/g, ""));
+    const m = AGENT_ROW_RE.exec(String(raw == null ? "" : raw));
     if (!m) continue;
     const parts = m[2].split(/\s{2,}/);
     const type = (parts[0] || "").trim();
@@ -876,23 +876,66 @@ function parseAgentList(lines) {
       type,
       label: parts.slice(1).join(" ").trim(),
     });
-    if (agents.length >= PANE_AGENTS_MAX) break;
   }
   return agents;
 }
 
-// The agent rows off a whole capture: the region below the LAST mode-marker
-// line. See parse_pane_agents in hub-agent.py for why the anchor is the footer
-// and never "the last ─ rule" — a stray rule in tool output plus a
-// composer-less full-screen view (/status, /model) parsed assistant prose as
-// agents, which reads as "working forever" on every surface.
-function paneAgents(raw) {
-  const lines = String(raw == null ? "" : raw).replace(/﻿/g, "").split("\n");
-  let anchor = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (PANE_MODE_MARKER_RE.test(lines[i])) { anchor = i; break; }
+// ---- live background agents, off the transcript (XERK-245) ------------------
+// Mirror of hub-agent.py's _scan_agent_entry / live_agents_report — read there
+// for why the TUI's footer list is NOT the source and must not become one
+// again: its rows are pane CONTENT (a quoted footer plus a composer-less
+// full-screen view forged them) and, measured on a live TUI, they LINGER ~24s
+// after an agent finishes, so no single capture can tell running from finished.
+const AGENT_LAUNCH_RE = /agentId:\s*([A-Za-z0-9_-]+)/;
+const AGENT_DONE_STATUSES = new Set(["completed", "failed", "killed", "stopped", "error"]);
+const LIVE_AGENTS_MAX = 32;
+
+function scanAgentEntry(entry, state) {
+  if (!entry || typeof entry !== "object" || !state) return;
+  const live = state.live || (state.live = new Map());
+  const tasks = state.tasks || (state.tasks = new Map());
+  const content = entry.message && entry.message.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "tool_use" && block.name === "Task" && block.id) {
+        const inp = block.input || {};
+        tasks.set(block.id, {
+          type: String(inp.subagent_type || "agent").trim() || "agent",
+          label: String(inp.description || "").trim(),
+        });
+        while (tasks.size > LIVE_AGENTS_MAX * 4) tasks.delete(tasks.keys().next().value);
+      } else if (block.type === "tool_result") {
+        const m = AGENT_LAUNCH_RE.exec(toolResultText(block.content));
+        if (m && live.size < LIVE_AGENTS_MAX) {
+          live.set(m[1], tasks.get(block.tool_use_id) || { type: "agent", label: "" });
+        }
+      }
+    }
   }
-  return anchor < 0 ? [] : parseAgentList(lines.slice(anchor + 1));
+  for (const text of entryTextsForScan(entry)) {
+    const tn = parseTaskNotification(text);
+    if (!tn || !tn.taskId) continue;
+    if (!tn.status || AGENT_DONE_STATUSES.has(tn.status)) live.delete(tn.taskId);
+  }
+}
+
+// The raw strings on one entry that could BE a `<task-notification>`: a
+// queue-operation's content, and any string/text-block message content.
+function entryTextsForScan(entry) {
+  const out = [];
+  if (typeof entry.content === "string") out.push(entry.content);
+  const content = entry.message && entry.message.content;
+  if (typeof content === "string") out.push(content);
+  else if (Array.isArray(content)) {
+    for (const b of content) if (b && typeof b.text === "string") out.push(b.text);
+  }
+  return out;
+}
+
+function liveAgentsReport(state) {
+  if (!state || !state.live) return [];
+  return [...state.live.values()].map((a) => ({ type: a.type, label: a.label }));
 }
 
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
@@ -955,21 +998,10 @@ function parsePaneLiveTurn(pane) {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (isRule(lines[i])) { bottom = i; break; }
   }
-  // The agent-manager list, when live, is painted under the composer's mode
-  // footer — a region the convo slice below intentionally drops. `paneAgents`
-  // anchors on that footer so the assistant block can't swallow it, the
-  // column-0 ● bullet can't fake a row, and a composer-less full-screen view
-  // yields nothing at all.
-  //
-  // Read BEFORE the busy check, and returned whether or not a turn is running
-  // (XERK-245). The TUI paints these rows for exactly as long as agents are
-  // LIVE — including after the main turn ends with a BACKGROUND agent still
-  // going, where the pane reads "Waiting for N background agent to finish" and
-  // carries no interrupt hint. That is the case this parse exists to catch: the
-  // session looks idle on every surface while an agent is still working, and
-  // the chat's agent list used to blink out the moment the turn ended.
-  const agents = paneAgents(raw);
-  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null, agents };
+  // Live background agents do NOT come from here — see scanAgentEntry. The
+  // footer's rows are pane content and linger ~24s past completion, so they
+  // cannot answer "is an agent running right now"; the transcript can.
+  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null, agents: [] };
   let end = lines.length;
   if (bottom >= 0) {
     end = bottom;
@@ -1005,11 +1037,14 @@ function parsePaneLiveTurn(pane) {
       if (h) status.hint = h;
     }
   }
-  // Kept on `status` as well as on the frame: it is where the chat's pinned bar
-  // has always read the list from, and an older hub forwards only `status`.
-  if (agents.length) {
+  // The pane's own footer rows still ride `status.agents` while a turn runs:
+  // they carry the live elapsed/token counters the transcript has no way to
+  // know, and an older hub forwards only `status`. They are DISPLAY ONLY —
+  // liveness is the transcript's answer (scanAgentEntry).
+  const paneRows = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
+  if (paneRows.length) {
     status = status || { verb: "", up: "", down: "", elapsed: "" };
-    status.agents = agents;
+    status.agents = paneRows;
   }
   // The in-progress assistant block starts at the last column-0 ● bullet.
   let start = -1;
@@ -1017,7 +1052,7 @@ function parsePaneLiveTurn(pane) {
     if (/^●\s/.test(convo[i])) { start = i; break; }
     if (/^❯/.test(convo[i])) break; // hit the user prompt -> no text yet
   }
-  if (start < 0) return { generating: true, text: "", status, agents }; // thinking; no text yet
+  if (start < 0) return { generating: true, text: "", status, agents: [] }; // thinking; no text yet
   const block = [];
   for (let i = start; i < convo.length; i++) {
     const l = convo[i];
@@ -1030,7 +1065,7 @@ function parsePaneLiveTurn(pane) {
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
   // and the transcript delivers the authoritative structure on completion.
   const text = stripActivityTail(block.join(" ").replace(/\s+/g, " ").trim());
-  return { generating: true, text, status, agents };
+  return { generating: true, text, status, agents: [] };
 }
 
 // Suppress a single-frame busy->idle blip in the live turn scrape. Claude Code
@@ -1160,7 +1195,7 @@ function pollWatcher(sessionId) {
   //    queue op is a transcript line that changes NO entry — without it, the
   //    frame that reports "your prompt is queued" would never fire.
   let tail = null;
-  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId); }
+  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId, w.agentState); }
   catch { tail = null; }
   if (tail && (tail.entries.length || tail.queued.length)) {
     const json = JSON.stringify(tail);
@@ -1198,7 +1233,7 @@ function pollWatcher(sessionId) {
     // must clear the instant the turn ends — while agents stay live past that,
     // which is exactly when the operator most needs to see them. Sending them
     // inside `status` would either hide them or fake a running turn.
-    const agents = Array.isArray(live.agents) ? live.agents : [];
+    const agents = liveAgentsReport(w.agentState);
     // They join the dedup key for the same reason `status` does: a background
     // agent's row ticks (elapsed, tokens) while the text and status hold still,
     // and without this the list would freeze on whatever its first frame said.
@@ -1229,6 +1264,9 @@ function startWatch(sessionId, worktreePath, transcriptId) {
     lastJson: null, lastTurn: "", timer: null,
     liveGen: false, livePending: false, // busy->idle blip hold; see liveTurnDecision
     heldText: "", // uncommitted prose held across paint gaps; see resolveLiveText
+    // Live background agents, accumulated from the transcript across polls
+    // (scanAgentEntry). Not derived from the pane — see that function.
+    agentState: { live: new Map(), tasks: new Map() },
     tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
@@ -1486,5 +1524,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, paneAgents, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }

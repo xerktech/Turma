@@ -150,6 +150,9 @@ test("parseTaskNotification: extracts summary/status/result, ignores non-notific
     summary: 'Agent "Confirm merge semantics" finished',
     status: "completed",
     result: "The --settings file is merged as a higher-precedence layer.",
+    // The id is what makes this a usable STOPPED edge for the live-agent scan,
+    // not just display text (XERK-245). Mirrors _parse_task_notification.
+    taskId: "af9e62627de15eaf4",
   });
   assert.equal(parseTaskNotification("just a normal prompt"), null);
   assert.equal(parseTaskNotification("talk about <task-notification> inline"), null);
@@ -1264,138 +1267,109 @@ test("parsePaneLiveTurn: no agent-manager list -> status without agents key", ()
   ].join("\n");
   const r = parsePaneLiveTurn(pane);
   assert.ok(r.status && !("agents" in r.status), "no expanded list -> no agents key");
-  assert.deepEqual(r.agents, [], "and nothing on the frame either");
 });
 
-// XERK-245. A real capture of the state the whole change is about: the main
-// turn has ENDED (no interrupt hint, and "Waiting for 1 background agent to
-// finish" has no ellipsis, so the spinner rule can't match it either) while a
-// background agent keeps working. The list must survive that, because it is
-// exactly when the operator can no longer tell the session apart from an idle
-// one — the chat's agent list used to blink out the instant the turn ended.
-const PANE_BG_AGENT = [
-  "● Launched.",
-  "",
-  "✻ Waiting for 1 background agent to finish",
-  "",
-  RULE,
-  "❯ ",
-  RULE,
-  "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents · ↓ to manage",
-  "",
-  "  ● main",
-  "  ◯ Explore  Map and summarize all JS files            41s · ↓ 93.9k tokens",
-].join("\n");
+// ---- XERK-245: live background agents, off the transcript -------------------
+// The TUI's footer list is NOT the source. It failed twice as one: its rows are
+// pane CONTENT (a quoted footer plus a composer-less full-screen view forged
+// them), and on a live TUI they LINGER ~24s after an agent finishes, so no
+// single capture can tell a running agent from a just-finished one. The
+// transcript records both edges exactly. Mirrors TestLiveAgentsScan in
+// test_hub_agent.py — keep the two in step (parity contract).
 
-test("parsePaneLiveTurn: an idle pane still reports its live background agents", () => {
-  const { parsePaneLiveTurn, paneShowsBusy } = require("../tunnel-agent.js");
-  const r = parsePaneLiveTurn(PANE_BG_AGENT);
-  assert.equal(r.generating, false, "the turn really has ended");
-  assert.equal(r.status, null, "so nothing may fake a running turn (Stop stays hidden)");
-  assert.deepEqual(r.agents, [
-    { sel: true, type: "main", label: "" },
-    { sel: false, type: "Explore",
-      label: "Map and summarize all JS files 41s · ↓ 93.9k tokens" },
+const LAUNCH_ENTRIES = [
+  { type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_1", name: "Task",
+      input: { subagent_type: "qa", description: "QA the parity change" } }] } },
+  { type: "user", message: { content: [
+    { type: "tool_result", tool_use_id: "toolu_1",
+      content: "Async agent launched successfully. agentId: agent-1 (internal ID)" }] } },
+];
+const notif = (taskId, status, carrier) => {
+  const text = `<task-notification>\n<task-id>${taskId}</task-id>\n` +
+    `<status>${status}</status>\n<summary>Agent finished</summary>\n</task-notification>`;
+  return carrier === "user"
+    ? { type: "user", message: { content: text } }
+    : { type: "queue-operation", operation: "enqueue", content: text };
+};
+function scanAll(entries, state) {
+  const { scanAgentEntry } = require("../tunnel-agent.js");
+  const st = state || {};
+  for (const e of entries) scanAgentEntry(e, st);
+  return st;
+}
+
+test("scanAgentEntry: a launch makes an agent live, named by its Task call", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  assert.deepEqual(liveAgentsReport(scanAll(LAUNCH_ENTRIES)),
+    [{ type: "qa", label: "QA the parity change" }]);
+});
+
+test("scanAgentEntry: the notification is what ends it, on either carrier", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  for (const carrier of ["queue-operation", "user"]) {
+    for (const status of ["completed", "failed", "killed", "stopped"]) {
+      const st = scanAll(LAUNCH_ENTRIES);
+      scanAll([notif("agent-1", status, carrier)], st);
+      assert.deepEqual(liveAgentsReport(st), [], `${status} via ${carrier}`);
+    }
+  }
+});
+
+test("scanAgentEntry: another agent's notification leaves this one running", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll(LAUNCH_ENTRIES);
+  scanAll([notif("someone-else", "completed")], st);
+  assert.equal(liveAgentsReport(st).length, 1);
+});
+
+test("scanAgentEntry: ordinary traffic moves nothing", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const st = scanAll([
+    { type: "assistant", message: { content: [
+      { type: "text", text: "talking about agentId: not-a-launch" }] } },
+    { type: "user", message: { content: "just a prompt" } },
+    { type: "assistant", message: { content: [
+      { type: "tool_use", id: "t9", name: "Bash", input: { command: "echo hi" } }] } },
   ]);
+  assert.deepEqual(liveAgentsReport(st), []);
 });
 
-test("parsePaneLiveTurn: mirrors hub-agent.py's parse_pane_agents on that pane", () => {
-  // Parity contract (CLAUDE.md): the same capture must yield the same rows in
-  // both implementations. The Python side asserts this fixture's result in
-  // TestParsePaneAgents (test_hub_agent.py); keep the two in step.
-  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
-  const subagents = parsePaneLiveTurn(PANE_BG_AGENT).agents
-    .filter((a) => a.type !== "main")
-    .map((a) => ({ type: a.type, label: a.label }));
-  assert.deepEqual(subagents, [
-    { type: "Explore", label: "Map and summarize all JS files 41s · ↓ 93.9k tokens" },
-  ]);
+test("scanAgentEntry: a launch whose Task call was missed still counts", () => {
+  // An agent restart primes past the call; the agent must be reported unnamed
+  // rather than invisible.
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  assert.deepEqual(liveAgentsReport(scanAll(LAUNCH_ENTRIES.slice(1))),
+    [{ type: "agent", label: "" }]);
 });
 
-// The anchor is the composer's mode footer, NEVER "the last ─ rule". A rule is
-// not a landmark: any output line of 20+ dashes was one, so a full-screen view
-// with no composer (/status, /model, /help, ctrl+o) left a stray conversation
-// rule as the last on screen and parsed the assistant prose below it as agent
-// rows. That reads as "working" forever AND suppresses ready-for-review — the
-// bug this feature exists to fix, inverted. Real tool output on the dev host
-// already contained such lines, so this was reachable, not theoretical.
-// Trimmed from a REAL capture (Claude Code 2.1.226) that reproduced the defect:
-// a tool result whose continuation lines are bare rules, then the assistant's
-// reply, then `/status` — a full-screen view that removes the composer. Under
-// the old "last ─ rule" anchor the reply's own `●` bullet parsed as a focused
-// agent named after the sentence.
-const PANE_STRAY_RULE_THEN_FULLSCREEN = [
-  "❯ print six 30-char rules",
-  "● I'll print them.",
-  "  ⎿  " + "─".repeat(30),
-  "     " + "─".repeat(30),
-  "     " + "─".repeat(30),   // <- the stray rule that used to become the anchor
-  "     … +3 lines",
-  "",
-  "● Six 30-char rules, as expected. Still nothing for me to act on.",
-  "",
-  "✻ Sautéed for 1s",
-  "",
-  "❯ /status",
-  "",
-  "   Settings  Status   Config   Usage   Stats",
-  "   Version:          2.1.226",
-  "",
-  "   Esc to cancel",
-].join("\n");
-
-test("paneAgents: a composer-less full-screen view yields nothing", () => {
-  const { paneAgents } = require("../tunnel-agent.js");
-  assert.deepEqual(paneAgents(PANE_STRAY_RULE_THEN_FULLSCREEN), [],
-    "no mode footer -> no agent rows, ever");
+test("scanAgentEntry: the live set is bounded", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const entries = [];
+  for (let i = 0; i < 200; i++) {
+    entries.push({ type: "user", message: { content: [
+      { type: "tool_result", tool_use_id: `t${i}`,
+        content: `Async agent launched successfully. agentId: a${i}` }] } });
+  }
+  assert.equal(liveAgentsReport(scanAll(entries)).length, 32);
 });
 
-test("paneAgents: a dialog's own bullets below a stray rule are not agent rows", () => {
-  const { paneAgents } = require("../tunnel-agent.js");
-  const pane = [
-    "● Here is the plan.",
-    "  ⎿  " + "─".repeat(40),
-    "     " + "─".repeat(40),   // bare rule -> the old anchor
-    "",
-    "  Select effort",
-    "  ● High effort (default) ←/→ to adjust",
-    "  ○ Low effort",
-  ].join("\n");
-  assert.deepEqual(paneAgents(pane), []);
-});
-
-test("paneAgents: BOM in the rows keeps py/js parity", () => {
-  // Python's \s does not match U+FEFF and JS's does; tmux passes the bytes
-  // through, so both sides strip it before matching or the two disagree.
-  const { paneAgents } = require("../tunnel-agent.js");
-  const pane = [
-    "─".repeat(60), "❯ ", "─".repeat(60),
-    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
-    "",
-    "  ﻿◯ qa﻿  QA the change",
-  ].join("\n");
-  assert.deepEqual(paneAgents(pane), [{ sel: false, type: "qa", label: "QA the change" }]);
-});
-
-test("paneAgents: the row list is bounded", () => {
-  const { paneAgents } = require("../tunnel-agent.js");
-  const rows = Array.from({ length: 500 }, (_, i) => `  ◯ a${i}  label ${i}`);
-  const pane = ["  ⏵⏵ auto mode on (shift+tab to cycle)", "", ...rows].join("\n");
-  assert.equal(paneAgents(pane).length, 32);
-});
-
-test("parsePaneLiveTurn: the list clears once the last agent finishes", () => {
-  // The TUI collapses it back to the "← for agents" hint, which is what makes
-  // presence an exact "an agent is running right now".
+test("parsePaneLiveTurn: no longer sources agents from the pane at all", () => {
+  // The footer rows still ride `status.agents` for their live counters while a
+  // turn runs, but the frame's own `agents` is the transcript's answer.
   const { parsePaneLiveTurn } = require("../tunnel-agent.js");
   const pane = [
-    "✻ Brewed for 9s",
-    RULE,
-    "❯ ",
-    RULE,
-    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    "● Launched.",
+    "✻ Waiting for 1 background agent to finish",
+    RULE, "❯ ", RULE,
+    "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+    "",
+    "  ● main",
+    "  ◯ Explore  Map and summarize all JS files            41s",
   ].join("\n");
-  assert.deepEqual(parsePaneLiveTurn(pane).agents, []);
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, false);
+  assert.deepEqual(r.agents, [], "an idle pane's rows are not liveness");
 });
 
 // ---- control-channel liveness ----------------------------------------------

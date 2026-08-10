@@ -2497,6 +2497,10 @@ def _parse_task_notification(text):
         "summary": _tn_tag("summary", body),
         "status": _tn_tag("status", body),
         "result": _tn_tag("result", body),
+        # Which background agent this is about — the same id its launch reported
+        # as `agentId:`. It is what makes the notification a usable STOPPED edge
+        # for the live-agent scan (XERK-245), not just display text.
+        "taskId": _tn_tag("task-id", body),
     }
 
 
@@ -3103,6 +3107,102 @@ def _scan_entry_line(raw, state, report):
         return
     _scan_pr_entry(entry, state, report)
     _scan_model_entry(entry, report)
+    _scan_agent_entry(entry, state)
+
+
+# ---- live background agents, off the transcript (XERK-245) -------------------
+#
+# WHICH background agents this session has in flight. The transcript records
+# BOTH edges exactly, so this is derived from data rather than inferred from the
+# screen:
+#
+#   started  a Task tool_use ({subagent_type, description}) whose paired
+#            tool_result says "Async agent launched successfully … agentId: X"
+#   stopped  a <task-notification> carrying <task-id>X</task-id> and a terminal
+#            <status> (completed / failed / killed / stopped)
+#
+# **The TUI's footer list is NOT the source and must not become one again.** It
+# was, and it failed twice: its rows are pane CONTENT, so a quoted footer plus a
+# composer-less full-screen view forged them (a session named after a sentence,
+# reading "working" forever and held out of Ready for review) — and, measured on
+# a live TUI, the rows LINGER ~24s after an agent finishes, so a single capture
+# cannot tell a running agent from a just-finished one at all. Same reason
+# pending questions come from the ask.py bridge and never from scraping.
+#
+# Failure direction is EMPTY: a launch this scan never saw (an agent restart
+# primes the byte offsets to EOF) reports no agents, which is the behaviour that
+# predates the feature. A phantom would instead strand work silently.
+AGENT_LAUNCH_RE = re.compile(r"agentId:\s*([A-Za-z0-9_-]+)")
+# Every status Claude Code writes is terminal — "the agent stopped" — so the set
+# is a guard against a future non-terminal one, not a filter of today's.
+AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "error"})
+# One session's fan-out is a handful; this bounds a pathological transcript.
+LIVE_AGENTS_MAX = 32
+
+
+def _scan_agent_entry(entry, state):
+    """Fold one transcript entry into `state["liveAgents"]` ({id: {type,label}}).
+
+    Task tool_use blocks are remembered by tool_use id (`state["agentTasks"]`)
+    because the launch RESULT — the block naming the agentId — is a separate
+    block, and often a separate entry, from the call that describes the work."""
+    live = state.setdefault("liveAgents", {})
+    tasks = state.setdefault("agentTasks", {})
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "Task":
+                inp = block.get("input") or {}
+                if block.get("id"):
+                    tasks[block["id"]] = {
+                        "type": str(inp.get("subagent_type") or "agent").strip() or "agent",
+                        "label": str(inp.get("description") or "").strip(),
+                    }
+                    # Bounded: a long conversation would otherwise accumulate one
+                    # entry per Task call for the life of the session.
+                    while len(tasks) > LIVE_AGENTS_MAX * 4:
+                        tasks.pop(next(iter(tasks)))
+            elif block.get("type") == "tool_result":
+                m = AGENT_LAUNCH_RE.search(_tool_result_text(block.get("content")))
+                if m and len(live) < LIVE_AGENTS_MAX:
+                    task = tasks.get(block.get("tool_use_id")) or {"type": "agent", "label": ""}
+                    live[m.group(1)] = dict(task)
+    # The notification can ride several entry shapes (a queued operation, the
+    # user turn it becomes once dequeued, an attachment), so the text is taken
+    # from wherever this entry carries it rather than from one field.
+    for text in _entry_texts_for_scan(entry):
+        tn = _parse_task_notification(text)
+        if not tn or not tn.get("taskId"):
+            continue
+        if not tn.get("status") or tn["status"] in AGENT_DONE_STATUSES:
+            live.pop(tn["taskId"], None)
+
+
+def _entry_texts_for_scan(entry):
+    """The raw strings on one entry that could BE a `<task-notification>`: a
+    queue-operation's content, and any string/text-block message content."""
+    out = []
+    if isinstance(entry.get("content"), str):
+        out.append(entry["content"])
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        out.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                out.append(block["text"])
+    return out
+
+
+def live_agents_report(state):
+    """`state["liveAgents"]` as the heartbeat's [{type, label}] (no ids: they are
+    internal, and the chat resolves a row back to its transcript by type+label)."""
+    return [{"type": a["type"], "label": a["label"]}
+            for a in (state.get("liveAgents") or {}).values()]
 
 
 def _entry_blocks(entry, caps):
@@ -4204,123 +4304,18 @@ def parse_pane_prompt(cap):
     return None
 
 
-# The TUI's agent-manager rows, painted under the COMPOSER FOOTER for exactly as
-# long as agents are LIVE: a radio glyph (◉/● = the one in focus, ○/◯ = a
-# background agent), the agent type, then — for a subagent — its short
-# description, separated from the type by the TUI's 2+-space gutter. Mirrors
-# AGENT_ROW_RE / parseAgentList in tunnel-agent.js (parity contract).
-PANE_AGENT_ROW_RE = re.compile(r"^\s*([◉●◯○])\s+(\S.*?)\s*$")
-PANE_AGENT_GUTTER_RE = re.compile(r"\s{2,}")
-# A pane is 220x50 (_launch_tmux) and the TUI lists a handful of agents, so this
-# only ever bites a malformed capture; it bounds what reaches the heartbeat.
-PANE_AGENTS_MAX = 32
-
-
-def parse_pane_agents(cap):
-    """The live agent rows off a pane capture, as [{sel, type, label}].
-
-    Scanned ONLY below the **mode-marker footer line** (`PANE_MODE_RE`, the
-    `⏵⏵ auto mode on …` the composer rides), which is exactly where the TUI
-    paints them. Empty for a capture with no rows — the TUI collapses the list
-    to a "← for agents" hint the moment the last agent finishes, so presence is
-    an exact "an agent is running right now".
-
-    **The anchor must be the footer, never "the last ─ rule".** A rule is not a
-    reliable landmark: `PANE_RULE_RE` matched `line.strip()`, so ANY output line
-    that is 20+ box-drawing dashes became one — and a full-screen view with no
-    composer (`/status`, `/model`, `/help`, `/config`, ctrl+o) leaves that stray
-    rule as the last one on screen, so the assistant prose below it parsed as
-    agent rows. Real tool results on this host already contain such lines. The
-    mode marker exists ONLY while the composer does, so those screens now yield
-    nothing.
-
-    This parser must fail toward EMPTY, never toward a phantom row: a row here
-    means "working" on every status surface AND suppresses ready-for-review, so
-    a false positive strands work silently, while a false negative is only the
-    behaviour we had before the list existed."""
-    # BOM: Python's \s does not match U+FEFF but JavaScript's does, and
-    # `capture-pane` passes those bytes through — dropping it up front is what
-    # keeps this byte-identical to parseAgentList (parity contract).
-    lines = str(cap or "").replace("\r", "").replace("﻿", "").split("\n")
-    anchor = -1
-    for i in range(len(lines) - 1, -1, -1):
-        if PANE_MODE_RE.search(lines[i]):
-            anchor = i
-            break
-    if anchor < 0:
-        return []
-    agents = []
-    for raw in lines[anchor + 1:]:
-        m = PANE_AGENT_ROW_RE.match(raw)
-        if not m:
-            continue
-        parts = PANE_AGENT_GUTTER_RE.split(m.group(2))
-        atype = parts[0].strip()
-        if not atype:
-            continue
-        agents.append({
-            "sel": m.group(1) in "◉●",
-            "type": atype,
-            "label": " ".join(parts[1:]).strip(),
-        })
-        if len(agents) >= PANE_AGENTS_MAX:
-            break
-    return agents
-
-
-def live_subagents(cap):
-    """The BACKGROUND agents this session is running, as [{type, label}].
-
-    `main` is the session's own conversation — already every surface's subject —
-    so it is dropped here and this list is non-empty only when the session has
-    delegated work still in flight. That makes it the missing half of the
-    working/idle read (XERK-245): a session whose main turn has ended while a
-    background agent keeps going shows no interrupt hint, so `paneBusy` reads
-    False and every status surface called it idle while it was still working."""
-    return [{"type": a["type"], "label": a["label"]}
-            for a in parse_pane_agents(cap) if a["type"] != "main"]
-
-
-def _stable_pane_agents(cap, tmux_name, state):
-    """live_subagents with the had-agents->none edge confirmed once, using
-    per-session `state` the same way _stable_pane_busy does.
-
-    The reason is the same one PANE_IDLE_CONFIRM_SEC exists for, and it matters
-    MORE here: this list drives the working/idle read on every status surface,
-    heartbeats are 20s apart, and a single capture landing in a TUI repaint gap
-    would report "no agents" for a whole interval — re-firing exactly the
-    ready-for-review alert this feature exists to hold back. Asymmetric like the
-    busy read: rows appearing are trusted instantly (nothing paints a phantom
-    row), rows VANISHING are re-read once before we believe them.
-
-    A capture failure (None) leaves the remembered state untouched and reports
-    nothing, so it degrades to paneBusy rather than to a wrong answer."""
-    if cap is None:
-        return []
-    agents = live_subagents(cap)
-    if agents:
-        state["paneAgentsStable"] = True
-        return agents
-    if state.get("paneAgentsStable") and PANE_IDLE_CONFIRM_SEC > 0:
-        time.sleep(PANE_IDLE_CONFIRM_SEC)
-        again = live_subagents(_capture_pane(tmux_name))
-        if again:  # the rows were one frame away -> still delegating
-            state["paneAgentsStable"] = True
-            return again
-    state["paneAgentsStable"] = False
-    return []
-
-
 def _pane_status(tmux_name, state):
-    """(paneBusy, modeActual, panePrompt, agents) for one beat: the busy and
-    agent-list halves each go through their own flicker suppression (hence
-    `state`), the mode and blocking-dialog halves read one shared capture."""
+    """(paneBusy, modeActual, panePrompt) for one beat: the busy half goes
+    through _stable_pane_busy's busy->idle flicker suppression (hence `state`),
+    the mode and blocking-dialog halves read one shared capture.
+
+    Live background agents are deliberately NOT read here — see
+    _scan_agent_entry for why the pane cannot answer that question."""
     if not tmux_name:
-        return None, None, None, []
+        return None, None, None
     busy = _stable_pane_busy(tmux_name, state)
     cap = _capture_pane(tmux_name)
-    return (busy, parse_pane_mode(cap), parse_pane_prompt(cap),
-            _stable_pane_agents(cap, tmux_name, state))
+    return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
 
 
 def _capture_pane(tmux_name):
@@ -4527,7 +4522,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
-    pane_busy, mode_actual, pane_prompt, pane_agents = _pane_status(tmux_name, state)
+    pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
@@ -4547,12 +4542,14 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # while it waits on a human. See parse_pane_prompt.
         "panePrompt": pane_prompt,
         # The background agents this session has in flight, [{type, label}]
-        # (empty when none). The OTHER thing paneBusy cannot see: a session that
-        # delegated work and ended its own turn keeps no interrupt hint, so it
-        # read idle on every surface while an agent was still working. Every
+        # (empty when none), derived from the transcript's own launch/stop edges
+        # — see _scan_agent_entry. The OTHER thing paneBusy cannot see: a session
+        # that delegated work and ended its own turn keeps no interrupt hint, so
+        # it read idle on every surface while an agent was still working. Every
         # working/idle mirror ORs this with paneBusy; an agent predating the
         # field sends none, which reads as "can't tell", i.e. today's behaviour.
-        "agents": pane_agents,
+        # Filled by _finish() once the incremental scan has run this beat.
+        "agents": [],
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
@@ -4573,6 +4570,11 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     }
 
     def _finish():
+        # Live background agents, accumulated across beats by _scan_agent_entry
+        # into `state`. Reported on EVERY exit path (including the ones that
+        # never reach a transcript this beat), so a session with agents still in
+        # flight keeps reporting them on a beat that appended nothing.
+        report["agents"] = live_agents_report(state)
         # The ask.py PreToolUse bridge publishes a request file for exactly as
         # long as a question is actually blocking the tool call, so it's the
         # authoritative pending signal — prefer it over the transcript scan

@@ -146,28 +146,27 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     repaint's sub-frame gap reads idle mid-turn. Busy is trusted instantly; idle re-confirms once
     after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), **only on the busy→idle EDGE**. Tests:
     `TestStablePaneBusy`.
-- **`agents` is the other half of the activity read** (XERK-245): `live_subagents` off the same
-  capture — the TUI's own agent rows, which it paints for exactly as long as agents are LIVE and
-  collapses to a "← for agents" hint the moment the last one ends.
+- **`agents` is the other half of the activity read** (XERK-245): the background agents in flight,
+  folded by `_scan_agent_entry` into the per-session `state` from the transcript's own two edges —
+  a Task `tool_use` whose result says `agentId: X` (**started**), and a `<task-notification>`
+  carrying `<task-id>X</task-id>` with a terminal `<status>` (**stopped**).
   - It exists because **`paneBusy` cannot see delegated work**: launching a background agent ENDS
     the main turn, and the pane then says "Waiting for N background agent to finish" — no interrupt
     hint, and no ellipsis for `PANE_SPINNER_RE`. **Do not widen the busy read to cover it**;
     `paneBusy` means the session's OWN turn is running, which is what the chat's Stop button and
     `_poll_pending_inputs`' idle gate key on.
-  - **The scan is anchored on the mode-marker footer (`PANE_MODE_RE`), NEVER on "the last ─ rule".**
-    A rule is not a landmark — any tool-output line of 20+ dashes is one (real results on the dev
-    host have them), and a composer-less full-screen view (`/status`, `/model`, `/help`, `/config`,
-    ctrl+o) leaves that stray rule last, so the assistant prose under it parsed as agent rows. The
-    marker exists only while the composer does.
-  - **This parser must fail toward EMPTY.** A phantom row means "working" on every status surface
-    AND suppresses ready-for-review, stranding work silently; a missed row is only the behaviour
-    that predates the list. Bounded by `PANE_AGENTS_MAX`; U+FEFF is stripped for JS parity.
-  - `_stable_pane_agents` confirms the had-agents→**none** edge with one re-read, mirroring
-    `_stable_pane_busy`'s asymmetry — a repaint-gap capture would otherwise drop the list for a
-    whole 20s beat and re-fire the alert this holds back.
-  - `main` is dropped (every surface's subject already), so a non-empty list means delegated work is
-    in flight. Mirrors `parseAgentList`/`paneAgents` in `tunnel-agent.js`. Tests:
-    `TestParsePaneAgents`.
+  - **The TUI's footer list is NOT the source and must not become one again.** It was, twice, and
+    failed twice: those rows are pane CONTENT, so a quoted footer plus a composer-less full-screen
+    view (`/status`, `/model`, ctrl+o) forged them — a session named after a sentence, reading
+    "working" forever and held out of Ready for review; and, measured on a live TUI, **the rows
+    linger ~24s after an agent finishes**, so no single capture can tell running from just-finished.
+    Same reason pending questions come from the `ask.py` bridge and never from scraping.
+  - **Failure direction is EMPTY.** A launch this scan never saw — an agent restart primes the byte
+    offsets to EOF — reports no agents, i.e. the behaviour that predates the feature. A phantom
+    instead strands work silently. Bounded by `LIVE_AGENTS_MAX`.
+  - Reported on **every** `session_report` exit path (in `_finish`), so a beat that appended nothing
+    still reports agents still in flight. Mirrors `scanAgentEntry`/`liveAgentsReport` in
+    `tunnel-agent.js`. Tests: `TestLiveAgentsScan`.
 - `modeActual` — the mode the TUI is REALLY in, off the footer marker (glyph-anchored so quoted text
   can't match; read beside the stable busy in `_pane_status`). `_session_payload` **reconciles the
   stored `permissionMode` to it** each beat, since the operator can cycle by hand. Tests:

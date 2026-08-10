@@ -39,14 +39,17 @@ is in `CLAUDE.md`, and `.claude/rules/agent.md` carries the Python side.
 
 - `parsePaneLiveTurn` → `{generating,text,status,agents}`: the in-progress assistant text plus
   `status = {verb, token counters, elapsed, hint}` and the live agent rows (`parseAgentList`).
-- **`agents` is parsed before the busy check and rides the FRAME, not `status`** (XERK-245): the two
-  stop being true at different moments. `status` is "a turn is running" — it drives the chat's Stop
-  button, so it must clear the instant the turn ends — while a background agent keeps going past
-  that, which is exactly when the operator can no longer tell the session from an idle one. It stays
-  on `status` as well while generating, for an older hub that forwards only `status`.
-- `paneAgents` anchors the row scan on the **mode-marker footer**, never on the last `─` rule — see
-  `parse_pane_agents` in `.claude/rules/agent.md` for the composer-less-screen false positive that
-  rule caused, and for why this parser must fail toward empty.
+- **`agents` rides the FRAME, not `status`** (XERK-245): the two stop being true at different
+  moments. `status` is "a turn is running" — it drives the chat's Stop button, so it must clear the
+  instant the turn ends — while a background agent keeps going past that, which is exactly when the
+  operator can no longer tell the session from an idle one.
+- **The frame's `agents` come from the TRANSCRIPT** (`scanAgentEntry`, folded from the same tail
+  parse into per-watcher `agentState` that persists across polls), never from the pane — see
+  `.claude/rules/agent.md` for the forged rows and the ~24s linger that ruled the pane out. Because
+  a launch always precedes its own notification in the file, a tail window holding the launch holds
+  the stop too, so re-folding a window is safe.
+- The pane's footer rows still ride **`status.agents` while a turn runs**, for the live
+  elapsed/token counters the transcript cannot know. **Display only** — never liveness.
 - **`turn` text only ever moves forward** (`resolveLiveText`): activity summaries strip off the
   REFLOWED tail (`stripActivityTail`); already-committed text is suppressed (`committedDupe`,
   skeleton compare — the pane renders markdown away); and UNCOMMITTED prose HOLDS through
