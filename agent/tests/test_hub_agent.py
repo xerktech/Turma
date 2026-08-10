@@ -2738,6 +2738,11 @@ class ManagerMixin:
             # Derived from REGISTRY_DIR at import, so it needs redirecting too —
             # delete() rmtree's a session's attachment dir (XERK-234).
             ("UPLOADS_DIR", os.path.join(self.tmp, "uploads")),
+            # Also derived at import. Redirected so a dev box that has a REAL
+            # limits snapshot in ~/.turma can't make the heartbeat tests depend
+            # on its subscription (XERK-247).
+            ("LIMITS_PATH", os.path.join(self.tmp, "limits.json")),
+            ("LIMITS_SETTINGS_PATH", os.path.join(self.tmp, "limits-settings.json")),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
@@ -2923,6 +2928,122 @@ class TestUsageLedger(ManagerMixin, unittest.TestCase):
         sm._refresh_repo_usage()
         self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
         self.assertIsNotNone(sm.host_usage)
+
+
+class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
+    """The subscription-limits snapshot (XERK-247): hooks/statusline.py writes
+    ~/.turma/limits.json out of band, the beat re-validates it and puts it on the
+    heartbeat, and the probe that refreshes it is spent sparingly because it is
+    billed against the very windows it measures."""
+
+    def _write(self, data):
+        with open(ha.LIMITS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def _snapshot(self, captured=None, **windows):
+        return {"capturedAt": int(captured if captured is not None else time.time()),
+                "source": "statusline", **windows}
+
+    def test_reports_both_windows(self):
+        self._write(self._snapshot(fiveHour={"usedPct": 23.5, "resetsAt": 111},
+                                   sevenDay={"usedPct": 41.2, "resetsAt": 222}))
+        snap = ha.read_limits_snapshot()
+        self.assertEqual(snap["fiveHour"], {"usedPct": 23.5, "resetsAt": 111})
+        self.assertEqual(snap["sevenDay"], {"usedPct": 41.2, "resetsAt": 222})
+        self.assertEqual(snap["source"], "statusline")
+
+    def test_missing_or_unreadable_file_reports_nothing(self):
+        self.assertIsNone(ha.read_limits_snapshot())
+        with open(ha.LIMITS_PATH, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        self.assertIsNone(ha.read_limits_snapshot())
+        self._write(["not", "a", "dict"])
+        self.assertIsNone(ha.read_limits_snapshot())
+
+    def test_a_snapshot_with_no_timestamp_is_refused(self):
+        # Every surface ages this against its own clock; an undated snapshot
+        # would render as freshly captured forever.
+        self._write({"fiveHour": {"usedPct": 20}})
+        self.assertIsNone(ha.read_limits_snapshot())
+
+    def test_a_snapshot_older_than_the_max_age_is_refused_outright(self):
+        # Not stale data — WRONG data: a day-old 5-hour window has reset several
+        # times since, so there is nothing left to be stale about.
+        self._write(self._snapshot(captured=time.time() - ha.LIMITS_MAX_AGE_SEC - 60,
+                                   fiveHour={"usedPct": 90, "resetsAt": 1}))
+        self.assertIsNone(ha.read_limits_snapshot())
+
+    def test_junk_windows_are_dropped_field_by_field(self):
+        self._write(self._snapshot(fiveHour={"usedPct": "lots"},
+                                   sevenDay={"usedPct": 140, "resetsAt": "soon"}))
+        snap = ha.read_limits_snapshot()
+        self.assertNotIn("fiveHour", snap)
+        self.assertEqual(snap["sevenDay"], {"usedPct": 100.0})
+
+    def test_heartbeat_carries_the_snapshot_and_none_without_one(self):
+        sm = self.make_manager()
+        self.assertIsNone(sm.build_payload(0)["limits"])
+        self._write(self._snapshot(fiveHour={"usedPct": 12, "resetsAt": 999}))
+        self.assertEqual(sm.build_payload(1)["limits"]["fiveHour"],
+                         {"usedPct": 12.0, "resetsAt": 999})
+
+    def test_probe_is_due_when_there_is_no_snapshot_at_all(self):
+        sm = self.make_manager()
+        self.assertTrue(sm._limits_probe_due())
+
+    def test_a_fresh_snapshot_is_not_reprobed(self):
+        self._write(self._snapshot(fiveHour={"usedPct": 12}))
+        sm = self.make_manager()
+        self.assertFalse(sm._limits_probe_due())
+
+    def test_an_aged_snapshot_is_reprobed_only_while_a_session_runs(self):
+        # A settled host re-probing all night would burn the very quota it
+        # reports, and the number cannot have moved for anything it did.
+        self._write(self._snapshot(captured=time.time() - ha.LIMITS_PROBE_SEC - 60,
+                                   fiveHour={"usedPct": 12}))
+        sm = self.make_manager()
+        sm.registry = [{"id": "a", "status": "stopped"}]
+        self.assertFalse(sm._limits_probe_due())
+        sm.registry = [{"id": "a", "status": "running"}]
+        self.assertTrue(sm._limits_probe_due())
+
+    def test_the_probe_is_disabled_by_a_zero_interval(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "LIMITS_PROBE_SEC", 0):
+            self.assertFalse(sm._limits_probe_due())
+
+    def test_the_probe_runs_a_throwaway_claude_in_its_own_tmux(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
+             mock.patch.object(ha, "LIMITS_PROBE_TRUST_SEC", 0):
+            sm._run_limits_probe(os.path.join(self.tmp, "limits-settings.json"))
+        launch = [c for c in self.run_ok_calls if c[:2] == ["tmux", "new-session"]]
+        self.assertEqual(len(launch), 1)
+        cmd = launch[0][-1]
+        # Not a registered session: its own tmux name, so no pane parser, no
+        # worktree, and nothing the session ceiling has to account for.
+        self.assertIn(ha.LIMITS_TMUX, launch[0])
+        self.assertNotIn("--remote-control", cmd)
+        # As small as a turn can be: cheapest model, no default system prompt,
+        # none of the operator's MCP servers.
+        self.assertIn("--model haiku", cmd)
+        # The hook's snapshot path is pinned on the command line, not left to
+        # whatever environment survives tmux and claude.
+        self.assertIn(f"TURMA_LIMITS_PATH={shlex.quote(ha.LIMITS_PATH)}", cmd)
+        self.assertIn("--system-prompt", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertIn("--permission-mode plan", cmd)
+        # It runs in the registry dir, which is what keeps its transcript off the
+        # usage page (_is_internal_tool_slug tombstones that slug).
+        self.assertIn(ha.REGISTRY_DIR, launch[0])
+        # And it always tears its tmux down, even when nothing was captured.
+        self.assertIn(["tmux", "kill-session", "-t", ha.LIMITS_TMUX], self.run_calls)
+
+    def test_the_probes_transcript_is_internal_overhead_not_a_repo(self):
+        # It runs where the summary/models helpers run, so the same tombstone
+        # keeps its tokens off the usage page's per-repo breakdown (XERK-27).
+        sm = self.make_manager()
+        self.assertTrue(sm._is_internal_tool_slug(ha._project_slug(ha.REGISTRY_DIR)))
 
 
 class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):

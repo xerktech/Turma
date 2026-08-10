@@ -13,6 +13,7 @@ that component's files.
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
 | `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, PR status, usage ledger, transcript blocks, archive, image |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
+| `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**` | guard hook, AskUserQuestion bridge |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |

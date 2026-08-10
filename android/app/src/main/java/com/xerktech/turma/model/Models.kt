@@ -103,6 +103,14 @@ data class AgentInfo(
     val models: ModelsInfo? = null,
     val usage: UsageInfo? = null,
     val repoUsage: List<RepoUsage> = emptyList(),
+    /**
+     * The Claude subscription's 5-hour and 7-day windows as this host last read
+     * them out of its own Claude Code (XERK-247). Null on an agent predating the
+     * field, on a login with no such windows (an API key, Bedrock, Vertex), and
+     * on one whose snapshot has aged out — all of which mean "this host can't
+     * tell you", never "0% used".
+     */
+    val limits: LimitsInfo? = null,
     val github: GithubInfo? = null,
     // Extra clone sources beside GitHub (XERK-155): the agent's Azure DevOps /
     // GitLab listings. Empty on an agent predating the block.
@@ -642,6 +650,31 @@ data class ModelUsage(
     val today: UsageBucket = UsageBucket(),
     val week: UsageBucket = UsageBucket(),
     val totals: UsageBucket = UsageBucket(),
+)
+
+/**
+ * A host's subscription-limit snapshot (XERK-247). Not live numbers: [capturedAt]
+ * is the epoch second the host last read them, and every reader ages the
+ * snapshot against its own clock rather than trusting it as current. Each window
+ * may be independently absent.
+ */
+@Serializable
+data class LimitsInfo(
+    /** The 5-hour session window. */
+    val fiveHour: LimitWindow? = null,
+    /** The 7-day weekly window. */
+    val sevenDay: LimitWindow? = null,
+    /** Epoch seconds the snapshot was taken. 0 from a malformed block. */
+    val capturedAt: Long = 0,
+    val source: String = "",
+)
+
+@Serializable
+data class LimitWindow(
+    /** Percentage of the window consumed, 0..100. Null when unreported. */
+    val usedPct: Double? = null,
+    /** Epoch seconds the window resets. Null when unreported. */
+    val resetsAt: Long? = null,
 )
 
 @Serializable

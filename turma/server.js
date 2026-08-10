@@ -1584,7 +1584,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "gitSources", "github", "inputMaxChars", "jira", "logTail", "memory",
+  "gitSources", "github", "inputMaxChars", "jira", "limits", "logTail", "memory",
   "models", "prunes", "repoUsage", "repos", "reposRoot", "sessions",
   "startedAt", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",

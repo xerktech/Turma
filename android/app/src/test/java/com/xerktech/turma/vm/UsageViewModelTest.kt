@@ -1,6 +1,8 @@
 package com.xerktech.turma.vm
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.LimitWindow
+import com.xerktech.turma.model.LimitsInfo
 import com.xerktech.turma.model.ModelUsage
 import com.xerktech.turma.model.RepoUsage
 import com.xerktech.turma.model.UsageBucket
@@ -238,5 +240,82 @@ class UsageViewModelTest {
         assertEquals(60L, host.cache.read)
         assertEquals(100L, host.cache.prompt)
         assertEquals(60, host.cache.hitPct)
+    }
+
+    // --- subscription limits (XERK-247) -------------------------------------
+    // Ports of usage.html's limitEntries / limitWindowView / fmtDuration; these
+    // mirror turma/tests/usage.test.js case for case.
+
+    private val now = 1_786_400_000L // epoch seconds, so countdowns are assertable
+
+    private fun limits(captured: Long = now, five: LimitWindow? = null, seven: LimitWindow? = null) =
+        LimitsInfo(fiveHour = five, sevenDay = seven, capturedAt = captured)
+
+    @Test fun `a host reporting no limits gets no card`() {
+        // An agent too old to send the field, a login with no subscription
+        // windows, and a block carrying neither window all mean the same thing:
+        // this host can't tell you. None of them is a card full of zeroes.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", device = "old"),
+            AgentInfo(key = "api", device = "api", limits = null),
+            AgentInfo(key = "empty", device = "empty", limits = limits()),
+            AgentInfo(key = "real", device = "real", limits = limits(five = LimitWindow(usedPct = 5.0))),
+        ))
+        val cards = UsageViewModel.compute(fleet, now).limits
+        assertEquals(listOf("real"), cards.map { it.host })
+    }
+
+    @Test fun `limit cards lead with the freshest snapshot`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "stale", device = "stale",
+                limits = limits(now - 9000, seven = LimitWindow(usedPct = 1.0))),
+            AgentInfo(key = "fresh", device = "fresh",
+                limits = limits(now - 60, seven = LimitWindow(usedPct = 2.0))),
+        ))
+        assertEquals(listOf("fresh", "stale"), UsageViewModel.compute(fleet, now).limits.map { it.host })
+    }
+
+    @Test fun `a window reports its percentage and the countdown to reset`() {
+        val v = UsageViewModel.limitView(
+            LimitWindow(usedPct = 23.5, resetsAt = now + 2 * 3600 + 14 * 60), now)!!
+        assertEquals("23.5%", v.pctLabel)
+        assertEquals("resets in 2h 14m", v.reset)
+        assertEquals(false, v.expired)
+        assertEquals(UsageViewModel.LimitView.Level.NORMAL, v.level)
+    }
+
+    @Test fun `a whole percentage drops its trailing zero`() {
+        assertEquals("41%", UsageViewModel.limitView(LimitWindow(usedPct = 41.0), now)!!.pctLabel)
+    }
+
+    @Test fun `the bar is coloured by headroom, not by branding`() {
+        fun level(pct: Double) = UsageViewModel.limitView(LimitWindow(usedPct = pct), now)!!.level
+        assertEquals(UsageViewModel.LimitView.Level.NORMAL, level(74.0))
+        assertEquals(UsageViewModel.LimitView.Level.WARN, level(75.0))
+        assertEquals(UsageViewModel.LimitView.Level.CRIT, level(90.0))
+    }
+
+    @Test fun `a window whose reset has already passed is no longer believed`() {
+        // The snapshot describes a window that has since rolled over; showing
+        // its last percentage would present a stale number as the balance.
+        val v = UsageViewModel.limitView(LimitWindow(usedPct = 88.0, resetsAt = now - 60), now)!!
+        assertEquals(true, v.expired)
+        assertEquals("—", v.pctLabel)
+        assertEquals("window has since reset", v.reset)
+    }
+
+    @Test fun `a window with no percentage has nothing to draw`() {
+        assertEquals(null, UsageViewModel.limitView(LimitWindow(resetsAt = now + 60), now))
+        assertEquals(null, UsageViewModel.limitView(null, now))
+    }
+
+    @Test fun `fmtDuration reads as an age or a countdown at every scale`() {
+        assertEquals("0s", UsageViewModel.fmtDuration(0))
+        assertEquals("45s", UsageViewModel.fmtDuration(45))
+        assertEquals("6m", UsageViewModel.fmtDuration(6 * 60))
+        assertEquals("2h 14m", UsageViewModel.fmtDuration(2 * 3600 + 14 * 60))
+        assertEquals("2d 2h", UsageViewModel.fmtDuration(50 * 3600))
+        // A clock skew that puts the snapshot in the future must not read "-3m".
+        assertEquals("0s", UsageViewModel.fmtDuration(-90))
     }
 }

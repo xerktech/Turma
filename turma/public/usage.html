@@ -19,6 +19,53 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 14px 16px 10px; position: relative;
   }
+  /* Claude subscription limits (XERK-247): the 5h/7d windows, one card per host
+     that reports them. Sits above the token chart because it answers a
+     different question — how much headroom is left, not what was spent. */
+  .limits { margin: 2px 0 16px; }
+  .limits h2 {
+    font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 8px;
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  }
+  .limits h2 .note { font-weight: 400; font-size: 11.5px; color: var(--muted); }
+  .lim-cards { display: flex; flex-wrap: wrap; gap: 10px; }
+  .lim-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 12px 14px;
+    flex: 1 1 320px; min-width: 0;
+  }
+  .lim-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 10px; margin-bottom: 10px;
+  }
+  .lim-host { font-weight: 600; font-size: 13px; color: var(--ink); }
+  .lim-age { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .lim-age.stale { color: var(--warning); }
+  .lim-row + .lim-row { margin-top: 10px; }
+  .lim-label {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px; font-size: 12px; color: var(--ink-2); margin-bottom: 4px;
+  }
+  .lim-pct { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink); }
+  .lim-reset { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+  .lim-track {
+    height: 7px; border-radius: 4px; background: var(--hairline); overflow: hidden;
+  }
+  .lim-fill { height: 100%; border-radius: 4px; background: var(--accent); min-width: 2px; }
+  /* The bar earns its colour from headroom, not from branding: amber past
+     three-quarters, red once the window is nearly gone. */
+  .lim-fill.warn { background: var(--warning); }
+  .lim-fill.crit { background: var(--critical); }
+  /* A window whose reset time has already passed: the snapshot describes a
+     window that no longer exists, so the bar is greyed rather than believed. */
+  .lim-row.expired .lim-fill { background: var(--muted); }
+  .lim-row.expired .lim-pct { color: var(--muted); }
+  .lim-empty {
+    color: var(--muted); font-size: 12.5px; background: var(--surface);
+    border: 1px dashed var(--hairline); border-radius: var(--radius-md);
+    padding: 12px 14px;
+  }
+
   /* View switch: By repo (fleet-wide, unified across hosts) vs By host. */
   .viewbar { display: flex; gap: 6px; margin: 2px 0 12px; }
   .viewbar button {
@@ -125,12 +172,13 @@
 </style>
 </head>
 <body>
-<header class="site-header" id="siteHeader" data-page="usage" data-sub="Token usage · daily"></header>
+<header class="site-header" id="siteHeader" data-page="usage" data-sub="Subscription limits · token usage"></header>
 <div class="wrap">
+  <div class="limits" id="limits"></div>
   <div class="viewbar" id="viewbar"></div>
   <div id="chart"></div>
   <div id="models"></div>
-  <div class="footer">Token figures are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
+  <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. Token figures below are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
@@ -203,6 +251,59 @@ function esc(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[c]);
 }
+// --- Claude subscription limits (XERK-247) ----------------------------------
+// A host's `limits` block is a SNAPSHOT of the subscription's 5-hour and 7-day
+// windows, taken the last time an agent's limits probe ran — the numbers only
+// exist inside Claude Code, so there is nothing here to poll live. Everything
+// below is written around that: the age is shown always, the countdown is
+// derived from the snapshot's own reset stamp, and a window whose reset has
+// already passed is drawn as unknown rather than as its last-known percentage.
+const LIMIT_WINDOWS = [["fiveHour", "Session (5h)"], ["sevenDay", "Weekly (7d)"]];
+// Agents refresh on a ~30 min cadence while a session runs, so an hour without
+// a refresh is the first point at which the numbers deserve a warning colour.
+const LIMIT_STALE_SEC = 60 * 60;
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + "s";
+  const mins = Math.round(sec / 60);
+  if (mins < 60) return mins + "m";
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + "h " + String(mins % 60).padStart(2, "0") + "m";
+  const days = Math.floor(hours / 24);
+  return days + "d " + (hours % 24) + "h";
+}
+
+// One entry per host that reports limits, newest snapshot first — a host is
+// skipped entirely when it reports none (an agent too old to send the field, a
+// login with no subscription windows, or one that hasn't probed yet), which is
+// the "absent flag means it can't tell you" heartbeat rule.
+function limitEntries(agents) {
+  return (agents || [])
+    .filter(a => a && a.limits && LIMIT_WINDOWS.some(([k]) => a.limits[k]))
+    .map(a => ({ host: a.device || a.key, limits: a.limits }))
+    .sort((x, y) => (y.limits.capturedAt || 0) - (x.limits.capturedAt || 0));
+}
+
+// The state one window renders in. `expired` (the reset stamp has passed) beats
+// the percentage: the window it measured has rolled over since, so the old
+// figure describes a window that no longer exists.
+function limitWindowView(win, nowSec) {
+  if (!win || typeof win.usedPct !== "number") return null;
+  const pct = Math.min(100, Math.max(0, win.usedPct));
+  const resetsIn = typeof win.resetsAt === "number" ? win.resetsAt - nowSec : null;
+  const expired = resetsIn !== null && resetsIn <= 0;
+  return {
+    pct,
+    expired,
+    // Rounded for display only — the bar keeps the unrounded width.
+    pctLabel: expired ? "—" : (Math.round(pct * 10) / 10) + "%",
+    reset: resetsIn === null ? ""
+      : expired ? "window has since reset" : "resets in " + fmtDuration(resetsIn),
+    level: pct >= 90 ? "crit" : pct >= 75 ? "warn" : "",
+  };
+}
+
 const TOKEN_KEYS = ["input", "output", "cacheWrite", "cacheRead"];
 function blankBucket() { return { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 }; }
 function dayTokens(d) { return d ? TOKEN_KEYS.reduce((n, k) => n + (d[k] || 0), 0) : 0; }
@@ -410,6 +511,102 @@ function paintSwatch(el, paint) {
   if (paint.texture !== "solid") el.classList.add("tx-" + paint.texture);
 }
 
+// The limits section: one card per reporting host, or a single line saying why
+// there's nothing to show. Rendered before the chart's own empty-state returns,
+// so a fleet that has spent no tokens yet still shows its headroom.
+function renderLimits(agents) {
+  const $limits = document.getElementById("limits");
+  $limits.replaceChildren();
+  const entries = limitEntries(agents);
+  const h2 = document.createElement("h2");
+  h2.textContent = "Claude subscription limits";
+  const note = document.createElement("span");
+  note.className = "note";
+  note.textContent = entries.length
+    ? "one shared pool across claude.ai and Claude Code · snapshot per host"
+    : "";
+  h2.append(note);
+  $limits.append(h2);
+
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "lim-empty";
+    empty.textContent = (agents || []).length
+      ? "No limit snapshot yet. Hosts capture the 5-hour and 7-day windows from "
+        + "Claude Code itself while a session is running, so one appears within "
+        + "a few minutes of the next session. A login without a Claude "
+        + "subscription (an API key, Bedrock or Vertex) has no such windows and "
+        + "never reports any."
+      : "No agents are reporting.";
+    $limits.append(empty);
+    return;
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const cards = document.createElement("div");
+  cards.className = "lim-cards";
+  for (const entry of entries) cards.append(limitCard(entry, nowSec));
+  $limits.append(cards);
+}
+
+function limitCard(entry, nowSec) {
+  const card = document.createElement("div");
+  card.className = "lim-card";
+
+  const head = document.createElement("div");
+  head.className = "lim-head";
+  const host = document.createElement("span");
+  host.className = "lim-host";
+  host.textContent = entry.host;
+  const age = document.createElement("span");
+  const ageSec = nowSec - (entry.limits.capturedAt || 0);
+  age.className = "lim-age" + (ageSec > LIMIT_STALE_SEC ? " stale" : "");
+  // "captured", not "updated": this is when the host last READ the windows out
+  // of Claude Code, not when the page last refreshed. (The header's own
+  // last-refreshed stamp was removed fleet-wide; nav.test.js guards it.)
+  age.textContent = "captured " + fmtDuration(ageSec) + " ago";
+  age.title = "Captured " + new Date((entry.limits.capturedAt || 0) * 1000).toLocaleString()
+    + ". These numbers come from the host's own Claude Code, so they can trail "
+    + "the real server-side counter.";
+  head.append(host, age);
+  card.append(head);
+
+  for (const [key, label] of LIMIT_WINDOWS) {
+    const view = limitWindowView(entry.limits[key], nowSec);
+    if (!view) continue;
+    const row = document.createElement("div");
+    row.className = "lim-row" + (view.expired ? " expired" : "");
+
+    const line = document.createElement("div");
+    line.className = "lim-label";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const right = document.createElement("span");
+    const pct = document.createElement("span");
+    pct.className = "lim-pct";
+    pct.textContent = view.pctLabel;
+    right.append(pct);
+    if (view.reset) {
+      const reset = document.createElement("span");
+      reset.className = "lim-reset";
+      reset.textContent = " · " + view.reset;
+      right.append(reset);
+    }
+    line.append(name, right);
+
+    const track = document.createElement("div");
+    track.className = "lim-track";
+    const fill = document.createElement("div");
+    fill.className = "lim-fill" + (view.level ? " " + view.level : "");
+    fill.style.width = (view.expired ? 0 : view.pct) + "%";
+    track.append(fill);
+
+    row.append(line, track);
+    card.append(row);
+  }
+  return card;
+}
+
 function render(data) {
   // The repaint replaces the #chart/#models subtrees wholesale every SSE beat,
   // which would drop the page scroll (the content it was anchored to is briefly
@@ -426,6 +623,9 @@ function renderInner(data) {
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
+  // Before the series work, and before its empty-state returns below: limit
+  // headroom is worth showing on a fleet that has charted nothing yet.
+  renderLimits(agents);
   const series = toSeries(agents);
   if (!series.length) {
     $chart.innerHTML = (data.agents || []).length

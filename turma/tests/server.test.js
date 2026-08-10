@@ -1938,6 +1938,36 @@ test("http: a current agent's per-model usage is left exactly as reported", asyn
   assert.deepEqual(rec.usage.models, models);
 });
 
+test("http: an agent's subscription limits reach the clients, and clear again", async () => {
+  // XERK-247: the 5h/7d windows are a snapshot the agent captures out of Claude
+  // Code itself, so the hub is pure carriage — but it has to be carriage that
+  // FORGETS. A host that stops reporting them (its snapshot aged out, or it was
+  // downgraded to an agent that can't) must not leave last week's percentages
+  // on the Usage page forever.
+  const limits = {
+    fiveHour: { usedPct: 23.5, resetsAt: 1_786_405_200 },
+    sevenDay: { usedPct: 41.2, resetsAt: 1_786_950_000 },
+    capturedAt: 1_786_400_000,
+    source: "statusline",
+  };
+  const beat = (body) =>
+    request("POST", "/api/heartbeat", { body, headers: agentHeaders });
+  const read = async () =>
+    (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === "limits-host");
+
+  assert.equal((await beat({ device: "limits-host", limits })).status, 200);
+  assert.deepEqual((await read()).limits, limits);
+
+  assert.equal((await beat({ device: "limits-host", limits: null })).status, 200);
+  assert.equal((await read()).limits, null);
+
+  // An agent too old to know the field reports nothing at all — which reads as
+  // "this host can't tell you", never as a stale number or as 0% used.
+  assert.equal((await beat({ device: "limits-host" })).status, 200);
+  assert.equal((await read()).limits, undefined);
+});
+
 test("http: command queue rides the reply until acked", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

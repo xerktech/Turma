@@ -120,6 +120,12 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
             Tab(selected = tab == 2, onClick = { setTab(2) }, text = { Text("By model") })
         }
         LazyColumn(Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // Subscription headroom (XERK-247) leads the list, above the token
+            // series, because it answers a different question: not what was
+            // spent, but how much of the plan's 5h/7d windows is left. It sits
+            // outside the grouping tabs — it is per host either way — and it is
+            // rendered whether or not any tokens have been charted.
+            item(key = "limits") { LimitsSection(ui.limits, fleet.agents.isNotEmpty()) }
             // Legend = filter: each item toggles its series; the group label
             // toggles them all (web legendEl). Persisted, and it rescopes the
             // chart AND the rows below.
@@ -170,6 +176,102 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The Claude subscription limits section (web usage.html `renderLimits`): one
+ * card per host reporting the 5-hour and 7-day windows, each with the percentage
+ * used, a bar coloured by headroom, the countdown to reset, and how long ago the
+ * snapshot was captured. These are snapshots, not live numbers, which is why the
+ * capture age is on every card rather than implied.
+ */
+@Composable
+private fun LimitsSection(cards: List<UsageViewModel.LimitCard>, anyAgents: Boolean) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Text(
+            "Claude subscription limits",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        if (cards.isEmpty()) {
+            Text(
+                if (anyAgents)
+                    "No limit snapshot yet. Hosts capture the 5-hour and 7-day windows from " +
+                        "Claude Code itself while a session is running, so one appears within a " +
+                        "few minutes of the next session. A login without a Claude subscription " +
+                        "(an API key, Bedrock or Vertex) has no such windows and never reports any."
+                else "No agents are reporting.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            return
+        }
+        Text(
+            "one shared pool across claude.ai and Claude Code · snapshot per host",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        val nowSec = System.currentTimeMillis() / 1000
+        for (card in cards) LimitCardView(card, nowSec)
+    }
+}
+
+@Composable
+private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(card.host, style = MaterialTheme.typography.bodyMedium)
+            val ageSec = nowSec - card.capturedAt
+            Text(
+                // "captured", not "updated": this is when the host last read the
+                // windows out of Claude Code, not when the screen refreshed.
+                "captured ${UsageViewModel.fmtDuration(ageSec)} ago",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (ageSec > UsageViewModel.LIMIT_STALE_SEC) TurmaColors.warning
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        LimitRow("Session (5h)", card.fiveHour)
+        LimitRow("Weekly (7d)", card.sevenDay)
+    }
+}
+
+@Composable
+private fun LimitRow(label: String, view: UsageViewModel.LimitView?) {
+    if (view == null) return
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val color = when {
+        view.expired -> muted
+        view.level == UsageViewModel.LimitView.Level.CRIT -> TurmaColors.critical
+        view.level == UsageViewModel.LimitView.Level.WARN -> TurmaColors.warning
+        else -> MaterialTheme.colorScheme.primary
+    }
+    Column(Modifier.fillMaxWidth().padding(top = 6.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, style = MaterialTheme.typography.bodySmall, color = muted)
+            Text(
+                view.pctLabel + (if (view.reset.isEmpty()) "" else " · ${view.reset}"),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (view.expired) muted else MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        Box(
+            Modifier.fillMaxWidth().height(6.dp).padding(top = 2.dp)
+                .clip(RoundedCornerShape(3.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            // An expired window draws nothing: its percentage described a window
+            // that has since rolled over.
+            val fraction = if (view.expired) 0f else (view.pct / 100.0).toFloat()
+            if (fraction > 0f) {
+                Box(
+                    Modifier.fillMaxWidth(fraction).fillMaxHeight()
+                        .clip(RoundedCornerShape(3.dp)).background(color)
                 )
             }
         }
@@ -279,7 +381,15 @@ private fun UsageLegend(
 }
 
 private const val USAGE_FOOTER =
-    "Token figures are parsed from the Claude transcripts on each host and count every session it " +
+    "The subscription limits at the top are the 5-hour session window and the 7-day weekly window " +
+        "of your Claude plan — a single pool shared across claude.ai, Claude Code and every other " +
+        "Claude surface, so it moves for work done anywhere, not just here. There is no API for " +
+        "those numbers: each host captures them from its own Claude Code and reports the snapshot, " +
+        "which is why every card carries the moment it was taken and goes amber once it ages. " +
+        "Claude Code computes them from the sessions on that machine, so they can trail the real " +
+        "server-side counter — read them as headroom at a glance, not as the authoritative " +
+        "balance. " +
+        "Token figures are parsed from the Claude transcripts on each host and count every session it " +
         "has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed " +
         "sessions. A new session gets a randomly-named worktree checked out in detached HEAD off the " +
         "latest default branch — the app creates no branch; the running agent branches its own work when " +
