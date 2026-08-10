@@ -75,12 +75,34 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
   invokes a statusLine, so it can't be a `claude -p` one-shot like the summary/models helpers — and
   kills it once the snapshot lands. cwd is `REGISTRY_DIR`, so its transcript is tombstoned as
   internal overhead by the same rule as those helpers.
-- The probe is **a real turn billed against the very windows it measures** — ~50k tokens, nearly all
-  of it cache reads, and ~14s wall clock when measured on a real host — so it is sized down (Haiku, a
-  one-line `--system-prompt` replacing the default, `--strict-mcp-config`, a one-word answer) and
-  spent sparingly: only with no snapshot at all, or once one ages past
+- The probe is **a real turn billed against the very windows it measures** — ~36k tokens, nearly all
+  of it prompt cache, and ~15s wall clock when measured on a real host — so it is sized down (the
+  cheapest model, a one-line `--system-prompt` replacing the default, `--strict-mcp-config`, a
+  one-word answer) and spent sparingly: only with no snapshot at all, or once one ages past
   `LIMITS_PROBE_SEC` **and a session is actually running**. A settled host lets its snapshot go
   stale, which is the honest rendering of "nothing has moved these numbers here".
+  - **`--model haiku` is a request, not a guarantee.** It sets the session's model, but a login
+    whose routing picks per turn answers with what that routing chooses — every interactive probe
+    measured came back `claude-sonnet-5`. Don't restate the cost as a Haiku cost.
+- **A probe that captures nothing backs off, doubling to `LIMITS_PROBE_MAX_BACKOFF_SEC`.** The
+  failure that matters is the permanent one: a login with no subscription windows (API key, Bedrock,
+  Vertex) can NEVER produce a snapshot, and the "only while a session runs" gate doesn't apply to
+  the no-snapshot branch — so without the backoff such a host spends a real turn every beat forever.
 - It answers the trust-folder dialog with one `Enter` — that dialog blocks the turn entirely, so
   without it a first probe in an untrusted `~/.turma` captures nothing.
+- **Its prompt is a distinctive signature, not a bare "ok"** (`INTERNAL_TOOL_PROMPT_SIGS`): where
+  `~/.turma` is a SYMLINK, claude resolves the path before slugifying it, so the probe's transcript
+  lands under the resolved dir's slug and `_is_internal_tool_slug`'s direct `REGISTRY_DIR` match
+  never fires — the prompt signature is then the only thing keeping the agent's own overhead dir off
+  the usage page (XERK-27), and a bare "ok" would also match a real session that opened with "ok".
+- **The probe's tmux is reaped in three places**, because its own `finally` is not enough: it runs on
+  a daemon thread, whose `finally` does NOT run when the interpreter exits, and tmux outlives the
+  manager. So `_kill_limits_probe` is also called from `_handle_shutdown` (the native updater's
+  SIGTERM is a routine path) and from `resume_on_boot` (a crash mid-probe).
+- **`read_limits_snapshot` never raises**, and that is load-bearing: it runs on the beat's critical
+  path, `~/.turma` is NOT in the guard's deny list (any session can write there), and `NaN`/`inf`
+  pass an `isinstance(x, float)` gate and then raise inside `int()`. An escape crash-loops the agent
+  on every restart until someone deletes the file. It also size-caps the read (a path pointed at
+  `/dev/zero` is an unbounded allocation), bounds both epochs, and refuses a FUTURE `capturedAt`,
+  which would otherwise read as freshly captured forever and never go stale.
 - Tests: `TestLimitsSnapshot`, `TestLimitsSettings`, `test_statusline.py`.

@@ -262,6 +262,12 @@ const LIMIT_WINDOWS = [["fiveHour", "Session (5h)"], ["sevenDay", "Weekly (7d)"]
 // Agents refresh on a ~30 min cadence while a session runs, so an hour without
 // a refresh is the first point at which the numbers deserve a warning colour.
 const LIMIT_STALE_SEC = 60 * 60;
+// Past this the card is dropped, not just coloured — the agent applies the same
+// rule (LIMITS_MAX_AGE_SEC) before reporting, but the hub keeps an OFFLINE
+// host's last heartbeat for days, so without the mirror here a host that died
+// shows a frozen 5-hour window (a window that has since reset ~5 times) for as
+// long as the record survives.
+const LIMIT_MAX_AGE_SEC = 24 * 60 * 60;
 
 function fmtDuration(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -274,13 +280,19 @@ function fmtDuration(sec) {
   return days + "d " + (hours % 24) + "h";
 }
 
-// One entry per host that reports limits, newest snapshot first — a host is
+// One entry per host that reports a usable snapshot, newest first. A host is
 // skipped entirely when it reports none (an agent too old to send the field, a
 // login with no subscription windows, or one that hasn't probed yet), which is
-// the "absent flag means it can't tell you" heartbeat rule.
-function limitEntries(agents) {
+// the "absent flag means it can't tell you" heartbeat rule — and when its
+// snapshot is older than LIMIT_MAX_AGE_SEC, which is no longer a fact about now.
+// A window needs a PERCENTAGE to count: one carrying only a reset time draws
+// nothing, and a card with no rows in it is worse than no card.
+function limitEntries(agents, nowSec) {
+  const now = nowSec ?? Math.floor(Date.now() / 1000);
   return (agents || [])
-    .filter(a => a && a.limits && LIMIT_WINDOWS.some(([k]) => a.limits[k]))
+    .filter(a => a && a.limits
+      && LIMIT_WINDOWS.some(([k]) => typeof (a.limits[k] || {}).usedPct === "number")
+      && now - (a.limits.capturedAt || 0) <= LIMIT_MAX_AGE_SEC)
     .map(a => ({ host: a.device || a.key, limits: a.limits }))
     .sort((x, y) => (y.limits.capturedAt || 0) - (x.limits.capturedAt || 0));
 }
@@ -517,7 +529,8 @@ function paintSwatch(el, paint) {
 function renderLimits(agents) {
   const $limits = document.getElementById("limits");
   $limits.replaceChildren();
-  const entries = limitEntries(agents);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const entries = limitEntries(agents, nowSec);
   const h2 = document.createElement("h2");
   h2.textContent = "Claude subscription limits";
   const note = document.createElement("span");
@@ -542,7 +555,6 @@ function renderLimits(agents) {
     return;
   }
 
-  const nowSec = Math.floor(Date.now() / 1000);
   const cards = document.createElement("div");
   cards.className = "lim-cards";
   for (const entry of entries) cards.append(limitCard(entry, nowSec));

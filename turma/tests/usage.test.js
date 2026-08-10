@@ -82,7 +82,7 @@ function loadHelpers() {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheHitRate, blankBucket,
-    limitEntries, limitWindowView, fmtDuration, LIMIT_STALE_SEC };`;
+    limitEntries, limitWindowView, fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC };`;
   return new Function(...keys, body)(...keys.map((k) => stubs[k]));
 }
 
@@ -180,23 +180,39 @@ test("limitEntries skips a host that reports no limits at all", () => {
     { device: "old-host" },
     { device: "api-key-host", limits: null },
     { device: "empty-host", limits: { capturedAt: NOW } },
+    // A window with a reset time but no percentage draws nothing, so it is not
+    // a card — it would render as a host name with no rows under it.
+    { device: "no-pct-host", limits: { capturedAt: NOW, fiveHour: { resetsAt: NOW + 60 } } },
     { device: "real-host", limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
-  ]);
+  ], NOW);
   assert.deepEqual(entries.map((e) => e.host), ["real-host"]);
+});
+
+test("limitEntries drops a snapshot too old to describe the current windows", () => {
+  // The agent refuses to report one this old, but the hub keeps an OFFLINE
+  // host's last heartbeat for days — so without this the page shows a dead
+  // host's frozen 5-hour window (one that has since reset many times over).
+  const entries = H.limitEntries([
+    { device: "died-yesterday",
+      limits: { capturedAt: NOW - H.LIMIT_MAX_AGE_SEC - 60, fiveHour: { usedPct: 40 } } },
+    { device: "stale-but-usable",
+      limits: { capturedAt: NOW - H.LIMIT_MAX_AGE_SEC + 60, fiveHour: { usedPct: 40 } } },
+  ], NOW);
+  assert.deepEqual(entries.map((e) => e.host), ["stale-but-usable"]);
 });
 
 test("limitEntries puts the freshest snapshot first", () => {
   const entries = H.limitEntries([
     { device: "stale", limits: { capturedAt: NOW - 9000, sevenDay: { usedPct: 1 } } },
     { device: "fresh", limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 2 } } },
-  ]);
+  ], NOW);
   assert.deepEqual(entries.map((e) => e.host), ["fresh", "stale"]);
 });
 
 test("limitEntries falls back to the agent key when a host has no device name", () => {
   const entries = H.limitEntries([
     { key: "unnamed-1", limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
-  ]);
+  ], NOW);
   assert.equal(entries[0].host, "unnamed-1");
 });
 

@@ -25,6 +25,7 @@ Two rules the callers depend on:
 """
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -34,6 +35,8 @@ DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".turma", "limits.json")
 
 # stdin key -> snapshot key. Each window may be independently absent.
 WINDOWS = (("five_hour", "fiveHour"), ("seven_day", "sevenDay"))
+# Magnitude bound on an epoch second (year ~5138), mirroring the reader's.
+EPOCH_MAX = 10 ** 11
 
 
 def snapshot_path():
@@ -51,13 +54,24 @@ def _window(raw):
     if not isinstance(raw, dict):
         return None
     out = {}
-    pct = raw.get("used_percentage")
-    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
-        out["usedPct"] = round(min(100.0, max(0.0, float(pct))), 1)
-    resets = raw.get("resets_at")
-    if isinstance(resets, (int, float)) and not isinstance(resets, bool):
+    pct = _number(raw.get("used_percentage"))
+    if pct is not None:
+        out["usedPct"] = round(min(100.0, max(0.0, pct)), 1)
+    resets = _number(raw.get("resets_at"))
+    # Bounded before int(): the reader on the other side of this file refuses an
+    # absurd epoch anyway, and a non-finite one can't even be written as JSON.
+    if resets is not None and abs(resets) <= EPOCH_MAX:
         out["resetsAt"] = int(resets)
     return out or None
+
+
+def _number(value):
+    """`value` as a finite float, or None — booleans, strings, NaN and inf all
+    read as "not a number this file should carry"."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 def build_snapshot(payload, now=None):
@@ -101,7 +115,10 @@ def write_snapshot(snap, path=None):
                                    prefix=".limits-", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as fh:
-                json.dump(snap, fh)
+                # allow_nan=False: Python writes bare NaN/Infinity, which is not
+                # JSON and which the reader would have to defuse. Nothing here
+                # can produce one (see _number) — this is the backstop.
+                json.dump(snap, fh, allow_nan=False)
             os.replace(tmp, path)
         except Exception:
             try:

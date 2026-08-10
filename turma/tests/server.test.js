@@ -1968,6 +1968,40 @@ test("http: an agent's subscription limits reach the clients, and clear again", 
   assert.equal((await read()).limits, undefined);
 });
 
+test("http: a malformed limits block is coerced at ingest, not fanned out", async () => {
+  // Same reason the per-model usage lists are coerced here: this block reaches
+  // web, Android and glasses, and Android decodes it into TYPED fields — a
+  // `usedPct` of "lots" from one buggy host would fail the decode of the WHOLE
+  // fleet payload, not just its own card.
+  const beat = (body) =>
+    request("POST", "/api/heartbeat", { body, headers: agentHeaders });
+  const read = async (key) =>
+    (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === key);
+
+  await beat({
+    device: "junk-limits-host",
+    limits: {
+      fiveHour: { usedPct: "lots", resetsAt: 1 },        // dropped: not a number
+      sevenDay: { usedPct: 250, resetsAt: "soon" },      // clamped; reset dropped
+      capturedAt: 1_786_400_000,
+      source: "x".repeat(200),
+    },
+  });
+  assert.deepEqual((await read("junk-limits-host")).limits, {
+    sevenDay: { usedPct: 100 },
+    capturedAt: 1_786_400_000,
+    source: "x".repeat(32),
+  });
+
+  // Nothing usable left, and shapes that aren't a block at all, all read as null
+  // rather than reaching a client as a half-formed card.
+  for (const limits of [{ capturedAt: 1 }, { fiveHour: { usedPct: 5 } }, [], "nope", 7]) {
+    await beat({ device: "junk-limits-host", limits });
+    assert.equal((await read("junk-limits-host")).limits, null, JSON.stringify(limits));
+  }
+});
+
 test("http: command queue rides the reply until acked", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

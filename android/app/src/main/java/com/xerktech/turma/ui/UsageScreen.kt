@@ -69,9 +69,8 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
     // so both groupings stay consistent: "By host" drops the other orgs' hosts,
     // and "By repo" charts only what the scoped org's hosts spent — a repo two
     // orgs share reads as that org's share of it, which is the point of scoping.
-    val ui = remember(fleet, org) {
-        UsageViewModel.compute(fleet.copy(agents = scopedAgents(fleet.agents, org)))
-    }
+    val scoped = remember(fleet, org) { scopedAgents(fleet.agents, org) }
+    val ui = remember(scoped) { UsageViewModel.compute(fleet.copy(agents = scoped)) }
     // Grouping pick + legend toggles persist across visits (web usage.html's
     // localStorage `turma-usage-mode` / `turma-hidden-sessions`).
     val context = LocalContext.current
@@ -125,7 +124,9 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
             // spent, but how much of the plan's 5h/7d windows is left. It sits
             // outside the grouping tabs — it is per host either way — and it is
             // rendered whether or not any tokens have been charted.
-            item(key = "limits") { LimitsSection(ui.limits, fleet.agents.isNotEmpty()) }
+            // The scoped list, not the whole fleet: the empty-state copy has to
+            // agree with the cards above it, which are org-scoped (web parity).
+            item(key = "limits") { LimitsSection(ui.limits, scoped.isNotEmpty()) }
             // Legend = filter: each item toggles its series; the group label
             // toggles them all (web legendEl). Persisted, and it rescopes the
             // chart AND the rows below.

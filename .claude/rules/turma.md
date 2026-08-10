@@ -135,8 +135,15 @@ which makes an `android/` change part of the same PR) live there.
 - The usage page renders `(root)` as **Root**, folding older agents' `(other)`/`?` in
   (`normRepo`/`repoLabel`).
 - Above the chart it shows the **Claude subscription's 5h/7d windows** (XERK-247) from each agent's
-  `limits` block — pure carriage, hub-side: the numbers exist only inside Claude Code (see
-  `.claude/rules/agent-usage.md` for how they're captured).
+  `limits` block — the numbers exist only inside Claude Code (see `.claude/rules/agent-usage.md` for
+  how they're captured).
+  - **`normalizeLimits` coerces the block at ingest**, like the per-model usage lists beside it and
+    for the same reason: it fans out to web, Android and glasses, and Android decodes it into TYPED
+    fields, so a `usedPct` of `"lots"` from one buggy host would fail the decode of the WHOLE fleet
+    payload rather than just its own card.
+  - **A card is dropped past `LIMIT_MAX_AGE_SEC`, not just coloured** — the agent applies the same
+    rule before reporting, but the hub keeps an OFFLINE host's last heartbeat for days, so without
+    the client-side mirror a dead host shows a frozen 5-hour window that has since reset many times.
   - Every card is a **SNAPSHOT, and says so**: it carries "captured <age> ago" (amber past
     `LIMIT_STALE_SEC`), because a host only refreshes while it's working. Wording is "captured", not
     "updated" — the header's fleet-wide last-refreshed stamp was removed, and `nav.test.js` guards

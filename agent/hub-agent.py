@@ -45,6 +45,7 @@ import html
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -1672,53 +1673,102 @@ LIMITS_SETTINGS_PATH = os.path.join(REGISTRY_DIR, "limits-settings.json")
 # not stale data, it is wrong data.
 LIMITS_MAX_AGE_SEC = int(os.environ.get("TURMA_LIMITS_MAX_AGE_SEC", "86400") or 86400)
 LIMITS_WINDOW_KEYS = ("fiveHour", "sevenDay")
+# The snapshot is a couple of hundred bytes; anything near this is not one.
+LIMITS_MAX_BYTES = 64 << 10
+# Bounds on the two timestamps. `EPOCH_MAX` (year ~5138) keeps a wild number
+# away from int() and away from clients that type these as a 64-bit integer;
+# `RESET_HORIZON` keeps a reset time near the windows it can describe (5 hours
+# and 7 days); `FUTURE_SKEW` allows ordinary clock drift on capturedAt but not a
+# stamp that would never age.
+LIMITS_EPOCH_MAX = 10 ** 11
+LIMITS_RESET_HORIZON_SEC = 60 * 86400
+LIMITS_FUTURE_SKEW_SEC = 300
+
+
+def _finite_epoch(value, limit):
+    """A finite epoch-second number as an int, or None. `limit` bounds the
+    magnitude, so `1e308`, `NaN` and `inf` never reach `int()` — which RAISES on
+    the last two, and `int()` on a float that large yields a number no client can
+    render (a Kotlin `Long` field can't even decode it)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if abs(value) > limit:
+        return None
+    return int(value)
 
 
 def read_limits_snapshot(path=None, now=None, max_age=None):
     """The heartbeat's `limits` block, read from the snapshot file — or None when
-    there is no usable one (no file, unreadable, unparseable, no window, or older
-    than LIMITS_MAX_AGE_SEC).
+    there is no usable one (no file, unreadable, unparseable, no window, or a
+    timestamp that makes the numbers meaningless).
 
-    Re-validated field by field rather than passed through: the file is written
-    by a separate process from a shape Claude Code owns and may change, and it
-    reaches every client from here. `capturedAt` is carried as the epoch second
-    the hook stamped, so staleness is measured against the READING clock on each
-    surface rather than against the agent's idea of now."""
+    Re-validated field by field rather than passed through, and **this function
+    never raises**: it is called on the heartbeat's critical path, the file is
+    written by a separate process from a shape Claude Code owns and may change,
+    and `~/.turma` is not in the guard's deny list — so any session on the host
+    can put anything there. An exception escaping here would take the beat loop,
+    and with it the host, down on every restart until someone deleted the file.
+
+    `capturedAt` is carried as the epoch second the hook stamped, so staleness is
+    measured against the READING clock on each surface rather than against the
+    agent's idea of now."""
     path = path or LIMITS_PATH
     now = int(now if now is not None else time.time())
     max_age = LIMITS_MAX_AGE_SEC if max_age is None else max_age
     try:
+        # The READ is bounded, not just the file's stat: the snapshot is a couple
+        # of hundred bytes, and `json.load` on a path pointed at something
+        # enormous is an unbounded allocation on the beat loop. A stat-only check
+        # wouldn't do — /dev/zero reports st_size 0 and then hands over bytes
+        # forever, which OOM-kills the agent.
         with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except (OSError, ValueError):
+            text = fh.read(LIMITS_MAX_BYTES + 1)
+        if len(text) > LIMITS_MAX_BYTES:
+            log(f"limits snapshot at {path} is implausibly large; ignoring it")
+            return None
+        raw = json.loads(text)
+        if not isinstance(raw, dict):
+            return None
+        captured = _finite_epoch(raw.get("capturedAt"), LIMITS_EPOCH_MAX)
+        if captured is None:
+            return None
+        if max_age and captured < now - max_age:
+            return None
+        # A snapshot stamped in the future would read as freshly captured
+        # forever, so it never goes stale in any UI. A little skew is ordinary
+        # (the writer's clock, or a beat that crosses a second); a lot is a
+        # broken or hostile stamp.
+        if captured > now + LIMITS_FUTURE_SKEW_SEC:
+            return None
+        out = {}
+        for key in LIMITS_WINDOW_KEYS:
+            win = raw.get(key)
+            if not isinstance(win, dict):
+                continue
+            clean = {}
+            pct = win.get("usedPct")
+            if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
+                    and not (isinstance(pct, float) and not math.isfinite(pct))):
+                clean["usedPct"] = round(min(100.0, max(0.0, float(pct))), 1)
+            # A reset time is only meaningful near now — these windows are 5
+            # hours and 7 days long. An absurd one renders as an absurd
+            # countdown ("resets in 1.15e+303d"), so drop the field and let the
+            # UI show the percentage alone.
+            resets = _finite_epoch(win.get("resetsAt"), LIMITS_EPOCH_MAX)
+            if resets is not None and abs(resets - now) <= LIMITS_RESET_HORIZON_SEC:
+                clean["resetsAt"] = resets
+            if "usedPct" in clean:  # a reset time with no percentage draws nothing
+                out[key] = clean
+        if not out:
+            return None
+        out["capturedAt"] = captured
+        out["source"] = "statusline"
+        return out
+    except Exception as e:
+        log(f"limits snapshot at {path} unreadable ({e}); ignoring it")
         return None
-    if not isinstance(raw, dict):
-        return None
-    captured = raw.get("capturedAt")
-    if not isinstance(captured, (int, float)) or isinstance(captured, bool):
-        return None
-    captured = int(captured)
-    if max_age and captured < now - max_age:
-        return None
-    out = {}
-    for key in LIMITS_WINDOW_KEYS:
-        win = raw.get(key)
-        if not isinstance(win, dict):
-            continue
-        clean = {}
-        pct = win.get("usedPct")
-        if isinstance(pct, (int, float)) and not isinstance(pct, bool):
-            clean["usedPct"] = round(min(100.0, max(0.0, float(pct))), 1)
-        resets = win.get("resetsAt")
-        if isinstance(resets, (int, float)) and not isinstance(resets, bool):
-            clean["resetsAt"] = int(resets)
-        if clean:
-            out[key] = clean
-    if not out:
-        return None
-    out["capturedAt"] = captured
-    out["source"] = "statusline"
-    return out
 
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
@@ -7672,6 +7722,11 @@ SUMMARY_INSTRUCTION = (
 INTERNAL_TOOL_PROMPT_SIGS = (
     "You are triaging Jira tickets",
     "In 2-4 words, give a Title Case name",
+    # The subscription-limits probe (XERK-247). Load-bearing wherever `~/.turma`
+    # is a symlink: claude resolves the path before slugifying it, so the
+    # transcript lands under the RESOLVED dir's slug and the direct
+    # REGISTRY_DIR match in _is_internal_tool_slug can't fire.
+    "turma limits probe",
 )
 
 
@@ -7706,7 +7761,12 @@ def _looks_like_internal_tool_prompt(text):
 # replacing the default one, and an answer of one word.
 LIMITS_TMUX = "turma-limits"                 # its own tmux; no session parses it
 LIMITS_PROBE_SYSTEM_PROMPT = "You are a no-op probe. Reply with exactly: ok"
-LIMITS_PROBE_PROMPT = "ok"
+# Distinctive on purpose. `~/.turma` is a SYMLINK on some hosts, so claude writes
+# the probe's transcript under the resolved path's slug and
+# _is_internal_tool_slug's direct REGISTRY_DIR match never fires; the fallback
+# then has to recognise this by its first user text, and a bare "ok" would also
+# match a real session that opened with "ok". See INTERNAL_TOOL_PROMPT_SIGS.
+LIMITS_PROBE_PROMPT = "turma limits probe: reply ok"
 LIMITS_PROBE_MODEL = (os.environ.get("TURMA_LIMITS_PROBE_MODEL", "haiku").strip()
                       or "haiku")
 # How stale a snapshot may get before a running host spends another probe.
@@ -7715,6 +7775,14 @@ LIMITS_PROBE_MODEL = (os.environ.get("TURMA_LIMITS_PROBE_MODEL", "haiku").strip(
 LIMITS_PROBE_SEC = int(os.environ.get("TURMA_LIMITS_PROBE_SEC", "1800") or 0)
 LIMITS_PROBE_TIMEOUT_SEC = int(
     os.environ.get("TURMA_LIMITS_PROBE_TIMEOUT_SEC", "120") or 120)
+# Backoff after a probe that captured nothing, doubling to the cap. The failure
+# that matters is the PERMANENT one — a login with no subscription windows can
+# never produce a snapshot, and without a backoff that host spends a real turn
+# every beat forever, chasing a number it will never have.
+LIMITS_PROBE_RETRY_SEC = int(
+    os.environ.get("TURMA_LIMITS_PROBE_RETRY_SEC", "900") or 900)
+LIMITS_PROBE_MAX_BACKOFF_SEC = int(
+    os.environ.get("TURMA_LIMITS_PROBE_MAX_BACKOFF_SEC", "21600") or 21600)
 LIMITS_PROBE_TRUST_SEC = 4  # let the TUI paint before answering its trust dialog
 
 MODEL_PROBE_PROMPT = "/model"
@@ -12258,15 +12326,25 @@ class SessionManager:
     def _limits_probe_due(self):
         """Whether to spend a probe this beat.
 
-        Two gates, both about not paying for a number that cannot have moved.
-        With no snapshot at all we probe (boot, or a host that has never had
-        one). With one in hand we probe only when it has aged past
+        Three gates, all about not paying for a number that cannot have moved.
+
+        With one snapshot in hand we probe only when it has aged past
         LIMITS_PROBE_SEC **and** a session is actually running: the windows are a
         shared pool, but this host only pushes them while it's working, and a
         settled host re-probing all night would burn the very quota it reports.
         A snapshot nothing refreshes goes stale in the UI, which is the honest
-        rendering of "nobody has asked Claude anything here in a while"."""
+        rendering of "nobody has asked Claude anything here in a while".
+
+        With NO snapshot the backoff is what bounds the cost, and it has to,
+        because a host that can never produce one is a normal outcome, not a
+        failure: an API-key/Bedrock/Vertex login has no subscription windows, so
+        every probe times out having spent a real turn. Unbounded, that is a turn
+        every beat, forever. Each failure doubles the wait to
+        LIMITS_PROBE_MAX_BACKOFF_SEC; a success resets it."""
         if not LIMITS_PROBE_SEC:
+            return False
+        waited = time.time() - getattr(self, "_limits_probe_at", 0)
+        if waited < getattr(self, "_limits_probe_backoff", 0):
             return False
         snap = read_limits_snapshot()
         if not snap:
@@ -12274,6 +12352,18 @@ class SessionManager:
         if time.time() - snap.get("capturedAt", 0) < LIMITS_PROBE_SEC:
             return False
         return any(s.get("status") == "running" for s in self.registry)
+
+    def _limits_probe_outcome(self, ok):
+        """Record a finished probe: a success clears the backoff, a failure
+        doubles it (from LIMITS_PROBE_RETRY_SEC, capped)."""
+        if ok:
+            self._limits_probe_backoff = 0
+            return
+        prev = getattr(self, "_limits_probe_backoff", 0)
+        self._limits_probe_backoff = min(
+            LIMITS_PROBE_MAX_BACKOFF_SEC,
+            LIMITS_PROBE_RETRY_SEC if not prev else prev * 2)
+        log(f"limits probe failed; next attempt in ~{self._limits_probe_backoff}s")
 
     def _start_limits_probe(self):
         """Run the limits probe on a daemon thread, single-flight.
@@ -12290,7 +12380,11 @@ class SessionManager:
             return
         settings = self._ensure_limits_settings()
         if not settings:
+            self._limits_probe_outcome(False)
             return
+        # Stamped BEFORE the thread starts, so the backoff also spaces attempts
+        # that die without reaching _limits_probe_outcome.
+        self._limits_probe_at = time.time()
         self._limits_probe = threading.Thread(
             target=self._run_limits_probe, args=(settings,),
             name="limits-probe", daemon=True)
@@ -12301,9 +12395,17 @@ class SessionManager:
         land so Claude Code populates `rate_limits`, wait for hooks/statusline.py
         to write the snapshot, and kill it.
 
-        Kept as cheap as a turn can be — Haiku, a one-line system prompt in place
-        of the default one, no MCP servers, a one-word answer — because it is
-        billed against the very windows it measures. cwd is REGISTRY_DIR, which
+        Kept as cheap as a turn can be — the cheapest model, a one-line system
+        prompt in place of the default one, no MCP servers, a one-word answer —
+        because it is billed against the very windows it measures. Measured at
+        ~36k tokens (nearly all of it prompt cache) and ~15s.
+
+        **`--model` is a request, not a guarantee**: it sets the session's model
+        (the statusLine payload reports haiku at launch), but on a login whose
+        routing picks per turn, the turn itself is answered by whatever that
+        routing chooses — every interactive run measured here came back
+        `claude-sonnet-5`. Nothing to fix agent-side; it means the cost figure is
+        the one above, not a Haiku one. cwd is REGISTRY_DIR, which
         is what keeps its transcript off the usage page (`_is_internal_tool_slug`
         tombstones the registry dir's slug), and plan mode plus a prompt with
         nothing to do keeps it from touching a repo."""
@@ -12325,14 +12427,16 @@ class SessionManager:
             f"--system-prompt {shlex.quote(LIMITS_PROBE_SYSTEM_PROMPT)}",
             f"-- {shlex.quote(LIMITS_PROBE_PROMPT)}",
         ]
-        run(["tmux", "kill-session", "-t", LIMITS_TMUX])  # clean slate
+        self._kill_limits_probe()  # clean slate
         rc, err = run_ok([
             "tmux", "new-session", "-d", "-s", LIMITS_TMUX,
             "-c", REGISTRY_DIR, "-x", "80", "-y", "24", " ".join(parts),
         ])
         if rc != 0:
             log(f"limits probe launch failed: {err}")
+            self._limits_probe_outcome(False)
             return
+        ok = False
         try:
             # One Enter, once: a directory claude has never been trusted in
             # opens a "do you trust this folder" dialog whose default is Yes, and
@@ -12346,16 +12450,31 @@ class SessionManager:
                 time.sleep(1)
                 snap = read_limits_snapshot()
                 if snap and snap.get("capturedAt", 0) >= started:
+                    ok = True
                     log("limits probe: 5h "
                         f"{(snap.get('fiveHour') or {}).get('usedPct')}%, 7d "
                         f"{(snap.get('sevenDay') or {}).get('usedPct')}%")
                     return
             # A login with no subscription windows (API key, Bedrock/Vertex) never
             # populates rate_limits, so this is a normal outcome on such a host,
-            # not an error — it just means the Usage page keeps its empty state.
+            # not an error — it just means the Usage page keeps its empty state,
+            # and the backoff keeps that host from paying for a turn per beat.
             log("limits probe: no rate limits reported before the timeout")
         finally:
-            run(["tmux", "kill-session", "-t", LIMITS_TMUX])
+            self._kill_limits_probe()
+            self._limits_probe_outcome(ok)
+
+    def _kill_limits_probe(self):
+        """Tear down the probe's tmux (and the claude inside it). Idempotent.
+
+        Called from the probe's own `finally`, from the shutdown handler and at
+        boot, because the `finally` is NOT enough on its own: the probe runs on a
+        daemon thread, whose `finally` never runs when the interpreter exits, and
+        tmux outlives the manager by design. A restart mid-probe (the native
+        updater does exactly that) would otherwise leave an interactive claude
+        sitting in a detached tmux until some later probe's clean-slate kill —
+        up to LIMITS_MAX_AGE_SEC away on an idle host."""
+        run(["tmux", "kill-session", "-t", LIMITS_TMUX])
 
     def models_available(self):
         """The probed alias list, or () before the first successful probe —
@@ -12563,6 +12682,11 @@ class SessionManager:
                 time.sleep(LAUNCH_STAGGER)  # stagger shared-login contention
             except Exception as e:
                 self._set_error(sess, e)
+        # A limits probe the previous manager was running when it died is NOT a
+        # session and is never adopted: its tmux holds an interactive claude
+        # nothing is waiting on. Reaped here so a crash mid-probe can't leave one
+        # sitting until the next probe happens to be due.
+        self._kill_limits_probe()
         self.save()
 
     # --- command handling (heartbeat reply) -------------------------------
@@ -13725,6 +13849,10 @@ class SessionManager:
         the whole stack down, which is exactly the outage this status explains."""
         reason, version = self._read_updating_flag()
         self._announce_updating(reason or "restart", version)
+        # A probe in flight is on a daemon thread, whose `finally` will NOT run
+        # through this exit — so its tmux (and the claude in it) is reaped here
+        # instead. Sessions are deliberately left alone; this is only ours.
+        self._kill_limits_probe()
         raise SystemExit(0)
 
     def run_forever(self):

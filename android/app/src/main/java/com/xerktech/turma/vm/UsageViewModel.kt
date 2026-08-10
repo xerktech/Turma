@@ -236,6 +236,14 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
          */
         const val LIMIT_STALE_SEC = 60L * 60L
 
+        /**
+         * Past this the card is dropped, not just coloured. The agent applies the
+         * same rule before reporting, but the hub keeps an OFFLINE host's last
+         * heartbeat for days — without the mirror here, a host that died shows a
+         * frozen 5-hour window (one that has since reset several times over).
+         */
+        const val LIMIT_MAX_AGE_SEC = 24L * 60L * 60L
+
         /** "45s" / "6m" / "2h 14m" / "2d 2h", as an age or a countdown. */
         fun fmtDuration(sec: Long): String {
             val s = maxOf(0L, sec)
@@ -274,14 +282,16 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         /**
-         * One card per host that reports a window, freshest snapshot first. A
+         * One card per host that reports a usable snapshot, freshest first. A
          * host reporting none is skipped entirely — an agent too old to send the
          * field, a login with no subscription windows, or one that hasn't been
-         * probed yet all mean "this host can't tell you", not "0% used".
+         * probed yet all mean "this host can't tell you", not "0% used" — and so
+         * is one whose snapshot is older than [LIMIT_MAX_AGE_SEC].
          */
         fun limitCards(fleet: FleetState, nowSec: Long): List<LimitCard> =
             fleet.agents.mapNotNull { a ->
                 val lim = a.limits ?: return@mapNotNull null
+                if (nowSec - lim.capturedAt > LIMIT_MAX_AGE_SEC) return@mapNotNull null
                 val five = limitView(lim.fiveHour, nowSec)
                 val seven = limitView(lim.sevenDay, nowSec)
                 if (five == null && seven == null) return@mapNotNull null

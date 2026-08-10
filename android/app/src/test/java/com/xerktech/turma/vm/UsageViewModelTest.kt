@@ -259,10 +259,26 @@ class UsageViewModelTest {
             AgentInfo(key = "old", device = "old"),
             AgentInfo(key = "api", device = "api", limits = null),
             AgentInfo(key = "empty", device = "empty", limits = limits()),
+            // A window with a reset time but no percentage draws nothing.
+            AgentInfo(key = "nopct", device = "nopct",
+                limits = limits(five = LimitWindow(resetsAt = now + 60))),
             AgentInfo(key = "real", device = "real", limits = limits(five = LimitWindow(usedPct = 5.0))),
         ))
         val cards = UsageViewModel.compute(fleet, now).limits
         assertEquals(listOf("real"), cards.map { it.host })
+    }
+
+    @Test fun `a snapshot too old to describe the current windows is dropped`() {
+        // The agent refuses to report one this old, but the hub keeps an OFFLINE
+        // host's last heartbeat for days — without this mirror, a dead host shows
+        // a frozen 5-hour window that has since reset many times over.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "dead", device = "dead", limits = limits(
+                now - UsageViewModel.LIMIT_MAX_AGE_SEC - 60, five = LimitWindow(usedPct = 40.0))),
+            AgentInfo(key = "old", device = "old", limits = limits(
+                now - UsageViewModel.LIMIT_MAX_AGE_SEC + 60, five = LimitWindow(usedPct = 40.0))),
+        ))
+        assertEquals(listOf("old"), UsageViewModel.compute(fleet, now).limits.map { it.host })
     }
 
     @Test fun `limit cards lead with the freshest snapshot`() {
