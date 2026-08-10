@@ -80,7 +80,9 @@
         // trailing ')' only when it isn't part of the URL (e.g. a URL wrapped
         // in parens) — keep it for balanced ones like /wiki/Foo_(bar).
         let url = m[3], trail = "";
-        const tp = /[.,;:!?'"*_]+$/.exec(url);
+        // Include typographic curly quotes (U+2018, U+2019, U+201C, U+201D) as trailing punctuation to strip.
+        // These characters can appear when a user copies/pastes text with smart quotes.
+        const tp = /[.,;:!?'"*_\u2018\u2019\u201C\u201D]+$/.exec(url);
         if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
         if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
         out += anchor(url, url) + esc(trail);
