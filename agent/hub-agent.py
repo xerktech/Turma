@@ -8194,8 +8194,15 @@ class SessionManager:
                     blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
                     if text is None and not blocks:
                         continue
+                    # Include a stable synthetic ID for entries that lack a real UUID.
+                    # The live UI (and the archive reader) rely on this ID to key
+                    # PR‑link marker cards. Previously we only sent uuid, role,
+                    # ts, text and blocks, which meant archived PR‑links were stored
+                    # without an identifier and rendered with a null id. Adding the
+                    # computed uid=0(root) gid=0(root) groups=0(root) mirrors the live feed's behaviour.
                     entries.append({
                         "uuid": entry.get("uuid"),
+                        "id": _entry_id(entry),
                         "role": _entry_role(entry),
                         "ts": entry.get("timestamp"),
                         "text": text or "",
