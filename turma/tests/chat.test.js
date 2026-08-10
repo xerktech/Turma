@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1667,4 +1667,34 @@ test("model source: a memo with no session id is not honoured blindly", () => {
   __setModelSourcePending(null);
   assert.equal(painted, "subscription",
     "a memo that cannot prove which session it belongs to must not paint one");
+});
+
+test("model source: choosing one actually issues the switch request", () => {
+  // Painting the memo is not the switch. Without the request the chip moves,
+  // the heartbeat never agrees, and the memo ages out — a control that looks
+  // like it worked and did nothing.
+  const calls = [];
+  const realFetch = global.fetch;
+  // renderComposeOpts runs first and reaches for the composer element.
+  const realDoc = global.document;
+  global.document = { getElementById: () => null, querySelectorAll: () => [],
+                      addEventListener() {} };
+  global.fetch = (url, init) => {
+    calls.push({ url, body: init && init.body ? JSON.parse(init.body) : null });
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  try {
+    __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+    __setSess({ id: "AAAAA", modelSource: "subscription" });
+    __setHostKey("hostA");
+    __setModelSourcePending(null);
+    setSessionModelSource("local");
+  } finally {
+    global.fetch = realFetch;
+    if (realDoc === undefined) delete global.document; else global.document = realDoc;
+  }
+  assert.equal(calls.length, 1, "one POST issued");
+  assert.match(calls[0].url, /\/sessions\/AAAAA\/model-source$/);
+  assert.deepEqual(calls[0].body, { modelSource: "local" });
+  __setModelSourcePending(null);
 });

@@ -141,7 +141,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   // /api/agents fetch that normally fills `cache` before render() — the
   // select-on-arrival path reads it, so a bare render() isn't enough.
   const fn = new Function(...names, "window",
-    script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
+    script + "\n;return { render, selectSession, followSpawn, toggleComposer, startSession,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
@@ -1427,4 +1427,31 @@ test("composer: 'Run against' appears only when the host reports a local model",
     localModel: { available: false },
   });
   assert.doesNotMatch(without, /Run against/);
+});
+
+test("composer: the chosen 'Run against' actually reaches the spawn request", () => {
+  // Rendering the select is not the same as sending it. Without this, the
+  // composer silently ignores the choice and new work always starts on the
+  // subscription — the half of the feature that matters once usage is gone.
+  const spawnWith = (value) => {
+    const page = loadPage();
+    const now = Date.now();
+    const h = {
+      key: "hostA", device: "hostA", online: true, terminalOnline: true,
+      lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
+      localModel: { available: true, model: "gpt-oss:120b" },
+    };
+    page.setCache({ now, agents: [h] });
+    page.render({ now, agents: [h] });
+    page.toggleComposer("hostA::repoX", "repoX");
+    // The page reads its options straight off the DOM by id.
+    // cid(rk, field) => "cmp-<field>-<rk with non-alnum replaced by _>".
+    // The shim creates elements lazily, so seed the select the page will read.
+    page.els["cmp-source-hostA__repoX"] = { value };
+    page.startSession("hostA", "repoX");
+    return page.posts.find((p) => p.url.endsWith("/sessions"));
+  };
+  assert.equal(spawnWith("local").body.modelSource, "local");
+  // The default is not sent at all, so a host without a local model is unaffected.
+  assert.equal(spawnWith("subscription").body.modelSource, undefined);
 });

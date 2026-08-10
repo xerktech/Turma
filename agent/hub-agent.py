@@ -646,9 +646,12 @@ def write_local_model_env(path):
     The credential must not appear in ANY process's argv. A command-line prefix
     puts it in the tmux SERVER's argv, and `tmux -e VAR=VALUE` puts it in the
     tmux CLIENT's — /proc/<pid>/cmdline is world-readable (0444) in both cases,
-    so every uid on the host could read the gateway key. A file the agent's uid
-    alone can read, sourced by the launch line, leaks nothing: only the PATH is
-    ever visible.
+    so every uid on the host could read the gateway key. Sourcing a 0600 file
+    keeps it out of every argv; only the PATH is ever visible there.
+
+    0600 stops OTHER uids, not the sessions themselves — they run as the uid
+    that owns this file. `_GUARD_DENY_PATH_RULES` denies Read on it for that
+    reason, since the file's whole content is the secret.
 
     Rewritten on every launch, so a rotated key or a changed endpoint takes
     effect without an agent restart."""
@@ -912,6 +915,13 @@ _GUARD_DENY_PATH_RULES = [
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
     "Edit(~/.git-credentials)",
+    # The self-hosted gateway credential (XERK-246). READ, not Edit: unlike the
+    # stores above — which a session could only misuse by writing — this file's
+    # whole content IS the secret, and sessions run as the same uid that owns
+    # it. tmux keeps LOCAL_MODEL_API_KEY out of session environments, so this
+    # file is the only path to it from inside a session.
+    "Read(~/.turma/local-model.env)",
+    "Edit(~/.turma/local-model.env)",
 ]
 
 # Operator-supplied extra permissions. Claude Code does NOT read a *user-level*
@@ -9680,7 +9690,12 @@ class SessionManager:
         closed = next((c for c in self.closed
                        if c.get("claudeSessionId") == transcript_id), None)
         if closed is None and cwd:
-            closed = next((c for c in self.closed
+            # NEWEST first: self.closed is append-ordered, so a plain next()
+            # yields the EARLIEST record for this worktree — a session that was
+            # later switched back to the subscription and killed again would be
+            # resumed onto the local model anyway, which is this bug in the
+            # opposite (and quieter) direction.
+            closed = next((c for c in reversed(self.closed)
                            if c.get("worktreePath")
                            and os.path.normpath(c["worktreePath"]) == os.path.normpath(cwd)),
                           None)
@@ -10030,6 +10045,11 @@ class SessionManager:
         if sess.get("modelSource", "subscription") == source:
             return                                  # already there; no relaunch
         previous = sess.get("modelSource", "subscription")
+        if source == "local":
+            # set_model refuses a local session, so a pick waiting for an idle
+            # pane would be silently discarded later. Drop it now rather than
+            # leave it heartbeat-visible and then unexplained.
+            sess.pop("pendingModel", None)
         sess["modelSource"] = source
         try:
             self._kill_tmux(sess)      # ends claude; tmux/ttyd are re-made below

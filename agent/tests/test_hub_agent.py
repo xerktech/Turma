@@ -3659,6 +3659,16 @@ class TestAckDeque(ManagerMixin, unittest.TestCase):
 
 
 class TestHandleCommands(ManagerMixin, unittest.TestCase):
+    def test_set_model_source_command_is_dispatched(self):
+        """Deleting the dispatch arm makes the hub queue the command, the agent
+        ack it, and every switch become a silent no-op."""
+        sm = self.make_manager()
+        sm.set_model_source = mock.Mock()
+        sm.save = mock.Mock()
+        sm.handle_commands([{"cmdId": "ms1", "type": "setModelSource",
+                             "sessionId": "abcde", "modelSource": "local"}])
+        sm.set_model_source.assert_called_once_with("abcde", "local")
+
     def test_dedup_and_dispatch(self):
         sm = self.make_manager()
         sm.spawn = mock.Mock()
@@ -6939,6 +6949,25 @@ class TestLocalModelConfig(unittest.TestCase):
         with self._configured(LOCAL_MODEL_NAME="oops; rm -rf /"):
             self.assertFalse(ha.local_model_configured())
 
+    def test_partial_config_says_which_half_is_missing(self):
+        """A half-configured host disables the feature with the control simply
+        never appearing; without a reason nobody can tell it from "off"."""
+        seen = []
+        with mock.patch.object(ha, "log", lambda m: seen.append(m)), \
+             mock.patch.object(ha, "_local_model_complaints", set()):
+            with self._configured(LOCAL_MODEL_API_KEY=""):
+                self.assertFalse(ha.local_model_configured())
+                ha.local_model_configured()          # every beat calls it
+        self.assertEqual(len(seen), 1, "said once, not once per heartbeat")
+        self.assertIn("LOCAL_MODEL_API_KEY", seen[0])
+        # Feature simply off (neither set) says nothing at all.
+        quiet = []
+        with mock.patch.object(ha, "log", lambda m: quiet.append(m)), \
+             mock.patch.object(ha, "_local_model_complaints", set()):
+            with self._configured(LOCAL_MODEL_BASE_URL="", LOCAL_MODEL_API_KEY=""):
+                self.assertFalse(ha.local_model_configured())
+        self.assertEqual(quiet, [])
+
     def test_resolve_model_source_enum(self):
         with self._configured():
             self.assertEqual(ha.resolve_model_source(""), "subscription")
@@ -6962,6 +6991,9 @@ class TestLocalModelConfig(unittest.TestCase):
         # trimmed back to the host.
         self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com", pairs)
         self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", pairs)
+        # Without this every background/small-model call asks the gateway for
+        # the LOGIN's default alias and 403s invisibly.
+        self.assertIn("ANTHROPIC_SMALL_FAST_MODEL=gpt-oss:120b", pairs)
         self.assertTrue(any(p.startswith("CLAUDE_CODE_MAX_CONTEXT_TOKENS=") for p in pairs))
         # An ambient key outranks ANTHROPIC_AUTH_TOKEN and would bill the very
         # account the failover exists to stop depending on.
@@ -7033,15 +7065,25 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         return [c for c in self.run_ok_calls if "new-session" in c][-1]
 
     def _launch_env(self):
-        """The settings the launch actually applies, read back from the 0600
-        file the launch line sources (never argv — see write_local_model_env)."""
+        """What the launch line ACTUALLY EXPORTS to claude.
+
+        Deliberately runs the real prefix through a real shell rather than
+        reading the file: the file being correct is not the same as its settings
+        reaching the child process. Dropping `set -a` leaves them defined but
+        unexported, so every "local" session silently runs on the exhausted
+        subscription while the UI still paints the mark — and a test that only
+        read the file could not tell."""
         cmd = self._launches()[-1]
-        m = re.search(r"\. (\S+local-model\.env)", cmd)
+        m = re.search(r"^(.*?local-model\.env[^;]*; set \+a;)", cmd)
         if not m:
             return []
-        path = m.group(1).strip("'\"")
-        with open(path) as fh:
-            return [ln.strip().replace("'", "") for ln in fh if ln.strip()]
+        probe = m.group(1) + (
+            ' python3 -c "import os;print(chr(10).join('
+            "f'{k}={v}' for k, v in os.environ.items() if k.startswith('ANTHROPIC_')"
+            ' or k.startswith(\'CLAUDE_CODE_MAX\')))"')
+        out = subprocess.run(["sh", "-c", probe], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True).stdout
+        return [ln for ln in out.splitlines() if ln.strip()]
 
     def test_local_session_launches_against_the_local_endpoint(self):
         sm = self.make_manager()
@@ -7070,6 +7112,12 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
             stdout=subprocess.PIPE, text=True).stdout
         self.assertEqual(out, hostile)                       # survived intact
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "pwned")))
+
+    def test_guard_denies_reading_the_credential_file(self):
+        """0600 stops other uids, not the sessions themselves — they run as the
+        uid that owns it, and this file's whole content IS the secret."""
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        self.assertIn("Read(~/.turma/local-model.env)", deny)
 
     def test_stale_env_file_is_removed_when_config_goes(self):
         """It holds a live gateway key under a HOST bind mount; leaving it after
@@ -7295,6 +7343,32 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm.registry = []
         sm.resume_transcript(older, cwd)
         self.assertEqual(sm.registry[-1]["modelSource"], "local")
+
+    def test_resume_any_uses_the_worktree_s_LATEST_closed_record(self):
+        """self.closed is append-ordered, so the naive lookup returns the
+        EARLIEST record for a worktree — a session later switched back to the
+        subscription and killed again would be resumed onto the local model
+        anyway. The last thing the operator chose is the answer."""
+        sm = self.make_manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "lllll")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        # A conversation from BEFORE a "clear context", so it matches no closed
+        # record by id and has to fall back to the worktree.
+        orphan_tid = "66666666-6666-4666-8666-666666666666"
+        open(os.path.join(proj, orphan_tid + ".jsonl"), "w").write("{}\n")
+        base = {"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                "worktreePath": cwd, "status": "running", "rcName": "r",
+                "tmuxName": "t", "ttydPort": 7700}
+        # Same worktree, killed twice: first on local, later on subscription.
+        sm._remember_closed({**base, "id": "aaaaa", "modelSource": "local",
+                             "claudeSessionId": "88888888-8888-4888-8888-888888888888"})
+        sm._remember_closed({**base, "id": "bbbbb", "modelSource": "subscription",
+                             "claudeSessionId": "77777777-7777-4777-8777-777777777777"})
+        sm.registry = []
+        sm.resume_transcript(orphan_tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
 
     def test_resume_any_foreign_transcript_defaults_to_subscription(self):
         """No closed record means no answer — never a guess."""
