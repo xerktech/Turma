@@ -10,6 +10,7 @@ docker/tmux/git needed.
 """
 
 import base64
+import contextlib
 import datetime
 import gzip
 import http.server
@@ -19,6 +20,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import shutil
 import signal
 import struct
@@ -7055,6 +7057,44 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         self.assertNotIn("sk-abc", self._launches()[-1])
         self.assertNotIn("sk-abc", " ".join(self._launch_argv()))
 
+    def test_env_file_quotes_hostile_values(self):
+        """The file is SOURCED by a shell, so an unquoted value would execute.
+        The defence had no test, so removing the quoting shipped green."""
+        hostile = "k'; touch " + os.path.join(self.tmp, "pwned") + "; echo '"
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY=hostile,
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"):
+            path = ha.write_local_model_env(os.path.join(self.tmp, "lm.env"))
+        out = subprocess.run(
+            ["sh", "-c", f". {shlex.quote(path)}; printf %s \"$ANTHROPIC_AUTH_TOKEN\""],
+            stdout=subprocess.PIPE, text=True).stdout
+        self.assertEqual(out, hostile)                       # survived intact
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "pwned")))
+
+    def test_stale_env_file_is_removed_when_config_goes(self):
+        """It holds a live gateway key under a HOST bind mount; leaving it after
+        a rotation or removal keeps a working credential on disk forever."""
+        path = os.path.join(self.tmp, "lm.env")
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY="sk-abc",
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"):
+            ha.write_local_model_env(path)
+        self.assertTrue(os.path.exists(path))
+        ha.discard_local_model_env(path)
+        self.assertFalse(os.path.exists(path))
+        ha.discard_local_model_env(path)                     # idempotent
+
+    def test_launch_fallback_persists_and_clears_the_key(self):
+        sm = self.make_manager(configured=False)
+        sess = self._session(sm, source="local")
+        env_path = os.path.join(ha.REGISTRY_DIR, "local-model.env")
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        open(env_path, "w").write("ANTHROPIC_AUTH_TOKEN=stale\n")
+        sm._launch_tmux(sess)
+        self.assertEqual(sess["modelSource"], "subscription")
+        sm.save.assert_called()                  # the demotion reaches disk
+        self.assertFalse(os.path.exists(env_path))
+
     def test_env_file_is_owner_only(self):
         """It holds the gateway credential, so nothing else on the host may
         read it — that is the entire reason it exists rather than argv."""
@@ -7196,14 +7236,22 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         self.assertEqual(revived["modelSource"], "local")
         self.assertNotIn("--model", self._launches()[-1])
 
-    def _migrate_in(self, sm, source):
-        """Run the shared migration/resume-any record build for a moved session."""
+    def _migrate_in(self, sm, source, launch=True):
+        """Run the shared migration/resume-any record build for a moved session.
+
+        launch=False stubs the launch, so the RECORD's own validation is what is
+        being asserted — otherwise _launch_tmux's fallback demotes an
+        unconfigured host anyway and the re-validation could be deleted without
+        a single test noticing."""
         cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "mmmmm")
         os.makedirs(cwd, exist_ok=True)
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
         os.makedirs(proj, exist_ok=True)
         open(os.path.join(proj, "t-1.jsonl"), "w").write("{}\n")
-        sm._resume_at_cwd("t-1", cwd, extra={"modelSource": source, "model": "sonnet"})
+        ctx = (mock.patch.object(sm, "_launch_tmux") if not launch
+               else contextlib.nullcontext())
+        with ctx:
+            sm._resume_at_cwd("t-1", cwd, extra={"modelSource": source, "model": "sonnet"})
         return sm.registry[-1] if sm.registry else {}
 
     def test_resume_any_transcript_keeps_the_local_model(self):
@@ -7226,6 +7274,28 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm.resume_transcript(tid, cwd)
         self.assertEqual(sm.registry[-1]["modelSource"], "local")
 
+    def test_resume_any_pre_restart_transcript_keeps_the_local_model(self):
+        """"Restart (clear context)" MOVES claudeSessionId, so a session's
+        earlier conversations stay resumable while matching no closed record by
+        id — and resuming one silently returned a failed-over session to the
+        exhausted subscription. Every conversation in a worktree is the same
+        lineage, so the worktree answers for all of them."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "ppppp")
+        os.makedirs(cwd, exist_ok=True)
+        sess.update({"worktreePath": cwd, "repo": "Turma",
+                     "repoPath": os.path.join(self.tmp, "Turma")})
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        older = "55555555-5555-4555-8555-555555555555"   # the pre-restart one
+        for tid in (older, sess["claudeSessionId"]):
+            open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        sm._remember_closed(sess)      # closed record pins only the NEWER id
+        sm.registry = []
+        sm.resume_transcript(older, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "local")
+
     def test_resume_any_foreign_transcript_defaults_to_subscription(self):
         """No closed record means no answer — never a guess."""
         sm = self.make_manager()
@@ -7237,6 +7307,28 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
         sm.resume_transcript(tid, cwd)
         self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
+
+    def test_session_payload_reports_the_model_source(self):
+        """Both the UI mark and the hub's /model 409 read this field off the
+        live session payload; dropping it disables both silently."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                     "branch": None, "root": False, "label": None, "summary": None,
+                     "createdAt": ha.now_iso(), "baseRef": None})
+        os.makedirs(sess["repoPath"], exist_ok=True)
+        # The git/usage side of the payload is not what this asserts.
+        p = mock.patch.object(sm, "_session_git", return_value=({}, {}))
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertEqual(sm._session_payload(sess, refresh=False)["modelSource"], "local")
+        sess["modelSource"] = "subscription"
+        self.assertEqual(sm._session_payload(sess, refresh=False)["modelSource"],
+                         "subscription")
+        # A record predating the field reads as subscription, never as absent.
+        sess.pop("modelSource")
+        self.assertEqual(sm._session_payload(sess, refresh=False)["modelSource"],
+                         "subscription")
 
     def test_closed_payload_reports_the_model_source(self):
         """The Ended card's mark reads this field; without it the mark can never
@@ -7295,7 +7387,8 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         though the source did, and launching at an endpoint that isn't there is
         worse than landing on the subscription."""
         sm = self.make_manager(configured=False)
-        self.assertEqual(self._migrate_in(sm, "local")["modelSource"], "subscription")
+        self.assertEqual(
+            self._migrate_in(sm, "local", launch=False)["modelSource"], "subscription")
 
     def test_noop_for_non_running_session(self):
         sm = self.make_manager()

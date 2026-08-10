@@ -104,16 +104,25 @@ denials re-implemented in a weaker permission system.
 Claude Code assumes 200k for a model it does not recognise and would compact far
 too late for a 64k window, and the tail then truncates server-side instead.
 
-Every relaunch path keeps the session's model source — restart, stop/start,
-resume-on-boot, queue drain, resume of an ended session, **resume-any-transcript
-(the dashboard's Resume picker)**, and migration to another host. The last three
-were each missed on a successive pass and silently returned a failed-over
-session to the exhausted subscription, restoring its `--model` alias with it. Two
-rules keep it honest: the closed record carries the source so a resume can
-recover it, and a migration RE-VALIDATES against the target's own configuration,
-so moving onto a host with no local model falls back rather than launching at an
-endpoint that is not there. A transcript with no closed record (foreign or
-pruned) has no answer and correctly defaults to the subscription.
+**Every path that creates or rebuilds a session record keeps its model source**
+— spawn, provision, queue drain, start, restart, resume of an ended session,
+resume-any-transcript (the dashboard's Resume picker), migration in, and
+resume-on-boot. Four successive QA passes each found this false on a *different*
+one of those routes, every time silently returning a failed-over session to the
+exhausted subscription and restoring its `--model` alias with it. Three rules
+keep it honest:
+
+- the closed record carries the source, so a resume can recover it;
+- resume-any matches that record by transcript id **and then by worktree** —
+  "Restart (clear context)" moves a session's transcript id, so its earlier
+  conversations stay resumable while matching nothing by id;
+- a migration RE-VALIDATES against the target's own configuration, so moving
+  onto a host with no local model falls back rather than launching at an
+  endpoint that is not there.
+
+A transcript with no closed record at all (foreign or pruned) has no answer and
+correctly defaults to the subscription. `--model` is suppressed for a local
+session at the single launch choke point, so it cannot diverge per route.
 
 ## Known limitations (found by the QA pass, accepted for this change)
 

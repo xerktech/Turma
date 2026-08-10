@@ -1358,3 +1358,73 @@ test("sessMeta shows the repo and branch, dropping blanks", () => {
   // Repos-root sessions have no repo/branch of their own.
   assert.equal(sessMeta({ root: true, repo: "" }), "repos root");
 });
+
+// --- local-model failover, on the page you actually scan (XERK-246) ----------
+// A session on the self-hosted model is running a much weaker model, so it must
+// never be indistinguishable from a subscription one at a glance.
+
+test("local mark: shown on a live card running the self-hosted model, not on its neighbour", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    { ...working("11111", "On local"), modelSource: "local",
+      modelSourceAt: "2026-08-10T12:00:00Z" },
+    { ...working("22222", "On subscription"), modelSource: "subscription" },
+  ]);
+  render({ now, agents: [h] });
+  const a = els.active.innerHTML;
+  assert.equal((a.match(/local-mark/g) || []).length, 1,
+    "exactly one card carries the mark");
+  // The marked card is the local one: the mark sits inside the same card body,
+  // ahead of the next card's title.
+  const localAt = a.indexOf("On local"), subAt = a.indexOf("On subscription");
+  const markAt = a.indexOf("local-mark");
+  const [first, second] = localAt < subAt ? [localAt, subAt] : [subAt, localAt];
+  const markBelongsToFirst = markAt > first && markAt < second;
+  assert.equal(markBelongsToFirst, localAt === first,
+    "the mark belongs to the local session's card");
+});
+
+test("local mark: shown on an ENDED row — reading the transcript is when it matters", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [
+    { id: "99999", repo: "repoX", summary: "Killed on local", modelSource: "local",
+      closedAt: new Date(now - 60000).toISOString(), worktreePath: "/w/x" },
+  ];
+  render({ now, agents: [h] });
+  assert.match(els.ended.innerHTML, /local-mark/);
+});
+
+test("local mark: absent when the session never left the subscription", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Plain")]);
+  render({ now, agents: [h] });
+  assert.doesNotMatch(els.active.innerHTML, /local-mark/);
+});
+
+test("composer: 'Run against' appears only when the host reports a local model", () => {
+  // Without this control an operator can fail EXISTING sessions over but cannot
+  // start any new work once usage is gone, which is half the point.
+  const open = (h) => {
+    const page = loadPage();
+    const { now } = host([]);
+    page.setCache({ now, agents: [h] });
+    page.render({ now, agents: [h] });
+    page.toggleComposer("hostA::repoX", "repoX");    // open the repo's composer
+    return page.els.spawn.innerHTML;
+  };
+  const withLocal = open({
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
+    localModel: { available: true, model: "gpt-oss:120b" },
+  });
+  assert.match(withLocal, /Run against/);
+  assert.match(withLocal, /gpt-oss:120b/, "names the host's actual model");
+
+  const without = open({
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
+    localModel: { available: false },
+  });
+  assert.doesNotMatch(without, /Run against/);
+});

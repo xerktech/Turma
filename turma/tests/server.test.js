@@ -5755,6 +5755,7 @@ test("control WS: a channel that pongs is kept past the dead-after window", asyn
 const migHost = (device, site, {
   session = "s1", repo = "Turma", repos = ["Turma"], status = "running",
   root = false, transcriptId = "trans-" + device, extraSessions = [],
+  modelSource = "local",
 } = {}) =>
   request("POST", "/api/heartbeat", {
     body: {
@@ -5766,6 +5767,7 @@ const migHost = (device, site, {
           id: session, status, root, repo, transcriptId,
           worktreePath: `/git/.turma/worktrees/${repo}/${session}`,
           model: "opus", permissionMode: "auto", summary: "Fix the logs",
+          modelSource,
           ticket: { key: "ENG-9", siteKey: site, url: "u", summary: "Fix the logs", branch: "ENG-9" },
         },
         ...extraSessions,
@@ -5859,6 +5861,10 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(imp.cwd, "/git/.turma/worktrees/Turma/s1");
   assert.equal(imp.repo, "Turma");
   assert.equal(imp.model, "opus");
+  // The moved session must arrive still failed over (XERK-246); without this
+  // the whole chain — session payload, migration meta, importSession command —
+  // could drop it and every suite would stay green.
+  assert.equal(imp.modelSource, "local");
   assert.equal(imp.ticket.key, "ENG-9");
   assert.equal(imp.migratedFrom.host, "mgA");
   assert.equal(m.importCmdId, imp.cmdId);
@@ -6234,39 +6240,3 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
 });
 
-test("migration meta and the import command both carry modelSource", async () => {
-  // Three links in the chain (hub meta, importSession command, agent forward).
-  // The previous version of this test only asserted an export was queued, so
-  // dropping modelSource anywhere in the chain shipped green.
-  await request("POST", "/api/heartbeat", {
-    body: {
-      device: "mv1", localModel: { available: true, model: "gpt-oss:120b" },
-      repos: [{ name: "R", path: "/r" }],
-      sessions: [{
-        id: "m1", repo: "R", status: "running", modelSource: "local",
-        transcriptId: "44444444-4444-4444-8444-444444444444",
-        worktreePath: "/r/.turma/worktrees/R/m1", root: false,
-      }],
-    },
-    headers: agentHeaders,
-  });
-  await request("POST", "/api/heartbeat", {
-    body: {
-      device: "mv2", localModel: { available: true, model: "gpt-oss:120b" },
-      repos: [{ name: "R", path: "/r" }], sessions: [],
-    },
-    headers: agentHeaders,
-  });
-  const res = await request("POST", "/api/agents/mv1/sessions/m1/migrate", {
-    body: { host: "mv2" }, headers: userHeaders,
-  });
-  assert.equal(res.status, 200, JSON.stringify(res.body));
-  const beat = await request("POST", "/api/heartbeat", {
-    body: { device: "mv1" }, headers: agentHeaders });
-  const exp = (beat.body.commands || []).find((c) => c.type === "exportSession");
-  assert.ok(exp, "export queued on the source");
-  // The meta the hub composed for the target must name the model source, or the
-  // moved session lands on the subscription.
-  const state = await request("GET", "/api/agents", { headers: userHeaders });
-  assert.ok(state.status === 200);
-});

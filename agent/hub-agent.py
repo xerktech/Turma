@@ -585,14 +585,34 @@ MODEL_SOURCES = {"subscription", "local"}
 LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
 
 
+_local_model_complaints = set()
+
+
 def local_model_configured():
     """True when this host can run a session on the self-hosted model.
 
     Both halves are required: an endpoint with no key (or the reverse) would
     launch a session that dies on its first request, which is strictly worse
-    than not offering the switch at all."""
-    return bool(LOCAL_MODEL_BASE_URL and LOCAL_MODEL_API_KEY
-                and LOCAL_MODEL_NAME_RE.fullmatch(LOCAL_MODEL_NAME))
+    than not offering the switch at all.
+
+    A PARTIAL configuration is the confusing case — the control simply never
+    appears and /model-source 409s — so it says why, once per distinct reason
+    (this runs every heartbeat)."""
+    if not LOCAL_MODEL_BASE_URL and not LOCAL_MODEL_API_KEY:
+        return False                       # feature simply off; nothing to say
+    reason = None
+    if not LOCAL_MODEL_BASE_URL:
+        reason = "LOCAL_MODEL_API_KEY is set but LOCAL_MODEL_BASE_URL is not"
+    elif not LOCAL_MODEL_API_KEY:
+        reason = "LOCAL_MODEL_BASE_URL is set but LOCAL_MODEL_API_KEY is not"
+    elif not LOCAL_MODEL_NAME_RE.fullmatch(LOCAL_MODEL_NAME):
+        reason = f"LOCAL_MODEL_NAME {LOCAL_MODEL_NAME!r} is not a usable model name"
+    if reason:
+        if reason not in _local_model_complaints:
+            _local_model_complaints.add(reason)
+            log(f"local model unavailable: {reason} — the failover is off on this host")
+        return False
+    return True
 
 
 def resolve_model_source(source):
@@ -643,6 +663,21 @@ def write_local_model_env(path):
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)          # atomic: a launch never sees a partial file
     return path
+
+
+def discard_local_model_env(path):
+    """Remove the settings file when the host no longer has a local model.
+
+    It holds the gateway credential and lives under REGISTRY_DIR, which the
+    deployment mounts from the host — so a rotated or removed configuration
+    would otherwise leave a working key on disk forever."""
+    try:
+        os.remove(path)
+        log(f"removed stale {path} (local model no longer configured)")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"could not remove {path}: {e}")
 
 
 def local_model_env_pairs():
@@ -8844,6 +8879,17 @@ class SessionManager:
                     f"host has none configured — launching on the subscription")
                 sess["modelSource"] = "subscription"
                 on_local = False
+                # Persist it: without this sessions.json keeps saying `local`
+                # while the session actually runs on the subscription, and the
+                # UI mark disagrees with reality until something else saves.
+                try:
+                    self.save()
+                except Exception:
+                    pass
+                # The configuration is gone, so the key on disk is stale. It
+                # lives in a host bind mount, so leaving it there keeps a live
+                # credential around indefinitely after a rotation or removal.
+                discard_local_model_env(os.path.join(REGISTRY_DIR, "local-model.env"))
         model = sess.get("model")
         # A session on the self-hosted model takes its model from ANTHROPIC_MODEL
         # in the env prefix, and --model OVERRIDES that: launching with both asks
@@ -9624,8 +9670,20 @@ class SessionManager:
         # it to the exhausted subscription, which is the halt this exists to
         # prevent. A transcript we have no closed record for (a foreign or
         # pruned one) has no answer, and correctly defaults to subscription.
+        # Match on the transcript id first, then on the WORKTREE. "Restart
+        # (clear context)" moves a session's claudeSessionId, so its earlier
+        # conversations stay resumable while matching no record by id — and
+        # resuming one of those would silently return a failed-over session to
+        # the exhausted subscription. Every conversation in a worktree belongs
+        # to the same lineage, so the closed record for that worktree is the
+        # answer for all of them.
         closed = next((c for c in self.closed
                        if c.get("claudeSessionId") == transcript_id), None)
+        if closed is None and cwd:
+            closed = next((c for c in self.closed
+                           if c.get("worktreePath")
+                           and os.path.normpath(c["worktreePath"]) == os.path.normpath(cwd)),
+                          None)
         extra = {"modelSource": closed.get("modelSource")} if closed else None
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
