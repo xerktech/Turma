@@ -7298,6 +7298,13 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         # nothing to do with what they assert. (It also stops the suite leaking
         # real ttyd processes onto the developer's TTYD_PORT_BASE range.)
         sm._launch_ttyd = mock.Mock()
+        # ManagerMixin does NOT patch REPOS_ROOT, so these tests were reading
+        # the developer's REAL git root — which is why they passed here and
+        # errored on CI: `scan_repos()` happened to find a Turma checkout.
+        # Point it at a scratch root so the fixtures own everything they assert.
+        pr = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        pr.start()
+        self.addCleanup(pr.stop)
         vals = {"LOCAL_MODEL_BASE_URL": "https://gw.example.com/v1",
                 "LOCAL_MODEL_API_KEY": "sk-abc",
                 "LOCAL_MODEL_NAME": "gpt-oss:120b"} if configured else {
