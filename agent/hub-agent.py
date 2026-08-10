@@ -1344,17 +1344,18 @@ def _finalize_usage(acc):
         # windows the UI shows travel.
         "models": sorted(
             (
-                {
-                    "model": name,
-                    "totals": dict(m["totals"]),
-                    "today": dict(m["days"].get(window[-1]) or _usage_bucket()),
-                    "week": _sum_days(m["days"], window),
-                }
-                for name, m in acc.models.items()
+              {
+                "model": name,
+                "totals": dict(m["totals"]),
+                "today": dict(m["days"].get(window[-1]) or _usage_bucket()),
+                "week": _sum_days(m["days"], window),
+              }
+              for name, m in acc.models.items()
+              if not name.startswith("<")
             ),
             key=lambda m: _total_tokens(m["totals"]),
             reverse=True,
-        ),
+          ),
     }
 
 
