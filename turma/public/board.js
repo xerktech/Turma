@@ -8,6 +8,7 @@
   const CATEGORIES = [
     ["todo", "To Do"],
     ["inprogress", "In Progress"],
+    ["review", "In Review"],
     ["done", "Done"],
   ];
   const SLOTS = 8; // categorical palette --s1..--s8 (app.css)
@@ -21,10 +22,21 @@
   // Defensive: an unknown/missing statusCategory lands in To Do rather than
   // vanishing (the agent maps Jira's fixed new/indeterminate/done keys, but an
   // older agent or a hand-fed payload might not).
-  function categoryOf(t) {
-    const c = t && t.statusCategory;
-    return c === "inprogress" || c === "done" ? c : "todo";
+  function isReviewStatus(t) {
+    const s = t && t.status;
+    if (!s) return false;
+    // Match review or testing keywords on word boundaries, case-insensitive.
+    // Allows phrases like "In Review", "Ready for Test", etc., but not substrings
+    // inside other words (e.g., "Attestation").
+    return /\b(review(?:ing)?|testing|test|qa)\b/i.test(s);
   }
+    function categoryOf(t) {
+        const c = t && t.statusCategory;
+        if (c === "inprogress") {
+            return isReviewStatus(t) ? "review" : "inprogress";
+        }
+        return c === "done" ? "done" : "todo";
+    }
 
   function ticketSort(a, b) {
     return String(b.updated || "").localeCompare(String(a.updated || ""));
@@ -661,7 +673,7 @@
     const o = opts || {};
     const allKeys = o.allKeys || sites.map(s => s.siteKey);
     const shown = sites.filter(s => !filter || s.siteKey === filter);
-    const cards = { todo: [], inprogress: [], done: [] };
+    const cards = { todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {
       const color = orgColor(site.siteKey, allKeys);
       for (const t of site.tickets) {
@@ -765,7 +777,7 @@
   }
 
   const api = {
-    CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr,
+    CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
