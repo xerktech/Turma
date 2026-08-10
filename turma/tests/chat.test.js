@@ -1327,6 +1327,37 @@ test("live status bar: agents keep the bar up after the turn ends", () => {
   } finally { clearDom(); }
 });
 
+// `main` is the conversation already on screen. A list carrying only it means
+// nothing is delegated, so raising a "Background agents…" bar for it would claim
+// work that isn't running — the same carve-out live_subagents makes agent-side.
+test("live status bar: a main-only list does not claim background agents", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([{ sel: true, type: "main", label: "" }]);
+    updateLiveStatus();
+    assert.equal(bar.hidden, true);
+    assert.equal(bar.innerHTML, "");
+  } finally { clearDom(); }
+});
+
+// Rows arrive from a pane scrape via the hub; a buggy agent can send junk and it
+// must not throw (an uncaught TypeError costs that whole repaint).
+test("live status bar: junk rows are dropped, not thrown on", () => {
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([null, 7, {}, { type: "qa", label: "QA it" }]);
+    assert.doesNotThrow(() => updateLiveStatus());
+    assert.equal(bar.hidden, false);
+    assert.match(bar.innerHTML, /QA it/);
+    // ...and a list of nothing BUT junk raises no bar at all.
+    __setLiveAgents([null, {}, 7]);
+    assert.doesNotThrow(() => updateLiveStatus());
+    assert.equal(bar.hidden, true);
+  } finally { clearDom(); }
+});
+
 test("live status bar: no turn and no agents -> hidden, as before", () => {
   const bar = fakeStatusBar();
   try {

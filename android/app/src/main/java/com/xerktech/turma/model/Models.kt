@@ -738,6 +738,12 @@ data class TailFrame(
     val entries: List<TailEntry> = emptyList(),
     val text: String = "",
     val status: TurnStatus? = null,
+    // The session's live agent list, beside `status` rather than inside it: the
+    // two stop being true at different moments (XERK-245). `status` means "a
+    // turn is running" and clears the instant it ends, while a background agent
+    // keeps going past that. Empty from a hub/agent predating the field, which
+    // leaves the `status.agents` behaviour it had before.
+    val agents: List<AgentRow> = emptyList(),
 )
 
 @Serializable

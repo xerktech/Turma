@@ -7064,6 +7064,87 @@ class TestParsePaneAgents(unittest.TestCase):
             self.assertEqual(ha.parse_pane_agents(cap), [])
             self.assertEqual(ha.live_subagents(cap), [])
 
+    def test_a_composer_less_full_screen_view_yields_nothing(self):
+        # Trimmed from a REAL capture that reproduced the defect: a tool result
+        # whose continuation lines are bare rules, the assistant's reply, then
+        # `/status` — a full-screen view with no composer. Anchoring on "the
+        # last ─ rule" made that reply's own ● bullet a focused agent named
+        # after the sentence, i.e. "working" forever with review suppressed.
+        cap = "\n".join([
+            "❯ print six 30-char rules",
+            "● I'll print them.",
+            "  ⎿  " + "─" * 30,
+            "     " + "─" * 30,
+            "     " + "─" * 30,
+            "     … +3 lines",
+            "",
+            "● Six 30-char rules, as expected. Still nothing for me to act on.",
+            "",
+            "✻ Sautéed for 1s",
+            "",
+            "❯ /status",
+            "",
+            "   Settings  Status   Config   Usage   Stats",
+            "   Version:          2.1.226",
+            "",
+            "   Esc to cancel",
+        ])
+        self.assertEqual(ha.parse_pane_agents(cap), [])
+        self.assertEqual(ha.live_subagents(cap), [])
+
+    def test_a_dialogs_own_bullets_below_a_stray_rule_are_not_rows(self):
+        cap = "\n".join([
+            "● Here is the plan.",
+            "  ⎿  " + "─" * 40,
+            "     " + "─" * 40,
+            "",
+            "  Select effort",
+            "  ● High effort (default) ←/→ to adjust",
+            "  ○ Low effort",
+        ])
+        self.assertEqual(ha.parse_pane_agents(cap), [])
+
+    def test_bom_in_the_rows_keeps_parity_with_the_js_mirror(self):
+        # Python's \s does not match U+FEFF and JavaScript's does; tmux passes
+        # those bytes through, so both sides strip it before matching.
+        cap = "\n".join([
+            "─" * 60, "❯ ", "─" * 60,
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            "",
+            "  ﻿◯ qa﻿  QA the change",
+        ])
+        self.assertEqual(ha.parse_pane_agents(cap),
+                         [{"sel": False, "type": "qa", "label": "QA the change"}])
+
+    def test_the_row_list_is_bounded(self):
+        rows = [f"  ◯ a{i}  label {i}" for i in range(500)]
+        cap = "\n".join(["  ⏵⏵ auto mode on (shift+tab to cycle)", ""] + rows)
+        self.assertEqual(len(ha.parse_pane_agents(cap)), ha.PANE_AGENTS_MAX)
+
+    def test_vanishing_rows_are_confirmed_before_they_are_believed(self):
+        # _stable_pane_agents mirrors _stable_pane_busy's asymmetry: rows
+        # appearing are trusted instantly, rows VANISHING are re-read once. A
+        # single capture landing in a repaint gap would otherwise report "no
+        # agents" for a whole 20s beat and re-fire the ready-for-review alert
+        # this feature exists to hold back.
+        state = {}
+        self.assertEqual(
+            [a["type"] for a in ha._stable_pane_agents(PANE_BG_AGENT, "agent-x", state)],
+            ["Explore"])
+        # The rows blink out for one capture, but the re-read still sees them.
+        with mock.patch.object(ha, "_capture_pane", return_value=PANE_BG_AGENT) as cap:
+            again = ha._stable_pane_agents(PANE_NO_AGENTS, "agent-x", state)
+        self.assertEqual([a["type"] for a in again], ["Explore"])
+        self.assertEqual(cap.call_count, 1, "re-read once, on the edge only")
+        # A confirmed disappearance is believed, and costs no re-read next beat.
+        with mock.patch.object(ha, "_capture_pane", return_value=PANE_NO_AGENTS):
+            self.assertEqual(ha._stable_pane_agents(PANE_NO_AGENTS, "agent-x", state), [])
+        with mock.patch.object(ha, "_capture_pane") as cap2:
+            self.assertEqual(ha._stable_pane_agents(PANE_NO_AGENTS, "agent-x", state), [])
+        self.assertEqual(cap2.call_count, 0, "steady empty pays nothing")
+        # A failed capture reports nothing and leaves the memory alone.
+        self.assertEqual(ha._stable_pane_agents(None, "agent-x", state), [])
+
 
 # What `claude -p "/model"` really prints (v2.1.214): the current default's
 # label, then the usage line carrying the login's whole alias list.

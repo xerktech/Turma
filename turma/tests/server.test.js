@@ -17,6 +17,7 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const net = require("net");
+const crypto = require("crypto");
 const { EventEmitter } = require("events");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -111,7 +112,7 @@ hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
-  heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking,
+  heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
@@ -506,6 +507,119 @@ test("sessionWorking: live background agents work even with paneBusy false", () 
   // that died mid-run must not leave its sessions reading working forever.
   assert.equal(sessionWorking({ session: bg }, now - 120000, now), false);
   assert.equal(sessionWorking({ session: { agents: bg.agents } }, now, now), false);
+});
+
+// XERK-245. The `turn` frame's agent rows cross the agent->hub->browser boundary
+// and are the ONLY input to the chat's persistent bar, so the hub re-shapes them
+// rather than forwarding raw: one `null` element threw in agentsHtml and cost a
+// repaint, and nothing else bounds the list.
+test("sanitizeLiveAgents: coerces rows, drops junk, bounds the list", () => {
+  assert.deepEqual(
+    sanitizeLiveAgents([{ sel: 1, type: "qa", label: "QA it" }]),
+    [{ sel: true, type: "qa", label: "QA it" }]);
+  // Non-objects and empty types are dropped, not rendered.
+  assert.deepEqual(sanitizeLiveAgents([null, 7, "x", {}, { type: "" }, { type: "ok" }]),
+    [{ sel: false, type: "ok", label: "" }]);
+  // Absent (older agent) stays null — "can't report", not "none running".
+  assert.equal(sanitizeLiveAgents(undefined), null);
+  assert.equal(sanitizeLiveAgents("nope"), null);
+  // Bounded in count and per-field length.
+  assert.equal(sanitizeLiveAgents(Array.from({ length: 500 }, () => ({ type: "a" }))).length, 32);
+  assert.equal(sanitizeLiveAgents([{ type: "a".repeat(9999) }])[0].type.length, 400);
+});
+
+test("heartbeat: a session's agent rows are sanitized on the way in", async () => {
+  const host = "agents-host";
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host,
+      sessions: [{ id: "s1", status: "running", session: {
+        paneBusy: false, transcriptAgeSec: 5,
+        agents: [null, { type: "qa", label: "QA it" }, { type: "" }],
+      } }],
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(agents[host].sessions[0].session.agents,
+    [{ sel: false, type: "qa", label: "QA it" }]);
+});
+
+// The whole agent -> hub -> browser path for the frame's agent rows, over real
+// sockets. A QA mutation pass deleted this forwarding and every suite stayed
+// green, because nothing in CI crossed the two upgrade handlers (XERK-245).
+test("live: a turn frame's agent rows reach the browser socket", async () => {
+  const host = "wire-host";
+  const sid = "wire-sid";
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: sid, status: "running", repo: "r",
+      worktreePath: "/w", transcriptId: "t1", session: { transcriptAgeSec: 1 } }] },
+  });
+  const tok = (await request("GET", "/api/ws-token", { headers: userHeaders })).body.token;
+
+  const upgrade = (pathName) => new Promise((resolve, reject) => {
+    const sock = net.connect(server.address().port, "127.0.0.1", () => {
+      sock.write(
+        `GET ${pathName} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${crypto.randomBytes(16).toString("base64")}\r\n` +
+        `Sec-WebSocket-Version: 13\r\n\r\n`);
+    });
+    let seen = "";
+    const onData = (b) => {
+      seen += b.toString("latin1");
+      if (!seen.includes("\r\n\r\n")) return;
+      sock.removeListener("data", onData);
+      if (!/ 101 /.test(seen)) return reject(new Error("no upgrade: " + seen.slice(0, 60)));
+      resolve(sock);
+    };
+    sock.on("data", onData);
+    sock.on("error", reject);
+  });
+
+  const browser = await upgrade(`/live/${host}/${sid}?auth=${encodeURIComponent(tok)}`);
+  const frames = [];
+  browser.on("data", (buf) => {
+    // Server->client frames here are small, unmasked, single JSON payloads.
+    for (let off = 0; off + 2 <= buf.length;) {
+      const op = buf[off] & 0x0f;
+      let len = buf[off + 1] & 0x7f, p = off + 2;
+      if (len === 126) { len = buf.readUInt16BE(p); p += 2; }
+      if (p + len > buf.length) break;
+      const payload = buf.slice(p, p + len).toString("utf8");
+      off = p + len;
+      if (op !== 0x1) continue;
+      try { frames.push(JSON.parse(payload)); } catch {}
+    }
+  });
+  const agentSock = await upgrade(`/agent/control?name=${host}&token=agenttok`);
+  const maskedText = (obj) => {
+    const body = Buffer.from(JSON.stringify(obj));
+    const mask = crypto.randomBytes(4);
+    const masked = Buffer.from(body);
+    for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i % 4];
+    return Buffer.concat([Buffer.from([0x81, 0x80 | body.length]), mask, masked]);
+  };
+
+  // The sockets MUST be closed even when an assertion throws: an open one keeps
+  // `test.after`'s server.close() pending, which hangs the whole run instead of
+  // failing it.
+  try {
+    // The turn is OVER (status null) with a background agent still running, plus
+    // a junk element the hub must drop rather than pass to the browser.
+    agentSock.write(maskedText({ turn: sid, text: "", status: null,
+      agents: [null, { sel: false, type: "qa", label: "QA it" }] }));
+    for (let i = 0; i < 60 && !frames.some((f) => f.type === "turn"); i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const turn = frames.find((f) => f.type === "turn");
+    assert.ok(turn, "the browser socket received the turn frame");
+    assert.equal(turn.status, null, "no running turn is faked");
+    assert.deepEqual(turn.agents, [{ sel: false, type: "qa", label: "QA it" }]);
+  } finally {
+    agentSock.destroy();
+    browser.destroy();
+  }
 });
 
 test("readyForReview: a session waiting on background agents is not ready", () => {

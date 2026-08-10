@@ -1138,7 +1138,13 @@
     // work continues. `st` stays the turn's own indicator, so Stop is unaffected.
     const agents = agentsHtml(liveAgents);
     if (!st) {
-      if (!agents) { bar.hidden = true; bar.innerHTML = ""; return; }
+      // Only BACKGROUND agents keep the bar up. `main` is the conversation
+      // already on screen, so a list carrying only it means nothing is
+      // delegated — raising a "Background agents…" bar for it would claim work
+      // that isn't running. Same carve-out the heartbeat makes (live_subagents).
+      if (!agents || !hasBackgroundAgents(liveAgents)) {
+        bar.hidden = true; bar.innerHTML = ""; return;
+      }
       bar.hidden = false;
       bar.innerHTML =
         '<div class="cc-row"><span class="cc-spin"></span>' +
@@ -1267,8 +1273,18 @@
   // tunnel-agent.js). Each subagent row is a button that opens that background
   // agent's transcript (see openSubagentView); "main" is the session itself —
   // already on screen — so it's a plain marker, not a link. Absent/empty -> "".
+  // Is anything actually delegated? `main` is the session's own conversation,
+  // so it never counts. Rows arrive from a pane scrape via the hub, so a
+  // non-object element is possible on a buggy agent and must not throw here.
+  function hasBackgroundAgents(agents) {
+    return Array.isArray(agents)
+      && agents.some((a) => a && typeof a === "object" && a.type && a.type !== "main");
+  }
+
   function agentsHtml(agents) {
-    if (!Array.isArray(agents) || !agents.length) return "";
+    if (!Array.isArray(agents)) return "";
+    agents = agents.filter((a) => a && typeof a === "object" && a.type);
+    if (!agents.length) return "";
     const rows = agents.map((a) => {
       const dot = '<span class="dot' + (a.sel ? " sel" : "") + '"></span>';
       const type = '<span class="atype">' + esc(a.type) + "</span>";
@@ -2301,7 +2317,7 @@
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
-      agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
+      agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
       attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, attachFiles,
       clearAttachments, MAX_ATTACHMENTS,

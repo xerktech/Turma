@@ -4204,34 +4204,53 @@ def parse_pane_prompt(cap):
     return None
 
 
-# The TUI's agent-manager rows, painted below the input box's bottom rule for
-# exactly as long as agents are LIVE: a radio glyph (◉/● = the one in focus,
-# ○/◯ = a background agent), the agent type, then — for a subagent — its short
+# The TUI's agent-manager rows, painted under the COMPOSER FOOTER for exactly as
+# long as agents are LIVE: a radio glyph (◉/● = the one in focus, ○/◯ = a
+# background agent), the agent type, then — for a subagent — its short
 # description, separated from the type by the TUI's 2+-space gutter. Mirrors
 # AGENT_ROW_RE / parseAgentList in tunnel-agent.js (parity contract).
-PANE_RULE_RE = re.compile(r"^─{20,}$")
 PANE_AGENT_ROW_RE = re.compile(r"^\s*([◉●◯○])\s+(\S.*?)\s*$")
 PANE_AGENT_GUTTER_RE = re.compile(r"\s{2,}")
+# A pane is 220x50 (_launch_tmux) and the TUI lists a handful of agents, so this
+# only ever bites a malformed capture; it bounds what reaches the heartbeat.
+PANE_AGENTS_MAX = 32
 
 
 def parse_pane_agents(cap):
     """The live agent rows off a pane capture, as [{sel, type, label}].
 
-    Scanned ONLY below the input box (after the last ─ rule), which is both
-    where the TUI paints them and what keeps the column-0 ● assistant-text
-    bullet from reading as a focused agent. Empty for a capture with no rows —
-    the TUI collapses the list to a "← for agents" hint the moment the last
-    agent finishes, so presence is an exact "an agent is running right now"."""
-    lines = str(cap or "").replace("\r", "").split("\n")
-    bottom = -1
+    Scanned ONLY below the **mode-marker footer line** (`PANE_MODE_RE`, the
+    `⏵⏵ auto mode on …` the composer rides), which is exactly where the TUI
+    paints them. Empty for a capture with no rows — the TUI collapses the list
+    to a "← for agents" hint the moment the last agent finishes, so presence is
+    an exact "an agent is running right now".
+
+    **The anchor must be the footer, never "the last ─ rule".** A rule is not a
+    reliable landmark: `PANE_RULE_RE` matched `line.strip()`, so ANY output line
+    that is 20+ box-drawing dashes became one — and a full-screen view with no
+    composer (`/status`, `/model`, `/help`, `/config`, ctrl+o) leaves that stray
+    rule as the last one on screen, so the assistant prose below it parsed as
+    agent rows. Real tool results on this host already contain such lines. The
+    mode marker exists ONLY while the composer does, so those screens now yield
+    nothing.
+
+    This parser must fail toward EMPTY, never toward a phantom row: a row here
+    means "working" on every status surface AND suppresses ready-for-review, so
+    a false positive strands work silently, while a false negative is only the
+    behaviour we had before the list existed."""
+    # BOM: Python's \s does not match U+FEFF but JavaScript's does, and
+    # `capture-pane` passes those bytes through — dropping it up front is what
+    # keeps this byte-identical to parseAgentList (parity contract).
+    lines = str(cap or "").replace("\r", "").replace("﻿", "").split("\n")
+    anchor = -1
     for i in range(len(lines) - 1, -1, -1):
-        if PANE_RULE_RE.match(lines[i].strip()):
-            bottom = i
+        if PANE_MODE_RE.search(lines[i]):
+            anchor = i
             break
-    if bottom < 0:
+    if anchor < 0:
         return []
     agents = []
-    for raw in lines[bottom + 1:]:
+    for raw in lines[anchor + 1:]:
         m = PANE_AGENT_ROW_RE.match(raw)
         if not m:
             continue
@@ -4244,6 +4263,8 @@ def parse_pane_agents(cap):
             "type": atype,
             "label": " ".join(parts[1:]).strip(),
         })
+        if len(agents) >= PANE_AGENTS_MAX:
+            break
     return agents
 
 
@@ -4260,16 +4281,46 @@ def live_subagents(cap):
             for a in parse_pane_agents(cap) if a["type"] != "main"]
 
 
+def _stable_pane_agents(cap, tmux_name, state):
+    """live_subagents with the had-agents->none edge confirmed once, using
+    per-session `state` the same way _stable_pane_busy does.
+
+    The reason is the same one PANE_IDLE_CONFIRM_SEC exists for, and it matters
+    MORE here: this list drives the working/idle read on every status surface,
+    heartbeats are 20s apart, and a single capture landing in a TUI repaint gap
+    would report "no agents" for a whole interval — re-firing exactly the
+    ready-for-review alert this feature exists to hold back. Asymmetric like the
+    busy read: rows appearing are trusted instantly (nothing paints a phantom
+    row), rows VANISHING are re-read once before we believe them.
+
+    A capture failure (None) leaves the remembered state untouched and reports
+    nothing, so it degrades to paneBusy rather than to a wrong answer."""
+    if cap is None:
+        return []
+    agents = live_subagents(cap)
+    if agents:
+        state["paneAgentsStable"] = True
+        return agents
+    if state.get("paneAgentsStable") and PANE_IDLE_CONFIRM_SEC > 0:
+        time.sleep(PANE_IDLE_CONFIRM_SEC)
+        again = live_subagents(_capture_pane(tmux_name))
+        if again:  # the rows were one frame away -> still delegating
+            state["paneAgentsStable"] = True
+            return again
+    state["paneAgentsStable"] = False
+    return []
+
+
 def _pane_status(tmux_name, state):
-    """(paneBusy, modeActual, panePrompt, agents) for one beat: the busy half
-    goes through _stable_pane_busy's busy->idle flicker suppression (hence
-    `state`), the mode, blocking-dialog and agent-list halves read one shared
-    capture."""
+    """(paneBusy, modeActual, panePrompt, agents) for one beat: the busy and
+    agent-list halves each go through their own flicker suppression (hence
+    `state`), the mode and blocking-dialog halves read one shared capture."""
     if not tmux_name:
         return None, None, None, []
     busy = _stable_pane_busy(tmux_name, state)
     cap = _capture_pane(tmux_name)
-    return busy, parse_pane_mode(cap), parse_pane_prompt(cap), live_subagents(cap)
+    return (busy, parse_pane_mode(cap), parse_pane_prompt(cap),
+            _stable_pane_agents(cap, tmux_name, state))
 
 
 def _capture_pane(tmux_name):

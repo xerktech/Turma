@@ -44,6 +44,9 @@ is in `CLAUDE.md`, and `.claude/rules/agent.md` carries the Python side.
   button, so it must clear the instant the turn ends — while a background agent keeps going past
   that, which is exactly when the operator can no longer tell the session from an idle one. It stays
   on `status` as well while generating, for an older hub that forwards only `status`.
+- `paneAgents` anchors the row scan on the **mode-marker footer**, never on the last `─` rule — see
+  `parse_pane_agents` in `.claude/rules/agent.md` for the composer-less-screen false positive that
+  rule caused, and for why this parser must fail toward empty.
 - **`turn` text only ever moves forward** (`resolveLiveText`): activity summaries strip off the
   REFLOWED tail (`stripActivityTail`); already-committed text is suppressed (`committedDupe`,
   skeleton compare — the pane renders markdown away); and UNCOMMITTED prose HOLDS through

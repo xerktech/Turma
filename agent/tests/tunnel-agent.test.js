@@ -1312,6 +1312,78 @@ test("parsePaneLiveTurn: mirrors hub-agent.py's parse_pane_agents on that pane",
   ]);
 });
 
+// The anchor is the composer's mode footer, NEVER "the last ─ rule". A rule is
+// not a landmark: any output line of 20+ dashes was one, so a full-screen view
+// with no composer (/status, /model, /help, ctrl+o) left a stray conversation
+// rule as the last on screen and parsed the assistant prose below it as agent
+// rows. That reads as "working" forever AND suppresses ready-for-review — the
+// bug this feature exists to fix, inverted. Real tool output on the dev host
+// already contained such lines, so this was reachable, not theoretical.
+// Trimmed from a REAL capture (Claude Code 2.1.226) that reproduced the defect:
+// a tool result whose continuation lines are bare rules, then the assistant's
+// reply, then `/status` — a full-screen view that removes the composer. Under
+// the old "last ─ rule" anchor the reply's own `●` bullet parsed as a focused
+// agent named after the sentence.
+const PANE_STRAY_RULE_THEN_FULLSCREEN = [
+  "❯ print six 30-char rules",
+  "● I'll print them.",
+  "  ⎿  " + "─".repeat(30),
+  "     " + "─".repeat(30),
+  "     " + "─".repeat(30),   // <- the stray rule that used to become the anchor
+  "     … +3 lines",
+  "",
+  "● Six 30-char rules, as expected. Still nothing for me to act on.",
+  "",
+  "✻ Sautéed for 1s",
+  "",
+  "❯ /status",
+  "",
+  "   Settings  Status   Config   Usage   Stats",
+  "   Version:          2.1.226",
+  "",
+  "   Esc to cancel",
+].join("\n");
+
+test("paneAgents: a composer-less full-screen view yields nothing", () => {
+  const { paneAgents } = require("../tunnel-agent.js");
+  assert.deepEqual(paneAgents(PANE_STRAY_RULE_THEN_FULLSCREEN), [],
+    "no mode footer -> no agent rows, ever");
+});
+
+test("paneAgents: a dialog's own bullets below a stray rule are not agent rows", () => {
+  const { paneAgents } = require("../tunnel-agent.js");
+  const pane = [
+    "● Here is the plan.",
+    "  ⎿  " + "─".repeat(40),
+    "     " + "─".repeat(40),   // bare rule -> the old anchor
+    "",
+    "  Select effort",
+    "  ● High effort (default) ←/→ to adjust",
+    "  ○ Low effort",
+  ].join("\n");
+  assert.deepEqual(paneAgents(pane), []);
+});
+
+test("paneAgents: BOM in the rows keeps py/js parity", () => {
+  // Python's \s does not match U+FEFF and JS's does; tmux passes the bytes
+  // through, so both sides strip it before matching or the two disagree.
+  const { paneAgents } = require("../tunnel-agent.js");
+  const pane = [
+    "─".repeat(60), "❯ ", "─".repeat(60),
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    "",
+    "  ﻿◯ qa﻿  QA the change",
+  ].join("\n");
+  assert.deepEqual(paneAgents(pane), [{ sel: false, type: "qa", label: "QA the change" }]);
+});
+
+test("paneAgents: the row list is bounded", () => {
+  const { paneAgents } = require("../tunnel-agent.js");
+  const rows = Array.from({ length: 500 }, (_, i) => `  ◯ a${i}  label ${i}`);
+  const pane = ["  ⏵⏵ auto mode on (shift+tab to cycle)", "", ...rows].join("\n");
+  assert.equal(paneAgents(pane).length, 32);
+});
+
 test("parsePaneLiveTurn: the list clears once the last agent finishes", () => {
   // The TUI collapses it back to the "← for agents" hint, which is what makes
   // presence an exact "an agent is running right now".

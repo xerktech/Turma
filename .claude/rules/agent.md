@@ -147,15 +147,27 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), **only on the busy→idle EDGE**. Tests:
     `TestStablePaneBusy`.
 - **`agents` is the other half of the activity read** (XERK-245): `live_subagents` off the same
-  capture — the TUI's own agent rows, which it paints below the input box for exactly as long as
-  agents are LIVE and collapses to a "← for agents" hint the moment the last one ends.
+  capture — the TUI's own agent rows, which it paints for exactly as long as agents are LIVE and
+  collapses to a "← for agents" hint the moment the last one ends.
   - It exists because **`paneBusy` cannot see delegated work**: launching a background agent ENDS
     the main turn, and the pane then says "Waiting for N background agent to finish" — no interrupt
     hint, and no ellipsis for `PANE_SPINNER_RE`. **Do not widen the busy read to cover it**;
     `paneBusy` means the session's OWN turn is running, which is what the chat's Stop button and
     `_poll_pending_inputs`' idle gate key on.
+  - **The scan is anchored on the mode-marker footer (`PANE_MODE_RE`), NEVER on "the last ─ rule".**
+    A rule is not a landmark — any tool-output line of 20+ dashes is one (real results on the dev
+    host have them), and a composer-less full-screen view (`/status`, `/model`, `/help`, `/config`,
+    ctrl+o) leaves that stray rule last, so the assistant prose under it parsed as agent rows. The
+    marker exists only while the composer does.
+  - **This parser must fail toward EMPTY.** A phantom row means "working" on every status surface
+    AND suppresses ready-for-review, stranding work silently; a missed row is only the behaviour
+    that predates the list. Bounded by `PANE_AGENTS_MAX`; U+FEFF is stripped for JS parity.
+  - `_stable_pane_agents` confirms the had-agents→**none** edge with one re-read, mirroring
+    `_stable_pane_busy`'s asymmetry — a repaint-gap capture would otherwise drop the list for a
+    whole 20s beat and re-fire the alert this holds back.
   - `main` is dropped (every surface's subject already), so a non-empty list means delegated work is
-    in flight. Mirrors `parseAgentList` in `tunnel-agent.js`. Tests: `TestParsePaneAgents`.
+    in flight. Mirrors `parseAgentList`/`paneAgents` in `tunnel-agent.js`. Tests:
+    `TestParsePaneAgents`.
 - `modeActual` — the mode the TUI is REALLY in, off the footer marker (glyph-anchored so quoted text
   can't match; read beside the stable busy in `_pane_status`). `_session_payload` **reconciles the
   stored `permissionMode` to it** each beat, since the operator can cycle by hand. Tests:

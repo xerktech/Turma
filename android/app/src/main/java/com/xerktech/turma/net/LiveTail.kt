@@ -25,7 +25,12 @@ import kotlin.coroutines.coroutineContext
  */
 sealed interface LiveEvent {
     data class Tail(val entries: List<TailEntry>) : LiveEvent
-    data class Turn(val text: String, val status: TurnStatus?) : LiveEvent
+    data class Turn(
+        val text: String,
+        val status: TurnStatus?,
+        // Live agents ride the frame, not `status` — see TailFrame (XERK-245).
+        val agents: List<com.xerktech.turma.model.AgentRow> = emptyList(),
+    ) : LiveEvent
     /** Emitted on connect/disconnect so the UI can show a live/offline dot. */
     data class Connected(val up: Boolean) : LiveEvent
 }
@@ -64,7 +69,7 @@ class LiveTail(private val client: HubClient, private val config: Config) {
                         val frame = try { TurmaJson.decodeFromString<TailFrame>(text) } catch (_: Exception) { return }
                         when (frame.type) {
                             "tail" -> if (frame.entries.isNotEmpty()) trySend(LiveEvent.Tail(frame.entries))
-                            "turn" -> trySend(LiveEvent.Turn(frame.text, frame.status))
+                            "turn" -> trySend(LiveEvent.Turn(frame.text, frame.status, frame.agents))
                         }
                     }
 

@@ -853,10 +853,20 @@ function isChecklistLine(l) {
 // in the footer region (below the input box) — see parsePaneLiveTurn — so the
 // column-0 ● assistant-text bullet can never be mistaken for a focused agent.
 const AGENT_ROW_RE = /^\s*([◉●◯○])\s+(\S.*?)\s*$/;
+// The composer's mode-marker footer — the ONLY landmark that reliably means
+// "the input box is on screen", and so the anchor the agent rows are found
+// under. Mirrors PANE_MODE_RE in hub-agent.py (parity contract).
+const PANE_MODE_MARKER_RE =
+  /[⏸⏵]+\s+(?:bypass permissions|accept edits|plan mode|auto mode|manual mode) on/;
+// A pane is 220x50 and the TUI lists a handful of agents; this only bites a
+// malformed capture, and bounds what reaches the wire. Mirrors PANE_AGENTS_MAX.
+const PANE_AGENTS_MAX = 32;
 function parseAgentList(lines) {
   const agents = [];
   for (const raw of lines || []) {
-    const m = AGENT_ROW_RE.exec(String(raw == null ? "" : raw));
+    // U+FEFF is stripped for parity: JS's \s matches it and Python's does not,
+    // and `capture-pane` passes those bytes through untouched.
+    const m = AGENT_ROW_RE.exec(String(raw == null ? "" : raw).replace(/﻿/g, ""));
     if (!m) continue;
     const parts = m[2].split(/\s{2,}/);
     const type = (parts[0] || "").trim();
@@ -866,8 +876,23 @@ function parseAgentList(lines) {
       type,
       label: parts.slice(1).join(" ").trim(),
     });
+    if (agents.length >= PANE_AGENTS_MAX) break;
   }
   return agents;
+}
+
+// The agent rows off a whole capture: the region below the LAST mode-marker
+// line. See parse_pane_agents in hub-agent.py for why the anchor is the footer
+// and never "the last ─ rule" — a stray rule in tool output plus a
+// composer-less full-screen view (/status, /model) parsed assistant prose as
+// agents, which reads as "working forever" on every surface.
+function paneAgents(raw) {
+  const lines = String(raw == null ? "" : raw).replace(/﻿/g, "").split("\n");
+  let anchor = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (PANE_MODE_MARKER_RE.test(lines[i])) { anchor = i; break; }
+  }
+  return anchor < 0 ? [] : parseAgentList(lines.slice(anchor + 1));
 }
 
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
@@ -930,10 +955,11 @@ function parsePaneLiveTurn(pane) {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (isRule(lines[i])) { bottom = i; break; }
   }
-  // The agent-manager list, when live, is painted BELOW the input box (after
-  // `bottom`, the box's bottom rule) alongside the mode line — a region the
-  // convo slice below intentionally drops. Parse it there so the assistant
-  // block can't swallow it and the column-0 ● bullet can't fake a row.
+  // The agent-manager list, when live, is painted under the composer's mode
+  // footer — a region the convo slice below intentionally drops. `paneAgents`
+  // anchors on that footer so the assistant block can't swallow it, the
+  // column-0 ● bullet can't fake a row, and a composer-less full-screen view
+  // yields nothing at all.
   //
   // Read BEFORE the busy check, and returned whether or not a turn is running
   // (XERK-245). The TUI paints these rows for exactly as long as agents are
@@ -942,7 +968,7 @@ function parsePaneLiveTurn(pane) {
   // carries no interrupt hint. That is the case this parse exists to catch: the
   // session looks idle on every surface while an agent is still working, and
   // the chat's agent list used to blink out the moment the turn ended.
-  const agents = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
+  const agents = paneAgents(raw);
   if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null, agents };
   let end = lines.length;
   if (bottom >= 0) {
@@ -1460,5 +1486,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, paneAgents, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }

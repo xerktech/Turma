@@ -42,6 +42,26 @@ class SessionsTest {
         )
     }
 
+    // The card's wording, which no test covered — a QA mutation pass removed the
+    // background-agent branch of liveStateLabel and every gate stayed green.
+    @Test fun `liveStateLabel names background agents and pluralizes them`() {
+        val one = LiveSignals(agents = listOf(com.xerktech.turma.model.LiveAgent(type = "qa")))
+        val two = LiveSignals(agents = listOf(
+            com.xerktech.turma.model.LiveAgent(type = "qa"),
+            com.xerktech.turma.model.LiveAgent(type = "Explore"),
+        ))
+        assertEquals("1 background agent",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, one))
+        assertEquals("2 background agents",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, two))
+        // No agents, or a state that isn't WORKING: the plain state word.
+        assertEquals("working",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, LiveSignals()))
+        assertEquals("working", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, null))
+        assertEquals("idle", com.xerktech.turma.ui.liveStateLabel(LiveState.IDLE, one))
+        assertEquals("waiting", com.xerktech.turma.ui.liveStateLabel(LiveState.WAITING, one))
+    }
+
     @Test fun `a session waiting on background agents is not ready for review`() {
         val bg = SessionInfo(
             status = "running",
