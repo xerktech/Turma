@@ -80,7 +80,7 @@
         // trailing ')' only when it isn't part of the URL (e.g. a URL wrapped
         // in parens) — keep it for balanced ones like /wiki/Foo_(bar).
         let url = m[3], trail = "";
-        const tp = /[.,;:!?'"*_]+$/.exec(url);
+        const tp = /[.,;:!?'"*_‘’“”]+$/.exec(url);
         if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
         if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
         out += anchor(url, url) + esc(trail);
