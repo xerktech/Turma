@@ -7291,6 +7291,13 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
     def make_manager(self, configured=True):
         sm = super().make_manager()
         sm.save = mock.Mock()
+        # Stub the real Popen. Without this the launch paths spawn an ACTUAL
+        # ttyd, which exists on a dev box and not on a CI runner — there the
+        # launch raised, set_model_source treated it as a failed relaunch and
+        # reverted the record, and ten tests failed for a reason that had
+        # nothing to do with what they assert. (It also stops the suite leaking
+        # real ttyd processes onto the developer's TTYD_PORT_BASE range.)
+        sm._launch_ttyd = mock.Mock()
         vals = {"LOCAL_MODEL_BASE_URL": "https://gw.example.com/v1",
                 "LOCAL_MODEL_API_KEY": "sk-abc",
                 "LOCAL_MODEL_NAME": "gpt-oss:120b"} if configured else {
