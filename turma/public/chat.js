@@ -1616,14 +1616,6 @@
   function autoGrow() {
     const inp = $("chatInput");
     if (!inp) return;
-    // scrollHeight is 0 for a textarea that isn't laid out — its pane is
-    // `.chat-pane[hidden]` (terminal view) or, on a phone, the whole `.stage` is
-    // display:none. Growing from that pins an inline height:0px that squishes the
-    // box below one line and survives every repaint until a page refresh
-    // (XERK-149). `growCompose` runs this during the chat<->terminal carryDraft,
-    // exactly when the box can be hidden — so skip while hidden and keep the last
-    // laid-out height; the pane's own carryDraft re-grows it when it's shown.
-    if (inp.offsetParent === null) return;
     inp.style.height = "auto";
     inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
   }
