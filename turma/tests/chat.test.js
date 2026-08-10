@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1659,4 +1659,126 @@ test("attachments: an expired staged file is an actionable refusal, not 'Send fa
 
 test("attachments: the per-message cap matches the hub's", () => {
   assert.equal(MAX_ATTACHMENTS, 10);
+});
+
+// --- local-model failover chip (XERK-246) ------------------------------------
+// The control follows the HOST's reported capability, exactly like the 📎
+// follows uploadMaxBytes: an agent reporting no `localModel` cannot fail a
+// session over, so offering the switch would queue a command it silently drops.
+
+test("model source: the switch is offered only when the host reports one", () => {
+  __setModelSourcePending(null);
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  assert.equal(localModelOffered(), true);
+  __setAgent({});                       // an agent predating the failover
+  assert.equal(localModelOffered(), false);
+  __setAgent({ localModel: { available: false } });
+  assert.equal(localModelOffered(), false);
+});
+
+test("model source: a session already on local keeps a way back", () => {
+  // The host's configuration can be removed under a running session; without
+  // this it would be stranded on the local model with no visible switch.
+  __setModelSourcePending(null);
+  __setSess({ id: "s1", modelSource: "local" });
+  __setAgent({});
+  assert.equal(localModelOffered(), true);
+  assert.equal(currentModelSource(), "local");
+});
+
+test("model source: defaults to subscription when the agent never says", () => {
+  __setModelSourcePending(null);
+  __setSess({ id: "s1" });              // no modelSource at all
+  __setAgent({ localModel: { available: true } });
+  assert.equal(currentModelSource(), "subscription");
+});
+
+test("model source: an in-flight switch paints the target, not the stale beat", () => {
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setModelSourcePending({ value: "local", at: Date.now(), sessionId: "s1" });
+  assert.equal(currentModelSource(), "local");
+  assert.equal(modelSourceLabel(), "gpt-oss:120b");
+  // A stale memo must not pin the chip forever if the switch never lands.
+  __setModelSourcePending({ value: "local", at: Date.now() - 120000, sessionId: "s1" });
+  assert.equal(currentModelSource(), "subscription");
+  __setModelSourcePending(null);
+});
+
+test("model source: the menu names the host's actual model", () => {
+  __setModelSourcePending(null);
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  assert.deepEqual(modelSourceOpts().map((o) => o.value), ["subscription", "local"]);
+  assert.equal(modelSourceOpts()[1].label, "gpt-oss:120b");
+  assert.equal(modelSourceLabel(), "Subscription");
+});
+
+test("model source: a pending switch never leaks onto another session", () => {
+  // Regression: the memo was module-global and survived opening a different
+  // session, so a subscription session wore the 🏠 mark and its own switch
+  // click was swallowed by the value === currentModelSource() early-return.
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setSess({ id: "AAAAA", modelSource: "subscription" });
+  __setModelSourcePending({ value: "local", at: Date.now(), sessionId: "AAAAA" });
+  assert.equal(currentModelSource(), "local");        // its own session: honoured
+  __setSess({ id: "BBBBB", modelSource: "subscription" });
+  assert.equal(currentModelSource(), "subscription"); // a different one: ignored
+  __setModelSourcePending(null);
+});
+
+test("model source: a local session's model chip is fixed, not a picker", () => {
+  // Every row the picker could offer is a Claude alias the gateway refuses —
+  // "Default" included, since it resolves to the login default — so offering
+  // the menu can only break the session, with no row to switch back to.
+  __setModelSourcePending(null);
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setSess({ id: "s1", modelSource: "local" });
+  assert.equal(currentModelSource(), "local");
+  __setSess({ id: "s1", modelSource: "subscription" });
+  assert.equal(currentModelSource(), "subscription");
+});
+
+test("model source: a memo with no session id is not honoured blindly", () => {
+  // The read-site guard tolerated a session-less memo, so dropping the
+  // sessionId from setSessionModelSource escaped every test. A memo must know
+  // whose it is.
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setSess({ id: "AAAAA", modelSource: "subscription" });
+  __setModelSourcePending({ value: "local", at: Date.now() });   // no sessionId
+  const painted = currentModelSource();
+  __setModelSourcePending(null);
+  assert.equal(painted, "subscription",
+    "a memo that cannot prove which session it belongs to must not paint one");
+});
+
+test("model source: choosing one actually issues the switch request", () => {
+  // Painting the memo is not the switch. Without the request the chip moves,
+  // the heartbeat never agrees, and the memo ages out — a control that looks
+  // like it worked and did nothing.
+  const calls = [];
+  const realFetch = global.fetch;
+  // renderComposeOpts runs first and reaches for the composer element.
+  const realDoc = global.document;
+  global.document = { getElementById: () => null, querySelectorAll: () => [],
+                      addEventListener() {} };
+  global.fetch = (url, init) => {
+    calls.push({ url, body: init && init.body ? JSON.parse(init.body) : null });
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  try {
+    __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+    __setSess({ id: "AAAAA", modelSource: "subscription" });
+    __setHostKey("hostA");
+    __setModelSourcePending(null);
+    setSessionModelSource("local");
+  } finally {
+    global.fetch = realFetch;
+    if (realDoc === undefined) delete global.document; else global.document = realDoc;
+  }
+  assert.equal(calls.length, 1, "one POST issued");
+  assert.match(calls[0].url, /\/sessions\/AAAAA\/model-source$/);
+  assert.deepEqual(calls[0].body, { modelSource: "local" });
+  __setModelSourcePending(null);
 });

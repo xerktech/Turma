@@ -438,6 +438,8 @@
   // ---- state ----------------------------------------------------------------
   let gen = 0;                      // bumped on every open/close; stale async work checks it
   let hostKey = null, sessionId = null, sess = null, agent = null;
+  // In-flight model-source switch (XERK-246); cleared once the heartbeat agrees.
+  let modelSourcePending = null;
   let buffer = [];                  // merged rich entries {id, role, text, blocks}
   // Prompts typed mid-turn, still waiting in Claude Code's queue (the agent
   // folds queue-operation transcript entries — see foldQueueOp in
@@ -1610,17 +1612,90 @@
         '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
         menuHtml(modeOpts, mode, "data-mode") + "</span></span>" +
       '<span class="cc-right">' + ticketFooterChip(sess) + prFooterChip(sess) +
-        '<span class="cc-opt cc-model">' +
-          '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
-          '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
-          '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
-          menuHtml(mOpts, model, "data-model") + "</span></span>" +
+        (localModelOffered()
+          ? '<span class="cc-opt cc-source' + (currentModelSource() === "local" ? " cc-source-local" : "") + '">' +
+            '<button class="cc-btn" id="ccSourceBtn" title="' +
+            esc("Which model this session runs against. Switching keeps the conversation" +
+                (localModelInfo().model ? " — self-hosted: " + localModelInfo().model : "")) + '">' +
+            (currentModelSource() === "local" ? "🏠" : "☁") +
+            ' <span class="cc-val">' + esc(modelSourceLabel()) + '</span><span class="cc-caret">▾</span></button>' +
+            '<span class="cc-menu" id="ccSourceMenu"><span class="cc-hint">Run against</span>' +
+            menuHtml(modelSourceOpts(), currentModelSource(), "data-source") + "</span></span>"
+          : "") +
+        (currentModelSource() === "local"
+          // A local session's model is fixed by the host's configuration. Every
+          // row the picker could offer is a Claude alias the gateway refuses —
+          // "Default" included, since it resolves to the login default — so the
+          // chip states the model instead of offering a menu that only breaks it.
+          ? '<span class="cc-opt cc-model cc-model-fixed">' +
+            '<span class="cc-btn" title="' +
+            esc("Fixed by this host's self-hosted model configuration. " +
+                "Switch back to the subscription to choose a Claude model.") + '">' +
+            '<span class="cc-val">' + esc(localModelInfo().model || "local model") +
+            "</span> 🧠</span></span>"
+          : '<span class="cc-opt cc-model">' +
+            '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
+            '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
+            '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
+            menuHtml(mOpts, model, "data-model") + "</span></span>") +
       "</span>";
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
+    wireComposeMenu("ccSourceBtn", "ccSourceMenu", "data-source", setSessionModelSource);
   }
+  // ---- local-model failover (XERK-246) --------------------------------------
+  // Running out of Claude usage stops every session on a host at once. A session
+  // can be moved onto that host's self-hosted model and carry on in the SAME
+  // conversation. The control follows the HOST's reported capability, exactly
+  // like the 📎 follows uploadMaxBytes: an agent that reports no `localModel`
+  // cannot do it, so offering the switch would queue a command it silently drops.
+  function localModelInfo(a) { return (a || agent || {}).localModel || {}; }
+  function localModelOffered() {
+    // Also shown when the session is ALREADY local, so a session whose host
+    // later lost its configuration still has a visible way back.
+    return Boolean(localModelInfo().available) || currentModelSource() === "local";
+  }
+  function currentModelSource() {
+    // A memo belongs to the session it was made on. Honouring another session's
+    // memo paints a subscription session as local (the exact confusion the mark
+    // exists to prevent) and swallows its own switch click via the
+    // `value === currentModelSource()` early-return in setSessionModelSource.
+    // A memo must prove WHICH session it belongs to. Tolerating a session-less
+    // one re-opens the leak this guard exists to close (and let a regression
+    // that stopped recording the id ship green).
+    const mine = modelSourcePending && modelSourcePending.sessionId === sessionId;
+    if (mine && Date.now() - modelSourcePending.at < 60000) return modelSourcePending.value;
+    return (sess && sess.modelSource) || "subscription";
+  }
+  function modelSourceLabel() {
+    return currentModelSource() === "local" ? (localModelInfo().model || "local model") : "Subscription";
+  }
+  function modelSourceOpts() {
+    const local = localModelInfo();
+    return [
+      { value: "subscription", label: "Claude subscription" },
+      { value: "local", label: local.model || "Self-hosted model" },
+    ];
+  }
+  async function setSessionModelSource(value) {
+    if (!hostKey || !sessionId || !sess || value === currentModelSource()) return;
+    // Memo-only, like the mode switch: the relaunch takes a moment and the
+    // heartbeat is the thing that confirms it actually happened.
+    modelSourcePending = { value, at: Date.now(), sessionId };
+    renderComposeOpts();
+    try {
+      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model-source", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ modelSource: value }) });
+      if (typeof fastPoll === "function") fastPoll();
+    } catch {}
+  }
+
   async function setSessionModel(value) {
     if (!hostKey || !sessionId || !sess || value === currentModelValue()) return;
+    // The agent refuses this for a local session (its model comes from the host
+    // configuration); don't send a request that only ever gets logged and dropped.
+    if (currentModelSource() === "local") return;
     modelSwitchPending = { value, prevActual: sess.modelActual || null, at: Date.now() };
     sess.model = value === "default" ? null : value; // optimistic; heartbeat confirms
     renderComposeOpts();
@@ -2223,7 +2298,14 @@
     closeStatic();
     gen++;
     const myGen = gen;
+    // A switch memo belongs to the session it was made on. Opening a DIFFERENT
+    // session must drop it, or that session is painted with the previous one's
+    // pending source (🏠 on a subscription session) and its own switch click is
+    // swallowed by the `value === currentModelSource()` early-return.
+    if (!modelSourcePending || modelSourcePending.sessionId !== id) modelSourcePending = null;
     hostKey = hk; sessionId = id; sess = s; agent = a;
+    // The switch has landed once the host reports the source we asked for.
+    if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
     reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
@@ -2256,6 +2338,7 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
+    modelSourcePending = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
     questionActive = false; answeredQuestion = null;
     panePromptActive = false; answeredPanePrompt = null;
@@ -2330,9 +2413,13 @@
       __setLiveAgents: (a) => { liveAgents = Array.isArray(a) ? a : []; },
       __stopPending: (t) => { stopPendingAt = t; },
       modelChipLabel, modeChipValue,
-      __setSess: (s) => { sess = s; },
+      __setSess: (s) => { sess = s; sessionId = s && s.id; },
+      __setHostKey: (k) => { hostKey = k; },
       __setAgent: (a) => { agent = a; },
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
+      localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,
+      setSessionModelSource,
+      __setModelSourcePending: (p) => { modelSourcePending = p; },
       __setModeSwitchPending: (p) => { modeSwitchPending = p; },
       __setQuestionActive: (v) => { questionActive = v; },
       __setPanePromptActive: (v) => { panePromptActive = v; },

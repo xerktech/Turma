@@ -335,6 +335,19 @@ those are marked `[MODEL]`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
+- **P1 Local-model failover control + chip (XERK-246).** The web compose bar carries a third
+  selector beside agent-mode and model — "Run against: Claude subscription / <self-hosted model>" —
+  which POSTs `/api/agents/<host>/sessions/<id>/model-source` and relaunches the session on the
+  local model, keeping its conversation. A session on the local model is marked (🏠 + warn colour)
+  so nobody has to wonder which model wrote a turn. Android shows neither the control nor the mark.
+  Gate it on the host's `localModel.available`, exactly as the 📎 gates on `uploadMaxBytes` — an
+  agent that reports nothing cannot do it. Field: `session.modelSource`
+  (`"subscription"`/`"local"`). This matters on a phone precisely when it matters most: usage runs
+  out while you are away from a desk. Three parts, all missing: the compose-bar selector, the mark
+  on live AND ended session cards, and a **"Run against" option in the spawn composer** (without the
+  last one you can fail existing sessions over from the phone but cannot start new work once usage
+  is gone). Note the web hides the model picker entirely for a local session — every alias it could
+  offer is one the gateway refuses.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
 - ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
   see Done above; the read-only review itself was XERK-70).

@@ -10,6 +10,7 @@ docker/tmux/git needed.
 """
 
 import base64
+import contextlib
 import datetime
 import gzip
 import http.server
@@ -17,7 +18,9 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
+import subprocess
 import shutil
 import signal
 import struct
@@ -3911,6 +3914,16 @@ class TestAckDeque(ManagerMixin, unittest.TestCase):
 
 
 class TestHandleCommands(ManagerMixin, unittest.TestCase):
+    def test_set_model_source_command_is_dispatched(self):
+        """Deleting the dispatch arm makes the hub queue the command, the agent
+        ack it, and every switch become a silent no-op."""
+        sm = self.make_manager()
+        sm.set_model_source = mock.Mock()
+        sm.save = mock.Mock()
+        sm.handle_commands([{"cmdId": "ms1", "type": "setModelSource",
+                             "sessionId": "abcde", "modelSource": "local"}])
+        sm.set_model_source.assert_called_once_with("abcde", "local")
+
     def test_dedup_and_dispatch(self):
         sm = self.make_manager()
         sm.spawn = mock.Mock()
@@ -3928,7 +3941,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         # plus the cmdId, which it echoes onto the session it creates.
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
-            model=None, permission_mode=None, cmd_id="c1",
+            model=None, permission_mode=None, model_source=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -3975,7 +3988,8 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         }])
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
-            model="opus", permission_mode="plan", cmd_id="c9",
+            model="opus", permission_mode="plan", model_source=None,
+            cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -4536,6 +4550,35 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         loaded = json.loads(open(settings).read())
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
         self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
+
+    def test_spawn_onto_the_local_model(self):
+        """Starting NEW work on the local model matters as much as failing an
+        existing session over: once usage is gone you cannot spawn either. A
+        regression making every spawn subscription-only shipped green before
+        this test existed."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY="sk-abc",
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"):
+            sm.spawn("Turma", model_source="local")
+            sess = sm.registry[-1]
+            self.assertEqual(sess["modelSource"], "local")
+            cmd = next(c[-1] for c in self.run_ok_calls if "new-session" in c)
+            self.assertIn("local-model.env", cmd)
+
+    def test_spawn_onto_local_refused_without_configuration(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="", LOCAL_MODEL_API_KEY=""):
+            sm.spawn("Turma", model_source="local")
+        self.assertEqual(sm.registry[-1]["status"], "error")
+
+    def test_spawn_defaults_to_the_subscription(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
 
     def test_spawn_threads_all_options(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -7132,6 +7175,617 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self._session(sm, perm="auto", status="stopped")
         sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
+
+
+class TestLocalModelConfig(unittest.TestCase):
+    """Validating the self-hosted-model settings (XERK-246). These decide
+    whether the failover is OFFERED at all, so a half-configured host must read
+    as "no", never as "yes" — a session launched against an endpoint with no key
+    dies on its first request, which is worse than never offering the switch."""
+
+    def _configured(self, **over):
+        vals = {"LOCAL_MODEL_BASE_URL": "https://gw.example.com/v1",
+                "LOCAL_MODEL_API_KEY": "sk-abc", "LOCAL_MODEL_NAME": "gpt-oss:120b"}
+        vals.update(over)
+        return mock.patch.multiple(ha, **vals)
+
+    def test_needs_both_endpoint_and_key(self):
+        with self._configured():
+            self.assertTrue(ha.local_model_configured())
+        with self._configured(LOCAL_MODEL_API_KEY=""):
+            self.assertFalse(ha.local_model_configured())
+        with self._configured(LOCAL_MODEL_BASE_URL=""):
+            self.assertFalse(ha.local_model_configured())
+
+    def test_model_name_is_charset_checked(self):
+        """The name is interpolated into a launch command line."""
+        with self._configured(LOCAL_MODEL_NAME="gpt-oss:120b"):
+            self.assertTrue(ha.local_model_configured())
+        with self._configured(LOCAL_MODEL_NAME="oops; rm -rf /"):
+            self.assertFalse(ha.local_model_configured())
+
+    def test_partial_config_says_which_half_is_missing(self):
+        """A half-configured host disables the feature with the control simply
+        never appearing; without a reason nobody can tell it from "off"."""
+        seen = []
+        with mock.patch.object(ha, "log", lambda m: seen.append(m)), \
+             mock.patch.object(ha, "_local_model_complaints", set()):
+            with self._configured(LOCAL_MODEL_API_KEY=""):
+                self.assertFalse(ha.local_model_configured())
+                ha.local_model_configured()          # every beat calls it
+        self.assertEqual(len(seen), 1, "said once, not once per heartbeat")
+        self.assertIn("LOCAL_MODEL_API_KEY", seen[0])
+        # Feature simply off (neither set) says nothing at all.
+        quiet = []
+        with mock.patch.object(ha, "log", lambda m: quiet.append(m)), \
+             mock.patch.object(ha, "_local_model_complaints", set()):
+            with self._configured(LOCAL_MODEL_BASE_URL="", LOCAL_MODEL_API_KEY=""):
+                self.assertFalse(ha.local_model_configured())
+        self.assertEqual(quiet, [])
+
+    def test_resolve_model_source_enum(self):
+        with self._configured():
+            self.assertEqual(ha.resolve_model_source(""), "subscription")
+            self.assertEqual(ha.resolve_model_source(None), "subscription")
+            self.assertEqual(ha.resolve_model_source("local"), "local")
+            with self.assertRaises(ValueError):
+                ha.resolve_model_source("bedrock")
+
+    def test_local_refused_when_host_has_no_local_model(self):
+        """Better a clean spawn error than a session that looks failed-over and
+        is quietly still burning the subscription."""
+        with self._configured(LOCAL_MODEL_API_KEY=""):
+            with self.assertRaises(ValueError):
+                ha.resolve_model_source("local")
+            self.assertEqual(ha.resolve_model_source("subscription"), "subscription")
+
+    def test_env_pairs_shape(self):
+        with self._configured():
+            pairs = ha.local_model_env_pairs()
+        # Claude Code appends /v1/messages itself, so the configured /v1 base is
+        # trimmed back to the host.
+        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com", pairs)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", pairs)
+        # Without this every background/small-model call asks the gateway for
+        # the LOGIN's default alias and 403s invisibly.
+        self.assertIn("ANTHROPIC_SMALL_FAST_MODEL=gpt-oss:120b", pairs)
+        self.assertTrue(any(p.startswith("CLAUDE_CODE_MAX_CONTEXT_TOKENS=") for p in pairs))
+        # An ambient key outranks ANTHROPIC_AUTH_TOKEN and would bill the very
+        # account the failover exists to stop depending on.
+        self.assertIn("ANTHROPIC_API_KEY=", pairs)
+
+    def test_messages_api_base_trims_only_a_trailing_v1(self):
+        """A plain rpartition mangles bases that merely CONTAIN /v1, and both
+        of these pass every configuration check before dying on first request."""
+        self.assertEqual(ha._messages_api_base("https://gw.example.com/v1"),
+                         "https://gw.example.com")
+        self.assertEqual(ha._messages_api_base("https://gw.example.com/v1/"),
+                         "https://gw.example.com")
+        # A host whose NAME contains v1 must survive intact.
+        self.assertEqual(ha._messages_api_base("https://v1.example.com"),
+                         "https://v1.example.com")
+        # A gateway mounted under a path keeps it.
+        self.assertEqual(ha._messages_api_base("https://gw.example.com/v1/openai"),
+                         "https://gw.example.com/v1/openai")
+        self.assertEqual(ha._messages_api_base("https://gw.example.com"),
+                         "https://gw.example.com")
+
+    def test_context_env_survives_a_typo(self):
+        """A bad value in a NEW env var must not stop every session on the host
+        at import time — that is the outage this feature exists to prevent."""
+        for bad in ["64k", "", "  ", "-5", "0", "not-a-number"]:
+            with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": bad}):
+                self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 65536)
+        with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": "131072"}):
+            self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 131072)
+
+
+class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
+    """Moving a running session onto the self-hosted model and back (XERK-246).
+
+    The point of the feature is that running out of Claude usage stops every
+    session at once; the session should carry on rather than halt. So the switch
+    must keep the CONVERSATION (resume, never clear-context) and must survive
+    later relaunches."""
+
+    def make_manager(self, configured=True):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        # Stub the real Popen. Without this the launch paths spawn an ACTUAL
+        # ttyd, which exists on a dev box and not on a CI runner — there the
+        # launch raised, set_model_source treated it as a failed relaunch and
+        # reverted the record, and ten tests failed for a reason that had
+        # nothing to do with what they assert. (It also stops the suite leaking
+        # real ttyd processes onto the developer's TTYD_PORT_BASE range.)
+        sm._launch_ttyd = mock.Mock()
+        # ManagerMixin does NOT patch REPOS_ROOT, so these tests were reading
+        # the developer's REAL git root — which is why they passed here and
+        # errored on CI: `scan_repos()` happened to find a Turma checkout.
+        # Point it at a scratch root so the fixtures own everything they assert.
+        pr = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        pr.start()
+        self.addCleanup(pr.stop)
+        vals = {"LOCAL_MODEL_BASE_URL": "https://gw.example.com/v1",
+                "LOCAL_MODEL_API_KEY": "sk-abc",
+                "LOCAL_MODEL_NAME": "gpt-oss:120b"} if configured else {
+                "LOCAL_MODEL_BASE_URL": "", "LOCAL_MODEL_API_KEY": "",
+                "LOCAL_MODEL_NAME": "gpt-oss:120b"}
+        p = mock.patch.multiple(ha, **vals)
+        p.start()
+        self.addCleanup(p.stop)
+        return sm
+
+    def _repo_on_disk(self, name="Turma"):
+        """Make scan_repos() actually see the repo.
+
+        _resume_at_cwd refuses a cwd whose repo is not in scan_repos(), so a
+        fixture that only creates the worktree silently produces no session at
+        all. Locally that passed on ambient state; CI has none, which is how it
+        was caught."""
+        os.makedirs(os.path.join(ha.REPOS_ROOT, name, ".git"), exist_ok=True)
+        return os.path.join(ha.REPOS_ROOT, name)
+
+    def _session(self, sm, source="subscription", status="running"):
+        sess = {"id": "abcde", "status": status, "tmuxName": "agent-abcde",
+                "worktreePath": os.path.join(self.tmp, "wt"),
+                "rcName": "host-repo-abcde", "ttydPort": 7700,
+                "claudeSessionId": "11111111-1111-4111-8111-111111111111",
+                "modelSource": source, "permissionMode": "auto"}
+        os.makedirs(sess["worktreePath"], exist_ok=True)
+        sm.registry = [sess]
+        return sess
+
+    def _launches(self):
+        """The claude command line of each tmux new-session."""
+        return [c[-1] for c in self.run_ok_calls if "new-session" in c]
+
+    def _launch_argv(self):
+        """The whole new-session argv — where the -e settings live."""
+        return [c for c in self.run_ok_calls if "new-session" in c][-1]
+
+    def _launch_env(self):
+        """What the launch line ACTUALLY EXPORTS to claude.
+
+        Deliberately runs the real prefix through a real shell rather than
+        reading the file: the file being correct is not the same as its settings
+        reaching the child process. Dropping `set -a` leaves them defined but
+        unexported, so every "local" session silently runs on the exhausted
+        subscription while the UI still paints the mark — and a test that only
+        read the file could not tell."""
+        cmd = self._launches()[-1]
+        m = re.search(r"^(.*?local-model\.env[^;]*; set \+a;)", cmd)
+        if not m:
+            return []
+        probe = m.group(1) + (
+            ' python3 -c "import os;print(chr(10).join('
+            "f'{k}={v}' for k, v in os.environ.items() if k.startswith('ANTHROPIC_')"
+            ' or k.startswith(\'CLAUDE_CODE_MAX\')))"')
+        out = subprocess.run(["sh", "-c", probe], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True).stdout
+        return [ln for ln in out.splitlines() if ln.strip()]
+
+    def test_local_session_launches_against_the_local_endpoint(self):
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sm._launch_tmux(sess)
+        env = self._launch_env()
+        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com", env)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", env)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-abc", env)
+        # The credential must reach NO process's argv — neither the command
+        # string (the tmux server's argv) nor a `tmux -e` value (the client's).
+        # /proc/<pid>/cmdline is world-readable in both cases.
+        self.assertNotIn("sk-abc", self._launches()[-1])
+        self.assertNotIn("sk-abc", " ".join(self._launch_argv()))
+
+    def test_env_file_quotes_hostile_values(self):
+        """The file is SOURCED by a shell, so an unquoted value would execute.
+        The defence had no test, so removing the quoting shipped green."""
+        hostile = "k'; touch " + os.path.join(self.tmp, "pwned") + "; echo '"
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY=hostile,
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"):
+            path = ha.write_local_model_env(os.path.join(self.tmp, "lm.env"))
+        out = subprocess.run(
+            ["sh", "-c", f". {shlex.quote(path)}; printf %s \"$ANTHROPIC_AUTH_TOKEN\""],
+            stdout=subprocess.PIPE, text=True).stdout
+        self.assertEqual(out, hostile)                       # survived intact
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "pwned")))
+
+    def test_guard_denies_reading_the_credential_file(self):
+        """0600 stops other uids, not the sessions themselves — they run as the
+        uid that owns it, and this file's whole content IS the secret."""
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        self.assertIn("Read(~/.turma/local-model.env)", deny)
+
+    def test_stale_env_file_is_removed_when_config_goes(self):
+        """It holds a live gateway key under a HOST bind mount; leaving it after
+        a rotation or removal keeps a working credential on disk forever."""
+        path = os.path.join(self.tmp, "lm.env")
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY="sk-abc",
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"):
+            ha.write_local_model_env(path)
+        self.assertTrue(os.path.exists(path))
+        ha.discard_local_model_env(path)
+        self.assertFalse(os.path.exists(path))
+        ha.discard_local_model_env(path)                     # idempotent
+
+    def test_launch_fallback_persists_and_clears_the_key(self):
+        sm = self.make_manager(configured=False)
+        sess = self._session(sm, source="local")
+        env_path = os.path.join(ha.REGISTRY_DIR, "local-model.env")
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        open(env_path, "w").write("ANTHROPIC_AUTH_TOKEN=stale\n")
+        sm._launch_tmux(sess)
+        self.assertEqual(sess["modelSource"], "subscription")
+        sm.save.assert_called()                  # the demotion reaches disk
+        self.assertFalse(os.path.exists(env_path))
+
+    def test_env_file_is_owner_only(self):
+        """It holds the gateway credential, so nothing else on the host may
+        read it — that is the entire reason it exists rather than argv."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sm._launch_tmux(sess)
+        path = os.path.join(ha.REGISTRY_DIR, "local-model.env")
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+
+    def test_subscription_session_launches_clean(self):
+        """No stray endpoint vars on an ordinary session — otherwise every
+        session on the host would quietly move to the local model."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="subscription")
+        sm._launch_tmux(sess)
+        self.assertEqual(self._launch_env(), [])
+        self.assertNotIn("ANTHROPIC_", self._launches()[-1])
+
+    def test_launch_falls_back_when_local_config_disappears(self):
+        """Config removed under a session already on local: launching against
+        the subscription silently would be a surprise usage bill, so the record
+        is corrected to say what actually happened."""
+        sm = self.make_manager(configured=False)
+        sess = self._session(sm, source="local")
+        sm._launch_tmux(sess)
+        self.assertEqual(self._launch_env(), [])
+        self.assertEqual(sess["modelSource"], "subscription")
+
+    def _pin_transcript(self, sess):
+        """Put this session's pinned conversation on disk, so the resume path
+        can actually resolve it (a pinned id with no file resolves to nothing,
+        by design — see _session_transcript_path)."""
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        open(os.path.join(proj, sess["claudeSessionId"] + ".jsonl"), "w").write("{}\n")
+
+    def test_local_launch_drops_model_flag(self):
+        """--model OVERRIDES ANTHROPIC_MODEL, so a failed-over session carrying a
+        Claude alias would ask the gateway for a model it will never serve: every
+        turn 403s while the record still reads running/local. The composer
+        remembers a model PER REPO, so this is the common case, not an exotic
+        one. Never re-add --model for a local session."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["model"] = "sonnet"
+        sm._launch_tmux(sess)
+        cmd = self._launches()[-1]
+        self.assertNotIn("--model", cmd)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", self._launch_env())
+
+    def test_subscription_launch_keeps_model_flag(self):
+        sm = self.make_manager()
+        sess = self._session(sm, source="subscription")
+        sess["model"] = "sonnet"
+        sm._launch_tmux(sess)
+        self.assertIn("--model sonnet", self._launches()[-1])
+
+    def test_set_model_refused_on_a_local_session(self):
+        """The picker only offers Claude aliases the gateway refuses — including
+        'Default', which resolves to the login default. Accepting one would
+        break the session with nothing in errorMsg and no way back from the
+        chip."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        self.run_calls.clear()
+        sm.set_model("abcde", "sonnet")
+        self.assertIsNone(sess.get("model"))
+        # The picker is never opened and no keys are sent to the pane.
+        self.assertEqual([c for c in self.run_calls if "tmux" in c], [])
+
+    def test_switch_keeps_the_conversation(self):
+        """The whole value of failing over is not losing what the session has
+        already worked out, so it resumes its own transcript id."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._pin_transcript(sess)
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "local")
+        cmd = self._launches()[-1]
+        self.assertIn("--resume 11111111-1111-4111-8111-111111111111", cmd)
+        self.assertNotIn("--session-id", cmd)   # never a fresh context
+        self.assertTrue(any(e.startswith("ANTHROPIC_BASE_URL=") for e in self._launch_env()))
+
+    def test_switch_bumps_restart_count_so_the_ui_can_settle(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        before = sess.get("restartCount", 0)
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["restartCount"], before + 1)
+        self.assertTrue(sess.get("modelSourceAt"))
+
+    def test_switch_back_to_subscription(self):
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sm.set_model_source("abcde", "subscription")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertEqual(self._launch_env(), [])
+
+    def test_same_source_is_a_noop(self):
+        """No pointless relaunch — that would drop a turn in flight."""
+        sm = self.make_manager()
+        self._session(sm, source="local")
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(self._launches(), [])
+
+    def test_unconfigured_host_refuses_and_stays_put(self):
+        sm = self.make_manager(configured=False)
+        sess = self._session(sm)
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertEqual(sess["status"], "error")
+        self.assertEqual(self._launches(), [])
+
+    def test_failed_relaunch_reverts_the_record(self):
+        """The record must never claim a move that did not happen, or the UI
+        shows 'local' for a session still on the exhausted subscription."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(sm, "_launch_tmux", side_effect=RuntimeError("boom")):
+            sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertEqual(sess["status"], "error")
+
+    def test_kill_then_resume_stays_on_the_local_model(self):
+        """Usage has not come back just because the session was killed. A resume
+        that drops modelSource silently returns the session to the exhausted
+        subscription AND restores its --model alias, which the gateway refuses —
+        with no mark and no error. Refuted the documented invariant once."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                     "model": "sonnet"})
+        os.makedirs(sess["repoPath"], exist_ok=True)
+        sm._remember_closed(sess)
+        self.assertEqual(sm.closed[0].get("modelSource"), "local")
+        sm.registry = []
+        sm.resume(sess["id"])
+        revived = sm._find(sess["id"])
+        self.assertEqual(revived["modelSource"], "local")
+        self.assertNotIn("--model", self._launches()[-1])
+
+    def _migrate_in(self, sm, source, launch=True):
+        """Run the shared migration/resume-any record build for a moved session.
+
+        launch=False stubs the launch, so the RECORD's own validation is what is
+        being asserted — otherwise _launch_tmux's fallback demotes an
+        unconfigured host anyway and the re-validation could be deleted without
+        a single test noticing."""
+        self._repo_on_disk()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "mmmmm")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        open(os.path.join(proj, "t-1.jsonl"), "w").write("{}\n")
+        ctx = (mock.patch.object(sm, "_launch_tmux") if not launch
+               else contextlib.nullcontext())
+        with ctx:
+            sm._resume_at_cwd("t-1", cwd, extra={"modelSource": source, "model": "sonnet"})
+        return sm.registry[-1] if sm.registry else {}
+
+    def test_resume_any_transcript_keeps_the_local_model(self):
+        """The DASHBOARD's Resume picker routes through resume_transcript, not
+        resume(), and passed no model source at all — so a killed failed-over
+        session came back on the exhausted subscription with no mark and no
+        error. The closed record already knew the answer."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        self._repo_on_disk()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "rrrrr")
+        os.makedirs(cwd, exist_ok=True)
+        sess.update({"worktreePath": cwd, "repo": "Turma",
+                     "repoPath": os.path.join(self.tmp, "Turma")})
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        tid = sess["claudeSessionId"]
+        open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        sm._remember_closed(sess)
+        sm.registry = []
+        sm.resume_transcript(tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "local")
+
+    def test_resume_any_pre_restart_transcript_keeps_the_local_model(self):
+        """"Restart (clear context)" MOVES claudeSessionId, so a session's
+        earlier conversations stay resumable while matching no closed record by
+        id — and resuming one silently returned a failed-over session to the
+        exhausted subscription. Every conversation in a worktree is the same
+        lineage, so the worktree answers for all of them."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        self._repo_on_disk()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "ppppp")
+        os.makedirs(cwd, exist_ok=True)
+        sess.update({"worktreePath": cwd, "repo": "Turma",
+                     "repoPath": os.path.join(self.tmp, "Turma")})
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        older = "55555555-5555-4555-8555-555555555555"   # the pre-restart one
+        for tid in (older, sess["claudeSessionId"]):
+            open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        sm._remember_closed(sess)      # closed record pins only the NEWER id
+        sm.registry = []
+        sm.resume_transcript(older, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "local")
+
+    def test_resume_any_uses_the_worktree_s_LATEST_closed_record(self):
+        """self.closed is append-ordered, so the naive lookup returns the
+        EARLIEST record for a worktree — a session later switched back to the
+        subscription and killed again would be resumed onto the local model
+        anyway. The last thing the operator chose is the answer."""
+        sm = self.make_manager()
+        self._repo_on_disk()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "lllll")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        # A conversation from BEFORE a "clear context", so it matches no closed
+        # record by id and has to fall back to the worktree.
+        orphan_tid = "66666666-6666-4666-8666-666666666666"
+        open(os.path.join(proj, orphan_tid + ".jsonl"), "w").write("{}\n")
+        base = {"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                "worktreePath": cwd, "status": "running", "rcName": "r",
+                "tmuxName": "t", "ttydPort": 7700}
+        # Same worktree, killed twice: first on local, later on subscription.
+        sm._remember_closed({**base, "id": "aaaaa", "modelSource": "local",
+                             "claudeSessionId": "88888888-8888-4888-8888-888888888888"})
+        sm._remember_closed({**base, "id": "bbbbb", "modelSource": "subscription",
+                             "claudeSessionId": "77777777-7777-4777-8777-777777777777"})
+        sm.registry = []
+        sm.resume_transcript(orphan_tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
+
+    def test_resume_any_prefers_the_latest_record_for_a_REUSED_transcript_id(self):
+        """A resume-any PINS the resumed transcript id onto the session it
+        creates, so killing that one leaves a SECOND closed record with the same
+        id. Append-order answers with the state before the operator last changed
+        their mind — here, putting work back on the local model after they moved
+        it off. No "clear context" needed: kill, resume, switch back, kill."""
+        sm = self.make_manager()
+        self._repo_on_disk()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "ddddd")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        tid = "99999999-9999-4999-8999-999999999999"
+        open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        base = {"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                "worktreePath": cwd, "status": "running", "rcName": "r",
+                "tmuxName": "t", "ttydPort": 7700, "claudeSessionId": tid}
+        sm._remember_closed({**base, "id": "aaaaa", "modelSource": "local"})
+        sm._remember_closed({**base, "id": "bbbbb", "modelSource": "subscription"})
+        sm.registry = []
+        sm.resume_transcript(tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
+
+    def test_switch_to_local_drops_a_deferred_model_pick(self):
+        """set_model refuses a local session, so a pick waiting for an idle pane
+        would sit heartbeat-visible and then vanish unexplained."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["pendingModel"] = "opus"
+        sm.set_model_source("abcde", "local")
+        self.assertNotIn("pendingModel", sess)
+
+    def test_resume_any_foreign_transcript_defaults_to_subscription(self):
+        """No closed record means no answer — never a guess."""
+        sm = self.make_manager()
+        self._repo_on_disk()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "fffff")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        tid = "22222222-2222-4222-8222-222222222222"
+        open(os.path.join(proj, tid + ".jsonl"), "w").write("{}\n")
+        sm.resume_transcript(tid, cwd)
+        self.assertEqual(sm.registry[-1]["modelSource"], "subscription")
+
+    def test_session_payload_reports_the_model_source(self):
+        """Both the UI mark and the hub's /model 409 read this field off the
+        live session payload; dropping it disables both silently."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                     "branch": None, "root": False, "label": None, "summary": None,
+                     "createdAt": ha.now_iso(), "baseRef": None})
+        os.makedirs(sess["repoPath"], exist_ok=True)
+        # The git/usage side of the payload is not what this asserts.
+        p = mock.patch.object(sm, "_session_git", return_value=({}, {}))
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertEqual(sm._session_payload(sess, refresh=False)["modelSource"], "local")
+        sess["modelSource"] = "subscription"
+        self.assertEqual(sm._session_payload(sess, refresh=False)["modelSource"],
+                         "subscription")
+        # A record predating the field reads as subscription, never as absent.
+        sess.pop("modelSource")
+        self.assertEqual(sm._session_payload(sess, refresh=False)["modelSource"],
+                         "subscription")
+
+    def test_closed_payload_reports_the_model_source(self):
+        """The Ended card's mark reads this field; without it the mark can never
+        render for a killed session — which is exactly when you are reading the
+        transcript and need to know which model wrote it."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma")})
+        sm._remember_closed(sess)
+        self.assertEqual(sm._closed_payload()[0]["modelSource"], "local")
+
+    def test_heartbeat_reports_the_capability_honestly(self):
+        """The hub and every composer gate on this; reporting available on a
+        host with no configuration would offer a switch that cannot work."""
+        sm = self.make_manager()
+        self.assertTrue(sm.build_payload(1)["localModel"]["available"])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="", LOCAL_MODEL_API_KEY=""):
+            body = sm.build_payload(1)
+        self.assertFalse(body["localModel"]["available"])
+        self.assertIsNone(body["localModel"]["model"])
+
+    def test_context_cap_rejects_an_absurd_window(self):
+        """Overstating the window is the exact failure the setting guards: the
+        agent compacts far too late and the server truncates the tail silently."""
+        with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": "999999999999"}):
+            self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 65536)
+        with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": "131072"}):
+            self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 131072)
+
+    def test_import_session_forwards_the_model_source(self):
+        """The agent half of the migration chain."""
+        sm = self.make_manager()
+        captured = {}
+        with mock.patch.object(sm, "_resume_at_cwd",
+                               side_effect=lambda *a, **k: captured.update(k)), \
+             mock.patch.object(sm, "_migration_download", return_value=b"x"), \
+             mock.patch.object(sm, "_unpack_transcript"), \
+             mock.patch.object(sm, "_resumable_cwd_class", return_value="worktree"), \
+             mock.patch.object(sm, "_localize_migrated_cwd",
+                               return_value=os.path.join(ha.WORKTREES_ROOT, "Turma", "iiiii")):
+            sm.import_session({
+                "migrationId": "aaaaaaaaaaaaaaaa", "repo": "Turma",
+                "transcriptId": "33333333-3333-4333-8333-333333333333",
+                "cwd": "/other/host/.turma/worktrees/Turma/iiiii",
+                "modelSource": "local"})
+        self.assertEqual((captured.get("extra") or {}).get("modelSource"), "local")
+
+    def test_migrated_session_keeps_its_model_source(self):
+        """The conversation moves; the model it was running against must move
+        with it, or the move quietly undoes the failover."""
+        sm = self.make_manager()
+        self.assertEqual(self._migrate_in(sm, "local")["modelSource"], "local")
+
+    def test_migration_to_a_host_without_a_local_model_falls_back(self):
+        """It crosses a host boundary: the TARGET may have no local model even
+        though the source did, and launching at an endpoint that isn't there is
+        worse than landing on the subscription."""
+        sm = self.make_manager(configured=False)
+        self.assertEqual(
+            self._migrate_in(sm, "local", launch=False)["modelSource"], "subscription")
+
+    def test_noop_for_non_running_session(self):
+        sm = self.make_manager()
+        sess = self._session(sm, status="stopped")
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertEqual(self._launches(), [])
 
 
 class TestParsePanePrompt(unittest.TestCase):

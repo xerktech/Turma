@@ -1,0 +1,25 @@
+{
+  "$schema": "https://charm.land/crush.json",
+  "providers": {
+    "local": {
+      "type": "openai",
+      "name": "Tenir gpt-oss (LiteLLM gateway)",
+      "base_url": "$TURMA_LOCAL_BASE_URL",
+      "api_key": "$TURMA_LOCAL_API_KEY",
+      "models": [
+        {
+          "id": "gpt-oss:120b",
+          "name": "gpt-oss 120b",
+          "context_window": 65536,
+          "default_max_tokens": 8192,
+          "can_reason": true
+        }
+      ]
+    }
+  },
+  "models": {
+    "large": { "model": "gpt-oss:120b", "provider": "local" },
+    "small": { "model": "gpt-oss:120b", "provider": "local" }
+  },
+  "permissions": { "allowed_tools": ["view", "ls", "grep", "edit", "write", "bash", "sourcegraph"] }
+}
