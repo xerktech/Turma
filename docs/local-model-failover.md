@@ -104,6 +104,28 @@ denials re-implemented in a weaker permission system.
 Claude Code assumes 200k for a model it does not recognise and would compact far
 too late for a 64k window, and the tail then truncates server-side instead.
 
+## Known limitations (found by the QA pass, accepted for this change)
+
+- **Ticket sessions are subscription-only.** `spawn_ticket` doesn't take a model
+  source, so board-started and auto-started ticket sessions can't begin on the
+  local model. Explicit "+ New session" spawns can. Failing an already-running
+  ticket session over works.
+- **Self-hosted tokens are counted in the usage totals**, split out only per
+  model. The usage page is how you judge remaining *subscription* headroom, so a
+  host with busy local sessions overstates what it has spent against the
+  subscription. Fixing it means teaching the ledger which model source a
+  transcript came from — a wider change than this one.
+- **The switch discards a turn in flight.** It does not defer on a busy pane the
+  way `set_model` does: the turn in flight is usually the one erroring on
+  exhausted usage, and waiting would withhold the switch exactly when it is
+  needed. The conversation survives, so the work is re-askable.
+- **Rapid toggling isn't single-flighted.** Two clicks queue two commands; unlike
+  migration there is no per-session in-flight lock, so a sub→local→sub burst can
+  produce back-to-back relaunches.
+- **A local session's model can't be changed from the chip** — by design, since
+  every row the picker offers is a Claude alias the gateway refuses. The chip
+  states the fixed model instead. Switch back to the subscription to choose one.
+
 ## Deliberately not shipped: automatic delegation
 
 The ticket also asks Claude to hand work to the local model automatically, to

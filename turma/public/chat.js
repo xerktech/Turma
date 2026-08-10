@@ -1582,11 +1582,22 @@
             '<span class="cc-menu" id="ccSourceMenu"><span class="cc-hint">Run against</span>' +
             menuHtml(modelSourceOpts(), currentModelSource(), "data-source") + "</span></span>"
           : "") +
-        '<span class="cc-opt cc-model">' +
-          '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
-          '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
-          '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
-          menuHtml(mOpts, model, "data-model") + "</span></span>" +
+        (currentModelSource() === "local"
+          // A local session's model is fixed by the host's configuration. Every
+          // row the picker could offer is a Claude alias the gateway refuses —
+          // "Default" included, since it resolves to the login default — so the
+          // chip states the model instead of offering a menu that only breaks it.
+          ? '<span class="cc-opt cc-model cc-model-fixed">' +
+            '<span class="cc-btn" title="' +
+            esc("Fixed by this host's self-hosted model configuration. " +
+                "Switch back to the subscription to choose a Claude model.") + '">' +
+            '<span class="cc-val">' + esc(localModelInfo().model || "local model") +
+            "</span> 🧠</span></span>"
+          : '<span class="cc-opt cc-model">' +
+            '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
+            '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
+            '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
+            menuHtml(mOpts, model, "data-model") + "</span></span>") +
       "</span>";
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
@@ -1605,7 +1616,13 @@
     return Boolean(localModelInfo().available) || currentModelSource() === "local";
   }
   function currentModelSource() {
-    if (modelSourcePending && Date.now() - modelSourcePending.at < 60000) return modelSourcePending.value;
+    // A memo belongs to the session it was made on. Honouring another session's
+    // memo paints a subscription session as local (the exact confusion the mark
+    // exists to prevent) and swallows its own switch click via the
+    // `value === currentModelSource()` early-return in setSessionModelSource.
+    const mine = modelSourcePending &&
+      (!modelSourcePending.sessionId || modelSourcePending.sessionId === sessionId);
+    if (mine && Date.now() - modelSourcePending.at < 60000) return modelSourcePending.value;
     return (sess && sess.modelSource) || "subscription";
   }
   function modelSourceLabel() {
@@ -1622,7 +1639,7 @@
     if (!hostKey || !sessionId || !sess || value === currentModelSource()) return;
     // Memo-only, like the mode switch: the relaunch takes a moment and the
     // heartbeat is the thing that confirms it actually happened.
-    modelSourcePending = { value, at: Date.now() };
+    modelSourcePending = { value, at: Date.now(), sessionId };
     renderComposeOpts();
     try {
       await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model-source", {
@@ -1634,6 +1651,9 @@
 
   async function setSessionModel(value) {
     if (!hostKey || !sessionId || !sess || value === currentModelValue()) return;
+    // The agent refuses this for a local session (its model comes from the host
+    // configuration); don't send a request that only ever gets logged and dropped.
+    if (currentModelSource() === "local") return;
     modelSwitchPending = { value, prevActual: sess.modelActual || null, at: Date.now() };
     sess.model = value === "default" ? null : value; // optimistic; heartbeat confirms
     renderComposeOpts();
@@ -2236,6 +2256,11 @@
     closeStatic();
     gen++;
     const myGen = gen;
+    // A switch memo belongs to the session it was made on. Opening a DIFFERENT
+    // session must drop it, or that session is painted with the previous one's
+    // pending source (🏠 on a subscription session) and its own switch click is
+    // swallowed by the `value === currentModelSource()` early-return.
+    if (!modelSourcePending || modelSourcePending.sessionId !== id) modelSourcePending = null;
     hostKey = hk; sessionId = id; sess = s; agent = a;
     // The switch has landed once the host reports the source we asked for.
     if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
@@ -2270,6 +2295,7 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
+    modelSourcePending = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
     panePromptActive = false; answeredPanePrompt = null;
     stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null; modeSwitchPending = null;
@@ -2342,7 +2368,7 @@
       __setLiveStatus: (st) => { liveStatus = st; },
       __stopPending: (t) => { stopPendingAt = t; },
       modelChipLabel, modeChipValue,
-      __setSess: (s) => { sess = s; },
+      __setSess: (s) => { sess = s; sessionId = s && s.id; },
       __setAgent: (a) => { agent = a; },
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
       localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,

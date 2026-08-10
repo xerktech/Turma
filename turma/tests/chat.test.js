@@ -1630,3 +1630,28 @@ test("model source: the menu names the host's actual model", () => {
   assert.equal(modelSourceOpts()[1].label, "gpt-oss:120b");
   assert.equal(modelSourceLabel(), "Subscription");
 });
+
+test("model source: a pending switch never leaks onto another session", () => {
+  // Regression: the memo was module-global and survived opening a different
+  // session, so a subscription session wore the 🏠 mark and its own switch
+  // click was swallowed by the value === currentModelSource() early-return.
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setSess({ id: "AAAAA", modelSource: "subscription" });
+  __setModelSourcePending({ value: "local", at: Date.now(), sessionId: "AAAAA" });
+  assert.equal(currentModelSource(), "local");        // its own session: honoured
+  __setSess({ id: "BBBBB", modelSource: "subscription" });
+  assert.equal(currentModelSource(), "subscription"); // a different one: ignored
+  __setModelSourcePending(null);
+});
+
+test("model source: a local session's model chip is fixed, not a picker", () => {
+  // Every row the picker could offer is a Claude alias the gateway refuses —
+  // "Default" included, since it resolves to the login default — so offering
+  // the menu can only break the session, with no row to switch back to.
+  __setModelSourcePending(null);
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setSess({ id: "s1", modelSource: "local" });
+  assert.equal(currentModelSource(), "local");
+  __setSess({ id: "s1", modelSource: "subscription" });
+  assert.equal(currentModelSource(), "subscription");
+});

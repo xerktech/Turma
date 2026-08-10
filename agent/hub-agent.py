@@ -544,7 +544,27 @@ LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "gpt-oss:120b").strip()
 # Claude Code assumes a 200k window for a model it does not recognise and would
 # compact far too late for a 64k server — the tail then silently truncates
 # server-side instead of compacting. Must match what the server actually serves.
-LOCAL_MODEL_CONTEXT = int(os.environ.get("LOCAL_MODEL_CONTEXT", "65536"))
+def _positive_int_env(name, default):
+    """Read a positive int from the environment, falling back on junk.
+
+    Deliberately NOT a bare int() at module scope like the older settings: a
+    typo in one of these new vars would raise during import and stop every
+    session on the host — precisely the outage this feature exists to prevent.
+    A wrong-but-sane context is recoverable; a dead agent is not."""
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        if raw:
+            log(f"{name}={raw!r} is not an integer — using {default}")
+        return default
+    if value <= 0:
+        log(f"{name}={value} must be positive — using {default}")
+        return default
+    return value
+
+
+LOCAL_MODEL_CONTEXT = _positive_int_env("LOCAL_MODEL_CONTEXT", 65536)
 # Where a session's model comes from. "subscription" is the mounted ~/.claude
 # login (the default, and what every existing session is); "local" is the
 # self-hosted model above.
@@ -577,24 +597,63 @@ def resolve_model_source(source):
     return source
 
 
-def local_model_env_prefix():
-    """Shell assignments that repoint Claude Code at the self-hosted model.
+def _messages_api_base(url):
+    """Trim a configured OpenAI-style `/v1` base back to what Claude Code wants.
 
-    Returned as a prefix for the tmux command line (rather than written into the
-    shared guard settings file) because the choice is PER SESSION: one session
-    can fail over while its neighbours stay on the subscription."""
-    base = LOCAL_MODEL_BASE_URL.rstrip("/")
-    host, _, _ = base.rpartition("/v1")
-    return (
-        f"ANTHROPIC_BASE_URL={shlex.quote(host or base)} "
-        f"ANTHROPIC_AUTH_TOKEN={shlex.quote(LOCAL_MODEL_API_KEY)} "
-        f"ANTHROPIC_MODEL={shlex.quote(LOCAL_MODEL_NAME)} "
-        f"ANTHROPIC_SMALL_FAST_MODEL={shlex.quote(LOCAL_MODEL_NAME)} "
-        f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={LOCAL_MODEL_CONTEXT} "
-        # An ambient API key outranks these and would quietly bill the very
-        # account this failover exists to stop depending on.
-        f"ANTHROPIC_API_KEY= "
-    )
+    Claude Code appends `/v1/messages` itself, so a base ending in `/v1` has to
+    lose exactly that suffix — and ONLY that suffix. A plain rstrip/rpartition
+    turns `https://v1.example.com` into `https:/` and silently drops the path of
+    `https://gw.example.com/v1/openai`, both of which pass every configuration
+    check and then die on the first request."""
+    base = (url or "").rstrip("/")
+    return base[:-3].rstrip("/") if base.endswith("/v1") else base
+
+
+def write_local_model_env(path):
+    """Write the self-hosted-model settings to a 0600 file and return its path.
+
+    The credential must not appear in ANY process's argv. A command-line prefix
+    puts it in the tmux SERVER's argv, and `tmux -e VAR=VALUE` puts it in the
+    tmux CLIENT's — /proc/<pid>/cmdline is world-readable (0444) in both cases,
+    so every uid on the host could read the gateway key. A file the agent's uid
+    alone can read, sourced by the launch line, leaks nothing: only the PATH is
+    ever visible.
+
+    Rewritten on every launch, so a rotated key or a changed endpoint takes
+    effect without an agent restart."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        for pair in local_model_env_pairs():
+            key, _, value = pair.partition("=")
+            fh.write(f"{key}={shlex.quote(value)}\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)          # atomic: a launch never sees a partial file
+    return path
+
+
+def local_model_env_pairs():
+    """`KEY=VALUE` settings that repoint Claude Code at the self-hosted model.
+
+    Passed to `tmux new-session -e` rather than written into the shared guard
+    settings file, because the choice is PER SESSION: one session can fail over
+    while its neighbours stay on the subscription. `-e` (not a command-line
+    prefix) because one of these is a credential and a command line is
+    world-readable via /proc — see the call site in _launch_tmux.
+
+    No shell quoting here: these are argv values handed straight to tmux, never
+    parsed by a shell. LOCAL_MODEL_NAME is charset-checked by
+    local_model_configured(), which gates every call site."""
+    return [
+        f"ANTHROPIC_BASE_URL={_messages_api_base(LOCAL_MODEL_BASE_URL)}",
+        f"ANTHROPIC_AUTH_TOKEN={LOCAL_MODEL_API_KEY}",
+        f"ANTHROPIC_MODEL={LOCAL_MODEL_NAME}",
+        f"ANTHROPIC_SMALL_FAST_MODEL={LOCAL_MODEL_NAME}",
+        f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={LOCAL_MODEL_CONTEXT}",
+        # An ambient API key outranks ANTHROPIC_AUTH_TOKEN and would quietly
+        # bill the very account this failover exists to stop depending on.
+        "ANTHROPIC_API_KEY=",
+    ]
 # git-ref-safe token: our allowlist is a strict subset of what git accepts, so
 # anything matching is also validated below for the few remaining git rules.
 _REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -8755,8 +8814,33 @@ class SessionManager:
         # board should chip both. No-op unless this session has a ticket.
         self._remember_ticket(sess)
         parts.append(f"--remote-control '{sess['rcName']}'")
+        # Failover (XERK-246): a session moved onto the self-hosted model runs the
+        # SAME claude with its endpoint repointed. Read off the record on EVERY
+        # launch, so a resume/restart of a failed-over session stays failed over
+        # rather than silently going back to the exhausted subscription.
+        on_local = sess.get("modelSource") == "local"
+        local_env_file = None
+        if on_local:
+            if local_model_configured():
+                local_env_file = write_local_model_env(
+                    os.path.join(REGISTRY_DIR, "local-model.env"))
+            else:
+                # Configuration was removed under a session that was already on
+                # local. Launching anyway would hit the subscription without
+                # saying so; drop back explicitly and leave the reason visible.
+                log(f"launch: session {sess['id']} wants the local model but this "
+                    f"host has none configured — launching on the subscription")
+                sess["modelSource"] = "subscription"
+                on_local = False
         model = sess.get("model")
-        if model:
+        # A session on the self-hosted model takes its model from ANTHROPIC_MODEL
+        # in the env prefix, and --model OVERRIDES that: launching with both asks
+        # the gateway for a Claude alias it will never serve, so every turn 403s
+        # ("key not allowed to access model") while the record still reads
+        # running/local. The composer remembers a model per repo, so this is the
+        # common case, not an exotic one — never re-add --model here for a local
+        # session.
+        if model and not on_local:
             parts.append(f"--model {model}")
         # Default (unset) -> --permission-mode auto; the explicit "default" choice
         # omits the flag (claude's own manual-review default).
@@ -8804,21 +8888,15 @@ class SessionManager:
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
         )
-        # Failover (XERK-246): a session moved onto the self-hosted model runs the
-        # SAME claude with its endpoint repointed. Read off the record on EVERY
-        # launch, so a resume/restart of a failed-over session stays failed over
-        # rather than silently going back to the exhausted subscription.
-        if sess.get("modelSource") == "local":
-            if local_model_configured():
-                env_prefix += local_model_env_prefix()
-            else:
-                # Configuration was removed under a session that was already on
-                # local. Launching anyway would hit the subscription without
-                # saying so; drop back explicitly and leave the reason visible.
-                log(f"launch: session {sess['id']} wants the local model but this "
-                    f"host has none configured — launching on the subscription")
-                sess["modelSource"] = "subscription"
         claude_cmd = env_prefix + claude_cmd
+        if local_env_file:
+            # SOURCED, never inlined and never passed as `tmux -e`: both put the
+            # gateway credential into a process's argv, and /proc/<pid>/cmdline
+            # is world-readable. Only the file PATH is ever visible; the file
+            # itself is 0600. `set -a` exports what it defines to claude and to
+            # every tool subprocess it spawns.
+            claude_cmd = (f"set -a; . {shlex.quote(local_env_file)}; set +a; "
+                          + claude_cmd)
         run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
         rc, err = run_ok([
             "tmux", "new-session", "-d", "-s", sess["tmuxName"],
@@ -9833,7 +9911,13 @@ class SessionManager:
         next request goes to changes.
 
         Deliberately NOT `restart` (which clears context): failing over is the
-        moment you least want to lose what the session has already worked out."""
+        moment you least want to lose what the session has already worked out.
+
+        Also deliberately NOT deferred on a busy pane, unlike `set_model`: the
+        turn in flight is usually the one erroring on exhausted usage, and
+        waiting for it to finish would withhold the switch exactly when it is
+        needed. The cost is that a genuinely productive turn is discarded — the
+        conversation survives, so the work is re-askable."""
         sess = self._find(sid)
         if not sess:
             log(f"setModelSource: no such session {sid}")
@@ -10301,6 +10385,16 @@ class SessionManager:
         tolerates a stale idle read because Escape is harmless, this path types
         into the pane, so it checks the pane NOW rather than trusting the
         beat-old paneBusy."""
+        sess_early = self._find(sid)
+        # A session on the self-hosted model takes its model from ANTHROPIC_MODEL
+        # (XERK-246). The picker only lists the LOGIN's Claude aliases — none of
+        # which the gateway will serve — and "Default" resolves to the login
+        # default, so every row here breaks the session with a 403 on the next
+        # turn, nothing in errorMsg, and no row to switch back to.
+        if sess_early and sess_early.get("modelSource") == "local":
+            log(f"set_model: session {sid} runs on the self-hosted model; "
+                f"its model is fixed by the host configuration")
+            return
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
@@ -12915,6 +13009,9 @@ class SessionManager:
             # self-hosted model it failed over to). Always present, so a client
             # never has to infer "not local" from an absent field.
             "modelSource": sess.get("modelSource") or "subscription",
+            # When it last moved, so a client can say "failed over 10m ago"
+            # rather than only "local". Absent on a session that never switched.
+            "modelSourceAt": sess.get("modelSourceAt"),
             # The permission modes this session's live Shift+Tab cycle can reach
             # (base modes + whichever optional it was launched into) — the hub's
             # mode selector offers only these, since a switch to any other mode is

@@ -147,7 +147,12 @@ def harness_claude_local(prompt, env):
     # Claude Code does not know this model's window and would otherwise assume
     # 200k and compact far too late for a 64k server.
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "65536"
-    env["CLAUDE_CONFIG_DIR"] = env.get("BENCH_CLAUDE_CONFIG_DIR", "/root/cc-local-test")
+    # Isolated from the operator's real login: a bench run must never write to
+    # the ~/.claude the fleet's sessions share. Overridable, and defaulted under
+    # the runs directory rather than a machine-specific absolute path.
+    env["CLAUDE_CONFIG_DIR"] = env.get(
+        "BENCH_CLAUDE_CONFIG_DIR",
+        os.path.join(os.path.expanduser("~"), ".turma-bench-claude"))
     return ["claude", "-p", "--permission-mode", "bypassPermissions", prompt], env
 
 
@@ -343,6 +348,8 @@ def main():
         if not os.environ.get(var):
             sys.exit(f"{var} must be set in the environment")
 
+    if not os.path.isdir(os.path.join(args.repo, ".git")):
+        sys.exit(f"--repo {args.repo!r} is not a git checkout")
     with open(args.tasks) as fh:
         tasks = json.load(fh)["tasks"]
     if args.id:

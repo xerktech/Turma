@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -6923,17 +6924,42 @@ class TestLocalModelConfig(unittest.TestCase):
                 ha.resolve_model_source("local")
             self.assertEqual(ha.resolve_model_source("subscription"), "subscription")
 
-    def test_env_prefix_shape(self):
+    def test_env_pairs_shape(self):
         with self._configured():
-            prefix = ha.local_model_env_prefix()
+            pairs = ha.local_model_env_pairs()
         # Claude Code appends /v1/messages itself, so the configured /v1 base is
         # trimmed back to the host.
-        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com ", prefix)
-        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", prefix)
-        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=", prefix)
+        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com", pairs)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", pairs)
+        self.assertTrue(any(p.startswith("CLAUDE_CODE_MAX_CONTEXT_TOKENS=") for p in pairs))
         # An ambient key outranks ANTHROPIC_AUTH_TOKEN and would bill the very
         # account the failover exists to stop depending on.
-        self.assertIn("ANTHROPIC_API_KEY= ", prefix)
+        self.assertIn("ANTHROPIC_API_KEY=", pairs)
+
+    def test_messages_api_base_trims_only_a_trailing_v1(self):
+        """A plain rpartition mangles bases that merely CONTAIN /v1, and both
+        of these pass every configuration check before dying on first request."""
+        self.assertEqual(ha._messages_api_base("https://gw.example.com/v1"),
+                         "https://gw.example.com")
+        self.assertEqual(ha._messages_api_base("https://gw.example.com/v1/"),
+                         "https://gw.example.com")
+        # A host whose NAME contains v1 must survive intact.
+        self.assertEqual(ha._messages_api_base("https://v1.example.com"),
+                         "https://v1.example.com")
+        # A gateway mounted under a path keeps it.
+        self.assertEqual(ha._messages_api_base("https://gw.example.com/v1/openai"),
+                         "https://gw.example.com/v1/openai")
+        self.assertEqual(ha._messages_api_base("https://gw.example.com"),
+                         "https://gw.example.com")
+
+    def test_context_env_survives_a_typo(self):
+        """A bad value in a NEW env var must not stop every session on the host
+        at import time — that is the outage this feature exists to prevent."""
+        for bad in ["64k", "", "  ", "-5", "0", "not-a-number"]:
+            with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": bad}):
+                self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 65536)
+        with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": "131072"}):
+            self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 131072)
 
 
 class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
@@ -6968,15 +6994,46 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         return sess
 
     def _launches(self):
+        """The claude command line of each tmux new-session."""
         return [c[-1] for c in self.run_ok_calls if "new-session" in c]
+
+    def _launch_argv(self):
+        """The whole new-session argv — where the -e settings live."""
+        return [c for c in self.run_ok_calls if "new-session" in c][-1]
+
+    def _launch_env(self):
+        """The settings the launch actually applies, read back from the 0600
+        file the launch line sources (never argv — see write_local_model_env)."""
+        cmd = self._launches()[-1]
+        m = re.search(r"\. (\S+local-model\.env)", cmd)
+        if not m:
+            return []
+        path = m.group(1).strip("'\"")
+        with open(path) as fh:
+            return [ln.strip().replace("'", "") for ln in fh if ln.strip()]
 
     def test_local_session_launches_against_the_local_endpoint(self):
         sm = self.make_manager()
         sess = self._session(sm, source="local")
         sm._launch_tmux(sess)
-        cmd = self._launches()[-1]
-        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com ", cmd)
-        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", cmd)
+        env = self._launch_env()
+        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com", env)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", env)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-abc", env)
+        # The credential must reach NO process's argv — neither the command
+        # string (the tmux server's argv) nor a `tmux -e` value (the client's).
+        # /proc/<pid>/cmdline is world-readable in both cases.
+        self.assertNotIn("sk-abc", self._launches()[-1])
+        self.assertNotIn("sk-abc", " ".join(self._launch_argv()))
+
+    def test_env_file_is_owner_only(self):
+        """It holds the gateway credential, so nothing else on the host may
+        read it — that is the entire reason it exists rather than argv."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sm._launch_tmux(sess)
+        path = os.path.join(ha.REGISTRY_DIR, "local-model.env")
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
 
     def test_subscription_session_launches_clean(self):
         """No stray endpoint vars on an ordinary session — otherwise every
@@ -6984,9 +7041,8 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._session(sm, source="subscription")
         sm._launch_tmux(sess)
-        cmd = self._launches()[-1]
-        self.assertNotIn("ANTHROPIC_BASE_URL", cmd)
-        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", cmd)
+        self.assertEqual(self._launch_env(), [])
+        self.assertNotIn("ANTHROPIC_", self._launches()[-1])
 
     def test_launch_falls_back_when_local_config_disappears(self):
         """Config removed under a session already on local: launching against
@@ -6995,7 +7051,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm = self.make_manager(configured=False)
         sess = self._session(sm, source="local")
         sm._launch_tmux(sess)
-        self.assertNotIn("ANTHROPIC_BASE_URL", self._launches()[-1])
+        self.assertEqual(self._launch_env(), [])
         self.assertEqual(sess["modelSource"], "subscription")
 
     def _pin_transcript(self, sess):
@@ -7005,6 +7061,40 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
         os.makedirs(proj, exist_ok=True)
         open(os.path.join(proj, sess["claudeSessionId"] + ".jsonl"), "w").write("{}\n")
+
+    def test_local_launch_drops_model_flag(self):
+        """--model OVERRIDES ANTHROPIC_MODEL, so a failed-over session carrying a
+        Claude alias would ask the gateway for a model it will never serve: every
+        turn 403s while the record still reads running/local. The composer
+        remembers a model PER REPO, so this is the common case, not an exotic
+        one. Never re-add --model for a local session."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["model"] = "sonnet"
+        sm._launch_tmux(sess)
+        cmd = self._launches()[-1]
+        self.assertNotIn("--model", cmd)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", self._launch_env())
+
+    def test_subscription_launch_keeps_model_flag(self):
+        sm = self.make_manager()
+        sess = self._session(sm, source="subscription")
+        sess["model"] = "sonnet"
+        sm._launch_tmux(sess)
+        self.assertIn("--model sonnet", self._launches()[-1])
+
+    def test_set_model_refused_on_a_local_session(self):
+        """The picker only offers Claude aliases the gateway refuses — including
+        'Default', which resolves to the login default. Accepting one would
+        break the session with nothing in errorMsg and no way back from the
+        chip."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        self.run_calls.clear()
+        sm.set_model("abcde", "sonnet")
+        self.assertIsNone(sess.get("model"))
+        # The picker is never opened and no keys are sent to the pane.
+        self.assertEqual([c for c in self.run_calls if "tmux" in c], [])
 
     def test_switch_keeps_the_conversation(self):
         """The whole value of failing over is not losing what the session has
@@ -7017,7 +7107,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         cmd = self._launches()[-1]
         self.assertIn("--resume 11111111-1111-4111-8111-111111111111", cmd)
         self.assertNotIn("--session-id", cmd)   # never a fresh context
-        self.assertIn("ANTHROPIC_BASE_URL=", cmd)
+        self.assertTrue(any(e.startswith("ANTHROPIC_BASE_URL=") for e in self._launch_env()))
 
     def test_switch_bumps_restart_count_so_the_ui_can_settle(self):
         sm = self.make_manager()
@@ -7032,7 +7122,7 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sess = self._session(sm, source="local")
         sm.set_model_source("abcde", "subscription")
         self.assertEqual(sess["modelSource"], "subscription")
-        self.assertNotIn("ANTHROPIC_BASE_URL", self._launches()[-1])
+        self.assertEqual(self._launch_env(), [])
 
     def test_same_source_is_a_noop(self):
         """No pointless relaunch — that would drop a turn in flight."""

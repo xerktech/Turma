@@ -125,6 +125,21 @@ function localModelAvailable(agent) {
   return Boolean(agent && agent.localModel && agent.localModel.available);
 }
 
+// Validate a spawn's optional modelSource the same way the switch route does.
+// Returns null when fine, else {status, error}. Spawning onto the local model is
+// how you start NEW work once usage is gone, so it gets the same enum check and
+// the same capability gate rather than failing later as an errored session card.
+function checkSpawnModelSource(cmd, hostKey) {
+  if (cmd.modelSource == null) return null;
+  if (!["subscription", "local"].includes(cmd.modelSource)) {
+    return { status: 400, error: "modelSource must be subscription or local" };
+  }
+  if (cmd.modelSource === "local" && !localModelAvailable(agents[hostKey])) {
+    return { status: 409, error: "host has no local model configured" };
+  }
+  return null;
+}
+
 // ---- file attachments (XERK-234) --------------------------------------------
 // The composer's 📎 uploads a file, which lands on the agent's host as a real
 // file the session can Read; the message typed into the pane carries its path.
@@ -3759,6 +3774,10 @@ const server = http.createServer(async (req, res) => {
       for (const f of ["label", "baseRef", "model", "permissionMode", "modelSource"]) {
         if (typeof body[f] === "string" && body[f].trim()) cmd[f] = body[f].trim();
       }
+      // Same enum as the switch route: a spawn is the OTHER way onto the local
+      // model, so junk must 400 here rather than land as an errored session card.
+      const spawnSourceErr = checkSpawnModelSource(cmd, hostname);
+      if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
       const cmdId = queueCommand(hostname, cmd);
       return json(res, 200, { ok: true, cmdId });
     }
@@ -3798,6 +3817,8 @@ const server = http.createServer(async (req, res) => {
             cmd[f] = body[f];
           }
         }
+        const spawnSourceErr = checkSpawnModelSource(cmd, key);
+        if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }

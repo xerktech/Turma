@@ -741,6 +741,11 @@
   /* A session running on the self-hosted model is a state worth SEEING at a
      glance — it is a weaker model, so an operator reading the transcript should
      never have to wonder which one wrote it (XERK-246). */
+  /* The same mark on the sessions LIST — the page an operator actually scans.
+     A local session is a weaker model, so it must not be indistinguishable from
+     a subscription one at a glance (XERK-246). */
+  .local-mark { font-size: 10.5px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
+    border: 1px solid var(--warn, #d98f2b); color: var(--warn, #d98f2b); white-space: nowrap; }
   .cc-source-local .cc-btn { border-color: var(--warn, #d98f2b); color: var(--warn, #d98f2b); }
   .cc-source-local .cc-btn .cc-val { color: var(--warn, #d98f2b); }
   .cc-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -1188,6 +1193,7 @@ function onOptChange(rk, repo) {
   const v = id => { const el = document.getElementById(cid(rk, id)); return el ? el.value : ""; };
   const o = loadOpts(repo);
   o.baseRef = v("base"); o.model = v("model"); o.permissionMode = v("perm");
+  o.modelSource = v("source");
   saveOpts(repo, o);
 }
 // The "New session" composer panel: Task (autofocused, Cmd/Ctrl+Enter submits),
@@ -1207,6 +1213,12 @@ function composer(a, repo, rk, spawning) {
     ? o.baseRef : (repo.defaultBranch || repo.branch || "");
   const selModel = o.model || "default";
   const selPerm = o.permissionMode || "auto";
+  // Which model a NEW session runs against (XERK-246). Only offered when this
+  // host reports one, on the same capability contract as everything else here —
+  // and it matters most exactly when usage has run out, since without it an
+  // operator can fail EXISTING sessions over but cannot start any new work.
+  const localModel = (a.localModel && a.localModel.available) ? a.localModel : null;
+  const selSource = (localModel && o.modelSource === "local") ? "local" : "subscription";
   const optsExpanded = optionsOpen.has(rk);
   const opt = (val, label, sel) => `<option value="${esc(val)}"${val === sel ? " selected" : ""}>${esc(label)}</option>`;
   const submit = `startSession('${key}','${rn}')`;
@@ -1245,6 +1257,12 @@ function composer(a, repo, rk, spawning) {
             ${opt("auto", "auto", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
           </select>
         </div>
+        ${localModel ? `<div>
+          <label>Run against</label>
+          <select id="${cid(rk, "source")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
+            ${opt("subscription", "Claude subscription", selSource)}${opt("local", localModel.model || "Self-hosted model", selSource)}
+          </select>
+        </div>` : ""}
       </div>
     </details>
     <div class="cmp-actions">
@@ -1820,6 +1838,9 @@ function activeCard({ a, s, live }) {
         <div class="meta">${meta}</div>
         <div class="state-row">
           <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
+          ${s.modelSource === "local" ? `<span class="local-mark" title="${
+            esc("Running on this host's self-hosted model, not the Claude subscription")
+          }">🏠 local</span>` : ""}
           ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
         </div>
         ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
@@ -1979,7 +2000,7 @@ function startSession(key, repo) {
   const defBranch = repoInfo ? (repoInfo.defaultBranch || repoInfo.branch) : "";
   const prompt = v("task").trim(), label = v("label").trim();
   const baseRef = v("base");
-  const model = v("model"), perm = v("perm");
+  const model = v("model"), perm = v("perm"), modelSource = v("source");
   const body = { repo };
   if (prompt) body.prompt = prompt;
   if (label) body.label = label;
@@ -1988,7 +2009,11 @@ function startSession(key, repo) {
   if (baseRef && baseRef !== defBranch) body.baseRef = baseRef;
   if (model && model !== "default") body.model = model;
   if (perm && perm !== "auto") body.permissionMode = perm;
-  saveOpts(repo, { baseRef, model, permissionMode: perm, optionsExpanded: optionsOpen.has(rk) });
+  // Only send a non-default source; a host with no local model renders no such
+  // control, so this stays absent there.
+  if (modelSource === "local") body.modelSource = modelSource;
+  saveOpts(repo, { baseRef, model, permissionMode: perm, modelSource,
+    optionsExpanded: optionsOpen.has(rk) });
   composerOpen.delete(rk);
   composerDraft.delete(rk);
   composerHeight.delete(rk);

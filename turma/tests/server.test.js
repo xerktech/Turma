@@ -6178,3 +6178,27 @@ test("heartbeat: localModel survives into the fleet payload", async () => {
   // The per-session field the UI chips off must reach clients too.
   assert.equal(host.sessions[0].modelSource, "local");
 });
+
+test("http: spawn validates modelSource like the switch route does", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm5", localModel: { available: true, model: "gpt-oss:120b" } },
+    headers: agentHeaders,
+  });
+  // Junk must 400 here rather than land as an errored session card on the host.
+  const bad = await request("POST", "/api/agents/lm5/sessions", {
+    body: { repo: "Turma", modelSource: "bedrock; rm -rf /" }, headers: userHeaders,
+  });
+  assert.equal(bad.status, 400);
+  const ok = await request("POST", "/api/agents/lm5/sessions", {
+    body: { repo: "Turma", modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test("http: spawning onto local is refused on a host without one", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "lm6" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/lm6/sessions", {
+    body: { repo: "Turma", modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 409);
+});
