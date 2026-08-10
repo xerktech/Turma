@@ -438,6 +438,8 @@
   // ---- state ----------------------------------------------------------------
   let gen = 0;                      // bumped on every open/close; stale async work checks it
   let hostKey = null, sessionId = null, sess = null, agent = null;
+  // In-flight model-source switch (XERK-246); cleared once the heartbeat agrees.
+  let modelSourcePending = null;
   let buffer = [];                  // merged rich entries {id, role, text, blocks}
   // Prompts typed mid-turn, still waiting in Claude Code's queue (the agent
   // folds queue-operation transcript entries — see foldQueueOp in
@@ -1570,6 +1572,16 @@
         '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
         menuHtml(modeOpts, mode, "data-mode") + "</span></span>" +
       '<span class="cc-right">' + ticketFooterChip(sess) + prFooterChip(sess) +
+        (localModelOffered()
+          ? '<span class="cc-opt cc-source' + (currentModelSource() === "local" ? " cc-source-local" : "") + '">' +
+            '<button class="cc-btn" id="ccSourceBtn" title="' +
+            esc("Which model this session runs against. Switching keeps the conversation" +
+                (localModelInfo().model ? " — self-hosted: " + localModelInfo().model : "")) + '">' +
+            (currentModelSource() === "local" ? "🏠" : "☁") +
+            ' <span class="cc-val">' + esc(modelSourceLabel()) + '</span><span class="cc-caret">▾</span></button>' +
+            '<span class="cc-menu" id="ccSourceMenu"><span class="cc-hint">Run against</span>' +
+            menuHtml(modelSourceOpts(), currentModelSource(), "data-source") + "</span></span>"
+          : "") +
         '<span class="cc-opt cc-model">' +
           '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
           '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
@@ -1578,7 +1590,48 @@
       "</span>";
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
+    wireComposeMenu("ccSourceBtn", "ccSourceMenu", "data-source", setSessionModelSource);
   }
+  // ---- local-model failover (XERK-246) --------------------------------------
+  // Running out of Claude usage stops every session on a host at once. A session
+  // can be moved onto that host's self-hosted model and carry on in the SAME
+  // conversation. The control follows the HOST's reported capability, exactly
+  // like the 📎 follows uploadMaxBytes: an agent that reports no `localModel`
+  // cannot do it, so offering the switch would queue a command it silently drops.
+  function localModelInfo(a) { return (a || agent || {}).localModel || {}; }
+  function localModelOffered() {
+    // Also shown when the session is ALREADY local, so a session whose host
+    // later lost its configuration still has a visible way back.
+    return Boolean(localModelInfo().available) || currentModelSource() === "local";
+  }
+  function currentModelSource() {
+    if (modelSourcePending && Date.now() - modelSourcePending.at < 60000) return modelSourcePending.value;
+    return (sess && sess.modelSource) || "subscription";
+  }
+  function modelSourceLabel() {
+    return currentModelSource() === "local" ? (localModelInfo().model || "local model") : "Subscription";
+  }
+  function modelSourceOpts() {
+    const local = localModelInfo();
+    return [
+      { value: "subscription", label: "Claude subscription" },
+      { value: "local", label: local.model || "Self-hosted model" },
+    ];
+  }
+  async function setSessionModelSource(value) {
+    if (!hostKey || !sessionId || !sess || value === currentModelSource()) return;
+    // Memo-only, like the mode switch: the relaunch takes a moment and the
+    // heartbeat is the thing that confirms it actually happened.
+    modelSourcePending = { value, at: Date.now() };
+    renderComposeOpts();
+    try {
+      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model-source", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ modelSource: value }) });
+      if (typeof fastPoll === "function") fastPoll();
+    } catch {}
+  }
+
   async function setSessionModel(value) {
     if (!hostKey || !sessionId || !sess || value === currentModelValue()) return;
     modelSwitchPending = { value, prevActual: sess.modelActual || null, at: Date.now() };
@@ -2184,6 +2237,8 @@
     gen++;
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
+    // The switch has landed once the host reports the source we asked for.
+    if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     modelSwitchPending = null; modeSwitchPending = null;
@@ -2290,6 +2345,8 @@
       __setSess: (s) => { sess = s; },
       __setAgent: (a) => { agent = a; },
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
+      localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,
+      __setModelSourcePending: (p) => { modelSourcePending = p; },
       __setModeSwitchPending: (p) => { modeSwitchPending = p; },
       __setQuestionActive: (v) => { questionActive = v; },
       __setPanePromptActive: (v) => { panePromptActive = v; },

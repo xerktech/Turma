@@ -737,6 +737,12 @@
   .cc-menu.open { display: block; }
   .cc-mode .cc-menu { left: 0; }
   .cc-model .cc-menu { right: 0; }
+  .cc-source .cc-menu { right: 0; }
+  /* A session running on the self-hosted model is a state worth SEEING at a
+     glance — it is a weaker model, so an operator reading the transcript should
+     never have to wonder which one wrote it (XERK-246). */
+  .cc-source-local .cc-btn { border-color: var(--warn, #d98f2b); color: var(--warn, #d98f2b); }
+  .cc-source-local .cc-btn .cc-val { color: var(--warn, #d98f2b); }
   .cc-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px;
     width: 100%; font: inherit; font-size: 12.5px; text-align: left; padding: 6px 10px; border: 0;
     border-radius: var(--radius-sm); background: transparent; color: var(--ink); cursor: pointer; }

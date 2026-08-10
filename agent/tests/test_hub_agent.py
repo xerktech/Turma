@@ -3673,7 +3673,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         # plus the cmdId, which it echoes onto the session it creates.
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
-            model=None, permission_mode=None, cmd_id="c1",
+            model=None, permission_mode=None, model_source=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -3720,7 +3720,8 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         }])
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
-            model="opus", permission_mode="plan", cmd_id="c9",
+            model="opus", permission_mode="plan", model_source=None,
+            cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -6877,6 +6878,193 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self._session(sm, perm="auto", status="stopped")
         sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
+
+
+class TestLocalModelConfig(unittest.TestCase):
+    """Validating the self-hosted-model settings (XERK-246). These decide
+    whether the failover is OFFERED at all, so a half-configured host must read
+    as "no", never as "yes" — a session launched against an endpoint with no key
+    dies on its first request, which is worse than never offering the switch."""
+
+    def _configured(self, **over):
+        vals = {"LOCAL_MODEL_BASE_URL": "https://gw.example.com/v1",
+                "LOCAL_MODEL_API_KEY": "sk-abc", "LOCAL_MODEL_NAME": "gpt-oss:120b"}
+        vals.update(over)
+        return mock.patch.multiple(ha, **vals)
+
+    def test_needs_both_endpoint_and_key(self):
+        with self._configured():
+            self.assertTrue(ha.local_model_configured())
+        with self._configured(LOCAL_MODEL_API_KEY=""):
+            self.assertFalse(ha.local_model_configured())
+        with self._configured(LOCAL_MODEL_BASE_URL=""):
+            self.assertFalse(ha.local_model_configured())
+
+    def test_model_name_is_charset_checked(self):
+        """The name is interpolated into a launch command line."""
+        with self._configured(LOCAL_MODEL_NAME="gpt-oss:120b"):
+            self.assertTrue(ha.local_model_configured())
+        with self._configured(LOCAL_MODEL_NAME="oops; rm -rf /"):
+            self.assertFalse(ha.local_model_configured())
+
+    def test_resolve_model_source_enum(self):
+        with self._configured():
+            self.assertEqual(ha.resolve_model_source(""), "subscription")
+            self.assertEqual(ha.resolve_model_source(None), "subscription")
+            self.assertEqual(ha.resolve_model_source("local"), "local")
+            with self.assertRaises(ValueError):
+                ha.resolve_model_source("bedrock")
+
+    def test_local_refused_when_host_has_no_local_model(self):
+        """Better a clean spawn error than a session that looks failed-over and
+        is quietly still burning the subscription."""
+        with self._configured(LOCAL_MODEL_API_KEY=""):
+            with self.assertRaises(ValueError):
+                ha.resolve_model_source("local")
+            self.assertEqual(ha.resolve_model_source("subscription"), "subscription")
+
+    def test_env_prefix_shape(self):
+        with self._configured():
+            prefix = ha.local_model_env_prefix()
+        # Claude Code appends /v1/messages itself, so the configured /v1 base is
+        # trimmed back to the host.
+        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com ", prefix)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", prefix)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=", prefix)
+        # An ambient key outranks ANTHROPIC_AUTH_TOKEN and would bill the very
+        # account the failover exists to stop depending on.
+        self.assertIn("ANTHROPIC_API_KEY= ", prefix)
+
+
+class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
+    """Moving a running session onto the self-hosted model and back (XERK-246).
+
+    The point of the feature is that running out of Claude usage stops every
+    session at once; the session should carry on rather than halt. So the switch
+    must keep the CONVERSATION (resume, never clear-context) and must survive
+    later relaunches."""
+
+    def make_manager(self, configured=True):
+        sm = super().make_manager()
+        sm.save = mock.Mock()
+        vals = {"LOCAL_MODEL_BASE_URL": "https://gw.example.com/v1",
+                "LOCAL_MODEL_API_KEY": "sk-abc",
+                "LOCAL_MODEL_NAME": "gpt-oss:120b"} if configured else {
+                "LOCAL_MODEL_BASE_URL": "", "LOCAL_MODEL_API_KEY": "",
+                "LOCAL_MODEL_NAME": "gpt-oss:120b"}
+        p = mock.patch.multiple(ha, **vals)
+        p.start()
+        self.addCleanup(p.stop)
+        return sm
+
+    def _session(self, sm, source="subscription", status="running"):
+        sess = {"id": "abcde", "status": status, "tmuxName": "agent-abcde",
+                "worktreePath": os.path.join(self.tmp, "wt"),
+                "rcName": "host-repo-abcde", "ttydPort": 7700,
+                "claudeSessionId": "11111111-1111-4111-8111-111111111111",
+                "modelSource": source, "permissionMode": "auto"}
+        os.makedirs(sess["worktreePath"], exist_ok=True)
+        sm.registry = [sess]
+        return sess
+
+    def _launches(self):
+        return [c[-1] for c in self.run_ok_calls if "new-session" in c]
+
+    def test_local_session_launches_against_the_local_endpoint(self):
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sm._launch_tmux(sess)
+        cmd = self._launches()[-1]
+        self.assertIn("ANTHROPIC_BASE_URL=https://gw.example.com ", cmd)
+        self.assertIn("ANTHROPIC_MODEL=gpt-oss:120b", cmd)
+
+    def test_subscription_session_launches_clean(self):
+        """No stray endpoint vars on an ordinary session — otherwise every
+        session on the host would quietly move to the local model."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="subscription")
+        sm._launch_tmux(sess)
+        cmd = self._launches()[-1]
+        self.assertNotIn("ANTHROPIC_BASE_URL", cmd)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", cmd)
+
+    def test_launch_falls_back_when_local_config_disappears(self):
+        """Config removed under a session already on local: launching against
+        the subscription silently would be a surprise usage bill, so the record
+        is corrected to say what actually happened."""
+        sm = self.make_manager(configured=False)
+        sess = self._session(sm, source="local")
+        sm._launch_tmux(sess)
+        self.assertNotIn("ANTHROPIC_BASE_URL", self._launches()[-1])
+        self.assertEqual(sess["modelSource"], "subscription")
+
+    def _pin_transcript(self, sess):
+        """Put this session's pinned conversation on disk, so the resume path
+        can actually resolve it (a pinned id with no file resolves to nothing,
+        by design — see _session_transcript_path)."""
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        open(os.path.join(proj, sess["claudeSessionId"] + ".jsonl"), "w").write("{}\n")
+
+    def test_switch_keeps_the_conversation(self):
+        """The whole value of failing over is not losing what the session has
+        already worked out, so it resumes its own transcript id."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._pin_transcript(sess)
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "local")
+        cmd = self._launches()[-1]
+        self.assertIn("--resume 11111111-1111-4111-8111-111111111111", cmd)
+        self.assertNotIn("--session-id", cmd)   # never a fresh context
+        self.assertIn("ANTHROPIC_BASE_URL=", cmd)
+
+    def test_switch_bumps_restart_count_so_the_ui_can_settle(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        before = sess.get("restartCount", 0)
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["restartCount"], before + 1)
+        self.assertTrue(sess.get("modelSourceAt"))
+
+    def test_switch_back_to_subscription(self):
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sm.set_model_source("abcde", "subscription")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertNotIn("ANTHROPIC_BASE_URL", self._launches()[-1])
+
+    def test_same_source_is_a_noop(self):
+        """No pointless relaunch — that would drop a turn in flight."""
+        sm = self.make_manager()
+        self._session(sm, source="local")
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(self._launches(), [])
+
+    def test_unconfigured_host_refuses_and_stays_put(self):
+        sm = self.make_manager(configured=False)
+        sess = self._session(sm)
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertEqual(sess["status"], "error")
+        self.assertEqual(self._launches(), [])
+
+    def test_failed_relaunch_reverts_the_record(self):
+        """The record must never claim a move that did not happen, or the UI
+        shows 'local' for a session still on the exhausted subscription."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(sm, "_launch_tmux", side_effect=RuntimeError("boom")):
+            sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertEqual(sess["status"], "error")
+
+    def test_noop_for_non_running_session(self):
+        sm = self.make_manager()
+        sess = self._session(sm, status="stopped")
+        sm.set_model_source("abcde", "local")
+        self.assertEqual(sess["modelSource"], "subscription")
+        self.assertEqual(self._launches(), [])
 
 
 class TestParsePanePrompt(unittest.TestCase):

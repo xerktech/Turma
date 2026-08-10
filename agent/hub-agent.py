@@ -524,6 +524,77 @@ PERMISSION_MODES = {"auto", "bypassPermissions", "acceptEdits", "plan", "default
 # list therefore lands on the wrong mode (the whole point of `perm_cycle_for`).
 PERM_CYCLE_BASE = ["default", "acceptEdits", "plan"]
 PERM_CYCLE_OPTIONAL = ["bypassPermissions", "auto"]  # canonical trailing order
+
+# --- local-model failover (XERK-246) --------------------------------------
+# Running out of Claude usage stops every session on the host at once, which is
+# the whole reason this exists. A session can be moved onto a SELF-HOSTED model
+# and carry on: Claude Code speaks the Anthropic Messages API, and the LiteLLM
+# gateway serves /v1/messages against our own gpt-oss box, so the SAME claude
+# binary runs against a different brain with nothing but environment variables.
+#
+# It is deliberately env-driven and per-launch rather than a second agent
+# binary: everything a session depends on — the transcript format the whole
+# chat/usage/PR-chip stack parses, `--resume`, Remote Control, the AskUserQuestion
+# bridge, and above all the `--settings` safety guard — keeps working untouched.
+# A separate coding agent loses all of it (see docs/local-model-failover.md for
+# the six-harness bake-off that settled this).
+LOCAL_MODEL_BASE_URL = os.environ.get("LOCAL_MODEL_BASE_URL", "").strip()
+LOCAL_MODEL_API_KEY = os.environ.get("LOCAL_MODEL_API_KEY", "").strip()
+LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "gpt-oss:120b").strip()
+# Claude Code assumes a 200k window for a model it does not recognise and would
+# compact far too late for a 64k server — the tail then silently truncates
+# server-side instead of compacting. Must match what the server actually serves.
+LOCAL_MODEL_CONTEXT = int(os.environ.get("LOCAL_MODEL_CONTEXT", "65536"))
+# Where a session's model comes from. "subscription" is the mounted ~/.claude
+# login (the default, and what every existing session is); "local" is the
+# self-hosted model above.
+MODEL_SOURCES = {"subscription", "local"}
+# The model name is interpolated into a launch command line, so it is charset
+# checked like every other launch input. Ollama-style tags carry a colon.
+LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
+
+
+def local_model_configured():
+    """True when this host can run a session on the self-hosted model.
+
+    Both halves are required: an endpoint with no key (or the reverse) would
+    launch a session that dies on its first request, which is strictly worse
+    than not offering the switch at all."""
+    return bool(LOCAL_MODEL_BASE_URL and LOCAL_MODEL_API_KEY
+                and LOCAL_MODEL_NAME_RE.fullmatch(LOCAL_MODEL_NAME))
+
+
+def resolve_model_source(source):
+    """Validate a model-source choice against a fixed enum. Blank ->
+    subscription (what every session was before this existed)."""
+    source = (source or "").strip()
+    if not source:
+        return "subscription"
+    if source not in MODEL_SOURCES:
+        raise ValueError(f"unknown model source {source!r}")
+    if source == "local" and not local_model_configured():
+        raise ValueError("local model not configured on this host")
+    return source
+
+
+def local_model_env_prefix():
+    """Shell assignments that repoint Claude Code at the self-hosted model.
+
+    Returned as a prefix for the tmux command line (rather than written into the
+    shared guard settings file) because the choice is PER SESSION: one session
+    can fail over while its neighbours stay on the subscription."""
+    base = LOCAL_MODEL_BASE_URL.rstrip("/")
+    host, _, _ = base.rpartition("/v1")
+    return (
+        f"ANTHROPIC_BASE_URL={shlex.quote(host or base)} "
+        f"ANTHROPIC_AUTH_TOKEN={shlex.quote(LOCAL_MODEL_API_KEY)} "
+        f"ANTHROPIC_MODEL={shlex.quote(LOCAL_MODEL_NAME)} "
+        f"ANTHROPIC_SMALL_FAST_MODEL={shlex.quote(LOCAL_MODEL_NAME)} "
+        f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={LOCAL_MODEL_CONTEXT} "
+        # An ambient API key outranks these and would quietly bill the very
+        # account this failover exists to stop depending on.
+        f"ANTHROPIC_API_KEY= "
+    )
 # git-ref-safe token: our allowlist is a strict subset of what git accepts, so
 # anything matching is also validated below for the few remaining git rules.
 _REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -8733,6 +8804,20 @@ class SessionManager:
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
         )
+        # Failover (XERK-246): a session moved onto the self-hosted model runs the
+        # SAME claude with its endpoint repointed. Read off the record on EVERY
+        # launch, so a resume/restart of a failed-over session stays failed over
+        # rather than silently going back to the exhausted subscription.
+        if sess.get("modelSource") == "local":
+            if local_model_configured():
+                env_prefix += local_model_env_prefix()
+            else:
+                # Configuration was removed under a session that was already on
+                # local. Launching anyway would hit the subscription without
+                # saying so; drop back explicitly and leave the reason visible.
+                log(f"launch: session {sess['id']} wants the local model but this "
+                    f"host has none configured — launching on the subscription")
+                sess["modelSource"] = "subscription"
         claude_cmd = env_prefix + claude_cmd
         run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
         rc, err = run_ok([
@@ -8862,7 +8947,8 @@ class SessionManager:
 
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
               model=None, permission_mode=None, ticket=None, ticket_detail=None,
-              cmd_id=None, await_clone=None, await_clone_owner=None):
+              cmd_id=None, await_clone=None, await_clone_owner=None,
+              model_source=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -8961,6 +9047,11 @@ class SessionManager:
             "ttydPort": self._alloc_port(),
             "model": None,                  # resolved --model value (None = omit)
             "permissionMode": "auto",
+            # Subscription or the self-hosted model (XERK-246). Spawning
+            # straight onto local matters as much as failing an existing
+            # session over: when usage runs out you cannot start NEW work
+            # either, which is the halt this ticket is about.
+            "modelSource": "subscription",
             "baseRef": None,                # base branch the worktree forked from
             # A queued record has no worktree/tmux/ttyd yet — _provision_session
             # (via _drain_queue) makes it real when it's allowed to run.
@@ -8985,6 +9076,7 @@ class SessionManager:
         try:
             sess["model"] = resolve_model(model, self.models_available())
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
+            sess["modelSource"] = resolve_model_source(model_source)
         except Exception as e:
             self._set_error(sess, e)
             return
@@ -9726,6 +9818,56 @@ class SessionManager:
             log(f"restarted (cleared context) session {sid}")
         except Exception as e:
             self._set_error(sess, e)
+
+    def set_model_source(self, sid, source):
+        """Move a running session between the subscription and the self-hosted
+        model, KEEPING its conversation (XERK-246).
+
+        This is the failover: when Claude usage runs out every session on the
+        host stops at once, and the work should continue rather than halt.
+
+        It relaunches with `--resume <this session's transcript id>` — the same
+        path a container restart already uses — so the session carries on in the
+        SAME conversation with the same worktree, branch and uncommitted work.
+        Nothing is exported, summarised or handed over; only the endpoint the
+        next request goes to changes.
+
+        Deliberately NOT `restart` (which clears context): failing over is the
+        moment you least want to lose what the session has already worked out."""
+        sess = self._find(sid)
+        if not sess:
+            log(f"setModelSource: no such session {sid}")
+            return
+        if sess.get("status") != "running":
+            log(f"setModelSource: session {sid} not running")
+            return
+        try:
+            source = resolve_model_source(source)
+        except ValueError as e:
+            self._set_error(sess, e)
+            return
+        if sess.get("modelSource", "subscription") == source:
+            return                                  # already there; no relaunch
+        previous = sess.get("modelSource", "subscription")
+        sess["modelSource"] = source
+        try:
+            self._kill_tmux(sess)      # ends claude; tmux/ttyd are re-made below
+            self._clear_question_files(sid)  # the old claude's question dies with it
+            # Resume THIS session's own conversation. _launch_tmux reads
+            # modelSource (set above) to decide the endpoint.
+            self._launch_tmux(sess, resume=True)
+            self._launch_ttyd(sess)
+            sess["errorMsg"] = None
+            # Same role as restartCount: the only heartbeat-visible proof the
+            # relaunch actually happened, so the UI can drop its spinner on a
+            # fact instead of a timer.
+            sess["restartCount"] = sess.get("restartCount", 0) + 1
+            sess["modelSourceAt"] = now_iso()
+            log(f"session {sid} moved from {previous} to {source} model")
+        except Exception as e:
+            sess["modelSource"] = previous          # never claim a move that failed
+            self._set_error(sess, e)
+        self.save()
 
     def delete(self, sid):
         """Remove a session entirely: its worktree + registry record. It
@@ -12168,6 +12310,7 @@ class SessionManager:
                         base_ref=cmd.get("baseRef"),
                         model=cmd.get("model"),
                         permission_mode=cmd.get("permissionMode"),
+                        model_source=cmd.get("modelSource"),
                         cmd_id=cid,
                     )
                 elif ctype == "spawnTicket":
@@ -12202,6 +12345,9 @@ class SessionManager:
                     self.set_model(cmd.get("sessionId"), cmd.get("model"))
                 elif ctype == "setMode":
                     self.set_mode(cmd.get("sessionId"), cmd.get("permissionMode"))
+                elif ctype == "setModelSource":
+                    self.set_model_source(
+                        cmd.get("sessionId"), cmd.get("modelSource"))
                 elif ctype == "answerQuestion":
                     self.answer_question(
                         cmd.get("sessionId"),
@@ -12764,6 +12910,11 @@ class SessionManager:
             # rather than looking like a dropped click. Absent when none.
             "pendingModel": sess.get("pendingModel"),
             "permissionMode": sess.get("permissionMode"),
+            # Which model this session is actually running against (XERK-246):
+            # "subscription" (the mounted ~/.claude login) or "local" (the
+            # self-hosted model it failed over to). Always present, so a client
+            # never has to infer "not local" from an absent field.
+            "modelSource": sess.get("modelSource") or "subscription",
             # The permission modes this session's live Shift+Tab cycle can reach
             # (base modes + whichever optional it was launched into) — the hub's
             # mode selector offers only these, since a switch to any other mode is
@@ -13096,6 +13247,17 @@ class SessionManager:
             # operator believes they sent whole. Rises on its own as hosts
             # update, with no hub-side version table to keep in step.
             "inputMaxChars": INPUT_MAX_CHARS,
+            # Whether this host can fail a session over to a self-hosted model
+            # (XERK-246). Doubles as the capability flag, exactly like
+            # inputMaxChars and uploadMaxBytes: an agent predating the failover —
+            # or one with no LOCAL_MODEL_* env — reports nothing, and the hub and
+            # composers hide the control rather than queue a command that host
+            # will silently ack and drop.
+            "localModel": {
+                "available": local_model_configured(),
+                "model": LOCAL_MODEL_NAME if local_model_configured() else None,
+                "contextTokens": LOCAL_MODEL_CONTEXT if local_model_configured() else None,
+            },
             # The largest file this agent will take as a message attachment
             # (XERK-234). Doubles as the capability flag, exactly like
             # inputMaxChars above: an agent predating attachments reports nothing

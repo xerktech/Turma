@@ -1,5 +1,19 @@
 # OpenCode coding-agent model eval — August 2026
 
+> **The coding-agent recommendation here is superseded by
+> `docs/local-model-failover.md` (XERK-246).** This eval never varied the
+> HARNESS — every model ran under OpenCode — and it ran OpenCode on the GPU box
+> against `localhost:9402`, which no agent host can reach. Over the gateway a
+> host must actually use, the config below fails outright: the address does not
+> resolve, and `reasoningEffort` is a hard 400 from LiteLLM. A six-harness
+> bake-off since found OpenCode cannot reliably reach that gateway at all, and
+> that Claude Code pointed at the local model beats it and everything else.
+> `opencode.json` and `OPENCODE_CONTRACT.md` have been deleted.
+>
+> **Everything else here still stands** — the cue/translation model choice, the
+> serving architecture, the vLLM/CUTLASS findings and the Ollama concurrency
+> numbers are unaffected.
+
 Which local model should power OpenCode sessions for the Turma fleet on the
 RTX 6000 Pro (96 GB) GPU box — **Qwen3.6-27B at BF16** or **poolside Laguna
 XS 2.1 (33B-A3B MoE) at BF16** — and what happens to Tenir cue + translation

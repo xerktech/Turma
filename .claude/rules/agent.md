@@ -73,6 +73,24 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   (id-deduped, `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts them. Tests:
   `TestHistoryCommand`.
 
+### `setModelSource` — failover to the self-hosted model (XERK-246)
+
+- Moves a RUNNING session between the `~/.claude` subscription and this host's local model, keeping
+  its conversation. See `CLAUDE.md`'s "Local-model failover" for why this is env-repointing rather
+  than a second coding agent, and `docs/local-model-failover.md` for the bake-off behind it.
+- `local_model_configured()` is the single gate — **both** endpoint and key, plus a charset-checked
+  model name (it is interpolated into a launch command line). Half-configured reads as "no": a
+  session launched at an endpoint with no key dies on its first request.
+- `local_model_env_prefix()` rides the tmux command line, **not** the shared guard settings file:
+  the choice is PER SESSION, so one session can fail over while its neighbours stay put. It blanks
+  `ANTHROPIC_API_KEY`, which outranks `ANTHROPIC_AUTH_TOKEN` and would bill the very account the
+  failover exists to stop depending on.
+- `set_model_source` **reverts the record if the relaunch throws** — a record claiming `local` for a
+  session still on the exhausted subscription is worse than a visible error. `_launch_tmux` likewise
+  demotes a `local` session to `subscription` (and says so) when the host's configuration has gone,
+  rather than launching against the subscription while the UI still says local.
+- Tests: `TestLocalModelConfig`, `TestLocalModelFailover`.
+
 ### `setModel` — live model switch, for that session only (XERK-33)
 
 - `set_model` drives Claude Code's /model picker (`parse_model_picker`). **Never `/model <name>`**,

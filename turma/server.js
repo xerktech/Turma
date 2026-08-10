@@ -116,6 +116,15 @@ function inputCapFor(agent) {
   return Math.min(reported, INPUT_MAX_CHARS);
 }
 
+// Whether a host can run a session on its own self-hosted model (XERK-246).
+// Same contract as inputCapFor above: an agent that predates the failover — or
+// one with no LOCAL_MODEL_* env — reports nothing, and an ABSENT flag means
+// "that agent cannot do it", never "assume it can". Clients hide the control
+// rather than queue a command the host will ack and drop.
+function localModelAvailable(agent) {
+  return Boolean(agent && agent.localModel && agent.localModel.available);
+}
+
 // ---- file attachments (XERK-234) --------------------------------------------
 // The composer's 📎 uploads a file, which lands on the agent's host as a real
 // file the session can Read; the message typed into the pane carries its path.
@@ -1584,7 +1593,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "gitSources", "github", "inputMaxChars", "jira", "logTail", "memory",
+  "gitSources", "github", "inputMaxChars", "jira", "localModel", "logTail", "memory",
   "models", "prunes", "repoUsage", "repos", "reposRoot", "sessions",
   "startedAt", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
@@ -3747,7 +3756,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 404, { error: "unknown repo" });
       }
       const cmd = { type: "spawn", repo, prompt };
-      for (const f of ["label", "baseRef", "model", "permissionMode"]) {
+      for (const f of ["label", "baseRef", "model", "permissionMode", "modelSource"]) {
         if (typeof body[f] === "string" && body[f].trim()) cmd[f] = body[f].trim();
       }
       const cmdId = queueCommand(hostname, cmd);
@@ -3774,7 +3783,8 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "repo required" });
         }
         const cmd = { type: "spawn", repo: body.repo };
-        for (const f of ["prompt", "label", "baseRef", "model", "permissionMode"]) {
+        for (const f of ["prompt", "label", "baseRef", "model", "permissionMode",
+                         "modelSource"]) {
           if (body[f] != null && body[f] !== "") {
             if (typeof body[f] !== "string") {
               return json(res, 400, { error: `${f} must be a string` });
@@ -3961,6 +3971,25 @@ const server = http.createServer(async (req, res) => {
         const permissionMode = typeof body.permissionMode === "string" ? body.permissionMode : "";
         if (!permissionMode) return json(res, 400, { error: "permissionMode required" });
         const cmdId = queueCommand(key, { type: "setMode", sessionId, permissionMode });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/model-source -> move a RUNNING
+      // session between the subscription login and this host's self-hosted
+      // model (XERK-246), keeping its conversation. This is the failover for
+      // Claude usage running out, which otherwise stops every session at once.
+      // Gated on the host reporting localModel.available: an agent that cannot
+      // do it would ack the command and silently drop it, so refusing here is
+      // what makes the button honest.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "model-source") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const modelSource = typeof body.modelSource === "string" ? body.modelSource : "";
+        if (!["subscription", "local"].includes(modelSource)) {
+          return json(res, 400, { error: "modelSource must be subscription or local" });
+        }
+        if (modelSource === "local" && !localModelAvailable(agents[key])) {
+          return json(res, 409, { error: "host has no local model configured" });
+        }
+        const cmdId = queueCommand(key, { type: "setModelSource", sessionId, modelSource });
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending

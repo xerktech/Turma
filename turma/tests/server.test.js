@@ -6113,3 +6113,68 @@ test("uploads: the relay is memory-only — nothing rides the fleet payload", as
   // It IS held, though — the agent has to be able to come and get it.
   assert.ok([...uploads.values()].some((u) => u.host === "upLeak"));
 });
+
+// --- local-model failover (XERK-246) -----------------------------------------
+// Moving a session onto the host's self-hosted model when Claude usage runs out.
+// The route is gated on the host REPORTING the capability, because an agent that
+// cannot do it would ack the command and drop it silently.
+
+test("http: model-source endpoint queues a setModelSource command", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm1", localModel: { available: true, model: "gpt-oss:120b" } },
+    headers: agentHeaders,
+  });
+  const res = await request("POST", "/api/agents/lm1/sessions/sess1/model-source", {
+    body: { modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "lm1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setModelSource", sessionId: "sess1", modelSource: "local", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: model-source refuses local on a host that reports no local model", async () => {
+  // No localModel block at all — an agent predating the failover.
+  await request("POST", "/api/heartbeat", { body: { device: "lm2" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/lm2/sessions/sess1/model-source", {
+    body: { modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 409);
+  // Going BACK to the subscription is always allowed — that path needs nothing
+  // from the host, and refusing it could strand a session on a local model
+  // whose configuration was removed.
+  const back = await request("POST", "/api/agents/lm2/sessions/sess1/model-source", {
+    body: { modelSource: "subscription" }, headers: userHeaders,
+  });
+  assert.equal(back.status, 200);
+});
+
+test("http: model-source rejects anything outside the enum", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm3", localModel: { available: true } }, headers: agentHeaders,
+  });
+  for (const modelSource of ["", "bedrock", "LOCAL", 7]) {
+    const res = await request("POST", "/api/agents/lm3/sessions/sess1/model-source", {
+      body: { modelSource }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, String(modelSource));
+  }
+});
+
+test("heartbeat: localModel survives into the fleet payload", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "lm4",
+      localModel: { available: true, model: "gpt-oss:120b", contextTokens: 65536 },
+      sessions: [{ id: "s1", repo: "Turma", status: "running", modelSource: "local" }],
+    },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "lm4");
+  assert.equal(host.localModel.available, true);
+  assert.equal(host.localModel.model, "gpt-oss:120b");
+  // The per-session field the UI chips off must reach clients too.
+  assert.equal(host.sessions[0].modelSource, "local");
+});

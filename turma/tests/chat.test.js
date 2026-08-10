@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1575,4 +1575,58 @@ test("attachments: an expired staged file is an actionable refusal, not 'Send fa
 
 test("attachments: the per-message cap matches the hub's", () => {
   assert.equal(MAX_ATTACHMENTS, 10);
+});
+
+// --- local-model failover chip (XERK-246) ------------------------------------
+// The control follows the HOST's reported capability, exactly like the 📎
+// follows uploadMaxBytes: an agent reporting no `localModel` cannot fail a
+// session over, so offering the switch would queue a command it silently drops.
+
+test("model source: the switch is offered only when the host reports one", () => {
+  __setModelSourcePending(null);
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  assert.equal(localModelOffered(), true);
+  __setAgent({});                       // an agent predating the failover
+  assert.equal(localModelOffered(), false);
+  __setAgent({ localModel: { available: false } });
+  assert.equal(localModelOffered(), false);
+});
+
+test("model source: a session already on local keeps a way back", () => {
+  // The host's configuration can be removed under a running session; without
+  // this it would be stranded on the local model with no visible switch.
+  __setModelSourcePending(null);
+  __setSess({ id: "s1", modelSource: "local" });
+  __setAgent({});
+  assert.equal(localModelOffered(), true);
+  assert.equal(currentModelSource(), "local");
+});
+
+test("model source: defaults to subscription when the agent never says", () => {
+  __setModelSourcePending(null);
+  __setSess({ id: "s1" });              // no modelSource at all
+  __setAgent({ localModel: { available: true } });
+  assert.equal(currentModelSource(), "subscription");
+});
+
+test("model source: an in-flight switch paints the target, not the stale beat", () => {
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setModelSourcePending({ value: "local", at: Date.now() });
+  assert.equal(currentModelSource(), "local");
+  assert.equal(modelSourceLabel(), "gpt-oss:120b");
+  // A stale memo must not pin the chip forever if the switch never lands.
+  __setModelSourcePending({ value: "local", at: Date.now() - 120000 });
+  assert.equal(currentModelSource(), "subscription");
+  __setModelSourcePending(null);
+});
+
+test("model source: the menu names the host's actual model", () => {
+  __setModelSourcePending(null);
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  assert.deepEqual(modelSourceOpts().map((o) => o.value), ["subscription", "local"]);
+  assert.equal(modelSourceOpts()[1].label, "gpt-oss:120b");
+  assert.equal(modelSourceLabel(), "Subscription");
 });

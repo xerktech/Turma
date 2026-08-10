@@ -267,6 +267,28 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   **directive rather than manager-side enforcement** because only the agent knows when "new work"
   begins. Tests: `TestSessionLifecycle`.
 
+### Local-model failover (XERK-246)
+
+- **Running out of Claude usage stops every session on a host at once**, which is what this exists to
+  stop. A session's `modelSource` is `subscription` (the mounted `~/.claude` login) or `local` (this
+  host's self-hosted model), settable at spawn and switchable on a running session.
+- `local` is the **same `claude` binary** with `ANTHROPIC_BASE_URL` and friends repointed at a
+  gateway serving the Anthropic Messages API. Never a second coding agent: a separate harness loses
+  the transcript format every surface parses, `--resume`, Remote Control, the AskUserQuestion bridge
+  and **the `--settings` safety guard**. `docs/local-model-failover.md` has the six-harness bake-off
+  that settled this, including why `opencode.json` was deleted rather than fixed.
+- The switch **relaunches with `--resume <that session's transcript id>`**, never `restart` — failing
+  over is the moment you least want to clear the context. Read off the record on EVERY launch, so a
+  resume/restart of a failed-over session stays failed over instead of silently returning to the
+  exhausted subscription.
+- `LOCAL_MODEL_CONTEXT` must match what the server really serves: Claude Code assumes 200k for a
+  model it doesn't recognise and would compact far too late, truncating server-side instead.
+- **It is a fallback, not a peer** — the local model solved 4/8 of the bench Claude would be expected
+  to clear. The UI marks a `local` session so nobody has to wonder which model wrote a turn.
+- **Automatic delegation to the local model is deliberately NOT shipped**; the token arithmetic
+  doesn't obviously work (diagnosis dominates, and Claude must diagnose before it can delegate). See
+  the doc before building it.
+
 ### Safety guard
 
 - Sessions run hands-off, so every launch passes `--settings` a generated file
@@ -297,6 +319,9 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
+- Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
+  `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
+  the agent reports `localModel.available:false` so clients hide the control.
 - The `turma` service also takes the LiteLLM env for **Whisper STT** (`LITELLM_URL` = that
   instance's `/v1` base, optional `LITELLM_API_KEY`; legacy `WHISPER_URL`/`WHISPER_API_KEY`
   override), and `NODE_NO_WARNINGS=1` to silence `node:sqlite`'s experimental warning.
