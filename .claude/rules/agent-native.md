@@ -96,7 +96,10 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       `--version` string): an unreadable version is usually a half-written install, but equally a
       working claude printing a shape this doesn't parse — there the reinstall fixes nothing and
       would run on every start forever, inside the awaited boot path. Retried only when what claude
-      prints CHANGES.
+      prints CHANGES — and the marker is earned only by a repair that actually RAN (`install_claude`
+      returns the install's status): remembering an install that never reached the registry, because
+      the host restarted while its network was down, would brick Claude Code on that host
+      permanently.
     - Every external call is `timeout`-bounded, `npm prefix -g`/`npm ls -g` included and the prefix
       read once per run: the lock is held for the whole run, so one hung child would block every
       later update — including the one shipping the fix — and this runs inside a start.

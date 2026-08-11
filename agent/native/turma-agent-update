@@ -256,6 +256,7 @@ install_claude() {  # <version_before> <version_wanted, may be empty>
       report_claude_install "$before" "$want"
     else
       logmsg "claude: install FAILED (see npm output above)"
+      return 1
     fi
   elif bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" claude update >>"$LOG" 2>&1; then
     # Not npm-managed: Anthropic's native installer owns this claude, and `npm
@@ -267,6 +268,7 @@ install_claude() {  # <version_before> <version_wanted, may be empty>
     report_claude_install "$before" ""
   else
     logmsg "claude: not npm-managed and 'claude update' failed"
+    return 1
   fi
 }
 
@@ -314,11 +316,19 @@ update_claude() {
       return 0
     fi
     logmsg "claude: $(command -v claude) reports no readable version ($raw) — reinstalling"
-    install_claude ""
-    if [ -z "$(claude_version)" ]; then
-      printf '%s\n' "$(claude_raw_version)" >"$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+    # The marker is only earned by a repair that actually RAN. An install that
+    # never reached the registry — the host restarted while its network was
+    # down, say — must not be remembered as "already tried": that would brick
+    # Claude Code on this host permanently, on an ordinary condition, with one
+    # log line as the evidence.
+    if install_claude ""; then
+      if [ -z "$(claude_version)" ]; then
+        printf '%s\n' "$(claude_raw_version)" >"$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+      else
+        rm -f "$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+      fi
     else
-      rm -f "$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+      logmsg "claude: the repair did not run, so it will be attempted again"
     fi
     return 0
   fi

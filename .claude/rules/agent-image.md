@@ -35,7 +35,13 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
   - **A repair that doesn't help is remembered** (`/root/.turma/claude-unparseable`): an unreadable
     version is usually a half-written install, but equally a working claude printing a shape this
     doesn't parse — there the reinstall fixes nothing and would run on every boot forever. Retried
-    only when what claude prints CHANGES.
+    only when what claude prints CHANGES, and only ever written by an install that SUCCEEDED.
+  - **Every `claude --version` here is `timeout`-wrapped, the post-install verification included.**
+    These are children of PID 1 with no outer timeout anywhere (the `||` guard only runs once the
+    block returns), and a hang is reachable from the very fault the repair branch handles: an
+    unbounded one leaves the container `running` with no manager, no tunnel and no sessions, and
+    because PID 1 looks alive no restart policy fires. Its test is TIMED — an unbounded read boots
+    too, just minutes later.
 - **Cloud CLIs** (terraform/`az`/`aws`, pinned via
   `TERRAFORM_VERSION`/`AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`) live in the
   `tooling` stage, so **every tier carries them and the CI scan covers them** — they are

@@ -421,6 +421,9 @@ case "\$1 \$2" in
      echo "npm-install \$*" >> "\$CLAUDE_LOG"
      # \$STUB_NPM_FAIL makes the FIRST install fail the way an EACCES against a
      # root-owned global prefix does, so the fallback is observable.
+     # \$STUB_NPM_ALWAYS_FAIL is the network-is-down shape: the install never
+     # reaches the registry, on this start and the next.
+     [ -n "\${STUB_NPM_ALWAYS_FAIL:-}" ] && exit 243
      if [ -n "\${STUB_NPM_FAIL:-}" ] && [ ! -f "$bin/.npm-failed-once" ]; then
        : > "$bin/.npm-failed-once"; exit 243
      fi
@@ -599,6 +602,41 @@ if grep -q 'a repair already failed to change that' "$root/out.log"; then
   pass "and says why it is leaving it alone"
 else
   fail "no explanation for skipping the repair: $(cat "$root/out.log")"
+fi
+rm -rf "$root" "$d"
+
+# 16c-iii. A repair that never RAN must not be remembered as tried. "The host
+#      restarted while its network was down" is an ordinary condition, and
+#      remembering that failed install as "already tried" would brick Claude Code
+#      on the host permanently — every session launch failing, one log line as
+#      the evidence.
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+# A genuinely broken claude (the shape a half-extracted package prints) and an
+# install that cannot reach the registry.
+install_fake_claude_toolchain "$bin" "Error: Cannot find module cli.js" "2.0.9" yes
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+: > "$root/claude.log"
+for _ in 1 2 3; do
+  env FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
+    TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" \
+    TURMA_BOOT_UPDATE_MIN_INTERVAL=0 STUB_NPM_ALWAYS_FAIL=1 \
+    "$bin/turma-agent-update" --claude-only >>"$root/out.log" 2>&1 || true
+done
+installs="$(grep -c 'npm-install' "$root/claude.log" 2>/dev/null || true)"
+if [ "${installs:-0}" -ge 3 ]; then
+  pass "a repair that never ran is retried, not remembered ($installs attempts)"
+else
+  fail "a failed install was remembered as 'already tried' — claude stays broken forever ($installs attempts)"
+fi
+if [ -f "$root/home/.turma/claude-unparseable" ]; then
+  fail "wrote the give-up marker for a repair that never ran"
+else
+  pass "no give-up marker without a repair"
 fi
 rm -rf "$root" "$d"
 

@@ -267,7 +267,12 @@ claude_update_check() (
     echo "[entrypoint] claude update: ${cur:-none-or-unreadable} -> $latest"
     if timeout "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
          npm install -g "@anthropic-ai/claude-code@$latest"; then
-      now_raw="$(claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
+      # BOUNDED, like the probe above. This is a child of PID 1 with no outer
+      # timeout anywhere: an unbounded read that never returns leaves the
+      # container `running` with no manager, no tunnel and no sessions, and
+      # since PID 1 is alive and healthy-looking, no restart policy ever fires.
+      # A hang here is reachable from exactly the fault this branch repairs.
+      now_raw="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
       echo "[entrypoint] claude: now ${now_raw:-?}"
       if printf '%s' "$now_raw" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
         rm -f "$unparseable" 2>/dev/null || true

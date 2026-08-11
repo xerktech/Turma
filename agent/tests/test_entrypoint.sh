@@ -76,7 +76,14 @@ done
 # install anything. Driven by STUB_CLAUDE_VERSION / STUB_NPM_LATEST.
 cat > "$WORK/claude" <<'STUB'
 #!/bin/sh
-[ "$1" = "--version" ] && { echo "${STUB_CLAUDE_VERSION:-1.0.0} (Claude Code)"; exit 0; }
+if [ "$1" = "--version" ]; then
+  # STUB_CLAUDE_HANG: a claude that never answers. Reachable from the very fault
+  # the repair branch exists for, so both the probe AND the post-install read
+  # have to be bounded.
+  [ -n "${STUB_CLAUDE_HANG:-}" ] && sleep "$STUB_CLAUDE_HANG"
+  echo "${STUB_CLAUDE_VERSION:-1.0.0} (Claude Code)"
+  exit 0
+fi
 exit 2
 STUB
 cat > "$WORK/npm" <<'STUB'
@@ -515,6 +522,26 @@ if echo "$out" | grep -q "a repair already failed to change that"; then
   echo "  ok: and says why"
 else
   echo "  FAIL: no explanation for skipping the repair"; FAILED=1
+fi
+
+echo "== case: a claude that never answers cannot wedge the boot"
+# Every read of `claude --version` is a child of PID 1 with no outer timeout
+# anywhere — the `||` guard only runs once the block RETURNS. An unbounded one
+# leaves the container `running` with no manager, no tunnel and no sessions, and
+# because PID 1 looks alive no restart policy ever fires: worse than a crash
+# loop. The hang is reachable from the same fault the repair branch handles, so
+# the post-install verification needs the bound just as much as the probe.
+make_fixture "$WORK/fx15" 0 0
+t0=$(date +%s)
+out="$(run_case "$WORK/fx15" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_HANG=120 -e TURMA_CLAUDE_PROBE_TIMEOUT=2 -e STUB_NPM_LATEST=2.0.9)"
+elapsed=$(( $(date +%s) - t0 ))
+# Timed, not just "did it eventually boot": an unbounded read boots too, 120s
+# later, so only the clock tells the fixed code from the broken code.
+if echo "$out" | grep -q "MANAGER uid=" && [ "$elapsed" -lt 60 ]; then
+  echo "  ok: the manager started in ${elapsed}s despite a claude that never answers"
+else
+  echo "  FAIL: the boot waited ${elapsed}s on a hung claude — running, no manager, no restart"; FAILED=1
 fi
 
 echo "== case: nothing in the check can stop the container booting"
