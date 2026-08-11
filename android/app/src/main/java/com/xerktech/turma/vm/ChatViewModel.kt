@@ -16,6 +16,7 @@ import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.entryTruncated
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
+import com.xerktech.turma.core.tunnelOnlineOf
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TurnStatus
@@ -53,6 +54,13 @@ data class ChatUiState(
     val liveAgents: List<com.xerktech.turma.model.AgentRow> = emptyList(),
     val verbosity: Verbosity = Verbosity.CONCISE,
     val connected: Boolean = false,
+    // Whether the session's HOST still has its terminal tunnel (control
+    // channel) up, off the fleet heartbeat. Distinct from [connected], which
+    // only says our own /live socket is open: the hub accepts and holds that
+    // socket across a tunnel flap, so it stays open while nothing flows
+    // (XERK-252). True until a beat says otherwise, so the very first frames —
+    // before any fleet payload has arrived — don't flash "tunnel offline".
+    val tunnelOnline: Boolean = true,
     val hasMore: Boolean = false,
     val loadingHistory: Boolean = false,
     val mic: MicState = MicState.IDLE,
@@ -155,6 +163,7 @@ class ChatViewModel(
                 val label = agent?.device?.ifBlank { host } ?: host
                 _state.update {
                     it.copy(session = session, hostLabel = label,
+                        tunnelOnline = tunnelOnlineOf(agent),
                         uploadMaxBytes = agent?.uploadMaxBytes ?: 0)
                 }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
@@ -171,6 +180,7 @@ class ChatViewModel(
         val seed = session?.session?.tail ?: emptyList()
         _state.update {
             it.copy(session = session, hostLabel = label,
+                tunnelOnline = tunnelOnlineOf(agent),
                 uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
                 entries = mergeTail(it.entries, seed))
         }

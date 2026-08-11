@@ -75,7 +75,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const els = {};
   const opened = [];
   const posts = [];
-  const chat = { busy: false, stopped: 0, failed: null };
+  const chat = { busy: false, stopped: 0, failed: null, closed: 0, reconnected: 0 };
   // Window-level listeners the page registers (e.g. popstate), so a test can
   // drive the mobile back-button flow that `history.back()` triggers.
   const winListeners = {};
@@ -114,7 +114,12 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     URL: global.URL, URLSearchParams: global.URLSearchParams,
     TurmaChat: {
       open: (hostKey, id) => opened.push(id),
-      onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
+      // `close` and `reconnectNow` are counted: the stage tears the chat down
+      // when its session goes, and nudges it back when a flapped tunnel
+      // returns (XERK-252) — both are observable only from here.
+      close: () => { chat.closed++; },
+      reconnectNow: () => { chat.reconnected++; },
+      onPoll: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
       // The chat engine owns the live busy read and the interrupt; the terminal's
       // compose button just defers to it. `busy` is what a test flips to model a
       // turn being in flight, and `stopped` records the delegation.
@@ -145,12 +150,15 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
-      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput,"
+      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts, chat, body: document.body };
+  return { ...api, els, opened, posts, chat, body: document.body,
+    // `setOrg` narrows the header's org filter, the way picking an org in the
+    // menu does — the sidebar lists only that org's hosts afterwards.
+    setOrg: (k) => { stubs.TurmaOrg._k = k; } };
 }
 // The card's ⋯/menu buttons pass their click event on; the shim has no events.
 const click = { stopPropagation() {} };
@@ -713,6 +721,180 @@ test("mobile: re-selecting a session after backing out re-reveals its stage (XER
   selectSession("11111");
   assert.ok(body.classList.contains("showing-term"), "re-selecting re-reveals the stage");
   assert.deepEqual(opened, ["11111"], "the warm chat is NOT torn down and rebuilt");
+});
+
+// XERK-252. The host's terminal tunnel (the agent's control-channel WebSocket)
+// flaps in normal operation — a Cloudflare hiccup, an agent restart, a hub
+// deploy — and reconnects within a second or two. The session never stops
+// running and never stops being heartbeated, so the operator must not be thrown
+// off the conversation they are reading.
+test("a tunnel flap holds the staged session, and heals it when the tunnel returns", () => {
+  const { beat, selectSession, els, chat, opened } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  assert.deepEqual(opened, ["11111"]);
+  const closedAtOpen = chat.closed;
+
+  // The tunnel drops: same running session, host still heartbeating, only
+  // `terminalOnline` flips. The stage stays, and says why it has gone quiet.
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  assert.equal(chat.closed, closedAtOpen, "the chat's live tail is NOT torn down");
+  assert.equal(els.chatTunnelOff.hidden, false, "the chat bar shows the tunnel is down");
+  assert.equal(els.termTunnelOff.hidden, false, "and so does the terminal bar");
+  assert.equal(chat.reconnected, 0, "nothing to reconnect while it's still down");
+
+  // ...and comes back: the chip clears and the chat is nudged to reconnect at
+  // once rather than waiting out its backoff.
+  beat({ now, agents: [h] });
+  assert.equal(els.chatTunnelOff.hidden, true);
+  assert.equal(chat.reconnected, 1, "the live socket is reconnected on the spot");
+  assert.equal(chat.closed, closedAtOpen, "still never closed");
+
+  // A steady stream of online beats must not re-nudge (or the terminal iframe
+  // below would restart every few seconds).
+  beat({ now, agents: [h] });
+  beat({ now, agents: [h] });
+  assert.equal(chat.reconnected, 1, "only the transition acts");
+});
+
+test("a tunnel flap re-attaches the terminal iframe, whose socket cannot self-heal", () => {
+  const { beat, selectSession, chatToTerminal, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  chatToTerminal();
+  els.termFrame.src = "";  // forget the initial attach so the re-attach is unambiguous
+
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  assert.equal(els.termFrame.src, "", "nothing to re-attach while the tunnel is down");
+  beat({ now, agents: [h] });
+  assert.equal(els.termFrame.src, "/term/11111/", "the ttyd frame is re-navigated on return");
+});
+
+// The stage's tunnel state belongs to ONE staged subject. Left over from the
+// previous one, the next session's first beat reads as a tunnel RETURN and
+// fires the heal — which in the browser meant TurmaChat.reconnectNow() landing
+// inside the open()'s own connect and opening a second /live socket the page
+// could never close (found in QA of this change).
+test("switching sessions while a tunnel is down doesn't fire the heal at the new one", () => {
+  const { beat, selectSession, els, chat } = loadPage();
+  const now = Date.now();
+  const h1 = { key: "hostA", device: "hostA", online: true, terminalOnline: true, lastSeen: now,
+    repos: [{ name: "repoX" }], sessions: [working("11111", "First")] };
+  const h2 = { key: "hostB", device: "hostB", online: true, terminalOnline: true, lastSeen: now,
+    repos: [{ name: "repoY" }], sessions: [working("22222", "Second")] };
+  beat({ now, agents: [h1, h2] });
+  selectSession("11111");
+
+  // hostA's tunnel drops while its session is staged.
+  beat({ now, agents: [{ ...h1, terminalOnline: false }, h2] });
+  assert.equal(els.chatTunnelOff.hidden, false);
+  const nudgesBefore = chat.reconnected;
+
+  // The operator picks hostB's session instead — nothing about THAT view ever
+  // went offline, so nothing about it needs healing.
+  selectSession("22222");
+  beat({ now, agents: [{ ...h1, terminalOnline: false }, h2] });
+  assert.equal(chat.reconnected, nudgesBefore, "no stale heal on the new session");
+  assert.equal(els.chatTunnelOff.hidden, true, "and no stale chip either");
+});
+
+// A host that has stopped heartbeating altogether is a different story from a
+// flapping tunnel, and the chip must not keep promising the session is fine.
+// The stage still holds (the machine may be up and merely unreachable), so it
+// also has to offer a way off it.
+test("a host that goes silent says so, and offers a way off the stage", () => {
+  const { beat, selectSession, els, clearStage } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  beat({ now, agents: [{ ...h, terminalOnline: false, online: false }] });
+  assert.match(els.chatTunnelOff.textContent, /host offline/);
+  assert.doesNotMatch(els.chatTunnelOff.title, /keeps running/,
+    "no promise the page can't keep about a host it hasn't heard from");
+  assert.equal(els.chatTunnelClose.hidden, false, "and an explicit way out");
+
+  // The tunnel-only case keeps the softer wording.
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  assert.match(els.chatTunnelOff.textContent, /tunnel offline/);
+  assert.match(els.chatTunnelOff.title, /keeps running/);
+
+  // What that button does (its onclick): drop the stage, and the chip with it.
+  // The session itself is untouched — it is still running on its host.
+  clearStage();
+  assert.equal(els.stageEmpty.hidden, false);
+  assert.equal(els.chatTunnelOff.hidden, true);
+  assert.equal(els.chatTunnelClose.hidden, true);
+});
+
+// A beat that doesn't mention the host at all says nothing about its sessions:
+// the hub restarts with its persisted fleet but can also answer before the
+// first heartbeat lands, and a refresh can fail outright. Silence is not
+// evidence the session died (XERK-252).
+test("a beat that can't see the host holds the stage rather than clearing it", () => {
+  const { beat, selectSession, chat } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  const closedAtOpen = chat.closed;
+
+  beat({ now, agents: [] });
+  assert.equal(chat.closed, closedAtOpen, "an empty payload doesn't evict the operator");
+  beat({ now, agents: [h] });
+  assert.equal(chat.closed, closedAtOpen);
+});
+
+// The org filter is a SIDEBAR scope (XERK-62) — sessionHit deliberately ignores
+// it so an open session isn't torn off the stage when its org leaves the list.
+// The vanish check has to read the same whole fleet, or narrowing the filter
+// closed the session the operator was reading.
+test("narrowing the org filter doesn't tear the staged session off the stage", () => {
+  const { beat, selectSession, setOrg, chat } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  h.jira = { siteKey: "acme.atlassian.net" };
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  const closedAtOpen = chat.closed;
+
+  setOrg("other.atlassian.net");   // the staged session's host leaves the sidebar
+  beat({ now, agents: [h] });
+  assert.equal(chat.closed, closedAtOpen, "the stage keeps the session it was showing");
+});
+
+// Toggling chat -> terminal is a VIEW change on the same session, not a new
+// subject: it must not spend the tunnel's return edge. It used to, so the
+// terminal opened black (ttyd can't attach through a downed tunnel) and nothing
+// ever re-navigated it — with the chip that would have explained it also gone.
+test("toggling to the terminal during a flap keeps the chip and still re-attaches", () => {
+  const { beat, selectSession, chatToTerminal, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  chatToTerminal();
+  assert.equal(els.termTunnelOff.hidden, false, "the terminal bar still says why it's dead");
+  els.termFrame.src = "";   // forget the toggle's own (doomed) attach
+
+  beat({ now, agents: [h] });
+  assert.equal(els.termFrame.src, "/term/11111/", "the return re-attaches the terminal");
+  assert.equal(els.termTunnelOff.hidden, true);
+});
+
+// The other half of the rule: a session that genuinely went (killed elsewhere,
+// or its host stopped reporting it at all) still drops the stage.
+test("a vanished session still clears the stage", () => {
+  const { beat, selectSession, els, chat } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  const closedAtOpen = chat.closed;
+
+  beat({ now, agents: [{ ...h, sessions: [] }] });
+  assert.ok(chat.closed > closedAtOpen, "the chat's live tail is torn down");
+  assert.equal(els.stageEmpty.hidden, false, "and the stage is back to the empty prompt");
 });
 
 test("desktop: re-selecting the current session stays a no-op", () => {

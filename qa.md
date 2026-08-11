@@ -140,7 +140,7 @@ Hard rules:
 
 ## 2. Building and running each component
 
-Baselines below are from `main` at v0.6 + XERK-251 (commit 5c78834), so a deviation is
+Baselines below are from `main` at v0.6 + XERK-252 (commit 4b638a4), so a deviation is
 either your environment or a regression — find out which before filing.
 
 **Pin your copy on `/mnt/data`, never in the `/tmp` scratchpad.** §4 tells you to
@@ -154,7 +154,7 @@ reason `--cache` must point at `/mnt/data/tmp-qa/npm-cache`, not `/tmp`.
 
 ```bash
 export PATH=/root/.local/node/bin:$PATH
-cd turma && node --test tests/*.test.js        # baseline: 911 pass, ~6s
+cd turma && node --test tests/*.test.js        # baseline: 926 pass, ~6s
 ```
 
 Boot a real hub with everything pointed at temp paths:
@@ -173,14 +173,24 @@ redirected — miss one and you write into the operator's `/data`.
 ```bash
 cd agent
 python3 -m unittest tests.test_hub_agent                       # 1138 pass, ~14s
-python3 -m unittest tests.test_guard tests.test_guard_settings tests.test_ask   # 48 pass
-node --test tests/tunnel-agent.test.js                         # 80 pass
+python3 -m unittest tests.test_guard tests.test_guard_settings tests.test_ask   # 108 pass
+node --test tests/tunnel-agent.test.js                         # 95 pass
 for t in tests/test_*.sh; do bash "$t"; done                   # native/entrypoint suites
 ```
 
 **There is no pytest.** `python3 -m unittest` is the only runner.
 
-The single node command `code-scan.yml` really runs (1042 pass) — use this to
+The fourth thing `code-scan.yml` gates is the **instruction-file size limit**, and it is the one
+that is easy to trip without noticing (a rules file grows a few bullets at a time). Run it exactly
+as the workflow does — note `-m`, not `wc -c`; these files are full of multibyte glyphs:
+
+```bash
+for f in CLAUDE.md .claude/rules/*.md; do
+  python3 -c "import sys;print(sys.argv[1], len(open(sys.argv[1],encoding='utf-8').read()))" "$f"
+done   # anything >= 40000 fails the PR; >= 36000 warns at Claude Code startup
+```
+
+The single node command `code-scan.yml` really runs (1057 pass) — use this to
 reproduce that gate rather than per-directory runs:
 
 ```bash
@@ -232,7 +242,7 @@ docker run --rm --entrypoint bash \
   'cd /work && gradle :app:testDebugUnitTest --no-daemon && gradle :app:assembleDebug --no-daemon'
 ```
 
-Baseline: **278 JVM unit tests**, 0 failures, and a ~21 MB
+Baseline: **281 JVM unit tests**, 0 failures, and a ~21 MB
 `app/build/outputs/apk/debug/app-debug.apk`. Per-suite counts are in
 `app/build/test-results/testDebugUnitTest/TEST-*.xml`.
 
@@ -247,6 +257,19 @@ Traps:
   `app/build.gradle.kts` pins it.
 - Kotlin does **not** treat warnings as errors here, so an import left dangling
   by a deletion compiles clean — grep for the removed symbol as well as building.
+- **There is no `app/src/androidTest`, and `android-ci.yml` runs only
+  `testDebugUnitTest` + `assembleDebug`** — no emulator, no `connectedAndroidTest`,
+  and the `androidTestImplementation` compose-ui-test deps in `build.gradle.kts`
+  are declared but unused. So **nothing can cover a Composable's body**: logic
+  that must be testable has to live in `core/` (pure Kotlin) and be called from
+  the screen. Judge an Android change on where its rule lives — a rule inline in
+  a `@Composable` has no gate at all, and deleting the CALL to a covered `core/`
+  helper is still invisible.
+- **`testDebugUnitTest` comes back `FROM-CACHE` in ~13s** when `GRADLE_USER_HOME`
+  is the shared `/mnt/data/tmp-qa/gradlehome` another run already filled. That is
+  a cached RESULT, not an execution — for a mutation test, or any time you must
+  know the tests really ran against the tree in front of you, add
+  `--rerun-tasks` (~46s).
 
 `:latest` is the `android-build` tier — **no emulator, no system image**. An
 install-and-drive-the-app run needs the separate `:emulator` tag (6.4 GB, built
@@ -281,6 +304,24 @@ the 302 to `/login` is a 3xx, which `-f` does not treat as failure. If you are
 parsing an empty string as JSON, that is why. Authenticate the way the client
 does, or assert on the status code first.
 
+Three more that each cost a run:
+
+- **Set the viewport explicitly.** A page from `connectOverCDP` starts at
+  **800x600**, which is below `sessions.html`'s 820px `isNarrow()` breakpoint, so
+  the phone layout applies: opening a session sets `body.showing-term`, which
+  **hides the site header** — the org filter, "New ticket" and the nav are all
+  unclickable and every desktop assertion is wrong. `page.setViewportSize({width:
+  1280, height: 900})` right after `newPage()`, and drop to 390 deliberately when
+  you want the phone.
+- **The page's top-level `let`s are NOT on `window`** — `cache`, `currentId`,
+  `currentHostKey`, `viewMode`, `endedViewId`. `page.evaluate(() => window.cache)`
+  is `undefined` and reads as "the page has no data"; `page.evaluate(() => cache)`
+  (bare identifier) works, because a top-level `let` lands in the global lexical
+  environment. Functions ARE on `window` (`selectSession`, `render`, `clearStage`).
+- **`page.on("websocket")` is how you count live sockets** — it fires per socket
+  with `ws.url()` and a `close` event, which is the only way to see a duplicate or
+  leaked `/live/<host>/<id>` connection the DOM says nothing about.
+
 On the **native host** run Chrome with `--network host` (the verify skill's
 `--network container:$CID` is for the agent container, where 127.0.0.1 is shared
 with the hub). Name the container after your ticket — a stray `qa-chrome` from
@@ -313,6 +354,32 @@ Three things that each cost a run:
   `{t:"text"|"thinking"|"tool_use"|"tool_result", …}`. A fixture using `type:`
   produces entries that render as **nothing at all**, and it looks like a bug in
   the code you are QA'ing. `buildItems` in `turma/public/chat.js` is the spec.
+- **A tail entry with no `id` renders as NOTHING.** `mergeTail` keys entries by
+  `e.id` and silently drops any without one, so `{role, ts, blocks}` fixtures
+  produce an empty transcript and it looks like the code under test. Always
+  `{id, role, ts, blocks:[{t:"text", text}]}`.
+- **The Sessions page does not poll while SSE is healthy.** `refresh()` (the full
+  `/api/agents`) runs at load, on a 15s timer *only when `sseOk` is false*, and in
+  the post-action fast-poll burst; everything else is per-agent `agent`/`removed`
+  SSE events patched into `cache`. So restarting the hub does NOT make the page
+  observe an empty fleet — it keeps its last records indefinitely. To drive a
+  fleet-without-this-host payload, call `render({now: Date.now(), agents: []})`
+  directly.
+- A hub restart on the same port keeps the login cookie and the ws-token path
+  working, so the browser stays authenticated across it.
+- **A hub booted less than 90s ago never marks a host offline.** The offline
+  sweep (`server.js`, `setInterval` at ~2421) returns early inside
+  `BOOT_GRACE_MS = 90s`, and it is the only thing that re-publishes an agent
+  after `OFFLINE_AFTER_MS` (75s) lapses — a silent host emits no heartbeat and
+  therefore no SSE event of its own. On a fresh hub the page keeps `online:true`
+  forever and anything keyed on it reads as "still up". **Warm the hub past 90s
+  before testing any host-went-away behaviour**; then the transition lands ~80s
+  after the last heartbeat.
+- **`navFrame()` uses `contentWindow.location.replace`, so the iframe's `src`
+  attribute never changes.** Reading `termFrame.src` tells you nothing about
+  whether the terminal was re-attached — count requests to `/term/<id>/` with
+  `page.on("request")` instead. (The unit-test shim DOES record `src`, which is
+  why a green test there proves nothing about the browser.)
 - Verbosity presets are plain buttons labelled `Concise`/`Normal`/`Verbose`;
   a thinking trace renders as `<details class="thought">` (not `.think*`), and
   `renderInline` supports **code spans and links only — there is no bold/italic**,
@@ -433,6 +500,10 @@ sees when it trips one, and whether the client can recover.
   `_entry_blocks`, `adf_text`, `azure_html_to_text`.
 - Every place agent-supplied text reaches the DOM, a path, a filename, a shell,
   or a tar extraction.
+- **Socket bookkeeping on any change to the chat/live path.** The hub `unwatch`es
+  a session only when its LAST `/live` viewer disconnects, so one browser socket
+  the page has lost track of pins the agent's ~1s transcript tail on forever.
+  Count sockets opened and still-open after leaving the stage.
 - Type validation on hub routes: `!body.repo` passes an object; a non-string
   `model` coerced to `""` silently *released* a pin.
 - The two mirrors of any rule (`liveState` in `index.html` vs `sessions.html`,
@@ -497,6 +568,18 @@ exercised code in the tree.
   test checked that both prefs filenames appeared in the XML. Flipping `<exclude>`
   to `<include>` keeps both names present and INVERTS the rule — those two files
   become the only things backed up — and the suite stayed green through it.
+- **A page-global "last known" flag whose edge handler fires against a different
+  subject.** `sessions.html` remembers one `stageTunnelOnline` for whatever the
+  stage shows, and acts on the false→true edge. Selecting a session on ANOTHER
+  host while the flag is false makes that edge land on the session just opened.
+  When you see a module-level flag paired with an edge test, ask what resets it
+  when the thing it describes is REPLACED rather than changed.
+- **A guard written against an object that is null for the whole window that
+  matters.** `chat.js`'s `reconnectNow` skips work when `ws` is OPEN or
+  CONNECTING — but `startWs` awaits a `/api/ws-token` fetch before it assigns
+  `ws`, so through that await `ws` is null and the guard waves a second
+  connection through. Unit tests that hand the guard a socket object never see
+  it. Count the sockets (§3, `page.on("websocket")`), don't read the guard.
 
 ---
 
@@ -546,12 +629,14 @@ worth closing, not as a breach of a boundary it never claimed to be.
 Each of these reproduces identically on `main`, so it is not whatever branch you
 are holding. Re-confirm with the same script on both before you spend time.
 
-- **An agent tunnel flap permanently kills an open chat's live stream.** Drop the
-  `/agent/control` channel: the browser's `/live/<host>/<id>` socket closes and
-  never reopens, the bubble freezes on the last text, and the poll fallback then
-  requests `/api/agents/null/sessions/null/history` (404) because `close()` has
-  already nulled `hostKey`/`sessionId`. Reconnecting the agent does not recover
-  it; re-selecting the session does. Verified identical on `main` at 5c78834.
+- **An agent tunnel flap holds the stage** (XERK-252, in `main` from 05ceb86).
+  Dropping the `/agent/control` channel leaves the conversation on screen, paints
+  a `⚠ tunnel offline` chip on both bars, and the stream RESUMES on its own when
+  the agent reconnects — the hub holds the browser's `/live` socket across the
+  flap and re-arms the watch. **Before 05ceb86 it cleared the stage** and then
+  fetched `/api/agents/null/sessions/null/history` (404); if you see either,
+  you are on an older pin or looking at a regression. Drive it with the fake
+  agent in §3.1: `agent.drop()`, then reconnect a new control channel.
 - **`preserveScrollOffset` in the glasses `App.onTurn` path has no test.**
   Deleting the call leaves all 455 vitest tests green while a scrolled-up view
   gets yanked down by a growing live turn. The behaviour is correct on both
