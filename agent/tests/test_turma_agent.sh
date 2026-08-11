@@ -93,6 +93,15 @@ wait_for() {  # <command> [args...]
   return 1
 }
 
+# Same, with a budget wide enough for a derived timeout to elapse.
+wait_longer() {  # <command> [args...]
+  for _ in $(seq 1 300); do
+    if "$@" 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
 count_starts() { if [ -f "$WORK/tunnel.log" ]; then wc -l < "$WORK/tunnel.log"; else echo 0; fi; }
 
 # shellcheck disable=SC2329  # each is invoked indirectly, through wait_for.
@@ -415,9 +424,14 @@ pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 echo "case: a hung Claude Code check does not hold the boot"
 : > "$WORK/boot-update.log"
 rm -f "$WORK/manager.log" "$WORK/claude-done"
-TEST_CLAUDE_CHECK_SLEEP=60 TURMA_CLAUDE_UPDATE_TIMEOUT=2 PATH="$WORK/stub-bin:$PATH" \
+# The per-call timeouts are what the deadline is derived from, so they are what a
+# test lowers — TURMA_CLAUDE_UPDATE_TIMEOUT alone is raised to the floor (see the
+# next case), precisely so it can never be set below a running install.
+TEST_CLAUDE_CHECK_SLEEP=60 TURMA_CLAUDE_UPDATE_TIMEOUT=2 \
+  TURMA_CLAUDE_PROBE_TIMEOUT=1 TURMA_NPM_VIEW_TIMEOUT=1 TURMA_NPM_INSTALL_TIMEOUT=1 \
+  TURMA_NPM_META_TIMEOUT=1 TURMA_CLAUDE_UPDATE_SLACK=2 PATH="$WORK/stub-bin:$PATH" \
   setsid "$PREFIX/bin/turma-agent" >"$WORK/run7.log" 2>&1 &
-if wait_for file_has_content "$WORK/manager.log"; then
+if wait_longer file_has_content "$WORK/manager.log"; then
   ok "the manager started despite a check that never returns"
 else
   fail "a hung check held the boot: $(cat "$WORK/run7.log")"
@@ -429,6 +443,35 @@ else
 fi
 pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent-update" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 12b: the awaited check's deadline is derived, not dictated ---------
+# `timeout` signals its direct child only, so a deadline that can fire while an
+# `npm install -g` is running leaves npm replacing the package while the manager
+# comes up and launches sessions into it — the very window awaiting the check
+# exists to close. The bound must therefore exceed the sum of the per-call
+# timeouts, and an operator value below that floor is raised, out loud.
+echo "case: an operator deadline below the floor is raised"
+: > "$WORK/boot-update.log"
+rm -f "$WORK/manager.log" "$WORK/claude-done"
+TURMA_CLAUDE_UPDATE_TIMEOUT=5 PATH="$WORK/stub-bin:$PATH" setsid \
+  "$PREFIX/bin/turma-agent" >"$WORK/run8.log" 2>&1 &
+if wait_for logged "claude check bounded at" "$WORK/run8.log"; then
+  bound="$(sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' "$WORK/run8.log" | head -1)"
+  if [ -n "$bound" ] && [ "$bound" -gt 300 ]; then
+    ok "raised 5s to the ${bound}s floor implied by the per-call timeouts"
+  else
+    fail "honoured a deadline that can fire mid-install (bounded at ${bound:-?}s)"
+  fi
+else
+  fail "the launcher never reported its bound: $(cat "$WORK/run8.log")"
+fi
+if grep -q "below the .*floor" "$WORK/run8.log"; then
+  ok "and said so"
+else
+  fail "raised the deadline silently"
+fi
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 
 # --- Case 13: TURMA_BOOT_UPDATE=0 opts out -----------------------------------

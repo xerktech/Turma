@@ -260,7 +260,29 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
   mkdir -p "$HOME/.turma" 2>/dev/null || true
   echo "[turma-agent] checking Claude Code (before any session can launch)"
   if command -v timeout >/dev/null 2>&1; then
-    timeout "${TURMA_CLAUDE_UPDATE_TIMEOUT:-420}" \
+    # The deadline is DERIVED from the updater's own per-call timeouts, never a
+    # hard-coded number. `timeout` signals its direct child only, so firing it
+    # while an `npm install -g` is running leaves npm replacing the package
+    # while the manager comes up and starts launching sessions into it — the
+    # exact window awaiting this check exists to close. Above the sum of the
+    # inner bounds it can only fire when something OTHER than a bounded call is
+    # stuck, where there is nothing to orphan. An operator value below the floor
+    # is raised, out loud; the way to shorten a boot is to lower the per-call
+    # timeouts, which are what actually take the time.
+    _num() { case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
+    claude_floor=$(( $(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30) * 2 \
+                     + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
+                     + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
+                     + $(_num "${TURMA_NPM_META_TIMEOUT:-30}" 30) * 2 \
+                     + $(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60) ))
+    claude_deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
+    if [ "$claude_deadline" -lt "$claude_floor" ]; then
+      [ "$claude_deadline" -gt 0 ] && echo "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${claude_deadline}s is below" \
+        "the ${claude_floor}s floor implied by the per-call timeouts; using ${claude_floor}s"
+      claude_deadline="$claude_floor"
+    fi
+    echo "[turma-agent] claude check bounded at ${claude_deadline}s"
+    timeout "$claude_deadline" \
       "$SELF_DIR/turma-agent-update" --claude-only \
       || echo "[turma-agent] claude update check did not finish; carrying on"
   else

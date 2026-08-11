@@ -109,7 +109,9 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       read once per run: the lock is held for the whole run, so one hung child would block every
       later update — including the one shipping the fix — and this runs inside a start.
 - **Every start is an update check**, fired by the launcher two different ways:
-  - **Claude Code, awaited** (`--claude-only`, bounded by `TURMA_CLAUDE_UPDATE_TIMEOUT`) — it must
+  - **Claude Code, awaited** (`--claude-only`, bounded by a deadline DERIVED from the updater's own
+    per-call timeouts — `timeout` signals its direct child only, so a bound that can fire mid-install
+    orphans npm into the session-relaunch window; an operator value below that floor is raised) — it must
     finish before the manager exists, per the window above. A slow registry may delay the start; it
     cannot stop it, and a late start is visible where a session that died on a missing binary is
     not.

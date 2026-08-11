@@ -95,6 +95,10 @@ case "$1 $2" in
     [ -n "${STUB_NPM_LATEST:-}" ] || exit 1
     echo "$STUB_NPM_LATEST" ;;
   "install -g")
+    echo "NPMINSTALL start $(date +%s) $*"
+    # A real `npm install -g` leaves claude absent from PATH while it unpacks;
+    # $STUB_NPM_INSTALL_SLEEP makes that window long enough to observe.
+    [ -n "${STUB_NPM_INSTALL_SLEEP:-}" ] && sleep "$STUB_NPM_INSTALL_SLEEP"
     echo "NPMINSTALL $*"
     # Where npm was pointed. The whole reason the block sets its own HOME is that
     # /root is the operator's bind mount, so this is the assertion that keeps it.
@@ -542,6 +546,34 @@ if echo "$out" | grep -q "MANAGER uid=" && [ "$elapsed" -lt 60 ]; then
   echo "  ok: the manager started in ${elapsed}s despite a claude that never answers"
 else
   echo "  FAIL: the boot waited ${elapsed}s on a hung claude — running, no manager, no restart"; FAILED=1
+fi
+
+echo "== case: the watchdog cannot fire while an install is running"
+# A `kill` reaches the check's shell, NEVER its npm grandchild. Fire the watchdog
+# mid-install and npm keeps replacing the package while the manager starts
+# launching sessions into it — 100 launch failures out of 100 when measured, the
+# exact window this design exists to close. So the deadline is DERIVED from the
+# per-call bounds and an operator value below that floor is raised, not honoured.
+make_fixture "$WORK/fx17" 0 0
+out="$(run_case "$WORK/fx17" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 \
+  -e STUB_NPM_INSTALL_SLEEP=12 -e TURMA_CLAUDE_UPDATE_TIMEOUT=5 \
+  -e TURMA_CLAUDE_PROBE_TIMEOUT=2 -e TURMA_NPM_VIEW_TIMEOUT=2 -e TURMA_NPM_INSTALL_TIMEOUT=30)"
+# `|| true` on both: under `set -o pipefail` a grep that finds nothing fails the
+# whole pipeline and would abort the suite instead of reporting the defect —
+# and "the install line is missing entirely" is exactly what a killed install
+# looks like, i.e. the case this is here to catch.
+done_line="$(echo "$out" | grep -n "NPMINSTALL install -g" | head -1 | cut -d: -f1 || true)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1 || true)"
+if [ -n "$done_line" ] && [ -n "$mgr_line" ] && [ "$done_line" -lt "$mgr_line" ]; then
+  echo "  ok: the install finished before the manager, despite a too-low outer timeout"
+else
+  echo "  FAIL: the watchdog orphaned an install into the session-relaunch window (install=$done_line manager=$mgr_line)"; FAILED=1
+fi
+if echo "$out" | grep -q "below the .*floor implied by the per-call timeouts"; then
+  echo "  ok: and said it was raising the deadline"
+else
+  echo "  FAIL: silently honoured a deadline below the floor"; FAILED=1
 fi
 
 echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"

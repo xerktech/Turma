@@ -209,6 +209,15 @@ turma_read_file() {  # <path> — prints nothing for anything that isn't a plain
   cat "$1" 2>/dev/null || true
 }
 
+# A positive integer, or the given default — env values reach arithmetic here,
+# and a non-numeric one would abort the shell rather than degrade.
+_num() {  # <value> <default>
+  case "$1" in
+    ''|*[!0-9]*) printf '%s' "$2" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 turma_write_file() {  # <path> <content>
   _dir="$(dirname "$1")"
   [ -d "$_dir" ] || return 0
@@ -316,16 +325,35 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
   # `|| echo` so nothing inside can abort the boot: this runs at PID 1 under
   # `set -e`, and an agent that will not start is far worse than a stale claude.
   #
-  # Bounded as a WHOLE, the way the native launcher wraps its check in
-  # `timeout`, and not only call by call. Every call inside is individually
-  # bounded today, but this block runs as a child of PID 1 with nothing above it
-  # — so one future unbounded call, or one blocking open nobody predicted, is a
-  # container that stays `running` forever with no manager and no restart. The
-  # watchdog is the structural guarantee; the per-call bounds and the
-  # regular-file guards are what stop it ever firing.
+  # Bounded as a WHOLE, and not only call by call. Every call inside is
+  # individually bounded today, but this block runs as a child of PID 1 with
+  # nothing above it — so one future unbounded call, or one blocking open nobody
+  # predicted, is a container that stays `running` forever with no manager and
+  # no restart. The watchdog is the structural guarantee; the per-call bounds
+  # and the regular-file guards are what stop it ever firing.
+  #
+  # Its deadline is DERIVED from those per-call bounds, never a hard-coded
+  # number, because a `kill` reaches the check's shell and NOT its npm
+  # grandchild. Fire it while an install is running and npm keeps replacing the
+  # package while the manager starts launching sessions into it — measured at
+  # 100 launch failures out of 100, which is the exact window this whole design
+  # exists to close. Above the sum, the watchdog can only fire when something
+  # OTHER than a bounded call is stuck, and there is then nothing to orphan.
+  # An operator value below the floor is raised, out loud: the way to shorten a
+  # boot is to lower the per-call timeouts, which are what actually take time.
+  _floor=$(( $(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30) * 2 \
+             + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
+             + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
+             + $(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60) ))
+  _deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
+  if [ "$_deadline" -lt "$_floor" ]; then
+    [ "$_deadline" -gt 0 ] && echo "[entrypoint] claude: TURMA_CLAUDE_UPDATE_TIMEOUT=${_deadline}s is" \
+      "below the ${_floor}s floor implied by the per-call timeouts; using ${_floor}s"
+    _deadline="$_floor"
+  fi
   claude_update_check &
   _check_pid=$!
-  ( sleep "${TURMA_CLAUDE_UPDATE_TIMEOUT:-420}"; kill -TERM "$_check_pid" 2>/dev/null ) &
+  ( sleep "$_deadline"; kill -TERM "$_check_pid" 2>/dev/null ) &
   _watchdog_pid=$!
   wait "$_check_pid" \
     || echo "[entrypoint] claude: update check did not finish; carrying on"

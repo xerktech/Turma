@@ -43,6 +43,13 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     and the call site adds a watchdog that bounds the whole block the way the native launcher's
     outer `timeout` does. Guards mean it never fires; the watchdog means a future unbounded call
     can't wedge a host.
+  - **The watchdog's deadline is DERIVED from the per-call timeouts, never hard-coded** (same on the
+    native launcher). A `kill` reaches the check's shell, not its npm grandchild: fire it during an
+    install and npm keeps replacing the package while the manager starts launching sessions into it
+    — 100 launch failures out of 100, the very window this design closes. Above the sum, it can only
+    fire when something OTHER than a bounded call is stuck, where there is nothing to orphan. An
+    operator value below the floor is raised, out loud; shorten a boot by lowering the PER-CALL
+    timeouts (`TURMA_CLAUDE_UPDATE_SLACK` is the headroom above them).
   - **Every `claude --version` here is `timeout`-wrapped, the post-install verification included.**
     These are children of PID 1 with no outer timeout anywhere (the `||` guard only runs once the
     block returns), and a hang is reachable from the very fault the repair branch handles: an
