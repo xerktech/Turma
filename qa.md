@@ -242,7 +242,7 @@ docker run --rm --entrypoint bash \
   'cd /work && gradle :app:testDebugUnitTest --no-daemon && gradle :app:assembleDebug --no-daemon'
 ```
 
-Baseline: **281 JVM unit tests**, 0 failures, and a ~21 MB
+Baseline: **281 JVM unit tests** (was 278 before XERK-252), 0 failures, and a ~21 MB
 `app/build/outputs/apk/debug/app-debug.apk`. Per-suite counts are in
 `app/build/test-results/testDebugUnitTest/TEST-*.xml`.
 
@@ -271,10 +271,46 @@ Traps:
   know the tests really ran against the tree in front of you, add
   `--rerun-tasks` (~46s).
 
-`:latest` is the `android-build` tier — **no emulator, no system image**. An
-install-and-drive-the-app run needs the separate `:emulator` tag (6.4 GB, built
-on demand) or a real device over `adb connect`. If you cannot reach one, the
-honest verdict is PARTIAL for the UI; say so rather than claiming you drove it.
+`:latest` is the `android-build` tier — no emulator and no system image **in the
+image** — but you do NOT need the `:emulator` tag (which is not pullable without
+GHCR auth) to drive the app. `/dev/kvm` exists on this host, so add the emulator
+to a throwaway container of `:latest` and boot an AVD (~4 min, mostly download):
+
+```bash
+docker run -d --name qa-emu --device /dev/kvm --network host -v /mnt/data/tmp-qa:/gh \
+  -e PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/emulator:/usr/bin:/bin \
+  --entrypoint sh ghcr.io/xerktech/turma-agent:latest -c 'sleep 100000'
+docker exec qa-emu sh -c 'ANDROID_USER_HOME=/gh/andhome HOME=/gh/emuhome \
+  yes | sdkmanager --sdk_root=/opt/android-sdk "emulator" "system-images;android-35;google_apis;x86_64" &&
+  ANDROID_USER_HOME=/gh/andhome avdmanager create avd -n qa35 -k "system-images;android-35;google_apis;x86_64" -d pixel_5 --force'
+# ANDROID_AVD_HOME, not ANDROID_USER_HOME — see the trap below
+docker exec -d qa-emu sh -c 'ANDROID_AVD_HOME=/gh/andhome/avd HOME=/gh/emuhome \
+  emulator -avd qa35 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot'
+docker exec qa-emu sh -c 'HOME=/gh/emuhome adb wait-for-device shell "while [ \"$(getprop sys.boot_completed)\" != 1 ]; do sleep 2; done"'
+```
+
+Driving it:
+
+- **`avdmanager` writes the AVD to `$ANDROID_USER_HOME/avd`, but `emulator` only
+  searches `$ANDROID_AVD_HOME`, `$ANDROID_SDK_HOME/avd` and `$HOME/.android/avd`.**
+  Set `ANDROID_AVD_HOME` on the emulator command or it dies with
+  "Unknown AVD name".
+- **`sdkmanager` installs into `/opt/android-sdk`, i.e. the CONTAINER's writable
+  layer — not into your `/gh` mount.** `docker rm` that container and the
+  emulator + system image are gone and re-download (~4 min), even though the AVD
+  under `/gh` survives. Keep the container, or expect to pay again.
+- `--network host` on the emulator container means the AVD's `10.0.2.2` reaches
+  the host loopback, so a scratch hub on `127.0.0.1:<port>` is reachable at
+  `http://10.0.2.2:<port>`. **The manifest already sets
+  `android:usesCleartextTraffic="true"`**, so plain HTTP works — no TLS or CA
+  install needed.
+- `adb install -r -t /tmp/app.apk` after `docker cp`ing the APK in.
+- **Taps do not move focus between the sign-in fields** (Compose text fields
+  under `input tap`): everything lands in whichever box has focus. Use
+  `input keyevent 61` (TAB) to advance, and `input keycombination 113 29` +
+  `keyevent 67` to clear a field you filled wrong.
+- Screenshots are 1080x2340, past the image limit most tools accept —
+  downscale with PIL before reading them.
 
 There is **no committed gradle wrapper** — CI generates it.
 `.github/workflows/android-ci.yml` is the reliable spec for how this is really
@@ -399,6 +435,32 @@ Three things that each cost a run:
   a thinking trace renders as `<details class="thought">` (not `.think*`), and
   `renderInline` supports **code spans and links only — there is no bold/italic**,
   so `**x**` staying literal is correct, not a regression.
+
+More of the same kind, learned on XERK-252:
+
+- **`terminalOnline` is exactly "is there an `/agent/control` socket right now"**
+  (`serializeAgent`), so `ws.close()` on your fake tunnel IS a tunnel flap and
+  re-opening it IS the recovery — no restart, no waiting. `online` is
+  `now - lastSeen < OFFLINE_AFTER_MS` (**75s**), so an offline host costs a real
+  75-second wait with the beats stopped; there is no env override.
+- **`GET .../sessions/<id>/history` is served from a hub-side cache for
+  `HISTORY_FRESH_MS` = 5 MINUTES.** Any test that expects a browser-side history
+  re-pull to fetch something new inside that window will see the *stale* body and
+  read as a client bug. To serve `/history` at all, your fake agent must read the
+  beat's reply, echo back `historyResults: [{sessionId, entries, …}]` and
+  `ackedCommands: [cmdId]` — the hub only queues `{type:"history"}` on a cache miss.
+- **`TurmaOrg.set("<key nothing reports>")` is inert** — `effectiveKeys` drops a
+  selection no host reports, so org-scoping tests need TWO hosts beating with
+  different `jira.siteKey` values and a `set()` to the *other* one.
+- **The terminal iframe is navigated with `contentWindow.location.replace()`**,
+  so `iframe.src` stays `about:blank` forever and tells you nothing. Spy on the
+  page's global instead: `const o = window.navFrame; window.navFrame = s => { … o(s) }`.
+  Its `/term/<id>/` load also 502s unless a real ttyd sits behind the tunnel.
+- **To prove a regression is real, boot a SECOND hub off `origin/main`'s page.**
+  `server.js` reads `public/` relative to `__dirname`, so
+  `cp -a turma /scratch/old && git show origin/main:turma/public/sessions.html >
+  /scratch/old/public/sessions.html` gives you the old UI on the same server, and
+  the same driver script can run against both.
 
 ### 3.2 Verifying a CSS / layout change
 
