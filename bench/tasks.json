@@ -1,0 +1,87 @@
+{
+  "_comment": [
+    "Coding-agent bench tasks mined from this repo's own merged history.",
+    "Each task names a commit that shipped a fix (or feature) TOGETHER WITH its",
+    "regression tests. The harness checks out that commit and reverts only the",
+    "files in revert_paths, so the tests stay at the fixed revision and start RED.",
+    "The prompt is the problem in a user's voice: no file paths, no solution, no",
+    "hint that tests already exist for it. Every task is gated by",
+    "validate_tasks.py, which proves red-with-fix-reverted and green-with-fix.",
+    "Prompts deliberately omit the delivery contract (branch + commit); that is",
+    "appended per-run by run_bench.py so every harness gets the identical wording."
+  ],
+  "tasks": [
+    {
+      "id": "turma-fix-linkify-quotes",
+      "commit": "009e505",
+      "kind": "bugfix",
+      "lang": "js",
+      "revert_paths": ["turma/public/chat.js"],
+      "test_cmd": ["node", "--test", "turma/tests/chat.test.js"],
+      "prompt": "In the session chat, when a message ends with a link wrapped in or followed by a typographic curly quote (the ‘ ’ “ ” characters Claude emits all the time), the quote character gets swallowed into the link itself. Clicking it 404s because the URL has a stray quote glued on the end. Straight ASCII quotes and punctuation are handled fine — it is only the curly ones that leak in. Please fix it."
+    },
+    {
+      "id": "turma-fix-compose-collapse",
+      "commit": "35894ec",
+      "kind": "bugfix",
+      "lang": "js",
+      "revert_paths": ["CLAUDE.md", "turma/public/chat.js", "turma/public/sessions.html"],
+      "test_cmd": ["node", "--test", "turma/tests/sessions.test.js"],
+      "prompt": "On the Sessions page, the message compose box sometimes collapses to zero height — it becomes a sliver you cannot type into, and it stays broken until I reload the page. It seems to happen after switching between the chat and terminal views, and it is much worse on my phone. Once it collapses nothing brings it back short of a refresh. Please fix it."
+    },
+    {
+      "id": "turma-fix-whisper-lang",
+      "commit": "d0a7975",
+      "kind": "bugfix",
+      "lang": "js",
+      "revert_paths": ["glasses/README.md", "turma/server.js"],
+      "test_cmd": ["node", "--test", "turma/tests/server.test.js"],
+      "prompt": "Our speech-to-text backend now auto-detects the spoken language, which is the whole reason we moved to it. But Turma pins the transcription request to English no matter what, so everything I say in Spanish comes back as garbled English. I tried setting the language environment variable to an empty string to turn the hint off and it still sends English. Setting it to an empty value should mean 'send no language hint and let the model auto-detect'; leaving the variable unset should keep defaulting to English so existing deployments do not change. Please fix it."
+    },
+    {
+      "id": "turma-feat-board-review",
+      "commit": "bfaee22",
+      "kind": "feature",
+      "lang": "js",
+      "revert_paths": ["CLAUDE.md", "turma/public/app.css", "turma/public/board.html", "turma/public/board.js"],
+      "test_cmd": ["node", "--test", "turma/tests/board.test.js"],
+      "prompt": "The board only has three columns (To Do, In Progress, Done) and it lumps everything under review in with In Progress, so I cannot see at a glance what is waiting on me to review. Add a fourth 'In Review' column sitting between In Progress and Done. Jira has no separate category for this — review and testing statuses share the same category as ordinary in-progress work — so it has to key off the status NAME instead. Match review/reviewing/testing/test/qa on word boundaries so a status like 'Attestation' or 'Contested' cannot leak in, and only ever move a ticket out of In Progress: a ticket Jira already calls Done or To Do keeps the column it has."
+    },
+    {
+      "id": "turma-feat-pr-ci-hold",
+      "commit": "288c7e0",
+      "kind": "feature",
+      "lang": "js",
+      "revert_paths": ["CLAUDE.md", "turma/server.js"],
+      "test_cmd": ["node", "--test", "turma/tests/server.test.js"],
+      "prompt": "The 'created a PR' push notification fires the second the agent opens the PR, which is the least useful moment — CI has not run, so I open it and there is nothing to judge. Hold that alert until the PR's checks come back green instead. If the checks pass, alert and say so. If the PR genuinely has no CI at all, still alert, but only after the empty check list has held steady for a couple of minutes, because a PR that was just opened looks identical to one with no CI while GitHub is still registering its workflows. If the checks are failing, stay silent for good — the session is going to push a fix, and I want the alert for the PR being ready, not for every trip through red. If we simply have not fetched the status yet, keep holding, but give up after about half an hour so a broken host delays the alert rather than losing it forever."
+    },
+    {
+      "id": "agent-fix-synthetic-usage",
+      "commit": "8f8aa5d",
+      "kind": "bugfix",
+      "lang": "py",
+      "revert_paths": ["CLAUDE.md", "agent/hub-agent.py"],
+      "test_cmd": ["python3", "-m", "unittest", "discover", "-s", "agent/tests", "-p", "test_hub_agent.py"],
+      "prompt": "The usage page's 'Tokens by model' table shows a phantom row called '<synthetic>' that always reports zero tokens. That is not a real model — it is the stamp Claude Code puts on assistant entries it fabricates itself, like session-limit notices and placeholder responses. It should not appear as a model row at all. Whatever tokens those entries carry should still count toward the grand totals so no real usage goes missing. Please fix it at the point the transcripts are parsed so it clears up everywhere the breakdown is shown, not just on the web page."
+    },
+    {
+      "id": "agent-fix-archive-entry-id",
+      "commit": "5e1d054",
+      "kind": "bugfix",
+      "lang": "py",
+      "revert_paths": ["CLAUDE.md", "agent/hub-agent.py"],
+      "test_cmd": ["python3", "-m", "unittest", "discover", "-s", "agent/tests", "-p", "test_hub_agent.py"],
+      "prompt": "When a session ends and I look at its archived conversation, the 'Opened PR' marker cards come through with a null id, unlike every other row. The live and history views key those same rows on a stable synthesized id because a PR-link entry has no real entry uuid of its own, but the archive push stamps the raw uuid instead, which for those entries is nothing. Make the archived rows key on the same id the live feeds use so the viewer keys its cards identically."
+    },
+    {
+      "id": "agent-fix-migrate-cwd",
+      "commit": "edc0ba0",
+      "kind": "bugfix",
+      "lang": "py",
+      "revert_paths": ["CLAUDE.md", "agent/hub-agent.py"],
+      "test_cmd": ["python3", "-m", "unittest", "discover", "-s", "agent/tests", "-p", "test_hub_agent.py"],
+      "prompt": "Moving a running session from one host to another hangs forever on 'Moving to <host>…'. It only happens between two hosts that mount the git root at different paths — one of ours is a native agent at /home/mhabeeb/git and the other is the container at /mnt/data/Docker/git. The target host's log says the incoming working directory is 'not resumable on this host', so it never resumes the session, never reports it up, and the source never gets killed. A move is always a worktree session, so the tail of that path is the same on both hosts even when the mount point is not. Sessions moving between hosts that DO share a mount point must keep working, and a genuinely foreign directory must still be rejected. Please fix it."
+    }
+  ]
+}

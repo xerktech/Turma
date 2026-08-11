@@ -116,6 +116,36 @@ function inputCapFor(agent) {
   return Math.min(reported, INPUT_MAX_CHARS);
 }
 
+// Whether a host can run a session on its own self-hosted model (XERK-246).
+// Same contract as inputCapFor above: an agent that predates the failover — or
+// one with no LOCAL_MODEL_* env — reports nothing, and an ABSENT flag means
+// "that agent cannot do it", never "assume it can". Clients hide the control
+// rather than queue a command the host will ack and drop.
+function localModelAvailable(agent) {
+  return Boolean(agent && agent.localModel && agent.localModel.available);
+}
+
+// Which model source a host reports for one of its sessions, "" when unknown.
+function sessionModelSource(hostKey, sessionId) {
+  const s = (agents[hostKey]?.sessions || []).find((x) => x.id === sessionId);
+  return (s && s.modelSource) || "";
+}
+
+// Validate a spawn's optional modelSource the same way the switch route does.
+// Returns null when fine, else {status, error}. Spawning onto the local model is
+// how you start NEW work once usage is gone, so it gets the same enum check and
+// the same capability gate rather than failing later as an errored session card.
+function checkSpawnModelSource(cmd, hostKey) {
+  if (cmd.modelSource == null) return null;
+  if (!["subscription", "local"].includes(cmd.modelSource)) {
+    return { status: 400, error: "modelSource must be subscription or local" };
+  }
+  if (cmd.modelSource === "local" && !localModelAvailable(agents[hostKey])) {
+    return { status: 409, error: "host has no local model configured" };
+  }
+  return null;
+}
+
 // ---- file attachments (XERK-234) --------------------------------------------
 // The composer's 📎 uploads a file, which lands on the agent's host as a real
 // file the session can Read; the message typed into the pane carries its path.
@@ -919,6 +949,11 @@ function startMigration(srcHost, s, targetHost) {
     meta: {
       model: s.model || null,
       permissionMode: s.permissionMode || null,
+      // Which model the moved session was running against (XERK-246). The
+      // target re-validates it against its OWN local-model configuration, so a
+      // move onto a host without one falls back rather than launching at an
+      // endpoint that isn't there.
+      modelSource: s.modelSource || null,
       summary: s.summary || null,
       summaryManual: s.summaryManual || null,
       label: s.label || null,
@@ -1619,9 +1654,9 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "gitSources", "github", "inputMaxChars", "jira", "limits", "logTail", "memory",
-  "models", "prunes", "repoUsage", "repos", "reposRoot", "sessions",
-  "startedAt", "uploadMaxBytes", "usage",
+  "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
+  "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
+  "sessions", "startedAt", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
 ]);
@@ -3623,6 +3658,7 @@ const server = http.createServer(async (req, res) => {
         repo: m.repo,
         model: m.meta.model,
         permissionMode: m.meta.permissionMode,
+        modelSource: m.meta.modelSource,
         summary: m.meta.summary,
         summaryManual: m.meta.summaryManual,
         label: m.meta.label,
@@ -3836,9 +3872,13 @@ const server = http.createServer(async (req, res) => {
         return json(res, 404, { error: "unknown repo" });
       }
       const cmd = { type: "spawn", repo, prompt };
-      for (const f of ["label", "baseRef", "model", "permissionMode"]) {
+      for (const f of ["label", "baseRef", "model", "permissionMode", "modelSource"]) {
         if (typeof body[f] === "string" && body[f].trim()) cmd[f] = body[f].trim();
       }
+      // Same enum as the switch route: a spawn is the OTHER way onto the local
+      // model, so junk must 400 here rather than land as an errored session card.
+      const spawnSourceErr = checkSpawnModelSource(cmd, hostname);
+      if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
       const cmdId = queueCommand(hostname, cmd);
       return json(res, 200, { ok: true, cmdId });
     }
@@ -3863,7 +3903,8 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "repo required" });
         }
         const cmd = { type: "spawn", repo: body.repo };
-        for (const f of ["prompt", "label", "baseRef", "model", "permissionMode"]) {
+        for (const f of ["prompt", "label", "baseRef", "model", "permissionMode",
+                         "modelSource"]) {
           if (body[f] != null && body[f] !== "") {
             if (typeof body[f] !== "string") {
               return json(res, 400, { error: `${f} must be a string` });
@@ -3877,6 +3918,8 @@ const server = http.createServer(async (req, res) => {
             cmd[f] = body[f];
           }
         }
+        const spawnSourceErr = checkSpawnModelSource(cmd, key);
+        if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
@@ -4024,6 +4067,13 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse((await readBody(req)) || "{}");
         const model = typeof body.model === "string" ? body.model : "";
         if (!model) return json(res, 400, { error: "model required" });
+        // A session on the self-hosted model takes its model from the host
+        // configuration; the agent refuses this and every alias the picker could
+        // offer is one the gateway rejects. Refuse here too, so the mirror case
+        // of /model-source's 409 is not a silent 200 for an out-of-parity client.
+        if (sessionModelSource(key, sessionId) === "local") {
+          return json(res, 409, { error: "session runs on the self-hosted model" });
+        }
         if (model.length > 60 || !/^[a-z0-9.[\]-]+$/i.test(model))
           return json(res, 400, { error: "invalid model" });
         const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
@@ -4050,6 +4100,25 @@ const server = http.createServer(async (req, res) => {
         const permissionMode = typeof body.permissionMode === "string" ? body.permissionMode : "";
         if (!permissionMode) return json(res, 400, { error: "permissionMode required" });
         const cmdId = queueCommand(key, { type: "setMode", sessionId, permissionMode });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/model-source -> move a RUNNING
+      // session between the subscription login and this host's self-hosted
+      // model (XERK-246), keeping its conversation. This is the failover for
+      // Claude usage running out, which otherwise stops every session at once.
+      // Gated on the host reporting localModel.available: an agent that cannot
+      // do it would ack the command and silently drop it, so refusing here is
+      // what makes the button honest.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "model-source") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const modelSource = typeof body.modelSource === "string" ? body.modelSource : "";
+        if (!["subscription", "local"].includes(modelSource)) {
+          return json(res, 400, { error: "modelSource must be subscription or local" });
+        }
+        if (modelSource === "local" && !localModelAvailable(agents[key])) {
+          return json(res, 409, { error: "host has no local model configured" });
+        }
+        const cmdId = queueCommand(key, { type: "setModelSource", sessionId, modelSource });
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
@@ -5067,6 +5136,10 @@ if (process.env.TURMA_TEST) {
     // In-memory by design, so a hub restart drops it and ownership falls back
     // to the fleet scan. Exported so a test can stage exactly that (XERK-241).
     cmdHosts,
+    // The heartbeat field allowlist. Exported so a test can hold the capability
+    // flags in it directly: dropping `localModel` would make the failover
+    // control vanish fleet-wide with every suite still green (XERK-246).
+    HEARTBEAT_KNOWN_KEYS,
     invalidateAgentsCache,
     serializeAgentsForSave,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these

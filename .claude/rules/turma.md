@@ -210,6 +210,15 @@ auto-start/auto-stop and the two tracker writes.
 
 ### The model and mode chips
 
+- A third selector — **"Run against"** (`cc-source`, XERK-246) — moves the session between the Claude
+  subscription and the host's self-hosted model. It follows the HOST's `localModel.available`
+  exactly as the 📎 follows `uploadMaxBytes`; an agent reporting nothing cannot do it, so offering
+  the switch would queue a command it silently drops. It is **also shown when the session is already
+  `local`**, so one whose host later lost its configuration still has a visible way back. A `local`
+  session is marked (🏠, warn colour) — it is a weaker model, and nobody should have to wonder which
+  one wrote a turn. Like the mode switch it paints from a MEMO, never an optimistic write onto
+  `sess`, so a stale beat can't flash the old value back; the memo ages out so a switch that never
+  lands doesn't pin the chip. Tests: the `model source:` cases in `chat.test.js`.
 - The compose footer's agent-mode / model selectors are joined by a compact **PR status chip**
   (`prFooterChip`) when it has one, and a `jira-chip` when the session has a ticket.
 - The **model selector is accurate** (XERK-33) — never a hardcoded menu, and never rewriting the

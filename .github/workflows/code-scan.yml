@@ -36,6 +36,10 @@ on:
       # annotations written on the assumption that it runs (XERK-235).
       - "android/**"
       - ".github/scripts/**"
+      # Same reasoning as android/** above: Semgrep scans the whole tree, so
+      # bench/ was covered only when some OTHER component's PR happened to
+      # trigger this workflow — a bench-only PR ran zero SAST over its Python.
+      - "bench/**"
       # Every workflow, not just this one: Semgrep's shell-injection rules read
       # the workflows themselves, so scoping this to code-scan.yml meant a
       # `run:` step interpolating ${{ }} could land in any OTHER workflow

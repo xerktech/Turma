@@ -3,19 +3,20 @@
   "provider": {
     "local": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Local Ollama (Tenir-Ollama-Cue, RTX 6000 Pro)",
-      "options": { "baseURL": "http://localhost:9402/v1" },
+      "name": "Tenir gpt-oss (LiteLLM gateway)",
+      "options": {
+        "baseURL": "{env:TURMA_LOCAL_BASE_URL}",
+        "apiKey": "{env:TURMA_LOCAL_API_KEY}"
+      },
       "models": {
         "gpt-oss:120b": {
           "name": "gpt-oss 120b",
           "tool_call": true,
           "reasoning": true,
-          "options": { "reasoningEffort": "medium" },
           "limit": { "context": 81920, "output": 8192 }
         }
       }
     }
   },
-  "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" },
-  "instructions": ["CLAUDE.md", "OPENCODE_CONTRACT.md"]
+  "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" }
 }

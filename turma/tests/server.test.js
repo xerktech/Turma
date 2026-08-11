@@ -5970,6 +5970,7 @@ test("control WS: a channel that pongs is kept past the dead-after window", asyn
 const migHost = (device, site, {
   session = "s1", repo = "Turma", repos = ["Turma"], status = "running",
   root = false, transcriptId = "trans-" + device, extraSessions = [],
+  modelSource = "local",
 } = {}) =>
   request("POST", "/api/heartbeat", {
     body: {
@@ -5981,6 +5982,7 @@ const migHost = (device, site, {
           id: session, status, root, repo, transcriptId,
           worktreePath: `/git/.turma/worktrees/${repo}/${session}`,
           model: "opus", permissionMode: "auto", summary: "Fix the logs",
+          modelSource,
           ticket: { key: "ENG-9", siteKey: site, url: "u", summary: "Fix the logs", branch: "ENG-9" },
         },
         ...extraSessions,
@@ -6074,6 +6076,10 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(imp.cwd, "/git/.turma/worktrees/Turma/s1");
   assert.equal(imp.repo, "Turma");
   assert.equal(imp.model, "opus");
+  // The moved session must arrive still failed over (XERK-246); without this
+  // the whole chain — session payload, migration meta, importSession command —
+  // could drop it and every suite would stay green.
+  assert.equal(imp.modelSource, "local");
   assert.equal(imp.ticket.key, "ENG-9");
   assert.equal(imp.migratedFrom.host, "mgA");
   assert.equal(m.importCmdId, imp.cmdId);
@@ -6328,3 +6334,124 @@ test("uploads: the relay is memory-only — nothing rides the fleet payload", as
   // It IS held, though — the agent has to be able to come and get it.
   assert.ok([...uploads.values()].some((u) => u.host === "upLeak"));
 });
+
+// --- local-model failover (XERK-246) -----------------------------------------
+// Moving a session onto the host's self-hosted model when Claude usage runs out.
+// The route is gated on the host REPORTING the capability, because an agent that
+// cannot do it would ack the command and drop it silently.
+
+test("http: model-source endpoint queues a setModelSource command", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm1", localModel: { available: true, model: "gpt-oss:120b" } },
+    headers: agentHeaders,
+  });
+  const res = await request("POST", "/api/agents/lm1/sessions/sess1/model-source", {
+    body: { modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "lm1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setModelSource", sessionId: "sess1", modelSource: "local", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: model-source refuses local on a host that reports no local model", async () => {
+  // No localModel block at all — an agent predating the failover.
+  await request("POST", "/api/heartbeat", { body: { device: "lm2" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/lm2/sessions/sess1/model-source", {
+    body: { modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 409);
+  // Going BACK to the subscription is always allowed — that path needs nothing
+  // from the host, and refusing it could strand a session on a local model
+  // whose configuration was removed.
+  const back = await request("POST", "/api/agents/lm2/sessions/sess1/model-source", {
+    body: { modelSource: "subscription" }, headers: userHeaders,
+  });
+  assert.equal(back.status, 200);
+});
+
+test("http: model-source rejects anything outside the enum", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm3", localModel: { available: true } }, headers: agentHeaders,
+  });
+  for (const modelSource of ["", "bedrock", "LOCAL", 7]) {
+    const res = await request("POST", "/api/agents/lm3/sessions/sess1/model-source", {
+      body: { modelSource }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, String(modelSource));
+  }
+});
+
+test("heartbeat: localModel survives into the fleet payload", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "lm4",
+      localModel: { available: true, model: "gpt-oss:120b", contextTokens: 65536 },
+      sessions: [{ id: "s1", repo: "Turma", status: "running", modelSource: "local" }],
+    },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "lm4");
+  assert.equal(host.localModel.available, true);
+  assert.equal(host.localModel.model, "gpt-oss:120b");
+  // The per-session field the UI chips off must reach clients too.
+  assert.equal(host.sessions[0].modelSource, "local");
+});
+
+test("http: spawn validates modelSource like the switch route does", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm5", localModel: { available: true, model: "gpt-oss:120b" } },
+    headers: agentHeaders,
+  });
+  // Junk must 400 here rather than land as an errored session card on the host.
+  const bad = await request("POST", "/api/agents/lm5/sessions", {
+    body: { repo: "Turma", modelSource: "bedrock; rm -rf /" }, headers: userHeaders,
+  });
+  assert.equal(bad.status, 400);
+  const ok = await request("POST", "/api/agents/lm5/sessions", {
+    body: { repo: "Turma", modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test("http: spawning onto local is refused on a host without one", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "lm6" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/lm6/sessions", {
+    body: { repo: "Turma", modelSource: "local" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 409);
+});
+
+test("http: /model refuses a session running on the self-hosted model", async () => {
+  // Mirror of /model-source's 409: every alias the picker could offer is one
+  // the gateway rejects, so a silent 200 would let an out-of-parity client
+  // break the session with nothing to show for it.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "lm7",
+      localModel: { available: true, model: "gpt-oss:120b" },
+      sessions: [
+        { id: "loc", repo: "R", status: "running", modelSource: "local" },
+        { id: "sub", repo: "R", status: "running", modelSource: "subscription" },
+      ],
+    },
+    headers: agentHeaders,
+  });
+  const refused = await request("POST", "/api/agents/lm7/sessions/loc/model", {
+    body: { model: "opus" }, headers: userHeaders,
+  });
+  assert.equal(refused.status, 409);
+  const ok = await request("POST", "/api/agents/lm7/sessions/sub/model", {
+    body: { model: "opus" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test("heartbeat: localModel is a known key, not an unknown-field remnant", async () => {
+  // It is the capability flag the hub and every composer gate on. Dropping it
+  // from HEARTBEAT_KNOWN_KEYS would make the control vanish fleet-wide.
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
+});
+

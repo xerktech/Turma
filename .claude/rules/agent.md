@@ -73,6 +73,40 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   (id-deduped, `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts them. Tests:
   `TestHistoryCommand`.
 
+### `setModelSource` — failover to the self-hosted model (XERK-246)
+
+- Moves a RUNNING session between the `~/.claude` subscription and this host's local model, keeping
+  its conversation. See `CLAUDE.md`'s "Local-model failover" for why this is env-repointing rather
+  than a second coding agent, and `docs/local-model-failover.md` for the bake-off behind it.
+- `local_model_configured()` is the single gate — **both** endpoint and key, plus a charset-checked
+  model name (it is interpolated into a launch command line). Half-configured reads as "no": a
+  session launched at an endpoint with no key dies on its first request.
+- The settings go to a **0600 file (`write_local_model_env`) that the launch line SOURCES**, never a
+  command-line prefix and never `tmux -e`: both put the gateway credential into a process's argv,
+  where `/proc/<pid>/cmdline` is world-readable (0444). Only the path is ever visible. Kept out of
+  the shared guard settings file because the choice is PER SESSION — one session can fail over while
+  its neighbours stay put. `set -a` around the source is load-bearing: without it the settings are
+  defined but not exported, and claude (a child process) never sees them, so the session runs on the
+  subscription while the UI still marks it local.
+- It blanks `ANTHROPIC_API_KEY`, which outranks `ANTHROPIC_AUTH_TOKEN` and would bill the very
+  account the failover exists to stop depending on, and sets `ANTHROPIC_SMALL_FAST_MODEL` too, or
+  every background call asks the gateway for the login's default alias and 403s invisibly.
+- **`--model` is suppressed for a local session** at that one launch choke point. It OVERRIDES
+  `ANTHROPIC_MODEL`, so a failed-over session carrying a Claude alias 403s on every turn while the
+  record still reads running/local. `set_model` refuses one for the same reason.
+- The credential file is **`Read`-denied** in `_GUARD_DENY_PATH_RULES`: 0600 stops other uids, not
+  the sessions themselves, which run as the uid that owns it.
+- **Every path that rebuilds a session record carries `modelSource`** — spawn, provision, queue
+  drain, start, restart, resume, resume-any, migration in, resume-on-boot. Resume-any matches the
+  closed record by transcript id and then by **worktree, newest first** (restart-clear-context moves
+  a transcript id, and `self.closed` is append-ordered). A migration RE-VALIDATES against the
+  target's own configuration.
+- `set_model_source` **reverts the record if the relaunch throws** — a record claiming `local` for a
+  session still on the exhausted subscription is worse than a visible error. `_launch_tmux` likewise
+  demotes a `local` session to `subscription` (and says so) when the host's configuration has gone,
+  rather than launching against the subscription while the UI still says local.
+- Tests: `TestLocalModelConfig`, `TestLocalModelFailover`.
+
 ### `setModel` — live model switch, for that session only (XERK-33)
 
 - `set_model` drives Claude Code's /model picker (`parse_model_picker`). **Never `/model <name>`**,

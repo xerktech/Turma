@@ -1,0 +1,12 @@
+# Codex CLI config for the bench. The key is read from the environment
+# (env_key), never written here.
+model = "gpt-oss:120b"
+model_provider = "local"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.local]
+name = "Tenir gpt-oss (LiteLLM gateway)"
+base_url = "$TURMA_LOCAL_BASE_URL"
+env_key = "TURMA_LOCAL_API_KEY"
+wire_api = "responses"
