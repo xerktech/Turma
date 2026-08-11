@@ -260,3 +260,9 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   host's tunnel-agent to `watch` the session, seeds it with the cached tail, fans the
   `{tail,entries}` deltas out, and `unwatch`es when the last viewer disconnects (re-arming on
   control reconnect).
+  - **That socket is HELD across a host's control-channel flap, never closed** — it is what lets the
+    client keep the conversation on screen and heal in place (XERK-252, `turma-sessions.md`). The
+    client's half of the contract is that ONE viewer keeps ONE socket, so "last viewer gone →
+    `unwatch`" still fires and the agent stops tailing.
+  - `GET /api/agents/<host>/sessions/<id>/subagents/history` answers **202 while it fetches**, and
+    the client polls that; a 202 is "not yet", never "none".

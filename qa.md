@@ -140,7 +140,7 @@ Hard rules:
 
 ## 2. Building and running each component
 
-Baselines below are from `main` at v0.6 + XERK-252 (commit 1c9e2cc), so a deviation is
+Baselines below are from `main` at v0.6 + XERK-252 (commit 4b638a4), so a deviation is
 either your environment or a regression — find out which before filing.
 
 **Pin your copy on `/mnt/data`, never in the `/tmp` scratchpad.** §4 tells you to
@@ -154,7 +154,7 @@ reason `--cache` must point at `/mnt/data/tmp-qa/npm-cache`, not `/tmp`.
 
 ```bash
 export PATH=/root/.local/node/bin:$PATH
-cd turma && node --test tests/*.test.js        # baseline: 925 pass, ~6s
+cd turma && node --test tests/*.test.js        # baseline: 926 pass, ~6s
 ```
 
 Boot a real hub with everything pointed at temp paths:
@@ -180,7 +180,17 @@ for t in tests/test_*.sh; do bash "$t"; done                   # native/entrypoi
 
 **There is no pytest.** `python3 -m unittest` is the only runner.
 
-The single node command `code-scan.yml` really runs (1056 pass) — use this to
+The fourth thing `code-scan.yml` gates is the **instruction-file size limit**, and it is the one
+that is easy to trip without noticing (a rules file grows a few bullets at a time). Run it exactly
+as the workflow does — note `-m`, not `wc -c`; these files are full of multibyte glyphs:
+
+```bash
+for f in CLAUDE.md .claude/rules/*.md; do
+  python3 -c "import sys;print(sys.argv[1], len(open(sys.argv[1],encoding='utf-8').read()))" "$f"
+done   # anything >= 40000 fails the PR; >= 36000 warns at Claude Code startup
+```
+
+The single node command `code-scan.yml` really runs (1057 pass) — use this to
 reproduce that gate rather than per-directory runs:
 
 ```bash
