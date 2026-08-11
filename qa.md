@@ -272,6 +272,10 @@ Driving it:
   searches `$ANDROID_AVD_HOME`, `$ANDROID_SDK_HOME/avd` and `$HOME/.android/avd`.**
   Set `ANDROID_AVD_HOME` on the emulator command or it dies with
   "Unknown AVD name".
+- **`sdkmanager` installs into `/opt/android-sdk`, i.e. the CONTAINER's writable
+  layer — not into your `/gh` mount.** `docker rm` that container and the
+  emulator + system image are gone and re-download (~4 min), even though the AVD
+  under `/gh` survives. Keep the container, or expect to pay again.
 - `--network host` on the emulator container means the AVD's `10.0.2.2` reaches
   the host loopback, so a scratch hub on `127.0.0.1:<port>` is reachable at
   `http://10.0.2.2:<port>`. **The manifest already sets

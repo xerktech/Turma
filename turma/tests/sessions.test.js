@@ -758,6 +758,11 @@ test("the host coming back heals the staged session in place", () => {
 test("healing in the terminal view re-points the iframe at the session", () => {
   const { beat, chatToTerminal, els, now, h } = staged();
   chatToTerminal();
+  // NB `navFrame` really navigates via `contentWindow.location.replace()`, which
+  // leaves `iframe.src` untouched in a browser; the shim has no contentWindow,
+  // so its `catch { $frame.src = src }` fallback is what this reads. Don't
+  // "correct" this assertion to match the browser — the call being made at all
+  // is the thing under test.
   const src = els.termFrame.src;
   assert.match(src, /\/term\/11111\//);
 

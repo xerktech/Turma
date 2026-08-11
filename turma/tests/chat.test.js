@@ -1853,3 +1853,41 @@ test("wake() is inert with no session staged", async () => {
   } finally { global.fetch = realFetch; }
   assert.deepEqual(calls, []);
 });
+
+// A socket already CLOSING is the one case that can leak: wake() used to skip
+// only OPEN/CONNECTING, so it built a replacement while the dying socket's own
+// onclose was still armed — and that handler's scheduleReconnect() then minted a
+// THIRD socket, orphaning the replacement.
+test("wake() replaces a CLOSING socket without letting it mint a rival", async () => {
+  const { wake, __setSess, __setHostKey, __setWs } = require("../public/chat.js");
+  const realFetch = global.fetch, realWS = global.WebSocket, realLoc = global.location;
+  let made = 0, oncloseFired = 0, closeCalled = 0;
+  global.WebSocket = class { constructor() { made++; } };
+  global.WebSocket.OPEN = 1; global.WebSocket.CONNECTING = 0;
+  // wsUrl() reads location.origin. Without it startWs throws INSIDE its own
+  // try/catch, quietly takes the scheduleReconnect() path, and the test hangs on
+  // that timer instead of reporting anything useful.
+  global.location = { origin: "http://hub.test" };
+  global.fetch = () => Promise.resolve({ ok: true, status: 200, json: async () => ({ token: "t", expiresInSec: 300 }) });
+  const dying = {
+    readyState: 2,   // CLOSING
+    onclose() { oncloseFired++; },
+    close() { closeCalled++; if (this.onclose) this.onclose(); },
+  };
+  try {
+    __setHostKey("hostA");
+    __setSess({ id: "AAAAA" });
+    __setWs(dying);
+    wake();
+    assert.equal(closeCalled, 1, "the dying socket is closed, not waited on");
+    assert.equal(oncloseFired, 0, "its handler is detached first, so it can't reconnect behind us");
+    // One setImmediate drains the whole microtask queue, so the awaited
+    // getToken() chain inside startWs has finished by here.
+    await new Promise((r) => setImmediate(r));
+  } finally {
+    global.fetch = realFetch; global.WebSocket = realWS;
+    if (realLoc === undefined) delete global.location; else global.location = realLoc;
+    __setWs(null);
+  }
+  assert.equal(made, 1, "exactly one replacement socket");
+});

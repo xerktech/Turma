@@ -2307,7 +2307,9 @@
   // the browser's /live socket across most flaps, so the common case here is a
   // socket that never dropped — hence the OPEN/CONNECTING early-out. Restarting
   // a socket that really did die is this function's actual job, with the backoff
-  // reset so the heal is immediate rather than a backoff step away.
+  // reset so the next attempt starts NOW rather than a backoff step away. That
+  // is all it buys: the attempt can still fail and fall back into the ordinary
+  // reconnect ladder, so this shortens recovery, it doesn't guarantee it.
   function wake() {
     if (!hostKey || !sessionId) return;
     const myGen = gen;
