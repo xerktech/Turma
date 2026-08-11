@@ -430,6 +430,10 @@ all. A green suite proves nothing here; measure it in a browser.
   wrong node. `#board` prepends `.kc-note` divs on truncation / a poll error;
   the column strip survives it only because it carries `id="kanbanCols"`. Flip a
   note across a beat and re-check any OTHER scrolled node.
+- **A regex-over-CSS guard only sees the FIRST rule matching its selector**, so a
+  later unscoped override — the pattern the vendored `board.css` files use — sails
+  past it while winning the cascade. Prove any such test by mutating the stylesheet
+  and re-running it, never by reading it.
 - `overflow-x: auto` computes `overflow-y` to `auto` too — confirm
   `scrollHeight === clientHeight` or a vertical wheel over it gets swallowed.
 - A scroll container's horizontal scrollbar sits at the bottom of **its own

@@ -33,6 +33,14 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   re-introduce a breakpoint that wraps them underneath each other — stacked columns stop reading as
   a Kanban, and the position of a column would then depend on the viewport. Android's `BoardScreen`
   has always been a scrolling `Row`, so this is also what keeps the two surfaces the same shape.
+  - Between ~561 and ~1024px the strip scrolls, and on a TALL board its scrollbar sits at the bottom
+    of its own box, far down the page — so the only on-screen cue is the last column being sliced.
+    **Known and accepted, not an oversight**: the fix is to cap the strip to the viewport and give
+    each column its own vertical scroll (what the phone rule does), which is a desktop layout change
+    of its own. Wrapping the columns is NOT the fix — that is the bug this rule exists to prevent.
+  - Guarded by the `app.css` cases in `board.test.js`, which read **every** rule naming
+    `.kanban-cols`, not the first: a later unscoped override wins the cascade, and that is exactly
+    the idiom the vendored `board.css` copies use.
 - Scoped by the **header's org filter**, not a strip of its own: `TurmaOrg.getKeys()` each render,
   passed to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as

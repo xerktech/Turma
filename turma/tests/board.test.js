@@ -1840,27 +1840,49 @@ test("createFormHtml: the created state shows a link and hides the form", () => 
 // stylesheet directly — cheap, and they are the only guard the rule has.
 const fs = require("node:fs");
 const path = require("node:path");
-const APP_CSS = fs.readFileSync(path.join(__dirname, "../public/app.css"), "utf8");
+const APP_CSS = fs.readFileSync(path.join(__dirname, "../public/app.css"), "utf8")
+  .replace(/\/\*[\s\S]*?\*\//g, "");   // comments discuss these rules; only declarations count
+
+// EVERY rule whose selector names the strip or a column, in source order — not
+// just the first. A guard that reads one rule is beaten by a later unscoped
+// override, which is the exact idiom the glasses/veiller vendored board.css
+// already uses, so it is one copy-paste away from re-stacking the columns.
+function rulesFor(cls) {
+  return [...APP_CSS.matchAll(/([^{}]*)\{([^{}]*)\}/g)]
+    .filter(([, sel]) => new RegExp(`\\.${cls}(?![\\w-])`).test(sel))
+    .map(([, sel, body]) => [sel.trim().split("\n").pop().trim(), body]);
+}
 
 test("board: the column strip is a flex row that scrolls sideways", () => {
-  const rule = /\.kanban-cols\s*\{([^}]*)\}/.exec(APP_CSS);
-  assert.ok(rule, "no .kanban-cols rule in app.css");
-  assert.match(rule[1], /display:\s*flex/, "the strip must be a row, not a wrapping grid");
-  assert.match(rule[1], /overflow-x:\s*auto/, "a column that doesn't fit must scroll, not restack");
-  assert.doesNotMatch(rule[1], /flex-wrap:\s*wrap/);
+  const rules = rulesFor("kanban-cols");
+  assert.ok(rules.length, "no .kanban-cols rule in app.css");
+  const all = rules.map(([, b]) => b).join(";");
+  assert.match(all, /display:\s*flex/, "the strip must be a row, not a wrapping grid");
+  assert.match(all, /overflow-x:\s*auto/, "a column that doesn't fit must scroll, not restack");
+  // The padding holds the drop-target outline the scroll container would clip;
+  // scroll-padding is what keeps that room on screen instead of scrolled away.
+  assert.match(all, /padding:\s*6px/);
+  assert.match(all, /scroll-padding:\s*6px/);
 });
 
-test("board: no media query stacks the status columns", () => {
-  // Every @media block's body, checked for a rule that re-lays the strip out as
-  // a grid or lets it wrap — that is exactly how the columns ended up 2x2.
-  for (const [, body] of APP_CSS.matchAll(/@media[^{]*\{((?:[^{}]*\{[^{}]*\})*)/g)) {
-    const strip = /\.kanban-cols\s*\{([^}]*)\}/.exec(body);
-    if (!strip) continue;
-    assert.doesNotMatch(strip[1], /grid-template-columns/,
-      "a media query lays .kanban-cols out as a grid — the columns must stay one horizontal row");
-    assert.doesNotMatch(strip[1], /display:\s*(grid|block)/);
-    assert.doesNotMatch(strip[1], /flex-wrap:\s*wrap/);
+test("board: nothing anywhere in app.css re-stacks the status columns", () => {
+  for (const [sel, body] of rulesFor("kanban-cols")) {
+    assert.doesNotMatch(body, /grid-template-columns/,
+      `\`${sel}\` lays the strip out as a grid — the columns must stay one horizontal row`);
+    assert.doesNotMatch(body, /display:\s*(?!flex\b)[a-z-]+/,
+      `\`${sel}\` gives the strip a display other than flex`);
+    assert.doesNotMatch(body, /flex-wrap:\s*wrap/, `\`${sel}\` lets the columns wrap`);
   }
+});
+
+test("board: the phone columns keep their share of the viewport", () => {
+  // The base rule's readable floor must be released inside the phone block, or
+  // it beats the 82% basis on a small phone and eats the next column's peek.
+  const phone = rulesFor("kanban-col").filter(([sel]) => /kanban-col(?![\w-])/.test(sel));
+  const flexed = phone.filter(([, b]) => /flex:\s*0\s+0\s+82%/.test(b));
+  assert.equal(flexed.length, 1, "expected exactly one 82%-basis column rule (the phone one)");
+  assert.match(flexed[0][1], /min-width:\s*0/,
+    "the phone column must release the base rule's min-width floor");
 });
 
 test("board: the strip carries the id preserveScroll anchors its sideways scroll to", () => {
