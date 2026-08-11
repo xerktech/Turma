@@ -86,6 +86,7 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun spawn(
         host: String, repo: String, prompt: String? = null, label: String? = null,
         baseRef: String? = null, model: String? = null, permissionMode: String? = null,
+        modelSource: String? = null,
     ) = run("session queued") {
         container.client.api.spawnSession(
             host,
@@ -96,6 +97,12 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
                 baseRef = baseRef?.ifBlank { null },
                 model = model?.ifBlank { null },
                 permissionMode = permissionMode?.ifBlank { null },
+                // Only sent when the operator chose the local model, so a spawn
+                // that didn't queues the exact body it always did. The control
+                // itself can only appear when the host reported `localModel`,
+                // which an older hub does not relay — so a hub that would drop
+                // this field silently never offers the choice in the first place.
+                modelSource = modelSource?.takeIf { it == com.xerktech.turma.core.ModelSource.LOCAL },
             ),
         )
     }

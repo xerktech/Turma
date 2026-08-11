@@ -10,6 +10,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.core.Attachment
+import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
@@ -27,6 +28,7 @@ import com.xerktech.turma.net.InputRequest
 import com.xerktech.turma.net.LiveEvent
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
+import com.xerktech.turma.net.ModelSourceRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -74,6 +76,11 @@ data class ChatUiState(
     // The host this session's agent runs on, shown in the header (XERK-121):
     // the agent's device name, falling back to its registration key.
     val hostLabel: String = "",
+    // This host's self-hosted model (XERK-246) and an unconfirmed switch onto or
+    // off it. Null localModel = its agent can't fail over, which is what hides
+    // the "run against" chip rather than offering a command the host would drop.
+    val localModel: com.xerktech.turma.model.LocalModelInfo? = null,
+    val modelSourcePending: ModelSource.Pending? = null,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     val question: String get() = session?.session?.question ?: ""
@@ -86,6 +93,17 @@ data class ChatUiState(
     // Attaching is off while a question is pending: the draft then routes to
     // POST .../answer, which carries no files (web chat.js renderAttachments).
     val canAttach: Boolean get() = Uploads.canAttach(uploadMaxBytes) && question.isBlank()
+
+    /**
+     * Which model this session runs against, taking an unconfirmed switch at its
+     * word until the heartbeat agrees. Read with a caller-supplied clock so the
+     * memo can age out on a repaint rather than only on the next state change.
+     */
+    fun modelSource(now: Long = System.currentTimeMillis()): String =
+        ModelSource.current(session, modelSourcePending, now)
+
+    fun canSwitchModelSource(now: Long = System.currentTimeMillis()): Boolean =
+        ModelSource.offered(localModel, modelSource(now))
 }
 
 class ChatViewModel(
@@ -164,7 +182,9 @@ class ChatViewModel(
                 _state.update {
                     it.copy(session = session, hostLabel = label,
                         tunnelOnline = tunnelOnlineOf(agent),
-                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0)
+                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
+                        localModel = agent?.localModel,
+                        modelSourcePending = settledPending(it.modelSourcePending, session))
                 }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
@@ -182,9 +202,22 @@ class ChatViewModel(
             it.copy(session = session, hostLabel = label,
                 tunnelOnline = tunnelOnlineOf(agent),
                 uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
+                localModel = agent?.localModel,
                 entries = mergeTail(it.entries, seed))
         }
     }
+
+    /**
+     * Retire an in-flight model-source switch once the heartbeat reports it —
+     * the same "clears on its own completion signal, not a blind timer" rule the
+     * dashboard's per-session pending follows. The TTL inside [ModelSource] is
+     * only the backstop for a switch that never lands.
+     */
+    private fun settledPending(
+        pending: ModelSource.Pending?,
+        session: SessionInfo?,
+    ): ModelSource.Pending? =
+        if (pending != null && session?.modelSource == pending.value) null else pending
 
     private fun startLive() {
         liveJob?.cancel()
@@ -471,6 +504,34 @@ class ChatViewModel(
     fun setMode(mode: String) = viewModelScope.launch {
         runCatching { client.api.setMode(host, sessionId, ModeRequest(mode)) }
         _messages.tryEmit("✓ mode queued")
+    }
+
+    /**
+     * Move this session between the subscription and the host's self-hosted
+     * model (XERK-246). The agent relaunches Claude with `--resume`, so the
+     * conversation, worktree and branch carry over — but that takes several
+     * beats, hence the memo the chip paints from meanwhile.
+     *
+     * A refusal DROPS the memo instead of letting it age out: the hub 409s when
+     * the host has no local model, and a chip that keeps claiming a switch that
+     * was rejected is worse than one that never moved.
+     */
+    fun setModelSource(source: String) = viewModelScope.launch {
+        if (source == _state.value.modelSource()) return@launch
+        _state.update {
+            it.copy(modelSourcePending = ModelSource.Pending(sessionId, source, System.currentTimeMillis()))
+        }
+        val res = runCatching { client.api.setModelSource(host, sessionId, ModelSourceRequest(source)) }
+        res.onSuccess {
+            _messages.tryEmit(
+                if (source == ModelSource.LOCAL) "✓ switching to the local model…"
+                else "✓ switching back to the subscription…"
+            )
+            container.fleet.nudge()
+        }.onFailure { e ->
+            _state.update { it.copy(modelSourcePending = null) }
+            _messages.tryEmit("✗ " + (hubErrorMessage(e) ?: "could not switch model"))
+        }
     }
 
     // ---- voice dictation into the draft --------------------------------------

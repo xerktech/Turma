@@ -97,6 +97,47 @@ class AgentDecodeTest {
         assertEquals(0, closed.prs.size)
     }
 
+    // The local-model failover block (XERK-246), in the exact shape hub-agent
+    // reports it: a host with no LOCAL_MODEL_* env sends available:false with
+    // BOTH other fields explicitly null, which must decode as "cannot fail over"
+    // rather than throw and hide the whole fleet.
+    @Test fun `the localModel block decodes both configured and not`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "on", "device": "on", "online": true,
+                "localModel": { "available": true, "model": "gpt-oss:120b", "contextTokens": 81920 },
+                "sessions": [ { "id": "s1", "modelSource": "local",
+                                "modelSourceAt": "2026-08-11T02:30:00Z" } ] },
+              { "key": "off", "device": "off", "online": true,
+                "localModel": { "available": false, "model": null, "contextTokens": null },
+                "sessions": [ { "id": "s2", "modelSource": "subscription" } ] }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val on = resp.agents[0]
+        assertEquals(true, on.localModel?.available)
+        assertEquals("gpt-oss:120b", on.localModel?.model)
+        assertEquals(81920, on.localModel?.contextTokens)
+        assertEquals("local", on.sessions[0].modelSource)
+        assertEquals("2026-08-11T02:30:00Z", on.sessions[0].modelSourceAt)
+        val off = resp.agents[1]
+        assertEquals(false, off.localModel?.available)
+        assertNull(off.localModel?.model)
+        assertEquals("subscription", off.sessions[0].modelSource)
+    }
+
+    // An agent predating the failover reports neither field. Absent must mean
+    // "that host can't do it", which is what hides the control.
+    @Test fun `an agent predating the failover decodes with no local model`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+              "sessions": [ { "id": "s" } ] } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertNull(resp.agents[0].localModel)
+        assertEquals("", resp.agents[0].sessions[0].modelSource)
+    }
+
     // The live-status frame (XERK-75): tunnel-agent.js scrapes up/down/elapsed as
     // DISPLAY STRINGS ("1.2k", "12s") and attaches an optional agents[] list. These
     // were typed Long, so decodeFromString<TailFrame> threw on every real status

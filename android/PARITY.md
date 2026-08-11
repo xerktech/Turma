@@ -315,6 +315,32 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   the drop case. Sharing INTO the app is not wired up (no `ACTION_SEND` intent filter yet) — a
   reasonable follow-up, tracked below.
 
+## Done (XERK-246 — local-model failover controls)
+
+- **Switch a running session between the subscription and the host's self-hosted model.** A third
+  compose-bar chip beside model and mode ("run: subscription" / "run: <model>") POSTing
+  `.../sessions/<id>/model-source`; the agent relaunches with `--resume`, so the conversation,
+  worktree and branch carry over. The chip paints from a memo until the heartbeat agrees — the
+  relaunch takes several beats, and without it the value springs back and reads as a dead control —
+  and the memo ages out (`ModelSource.SWITCH_SETTLE_MS`) so a switch that never lands can't pin it
+  on a lie. A refused switch (the hub 409s a host with no local model) drops the memo at once and
+  says why.
+- **Start NEW work on the local model**: a "Run against" row in the spawn composer, the web's
+  `sessions.html` field. Without it you could fail existing sessions over from the phone but not
+  begin anything once usage was gone — which is exactly when you need to.
+- Both follow the **host's** `localModel.available`, exactly as the 📎 follows `uploadMaxBytes`; an
+  agent reporting nothing cannot do it, so the control is hidden rather than offered and refused.
+  The compose-bar chip is also shown when the session is already `local`, so one whose host later
+  lost its configuration keeps a visible way back.
+- **The Claude model picker is hidden on a local session** (a static chip states the model instead),
+  matching the web: every alias it could offer — "default" included, since that resolves to the
+  shared login's default — is one the self-hosted endpoint refuses. The spawn composer drops the
+  alias for the same reason.
+- Pure half in `core/ModelSource.kt` (`ModelSourceTest.kt`); the wire block is locked in
+  `AgentDecodeTest.kt`, including the all-nulls shape an unconfigured host reports.
+- **Still open:** the 🏠 mark on live and ended session CARDS (see below) — inside a session the
+  compose-bar chip already names the model.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -332,19 +358,11 @@ those are marked `[MODEL]`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
-- **P1 Local-model failover control + chip (XERK-246).** The web compose bar carries a third
-  selector beside agent-mode and model — "Run against: Claude subscription / <self-hosted model>" —
-  which POSTs `/api/agents/<host>/sessions/<id>/model-source` and relaunches the session on the
-  local model, keeping its conversation. A session on the local model is marked (🏠 + warn colour)
-  so nobody has to wonder which model wrote a turn. Android shows neither the control nor the mark.
-  Gate it on the host's `localModel.available`, exactly as the 📎 gates on `uploadMaxBytes` — an
-  agent that reports nothing cannot do it. Field: `session.modelSource`
-  (`"subscription"`/`"local"`). This matters on a phone precisely when it matters most: usage runs
-  out while you are away from a desk. Three parts, all missing: the compose-bar selector, the mark
-  on live AND ended session cards, and a **"Run against" option in the spawn composer** (without the
-  last one you can fail existing sessions over from the phone but cannot start new work once usage
-  is gone). Note the web hides the model picker entirely for a local session — every alias it could
-  offer is one the gateway refuses.
+- **P2 Local-model mark on session CARDS (XERK-246 remainder).** The two controls are done (see Done
+  above); what's left is the web's 🏠 + warn-colour mark on live and ended session cards, so a
+  glance at the list says which sessions are on the weaker model without opening each one. Read
+  `session.modelSource == "local"`, titled with `modelSourceAt`. Both fields already decode onto
+  `SessionInfo`.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
 - ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
   see Done above; the read-only review itself was XERK-70).
