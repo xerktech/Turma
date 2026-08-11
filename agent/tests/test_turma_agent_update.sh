@@ -777,6 +777,35 @@ for bad in abc -5 0 30.5; do
   fi
 done
 
+# 16l. The poller's interval reaches `sleep` — where 0 is not "no delay" but a
+#      HOT LOOP (a full release check several times a second, rate-limiting the
+#      host against api.github.com), and garbage fails the other way: `sleep abc`
+#      exits and, under set -e, the poller stops auto-updating this host with no
+#      sign it has. Both are sanitised, so neither reaches `sleep`.
+for bad in 0 abc -5; do
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+  echo "0.3.0" >"$prefix/VERSION"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+  FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+    TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_UPDATE_INTERVAL="$bad" \
+    "$bin/turma-agent-update" --loop >"$root/loop.log" 2>&1 &
+  loop_pid=$!
+  sleep 3
+  runs="$(grep -c 'up to date' "$root/loop.log" 2>/dev/null || true)"
+  alive=no; kill -0 "$loop_pid" 2>/dev/null && alive=yes
+  kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+  if [ "${runs:-0}" -le 2 ] && [ "$alive" = yes ]; then
+    pass "TURMA_UPDATE_INTERVAL=$bad neither hot-loops nor kills the poller ($runs run(s) in 3s)"
+  else
+    fail "TURMA_UPDATE_INTERVAL=$bad gave $runs run(s) in 3s, poller alive=$alive"
+  fi
+  rm -rf "$root" "$d"
+done
+
 # --- The --boot rate limit (XERK-254) ----------------------------------------
 # The launcher fires --boot on every start, and systemd's Restart=always makes a
 # crash-looping manager start every 5s. Unthrottled that is a release+registry

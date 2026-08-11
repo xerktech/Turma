@@ -189,7 +189,8 @@ claude_is_npm_managed() {
   command -v npm >/dev/null 2>&1 || return 1
   bounded "${TURMA_NPM_META_TIMEOUT:-30}" npm ls -g --depth=0 "$CLAUDE_PKG" >/dev/null 2>&1 || return 1
   local prefix on_path
-  prefix="$(npm_global_prefix)"
+  ensure_npm_prefix
+  prefix="$NPM_GLOBAL_PREFIX"
   [ -n "$prefix" ] || return 1
   on_path="$(command -v claude 2>/dev/null || true)"
   [ -n "$on_path" ] || return 0   # nothing on PATH yet: npm is who installs it
@@ -205,17 +206,18 @@ claude_is_npm_managed() {
 # under the prefix would otherwise add unbounded time to a start.
 NPM_GLOBAL_PREFIX=""
 NPM_GLOBAL_PREFIX_READ=no
-npm_global_prefix() {
-  if [ "$NPM_GLOBAL_PREFIX_READ" = no ]; then
-    NPM_GLOBAL_PREFIX="$(bounded "${TURMA_NPM_META_TIMEOUT:-30}" npm prefix -g 2>/dev/null || true)"
-    NPM_GLOBAL_PREFIX_READ=yes
-  fi
-  printf '%s' "$NPM_GLOBAL_PREFIX"
+# CALL THIS DIRECTLY, never as `$(...)`. A command substitution runs in a
+# SUBSHELL, so an assignment inside one never reaches the caller: written as a
+# value-returning function, this memo silently did nothing and every caller
+# re-read the prefix. It sets the two globals and prints nothing.
+ensure_npm_prefix() {
+  [ "$NPM_GLOBAL_PREFIX_READ" = yes ] && return 0
+  NPM_GLOBAL_PREFIX="$(bounded "${TURMA_NPM_META_TIMEOUT:-30}" npm prefix -g 2>/dev/null || true)"
+  NPM_GLOBAL_PREFIX_READ=yes
 }
 
 npm_bin_dir() {
-  local p; p="$(npm_global_prefix)"
-  [ -n "$p" ] && printf '%s/bin' "$p"
+  [ -n "$NPM_GLOBAL_PREFIX" ] && printf '%s/bin' "$NPM_GLOBAL_PREFIX"
 }
 
 on_path() {  # <dir>
@@ -225,6 +227,7 @@ on_path() {  # <dir>
 
 npm_install_claude() {
   local gbin lbin
+  ensure_npm_prefix
   gbin="$(npm_bin_dir)"
   lbin="$HOME/.local/bin"   # the prefix install.sh blesses and the launcher exports
 
@@ -352,10 +355,15 @@ update_claude() {
     # Claude Code on this host permanently, on an ordinary condition, with one
     # log line as the evidence.
     if install_claude ""; then
-      if [ -z "$(claude_version)" ]; then
-        safe_write "$CLAUDE_UNPARSEABLE" "$(claude_raw_version)"
-      else
+      # ONE read, not two: every `claude --version` is a bounded call, and the
+      # launcher's floor is the sum of those bounds — so a redundant probe is
+      # not just slow, it raises the worst case the boot has to allow for.
+      local after
+      after="$(claude_raw_version)"
+      if printf '%s' "$after" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
         rm -f "$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+      else
+        safe_write "$CLAUDE_UNPARSEABLE" "$after"
       fi
     else
       logmsg "claude: the repair did not run, so it will be attempted again"
@@ -725,12 +733,18 @@ claude_check() {
 
 main() {
   local loop=no boot=no claude_only=no
+  # `sleep 0` in the poller loop is not "no delay", it is a HOT loop — a full
+  # release check several times a second, which rate-limits the host against
+  # api.github.com. A malformed value is worse in the other direction: `sleep
+  # abc` fails and, under set -e, the poller exits, so the host silently stops
+  # auto-updating. Sanitised for both.
+  INTERVAL="$(num "$INTERVAL" 3600)"
   while [ $# -gt 0 ]; do
     case "$1" in
       --loop) loop=yes ;;
       --boot) boot=yes ;;
       --claude-only) claude_only=yes ;;
-      --interval) shift; INTERVAL="$1" ;;
+      --interval) shift; INTERVAL="$(num "${1:-}" 3600)" ;;
       *) usage ;;
     esac
     shift

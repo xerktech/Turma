@@ -88,6 +88,8 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       looks at leaves claude just as missing, so the next check repairs again, on every start,
       forever; `npm_install_claude` picks npm's global prefix if its bin is on PATH, else the
       `~/.local` the launcher exports, else refuses and says why.
+    - `--loop`'s interval is sanitised too: `sleep 0` is a hot loop against the GitHub API, and
+      `sleep abc` exits the poller under `set -e`, silently ending auto-updates on that host.
     - Unreachable-or-unparseable registry output and installed-ahead-of-published both stay put
       (`sort -V` ranks a non-version ABOVE a semver, so an error line would otherwise read as an
       upgrade). `TURMA_CLAUDE_AUTO_UPDATE=0` pins the host — and so does `TURMA_BOOT_UPDATE=0`,
@@ -110,6 +112,13 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       in the config stops being "no timeout" and becomes "every claude read looks broken, every
       start attempts a futile repair, no check ever runs". `0` reads as the default too — it
       disables `timeout` outright. Shipped default deadline (585s) pinned by a test.
+    - **The floor's multipliers are measured, not read off the source** — shim `timeout` on PATH and
+      count. The worst path is the REPAIR one (4 probes, 2 npm-metadata reads, 1 install = 7
+      invocations, hence 7 graces); reading them off the code gave 585s against a path needing 630s,
+      which would have fired the watchdog mid-install. A test pins the shipped 655s.
+    - **`ensure_npm_prefix` must be called DIRECTLY, never as `$(...)`** — a command substitution is
+      a subshell, so a memo written as a value-returning function silently never memoised and every
+      caller re-read the prefix.
     - Every external call is `timeout -k`-bounded, `npm prefix -g`/`npm ls -g` included and the
       prefix read once per run: the lock is held for the whole run, so one hung child would block every
       later update — including the one shipping the fix — and this runs inside a start.
