@@ -84,6 +84,30 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val cache: CacheSummary = CacheSummary(),
     )
 
+    /** One host's subscription-limit snapshot, ready to render (XERK-247). */
+    data class LimitCard(
+        val host: String,
+        val capturedAt: Long,
+        val fiveHour: LimitView? = null,
+        val sevenDay: LimitView? = null,
+    )
+
+    /**
+     * One window's rendered state. [expired] beats the percentage: when the
+     * snapshot's reset time has passed, the window it measured has rolled over
+     * since, so the old figure describes a window that no longer exists.
+     */
+    data class LimitView(
+        val pct: Double,
+        val expired: Boolean,
+        val pctLabel: String,
+        val reset: String,
+        val level: Level,
+    ) {
+        /** Bar colour band — earned from headroom, not from branding. */
+        enum class Level { NORMAL, WARN, CRIT }
+    }
+
     data class UsageUi(
         val byRepo: List<RepoTotal> = emptyList(),
         val byHost: List<HostTotal> = emptyList(),
@@ -92,6 +116,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val week: Long = 0,
         val total: Long = 0,
         val cache: CacheSummary = CacheSummary(),
+        /** Freshest snapshot first; empty when no host reports any window. */
+        val limits: List<LimitCard> = emptyList(),
     )
 
     companion object {
@@ -122,7 +148,10 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         /** The prompt-side split of a bucket (web `cacheHitRate`'s inputs). */
         fun UsageBucket.cacheSummary() = CacheSummary(cacheRead, cacheWrite, input)
 
-        fun compute(fleet: FleetState): UsageUi {
+        fun compute(
+            fleet: FleetState,
+            nowSec: Long = System.currentTimeMillis() / 1000,
+        ): UsageUi {
             val repoAcc = LinkedHashMap<String, RepoTotal>()
             val modelAcc = LinkedHashMap<String, ModelTotal>()
             val hosts = ArrayList<HostTotal>()
@@ -192,8 +221,82 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 week = week,
                 total = total,
                 cache = cache,
+                limits = limitCards(fleet, nowSec),
             )
         }
+
+        // --- subscription limits (XERK-247) -------------------------------
+        // Ports of usage.html's limitEntries / limitWindowView / fmtDuration.
+        // The web page is the source of truth for this section; keep them in
+        // step (see CLAUDE.md's Web ⇄ Android parity rule).
+
+        /**
+         * Agents refresh on a ~30 min cadence while a session runs, so an hour
+         * without one is the first point at which the numbers deserve a warning.
+         */
+        const val LIMIT_STALE_SEC = 60L * 60L
+
+        /**
+         * Past this the card is dropped, not just coloured. The agent applies the
+         * same rule before reporting, but the hub keeps an OFFLINE host's last
+         * heartbeat for days — without the mirror here, a host that died shows a
+         * frozen 5-hour window (one that has since reset several times over).
+         */
+        const val LIMIT_MAX_AGE_SEC = 24L * 60L * 60L
+
+        /** "45s" / "6m" / "2h 14m" / "2d 2h", as an age or a countdown. */
+        fun fmtDuration(sec: Long): String {
+            val s = maxOf(0L, sec)
+            if (s < 60) return "${s}s"
+            val mins = Math.round(s / 60.0)
+            if (mins < 60) return "${mins}m"
+            val hours = mins / 60
+            if (hours < 24) return "%dh %02dm".format(hours, mins % 60)
+            return "${hours / 24}d ${hours % 24}h"
+        }
+
+        /** One window's rendered state, or null when it carries no percentage. */
+        fun limitView(win: com.xerktech.turma.model.LimitWindow?, nowSec: Long): LimitView? {
+            val raw = win?.usedPct ?: return null
+            val pct = raw.coerceIn(0.0, 100.0)
+            val resetsIn = win.resetsAt?.let { it - nowSec }
+            val expired = resetsIn != null && resetsIn <= 0
+            // Trailing ".0" dropped so a whole percentage reads as "41%".
+            val rounded = Math.round(pct * 10) / 10.0
+            val pctText = if (rounded == Math.floor(rounded)) "${rounded.toInt()}%" else "$rounded%"
+            return LimitView(
+                pct = pct,
+                expired = expired,
+                pctLabel = if (expired) "—" else pctText,
+                reset = when {
+                    resetsIn == null -> ""
+                    expired -> "window has since reset"
+                    else -> "resets in ${fmtDuration(resetsIn)}"
+                },
+                level = when {
+                    pct >= 90 -> LimitView.Level.CRIT
+                    pct >= 75 -> LimitView.Level.WARN
+                    else -> LimitView.Level.NORMAL
+                },
+            )
+        }
+
+        /**
+         * One card per host that reports a usable snapshot, freshest first. A
+         * host reporting none is skipped entirely — an agent too old to send the
+         * field, a login with no subscription windows, or one that hasn't been
+         * probed yet all mean "this host can't tell you", not "0% used" — and so
+         * is one whose snapshot is older than [LIMIT_MAX_AGE_SEC].
+         */
+        fun limitCards(fleet: FleetState, nowSec: Long): List<LimitCard> =
+            fleet.agents.mapNotNull { a ->
+                val lim = a.limits ?: return@mapNotNull null
+                if (nowSec - lim.capturedAt > LIMIT_MAX_AGE_SEC) return@mapNotNull null
+                val five = limitView(lim.fiveHour, nowSec)
+                val seven = limitView(lim.sevenDay, nowSec)
+                if (five == null && seven == null) return@mapNotNull null
+                LimitCard(a.device.ifBlank { a.key }, lim.capturedAt, five, seven)
+            }.sortedByDescending { it.capturedAt }
 
         /** How many days the stacked daily chart shows (web usage.html DAYS_SHOWN). */
         const val DAYS_SHOWN = 30

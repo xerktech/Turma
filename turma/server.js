@@ -1046,6 +1046,41 @@ function normalizeUsage(payload) {
   for (const s of payload.sessions || []) normalizeModelUsage(s && s.usage);
 }
 
+// The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for
+// the same reason the model lists above are: this block is agent-authored and
+// fans out to web, Android and glasses, and the Android client decodes it into
+// TYPED fields — a `usedPct` of "lots" from one buggy host would fail the decode
+// of the WHOLE fleet payload, not just its own card. The agent validates before
+// reporting; this is the boundary that makes one that didn't survivable.
+function normalizeLimits(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const lim = payload.limits;
+  if (!lim || typeof lim !== "object" || Array.isArray(lim)) {
+    if ("limits" in payload) payload.limits = null;
+    return;
+  }
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const out = {};
+  for (const key of ["fiveHour", "sevenDay"]) {
+    const win = lim[key];
+    if (!win || typeof win !== "object") continue;
+    const pct = num(win.usedPct);
+    if (pct === undefined) continue;   // a window with no percentage draws nothing
+    const clean = { usedPct: Math.min(100, Math.max(0, pct)) };
+    const resets = num(win.resetsAt);
+    if (resets !== undefined) clean.resetsAt = resets;
+    out[key] = clean;
+  }
+  const captured = num(lim.capturedAt);
+  if (!Object.keys(out).length || captured === undefined) {
+    payload.limits = null;
+    return;
+  }
+  out.capturedAt = captured;
+  if (typeof lim.source === "string") out.source = lim.source.slice(0, 32);
+  payload.limits = out;
+}
+
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
 // into the host's per-session cache, then bound its memory: drop entries older
 // than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
@@ -1619,9 +1654,9 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "gitSources", "github", "inputMaxChars", "jira", "localModel", "logTail", "memory",
-  "models", "prunes", "repoUsage", "repos", "reposRoot", "sessions",
-  "startedAt", "uploadMaxBytes", "usage",
+  "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
+  "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
+  "sessions", "startedAt", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
 ]);
@@ -3381,6 +3416,7 @@ const server = http.createServer(async (req, res) => {
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
       normalizeUsage(payload);
+      normalizeLimits(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.

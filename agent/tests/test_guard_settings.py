@@ -170,5 +170,32 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         self.assertEqual(allow, [])
 
 
+class TestLimitsSettings(unittest.TestCase):
+    """The separate --settings file the subscription-limits probe launches with
+    (XERK-247)."""
+
+    def test_wires_the_statusline_hook(self):
+        s = ha.build_limits_settings(python_exe="/usr/bin/python3")
+        self.assertEqual(s["statusLine"]["type"], "command")
+        self.assertIn("statusline.py", s["statusLine"]["command"])
+        self.assertIn("/usr/bin/python3", s["statusLine"]["command"])
+
+    def test_session_settings_carry_no_statusline(self):
+        # THE reason the probe exists. Configuring a statusLine makes Claude Code
+        # stop painting the footer's "esc to interrupt" hint, and that hint is
+        # what _busy_from_capture (and tunnel-agent's paneShowsBusy) read to know
+        # a session is working — measured on a 54-column pane mid-stream, busy
+        # detection falls from 53/54 captures to 10/41. Merging these two
+        # settings files would trade every session's status for a usage widget.
+        self.assertNotIn("statusLine", ha.build_guard_settings())
+
+    def test_probe_settings_carry_no_hooks_or_permissions(self):
+        # The probe runs one no-op turn in ~/.turma and is killed; the guard has
+        # nothing to guard there, and inheriting it would be a second place the
+        # guard's rules have to be kept true.
+        s = ha.build_limits_settings()
+        self.assertEqual(set(s), {"statusLine"})
+
+
 if __name__ == "__main__":
     unittest.main()

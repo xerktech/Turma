@@ -134,6 +134,27 @@ which makes an `android/` change part of the same PR) live there.
   across every host it runs on (matched by `remoteKey`); **By host** shows per-host totals.
 - The usage page renders `(root)` as **Root**, folding older agents' `(other)`/`?` in
   (`normRepo`/`repoLabel`).
+- Above the chart it shows the **Claude subscription's 5h/7d windows** (XERK-247) from each agent's
+  `limits` block — the numbers exist only inside Claude Code (see `.claude/rules/agent-usage.md` for
+  how they're captured).
+  - **`normalizeLimits` coerces the block at ingest**, like the per-model usage lists beside it and
+    for the same reason: it fans out to web, Android and glasses, and Android decodes it into TYPED
+    fields, so a `usedPct` of `"lots"` from one buggy host would fail the decode of the WHOLE fleet
+    payload rather than just its own card.
+  - **A card is dropped past `LIMIT_MAX_AGE_SEC`, not just coloured** — the agent applies the same
+    rule before reporting, but the hub keeps an OFFLINE host's last heartbeat for days, so without
+    the client-side mirror a dead host shows a frozen 5-hour window that has since reset many times.
+  - Every card is a **SNAPSHOT, and says so**: it carries "captured <age> ago" (amber past
+    `LIMIT_STALE_SEC`), because a host only refreshes while it's working. Wording is "captured", not
+    "updated" — the header's fleet-wide last-refreshed stamp was removed, and `nav.test.js` guards
+    the page against re-growing one.
+  - **A window whose `resetsAt` has passed renders as `—`, not as its last percentage**
+    (`limitWindowView`'s `expired`): that window has since rolled over, so the stored figure
+    describes one that no longer exists. The bar colours by headroom (75% warn, 90% crit).
+  - A host reporting no window at all gets **no card** — an older agent, a non-subscription login and
+    an unprobed host all mean "can't tell you", never 0% used. The section renders before the
+    chart's empty-state returns, so headroom shows on a fleet that has charted nothing.
+  - Tests: `usage.test.js`, the `limits` heartbeat case in `server.test.js`.
 
 ## Board page (`/board`)
 

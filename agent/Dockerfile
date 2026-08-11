@@ -340,14 +340,15 @@ ENV TURMA_AGENT_VERSION=${TURMA_AGENT_VERSION}
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY hub-agent.py /usr/local/bin/hub-agent.py
 COPY tunnel-agent.js /usr/local/bin/tunnel-agent.js
-# PreToolUse hooks — invoked by claude via the generated --settings file:
-# guard.py (safety guard over Bash) and ask.py (AskUserQuestion → glasses
-# bridge). Resolved as hooks/<name>.py next to hub-agent.py.
+# Hooks invoked by claude via a generated --settings file: guard.py (PreToolUse
+# safety guard over Bash) and ask.py (AskUserQuestion → glasses bridge) for
+# sessions, statusline.py (subscription limit capture) for the limits probe
+# only. Resolved as hooks/<name>.py next to hub-agent.py.
 COPY hooks/ /usr/local/bin/hooks/
 COPY tmux.conf /etc/tmux.conf
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py \
       /usr/local/bin/tunnel-agent.js /usr/local/bin/hooks/guard.py \
-      /usr/local/bin/hooks/ask.py
+      /usr/local/bin/hooks/ask.py /usr/local/bin/hooks/statusline.py
 
 # No baked repo WORKDIR anymore: this is ONE container per host that scans
 # REPOS_ROOT for repos and multiplexes N worktree-backed sessions. A neutral

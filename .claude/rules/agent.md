@@ -314,47 +314,11 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   to enrich the announcement (`reason:"update"`); a container update leaves no file and announces
   `reason:"restart"`. Next boot clears a stale flag. Tests: `TestUpdatingAnnounce`.
 
-## Usage aggregates and the attribution ledger
+## Usage aggregates, ledger and subscription limits
 
-- The heartbeat carries **usage aggregates independent of the live registry** — per-repo
-  `repoUsage[]` and host-level `usage`, from re-parsing *every* known transcript
-  (`repo_usage_report()`). Each entry carries a `remoteKey` (`normalize_remote()`) so the hub can
-  unify a repo across hosts.
-- The per-model breakdown **excludes `<synthetic>`** (and any `<...>` model): Claude Code stamps
-  fabricated entries with that model and an all-zero usage block, so `_accumulate_usage` keeps them
-  out of `acc.models`, else the usage page lists a phantom model that ran nothing. Their tokens
-  still fold into the grand totals. Mirrors `_scan_model_entry`'s guard.
-- A durable worktree→{repo, remote, slug} **attribution ledger** (`~/.turma/repo-usage.json`) keeps
-  a transcript traceable after its session and worktree are gone, so **usage history survives
-  kill/delete/prune**. Written at spawn (`_remember_usage`), backfilled from registry/closed
-  history, reconciled each usage beat by `_reconcile_orphan_transcripts()`, pruned only when a
-  transcript dir disappears. `repo_usage_report()` folds only slugs the ledger names, so
-  **reconciliation is what makes it cover every transcript on disk**.
-- Orphans are adopted best-effort in order: (1) exact repo + git origin when the worktree exists;
-  (2) the repo from the worktree-shaped slug; (3) the repo from the transcript's recorded `cwd`
-  (`_repo_from_transcript_cwd`); (4) the root bucket (`ROOT_REPO_NAME`) — **there is no "(other)"
-  bucket**.
-- **A derived name (case 2/3) only stands when it names a repo this host scans** (XERK-147): both
-  heuristics are lossy and unvalidated they mint phantom repos. `_sanitize_junk_repo_entries`
-  retires persisted junk the same way each beat (a stored name stands only with a recorded git
-  remote or a scanned repo), and is a **no-op when the repo scan is empty** so an unreadable
-  `REPOS_ROOT` can't fold real history into root.
-- **No real session is excluded.** The one carve-out is the manager's OWN internal `claude -p`
-  helpers (naming, triage, models probe), which run with `cwd=REGISTRY_DIR` yet write into the
-  shared projects dir — else the reconciler adopts the agent's overhead as a phantom repo (XERK-27).
-  `_is_internal_tool_slug` knows them by the registry dir's slug, or a harness's temp slug via
-  `INTERNAL_TOOL_PROMPT_SIGS`; the models probe's prompt is a slash command (which
-  `_first_user_text` skips) so it goes by `_first_command_name` = `/model`. Such a slug is
-  **tombstoned** (`{internal:true}`); `_sanitize_internal_tool_entries` retires entries earlier
-  builds adopted.
-  - **But the `REPOS_ROOT` slug is never `internal`**: the check reads only the newest transcript,
-    and a root session where the operator typed only `/model` reads exactly like the models probe.
-    The sanitizer lifts such a tombstone.
-- **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs), so
-  reconciliation *intentionally* widens archival too — decouple them only if the scopes should
-  diverge.
-- Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android
-  `UsageViewModelTest`.
+See `.claude/rules/agent-usage.md` — the per-repo/host token aggregates, the worktree→repo
+attribution ledger that outlives a session, and the subscription-limit snapshot plus the probe that
+captures it. All of it lives in `hub-agent.py` and `hooks/statusline.py`.
 
 ## Board sources, triage and ticket sessions
 

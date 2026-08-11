@@ -1,11 +1,12 @@
-// Unit tests for the Usage page's token cells (public/usage.html): the cache
-// read/write split and the hit rate that says whether sessions on a repo are
-// re-paying for the same prompt prefix instead of reading it back from cache.
+// Unit tests for the Usage page's pure helpers (public/usage.html): the token
+// cells — the cache read/write split and the hit rate that says whether sessions
+// on a repo are re-paying for the same prompt prefix instead of reading it back
+// from cache — and the subscription-limit snapshot readers beneath them.
 // node:test, no npm — matches this package's zero-dependency stance. There's no
 // jsdom here, so the page's real inline <script> is loaded into a minimal DOM
 // shim (the same trick sessions.test.js uses) and the pure helpers are returned
-// out of the sandbox; only tokenCell/cacheSubLine/cacheHitRate are exercised, so
-// the shim only has to be complete enough for the page's boot to not throw.
+// out of the sandbox; only those helpers are exercised, so the shim only has to
+// be complete enough for the page's boot to not throw.
 
 "use strict";
 
@@ -80,7 +81,8 @@ function loadHelpers() {
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
-  const body = `${script}\n;return { tokenCell, cacheSubLine, cacheHitRate, blankBucket };`;
+  const body = `${script}\n;return { tokenCell, cacheSubLine, cacheHitRate, blankBucket,
+    limitEntries, limitWindowView, fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC };`;
   return new Function(...keys, body)(...keys.map((k) => stubs[k]));
 }
 
@@ -162,4 +164,99 @@ test("tokenCell keeps the caller's column class alongside the cache line", () =>
   const td = H.tokenCell(bucket({ input: 1, cacheRead: 9 }), "total-col");
   assert.match(td, /class="total-col"/);
   assert.match(td, /90% hit/);
+});
+
+// --- subscription limits (XERK-247) -----------------------------------------
+// The 5h/7d windows arrive as a snapshot per host, not as live numbers, so the
+// tests below are mostly about what the page does with an OLD one.
+
+const NOW = 1_786_400_000; // epoch seconds, fixed so countdowns are assertable
+
+test("limitEntries skips a host that reports no limits at all", () => {
+  // An agent too old to send the field, a login with no subscription windows,
+  // and one whose block carries neither window all mean the same thing: this
+  // host can't tell you. None of them is a card with zeroes in it.
+  const entries = H.limitEntries([
+    { device: "old-host" },
+    { device: "api-key-host", limits: null },
+    { device: "empty-host", limits: { capturedAt: NOW } },
+    // A window with a reset time but no percentage draws nothing, so it is not
+    // a card — it would render as a host name with no rows under it.
+    { device: "no-pct-host", limits: { capturedAt: NOW, fiveHour: { resetsAt: NOW + 60 } } },
+    { device: "real-host", limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
+  ], NOW);
+  assert.deepEqual(entries.map((e) => e.host), ["real-host"]);
+});
+
+test("limitEntries drops a snapshot too old to describe the current windows", () => {
+  // The agent refuses to report one this old, but the hub keeps an OFFLINE
+  // host's last heartbeat for days — so without this the page shows a dead
+  // host's frozen 5-hour window (one that has since reset many times over).
+  const entries = H.limitEntries([
+    { device: "died-yesterday",
+      limits: { capturedAt: NOW - H.LIMIT_MAX_AGE_SEC - 60, fiveHour: { usedPct: 40 } } },
+    { device: "stale-but-usable",
+      limits: { capturedAt: NOW - H.LIMIT_MAX_AGE_SEC + 60, fiveHour: { usedPct: 40 } } },
+  ], NOW);
+  assert.deepEqual(entries.map((e) => e.host), ["stale-but-usable"]);
+});
+
+test("limitEntries puts the freshest snapshot first", () => {
+  const entries = H.limitEntries([
+    { device: "stale", limits: { capturedAt: NOW - 9000, sevenDay: { usedPct: 1 } } },
+    { device: "fresh", limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 2 } } },
+  ], NOW);
+  assert.deepEqual(entries.map((e) => e.host), ["fresh", "stale"]);
+});
+
+test("limitEntries falls back to the agent key when a host has no device name", () => {
+  const entries = H.limitEntries([
+    { key: "unnamed-1", limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
+  ], NOW);
+  assert.equal(entries[0].host, "unnamed-1");
+});
+
+test("limitWindowView reports the percentage and the countdown to reset", () => {
+  const v = H.limitWindowView({ usedPct: 23.5, resetsAt: NOW + 2 * 3600 + 14 * 60 }, NOW);
+  assert.equal(v.pctLabel, "23.5%");
+  assert.equal(v.reset, "resets in 2h 14m");
+  assert.equal(v.expired, false);
+  assert.equal(v.level, "");
+});
+
+test("limitWindowView colours the bar by headroom, not by branding", () => {
+  assert.equal(H.limitWindowView({ usedPct: 74 }, NOW).level, "");
+  assert.equal(H.limitWindowView({ usedPct: 75 }, NOW).level, "warn");
+  assert.equal(H.limitWindowView({ usedPct: 90 }, NOW).level, "crit");
+});
+
+test("limitWindowView stops believing a window whose reset has already passed", () => {
+  // The snapshot describes a window that no longer exists — showing its last
+  // percentage would be presenting a stale number as the current balance.
+  const v = H.limitWindowView({ usedPct: 88, resetsAt: NOW - 60 }, NOW);
+  assert.equal(v.expired, true);
+  assert.equal(v.pctLabel, "—");
+  assert.equal(v.reset, "window has since reset");
+});
+
+test("limitWindowView renders a window that reports no reset time", () => {
+  const v = H.limitWindowView({ usedPct: 12 }, NOW);
+  assert.equal(v.pctLabel, "12%");
+  assert.equal(v.reset, "");
+  assert.equal(v.expired, false);
+});
+
+test("limitWindowView has nothing to draw without a percentage", () => {
+  assert.equal(H.limitWindowView({ resetsAt: NOW + 60 }, NOW), null);
+  assert.equal(H.limitWindowView(null, NOW), null);
+});
+
+test("fmtDuration reads as an age or a countdown at every scale", () => {
+  assert.equal(H.fmtDuration(0), "0s");
+  assert.equal(H.fmtDuration(45), "45s");
+  assert.equal(H.fmtDuration(6 * 60), "6m");
+  assert.equal(H.fmtDuration(2 * 3600 + 14 * 60), "2h 14m");
+  assert.equal(H.fmtDuration(50 * 3600), "2d 2h");
+  // A clock skew that puts the snapshot in the future must not print "-3m ago".
+  assert.equal(H.fmtDuration(-90), "0s");
 });

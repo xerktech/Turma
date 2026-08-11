@@ -45,6 +45,7 @@ import html
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -991,6 +992,13 @@ def ask_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
 
 
+def statusline_script_path():
+    """Absolute path to the bundled subscription-limits statusLine hook
+    (``hooks/statusline.py``), resolved the same way as ``guard_script_path``."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks",
+                        "statusline.py")
+
+
 # The ask.py bridge blocks the AskUserQuestion tool call while it waits for the
 # glasses answer, so its Claude-Code hook timeout must comfortably exceed the
 # bridge's own per-question block (TURMA_QUESTION_TIMEOUT_SEC, default 600) or
@@ -1042,6 +1050,35 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
                     }],
                 },
             ]
+        },
+    }
+
+
+def build_limits_settings(python_exe=None, statusline_path=None):
+    """Build the dict passed to ``claude --settings`` by the LIMITS PROBE alone
+    (XERK-247): a ``statusLine`` command wired to ``hooks/statusline.py``, which
+    records the login's 5-hour and 7-day subscription windows out of the blob
+    Claude Code hands every status line.
+
+    **This must never be merged into a session's settings.** Configuring a
+    statusLine makes Claude Code stop painting the footer's ``esc to interrupt``
+    hint, and that hint is what `_busy_from_capture` (and tunnel-agent's
+    `paneShowsBusy`) read to know a session is working. Measured on a 54-column
+    pane mid-stream, busy detection falls from 53/54 captures to 10/41 — the
+    XERK-130 defect, on every session on the host, in exchange for a usage
+    widget. So the statusLine lives on a throwaway probe whose pane nothing
+    parses, and real sessions keep the hint.
+
+    No hooks and no permissions here either: the probe runs one trivial turn and
+    is killed, so the guard has nothing to guard.
+    """
+    python_exe = python_exe or sys.executable or "python3"
+    statusline_path = statusline_path or statusline_script_path()
+    return {
+        "statusLine": {
+            "type": "command",
+            "command": f'"{python_exe}" "{statusline_path}"',
+            "padding": 0,
         },
     }
 
@@ -1810,6 +1847,147 @@ def repo_usage_report(ledger, fold_slug):
     host_usage = _finalize_usage(host) if host.sessions else None
     repo_usage.sort(key=lambda r: _total_tokens(r["usage"]["totals"]), reverse=True)
     return repo_usage, host_usage
+
+
+# --- subscription limit snapshot (XERK-247) ---------------------------------
+#
+# Token usage above is what THIS host spent; the limits below are how much of
+# the Claude subscription's 5-hour and 7-day windows is gone — a single pool
+# shared across claude.ai, Claude Code and every other surface, with no API
+# behind it (the Usage & Cost API is org-scoped, admin-keyed, and reports API
+# spend instead). Claude Code hands the numbers to a `statusLine` command and
+# nowhere else, so hooks/statusline.py captures them into this file and the beat
+# folds the file onto the heartbeat.
+#
+# The write is out-of-band (a probe process, see _start_limits_probe) and the
+# read is a plain file read, which is what keeps the ingest one-directional: the
+# agent never holds a credential for this and the hub never sees anything but
+# the two percentages.
+LIMITS_PATH = os.environ.get("TURMA_LIMITS_PATH") or os.path.join(
+    REGISTRY_DIR, "limits.json")
+LIMITS_SETTINGS_PATH = os.path.join(REGISTRY_DIR, "limits-settings.json")
+# A snapshot older than this is not reported at all. The UI ages what it gets
+# and marks it stale on its own (capturedAt rides along), but a snapshot from
+# last week describes a window that has since reset several times over — it is
+# not stale data, it is wrong data.
+LIMITS_MAX_AGE_SEC = int(os.environ.get("TURMA_LIMITS_MAX_AGE_SEC", "86400") or 86400)
+LIMITS_WINDOW_KEYS = ("fiveHour", "sevenDay")
+# The snapshot is a couple of hundred bytes; anything near this is not one.
+LIMITS_MAX_BYTES = 64 << 10
+# Bounds on the two timestamps. `EPOCH_MAX` (year ~5138) keeps a wild number
+# away from int() and away from clients that type these as a 64-bit integer;
+# `RESET_HORIZON` keeps a reset time near the windows it can describe (5 hours
+# and 7 days); `FUTURE_SKEW` allows ordinary clock drift on capturedAt but not a
+# stamp that would never age.
+LIMITS_EPOCH_MAX = 10 ** 11
+LIMITS_RESET_HORIZON_SEC = 60 * 86400
+LIMITS_FUTURE_SKEW_SEC = 300
+
+
+# The last problem logged about the snapshot file. read_limits_snapshot runs on
+# EVERY beat, so a file that stays broken would otherwise repeat its complaint
+# every TURMA_INTERVAL seconds, forever, into a log tail that rides the
+# heartbeat. Say each distinct problem once; a changed one is news again.
+_limits_last_problem = None
+
+
+def _log_limits_problem(msg):
+    global _limits_last_problem
+    if msg != _limits_last_problem:
+        _limits_last_problem = msg
+        log(msg)
+
+
+def _finite_epoch(value, limit):
+    """A finite epoch-second number as an int, or None. `limit` bounds the
+    magnitude, so `1e308`, `NaN` and `inf` never reach `int()` — which RAISES on
+    the last two, and `int()` on a float that large yields a number no client can
+    render (a Kotlin `Long` field can't even decode it)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if abs(value) > limit:
+        return None
+    return int(value)
+
+
+def read_limits_snapshot(path=None, now=None, max_age=None):
+    """The heartbeat's `limits` block, read from the snapshot file — or None when
+    there is no usable one (no file, unreadable, unparseable, no window, or a
+    timestamp that makes the numbers meaningless).
+
+    Re-validated field by field rather than passed through, and **this function
+    never raises**: it is called on the heartbeat's critical path, the file is
+    written by a separate process from a shape Claude Code owns and may change,
+    and `~/.turma` is not in the guard's deny list — so any session on the host
+    can put anything there. An exception escaping here would take the beat loop,
+    and with it the host, down on every restart until someone deleted the file.
+
+    `capturedAt` is carried as the epoch second the hook stamped, so staleness is
+    measured against the READING clock on each surface rather than against the
+    agent's idea of now."""
+    path = path or LIMITS_PATH
+    now = int(now if now is not None else time.time())
+    max_age = LIMITS_MAX_AGE_SEC if max_age is None else max_age
+    try:
+        # The READ is bounded, not just the file's stat: the snapshot is a couple
+        # of hundred bytes, and `json.load` on a path pointed at something
+        # enormous is an unbounded allocation on the beat loop. A stat-only check
+        # wouldn't do — /dev/zero reports st_size 0 and then hands over bytes
+        # forever, which OOM-kills the agent.
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(LIMITS_MAX_BYTES + 1)
+        if len(text) > LIMITS_MAX_BYTES:
+            _log_limits_problem(
+                f"limits snapshot at {path} is implausibly large; ignoring it")
+            return None
+        raw = json.loads(text)
+        if not isinstance(raw, dict):
+            return None
+        captured = _finite_epoch(raw.get("capturedAt"), LIMITS_EPOCH_MAX)
+        if captured is None:
+            return None
+        if max_age and captured < now - max_age:
+            return None
+        # A snapshot stamped in the future would read as freshly captured
+        # forever, so it never goes stale in any UI. A little skew is ordinary
+        # (the writer's clock, or a beat that crosses a second); a lot is a
+        # broken or hostile stamp.
+        if captured > now + LIMITS_FUTURE_SKEW_SEC:
+            return None
+        out = {}
+        for key in LIMITS_WINDOW_KEYS:
+            win = raw.get(key)
+            if not isinstance(win, dict):
+                continue
+            clean = {}
+            pct = win.get("usedPct")
+            if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
+                    and not (isinstance(pct, float) and not math.isfinite(pct))):
+                clean["usedPct"] = round(min(100.0, max(0.0, float(pct))), 1)
+            # A reset time is only meaningful near now — these windows are 5
+            # hours and 7 days long. An absurd one renders as an absurd
+            # countdown ("resets in 1.15e+303d"), so drop the field and let the
+            # UI show the percentage alone.
+            resets = _finite_epoch(win.get("resetsAt"), LIMITS_EPOCH_MAX)
+            if resets is not None and abs(resets - now) <= LIMITS_RESET_HORIZON_SEC:
+                clean["resetsAt"] = resets
+            if "usedPct" in clean:  # a reset time with no percentage draws nothing
+                out[key] = clean
+        if not out:
+            return None
+        out["capturedAt"] = captured
+        out["source"] = "statusline"
+        return out
+    except FileNotFoundError:
+        # The ordinary state on a host that hasn't probed yet (and forever on one
+        # whose login has no windows). Silent: this runs every beat, and the log
+        # tail rides the heartbeat to the hub.
+        return None
+    except Exception as e:
+        _log_limits_problem(f"limits snapshot at {path} unreadable ({e}); ignoring it")
+        return None
 
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
@@ -7763,6 +7941,11 @@ SUMMARY_INSTRUCTION = (
 INTERNAL_TOOL_PROMPT_SIGS = (
     "You are triaging Jira tickets",
     "In 2-4 words, give a Title Case name",
+    # The subscription-limits probe (XERK-247). Load-bearing wherever `~/.turma`
+    # is a symlink: claude resolves the path before slugifying it, so the
+    # transcript lands under the RESOLVED dir's slug and the direct
+    # REGISTRY_DIR match in _is_internal_tool_slug can't fire.
+    "turma limits probe",
 )
 
 
@@ -7790,6 +7973,37 @@ def _looks_like_internal_tool_prompt(text):
 # login, cwd=REGISTRY_DIR so its transcript is tombstoned as internal overhead —
 # see _is_internal_tool_slug, which also recognizes it by its command name in a
 # harness's foreign REGISTRY_DIR slug).
+# The limits probe (XERK-247): a throwaway interactive claude whose only job is
+# to make Claude Code populate `rate_limits` for hooks/statusline.py to capture.
+# It is a real turn against the subscription, so everything here is sized to make
+# that turn as small as one can be — the cheapest model, a one-line system prompt
+# replacing the default one, and an answer of one word.
+LIMITS_TMUX = "turma-limits"                 # its own tmux; no session parses it
+LIMITS_PROBE_SYSTEM_PROMPT = "You are a no-op probe. Reply with exactly: ok"
+# Distinctive on purpose. `~/.turma` is a SYMLINK on some hosts, so claude writes
+# the probe's transcript under the resolved path's slug and
+# _is_internal_tool_slug's direct REGISTRY_DIR match never fires; the fallback
+# then has to recognise this by its first user text, and a bare "ok" would also
+# match a real session that opened with "ok". See INTERNAL_TOOL_PROMPT_SIGS.
+LIMITS_PROBE_PROMPT = "turma limits probe: reply ok"
+LIMITS_PROBE_MODEL = (os.environ.get("TURMA_LIMITS_PROBE_MODEL", "haiku").strip()
+                      or "haiku")
+# How stale a snapshot may get before a running host spends another probe.
+# 0 disables the probe entirely (the Usage page then shows its empty state, or
+# whatever a hand-wired statusLine last left in the snapshot file).
+LIMITS_PROBE_SEC = int(os.environ.get("TURMA_LIMITS_PROBE_SEC", "1800") or 0)
+LIMITS_PROBE_TIMEOUT_SEC = int(
+    os.environ.get("TURMA_LIMITS_PROBE_TIMEOUT_SEC", "120") or 120)
+# Backoff after a probe that captured nothing, doubling to the cap. The failure
+# that matters is the PERMANENT one — a login with no subscription windows can
+# never produce a snapshot, and without a backoff that host spends a real turn
+# every beat forever, chasing a number it will never have.
+LIMITS_PROBE_RETRY_SEC = int(
+    os.environ.get("TURMA_LIMITS_PROBE_RETRY_SEC", "900") or 900)
+LIMITS_PROBE_MAX_BACKOFF_SEC = int(
+    os.environ.get("TURMA_LIMITS_PROBE_MAX_BACKOFF_SEC", "21600") or 21600)
+LIMITS_PROBE_TRUST_SEC = 4  # let the TUI paint before answering its trust dialog
+
 MODEL_PROBE_PROMPT = "/model"
 MODELS_REFRESH_EVERY = int(os.environ.get("TURMA_MODELS_REFRESH_EVERY", "1080")
                            or 1080)   # beats (~6h at the 20s interval)
@@ -12479,6 +12693,185 @@ class SessionManager:
         elif raw is not None:
             log("models probe output unparseable; keeping previous list")
 
+    # --- subscription limits probe (XERK-247) -------------------------------
+
+    def _ensure_limits_settings(self):
+        """Write (once per manager) the ``--settings`` file the limits probe
+        launches with, returning its path — or None if it couldn't be written,
+        in which case the probe is skipped (a probe with no statusLine captures
+        nothing, so there is no degraded mode worth launching)."""
+        cached = getattr(self, "_limits_settings_path", None)
+        if cached and os.path.exists(cached):
+            return cached
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            with open(LIMITS_SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump(build_limits_settings(), fh, indent=2)
+        except OSError as e:
+            log(f"limits settings write failed ({e}); skipping the limits probe")
+            return None
+        self._limits_settings_path = LIMITS_SETTINGS_PATH
+        return LIMITS_SETTINGS_PATH
+
+    def _limits_probe_due(self):
+        """Whether to spend a probe this beat.
+
+        Three gates, all about not paying for a number that cannot have moved.
+
+        With one snapshot in hand we probe only when it has aged past
+        LIMITS_PROBE_SEC **and** a session is actually running: the windows are a
+        shared pool, but this host only pushes them while it's working, and a
+        settled host re-probing all night would burn the very quota it reports.
+        A snapshot nothing refreshes goes stale in the UI, which is the honest
+        rendering of "nobody has asked Claude anything here in a while".
+
+        With NO snapshot the backoff is what bounds the cost, and it has to,
+        because a host that can never produce one is a normal outcome, not a
+        failure: an API-key/Bedrock/Vertex login has no subscription windows, so
+        every probe times out having spent a real turn. Unbounded, that is a turn
+        every beat, forever. Each failure doubles the wait to
+        LIMITS_PROBE_MAX_BACKOFF_SEC; a success resets it."""
+        if not LIMITS_PROBE_SEC:
+            return False
+        waited = time.time() - getattr(self, "_limits_probe_at", 0)
+        if waited < getattr(self, "_limits_probe_backoff", 0):
+            return False
+        snap = read_limits_snapshot()
+        if not snap:
+            return True
+        if time.time() - snap.get("capturedAt", 0) < LIMITS_PROBE_SEC:
+            return False
+        return any(s.get("status") == "running" for s in self.registry)
+
+    def _limits_probe_outcome(self, ok):
+        """Record a finished probe: a success clears the backoff, a failure
+        doubles it (from LIMITS_PROBE_RETRY_SEC, capped)."""
+        if ok:
+            self._limits_probe_backoff = 0
+            return
+        prev = getattr(self, "_limits_probe_backoff", 0)
+        self._limits_probe_backoff = min(
+            LIMITS_PROBE_MAX_BACKOFF_SEC,
+            LIMITS_PROBE_RETRY_SEC if not prev else prev * 2)
+        log(f"limits probe failed; next attempt in ~{self._limits_probe_backoff}s")
+
+    def _start_limits_probe(self):
+        """Run the limits probe on a daemon thread, single-flight.
+
+        Unlike the summary/models helpers this can't be a `claude -p` reaped on
+        the beat: print mode never invokes a statusLine (verified), so the probe
+        has to be a real interactive claude on a TTY — hence tmux — and it needs
+        a keypress and a poll for the snapshot to land, which is a few seconds of
+        waiting the heartbeat loop must not do. Nothing outside the thread is
+        mutated: the thread drives tmux and the hook writes the file, while the
+        beat only ever READS that file."""
+        thread = getattr(self, "_limits_probe", None)
+        if thread is not None and thread.is_alive():
+            return
+        settings = self._ensure_limits_settings()
+        if not settings:
+            self._limits_probe_outcome(False)
+            return
+        # Stamped BEFORE the thread starts, so the backoff also spaces attempts
+        # that die without reaching _limits_probe_outcome.
+        self._limits_probe_at = time.time()
+        self._limits_probe = threading.Thread(
+            target=self._run_limits_probe, args=(settings,),
+            name="limits-probe", daemon=True)
+        self._limits_probe.start()
+
+    def _run_limits_probe(self, settings):
+        """The probe, start to finish: launch a throwaway claude, let one turn
+        land so Claude Code populates `rate_limits`, wait for hooks/statusline.py
+        to write the snapshot, and kill it.
+
+        Kept as cheap as a turn can be — the cheapest model, a one-line system
+        prompt in place of the default one, no MCP servers, a one-word answer —
+        because it is billed against the very windows it measures. Measured at
+        ~36k tokens (nearly all of it prompt cache) and ~15s.
+
+        **`--model` is a request, not a guarantee**: it sets the session's model
+        (the statusLine payload reports haiku at launch), but on a login whose
+        routing picks per turn, the turn itself is answered by whatever that
+        routing chooses — every interactive run measured here came back
+        `claude-sonnet-5`. Nothing to fix agent-side; it means the cost figure is
+        the one above, not a Haiku one. cwd is REGISTRY_DIR, which
+        is what keeps its transcript off the usage page (`_is_internal_tool_slug`
+        tombstones the registry dir's slug), and plan mode plus a prompt with
+        nothing to do keeps it from touching a repo."""
+        started = int(time.time())
+        # It measures the SUBSCRIPTION's windows, so it must run against the
+        # mounted ~/.claude login — never the local-model failover's endpoint
+        # (XERK-246), which has no such windows and would make every probe time
+        # out. That holds because the failover's credentials are SOURCED into one
+        # session's launch line, never exported process-wide; this command
+        # deliberately sources nothing.
+        parts = [
+            # hooks/statusline.py resolves its own default path, which would be
+            # the right one anyway — but only if it inherits this process's
+            # environment through tmux AND claude. Pinned as a shell assignment
+            # (like _launch_tmux's ask-bridge vars) so the hook writes exactly
+            # where read_limits_snapshot reads, override included.
+            f"TURMA_LIMITS_PATH={shlex.quote(LIMITS_PATH)}",
+            "claude",
+            f"--settings {shlex.quote(settings)}",
+            f"--model {shlex.quote(LIMITS_PROBE_MODEL)}",
+            "--permission-mode plan",
+            # The operator's MCP servers would be loaded (and their tool
+            # definitions billed) for a turn that uses none of them.
+            "--strict-mcp-config",
+            f"--system-prompt {shlex.quote(LIMITS_PROBE_SYSTEM_PROMPT)}",
+            f"-- {shlex.quote(LIMITS_PROBE_PROMPT)}",
+        ]
+        self._kill_limits_probe()  # clean slate
+        rc, err = run_ok([
+            "tmux", "new-session", "-d", "-s", LIMITS_TMUX,
+            "-c", REGISTRY_DIR, "-x", "80", "-y", "24", " ".join(parts),
+        ])
+        if rc != 0:
+            log(f"limits probe launch failed: {err}")
+            self._limits_probe_outcome(False)
+            return
+        ok = False
+        try:
+            # One Enter, once: a directory claude has never been trusted in
+            # opens a "do you trust this folder" dialog whose default is Yes, and
+            # nothing else happens until it's answered — the turn never runs, so
+            # the snapshot never lands. On an already-trusted dir this presses
+            # Enter on an empty composer, which does nothing.
+            time.sleep(LIMITS_PROBE_TRUST_SEC)
+            run(["tmux", "send-keys", "-t", LIMITS_TMUX, "Enter"])
+            deadline = time.time() + LIMITS_PROBE_TIMEOUT_SEC
+            while time.time() < deadline:
+                time.sleep(1)
+                snap = read_limits_snapshot()
+                if snap and snap.get("capturedAt", 0) >= started:
+                    ok = True
+                    log("limits probe: 5h "
+                        f"{(snap.get('fiveHour') or {}).get('usedPct')}%, 7d "
+                        f"{(snap.get('sevenDay') or {}).get('usedPct')}%")
+                    return
+            # A login with no subscription windows (API key, Bedrock/Vertex) never
+            # populates rate_limits, so this is a normal outcome on such a host,
+            # not an error — it just means the Usage page keeps its empty state,
+            # and the backoff keeps that host from paying for a turn per beat.
+            log("limits probe: no rate limits reported before the timeout")
+        finally:
+            self._kill_limits_probe()
+            self._limits_probe_outcome(ok)
+
+    def _kill_limits_probe(self):
+        """Tear down the probe's tmux (and the claude inside it). Idempotent.
+
+        Called from the probe's own `finally`, from the shutdown handler and at
+        boot, because the `finally` is NOT enough on its own: the probe runs on a
+        daemon thread, whose `finally` never runs when the interpreter exits, and
+        tmux outlives the manager by design. A restart mid-probe (the native
+        updater does exactly that) would otherwise leave an interactive claude
+        sitting in a detached tmux until some later probe's clean-slate kill —
+        up to LIMITS_MAX_AGE_SEC away on an idle host."""
+        run(["tmux", "kill-session", "-t", LIMITS_TMUX])
+
     def models_available(self):
         """The probed alias list, or () before the first successful probe —
         the `extra` allowlist resolve_model/set_model accept beyond the static
@@ -12685,6 +13078,11 @@ class SessionManager:
                 time.sleep(LAUNCH_STAGGER)  # stagger shared-login contention
             except Exception as e:
                 self._set_error(sess, e)
+        # A limits probe the previous manager was running when it died is NOT a
+        # session and is never adopted: its tmux holds an interactive claude
+        # nothing is waiting on. Reaped here so a crash mid-probe can't leave one
+        # sitting until the next probe happens to be due.
+        self._kill_limits_probe()
         self.save()
 
     # --- command handling (heartbeat reply) -------------------------------
@@ -13624,6 +14022,11 @@ class SessionManager:
                 self.models_info is None and beat % MODELS_RETRY_EVERY == 0)):
             self._start_models_probe()
         self._poll_models_probe()
+        # Refresh the subscription's 5h/7d limit snapshot when it's due (see
+        # _limits_probe_due for what "due" costs). The probe runs on its own
+        # thread; this beat reports whatever snapshot is already on disk.
+        if not light and self._limits_probe_due():
+            self._start_limits_probe()
         # Apply model switches deferred while their session was mid-turn.
         if not light:
             try:
@@ -13691,6 +14094,13 @@ class SessionManager:
             # host's merged total. Survives kill/delete/prune.
             "repoUsage": self.repo_usage,
             "usage": self.host_usage,
+            # How much of the Claude SUBSCRIPTION's 5-hour and 7-day windows is
+            # gone (XERK-247) — a different question from the token counts above,
+            # and one only Claude Code can answer (hooks/statusline.py captures
+            # it; read_limits_snapshot validates it). None on a host whose login
+            # has no such windows or hasn't been probed yet, which the clients
+            # read as "this agent can't tell you", never as "0% used".
+            "limits": read_limits_snapshot(),
             # GitHub clone-into-root: availability + clonable repos for the hub's
             # clone control, and any in-flight/recent clone jobs.
             "github": self.github,
@@ -13863,6 +14273,10 @@ class SessionManager:
         the whole stack down, which is exactly the outage this status explains."""
         reason, version = self._read_updating_flag()
         self._announce_updating(reason or "restart", version)
+        # A probe in flight is on a daemon thread, whose `finally` will NOT run
+        # through this exit — so its tmux (and the claude in it) is reaped here
+        # instead. Sessions are deliberately left alone; this is only ours.
+        self._kill_limits_probe()
         raise SystemExit(0)
 
     def run_forever(self):

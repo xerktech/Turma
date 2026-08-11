@@ -452,6 +452,12 @@ those are marked `[MODEL]`.
   `UsageRow` and the headline stat row, since Android has no table view yet (the P1 above). The
   `CacheSummary` reducer is `UsageViewModel`'s, tested against the same vectors as the web's
   `cacheHitRate` (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`).
+- The **subscription limits section** (XERK-247) is at parity: one card per host reporting the 5h/7d
+  windows, each with the percentage used, a headroom-coloured bar, the countdown to reset, and the
+  "captured <age> ago" stamp that goes amber once stale. `limitCards`/`limitView`/`fmtDuration` are
+  ports of the web's `limitEntries`/`limitWindowView`/`fmtDuration`, tested case for case
+  (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`). Platform difference: the web lays the cards
+  out in a wrapping flex row, Android stacks them at the top of the usage list.
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
 ### Nav / Login
