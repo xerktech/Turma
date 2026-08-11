@@ -6635,9 +6635,12 @@ def _azure_states(site_key, project, wtype):
     _azure_category silently fell back to the static name map (XERK-250). The
     older spelling is still tolerated, but `category` is the contract."""
     def load():
+        # safe="" so a "/" in either segment can't extend the path. Both are
+        # read off ADO's OWN work-item response and ADO forbids "/" in a project
+        # or type name, so this is belt-and-braces, not a live hole.
         data = azure_req(
-            f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
-            f"{urllib.parse.quote(wtype)}/states", {})
+            f"/{urllib.parse.quote(project, safe='')}/_apis/wit/workItemTypes/"
+            f"{urllib.parse.quote(wtype, safe='')}/states", {})
         out = []
         for s in data.get("value") or []:
             name = str(s.get("name") or "").strip()
@@ -6663,21 +6666,30 @@ def _azure_transitions(site_key, project, wtype):
     only the panel and the write need it."""
     def load():
         data = azure_req(
-            f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
-            f"{urllib.parse.quote(wtype)}", {})
+            f"/{urllib.parse.quote(project, safe='')}/_apis/wit/workItemTypes/"
+            f"{urllib.parse.quote(wtype, safe='')}", {})
         out = {}
         for frm, moves in (data.get("transitions") or {}).items():
+            # An entry we can't read at all is OMITTED, so the caller falls back
+            # to "can't tell" and offers everything. An entry ADO reports as
+            # genuinely EMPTY is kept, because that is an answer — "nothing is
+            # allowed" — and the two must not collapse into each other.
+            #
+            # A list that yields NO usable target is the unreadable case, not
+            # the empty one: dropping unparseable members and keeping the empty
+            # set left would fail CLOSED, hiding the Change button and refusing
+            # every drop — the exact symptom XERK-250 is about.
             if not isinstance(moves, list):
                 continue
-            # Kept even when it comes back empty: a state the server names with
-            # nowhere to go is an ANSWER ("nothing is allowed"), which the
-            # caller must be able to tell apart from an absent key ("can't
-            # tell"). ADO's own map also carries a "" key for creation and a
+            to = {str(m.get("to")).strip().lower() for m in moves
+                  if isinstance(m, dict) and isinstance(m.get("to"), str)
+                  and m.get("to").strip()}
+            if moves and not to:
+                continue
+            # ADO's own map also carries a "" key for creation and a
             # self-transition per state; both are harmless here, since the
             # caller drops the current state anyway.
-            out[str(frm or "").strip().lower()] = {
-                str(m.get("to") or "").strip().lower()
-                for m in moves if isinstance(m, dict) and m.get("to")}
+            out[str(frm or "").strip().lower()] = to
         return out
     return _azure_type_meta(_AZDO_STATE_CACHE, site_key, project, wtype,
                             "transitions", load, {})

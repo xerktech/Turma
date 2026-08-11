@@ -12228,6 +12228,81 @@ class TestAzureStatusOptions(unittest.TestCase):
              mock.patch.object(ha, "azure_req", self._both(states, doc)):
             self.assertEqual(ha._azure_status_options("s", "P", "Bug", "Shipped"), [])
 
+    def test_an_unreadable_entry_fails_OPEN_not_closed(self):
+        # The one direction this must never get wrong. A malformed entry means
+        # "can't tell" -> offer everything; failing closed would hide the Change
+        # button and refuse every drop, which IS the bug XERK-250 is about.
+        # ADO's contract makes none of these reachable today; that is the point.
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Active", "category": "InProgress"},
+                            {"name": "Closed", "category": "Completed"}]}
+        unreadable = [
+            "New",                       # entry is not a list at all
+            None,                        # entry is null
+            ["New", 3, None],            # members aren't dicts
+            [{"actions": None}],         # member carries no `to`
+            [{"to": None}],              # `to` is null
+            [{"to": 7}],                 # `to` isn't a string
+            [{"to": "   "}],             # `to` is blank
+        ]
+        for moves in unreadable:
+            doc = {"transitions": {"Active": moves}}
+            with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+                 mock.patch.object(ha, "azure_req", self._both(states, doc)):
+                opts = ha._azure_status_options("s", "P", "Bug", "Active")
+            self.assertEqual([o["id"] for o in opts], ["New", "Closed"],
+                             f"{moves!r} should read as 'can't tell'")
+        # A partly-readable entry is still an answer: the readable members win.
+        doc = {"transitions": {"Active": [{"to": "Closed"}, {"to": None}, 3]}}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, doc)):
+            opts = ha._azure_status_options("s", "P", "Bug", "Active")
+        self.assertEqual([o["id"] for o in opts], ["Closed"])
+
+    def test_one_unreadable_entry_doesnt_cost_the_readable_ones(self):
+        # The guard is per-ENTRY: a state whose entry can't be iterated must not
+        # take the rest of the map down with it, which is what an exception out
+        # of the parse would do.
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Active", "category": "InProgress"},
+                            {"name": "Closed", "category": "Completed"}]}
+        doc = {"transitions": {"Active": None, "New": [{"to": "Active"}]}}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, doc)):
+            self.assertEqual(
+                [o["id"] for o in ha._azure_status_options("s", "P", "Bug", "New")],
+                ["Active"])                       # New's own entry survived
+            self.assertEqual(
+                [o["id"] for o in ha._azure_status_options("s", "P", "Bug", "Active")],
+                ["New", "Closed"])                # Active's is "can't tell"
+
+    def test_a_malformed_transitions_block_never_raises(self):
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Active", "category": "InProgress"}]}
+        for block in (None, [], "nope", 7, {"": [{"to": "New"}]}):
+            with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+                 mock.patch.object(ha, "azure_req",
+                                   self._both(states, {"transitions": block})):
+                opts = ha._azure_status_options("s", "P", "Bug", "New")
+            self.assertEqual([o["id"] for o in opts], ["Active"], repr(block))
+
+    def test_the_path_segments_are_fully_encoded(self):
+        # project/wtype come from ADO's own response, but they land in a REST
+        # path, so a "/" must not be able to extend it.
+        seen = []
+
+        def spy(path, params, body=None, **k):
+            seen.append(path)
+            raise RuntimeError("stop")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", spy):
+            ha._azure_states("s", "My Prøject", "User Story")
+            ha._azure_transitions("s", "a/b", "Bug/../../workitems/1")
+        self.assertEqual(seen[0],
+                         "/My%20Pr%C3%B8ject/_apis/wit/workItemTypes/User%20Story/states")
+        self.assertEqual(seen[1],
+                         "/a%2Fb/_apis/wit/workItemTypes/Bug%2F..%2F..%2Fworkitems%2F1")
+
     def test_empty_when_states_api_unavailable(self):
         def boom(*a, **k):
             raise RuntimeError("403")

@@ -57,7 +57,15 @@ lives in `hub-agent.py`; the hub/UI half is `.claude/rules/turma-board.md`.
     state ADO will refuse turns a drop into an error the operator can do nothing about — as much a
     "can't change the status" as an empty picker. An **unreadable** map means "offer everything"
     (the older behaviour); a **known but empty** entry means nothing is allowed and is honoured.
-    Kept off the per-ticket path — that response carries the type's whole form definition.
+    Kept off the per-ticket path — that response carries the type's whole form definition (~35 KiB
+    measured), so a board poll costs zero of these and a detail-open costs one per type per TTL.
+  - **A malformed transitions entry fails OPEN.** An entry that yields no readable target is
+    OMITTED, not stored empty: storing it would read as "nothing is allowed" and reproduce the very
+    symptom — no Change button, every drop refused. Only an entry ADO reports as genuinely empty is
+    kept. Tests: `test_an_unreadable_entry_fails_OPEN_not_closed`.
+  - Known gap: the two reads have **independent TTLs** and only states is refreshed by the poll, so
+    for up to `AZDO_META_TTL_SEC` after a template gains a state, that state can be live but not
+    offered. Bounded, and still better than the restart it replaced.
   - ADO's `Resolved` metastate is `inprogress` on the wire and the BOARD carves it into **In Review**
     by the state's NAME (`_REVIEW_STATUS_RE`) — the wire has no fourth category, and emitting one
     would land those tickets in To Do on every older client. Cost: a Resolved-metastate state not
