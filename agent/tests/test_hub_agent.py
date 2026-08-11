@@ -44,6 +44,11 @@ sys.modules["hub_agent"] = ha
 spec.loader.exec_module(ha)
 
 
+# The shipped probe interval, captured before ManagerMixin patches it to 0 for
+# the suite (see the patch list); the probe's own tests restore it.
+LIMITS_PROBE_SEC_DEFAULT = ha.LIMITS_PROBE_SEC
+
+
 def write_jsonl(path, lines):
     """Write transcript lines; each item is a dict (JSON-encoded) or a raw
     string (written verbatim, for truncated/garbage fixtures)."""
@@ -2746,6 +2751,13 @@ class ManagerMixin:
             # on its subscription (XERK-247).
             ("LIMITS_PATH", os.path.join(self.tmp, "limits.json")),
             ("LIMITS_SETTINGS_PATH", os.path.join(self.tmp, "limits-settings.json")),
+            # The limits probe is OFF for the suite at large. A beat with no
+            # snapshot considers one due and starts a real background thread
+            # that, seconds later, drives tmux through the CURRENT test's fake
+            # run() — its trust-dialog Enter landed in an unrelated test's key
+            # assertions (CI caught exactly that in TestSetModelMode). The tests
+            # that exercise the probe re-enable it deliberately.
+            ("LIMITS_PROBE_SEC", 0),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
@@ -3053,11 +3065,21 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
 
     def test_heartbeat_carries_the_snapshot_and_none_without_one(self):
         sm = self.make_manager()
-        self.assertIsNone(sm.build_payload(0)["limits"])
+        with mock.patch.object(ha, "LIMITS_PROBE_SEC", 0):  # no probe from a beat
+            self.assertIsNone(sm.build_payload(0)["limits"])
         resets = int(time.time()) + 900
         self._write(self._snapshot(fiveHour={"usedPct": 12, "resetsAt": resets}))
-        self.assertEqual(sm.build_payload(1)["limits"]["fiveHour"],
-                         {"usedPct": 12.0, "resetsAt": resets})
+        with mock.patch.object(ha, "LIMITS_PROBE_SEC", 0):
+            self.assertEqual(sm.build_payload(1)["limits"]["fiveHour"],
+                             {"usedPct": 12.0, "resetsAt": resets})
+
+    def setUp(self):
+        super().setUp()
+        # ManagerMixin turns the probe off for the suite; these tests are the
+        # ones about when it fires, so they run with the shipped interval.
+        p = mock.patch.object(ha, "LIMITS_PROBE_SEC", LIMITS_PROBE_SEC_DEFAULT)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_probe_is_due_when_there_is_no_snapshot_at_all(self):
         sm = self.make_manager()
@@ -3083,6 +3105,26 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         with mock.patch.object(ha, "LIMITS_PROBE_SEC", 0):
             self.assertFalse(sm._limits_probe_due())
+            sm.build_payload(0)
+            self.assertFalse([t for t in threading.enumerate()
+                              if t.name == "limits-probe" and t.is_alive()])
+
+    def test_a_missing_snapshot_is_silent_but_a_broken_one_says_so_once(self):
+        # read_limits_snapshot runs on EVERY beat and its log tail rides the
+        # heartbeat to the hub, so "no snapshot yet" — the ordinary state before
+        # the first probe, and forever on a login with no windows — must not
+        # narrate itself every 20 seconds. A file that IS there and IS broken is
+        # worth saying, but only until it stops changing.
+        with mock.patch.object(ha, "_limits_last_problem", None), \
+             mock.patch.object(ha, "log") as logged:
+            for _ in range(3):
+                self.assertIsNone(ha.read_limits_snapshot())
+            self.assertEqual(logged.call_count, 0, "a missing snapshot logged")
+            with open(ha.LIMITS_PATH, "w", encoding="utf-8") as fh:
+                fh.write("{ not json")
+            for _ in range(3):
+                self.assertIsNone(ha.read_limits_snapshot())
+            self.assertEqual(logged.call_count, 1, "a broken snapshot logged per beat")
 
     def test_a_probe_that_captures_nothing_backs_off(self):
         # A login with no subscription windows (API key, Bedrock, Vertex) can

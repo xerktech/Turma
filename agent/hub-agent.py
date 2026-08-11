@@ -1884,6 +1884,20 @@ LIMITS_RESET_HORIZON_SEC = 60 * 86400
 LIMITS_FUTURE_SKEW_SEC = 300
 
 
+# The last problem logged about the snapshot file. read_limits_snapshot runs on
+# EVERY beat, so a file that stays broken would otherwise repeat its complaint
+# every TURMA_INTERVAL seconds, forever, into a log tail that rides the
+# heartbeat. Say each distinct problem once; a changed one is news again.
+_limits_last_problem = None
+
+
+def _log_limits_problem(msg):
+    global _limits_last_problem
+    if msg != _limits_last_problem:
+        _limits_last_problem = msg
+        log(msg)
+
+
 def _finite_epoch(value, limit):
     """A finite epoch-second number as an int, or None. `limit` bounds the
     magnitude, so `1e308`, `NaN` and `inf` never reach `int()` — which RAISES on
@@ -1925,7 +1939,8 @@ def read_limits_snapshot(path=None, now=None, max_age=None):
         with open(path, encoding="utf-8") as fh:
             text = fh.read(LIMITS_MAX_BYTES + 1)
         if len(text) > LIMITS_MAX_BYTES:
-            log(f"limits snapshot at {path} is implausibly large; ignoring it")
+            _log_limits_problem(
+                f"limits snapshot at {path} is implausibly large; ignoring it")
             return None
         raw = json.loads(text)
         if not isinstance(raw, dict):
@@ -1965,8 +1980,13 @@ def read_limits_snapshot(path=None, now=None, max_age=None):
         out["capturedAt"] = captured
         out["source"] = "statusline"
         return out
+    except FileNotFoundError:
+        # The ordinary state on a host that hasn't probed yet (and forever on one
+        # whose login has no windows). Silent: this runs every beat, and the log
+        # tail rides the heartbeat to the hub.
+        return None
     except Exception as e:
-        log(f"limits snapshot at {path} unreadable ({e}); ignoring it")
+        _log_limits_problem(f"limits snapshot at {path} unreadable ({e}); ignoring it")
         return None
 
 
