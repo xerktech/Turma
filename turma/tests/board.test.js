@@ -1833,3 +1833,98 @@ test("createFormHtml: the created state shows a link and hides the form", () => 
   assert.match(html, /data-cf-another/);
   assert.doesNotMatch(html, /data-cf-submit/);
 });
+
+// ---- The columns are one horizontal row at every width (XERK-253) ----------
+// The layout lives in app.css, which no other test reads for layout, so nothing
+// stopped a breakpoint that stacks the columns from coming back. These read the
+// stylesheet directly — cheap, and they are the only guard the rule has.
+const fs = require("node:fs");
+const path = require("node:path");
+const APP_CSS = fs.readFileSync(path.join(__dirname, "../public/app.css"), "utf8")
+  .replace(/\/\*[\s\S]*?\*\//g, "");   // comments discuss these rules; only declarations count
+
+// EVERY rule whose selector names the strip or a column, in source order — not
+// just the first. A guard that reads one rule is beaten by a later unscoped
+// override, which is the exact idiom the glasses/veiller vendored board.css
+// already uses, so it is one copy-paste away from re-stacking the columns.
+function allRules() {
+  return [...APP_CSS.matchAll(/([^{}]*)\{([^{}]*)\}/g)]
+    .map(([, sel, body]) => [sel.trim().split("\n").pop().trim(), body]);
+}
+function rulesFor(cls) {
+  const names = new RegExp(`\\.${cls}(?![\\w-])`);
+  return allRules().filter(([sel]) => names.test(sel));
+}
+
+test("board: the column strip is a flex row that scrolls sideways", () => {
+  const rules = rulesFor("kanban-cols");
+  assert.ok(rules.length, "no .kanban-cols rule in app.css");
+  const all = rules.map(([, b]) => b).join(";");
+  assert.match(all, /display:\s*flex/, "the strip must be a row, not a wrapping grid");
+  assert.match(all, /overflow-x:\s*auto/, "a column that doesn't fit must scroll, not restack");
+  // The padding holds the drop-target outline the scroll container would clip;
+  // scroll-padding is what keeps that room on screen instead of scrolled away.
+  assert.match(all, /padding:\s*6px/);
+  assert.match(all, /scroll-padding:\s*6px/);
+});
+
+test("board: nothing anywhere in app.css re-stacks the status columns", () => {
+  for (const [sel, body] of rulesFor("kanban-cols")) {
+    assert.doesNotMatch(body, /grid-template-columns/,
+      `\`${sel}\` lays the strip out as a grid — the columns must stay one horizontal row`);
+    assert.doesNotMatch(body, /display:\s*(?!flex\b)[a-z-]+/,
+      `\`${sel}\` gives the strip a display other than flex`);
+    assert.doesNotMatch(body, /flex-wrap:\s*wrap/, `\`${sel}\` lets the columns wrap`);
+  }
+});
+
+test("board: a column is one fixed width at every viewport", () => {
+  // Fixed, not fluid: the column must not grow into a wide board or shrink as
+  // the window narrows, and nothing may re-size it — a card is the same size on
+  // a phone as on a desktop, and 300px is Android's `.width(300.dp)`.
+  //
+  // Two ways a width creeps back in, both found by mutating this stylesheet and
+  // both of which an earlier version of this test let through: a SECOND rule on
+  // `.kanban-col` (a bare `min-width` re-sizes it just as well as `flex` does),
+  // and a rule that reaches the columns WITHOUT naming them — `.kanban-cols >
+  // div`, which is the later-unscoped-override idiom the vendored board.css
+  // files already use. So this collects every rule that can size a column by
+  // either route, and insists exactly one of them does.
+  const SIZES = /(?:^|;)\s*(?:flex|flex-basis|width|min-width|max-width)\s*:/;
+  const canSizeAColumn = ([sel]) =>
+    /\.kanban-col(?![\w-])/.test(sel) ||          // names the column
+    /\.kanban-cols\s*[>+~]/.test(sel) ||          // a combinator into the strip
+    /\.kanban-cols\s+\S/.test(sel);               // a descendant of the strip
+  // Over EVERY rule in the stylesheet, not a pre-filtered set — a pre-filter on
+  // the class name is what let `.kanban-cols > div` through in the first place.
+  const rules = allRules().filter(canSizeAColumn);
+  assert.ok(rules.length, "no .kanban-col rule in app.css");
+
+  const sized = rules.filter(([, b]) => SIZES.test(b));
+  assert.deepEqual(sized.map(([sel]) => sel), [".kanban-col"],
+    "exactly one rule may size a column, and it must be the bare `.kanban-col` one");
+  assert.match(sized[0][1], /flex:\s*0\s+0\s+300px/, "the column must be a fixed 300px");
+  assert.match(sized[0][1], /min-width:\s*0/,
+    "without this a long card widens the column past its fixed width");
+});
+
+test("board: the focused card is scrolled into the strip, not left clipped", () => {
+  // The browser only auto-scrolls a focused element in when it is ENTIRELY out
+  // of view, so on a strip that scrolls a half-visible card keeps its focus ring
+  // clipped and the keyboard user loses the card they are on.
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  assert.match(src, /addEventListener\("focusin"/, "no focusin handler on the board");
+  const fn = /addEventListener\("focusin",[\s\S]{0,400}?\}\);/.exec(src)[0];
+  assert.match(fn, /scrollIntoView\(\{\s*block:\s*"nearest",\s*inline:\s*"nearest"\s*\}\)/,
+    "must move the minimum, in both axes");
+  assert.match(fn, /dragActive\(\)/, "a drag owns the scroll — focus must not fight it");
+});
+
+test("board: the strip carries the id preserveScroll anchors its sideways scroll to", () => {
+  // Without it the strip is keyed by child index, and the notes rendered above
+  // it appear/clear with a poll error — throwing the scroll back to column one.
+  const html = boardHtml([{
+    siteKey: "o", orgName: "o", tickets: [ticket("A-1")], fetchedAt: "2026-01-01T00:00:00Z",
+  }], "", { now: Date.parse("2026-01-01T00:00:00Z"), allKeys: ["o"] });
+  assert.match(html, /class="kanban-cols" id="kanbanCols"/);
+});

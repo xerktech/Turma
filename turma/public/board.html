@@ -413,6 +413,20 @@ $board.addEventListener("pointermove", onDragMove);
 window.addEventListener("pointerup", onDragEnd);
 window.addEventListener("pointercancel", onDragEnd);
 
+// Keyboard: keep the focused card inside the column strip's viewport (XERK-253).
+// The browser only auto-scrolls a focused element into view when it is ENTIRELY
+// out of view, and the strip now scrolls on the desktop too — so tabbing into a
+// column that is half off the right edge drew the focus ring clipped and never
+// scrolled, which is how a keyboard user loses the card they are on. We scroll
+// the CARD (300px, the column's own width), so bringing it in brings its column
+// in; `nearest` moves the minimum, and the strip's `scroll-padding` leaves the
+// ring room. Not during a drag — that gesture owns the scroll.
+$board.addEventListener("focusin", (e) => {
+  if (dragActive()) return;
+  const el = e.target.closest && e.target.closest(".kanban-card, .kanban-col");
+  if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });
+});
+
 // ---- Expanded ticket detail --------------------------------------------
 // A card click opens the panel immediately, painted from the card's own
 // heartbeat fields, and fills in description + comments once the on-demand
