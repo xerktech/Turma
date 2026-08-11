@@ -6474,14 +6474,18 @@ _AZDO_STATE_CATEGORY = {
     "code review": "inprogress", "testing": "inprogress", "ready": "inprogress",
     "done": "done", "closed": "done", "completed": "done", "removed": "done",
 }
-# (siteKey, project, workItemType) -> (states, retry_after_epoch). Populated
-# lazily from the states API, so a settled poll costs one cached lookup. A real
-# answer is kept for the life of the process (a type's states move about as often
-# as its process template); an EMPTY one is only held for AZDO_STATE_RETRY_SEC,
-# because the status row and every drag key on this list — caching one 503 for
-# the life of the agent would disable status changes until someone restarted it.
+# (kind, siteKey, project, workItemType) -> (value, expires_at), so a settled poll
+# costs one cached lookup. ONE dict for both per-type reads — `kind` ("states" /
+# "transitions") is already in the key, and a second dict is a second thing every
+# test has to remember to reset.
 _AZDO_STATE_CACHE = {}
-AZDO_STATE_RETRY_SEC = 300
+# A good answer is held AZDO_META_TTL_SEC: a process template changes rarely, but
+# never re-reading means an operator who adds a state must restart the agent
+# before the picker can reach it. An EMPTY one is held only AZDO_META_RETRY_SEC —
+# status changes key on these lists, so caching one 503 for the life of the agent
+# would disable them until someone noticed and restarted it.
+AZDO_META_TTL_SEC = 3600
+AZDO_META_RETRY_SEC = 300
 
 # Work item ids are bare integers, so the JIRA_KEY_RE grammar (PROJECT-123) would
 # reject every one. This is the allowlist gate before an id reaches a REST path.
@@ -6593,6 +6597,30 @@ def azure_req(path, params, body=None, method=None, content_type="application/js
     return _board_urlopen(req)
 
 
+def _azure_type_meta(cache, site_key, project, wtype, kind, load, empty):
+    """One cached, best-effort read about a (project, work-item-type). `load`
+    takes no arguments and returns the parsed value; anything it raises becomes
+    `empty`, since none of this is worth failing a board poll over.
+
+    A failure is logged only the FIRST time after a good answer: a permanently
+    locked-down endpoint is re-tried every AZDO_META_RETRY_SEC per type, and
+    logging each retry buries the log for as long as the org stays that way."""
+    ck = (kind, site_key, project or "", wtype or "")
+    hit = cache.get(ck)
+    if hit is not None and time.time() < hit[1]:
+        return hit[0]
+    out = empty
+    if project and wtype:
+        try:
+            out = load()
+        except Exception as e:
+            if hit is None or hit[0]:
+                log(f"azure {kind} fetch failed for {project}/{wtype}: {e}")
+    cache[ck] = (out, time.time() +
+                 (AZDO_META_TTL_SEC if out else AZDO_META_RETRY_SEC))
+    return out
+
+
 def _azure_states(site_key, project, wtype):
     """The ordered [{name, category}] a (project, work-item-type) can be in, from
     the states API, cached. [] when the call fails or is unavailable, so the
@@ -6606,25 +6634,53 @@ def _azure_states(site_key, project, wtype):
     its Change button, every drag refused with "nothing can move it to …", and
     _azure_category silently fell back to the static name map (XERK-250). The
     older spelling is still tolerated, but `category` is the contract."""
-    ck = ("states", site_key, project or "", wtype or "")
-    hit = _AZDO_STATE_CACHE.get(ck)
-    if hit is not None and (hit[0] or time.time() < hit[1]):
-        return hit[0]
-    out = []
-    if project and wtype:
-        try:
-            data = azure_req(
-                f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
-                f"{urllib.parse.quote(wtype)}/states", {})
-            for s in data.get("value") or []:
-                name = str(s.get("name") or "").strip()
-                cat = str(s.get("category") or s.get("stateCategory") or "").strip().lower()
-                if name and cat in _AZDO_META_CATEGORY:
-                    out.append({"name": name, "category": _AZDO_META_CATEGORY[cat]})
-        except Exception as e:
-            log(f"azure states fetch failed for {project}/{wtype}: {e}")
-    _AZDO_STATE_CACHE[ck] = (out, time.time() + AZDO_STATE_RETRY_SEC)
-    return out
+    def load():
+        data = azure_req(
+            f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
+            f"{urllib.parse.quote(wtype)}/states", {})
+        out = []
+        for s in data.get("value") or []:
+            name = str(s.get("name") or "").strip()
+            cat = str(s.get("category") or s.get("stateCategory") or "").strip().lower()
+            if name and cat in _AZDO_META_CATEGORY:
+                out.append({"name": name, "category": _AZDO_META_CATEGORY[cat]})
+        return out
+    return _azure_type_meta(_AZDO_STATE_CACHE, site_key, project, wtype,
+                            "states", load, [])
+
+
+def _azure_transitions(site_key, project, wtype):
+    """{from_state_lower: {to_state_lower, …}} — the state moves a type's process
+    actually permits, off the work-item-type definition, cached. {} when the read
+    fails or the server doesn't report the map, which callers must read as "can't
+    tell", never as "nothing is allowed".
+
+    A process template restricts transitions (an Agile User Story cannot go
+    Removed -> Resolved), and offering a state it will refuse turns a drop into
+    an error the operator can do nothing about — which reads as "I can't change
+    the status" just as much as an empty picker does (XERK-250). Kept off the
+    per-ticket path: this response carries the type's whole form definition, and
+    only the panel and the write need it."""
+    def load():
+        data = azure_req(
+            f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
+            f"{urllib.parse.quote(wtype)}", {})
+        out = {}
+        for frm, moves in (data.get("transitions") or {}).items():
+            if not isinstance(moves, list):
+                continue
+            # Kept even when it comes back empty: a state the server names with
+            # nowhere to go is an ANSWER ("nothing is allowed"), which the
+            # caller must be able to tell apart from an absent key ("can't
+            # tell"). ADO's own map also carries a "" key for creation and a
+            # self-transition per state; both are harmless here, since the
+            # caller drops the current state anyway.
+            out[str(frm or "").strip().lower()] = {
+                str(m.get("to") or "").strip().lower()
+                for m in moves if isinstance(m, dict) and m.get("to")}
+        return out
+    return _azure_type_meta(_AZDO_STATE_CACHE, site_key, project, wtype,
+                            "transitions", load, {})
 
 
 def _azure_state_map(site_key, project, wtype):
@@ -6636,15 +6692,23 @@ def _azure_state_map(site_key, project, wtype):
 
 
 def _azure_status_options(site_key, project, wtype, current):
-    """The states this work item can be moved TO — every state of its type except
-    the one it's already in — in the source-agnostic statusOptions shape. For
-    Azure the submit value IS the state name (there is no transition id). [] when
-    the states API is unreachable (a locked-down server), so the row stays
-    read-only rather than offering a change that can't be validated."""
+    """The states this work item can be moved TO — its type's states, minus the
+    one it's already in, minus any its process forbids moving to from there — in
+    the source-agnostic statusOptions shape. For Azure the submit value IS the
+    state name (there is no transition id). [] when the states API is unreachable
+    (a locked-down server), so the row stays read-only rather than offering a
+    change that can't be validated.
+
+    An UNKNOWN transition map means "offer everything" (the pre-XERK-250
+    behaviour): a server that won't report one must not be read as a workflow
+    that permits nothing. A KNOWN but empty entry for the current state does
+    mean nothing is allowed, and is honoured."""
     cur = str(current or "").strip().lower()
+    allowed = _azure_transitions(site_key, project, wtype).get(cur)
     return [{"id": s["name"], "name": s["name"], "category": s["category"]}
             for s in _azure_states(site_key, project, wtype)
-            if s["name"].strip().lower() != cur]
+            if s["name"].strip().lower() != cur
+            and (allowed is None or s["name"].strip().lower() in allowed)]
 
 
 def _azure_category(site_key, project, wtype, state):

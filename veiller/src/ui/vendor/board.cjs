@@ -38,7 +38,13 @@
   // by matching the org-specific status NAME rather than the category. Matched
   // on word boundaries so "Attestation" or "Contest" can't leak in, but "In
   // Review", "Code Review", "Testing", "In Test", "QA" all land here.
-  const REVIEW_STATUS_RE = /\b(review|reviewing|testing|test|qa)\b/i;
+  //
+  // "Resolved" is here for Azure DevOps (XERK-250), whose fixed state set is
+  // New / Active / Resolved / Closed / Removed: its `Resolved` metastate means
+  // "fixed, not yet verified" — this board's In Review — and reaches the client
+  // as `inprogress`, so the name is the only thing that can place it. A Jira
+  // "Resolved" is normally in the `done` category, which this can't pull from.
+  const REVIEW_STATUS_RE = /\b(review|reviewing|testing|test|qa|resolved)\b/i;
 
   function isReviewStatus(t) {
     return REVIEW_STATUS_RE.test(String((t && t.status) || ""));

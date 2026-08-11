@@ -27,6 +27,7 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     Closed/Removed: `Resolved` means "fixed, not yet verified" and reaches clients as `inprogress`,
     so the name is the only thing that can place it. A Jira "Resolved" is normally a `done` status,
     which the carve-out cannot pull from.
+  - **The rule has FIVE mirrors** — see `CLAUDE.md`'s cross-cutting contracts for the list.
 - Scoped by the **header's org filter**, not a strip of its own: `TurmaOrg.getKeys()` each render,
   passed to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as
