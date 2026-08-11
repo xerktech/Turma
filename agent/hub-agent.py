@@ -6670,21 +6670,31 @@ def _azure_transitions(site_key, project, wtype):
             f"{urllib.parse.quote(wtype, safe='')}", {})
         out = {}
         for frm, moves in (data.get("transitions") or {}).items():
-            # An entry we can't read at all is OMITTED, so the caller falls back
-            # to "can't tell" and offers everything. An entry ADO reports as
-            # genuinely EMPTY is kept, because that is an answer — "nothing is
-            # allowed" — and the two must not collapse into each other.
+            # ANY member we can't read omits the whole entry, so the caller
+            # falls back to "can't tell" and offers everything. Only an entry
+            # every member of which reads — including a genuinely EMPTY one,
+            # which is the answer "nothing is allowed" — becomes a verdict.
             #
-            # A list that yields NO usable target is the unreadable case, not
-            # the empty one: dropping unparseable members and keeping the empty
-            # set left would fail CLOSED, hiding the Change button and refusing
-            # every drop — the exact symptom XERK-250 is about.
+            # Keeping the readable members of a partly-readable entry looks
+            # tempting and is the wrong default: the realistic way this parser
+            # breaks is a PARTIAL schema change (a new api-version spelling
+            # `to` differently for some members), which would silently narrow
+            # the picker with no log line — the XERK-250 symptom, and
+            # undiagnosable. A wholesale rename hits every member and falls
+            # open correctly. Being wrong toward "offer it" costs one error
+            # toast when ADO refuses; being wrong toward "hide it" costs an
+            # option nobody can find.
             if not isinstance(moves, list):
                 continue
-            to = {str(m.get("to")).strip().lower() for m in moves
-                  if isinstance(m, dict) and isinstance(m.get("to"), str)
-                  and m.get("to").strip()}
-            if moves and not to:
+            to, readable = set(), True
+            for m in moves:
+                if (isinstance(m, dict) and isinstance(m.get("to"), str)
+                        and m["to"].strip()):
+                    to.add(m["to"].strip().lower())
+                else:
+                    readable = False
+                    break
+            if not readable:
                 continue
             # ADO's own map also carries a "" key for creation and a
             # self-transition per state; both are harmless here, since the

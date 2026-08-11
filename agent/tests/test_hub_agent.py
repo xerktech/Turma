@@ -12252,8 +12252,17 @@ class TestAzureStatusOptions(unittest.TestCase):
                 opts = ha._azure_status_options("s", "P", "Bug", "Active")
             self.assertEqual([o["id"] for o in opts], ["New", "Closed"],
                              f"{moves!r} should read as 'can't tell'")
-        # A partly-readable entry is still an answer: the readable members win.
+        # A PARTLY-readable entry is can't-tell too, deliberately: the realistic
+        # break is a partial schema change, and keeping only the readable
+        # members would silently narrow the picker with no log line.
         doc = {"transitions": {"Active": [{"to": "Closed"}, {"to": None}, 3]}}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, doc)):
+            opts = ha._azure_status_options("s", "P", "Bug", "Active")
+        self.assertEqual([o["id"] for o in opts], ["New", "Closed"])
+        # …but an entry every member of which reads IS a verdict, self
+        # transitions and all.
+        doc = {"transitions": {"Active": [{"to": "Active"}, {"to": "Closed"}]}}
         with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
              mock.patch.object(ha, "azure_req", self._both(states, doc)):
             opts = ha._azure_status_options("s", "P", "Bug", "Active")
