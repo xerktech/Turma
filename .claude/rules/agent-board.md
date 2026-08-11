@@ -39,9 +39,19 @@ lives in `hub-agent.py`; the hub/UI half is `.claude/rules/turma-board.md`.
 - **Work-item ids are bare integers**, so `AZDO_KEY_RE`/`valid_issue_key` accept `^[0-9]+$`
   alongside `PROJECT-123`. Ticket sessions get a human branch base `<project>-<id>`
   (`ticket_branch_base`), not a bare number.
-- **State → column**: Azure's per-type `stateCategory` comes from the states API when reachable
+- **State → column**: Azure's per-type metastate comes from the states API when reachable
   (`_azure_state_map`, cached), falling back to a static name map then `todo` — mapping to
   todo/inprogress/done as Jira's `statusCategory` does. The raw name rides as `status`.
+  - **The metastate field is `category`**, per the API's own `WorkItemStateColor` ({name, color,
+    category}) — unchanged 4.1→7.2. Reading `stateCategory` matched nothing, so `_azure_states`
+    returned `[]` on every real org: no `statusOptions`, hence no Change button and a refusal on
+    every drop, plus categories silently reduced to the static name map (XERK-250).
+  - **An EMPTY states read is cached only `AZDO_STATE_RETRY_SEC`**, a real one for the process's
+    life: status changes key on this list, so caching one 503 forever disables them until a restart.
+  - ADO's `Resolved` metastate is `inprogress` on the wire and the BOARD carves it into **In Review**
+    by the state's NAME (`_REVIEW_STATUS_RE`, mirrored in `board.js`) — the wire has no fourth
+    category, and emitting one would land those tickets in To Do on every older client. Cost: a
+    custom state in the Resolved metastate that isn't NAMED "resolved" shows as In Progress.
 - Tests: `TestAdfText`, `TestShapeIssueDetail`, `TestFetchJiraIssue`, `TestStageJiraIssue`,
   `TestNormalizeAzureSite`, `TestAzureBase`, `TestCollectAzure`, `TestShapeAzureItem`,
   `TestAzureCategory`, `TestAzureHtmlToText`, `TestFetchAzureIssue`, `TestBoardSourceDispatch`.

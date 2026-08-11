@@ -12030,8 +12030,8 @@ class TestAzureCategory(unittest.TestCase):
     def test_states_api_metastate_wins(self):
         def fake_req(path, params, body=None):
             self.assertTrue(path.endswith("/states"))
-            return {"value": [{"name": "Peer Review", "stateCategory": "InProgress"},
-                              {"name": "Shipped", "stateCategory": "Completed"}]}
+            return {"value": [{"name": "Peer Review", "category": "InProgress"},
+                              {"name": "Shipped", "category": "Completed"}]}
         with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
              mock.patch.object(ha, "azure_req", fake_req):
             self.assertEqual(ha._azure_category("s", "P", "Bug", "Peer Review"),
@@ -12054,12 +12054,61 @@ class TestAzureCategory(unittest.TestCase):
 
         def fake_req(path, params, body=None):
             calls.append(path)
-            return {"value": [{"name": "Active", "stateCategory": "InProgress"}]}
+            return {"value": [{"name": "Active", "category": "InProgress"}]}
         with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
              mock.patch.object(ha, "azure_req", fake_req):
             ha._azure_category("s", "P", "Bug", "Active")
             ha._azure_category("s", "P", "Bug", "Active")
         self.assertEqual(len(calls), 1)   # second lookup hits the cache
+
+    def test_reads_the_apis_own_category_field(self):
+        # XERK-250: the states API's WorkItemStateColor is {name, color,
+        # category} — reading `stateCategory` matched nothing on every real org,
+        # so the list came back EMPTY and the whole feature silently degraded.
+        # This payload is the API reference's own sample response verbatim.
+        doc = {"count": 5, "value": [
+            {"name": "New", "color": "b2b2b2", "category": "Proposed"},
+            {"name": "Active", "color": "007acc", "category": "InProgress"},
+            {"name": "CustomState", "color": "5688E0", "category": "InProgress"},
+            {"name": "Resolved", "color": "ff9d00", "category": "Resolved"},
+            {"name": "Closed", "color": "339933", "category": "Completed"},
+        ]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=doc):
+            states = ha._azure_states("s", "P", "Bug")
+        self.assertEqual(states, [
+            {"name": "New", "category": "todo"},
+            {"name": "Active", "category": "inprogress"},
+            {"name": "CustomState", "category": "inprogress"},
+            {"name": "Resolved", "category": "inprogress"},
+            {"name": "Closed", "category": "done"},
+        ])
+
+    def test_removed_metastate_is_done(self):
+        doc = {"value": [{"name": "Removed", "color": "ffffff", "category": "Removed"}]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=doc):
+            self.assertEqual(ha._azure_category("s", "P", "Task", "Removed"), "done")
+
+    def test_an_empty_read_is_retried_but_a_good_one_is_kept(self):
+        # A failed states read must not be cached for the life of the process:
+        # the Status row and every drag key on this list, so one 503 would
+        # disable ADO status changes until someone restarted the agent.
+        calls = []
+        doc = {"value": [{"name": "Active", "category": "InProgress"}]}
+
+        def flaky(path, params, body=None):
+            calls.append(path)
+            if len(calls) == 1:
+                raise RuntimeError("503")
+            return doc
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "AZDO_STATE_RETRY_SEC", 0), \
+             mock.patch.object(ha, "azure_req", flaky):
+            self.assertEqual(ha._azure_states("s", "P", "Bug"), [])       # blip
+            self.assertEqual(len(ha._azure_states("s", "P", "Bug")), 1)   # retried
+            ha._azure_states("s", "P", "Bug")                             # now cached
+        self.assertEqual(len(calls), 2)
 
 
 class TestAzureStatusOptions(unittest.TestCase):
@@ -12068,9 +12117,9 @@ class TestAzureStatusOptions(unittest.TestCase):
 
     def _states(self):
         return {"value": [
-            {"name": "New", "stateCategory": "Proposed"},
-            {"name": "Active", "stateCategory": "InProgress"},
-            {"name": "Closed", "stateCategory": "Completed"},
+            {"name": "New", "category": "Proposed"},
+            {"name": "Active", "category": "InProgress"},
+            {"name": "Closed", "category": "Completed"},
         ]}
 
     def test_lists_states_except_current(self):
@@ -12081,6 +12130,27 @@ class TestAzureStatusOptions(unittest.TestCase):
             {"id": "New", "name": "New", "category": "todo"},
             {"id": "Closed", "name": "Closed", "category": "done"},
         ])
+
+    def test_the_agile_bug_workflow_reaches_every_column(self):
+        # XERK-250 end to end: the four board columns a New Bug can be dropped
+        # onto, resolved from the real ADO state set. Before the fix this list
+        # was empty, so the panel's Change button never appeared and every drop
+        # refused with "nothing can move it to …".
+        doc = {"value": [
+            {"name": "New", "color": "b2b2b2", "category": "Proposed"},
+            {"name": "Active", "color": "007acc", "category": "InProgress"},
+            {"name": "Resolved", "color": "ff9d00", "category": "Resolved"},
+            {"name": "Closed", "color": "339933", "category": "Completed"},
+        ]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=doc):
+            opts = ha._azure_status_options("s", "P", "Bug", "New")
+        landed = {c: (ha._status_option_for_column(opts, c) or {}).get("id")
+                  for c in ("todo", "inprogress", "review", "done")}
+        self.assertEqual(landed, {"todo": None,          # it is already New
+                                  "inprogress": "Active",
+                                  "review": "Resolved",  # ADO's review column
+                                  "done": "Closed"})
 
     def test_empty_when_states_api_unavailable(self):
         def boom(*a, **k):
@@ -12692,6 +12762,11 @@ class TestBoardColumn(unittest.TestCase):
         self.assertEqual(ha._board_column("QA", "inprogress"), "review")
         self.assertEqual(ha._board_column("Attestation", "inprogress"), "inprogress")
         self.assertEqual(ha._board_column("Testing complete", "done"), "done")
+        # Azure DevOps' "fixed, not yet verified" state (XERK-250).
+        self.assertEqual(ha._board_column("Resolved", "inprogress"), "review")
+        # Still only ever pulled FROM inprogress: a Jira "Resolved" is normally
+        # in the done category and stays in Done.
+        self.assertEqual(ha._board_column("Resolved", "done"), "done")
 
     def test_first_matching_option_wins(self):
         opts = [{"id": "a", "name": "First Done", "category": "done"},

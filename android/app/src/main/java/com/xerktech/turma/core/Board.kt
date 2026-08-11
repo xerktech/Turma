@@ -31,8 +31,12 @@ val BOARD_CATEGORIES = listOf(
  * org-specific status NAME rather than the category, on word boundaries so
  * "Attestation"/"Contest" can't leak in but "In Review"/"Code Review"/"Testing"/
  * "In Test"/"QA" all land here. A pure port of board.js `REVIEW_STATUS_RE`.
+ *
+ * "Resolved" is Azure DevOps' own "fixed, not yet verified" state (XERK-250),
+ * which reaches the client as `inprogress`; board.js's copy carries the why.
  */
-private val REVIEW_STATUS_RE = Regex("\\b(review|reviewing|testing|test|qa)\\b", RegexOption.IGNORE_CASE)
+private val REVIEW_STATUS_RE =
+    Regex("\\b(review|reviewing|testing|test|qa|resolved)\\b", RegexOption.IGNORE_CASE)
 
 fun isReviewStatus(t: JiraTicket): Boolean = REVIEW_STATUS_RE.containsMatchIn(t.status)
 

@@ -6455,7 +6455,10 @@ AZDO_BATCH = 200        # ids per work-items GET (the API's own hard cap)
 # way Jira exposes statusCategory — the one facet that unifies orgs with custom
 # state names. We read it from the work-item-type states API when reachable and
 # fall back to a name map for older/locked-down servers. Both collapse to the
-# board's three columns.
+# board's three wire categories; ADO's `Resolved` metastate is `inprogress` here
+# and the BOARD then carves it into the In Review column by the state's name (see
+# _board_column / board.js categoryOf), the same way Jira's review statuses land
+# there — there is no fourth wire category to map it onto.
 _AZDO_META_CATEGORY = {
     "proposed": "todo",
     "inprogress": "inprogress",
@@ -6471,9 +6474,14 @@ _AZDO_STATE_CATEGORY = {
     "code review": "inprogress", "testing": "inprogress", "ready": "inprogress",
     "done": "done", "closed": "done", "completed": "done", "removed": "done",
 }
-# (siteKey, project, workItemType) -> {state_name_lower: column}. Populated
-# lazily from the states API, so a settled poll costs one cached lookup.
+# (siteKey, project, workItemType) -> (states, retry_after_epoch). Populated
+# lazily from the states API, so a settled poll costs one cached lookup. A real
+# answer is kept for the life of the process (a type's states move about as often
+# as its process template); an EMPTY one is only held for AZDO_STATE_RETRY_SEC,
+# because the status row and every drag key on this list — caching one 503 for
+# the life of the agent would disable status changes until someone restarted it.
 _AZDO_STATE_CACHE = {}
+AZDO_STATE_RETRY_SEC = 300
 
 # Work item ids are bare integers, so the JIRA_KEY_RE grammar (PROJECT-123) would
 # reject every one. This is the allowlist gate before an id reaches a REST path.
@@ -6589,10 +6597,19 @@ def _azure_states(site_key, project, wtype):
     """The ordered [{name, category}] a (project, work-item-type) can be in, from
     the states API, cached. [] when the call fails or is unavailable, so the
     caller falls back to the static name map (category) or offers no status
-    options (XERK-138). Best-effort and total."""
+    options (XERK-138). Best-effort and total.
+
+    The metastate rides each entry as **`category`** — that is the field name in
+    the API's own WorkItemStateColor ({name, color, category}), unchanged from
+    api-version 4.1 through 7.2. Reading `stateCategory` instead matched nothing
+    on every real org, so this returned [] always: the panel's Status row lost
+    its Change button, every drag refused with "nothing can move it to …", and
+    _azure_category silently fell back to the static name map (XERK-250). The
+    older spelling is still tolerated, but `category` is the contract."""
     ck = ("states", site_key, project or "", wtype or "")
-    if ck in _AZDO_STATE_CACHE:
-        return _AZDO_STATE_CACHE[ck]
+    hit = _AZDO_STATE_CACHE.get(ck)
+    if hit is not None and (hit[0] or time.time() < hit[1]):
+        return hit[0]
     out = []
     if project and wtype:
         try:
@@ -6601,12 +6618,12 @@ def _azure_states(site_key, project, wtype):
                 f"{urllib.parse.quote(wtype)}/states", {})
             for s in data.get("value") or []:
                 name = str(s.get("name") or "").strip()
-                cat = str(s.get("stateCategory") or "").strip().lower()
+                cat = str(s.get("category") or s.get("stateCategory") or "").strip().lower()
                 if name and cat in _AZDO_META_CATEGORY:
                     out.append({"name": name, "category": _AZDO_META_CATEGORY[cat]})
         except Exception as e:
             log(f"azure states fetch failed for {project}/{wtype}: {e}")
-    _AZDO_STATE_CACHE[ck] = out
+    _AZDO_STATE_CACHE[ck] = (out, time.time() + AZDO_STATE_RETRY_SEC)
     return out
 
 
@@ -7335,7 +7352,9 @@ _COLUMN_LABEL = {"todo": "To Do", "inprogress": "In Progress",
                  "review": "In Review", "done": "Done"}
 # The In Review column is carved out of `inprogress` by the status NAME, matched
 # on word boundaries — mirrors board.js REVIEW_STATUS_RE / isReviewStatus exactly.
-_REVIEW_STATUS_RE = re.compile(r"\b(review|reviewing|testing|test|qa)\b", re.I)
+# `resolved` is Azure DevOps' own "fixed, not yet verified" state (XERK-250); the
+# rationale for placing it by name lives on board.js's copy.
+_REVIEW_STATUS_RE = re.compile(r"\b(review|reviewing|testing|test|qa|resolved)\b", re.I)
 
 
 def _board_column(name, category):
