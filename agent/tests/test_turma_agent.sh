@@ -353,5 +353,74 @@ case "$out" in
   *)             fail "launcher did not reach preflight with HOME unset: $out" ;;
 esac
 
+# --- Case 11: every start is an update check (XERK-254) ----------------------
+# A restart — an operator's, systemd's after a crash, a host reboot — is the
+# moment to be running current code, so the launcher fires the same updater the
+# hourly timer runs. It must be DETACHED: it does network I/O against GitHub and
+# the npm registry, and a start that waits on those is a start an unreachable
+# network can hold up indefinitely, while the whole point of the agent is to be
+# up and heartbeating.
+echo "case: the run path fires the update check, detached"
+# Stands in for the real updater: records its args, then blocks for longer than
+# a launcher start takes — so a launcher that WAITED for it would never reach
+# the manager, which is exactly what the next assertion catches.
+cat > "$PREFIX/bin/turma-agent-update" <<STUB
+#!/bin/sh
+echo "update \$*" >> "$WORK/boot-update.log"
+sleep 20
+STUB
+chmod +x "$PREFIX/bin/turma-agent-update"
+: > "$WORK/boot-update.log"
+rm -f "$WORK/manager.log"
+PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run5.log" 2>&1 &
+if wait_for logged "update --boot" "$WORK/boot-update.log"; then
+  ok "fired turma-agent-update --boot on start"
+else
+  fail "no update check on start: $(cat "$WORK/run5.log")"
+fi
+if wait_for file_has_content "$WORK/manager.log"; then
+  ok "manager started anyway — the check never blocks the boot"
+else
+  fail "the manager never started; the update check blocked it"
+fi
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent-update" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 12: TURMA_BOOT_UPDATE=0 opts out -----------------------------------
+# For a prefix someone is editing in place, which the updater would otherwise
+# overwrite with the latest release.
+echo "case: TURMA_BOOT_UPDATE=0 suppresses the check"
+: > "$WORK/boot-update.log"
+rm -f "$WORK/manager.log"
+TURMA_BOOT_UPDATE=0 PATH="$WORK/stub-bin:$PATH" setsid \
+  "$PREFIX/bin/turma-agent" >"$WORK/run6.log" 2>&1 &
+if wait_for file_has_content "$WORK/manager.log"; then
+  sleep 0.5
+  if [ -s "$WORK/boot-update.log" ]; then
+    fail "ran the update check despite TURMA_BOOT_UPDATE=0"
+  else
+    ok "no update check when opted out"
+  fi
+else
+  fail "manager never started: $(cat "$WORK/run6.log")"
+fi
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 13: --preflight never updates --------------------------------------
+# install.sh --verify calls it. A report is a report: it must not go and rewrite
+# the very prefix the installer is in the middle of verifying.
+echo "case: --preflight runs no update check"
+: > "$WORK/boot-update.log"
+PATH="$WORK/stub-bin:$PATH" timeout 10 \
+  "$PREFIX/bin/turma-agent" --preflight >"$WORK/pre3.log" 2>&1 || true
+if [ -s "$WORK/boot-update.log" ]; then
+  fail "--preflight triggered an update ($(cat "$WORK/boot-update.log"))"
+else
+  ok "--preflight only reports"
+fi
+rm -f "$PREFIX/bin/turma-agent-update"
+
 if [ "$FAILED" = 0 ]; then echo "all turma-agent launcher tests passed"; else echo "FAILURES"; fi
 exit "$FAILED"

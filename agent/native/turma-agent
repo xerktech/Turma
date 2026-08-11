@@ -224,6 +224,35 @@ fi
 
 report_creds
 
+# ---- update check on every start (XERK-254) --------------------------------
+# A restart — an operator's, systemd's after a crash, the hub's, a host reboot —
+# is the moment to be running current code, so every start fires the same
+# updater the hourly timer runs: it bumps Claude Code and, when a newer native
+# build exists, swaps this install and restarts the manager (sessions survive,
+# see resume_on_boot).
+#
+# DETACHED, never inline, for two reasons:
+#   * it does network I/O against GitHub and the npm registry, and a start that
+#     waits on those is a start an unreachable network can hold up indefinitely
+#     — the agent must come up and heartbeat regardless;
+#   * a successful self-update restarts this very unit, so it has to be outside
+#     the process tree that restart tears down. setsid + KillMode=process is
+#     what lets it survive to finish the swap it started.
+# --boot rate-limits itself (see boot_throttled) so a crash-looping unit can't
+# turn Restart=always into an update check every five seconds.
+#
+# Placed BEFORE the credential gate below on purpose: a host idling for want of
+# a Claude login is exactly a host that should still be picking up new builds,
+# and a MISSING claude is something this check installs rather than reports.
+# TURMA_BOOT_UPDATE=0 opts out (a checkout you are editing in place).
+if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]; then
+  echo "[turma-agent] checking for agent + Claude Code updates (detached)"
+  # The updater logs to this file itself; create the dir here because the
+  # redirect below is evaluated by THIS shell, before it ever runs.
+  mkdir -p "$HOME/.turma" 2>/dev/null || true
+  setsid "$SELF_DIR/turma-agent-update" --boot >>"$HOME/.turma/update.log" 2>&1 &
+fi
+
 # The one fatal check: Remote Control needs a subscription OAuth login. Idle
 # rather than crash-loop, so a systemd service self-heals the moment the user
 # logs in on the host without needing a manual restart.

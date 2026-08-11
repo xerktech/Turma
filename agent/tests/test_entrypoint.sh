@@ -70,13 +70,41 @@ for cli in aws az terraform; do
     > "$WORK/$cli"
 done
 
+# Stand-ins for the Claude Code update check (XERK-254). The real image bakes
+# claude at build time and has a real npm; both are stubbed so the case observes
+# the DECISION without reaching the npm registry — and so a test run can never
+# install anything. Driven by STUB_CLAUDE_VERSION / STUB_NPM_LATEST.
+cat > "$WORK/claude" <<'STUB'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "${STUB_CLAUDE_VERSION:-1.0.0} (Claude Code)"; exit 0; }
+exit 2
+STUB
+cat > "$WORK/npm" <<'STUB'
+#!/bin/sh
+case "$1 $2" in
+  "view @anthropic-ai/claude-code")
+    # A registry that never answers, for the does-it-block case.
+    [ -n "${STUB_NPM_HANG:-}" ] && sleep "$STUB_NPM_HANG"
+    [ -n "${STUB_NPM_LATEST:-}" ] || exit 1
+    echo "$STUB_NPM_LATEST" ;;
+  "install -g")
+    echo "NPMINSTALL $*"
+    # What a real install changes, so the version echoed afterwards moves.
+    STUB_CLAUDE_VERSION="${STUB_NPM_LATEST}"; export STUB_CLAUDE_VERSION ;;
+  *) exit 2 ;;
+esac
+STUB
+
 cat > "$WORK/Dockerfile" <<'DOCKERFILE'
 FROM node:24-bookworm-slim
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY python3 /usr/local/bin/python3
 COPY hub-agent.py tunnel-agent.js aws az terraform /usr/local/bin/
+# Last, so they shadow the base image's real npm.
+COPY claude npm /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/python3 \
-      /usr/local/bin/aws /usr/local/bin/az /usr/local/bin/terraform
+      /usr/local/bin/aws /usr/local/bin/az /usr/local/bin/terraform \
+      /usr/local/bin/claude /usr/local/bin/npm
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 DOCKERFILE
 
@@ -324,6 +352,73 @@ if echo "$out" | grep -q "tunnel-agent exited; restarting"; then
   echo "  ok: the restart is logged"
 else
   echo "  FAIL: no restart log line"; FAILED=1
+fi
+
+# --- Case 11: Claude Code is updated on every start (XERK-254) ---------------
+# The container cannot self-update — it IS the image, and an image pull is what
+# brings it back through this code — but the Claude Code baked in at build time
+# then ages for the life of the tag. These cases pin the decision: only when the
+# registry really has something newer, never a downgrade, and never at all when
+# the operator has pinned it.
+#
+# STUB_MANAGER_SLEEP keeps the container alive past the backgrounded check, which
+# is the only reason its output lands in the same capture.
+echo "== case: a newer published Claude Code is installed at boot"
+make_fixture "$WORK/fx11" 0 0
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9)"
+if echo "$out" | grep -q "NPMINSTALL install -g @anthropic-ai/claude-code@2.0.9"; then
+  echo "  ok: installed the newer version"
+else
+  echo "  FAIL: no claude install at boot — the bundled version would age forever"; FAILED=1
+fi
+
+echo "== case: an already-current Claude Code is a no-op"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.9 -e STUB_NPM_LATEST=2.0.9)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: reinstalled an up-to-date claude on every container start"; FAILED=1
+else
+  echo "  ok: nothing installed"
+fi
+
+echo "== case: an installed version ahead of the registry is not downgraded"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.1.0 -e STUB_NPM_LATEST=2.0.9)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: downgraded a hand-pinned/unpublished claude"; FAILED=1
+else
+  echo "  ok: left the newer install alone"
+fi
+
+echo "== case: an unreachable registry leaves the install alone"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.1)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: installed something with no answer from the registry"; FAILED=1
+else
+  echo "  ok: stayed put"
+fi
+
+echo "== case: TURMA_CLAUDE_AUTO_UPDATE=0 pins the image's bundled version"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e TURMA_CLAUDE_AUTO_UPDATE=0)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: updated claude despite TURMA_CLAUDE_AUTO_UPDATE=0"; FAILED=1
+else
+  echo "  ok: pinned"
+fi
+
+echo "== case: the check never delays the manager"
+# The whole reason it is backgrounded: an npm registry that hangs must not hold
+# up the container's boot. A `view` that blocks for longer than the manager's
+# whole lifetime here proves the manager doesn't wait for it.
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=3 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_HANG=30)"
+if echo "$out" | grep -q "MANAGER uid="; then
+  echo "  ok: the manager started while the check was still hanging"
+else
+  echo "  FAIL: a hanging registry blocked the container's boot"; FAILED=1
 fi
 
 echo

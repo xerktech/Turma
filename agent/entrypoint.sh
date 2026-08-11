@@ -154,6 +154,64 @@ if [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; then
   fi
 fi
 
+# --- Claude Code update on every start (XERK-254) --------------------------
+# The native launcher fires its updater on every start; this is the container's
+# half of the same rule, and it covers ONE of the two things that updater does.
+#
+# The agent itself cannot self-update here: it IS the image, so its update is an
+# image pull (Watchtower, per DockerOps) followed by a recreate — which is what
+# brings us through this code again. Claude Code, though, is baked in at build
+# time (CLAUDE_CODE_VERSION in agent/Dockerfile) and then frozen for the life of
+# the tag, so a host that only ever pulls a carried-forward agent image runs a
+# Claude Code that keeps aging. This closes that half.
+#
+# As root, BEFORE the manager starts: `npm install -g` writes /usr/local, which
+# the dropped identity cannot. The result is world-readable, so the sessions —
+# which run as that dropped identity — execute it fine.
+#
+# BACKGROUNDED, so a slow or unreachable npm registry delays no boot. The cost
+# is a race: sessions relaunched by resume_on_boot in the next few seconds may
+# start on the old version and pick the new one up on their next launch. That is
+# the right trade — blocking here would hold every session on this host hostage
+# to registry latency, and the version they run is never wrong, only behind.
+#
+# TURMA_CLAUDE_AUTO_UPDATE=0 pins the image's bundled version.
+if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
+   && { [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; } \
+   && command -v npm >/dev/null 2>&1; then
+  (
+    # Run against a throwaway HOME. /root is the operator's bind mount: npm
+    # would leave a cache of tarballs nothing reads later (the Dockerfile
+    # deletes them for the same reason), and anything `claude` touches on the
+    # way to printing its version would land there ROOT-owned on a host whose
+    # sessions run as somebody else — re-creating, one file at a time, the
+    # breakage the identity block exists to end.
+    export HOME=/tmp/.turma-claude-update
+    export npm_config_cache="$HOME/npm"
+    mkdir -p "$HOME"
+    cur="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+    latest="$(npm view @anthropic-ai/claude-code version 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$latest" ]; then
+      echo "[entrypoint] claude: registry unreachable; staying at ${cur:-unknown}"
+    elif [ -n "$cur" ] && [ "$cur" = "$latest" ]; then
+      echo "[entrypoint] claude up to date ($cur)"
+    elif [ -n "$cur" ] \
+         && [ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" = "$cur" ]; then
+      # Installed is NEWER than the registry's latest — a version pinned by hand
+      # or an unpublished build. Never downgrade it.
+      echo "[entrypoint] claude: installed $cur is ahead of published $latest; leaving it"
+    else
+      echo "[entrypoint] claude update: ${cur:-none} -> $latest"
+      if npm install -g "@anthropic-ai/claude-code@$latest"; then
+        echo "[entrypoint] claude: now $(claude --version 2>/dev/null || echo '?')"
+      else
+        echo "[entrypoint] claude: update FAILED; staying at ${cur:-none}"
+      fi
+    fi
+    rm -rf /tmp/.turma-claude-update
+  ) &
+fi
+
 # --- GitHub auth preflight (agent-agnostic) --------------------------------
 # git authenticates through the image's system credential helper
 # (`gh auth git-credential`, set in /etc/gitconfig), so private clone/fetch/push

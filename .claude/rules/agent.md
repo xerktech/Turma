@@ -454,6 +454,14 @@ See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_se
 - Creds preflight, then launches the tunnel (a simple respawn loop, XERK-34) and `exec`s the session
   manager as PID 1 — the container stays up with zero sessions. Uid resolution is in `CLAUDE.md`'s
   "Run-as identity". Tests: `test_entrypoint.sh`.
+- **Every start re-checks Claude Code** (XERK-254), otherwise frozen at the image's
+  `CLAUDE_CODE_VERSION` for the life of the tag. The agent can't self-update here — it IS the image,
+  and the Watchtower pull's recreate is what re-runs this code. A version COMPARE (a blind `npm i -g
+  @latest` would replace the package under live sessions every boot), never a downgrade, unreachable
+  registry = stay put. As **root** (only root writes `/usr/local`) under a **throwaway `HOME`**, so
+  npm's cache and claude's own writes can't land root-owned in the bind-mounted `/root`.
+  **Backgrounded**, so a slow registry delays no boot — at the cost of sessions relaunched seconds
+  later starting on the old version. `TURMA_CLAUDE_AUTO_UPDATE=0` pins it.
 - **Cloud CLIs** (terraform/`az`/`aws`, pinned via
   `TERRAFORM_VERSION`/`AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`) live in the
   `tooling` stage, so **every tier carries them and the CI scan covers them** — they are
