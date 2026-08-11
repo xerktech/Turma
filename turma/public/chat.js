@@ -8,7 +8,7 @@
 // verbosity preset (Concise hides thinking + tool actions entirely; Normal adds
 // tool cards with collapsed output; Verbose expands everything) picks how much
 // of each turn is shown. Ported in spirit from the glasses client (glasses/src/live.ts,
-// transcript.ts, reveal.ts) into framework-free, build-free browser JS.
+// transcript.ts) into framework-free, build-free browser JS.
 //
 // Reads a few shared helpers from the page's inline script (same classic-script
 // global scope): esc(), enc(), cache, sessTitle(), sessMeta(), fastPoll().

@@ -14,7 +14,6 @@ import {
   sessionContentLines,
   sessionTranscriptArea,
   SESSION_SCROLL_STEP,
-  LIVE_TURN_ID,
   type HomeRow,
   type SessionFocus,
 } from "./render.ts";
