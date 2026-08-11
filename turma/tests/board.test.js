@@ -1875,14 +1875,21 @@ test("board: nothing anywhere in app.css re-stacks the status columns", () => {
   }
 });
 
-test("board: the phone columns keep their share of the viewport", () => {
-  // The base rule's readable floor must be released inside the phone block, or
-  // it beats the 82% basis on a small phone and eats the next column's peek.
-  const phone = rulesFor("kanban-col").filter(([sel]) => /kanban-col(?![\w-])/.test(sel));
-  const flexed = phone.filter(([, b]) => /flex:\s*0\s+0\s+82%/.test(b));
-  assert.equal(flexed.length, 1, "expected exactly one 82%-basis column rule (the phone one)");
-  assert.match(flexed[0][1], /min-width:\s*0/,
-    "the phone column must release the base rule's min-width floor");
+test("board: a column is one fixed width at every viewport", () => {
+  // Fixed, not fluid: the column must not grow into a wide board or shrink as
+  // the window narrows, and no media query may re-size it — a card is the same
+  // size on a phone as on a desktop, and 300px is Android's `.width(300.dp)`.
+  const rules = rulesFor("kanban-col").filter(([sel]) => /\.kanban-col(?![\w-])/.test(sel));
+  assert.ok(rules.length, "no .kanban-col rule in app.css");
+  const sized = rules.filter(([, b]) => /(?:^|;)\s*flex\s*:/.test(b));
+  assert.equal(sized.length, 1, "the column's width must be set in exactly one place");
+  assert.match(sized[0][1], /flex:\s*0\s+0\s+300px/, "the column must be a fixed 300px");
+  assert.match(sized[0][1], /min-width:\s*0/,
+    "without this a long card widens the column past its fixed width");
+  for (const [sel, body] of rules) {
+    assert.doesNotMatch(body, /(?:^|;)\s*width:/, `\`${sel}\` re-sizes the column`);
+    assert.doesNotMatch(body, /flex-basis:/, `\`${sel}\` re-sizes the column`);
+  }
 });
 
 test("board: the strip carries the id preserveScroll anchors its sideways scroll to", () => {

@@ -394,11 +394,16 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   overflow-x: auto; overscroll-behavior-x: contain;
   padding: 6px; margin: -6px -6px 0; scroll-padding: 6px;
 }
-/* Share out a wide board, give a little on a narrower one, but never shrink past
-   a readable floor — that floor is what turns a cramped viewport into a sideways
-   scroll rather than a squeeze. The explicit `min-width` also replaces a flex
-   item's automatic min-content minimum, so one long card can't widen a column. */
-.kanban-col { flex: 1 1 260px; min-width: 240px; }
+/* A column is a FIXED 300px at every viewport — it does not grow into a wide
+   board and does not shrink as the window narrows, so a card is the same size in
+   the hand as on the desk and the board never re-flows under you. 300 is
+   Android's `.width(300.dp)`, which makes the two surfaces the same layout and
+   not merely the same shape. Four of them exceed the 1180px content column, so
+   the desktop board scrolls a little even at full width: that is the intended
+   trade, not a fallback. `min-width: 0` replaces a flex item's automatic
+   min-content minimum, which would otherwise let one long card widen a column
+   past 300 and undo the whole point. */
+.kanban-col { flex: 0 0 300px; min-width: 0; }
 .kanban-col .kc-head {
   font-weight: 600; font-size: 13px; color: var(--ink-2);
   padding: 2px 4px 8px; display: flex; align-items: center; gap: 8px;
@@ -542,9 +547,9 @@ body.kc-drag-on { user-select: none; -webkit-user-select: none; }
 body.kc-drag-on .kanban-card { touch-action: none; }
 
 /* On phones the strip the base rule already lays out gets swipe manners and a
-   per-column vertical scroll (XERK-24). Four columns across a ~390px screen
-   would crush the cards, so each takes a comfortable share of the viewport and
-   the row scroll-snaps; a peek of the next column signals that it swipes.
+   per-column vertical scroll (XERK-24). The column keeps its fixed 300px here
+   too — on a typical phone that still leaves a peek of the next one, which is
+   what signals the row swipes — and the row scroll-snaps to it.
    Each column's card list scrolls vertically, capped to roughly a viewport minus
    the header/toolbar/bottom-nav chrome. The estimate is deliberately rough —
    being a little off only trades a touch of page scroll for a touch of unused
@@ -553,11 +558,8 @@ body.kc-drag-on .kanban-card { touch-action: none; }
    browsers without `dvh`. */
 @media (max-width: 560px) {
   .kanban-cols { gap: 10px; scroll-snap-type: x proximity; }
-  /* The `min-width: 0` releases the base rule's readable floor: here the column
-     is already a share of the viewport, and on a small phone that floor would
-     otherwise win and eat the peek of the next column this layout is built on. */
   .kanban-col {
-    flex: 0 0 82%; min-width: 0; scroll-snap-align: start;
+    scroll-snap-align: start;
     display: flex; flex-direction: column;
   }
   .kanban-col .kc-head { padding: 2px 2px 6px; }
