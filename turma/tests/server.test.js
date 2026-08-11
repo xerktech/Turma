@@ -6493,7 +6493,13 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
   assert.equal(long.model.length, 60);
   const astral = norm({ available: true, model: "x".repeat(59) + "😀" + "tail" });
   assert.equal([...astral.model].length, 60);
-  assert.ok(astral.model.isWellFormed(), "a lone surrogate reached the clients");
+  assert.ok(astral.model.isWellFormed(), "the cut manufactured a lone surrogate");
+  // ...and one that ARRIVES that way is replaced, not passed through. Either
+  // direction kills uiautomator, so the guarantee has to cover both.
+  for (const evil of ["qwen\uD83Dcoder", "abc\uDE00def", "x".repeat(59) + "\uD83Dtail"]) {
+    assert.ok(norm({ available: true, model: evil }).model.isWellFormed(),
+      `a lone surrogate survived: ${JSON.stringify(evil)}`);
+  }
 
   // Not an object at all -> null, which every client reads as "cannot fail over".
   assert.equal(norm("yes"), null);

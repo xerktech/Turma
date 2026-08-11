@@ -12,6 +12,7 @@ import com.xerktech.turma.net.MigrateRequest
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.OkResponse
+import com.xerktech.turma.net.hubErrorMessage
 import com.xerktech.turma.net.ResumeRequest
 import com.xerktech.turma.net.SpawnRequest
 import com.xerktech.turma.net.SummaryRequest
@@ -66,7 +67,11 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
                 val r = block()
                 if (r.error.isNotEmpty()) "✗ ${r.error}" else "✓ $ok"
             } catch (e: Exception) {
-                "✗ hub unreachable"
+                // Prefer the hub's OWN reason when it gave one (XERK-246): a
+                // refused spawn — "host has no local model configured" on a 409
+                // — used to read "hub unreachable", which is both wrong and
+                // unactionable. Only a genuinely unanswered request says that.
+                "✗ " + (hubErrorMessage(e) ?: "hub unreachable")
             }
             _messages.tryEmit(msg)
             container.fleet.nudge()

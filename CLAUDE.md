@@ -224,17 +224,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
-  - **Every HOST-LEVEL block Android decodes into typed fields is coerced at hub ingest** —
-    `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel` — and a new one needs the same.
-    `/api/agents` decodes ATOMICALLY on Android, so one buggy host's wrong-typed field throws for
-    the whole array and every OTHER host vanishes from that phone, silently: the full refresh fails
-    while the tile still says "N / N online". Coerce to the "can't tell you" value every client
-    already handles, never to a plausible default; a `normalize*` is a whitelist, so adding a
-    sub-key to a block means adding it there too or it is dropped fleet-wide.
-    - **Per-SESSION fields have no such coercion** (`model`, `permissionMode`, `modelSource`,
-      `ttydPort`, …), so an object or array in one is the same fleet-wide freeze. Lenient decoding
-      absorbs the common cases (a number or bool in a String field decodes fine), and only the agent
-      writes these — but do not read the host-level rule as covering them.
+  - **`/api/agents` decodes ATOMICALLY on Android**, so one host's wrong-typed field throws for the
+    whole array and every OTHER host vanishes from that phone — silently, since the app keeps its
+    last good snapshot and the tile still says "N / N online". **Exactly three blocks are coerced at
+    ingest today** (`normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`); everything else,
+    host-level blocks included, is served raw, so this is a live hazard rather than a solved one.
+    Give a new typed block a `normalize*`, and coerce to the "can't tell you" value every client
+    already handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer
+    agent adds is dropped fleet-wide unless it is added there too.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 

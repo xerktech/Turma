@@ -14,17 +14,20 @@ actually run on, where several of its recipes do not apply as written.
 
 Turma runs its fleet two ways, and they are not interchangeable:
 
-| | agent container | TrueNAS native (this host) |
-|---|---|---|
-| `npm` / `npx` | on PATH | **not on PATH** — see below |
-| `java`, `gradle`, Android SDK | bundled | **absent** |
-| `apt`, writable `/usr` | yes | **no** — read-only, no sudo |
-| `ps` / `pkill` | absent | present |
-| `~/.claude`, `~/.turma` | bind mounts | the operator's real ones |
+| | agent container | TrueNAS native | WSL workstation (`MaxAI`) |
+|---|---|---|---|
+| `npm` / `npx` | on PATH | **not on PATH** — see below | on PATH |
+| `java`, `gradle`, Android SDK | bundled | **absent** | **installed** — see §2.5 |
+| emulator / `adb` | only the `:emulator` tag | absent | **a running AVD** |
+| `apt`, writable `/usr` | yes | **no** — read-only, no sudo | yes, with sudo |
+| `ps` / `pkill` | absent | present | present |
+| `~/.claude`, `~/.turma` | bind mounts | the operator's real ones | the operator's real ones |
 
-Check with `which java gradle npm` before you plan anything. Assuming the
+Check with `which java gradle npm adb` before you plan anything. Assuming the
 container's toolchain on a native host is the single most common way to waste
-a QA session.
+a QA session — and assuming the TrueNAS host's *absences* on the WSL
+workstation is the second, because it sends you into a docker pull and an
+emulator download you don't need.
 
 ### Native-host facts
 
@@ -314,7 +317,80 @@ Driving it:
 
 There is **no committed gradle wrapper** — CI generates it.
 `.github/workflows/android-ci.yml` is the reliable spec for how this is really
-built; read it before inventing your own invocation.
+built; read it before inventing your own invocation. That workflow runs
+`:app:testDebugUnitTest` + `:app:assembleDebug` and **nothing else** — no lint,
+no ktlint, no instrumented source set — so a rule living inside a `@Composable`
+or a ViewModel call site has **no gate at all**. Read the count out of
+`app/build/test-results/testDebugUnitTest/TEST-*.xml`; it moves every ticket.
+
+#### On the WSL workstation, build and drive natively — no container
+
+```bash
+export JAVA_HOME=~/tools/jdk-17.0.20+8 ANDROID_HOME=~/Android/Sdk
+export PATH=~/tools/gradle-8.11.1/bin:$JAVA_HOME/bin:~/Android/Sdk/platform-tools:$PATH
+cd android && gradle --no-daemon :app:testDebugUnitTest --rerun :app:assembleDebug
+adb -s <device> install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+`--rerun` is not optional for a mutation test: without it Gradle says
+`UP-TO-DATE`, nothing executes, and **every mutation reads as caught**. Same
+trap as the container's `FROM-CACHE`, different wording.
+
+**Stand up your own AVD.** The shared `turma228` is used by other sessions whose
+apps steal the foreground every 30–60s and which have force-stopped
+`com.xerktech.turma` outright (`adb logcat -b events | grep am_kill`) — that
+looks exactly like your app crashing.
+
+```bash
+echo no | avdmanager create avd -n qa-<ticket> -k "system-images;android-35;google_apis;x86_64" -d pixel_6
+emulator -avd qa-<ticket> -no-window -no-audio -no-boot-anim -port 5556
+```
+
+A second instance of an AVD already running is refused unless the first was
+started `-read-only`, which is why you cannot simply reuse the shared one.
+
+- **Re-focus with `am start -f 0x20000`** (REORDER_TO_FRONT), which returns you
+  to the last SCREEN, not a tab. A plain `am start` pushes a new `MainActivity`
+  and resets the Compose nav stack to the dashboard, silently losing the screen
+  under test.
+- **Guard every tap on `dumpsys activity activities | grep topResumedActivity`.**
+  A tap resolved from one app's dump and delivered to another lands wherever
+  that app put it — one such stray tap opened a package-manager "Uninstall
+  Turma?" dialog.
+- Resolve targets from `uiautomator dump`, never screenshot pixels: the
+  compose-bar chips reflow as their labels change width. Match `content-desc`
+  where there is one, and **match exactly** — a substring `Sessions` hits
+  `RUNNING SESSIONS` first. Snackbars live ~3s, so poll at t+2s.
+- `ExposedDropdownMenuBox` opens on its **trailing caret**, not the field body.
+- **A lone surrogate anywhere in the payload makes `uiautomator dump` return an
+  empty file** (`KXmlSerializer … Illegal character`). The hub coerces the one
+  field that could manufacture one (`normalizeLocalModel`), but not one that
+  arrives in a rogue agent's input.
+- **`ChatViewModel` is scoped to the chat's nav back-stack entry**, so all of its
+  in-memory state dies when you leave that screen (backgrounding does not).
+  Anything that must survive lives in `AppContainer` — `container.drafts`,
+  `container.modelSwitches`. Check which before calling a "the value springs
+  back" report a logic bug.
+
+#### Standing a hub up for the app to talk to
+
+Run the real `turma/server.js` on scratch `STATE_FILE`/`ARCHIVE_DIR`/
+`ARCHIVE_DB`, POST synthetic `/api/heartbeat`s every ~3s to keep hosts online,
+and point the app at `http://10.0.2.2:<port>`.
+
+- **Put a logging HTTP proxy in front of it.** The heartbeat RESPONSE drains the
+  command queue, so polling `/api/agents` for `commands` misses what a tap
+  actually sent; a proxy logging method + path + body is the only reliable
+  record, and it is how you inject 409/500/socket-drop to reach the error paths.
+  It must handle `upgrade` (raw socket pipe) or the live-tail WebSocket dies,
+  and must `pipe()` responses or SSE hangs.
+- Delay the first heartbeat ~2.5s; `server.js` is not listening instantly.
+- **Kill previous passes' rigs first** (`/proc/*/cmdline` matching
+  `turma/server.js` under your worktree). Stale beat loops from an earlier pass
+  keep overwriting your hosts and quietly contaminate the evidence.
+- A host the app has decoded once stays in its `byKey` map, so **re-probing a
+  malformed payload under a name the app has already seen hides the failure** —
+  use a fresh host name for every decode probe.
 
 ---
 
@@ -581,6 +657,37 @@ act on every time.
   a session only when its LAST `/live` viewer disconnects, so one browser socket
   the page has lost track of pins the agent's ~1s transcript tail on forever.
   Count sockets opened and still-open after leaving the stage.
+- **Whether the branch still merges, and what the careless resolution costs.**
+  `git merge-tree --write-tree HEAD origin/main` finds the conflicts (it exits 1
+  on one); then run the *wrong* side of each hunk as a mutation. XERK-246
+  conflicted on a single `_state.update` line where taking `main`'s side drops
+  one field and permanently hides two controls — with the whole suite green.
+  A branch verified only at its own tip is not verified. `qa.md` is the file
+  most likely to conflict; a "take theirs" there silently deletes a pass's notes.
+- **Boundaries asserted relative to the constant they test.** A TTL check written
+  `now = at + SETTLE_MS + 1` bounds the constant from below only: raising it to
+  16.7 hours keeps the test green, which is the exact failure the constant
+  exists to prevent. Assert one side with a literal.
+- **Which heartbeat fields are actually coerced at ingest.** Only three —
+  `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`. Every other
+  host-level block Android types (`capacity`, `github`, `models`, `jira`,
+  `claudeAuth`, `closedSessions`, …) and every per-session field is raw, and an
+  object or array in any of them throws for the WHOLE `/api/agents` array.
+  A `normalize*` is also a WHITELIST: a sub-key a newer agent adds is dropped
+  fleet-wide with nothing failing. Two-line repro in §6.2.
+
+Mutation-testing mechanics, since a broken harness reads as a passing one:
+
+- Force the tests to actually run (`--rerun`, or `--rerun-tasks` in the
+  container) — an `UP-TO-DATE`/`FROM-CACHE` result makes every mutation "caught".
+- `git checkout -- <path>` resolves relative to the `-C` root, not your cwd. A
+  silently failed revert leaves the previous mutation in the tree and the NEXT
+  one then reads as caught. Verify with `git status` after every revert, and
+  mutate a scratch copy rather than the repo.
+- On `android/`, survivors cluster in exactly two places and neither is a
+  surprise: **Composable bodies** (no instrumented source set) and **ViewModel
+  call sites** (no Robolectric, no coroutine-test harness). A pure `core/` rule
+  with a test is gated; the CALL to it is not.
 - Type validation on hub routes: `!body.repo` passes an object; a non-string
   `model` coerced to `""` silently *released* a pin.
 - The two mirrors of any rule (`liveState` in `index.html` vs `sessions.html`,
@@ -647,6 +754,28 @@ are holding. Re-confirm with the same script on both before you spend time.
   Deleting the call leaves all 455 vitest tests green while a scrolled-up view
   gets yanked down by a growing live turn. The behaviour is correct on both
   `main` and HEAD — it is the coverage that is missing.
+- **One malformed host costs the phone every OTHER host, silently.** Decoding
+  `/api/agents` is atomic on Android, so an object/array in any uncoerced field
+  throws for the whole array; `FleetRepository.refresh` catches it into
+  `FleetState.error`, but `ui/FleetScreen.kt` renders that error ONLY when the
+  fleet is empty, so the app keeps painting its last good snapshot and still
+  claims "N / N online". Per-agent SSE events decode inside `runCatching{}`, so
+  while SSE is healthy a bad host loses only itself — but every full refresh
+  throws, and a cold start then shows the reduced count with no error at all.
+  Two-line repro, no app changes needed:
+  ```
+  POST /api/heartbeat {"device":"capbad","online":true,
+        "capacity":{"maxSessions":"eight","running":1.5,"queued":0,"free":0}}
+  ```
+  Hub serves it raw; the phone silently drops `capbad`. Lenient decoding absorbs
+  a number or bool in a String field, so only object/array values do it. Use a
+  host name the app has never decoded, or its `byKey` entry hides the failure.
+- **`ChatViewModel` never starts the fleet poll**, so a process-death restore
+  straight into a chat shows no session record — header "Session", chips at
+  their defaults, no PR/ticket/source chips — and never recovers until you back
+  out to a list and re-enter. `FleetRepository.start()` is called only from
+  `FleetViewModel.start()`, i.e. from a list screen. It degrades in the safe
+  direction (controls hidden, not wrongly enabled).
 - **The board drag's edge auto-scroll is dead on a phone (≤560px).** `edgeScroll`
   nudges `scrollLeft += 18` per pointermove and `scroll-snap-type: x proximity`
   snaps it back, so a card only reaches a column already on screen (a peek is

@@ -1103,14 +1103,15 @@ function normalizeLocalModel(payload) {
     payload.localModel = { available: false, model: null, contextTokens: null };
     return;
   }
-  // Cut on CODE POINTS, not UTF-16 units: `slice(60)` through an astral pair
-  // ships a lone surrogate to every client, which is not merely a mojibake — it
-  // is unencodable, and Android's own uiautomator dies on it
-  // (KXmlSerializer "Illegal character"). Only a rogue agent gets here (a real
-  // one is bounded by LOCAL_MODEL_NAME_RE), which is this function's whole
-  // threat model.
+  // No LONE SURROGATE may leave here, from either direction. Cutting with
+  // `slice(60)` through an astral pair MANUFACTURES one, so the cut is on code
+  // points; and one already in the input is replaced rather than passed on.
+  // It is not mere mojibake — it is unencodable, and it kills Android's own
+  // uiautomator outright (`KXmlSerializer: Illegal character`), i.e. the tool a
+  // QA pass drives the app with. Only a rogue agent reaches this (a real one is
+  // bounded by LOCAL_MODEL_NAME_RE), which is this function's whole threat model.
   const name = typeof lm.model === "string"
-    ? [...lm.model.trim()].slice(0, 60).join("")
+    ? [...lm.model.trim().replace(/\p{Surrogate}/gu, "�")].slice(0, 60).join("")
     : "";
   const ctx = lm.contextTokens;
   payload.localModel = {
