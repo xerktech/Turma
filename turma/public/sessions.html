@@ -2263,10 +2263,13 @@ function navFrame(src) {
   try { $frame.contentWindow.location.replace(src); }
   catch { $frame.src = src; }
 }
+// NOT a stageTunnelReset() site, unlike the four that re-point the stage: the
+// only caller is chatToTerminal(), a VIEW TOGGLE on the session already staged.
+// Resetting here would hide the chip explaining why the terminal is dead and
+// spend the tunnel's return edge, so the iframe would never re-attach.
 function setFrame(id, s, a) {
   currentId = id;
   if (a && a.key) currentHostKey = a.key;
-  stageTunnelReset();   // a fresh subject starts with a clean tunnel state
   const src = `/term/${encodeURIComponent(id)}/`;
   document.getElementById("termTitle").textContent = s ? sessTitle(s) : id;
   document.getElementById("termPath").textContent =

@@ -140,7 +140,7 @@ Hard rules:
 
 ## 2. Building and running each component
 
-Baselines below are from `main` at v0.6 + XERK-252 (commit 05ceb86), so a deviation is
+Baselines below are from `main` at v0.6 + XERK-252 (commit 1c9e2cc), so a deviation is
 either your environment or a regression — find out which before filing.
 
 **Pin your copy on `/mnt/data`, never in the `/tmp` scratchpad.** §4 tells you to
@@ -154,7 +154,7 @@ reason `--cache` must point at `/mnt/data/tmp-qa/npm-cache`, not `/tmp`.
 
 ```bash
 export PATH=/root/.local/node/bin:$PATH
-cd turma && node --test tests/*.test.js        # baseline: 920 pass, ~6s
+cd turma && node --test tests/*.test.js        # baseline: 925 pass, ~6s
 ```
 
 Boot a real hub with everything pointed at temp paths:
@@ -180,7 +180,7 @@ for t in tests/test_*.sh; do bash "$t"; done                   # native/entrypoi
 
 **There is no pytest.** `python3 -m unittest` is the only runner.
 
-The single node command `code-scan.yml` really runs (1051 pass) — use this to
+The single node command `code-scan.yml` really runs (1056 pass) — use this to
 reproduce that gate rather than per-directory runs:
 
 ```bash
@@ -232,7 +232,7 @@ docker run --rm --entrypoint bash \
   'cd /work && gradle :app:testDebugUnitTest --no-daemon && gradle :app:assembleDebug --no-daemon'
 ```
 
-Baseline: **278 JVM unit tests**, 0 failures, and a ~21 MB
+Baseline: **281 JVM unit tests**, 0 failures, and a ~21 MB
 `app/build/outputs/apk/debug/app-debug.apk`. Per-suite counts are in
 `app/build/test-results/testDebugUnitTest/TEST-*.xml`.
 
@@ -247,6 +247,14 @@ Traps:
   `app/build.gradle.kts` pins it.
 - Kotlin does **not** treat warnings as errors here, so an import left dangling
   by a deletion compiles clean — grep for the removed symbol as well as building.
+- **There is no `app/src/androidTest`, and `android-ci.yml` runs only
+  `testDebugUnitTest` + `assembleDebug`** — no emulator, no `connectedAndroidTest`,
+  and the `androidTestImplementation` compose-ui-test deps in `build.gradle.kts`
+  are declared but unused. So **nothing can cover a Composable's body**: logic
+  that must be testable has to live in `core/` (pure Kotlin) and be called from
+  the screen. Judge an Android change on where its rule lives — a rule inline in
+  a `@Composable` has no gate at all, and deleting the CALL to a covered `core/`
+  helper is still invisible.
 - **`testDebugUnitTest` comes back `FROM-CACHE` in ~13s** when `GRADLE_USER_HOME`
   is the shared `/mnt/data/tmp-qa/gradlehome` another run already filled. That is
   a cached RESULT, not an execution — for a mutation test, or any time you must
@@ -349,6 +357,19 @@ Three things that each cost a run:
   directly.
 - A hub restart on the same port keeps the login cookie and the ws-token path
   working, so the browser stays authenticated across it.
+- **A hub booted less than 90s ago never marks a host offline.** The offline
+  sweep (`server.js`, `setInterval` at ~2421) returns early inside
+  `BOOT_GRACE_MS = 90s`, and it is the only thing that re-publishes an agent
+  after `OFFLINE_AFTER_MS` (75s) lapses — a silent host emits no heartbeat and
+  therefore no SSE event of its own. On a fresh hub the page keeps `online:true`
+  forever and anything keyed on it reads as "still up". **Warm the hub past 90s
+  before testing any host-went-away behaviour**; then the transition lands ~80s
+  after the last heartbeat.
+- **`navFrame()` uses `contentWindow.location.replace`, so the iframe's `src`
+  attribute never changes.** Reading `termFrame.src` tells you nothing about
+  whether the terminal was re-attached — count requests to `/term/<id>/` with
+  `page.on("request")` instead. (The unit-test shim DOES record `src`, which is
+  why a green test there proves nothing about the browser.)
 - Verbosity presets are plain buttons labelled `Concise`/`Normal`/`Verbose`;
   a thinking trace renders as `<details class="thought">` (not `.think*`), and
   `renderInline` supports **code spans and links only — there is no bold/italic**,

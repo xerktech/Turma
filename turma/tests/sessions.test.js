@@ -863,6 +863,26 @@ test("narrowing the org filter doesn't tear the staged session off the stage", (
   assert.equal(chat.closed, closedAtOpen, "the stage keeps the session it was showing");
 });
 
+// Toggling chat -> terminal is a VIEW change on the same session, not a new
+// subject: it must not spend the tunnel's return edge. It used to, so the
+// terminal opened black (ttyd can't attach through a downed tunnel) and nothing
+// ever re-navigated it — with the chip that would have explained it also gone.
+test("toggling to the terminal during a flap keeps the chip and still re-attaches", () => {
+  const { beat, selectSession, chatToTerminal, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  chatToTerminal();
+  assert.equal(els.termTunnelOff.hidden, false, "the terminal bar still says why it's dead");
+  els.termFrame.src = "";   // forget the toggle's own (doomed) attach
+
+  beat({ now, agents: [h] });
+  assert.equal(els.termFrame.src, "/term/11111/", "the return re-attaches the terminal");
+  assert.equal(els.termTunnelOff.hidden, true);
+});
+
 // The other half of the rule: a session that genuinely went (killed elsewhere,
 // or its host stopped reporting it at all) still drops the stage.
 test("a vanished session still clears the stage", () => {
