@@ -37,7 +37,6 @@ globalThis.document = {
   addEventListener() {},
 };
 globalThis.window = { getSelection: () => selection };
-globalThis.requestAnimationFrame = () => 1;
 
 const chat = require("../public/chat.js");
 
@@ -109,69 +108,39 @@ test("a changed repaint is deferred while text is selected, then flushes", () =>
   assert.match(scroll.innerHTML, /again/);
 });
 
-test("the typewriter reveal idles while text is selected, then resumes", () => {
+// XERK-251: the live turn no longer types in — the bubble shows every character
+// the classifier accepted, the frame it arrives.
+test("the live turn paints in full, with no typewriter holding text back", () => {
   chat.__setLiveTurn("streaming answer text");
-  chat.repaint();                       // paints the (empty) live bubble, arms revealFull
-  const before = bubble.writes;
+  chat.repaint();
+  assert.match(scroll.innerHTML, /chatLiveBubble/);
+  assert.match(scroll.innerHTML, /streaming answer text/, "the whole capture is on screen at once");
 
-  // Mid-selection: the reveal must not rewrite the bubble under the reader.
-  selectInside();
-  chat.tick(1000);
-  chat.tick(1016);
-  assert.equal(bubble.writes, before, "reveal held the bubble while selecting");
-  assert.equal(chat.__revealShown(), 0, "and didn't advance past what's painted");
-
-  // Selection released: typing resumes.
-  selectNothing();
-  chat.tick(1032);
-  assert.ok(bubble.writes > before, "reveal resumed after the selection cleared");
-  assert.ok(chat.__revealShown() > 0);
-  assert.match(bubble.innerHTML, /^<span class="role">assistant<\/span>s/);
+  // A grown capture repaints the whole text again — no partial slice, ever.
+  chat.__applyTurn("streaming answer text, now longer");
+  chat.repaint();
+  assert.match(scroll.innerHTML, /streaming answer text, now longer/);
 });
 
 // XERK-19: the pane scrape's "last ● bullet" swaps between unrelated blocks as
-// tools run (prose -> Bash(…) -> Read(…) -> next prose). Each such swap must
-// snap the reveal to the new text — NOT keep typing from the previous block's
-// offset, which reads as the last line deleting and re-streaming over and over.
-test("a swap to different live-turn text snaps the reveal instead of re-typing", () => {
-  // A tool bullet, fully revealed.
-  chat.__setLiveTurn("");                       // reset shown to 0
-  chat.__setLiveTurnRaw("Bash(ls -la)");        // 12 chars
-  chat.__setRevealShown(12);                    // typed all the way out
+// tools run (prose -> Bash(…) -> Read(…) -> next prose). The classifier is what
+// keeps those swaps from reading as the last line deleting and re-appearing.
+test("a swap to different live-turn text replaces the bubble wholesale", () => {
+  chat.__setLiveTurn("Bash(ls -la)");
   chat.repaint();
 
-  // The scrape swaps to a LONGER, unrelated block (the next prose). The old
-  // length-only clamp only caught shrinks, so this one kept re-typing from 12.
-  chat.__setLiveTurnRaw("Now reading the configuration file in detail"); // 44
+  // The scrape swaps to a LONGER, unrelated block (the next prose).
+  chat.__applyTurn("Now reading the configuration file in detail");
   chat.repaint();
-  assert.equal(chat.__revealShown(), 44, "swap to longer text snaps, no re-stream");
-
-  // And a swap to a shorter, unrelated block snaps down too (not to 0).
-  chat.__setLiveTurnRaw("Read(app.js)");        // 12 chars
-  chat.repaint();
-  assert.equal(chat.__revealShown(), 12, "swap to shorter text snaps to its length");
-});
-
-// The flip side: when the SAME block genuinely grows (real streaming prose),
-// the reveal must keep its place and type only the delta, not snap.
-test("a genuine continuation of the live turn keeps typing the delta", () => {
-  chat.__setLiveTurn("");        // fresh turn: revealFull="", shown=0
-  chat.repaint();
-  chat.__setLiveTurnRaw("Hello wor");
-  chat.repaint();               // arms revealFull="Hello wor" (continuation of "")
-  chat.__setRevealShown(5);     // typewriter has revealed "Hello" so far
-
-  chat.__setLiveTurnRaw("Hello world, and here is a lot more prose");
-  chat.repaint();
-  assert.equal(chat.__revealShown(), 5, "continuation kept its place; the delta types in");
+  assert.equal(chat.__liveTurn(), "Now reading the configuration file in detail");
+  assert.match(scroll.innerHTML, /Now reading the configuration file in detail/);
+  assert.doesNotMatch(scroll.innerHTML, /ls -la/, "the previous block is gone, not merged");
 });
 
 // XERK-19 (the real fix): the `turn` frame is classified by applyTurn before it
-// ever reaches the reveal, so the pane's block-swap can't drive the bubble.
-test("a tool-use bullet clears the streaming bubble instead of showing as text", () => {
-  // Prose is streaming and partly revealed.
+// reaches the bubble, so the pane's block-swap can't drive it.
+test("a tool-use bullet clears the live bubble instead of showing as text", () => {
   chat.__applyTurn("Let me check the config");
-  chat.__setRevealShown(10);
   assert.equal(chat.__liveTurn(), "Let me check the config");
 
   // The pane's last ● bullet swaps to a tool call — the block is done, and the
@@ -191,24 +160,19 @@ test("a tool-use bullet clears the streaming bubble instead of showing as text",
 
 test("the same prose block grows, but a shorter re-capture never shrinks it", () => {
   chat.__applyTurn("Here's the plan");           // 15
-  chat.__setRevealShown(15);                      // fully typed out
   chat.__applyTurn("Here's the plan, step one");  // 25 — same block, grew
   assert.equal(chat.__liveTurn(), "Here's the plan, step one", "grows to the longer capture");
-  assert.equal(chat.__revealShown(), 15, "kept its place; only the delta types");
 
   // A partial re-capture of the same block (the TUI redrew mid-frame) must be
   // ignored — shrinking then re-growing is the char-level flicker.
   chat.__applyTurn("Here's the");
   assert.equal(chat.__liveTurn(), "Here's the plan, step one", "held the longer text");
-  assert.equal(chat.__revealShown(), 15, "reveal offset untouched");
 });
 
-test("a genuinely different prose block retypes from zero", () => {
+test("a genuinely different prose block replaces the previous one", () => {
   chat.__applyTurn("First block of prose");
-  chat.__setRevealShown(21);
   chat.__applyTurn("An unrelated second block");   // shares no prefix
   assert.equal(chat.__liveTurn(), "An unrelated second block");
-  assert.equal(chat.__revealShown(), 0, "new block types in from the start, not a stale offset");
 });
 
 test("isToolBullet matches tool calls, not prose", () => {

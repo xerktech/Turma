@@ -3,7 +3,8 @@
 // terminal" as the default running-session view: it opens the hub's live
 // transcript WebSocket (/live/<host>/<id>), renders the session as chat bubbles
 // (user right, agent left) plus collapsible tool-action cards + thinking traces,
-// and streams the in-progress turn with a typewriter reveal. A three-way
+// and shows the in-progress turn as a trailing bubble that updates in place
+// (text appears as it arrives — no typewriter, XERK-251). A three-way
 // verbosity preset (Concise hides thinking + tool actions entirely; Normal adds
 // tool cards with collapsed output; Verbose expands everything) picks how much
 // of each turn is shown. Ported in spirit from the glasses client (glasses/src/live.ts,
@@ -13,8 +14,6 @@
 // global scope): esc(), enc(), cache, sessTitle(), sessMeta(), fastPoll().
 (function () {
   // ---- constants ------------------------------------------------------------
-  const REVEAL_RATE_CPS = 150;      // typewriter speed for the in-progress turn
-  const REVEAL_SNAP_CHARS = 200;    // a bigger backlog than this snaps, not types
   const BACKOFF_MS = [1000, 2000, 4000, 8000, 15000];
   const TOKEN_SKEW_MS = 30000;      // refetch a ws-token this long before expiry
   const LIVE_TURN_ID = "__live";
@@ -311,9 +310,10 @@
   // (XERK-221), passing the surrounding text through renderTables() unchanged. A
   // block only qualifies when its <svg> opens at the START of a line — so a
   // `<svg>` mentioned inside an inline `code` span or mid-sentence stays text —
-  // and it must reach a </svg>; an unterminated one (mid-stream reveal) falls
-  // through as escaped text until its closer lands. renderProse() lifts fenced
-  // code out first, so a fenced SVG is handled there, never here.
+  // and it must reach a </svg>; an unterminated one (a live turn captured
+  // mid-block) falls through as escaped text until its closer lands.
+  // renderProse() lifts fenced code out first, so a fenced SVG is handled
+  // there, never here.
   function renderSvgAndText(text) {
     const s = String(text == null ? "" : text);
     if (!/<svg[\s>]/i.test(s)) return renderTables(s); // no <svg → nothing to lift out
@@ -331,8 +331,8 @@
   // ---- fenced code blocks ---------------------------------------------------
   // A ``` fence opens a code block that runs to the next fence of at least the
   // same length (or, unterminated, to the end of the text — which is the normal
-  // case mid-stream, while the typewriter is still revealing the block, and is
-  // why an open fence renders as code rather than waiting for its closer).
+  // case for a live turn captured mid-block, and is why an open fence renders
+  // as code rather than waiting for its closer).
   //
   // The opening line must be the fence plus at most a one-word info string
   // (```hcl), so an inline run of backticks in prose can't open a block. The
@@ -479,11 +479,6 @@
   let stopPendingAt = 0;
   // Until when the compose button is showing a transient failure message.
   let actionFailUntil = 0;
-
-  // reveal (only the live turn types in; committed messages render whole)
-  let reveal = { shown: 0 };
-  let revealFull = "";
-  let rafId = null, lastTs = 0;
 
   // The HTML currently in the scroll, and whether a changed paint was held back
   // because the reader was selecting text. See repaint()/selectionInScroll().
@@ -1051,23 +1046,14 @@
     const items = buildItems(buffer);
     let html = itemsToHtml(items);
     if (!html && !liveTurn && !queuedPrompts.length) html = '<div class="chat-empty">No messages yet. Say something below to get the agent going.</div>';
-    // The in-progress assistant turn (streaming, text-only) as the trailing
-    // bubble; its text is revealed by the typewriter loop.
+    // The in-progress assistant turn (text-only) as the trailing bubble, shown
+    // in full the moment it arrives (XERK-251 — it used to type in). liveTurn is
+    // already classified by applyTurn (block swaps / tool bullets / shorter
+    // re-captures handled there, see XERK-19), so what lands here is the block
+    // the pane is actually generating.
     if (liveTurn) {
-      // liveTurn is already classified by applyTurn (block swaps / tool bullets /
-      // shrinks handled there — see XERK-19), so by here it only grows within a
-      // block or was reset to shown=0 for a new one. This prefix check is a
-      // defensive clamp for any other path that sets liveTurn directly: if the
-      // new text doesn't continue the revealed slice, snap `shown` to it rather
-      // than typewriting the tail of an unrelated block from a stale offset.
-      if (!liveTurn.startsWith(revealFull.slice(0, reveal.shown))) reveal.shown = liveTurn.length;
-      revealFull = liveTurn;
-      const shownText = liveTurn.slice(0, Math.max(0, reveal.shown));
       html += '<div class="tr-msg assistant streaming" id="chatLiveBubble"><span class="role">assistant</span>' +
-        esc(shownText) + "</div>";
-    } else {
-      revealFull = "";
-      reveal.shown = 0;
+        esc(liveTurn) + "</div>";
     }
     // Still-queued prompts (typed mid-turn) trail the live turn, where they'll
     // actually run — the TUI shows the same list under its input box. Each is a
@@ -1083,7 +1069,6 @@
     if (html === lastHtml) {
       updateJump();
       updateLiveStatus();
-      if (liveTurn) startReveal();
       return;
     }
     // Something DID change, but the reader is mid-selection — hold the paint and
@@ -1103,7 +1088,6 @@
     scroll.scrollTop = pin ? scroll.scrollHeight : prevTop;
     updateJump();
     updateLiveStatus();
-    if (liveTurn) startReveal();
   }
 
   // The floating "jump to latest" pill hovering just above the compose box: shown
@@ -1327,24 +1311,21 @@
   // flicker back, so the test deliberately leans toward matching.
   function isToolBullet(t) { return /^[\w-]+\(/.test(t); }
 
-  // Fold a pane-scrape `turn` frame into the streaming bubble. The pane's
+  // Fold a pane-scrape `turn` frame into the live bubble. The pane's
   // "last ● bullet" is NOT a growing stream: within one generating turn it
   // SWAPS between blocks — assistant prose, then a tool-use bullet (Bash(…),
   // Read(…)), then the next prose. Feeding every swap straight to the bubble is
   // what makes "the final line delete and re-appear over and over" (XERK-19):
   // the tool bullet swaps in (the line deletes) and prose swaps back (it
   // reappears). So classify the frame instead of trusting it verbatim:
-  //  - empty, or a tool-use bullet -> the streaming block is over (or is a tool
-  //    that renders as a committed card, not raw text here). Clear the bubble;
-  //    the committed transcript owns what just finished.
+  //  - empty, or a tool-use bullet -> the in-progress block is over (or is a
+  //    tool that renders as a committed card, not raw text here). Clear the
+  //    bubble; the committed transcript owns what just finished.
   //  - the SAME prose block, grown or re-captured shorter -> keep the LONGER
   //    text and never shrink. A shorter partial re-capture of the same block is
-  //    what re-typed the tail from a stale offset; holding it keeps the reveal's
-  //    place so only genuine new characters type in.
-  //  - a genuinely different prose block -> retype it from 0, not from the
-  //    previous block's offset.
-  // This stands in for glasses/src/reveal.ts advanceReveal's entryId-change
-  // snap; the pane scrape has no id, so the revealed prose stands in for it.
+  //    the TUI redrawing mid-frame, and letting it through shrinks the bubble
+  //    only to re-grow it a frame later — the char-level flicker.
+  //  - a genuinely different prose block -> replace the bubble's text with it.
   function applyTurn(text) {
     const t = typeof text === "string" ? text : "";
     if (!t || isToolBullet(t)) { liveTurn = ""; return; }
@@ -1354,36 +1335,6 @@
       return;
     }
     liveTurn = t;
-    reveal.shown = 0;
-  }
-
-  // ---- typewriter reveal loop (live turn only) ------------------------------
-  function startReveal() {
-    if (rafId != null) return;
-    lastTs = 0;
-    rafId = requestAnimationFrame(tick);
-  }
-  function tick(ts) {
-    rafId = null;
-    const dt = lastTs ? ts - lastTs : 0;
-    lastTs = ts;
-    const bubble = $("chatLiveBubble");
-    if (!bubble || !revealFull) return; // nothing to animate
-    // The reveal rewrites the live bubble in place, so it clobbers a selection
-    // anchored inside it just like a repaint does. Idle the loop (holding the
-    // revealed text where it is) until the reader is done selecting.
-    if (selectionInScroll()) { rafId = requestAnimationFrame(tick); return; }
-    const target = revealFull.length;
-    if (reveal.shown < target) {
-      const backlog = target - reveal.shown;
-      if (backlog > REVEAL_SNAP_CHARS) reveal.shown = target;
-      else reveal.shown = Math.min(target, reveal.shown + Math.max(1, Math.floor(REVEAL_RATE_CPS * dt / 1000)));
-      const scroll = $("chatScroll");
-      // Rebuild the bubble text: role span + revealed slice.
-      bubble.innerHTML = '<span class="role">assistant</span>' + esc(revealFull.slice(0, reveal.shown));
-      if (stickBottom && scroll) scroll.scrollTop = scroll.scrollHeight;
-    }
-    if (reveal.shown < target) { rafId = requestAnimationFrame(tick); }
   }
 
   // ---- header + verbosity control ------------------------------------------
@@ -2307,7 +2258,7 @@
     // The switch has landed once the host reports the source we asked for.
     if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
-    reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
@@ -2336,7 +2287,6 @@
     if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
     stopPollFallback();
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
-    if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
     modelSourcePending = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
@@ -2400,7 +2350,7 @@
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
-      agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
+      agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
       attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, attachFiles,
       clearAttachments, MAX_ATTACHMENTS,
@@ -2427,14 +2377,8 @@
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },
       __setQueued: (q) => { queuedPrompts = q; },
-      __setLiveTurn: (t) => { liveTurn = t; reveal.shown = 0; },
-      // Set the live turn WITHOUT resetting the reveal — the real ws `turn`
-      // frame does exactly this (liveTurn = frame.text), and testing the
-      // swap-vs-continuation snap needs `shown` to carry across the change.
-      __setLiveTurnRaw: (t) => { liveTurn = t; },
-      __setRevealShown: (n) => { reveal.shown = n; },
+      __setLiveTurn: (t) => { liveTurn = t; },
       __resetPaint: () => { lastHtml = null; repaintDeferred = false; },
-      __revealShown: () => reveal.shown,
       __liveTurn: () => liveTurn,
     };
   }

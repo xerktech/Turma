@@ -168,16 +168,17 @@ auto-start/auto-stop and the two tracker writes.
   from the heartbeat's cached tail, scrollback from `GET .../history`, `/history`-poll fallback when
   the socket is down).
 - It renders chat bubbles — **user right, agent left** — with collapsible tool-action cards
-  (tool_use + its paired tool_result, error-styled) and collapsed thinking traces, the in-progress
-  turn typing in via a typewriter reveal (ported from glasses
-  `live.ts`/`transcript.ts`/`reveal.ts`).
+  (tool_use + its paired tool_result, error-styled) and collapsed thinking traces, and the
+  in-progress turn as a trailing bubble.
+  - **No text ever types in** (XERK-251): a capture is painted whole the frame it arrives, in this
+    and every other client. The typewriter was animation over an already-~1s-delayed pane scrape —
+    it delayed the text further and bought nothing. Don't reintroduce one.
   - The live turn is the tmux **pane scrape's "last ● bullet"**, NOT monotonic (XERK-19): it SWAPS
-    blocks mid-turn, so every `turn` frame is CLASSIFIED by `applyTurn` before the reveal and the
-    streaming bubble is only for in-progress **prose** — an empty frame or a tool-use bullet
-    (`isToolBullet`, biased toward matching since a miss brings the flicker back) CLEARS it, the
-    same prose block keeps the LONGER text and never shrinks (`reveal.shown`), a different one
-    retypes from 0 — standing in for glasses `advanceReveal`'s entryId snap, since the scrape has no
-    id. `repaint`'s prefix check is a defensive clamp. Tests: `chat-selection.test.js`.
+    blocks mid-turn, so every `turn` frame is CLASSIFIED by `applyTurn` before it reaches the bubble
+    — an empty frame or a tool-use bullet (`isToolBullet`, biased toward matching since a miss
+    brings the flicker back) CLEARS it, the same prose block keeps the LONGER text and never shrinks
+    (a shorter re-capture is the TUI redrawing mid-frame), a different one replaces it wholesale.
+    Tests: `chat-selection.test.js`.
 - Bubble prose is rendered by `renderProse`: **fenced ` ``` ` blocks** become `<pre
   class="md-code">` (language chip from the info string), inline **` `code` ` spans** become `<code
   class="md-code-inline">` chips (`renderInline`), GFM **tables** become real `<table>`s, else

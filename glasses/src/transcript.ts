@@ -22,8 +22,8 @@ export function emptyBuffer(): TranscriptBuffer {
 // Sessions-page web chat now renders its "Concise" verbosity by omitting tool
 // actions entirely (only user/assistant message text shows). The glasses view
 // is inherently that same text-only surface, so we match Concise by stripping
-// those markers here, at ingest — the buffer, the typewriter reveal length, and
-// render then all see the same clean, tool-free text. Only assistant turns
+// those markers here, at ingest — the buffer and render then both see the same
+// clean, tool-free text. Only assistant turns
 // carry the markers (tool_use blocks never appear in user turns, and
 // tool_result blocks are already dropped upstream), so user text — which may
 // legitimately contain brackets — is left untouched. Tool names are CapitalCase

@@ -1413,7 +1413,7 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
     expect(app.getState().session?.focus).toBe("transcript");
   });
 
-  describe("live tail + streaming reveal", () => {
+  describe("live tail", () => {
     // This block needs a FakeLiveTail wired into the App (the enclosing
     // Task-4 describe's makeApp doesn't pass one), so it builds the App
     // itself rather than reusing the outer makeApp.
@@ -1452,69 +1452,48 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(liveTail.isWatching("s1")).toBe(false);
     });
 
-    it("snaps a freshly-committed entry in immediately (it landed whole — no fake typing)", async () => {
+    // XERK-251: nothing types in any more — a delta is on the glasses in full
+    // the frame it lands, however big it is.
+    it("shows a freshly-committed entry in full immediately", async () => {
       const app = await enterSession();
-      // A brand-new committed transcript entry (a user echo / tool result /
-      // a message the transcript only recorded on completion): it arrived whole
-      // and was never streamed char-by-char, so it snaps to full at once.
-      liveTail.deliver([{ id: "m1", role: "assistant", text: "hello world" }]); // 11 chars
-      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 11 });
+      liveTail.deliver([{ id: "m1", role: "assistant", text: "hello world" }]);
+      expect(app.getState().transcripts.s1?.entries.length).toBe(1);
       expect(display.lines.some((l) => l.includes("hello world"))).toBe(true);
     });
 
-    it("snaps a big live block instead of typewriting it", async () => {
+    it("shows an entry growing in place in full, with no prefix held back", async () => {
       const app = await enterSession();
-      const big = "x".repeat(400); // > REVEAL_SNAP_CHARS
-      liveTail.deliver([{ id: "m1", role: "assistant", text: big }]);
-      // No tick needed — a block appears at once.
-      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 400 });
-    });
-
-    it("reveals only the typed prefix of the newest entry during in-place growth", async () => {
-      const app = await enterSession();
-      // Seed an older entry and a newest one; both committed, so both snap in.
       liveTail.deliver([{ id: "m1", role: "assistant", text: "done" }]);
       liveTail.deliver([
         { id: "m1", role: "assistant", text: "done" },
-        { id: "m2", role: "assistant", text: "abc" }, // snaps to full (3 chars)
+        { id: "m2", role: "assistant", text: "abc" },
       ]);
-      expect(app.getState().reveal).toEqual({ entryId: "m2", shown: 3 });
       // The SAME entry now grows in place (e.g. a poll delivering more of a
-      // still-arriving message) — small in-place growth still types in.
+      // still-arriving message) — every new character is on screen at once.
       liveTail.deliver([
         { id: "m1", role: "assistant", text: "done" },
-        { id: "m2", role: "assistant", text: "abcdefghijklmnopqrstuvwxyz0123456789" }, // 36 chars
+        { id: "m2", role: "assistant", text: "abcdefghijklmnopqrstuvwxyz0123456789" },
       ]);
-      expect(app.getState().reveal.entryId).toBe("m2");
-      await vi.advanceTimersByTimeAsync(80); // 3 + 12 chars revealed
-      const state = app.getState();
-      expect(state.reveal.shown).toBe(15);
-      // Older entry stays full; newest shows only its 15-char prefix.
+      expect(app.getState().transcripts.s1?.entries.length).toBe(2);
       expect(display.lines.some((l) => l.includes("done"))).toBe(true);
-      expect(display.lines.some((l) => l.includes("abcdefghijklmno") && !l.includes("pqrs"))).toBe(true);
+      expect(display.lines.join(" ")).toContain("abcdefghijklmnopqrstuvwxyz0123456789");
     });
 
-    it("stops the live tail and reveal timer on pause()", async () => {
+    it("stops the live tail on pause()", async () => {
       const app = await enterSession();
-      liveTail.deliver([{ id: "m1", role: "assistant", text: "streaming text here" }]);
+      liveTail.deliver([{ id: "m1", role: "assistant", text: "some text here" }]);
       app.pause();
       expect(liveTail.stops).toBe(1);
-      const shownAtPause = app.getState().reveal.shown;
-      await vi.advanceTimersByTimeAsync(500); // no ticks should fire while paused
-      expect(app.getState().reveal.shown).toBe(shownAtPause);
+      expect(app.getState().liveTurn).toBe(null);
     });
 
-    it("streams the in-progress assistant turn from the TUI, then hands off to the committed transcript", async () => {
+    it("shows the in-progress assistant turn from the TUI, then hands off to the committed transcript", async () => {
       const app = await enterSession();
       // A live delta: Claude is generating (transcript has only the user turn).
       liveTail.deliver([{ id: "u1", role: "user", text: "haiku please" }]);
-      // The TUI stream delivers the in-progress assistant text (grows over ticks).
+      // The TUI stream delivers the in-progress assistant text.
       liveTail.deliverTurn("Salt breath meets the shore");
       expect(app.getState().liveTurn).toEqual({ sessionId: "s1", text: "Salt breath meets the shore" });
-      // The reveal anchors to the live turn and types it in.
-      expect(app.getState().reveal.entryId).toBe("__live");
-      await vi.advanceTimersByTimeAsync(300);
-      expect(app.getState().reveal.shown).toBeGreaterThan(0);
       expect(display.lines.some((l) => l.includes("Salt breath"))).toBe(true);
 
       // Turn completes: the committed transcript delivers the real entry and the
@@ -1538,37 +1517,6 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(app.getState().liveTurn).toBe(null);
     });
 
-    it("freezes the reveal while scrolled up and resumes at the tail", async () => {
-      const app = await enterSession();
-      // Enough short entries that scrolling up moves the offset above 0.
-      const older = Array.from({ length: 20 }, (_, i) => ({
-        id: `m${i}`,
-        role: "assistant",
-        text: `line ${i}`,
-      }));
-      liveTail.deliver(older);
-      await vi.advanceTimersByTimeAsync(80);
-      // A live in-progress turn begins typing (78 chars — more than one 80ms
-      // tick, under the 200-char snap threshold). Committed entries snap, so the
-      // typewriter this test exercises is the genuinely-streamed live turn.
-      const longText = "abcdefghijklmnopqrstuvwxyz".repeat(3);
-      liveTail.deliverTurn(longText);
-      expect(app.getState().reveal.entryId).toBe("__live");
-
-      // Scroll up to read history — the reveal must freeze.
-      display.emit({ type: "scrollUp" });
-      expect(app.getState().session?.offset ?? 0).toBeGreaterThan(0);
-      const frozen = app.getState().reveal.shown;
-      await vi.advanceTimersByTimeAsync(500);
-      expect(app.getState().reveal.shown).toBe(frozen); // no ticks while scrolled up
-
-      // Scroll back to the tail — the typewriter resumes and advances.
-      for (let i = 0; i < 12; i++) display.emit({ type: "scrollDown" });
-      expect(app.getState().session?.offset).toBe(0);
-      await vi.advanceTimersByTimeAsync(80);
-      expect(app.getState().reveal.shown).toBeGreaterThan(frozen);
-    });
-
     it("pins the visible window when scrolled up and new text lands, but auto-scrolls at the tail", async () => {
       const app = await enterSession();
       // Enough one-line entries to overflow the display so scrolling up moves
@@ -1579,7 +1527,6 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
         text: `line ${i}`,
       }));
       liveTail.deliver(entries);
-      await vi.advanceTimersByTimeAsync(200); // let the tail fully reveal
 
       // Scroll up to read history and snapshot the top visible transcript line.
       display.emit({ type: "scrollUp" });
@@ -1588,10 +1535,9 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       const model = () => display.model as { type: "session"; transcriptLines: string[] };
       const topBefore = model().transcriptLines[0];
 
-      // A committed block lands underneath the scrolled-up view (>200 chars, so
-      // it snaps in at full length rather than typewriting): the visible window
-      // stays pinned to the same lines (offset absorbs the added lines) and the
-      // fresh text is NOT yanked on screen.
+      // A committed block lands underneath the scrolled-up view: the visible
+      // window stays pinned to the same lines (offset absorbs the added lines)
+      // and the fresh text is NOT yanked on screen.
       const block = "brand new block ".repeat(20); // ~320 chars -> several wrapped lines
       liveTail.deliver([...entries, { id: "mNew", role: "assistant", text: block }]);
       expect(model().transcriptLines[0]).toBe(topBefore);
@@ -1606,7 +1552,6 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
         { id: "mNew", role: "assistant", text: block },
         { id: "mNew2", role: "assistant", text: "newest line here" },
       ]);
-      await vi.advanceTimersByTimeAsync(200);
       expect(display.lines.some((l) => l.includes("newest line here"))).toBe(true);
     });
   });

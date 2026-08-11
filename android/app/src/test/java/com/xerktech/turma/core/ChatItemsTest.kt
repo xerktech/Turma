@@ -154,10 +154,12 @@ class ChatItemsTest {
         assertEquals(ChatItem.Bubble("e3", "user", "hello"), items.single())
     }
 
-    @Test fun `reveal length only clamps the newest bubble`() {
+    // XERK-251: nothing is ever held back — the newest bubble carries every
+    // character the entry has.
+    @Test fun `the newest bubble renders its whole text`() {
         val e = TailEntry(id = "e4", role = "assistant", text = "abcdefghij")
-        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL), revealNewestId = "e4", revealShown = 4)
-        assertEquals(4, (items.single() as ChatItem.Bubble).revealLen)
+        val items = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+        assertEquals("abcdefghij", (items.single() as ChatItem.Bubble).text)
     }
 
     @Test fun `an orphan result with EMPTY text still renders, as the web does`() {

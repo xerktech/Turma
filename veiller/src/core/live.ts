@@ -5,7 +5,7 @@
 // hub (turma/server.js), which asks that host's tunnel-agent to tail the
 // one session's transcript ~1s and push deltas back; each `{type:"tail",
 // entries}` frame is handed straight to the App, which merges it (mergeTail)
-// and typewriter-reveals the growth (reveal.ts).
+// and repaints.
 //
 // Purely additive: if the socket never connects (agent tunnel offline, dev
 // mock hub with no /live route) the App still runs on the poll — live tail is

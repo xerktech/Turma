@@ -26,9 +26,8 @@ export const SESSION_SCROLL_STEP = 2;
 
 // Synthetic id for the in-progress assistant turn scraped live from the TUI
 // (app.ts `liveTurn`). It's rendered as the newest transcript entry while
-// generating and the reveal types it; the committed transcript supersedes it
-// on completion. A stable non-uuid string so it never collides with a real
-// entry id.
+// generating; the committed transcript supersedes it on completion. A stable
+// non-uuid string so it never collides with a real entry id.
 export const LIVE_TURN_ID = "__live";
 
 // Focus target on the session screen: the scrollable transcript, or the
@@ -79,13 +78,12 @@ function contentWidth(): number {
 }
 
 // Memoized word-wrap for transcript content. `sessionContentLines` re-wraps the
-// whole visible buffer on every 80ms reveal tick (app.ts's revealTick ->
-// repaint -> render) and several times per poll (via `sessionContentLength`),
-// and each wrap runs the real device font metric (text-wrap's getTextWidth)
-// once per word — so re-wrapping every committed entry every frame is O(all
-// words in the buffer) of pure repeat work. Only the newest/revealing entry
-// (whose revealed prefix changes) and the live turn actually change between
-// frames; every older committed entry produces byte-identical wrapped output.
+// whole visible buffer on every repaint (a ~1s live turn frame, every poll) and
+// several times per poll on its own (via `sessionContentLength`), and each wrap
+// runs the real device font metric (text-wrap's getTextWidth) once per word —
+// so re-wrapping every committed entry every frame is O(all words in the
+// buffer) of pure repeat work. Only the live turn changes between frames; every
+// committed entry produces byte-identical wrapped output.
 //
 // Cache key is the exact string handed to `wrapText()` plus the wrap width and
 // the measure generation (text-wrap's `measureGeneration()`): identical text at
@@ -94,8 +92,7 @@ function contentWidth(): number {
 // folding the width in keeps the two widths in play (full-width meta/PR lines
 // vs the narrower hang-indented turn content) from colliding. Bounded and
 // evicted LRU-style so it can't grow without limit as sessions churn (the
-// changing revealing-prefix strings would otherwise accumulate one entry per
-// tick).
+// live turn's growing text would otherwise accumulate one entry per frame).
 const WRAP_CACHE_MAX = 512;
 const wrapCache = new Map<string, string[]>();
 
@@ -104,7 +101,7 @@ function wrapCached(text: string, width: number): string[] {
   const hit = wrapCache.get(key);
   if (hit) {
     // Refresh recency: re-insert so the genuinely hot entries stay newest and
-    // survive eviction over one-shot revealing-prefix keys.
+    // survive eviction over the live turn's one-shot growing-text keys.
     wrapCache.delete(key);
     wrapCache.set(key, hit);
     return hit;
@@ -279,23 +276,15 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
     // scroll away.
     lines.push("· earlier history truncated ·");
   }
-  // The newest entry of the focused session may be mid-typewriter (reveal.ts):
-  // show only its revealed prefix so still-streaming text types in rather than
-  // block-jumping. Older entries, and any other session, always render in full.
+  // Every entry renders in full, the moment it lands (XERK-251 — the newest
+  // one used to type in character by character).
   const entries = buffer?.entries ?? [];
-  const reveal = state.session?.sessionId === sessionId ? state.reveal : null;
-  const lastIdx = entries.length - 1;
-  entries.forEach((entry, i) => {
-    let text = entry.text;
-    if (reveal && i === lastIdx && reveal.entryId === entry.id && reveal.shown < text.length) {
-      text = text.slice(0, Math.max(0, reveal.shown));
-    }
-    // Concise ingest (transcript.ts) drops a pure tool-call turn to empty text,
-    // and a not-yet-revealed entry is momentarily empty — render neither as a
-    // blank line.
-    if (text === "") return;
-    lines.push(...roleBlock(entry.role, text));
-  });
+  for (const entry of entries) {
+    // Concise ingest (transcript.ts) drops a pure tool-call turn to empty
+    // text — don't render that as a blank line.
+    if (entry.text === "") continue;
+    lines.push(...roleBlock(entry.role, entry.text));
+  }
   // A pending question no longer duplicates here — the session bottom's sheet
   // mode (Task 6) is the one place it renders. PR links aren't part of the
   // question, so they still surface at the newest end of the transcript.
@@ -304,17 +293,12 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
     lines.push(...wrapCached(`PR ${url}`, LINE_WIDTH_PX));
   }
   // The in-progress assistant turn scraped live from the TUI (real-time),
-  // rendered as the newest entry and typed in by the reveal. It supersedes
-  // nothing in the committed transcript — the agent clears it (empty text)
-  // the instant the turn completes and the committed tail owns that message.
+  // rendered as the newest entry. It supersedes nothing in the committed
+  // transcript — the agent clears it (empty text) the instant the turn
+  // completes and the committed tail owns that message.
   const lt = state.liveTurn;
   if (lt && lt.sessionId === sessionId && lt.text) {
-    const reveal = state.session?.sessionId === sessionId ? state.reveal : null;
-    let text = lt.text;
-    if (reveal && reveal.entryId === LIVE_TURN_ID && reveal.shown < text.length) {
-      text = text.slice(0, Math.max(0, reveal.shown));
-    }
-    lines.push(...roleBlock("assistant", text));
+    lines.push(...roleBlock("assistant", lt.text));
   }
   return lines;
 }
@@ -474,8 +458,7 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
 
 // Builds the session-screen overlay used by the actions/confirm menus: the
 // underlying session's transcript, bottom-anchored to whatever room the menu
-// box leaves, with `bottom` (a menu-mode box) drawn over it. The transcript is
-// static while a menu is open (the reveal only ticks on the session screen).
+// box leaves, with `bottom` (a menu-mode box) drawn over it.
 function sessionOverlay(state: AppState, hostKey: string, sessionId: string, bottom: BottomModel): ScreenModel {
   const content = sessionContentLines(state, hostKey, sessionId);
   const area = Math.max(1, DISPLAY_LINES - boxLineCount(bottom));

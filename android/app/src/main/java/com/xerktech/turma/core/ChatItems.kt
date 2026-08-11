@@ -38,12 +38,11 @@ data class VerbosityPrefs(
 sealed interface ChatItem {
     val entryKey: String
 
-    /** A user/assistant text bubble. [revealLen] < 0 means "show all". */
+    /** A user/assistant text bubble. */
     data class Bubble(
         override val entryKey: String,
         val role: String,
         val text: String,
-        val revealLen: Int = -1,
     ) : ChatItem
 
     data class Thinking(override val entryKey: String, val text: String) : ChatItem
@@ -69,15 +68,12 @@ sealed interface ChatItem {
 }
 
 /**
- * Build display items from [entries] under [prefs]. When [revealNewestId]/
- * [revealShown] are set, the matching newest bubble is truncated to [revealShown]
- * chars for the typewriter effect (everything else renders full).
+ * Build display items from [entries] under [prefs]. Every bubble renders in
+ * full, the moment it lands (XERK-251 — the newest one used to type in).
  */
 fun buildItems(
     entries: List<TailEntry>,
     prefs: VerbosityPrefs,
-    revealNewestId: String? = null,
-    revealShown: Int = -1,
 ): List<ChatItem> {
     val out = ArrayList<ChatItem>()
     // Pair tool_result -> tool_use by forId across the WHOLE conversation, not
@@ -99,17 +95,9 @@ fun buildItems(
         }
     }
     for (entry in entries) {
-        val revealThis = entry.key == revealNewestId
         if (entry.blocks.isEmpty()) {
             val text = conciseText(entry.role, entry.text)
-            if (text.isNotBlank()) {
-                out.add(
-                    ChatItem.Bubble(
-                        entry.key, entry.role, text,
-                        revealLen = if (revealThis) revealShown else -1,
-                    )
-                )
-            }
+            if (text.isNotBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text))
             continue
         }
         // Consecutive text blocks are ONE bubble, flushed by any other block —
@@ -119,14 +107,7 @@ fun buildItems(
         fun flushText() {
             val text = pending?.toString()
             pending = null
-            if (!text.isNullOrBlank()) {
-                out.add(
-                    ChatItem.Bubble(
-                        entry.key, entry.role, text,
-                        revealLen = if (revealThis) revealShown else -1,
-                    )
-                )
-            }
+            if (!text.isNullOrBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text))
         }
         for (block in entry.blocks) {
             when (block) {

@@ -1136,9 +1136,9 @@ test("renderProse: blank lines and indentation inside a block are preserved", ()
   assert.match(renderProse(md), /<code>def f\(\):\n    return 1\n\n\nx = f\(\)<\/code>/);
 });
 
-test("renderProse: an unterminated fence still renders as code (mid-stream)", () => {
-  // The typewriter reveals a block a chunk at a time; the closer hasn't arrived
-  // yet, and the partial body must not flash as prose in the meantime.
+test("renderProse: an unterminated fence still renders as code (mid-turn)", () => {
+  // A live turn is captured mid-block; the closer hasn't arrived yet, and the
+  // partial body must not flash as prose in the meantime.
   const html = renderProse("Here:\n```hcl\nenv_features = {\n  dev = {");
   assert.match(html, /<pre class="md-code" data-lang="hcl"><code>env_features = \{\n {2}dev = \{<\/code><\/pre>/);
   assert.match(html, /Here:/);

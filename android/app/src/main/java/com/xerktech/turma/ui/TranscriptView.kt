@@ -98,10 +98,9 @@ private val BASE_BUBBLE_MAX = 340.dp
 @Composable
 private fun TranscriptBubble(b: ChatItem.Bubble) {
     val isUser = b.role == "user"
-    val shown = if (b.revealLen in 0 until b.text.length) b.text.take(b.revealLen) else b.text
     // Parse the prose once (web parity: chat.js renderProse) — tables, fenced
     // code, inline code and links become real blocks/spans rather than raw text.
-    val blocks = remember(shown) { parseProse(shown) }
+    val blocks = remember(b.text) { parseProse(b.text) }
     // A bubble carrying a table or code block takes the full width so the grid /
     // code lines have room, mirroring the web's `:has(.md-code)` widening.
     val wide = blocks.any { it is ProseBlock.Table || it is ProseBlock.Code }

@@ -735,7 +735,7 @@ describe("render: transcript wrap memoization (Fix 1)", () => {
     const stateFor = (text: string) =>
       base({
         screen: "session",
-        session: null, // no reveal slicing — the entry wraps in full
+        session: null,
         transcripts: { s1: { entries: [{ id: "e1", role: "assistant", text }] } },
       });
 
@@ -761,7 +761,7 @@ describe("render: transcript wrap memoization (Fix 1)", () => {
     expect(calls).toBeGreaterThan(afterGrow);
   });
 
-  it("re-wraps the revealing prefix each tick but keeps older entries cached", () => {
+  it("re-wraps the growing live turn each frame but keeps older entries cached", () => {
     let calls = 0;
     const counting: Measure = (s) => {
       calls++;
@@ -770,26 +770,25 @@ describe("render: transcript wrap memoization (Fix 1)", () => {
     setDefaultMeasure(counting);
 
     const older = "older committed assistant entry that wraps ".repeat(3);
-    const live = "streaming live turn text that grows over ticks and wraps too";
-    const stateFor = (shown: number) =>
+    const live = "streaming live turn text that grows over frames and wraps too";
+    const stateFor = (len: number) =>
       base({
         screen: "session",
         session: newSessionState("host-a", "s1"),
-        reveal: { entryId: "__live", shown },
-        liveTurn: { sessionId: "s1", text: live },
+        liveTurn: { sessionId: "s1", text: live.slice(0, len) },
         transcripts: { s1: { entries: [{ id: "e-old", role: "assistant", text: older }] } },
       });
 
     sessionContentLines(stateFor(10), "host-a", "s1");
     const afterFirst = calls;
-    // Next "tick": a different revealed prefix of the live turn -> only that
-    // prefix re-wraps; the older committed entry stays a cache hit.
+    // Next frame: the live turn's capture grew -> only it re-wraps; the older
+    // committed entry stays a cache hit.
     sessionContentLines(stateFor(20), "host-a", "s1");
-    const perTick = calls - afterFirst;
-    expect(perTick).toBeGreaterThan(0); // the changed prefix did re-wrap
+    const perFrame = calls - afterFirst;
+    expect(perFrame).toBeGreaterThan(0); // the grown turn did re-wrap
     // Re-wrapping the whole buffer would cost at least the older entry's words
-    // too; a per-tick cost below that shows the older entry was cached.
+    // too; a per-frame cost below that shows the older entry was cached.
     const olderWords = older.trim().split(/\s+/).length;
-    expect(perTick).toBeLessThan(olderWords);
+    expect(perFrame).toBeLessThan(olderWords);
   });
 });

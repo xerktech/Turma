@@ -8,10 +8,10 @@
 //   agents (SLIMMED — see slimAgent), orgFilter, orgColors, autoStartOrgs,
 //   screen + session identity, liveTurn, flash, now.
 //
-// Deliberately NOT serialized: transcripts/reveal (the phone keeps its own
-// rich buffer fed by turma:rich-tail), pending, loadingHistory, and the
+// Deliberately NOT serialized: transcripts (the phone keeps its own rich
+// buffer fed by turma:rich-tail), pending, loadingHistory, and the
 // glasses-only per-screen cursor states — the phone never reads them, and
-// they're the bulk of the state's weight on every 80ms reveal tick.
+// they're the bulk of the state's weight on every repaint.
 //
 // The agents array is slimmed to what the phone renders (XERK-215): the raw
 // fleet payload is hundreds of KB (a real 6-host fleet measured ~800 KB —
@@ -150,10 +150,10 @@ export function hydratePhoneState(payload: PhoneStatePayload): AppState {
 }
 
 // Decides whether a repaint changed anything the phone can see. App.onState
-// fires on EVERY glasses repaint — including the 80ms reveal ticks of a
-// streaming turn — but those mutate only transcripts/reveal, which the phone
-// payload doesn't carry. Broadcasting the (even slimmed) payload per tick
-// floods the WebView bridge for nothing, so the background sends only when
+// fires on EVERY glasses repaint — including a live turn's ~1s frames — but
+// those mutate only transcripts, which the phone payload doesn't carry.
+// Broadcasting the (even slimmed) payload per repaint floods the WebView
+// bridge for nothing, so the background sends only when
 // one of the serialized fields actually changed. Reference compares are
 // enough: App.poll replaces `agents` wholesale each poll, and every mutation
 // path builds fresh objects. `now` is deliberately NOT compared — it moves on

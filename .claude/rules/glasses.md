@@ -6,12 +6,12 @@ paths:
 # `glasses/` — Even Realities G2 smart-glasses client
 
 - Vite + TypeScript, Vitest; an Even Hub plugin. An open session screen tails the hub's `/live`
-  WebSocket (`live.ts`) with a **streaming typewriter reveal** (`reveal.ts`), else the 6s poll. See
-  `glasses/README.md` for dev/packaging/QA.
+  WebSocket (`live.ts`), else the 6s poll. See `glasses/README.md` for dev/packaging/QA.
+- Text lands on the display **whole, the frame it arrives** — the typewriter reveal this client
+  invented was deleted in XERK-251, here and in every client that ported it. Don't bring one back.
 - `src/` is the reference implementation the Android `core/` reducers are ported from
-  (`live.ts`/`transcript.ts`/`reveal.ts` → `Reveal`/`Transcript`/`ChatItems`), and `chat.js`'s
-  typewriter reveal is ported from it too. A change to the reveal or transcript-merge semantics here
-  is a change to those.
+  (`live.ts`/`transcript.ts` → `Transcript`/`ChatItems`). A change to the transcript-merge semantics
+  here is a change to those.
 - **`src/sessions.ts` is one of the FIVE `readyForReview` mirrors** that must agree — see
   `CLAUDE.md`'s cross-cutting contracts. Veiller carries a FORK of this file; it counts as a mirror.
 - The glasses client has **no board creds and no picker TUI**: pending `AskUserQuestion`s reach it

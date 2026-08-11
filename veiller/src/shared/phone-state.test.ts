@@ -75,7 +75,6 @@ describe("phone-state serialization", () => {
     expect(hydrated.flashUntil).toBe(123999);
     // The glasses-only heavyweight fields are deliberately not carried.
     expect(payload).not.toHaveProperty("transcripts");
-    expect(payload).not.toHaveProperty("reveal");
     expect(hydrated.transcripts).toEqual({});
   });
 
@@ -280,8 +279,8 @@ describe("chunked state pull", () => {
   });
 });
 
-// XERK-215's other half: App.onState fires on every glasses repaint (80ms
-// reveal ticks included), but those mutate only fields the phone payload
+// XERK-215's other half: App.onState fires on every glasses repaint (a live
+// turn's ~1s frames included), but those mutate only fields the phone payload
 // doesn't carry — the gate keeps them off the channel bus.
 describe("createPhoneStateGate", () => {
   function state(patch: Partial<AppState> = {}): AppState {
@@ -292,7 +291,7 @@ describe("createPhoneStateGate", () => {
     const gate = createPhoneStateGate();
     const s1 = state();
     expect(gate(s1)).toBe(true);
-    // A reveal tick: new state object, same field references.
+    // A transcript-only repaint: new state object, same field references.
     expect(gate({ ...s1, now: 101, transcripts: { s1: { entries: [], anchor: 0 } } } as unknown as AppState)).toBe(false);
     expect(gate({ ...s1, now: 102 })).toBe(false);
   });

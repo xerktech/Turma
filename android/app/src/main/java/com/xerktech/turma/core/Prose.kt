@@ -11,8 +11,8 @@ package com.xerktech.turma.core
  * code spans and links — and are locked to chat.js's own test vectors in
  * `ProseTest.kt`. Keep the two in sync: a change to `renderProse` belongs here.
  *
- * Like the web, this is safe on a partial (mid-stream) buffer: an unterminated
- * fence renders as code so a half-revealed block doesn't flash as prose.
+ * Like the web, this is safe on a partial (mid-turn) buffer: an unterminated
+ * fence renders as code so a half-captured block doesn't flash as prose.
  */
 
 enum class CellAlign { NONE, LEFT, CENTER, RIGHT }

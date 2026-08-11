@@ -377,7 +377,7 @@ fun SessionsRoute(
     val hasSel = hasLive || hasEnded
 
     val detail: @Composable () -> Unit = {
-        // key() so switching sessions rebuilds the detail subtree (fresh VM + reveal).
+        // key() so switching sessions rebuilds the detail subtree (a fresh VM).
         key(selHost, selId, endHost, endTid, subType, subLabel) {
             when {
                 hasSub -> SubagentView(

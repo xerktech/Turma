@@ -1,6 +1,6 @@
 name: android-ci
 
-# PR gate for the Android client: unit-test the pure core (reveal/transcript/
+# PR gate for the Android client: unit-test the pure core (transcript/
 # sessions/chat-items + serialization) and assemble a debug APK.
 #
 # Runs on GitHub-hosted `ubuntu-latest`, using the JDK + Android SDK that runner
