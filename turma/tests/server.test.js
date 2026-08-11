@@ -6486,6 +6486,15 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
   assert.deepEqual(norm({ available: true, model: "m", contextTokens: 1.5 }),
     { available: true, model: "m", contextTokens: null });
 
+  // The name is BOUNDED, and cut on code points. A UTF-16 `slice` through an
+  // astral pair emits a lone surrogate — unencodable, and it kills Android's
+  // uiautomator outright. Nothing else pins this length.
+  const long = norm({ available: true, model: "x".repeat(500) });
+  assert.equal(long.model.length, 60);
+  const astral = norm({ available: true, model: "x".repeat(59) + "😀" + "tail" });
+  assert.equal([...astral.model].length, 60);
+  assert.ok(astral.model.isWellFormed(), "a lone surrogate reached the clients");
+
   // Not an object at all -> null, which every client reads as "cannot fail over".
   assert.equal(norm("yes"), null);
   assert.equal(norm([1, 2]), null);

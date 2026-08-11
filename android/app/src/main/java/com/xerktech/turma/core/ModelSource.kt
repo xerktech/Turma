@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.SessionInfo
 
@@ -102,6 +103,16 @@ object ModelSource {
      * there is no session yet, so the host's capability flag is the whole rule.
      */
     fun composerOffers(local: LocalModelInfo?): Boolean = local?.available == true
+
+    /**
+     * The self-hosted model of the host a spawn is TARGETING — never the fleet's
+     * first, which is the shape of a bug this repo has shipped before (a union
+     * built over the wrong loop, `PARITY.md`/qa.md §5.7). The failover is
+     * configured per host, so offering the row off some other host's block would
+     * queue a `local` spawn the target 409s or silently drops.
+     */
+    fun hostLocalModel(agents: List<AgentInfo>, host: String): LocalModelInfo? =
+        agents.firstOrNull { it.key == host }?.localModel
 
     /**
      * Human label for a source. A local session reads as the MODEL NAME, not the

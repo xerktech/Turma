@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.SessionInfo
 import org.junit.Assert.assertEquals
@@ -99,6 +100,23 @@ class ModelSourceTest {
         assertTrue(ModelSource.composerOffers(configured))
         assertFalse(ModelSource.composerOffers(unconfigured))
         assertFalse(ModelSource.composerOffers(null))
+    }
+
+    @Test fun `the composer reads the TARGET host's model, not the fleet's first`() {
+        // "The wrong loop" is a shape this repo has shipped before, and the
+        // composer's dialog only ever sees one host: offering another host's
+        // model would queue a `local` spawn the target 409s or drops.
+        val other = LocalModelInfo(available = true, model = "qwen3-coder:30b")
+        val fleet = listOf(
+            AgentInfo(key = "h0", localModel = other),
+            AgentInfo(key = "h1", localModel = configured),
+            AgentInfo(key = "h2", localModel = null),
+        )
+        assertEquals(configured, ModelSource.hostLocalModel(fleet, "h1"))
+        assertEquals(other, ModelSource.hostLocalModel(fleet, "h0"))
+        assertNull(ModelSource.hostLocalModel(fleet, "h2"))
+        assertNull(ModelSource.hostLocalModel(fleet, "nosuchhost"))
+        assertNull(ModelSource.hostLocalModel(emptyList(), "h1"))
     }
 
     @Test fun `a memo with no session id is never honoured`() {

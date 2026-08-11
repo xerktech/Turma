@@ -1103,7 +1103,15 @@ function normalizeLocalModel(payload) {
     payload.localModel = { available: false, model: null, contextTokens: null };
     return;
   }
-  const name = typeof lm.model === "string" ? lm.model.trim().slice(0, 60) : "";
+  // Cut on CODE POINTS, not UTF-16 units: `slice(60)` through an astral pair
+  // ships a lone surrogate to every client, which is not merely a mojibake — it
+  // is unencodable, and Android's own uiautomator dies on it
+  // (KXmlSerializer "Illegal character"). Only a rogue agent gets here (a real
+  // one is bounded by LOCAL_MODEL_NAME_RE), which is this function's whole
+  // threat model.
+  const name = typeof lm.model === "string"
+    ? [...lm.model.trim()].slice(0, 60).join("")
+    : "";
   const ctx = lm.contextTokens;
   payload.localModel = {
     available: true,
