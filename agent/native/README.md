@@ -159,8 +159,9 @@ takes a new Claude Code**; `turma-agent-update --claude-only` does it by hand.
 
 Both checks are rate-limited to one per `TURMA_BOOT_UPDATE_MIN_INTERVAL` (300s),
 so a crash-looping unit can't turn `Restart=always` into a check every five
-seconds. See `turma-agent.env` for `TURMA_BOOT_UPDATE=0` /
-`TURMA_CLAUDE_AUTO_UPDATE=0` to opt out of either half.
+seconds. `TURMA_CLAUDE_AUTO_UPDATE=0` in `turma-agent.env` pins Claude Code;
+`TURMA_BOOT_UPDATE=0` turns off both start checks — which, since start is the
+only time Claude Code is looked at, also stops it being updated at all.
 
 It reads the unified release stream: each `v<MAJOR>.<MINOR>.<PATCH>` release
 carries a `manifest.json`, and the updater compares the manifest's **agent-native

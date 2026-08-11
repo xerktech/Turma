@@ -466,6 +466,46 @@ else
   echo "  FAIL: the update left $leftover new path(s) in the operator's ~/.claude"; FAILED=1
 fi
 
+echo "== case: nothing in the check can stop the container booting"
+# The check is AWAITED, which puts it in `set -e`'s path at PID 1. It used to
+# use a fixed /tmp scratch dir, so any session — running as the dropped identity
+# — could `touch /tmp/.turma-claude-update` and the next `mkdir -p` failure
+# killed PID 1 with a one-line error, on every restart, forever. /tmp is the
+# image's writable layer, so it survived restarts and never self-healed.
+make_fixture "$WORK/fx12" 1000 1000
+out="$(docker run --rm -e AGENT=claude -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
+  -e STUB_MANAGER_SLEEP=2 -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 \
+  -v "$WORK/fx12/repos:/f/repos" -v "$WORK/fx12/claude:/root/.claude" \
+  --entrypoint /bin/sh "$IMG" -c \
+  'mkdir -p /tmp/.turma-claude-update /tmp/turma-claude-update.XXXXXX; \
+   chmod 000 /tmp/turma-claude-update.XXXXXX 2>/dev/null; \
+   exec /usr/local/bin/entrypoint.sh' 2>&1)"
+if echo "$out" | grep -q "MANAGER uid="; then
+  echo "  ok: booted with the scratch paths already taken"
+else
+  echo "  FAIL: a pre-existing /tmp path stopped the container booting: $out"; FAILED=1
+fi
+
+echo "== case: the boot check is rate-limited"
+# A container in a restart loop would otherwise hit the registry every few
+# seconds and pay the check's latency on every pass. ~/.turma is the agent's own
+# state dir, so the stamp rides the same mount the rest of its state does.
+make_fixture "$WORK/fx13" 0 0
+out="$(run_case "$WORK/fx13" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -v "$WORK/fx13/turma:/root/.turma")"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  ok: the first start checks"
+else
+  echo "  FAIL: the first start ran no check"; FAILED=1
+fi
+out="$(run_case "$WORK/fx13" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -v "$WORK/fx13/turma:/root/.turma")"
+if echo "$out" | grep -q "claude check skipped"; then
+  echo "  ok: a restart seconds later skips it"
+else
+  echo "  FAIL: a restart loop would check on every pass: $(echo "$out" | grep claude)"; FAILED=1
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi
 exit "$FAILED"

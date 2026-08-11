@@ -177,51 +177,86 @@ fi
 # exists means nothing can be launching while the package moves. Each call is
 # bounded by `timeout` instead, so a wedged registry delays the boot but cannot
 # stop it; it is two version reads unless something newer is really published.
-# An install killed by that timeout leaves a claude that can't report a version,
-# which the next boot reinstalls — the check heals its own interruption.
+#
+# Being awaited puts it in `set -e`'s path at PID 1, so NOTHING in here may be
+# allowed to abort the boot: the whole block is `||`-guarded, and its scratch
+# HOME is an mktemp dir rather than a fixed path. A fixed /tmp path was a denial
+# of service — any session, running as the dropped identity, could `touch
+# /tmp/.turma-claude-update`, and the next `mkdir -p` failure then killed PID 1
+# with a one-line error and no self-heal, on every restart, forever.
 #
 # TURMA_CLAUDE_AUTO_UPDATE=0 pins the image's bundled version.
+claude_update_check() {
+  # Rate-limited like the native launcher's, and for the same reason: a
+  # container in a restart loop would otherwise hit the registry every few
+  # seconds, and pay the check's latency on every pass.
+  stamp=/root/.turma/last-claude-check
+  now="$(date +%s)"
+  last="$(tr -cd '0-9' <"$stamp" 2>/dev/null || true)"
+  # Strip leading zeros before the arithmetic: this is /bin/sh, where a
+  # zero-padded number is OCTAL and `09` is an error — and bash's `10#` prefix
+  # is undefined here. An implausibly long value is treated as no stamp rather
+  # than risking an overflow whose result is unspecified.
+  last="$(printf '%s' "$last" | sed 's/^0*//')"
+  [ "${#last}" -le 12 ] || last=""
+  if [ -n "$last" ]; then
+    age=$((now - last))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}" ]; then
+      echo "[entrypoint] claude check skipped: last check ${age}s ago"
+      return 0
+    fi
+  fi
+
+  # Run against a throwaway HOME. /root is the operator's bind mount: npm would
+  # leave a cache of tarballs nothing reads later (the Dockerfile deletes them
+  # for the same reason), and anything `claude` touches on the way to printing
+  # its version would land there ROOT-owned on a host whose sessions run as
+  # somebody else — re-creating, one file at a time, the breakage the identity
+  # block exists to end.
+  scratch="$(mktemp -d /tmp/turma-claude-update.XXXXXX)" || return 1
+  mkdir -p /root/.turma 2>/dev/null || true
+  echo "$now" >"$stamp" 2>/dev/null || true
+  HOME="$scratch"; export HOME
+  npm_config_cache="$scratch/npm"; export npm_config_cache
+
+  cur="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  latest="$(timeout "${TURMA_NPM_VIEW_TIMEOUT:-45}" npm view @anthropic-ai/claude-code version \
+            --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]')"
+  # A registry that answers with anything but a version is "stay put", not an
+  # upgrade: `sort -V` ranks a non-numeric string ABOVE a semver, so a proxy
+  # error line or a warning on stdout would otherwise replace the package on
+  # every single boot.
+  echo "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' || latest=""
+  if [ -z "$latest" ]; then
+    echo "[entrypoint] claude: registry unreachable or unreadable; staying at ${cur:-unknown}"
+  elif [ -n "$cur" ] && [ "$cur" = "$latest" ]; then
+    echo "[entrypoint] claude up to date ($cur)"
+  elif [ -n "$cur" ] \
+       && [ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" = "$cur" ]; then
+    # Installed is NEWER than the registry's latest — a version pinned by hand
+    # or an unpublished build. Never downgrade it.
+    echo "[entrypoint] claude: installed $cur is ahead of published $latest; leaving it"
+  else
+    # An unreadable version reaches here too (claude present, $cur empty): that
+    # is a half-written install, and reinstalling is the repair. Bounded to once
+    # per rate-limit window, and verified below rather than assumed.
+    echo "[entrypoint] claude update: ${cur:-none-or-unreadable} -> $latest"
+    if timeout "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+         npm install -g "@anthropic-ai/claude-code@$latest"; then
+      echo "[entrypoint] claude: now $(claude --version 2>/dev/null || echo '?')"
+    else
+      echo "[entrypoint] claude: update FAILED; staying at ${cur:-none}"
+    fi
+  fi
+  rm -rf "$scratch"
+}
+
 if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
    && { [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; } \
    && command -v npm >/dev/null 2>&1; then
-  (
-    # Run against a throwaway HOME. /root is the operator's bind mount: npm
-    # would leave a cache of tarballs nothing reads later (the Dockerfile
-    # deletes them for the same reason), and anything `claude` touches on the
-    # way to printing its version would land there ROOT-owned on a host whose
-    # sessions run as somebody else — re-creating, one file at a time, the
-    # breakage the identity block exists to end.
-    export HOME=/tmp/.turma-claude-update
-    export npm_config_cache="$HOME/npm"
-    mkdir -p "$HOME"
-    cur="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-    latest="$(timeout "${TURMA_NPM_VIEW_TIMEOUT:-60}" npm view @anthropic-ai/claude-code version \
-              --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]')"
-    # A registry that answers with anything but a version is "stay put", not an
-    # upgrade: `sort -V` ranks a non-numeric string ABOVE a semver, so a proxy
-    # error line or a warning on stdout would otherwise replace the package on
-    # every single boot.
-    echo "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' || latest=""
-    if [ -z "$latest" ]; then
-      echo "[entrypoint] claude: registry unreachable or unreadable; staying at ${cur:-unknown}"
-    elif [ -n "$cur" ] && [ "$cur" = "$latest" ]; then
-      echo "[entrypoint] claude up to date ($cur)"
-    elif [ -n "$cur" ] \
-         && [ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" = "$cur" ]; then
-      # Installed is NEWER than the registry's latest — a version pinned by hand
-      # or an unpublished build. Never downgrade it.
-      echo "[entrypoint] claude: installed $cur is ahead of published $latest; leaving it"
-    else
-      echo "[entrypoint] claude update: ${cur:-none} -> $latest"
-      if timeout "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
-           npm install -g "@anthropic-ai/claude-code@$latest"; then
-        echo "[entrypoint] claude: now $(claude --version 2>/dev/null || echo '?')"
-      else
-        echo "[entrypoint] claude: update FAILED; staying at ${cur:-none}"
-      fi
-    fi
-    rm -rf /tmp/.turma-claude-update
-  )
+  # `|| echo` so nothing inside can abort the boot: this runs at PID 1 under
+  # `set -e`, and an agent that will not start is far worse than a stale claude.
+  claude_update_check || echo "[entrypoint] claude: update check failed; carrying on"
 fi
 
 # --- GitHub auth preflight (agent-agnostic) --------------------------------

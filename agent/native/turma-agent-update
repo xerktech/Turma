@@ -130,7 +130,7 @@ claude_version() {
 claude_latest() {
   command -v npm >/dev/null 2>&1 || return 0
   local out
-  out="$(bounded "${TURMA_NPM_VIEW_TIMEOUT:-60}" npm view "$CLAUDE_PKG" version \
+  out="$(bounded "${TURMA_NPM_VIEW_TIMEOUT:-45}" npm view "$CLAUDE_PKG" version \
          --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]' || true)"
   printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' || return 0
   printf '%s' "$out"
@@ -156,34 +156,96 @@ claude_is_npm_managed() {
   case "$on_path" in "$prefix"/*) return 0 ;; *) return 1 ;; esac
 }
 
+# Where would `npm install -g` put claude's launcher, and can this agent's PATH
+# reach it? An install into a prefix PATH never looks at is not an install: the
+# agent still can't run claude, the next check finds it MISSING again, and the
+# whole thing repeats — inside the boot path — on every start, forever.
+npm_bin_dir() {  # <prefix override, or empty for npm's own>
+  if [ -n "${1:-}" ]; then printf '%s/bin' "$1"; else
+    local p; p="$(npm prefix -g 2>/dev/null || true)"
+    [ -n "$p" ] && printf '%s/bin' "$p"
+  fi
+}
+
+on_path() {  # <dir>
+  [ -n "${1:-}" ] || return 1
+  case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac
+}
+
 npm_install_claude() {
-  bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
-    npm install -g "$CLAUDE_PKG@latest" >>"$LOG" 2>&1 && return 0
-  # A non-root user against a root-owned global prefix fails with EACCES. Retry
-  # into the prefix install.sh blesses and the launcher puts on PATH, which is
-  # where this fleet's claude lives anyway. Root takes no retry: it can write
-  # the real global prefix, so a failure there is a real failure, and installing
-  # into /root/.local instead would just put claude somewhere PATH may not reach.
-  [ "$(id -u)" = 0 ] && return 1
-  logmsg "claude: global npm install failed; retrying into $HOME/.local"
+  local gbin lbin
+  gbin="$(npm_bin_dir "")"
+  lbin="$HOME/.local/bin"   # the prefix install.sh blesses and the launcher exports
+
+  if on_path "$gbin"; then
+    bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+      npm install -g "$CLAUDE_PKG@latest" >>"$LOG" 2>&1 && return 0
+    # A non-root user against a root-owned global prefix fails with EACCES.
+    # Root takes no retry: it can write the real global prefix, so a failure
+    # there is a real failure, and installing into /root/.local instead would
+    # just put claude somewhere PATH may not reach.
+    [ "$(id -u)" = 0 ] && return 1
+    on_path "$lbin" || { logmsg "claude: npm install failed and $lbin is not on PATH"; return 1; }
+    logmsg "claude: global npm install failed; retrying into $HOME/.local"
+  elif on_path "$lbin"; then
+    # npm's own prefix is somewhere this agent cannot reach — install where it
+    # can, rather than into a directory nothing here will ever run from.
+    logmsg "claude: npm's global bin ($gbin) is not on this agent's PATH; installing into $HOME/.local"
+  else
+    logmsg "claude: neither npm's global bin ($gbin) nor $lbin is on this agent's PATH —" \
+           "an install would land somewhere no session can run; not installing"
+    return 1
+  fi
   bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
     npm install -g --prefix "$HOME/.local" "$CLAUDE_PKG@latest" >>"$LOG" 2>&1
 }
 
-# Report what an install actually achieved. An install that reports success
-# while the version on PATH doesn't move means the copy we updated is not the
-# copy this host runs — say so, rather than logging the old version as if it
-# were the new one and repeating the whole thing on the next check.
+# Report what an install actually ACHIEVED, never what it was asked to do. An
+# install can report success while the version this agent resolves doesn't move
+# — the copy that was updated is then not the copy this host runs — and logging
+# the old number as if it were the new one hides that it will repeat forever.
+# <want> may be empty when the target version isn't knowable (`claude update`
+# tracks its own channel, which can lag npm's `latest`).
 report_claude_install() {  # <version_before> <want>
   local before="$1" want="$2" now
   now="$(claude_version)"
-  if [ "$now" = "$want" ] || [ -z "$want" ]; then
-    logmsg "claude: now ${now:-unknown}"
+  if [ -z "$now" ]; then
+    logmsg "claude: install finished but $(command -v claude 2>/dev/null || echo 'claude')" \
+           "still reports no readable version"
   elif [ "$now" = "$before" ]; then
-    logmsg "claude: install reported success but PATH still resolves $before at" \
+    logmsg "claude: install reported success but this agent still resolves $before at" \
            "$(command -v claude 2>/dev/null || echo '?') — that copy is not the one that was updated"
+  elif [ -n "$want" ] && [ "$now" != "$want" ]; then
+    logmsg "claude: now $now (wanted $want)"
   else
-    logmsg "claude: now ${now:-unknown} (wanted $want)"
+    logmsg "claude: now $now"
+  fi
+}
+
+# Install or repair, and VERIFY. Shared by the upgrade and the repair paths so
+# they cannot drift: which mechanism owns this claude is the same question in
+# both cases.
+install_claude() {  # <version_before> <version_wanted, may be empty>
+  local before="$1" want="${2:-}"
+  # Nothing on PATH at all means npm is the only mechanism there is — asking a
+  # claude that doesn't exist to update itself cannot work. Otherwise the
+  # question is who OWNS the claude this agent resolves.
+  if ! command -v claude >/dev/null 2>&1 || claude_is_npm_managed; then
+    if npm_install_claude; then
+      report_claude_install "$before" "$want"
+    else
+      logmsg "claude: install FAILED (see npm output above)"
+    fi
+  elif bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" claude update >>"$LOG" 2>&1; then
+    # Not npm-managed: Anthropic's native installer owns this claude, and `npm
+    # install -g` would lay a SECOND one down beside it, with whichever PATH
+    # entry wins deciding the version — so hand the update to the installer that
+    # owns it. Its channel tracks its own releases, which can lag npm's `latest`,
+    # so the wanted version is not demanded of it — but an update that changed
+    # NOTHING is still called out rather than logged as a success.
+    report_claude_install "$before" ""
+  else
+    logmsg "claude: not npm-managed and 'claude update' failed"
   fi
 }
 
@@ -194,30 +256,29 @@ update_claude() {
   fi
 
   local cur latest
-  # ABSENT and UNREADABLE are different faults. Keyed on `command -v`, not on
-  # whether a version could be parsed: a claude that runs but prints something
-  # this doesn't recognise (or exits nonzero) would otherwise be "missing" on
-  # every single check, reinstalled every time, forever, and never verified.
+  # ABSENT and UNREADABLE are different faults with the same repair. Both are
+  # kept off the version COMPARE — there is nothing to compare — and both are
+  # verified afterwards rather than assumed, which is what keeps a repair that
+  # cannot work from being retried blindly forever.
   if ! command -v claude >/dev/null 2>&1; then
-    # Every session this agent launches dies seconds later on exec, so
-    # installing it IS the fix rather than something to report and move on from.
     if ! command -v npm >/dev/null 2>&1; then
       logmsg "claude: MISSING and npm is not installed — every session launch will fail"
       return 0
     fi
+    # Every session this agent launches dies seconds later on exec, so
+    # installing it IS the fix rather than something to report and move on from.
     logmsg "claude: MISSING — installing $CLAUDE_PKG"
-    if npm_install_claude; then
-      logmsg "claude: installed $(claude_version)"
-    else
-      logmsg "claude: install FAILED (see npm output above); sessions will keep failing"
-    fi
+    install_claude ""
     return 0
   fi
 
   cur="$(claude_version)"
   if [ -z "$cur" ]; then
-    logmsg "claude: installed at $(command -v claude) but reports no readable version;" \
-           "leaving it alone"
+    # Present but unable to say what it is — a half-written install (an install
+    # killed mid-write, a partial extract). Reinstalling is the repair, and the
+    # start-check rate limit is what bounds it to once per window.
+    logmsg "claude: $(command -v claude) reports no readable version — reinstalling"
+    install_claude ""
     return 0
   fi
 
@@ -232,22 +293,7 @@ update_claude() {
   fi
 
   logmsg "claude update available: $cur -> $latest"
-  if claude_is_npm_managed; then
-    if npm_install_claude; then
-      report_claude_install "$cur" "$latest"
-    else
-      logmsg "claude: update FAILED; staying at $cur"
-    fi
-  elif bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" claude update >>"$LOG" 2>&1; then
-    # Not npm-managed: Anthropic's native installer owns this claude, and `npm
-    # install -g` would lay a SECOND one down beside it, with whichever PATH
-    # entry wins deciding the version — so hand the update to the installer that
-    # owns it. Its channel can lag npm's `latest`, so don't demand the version
-    # we compared against; report whatever it landed on.
-    report_claude_install "$cur" ""
-  else
-    logmsg "claude: not npm-managed and 'claude update' failed; staying at $cur"
-  fi
+  install_claude "$cur" "$latest"
 }
 
 # The Authorization header to send with a plain-curl GitHub call, as an array —

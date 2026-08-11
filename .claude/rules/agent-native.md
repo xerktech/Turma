@@ -78,12 +78,20 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       alone answers a different question, and on a host with both (npm prefix `~/.local/node`,
       claude in `~/.local/bin`) it "updates" the copy nobody runs, reports the unchanged version as
       success, and repeats forever. Otherwise `claude update`, the installer that owns it.
-    - **ABSENT ≠ unreadable**: keyed on `command -v`, since a claude that runs but prints an
-      unrecognised version would otherwise be reinstalled on every check. A genuinely missing claude
-      IS installed — without it every session dies on exec. Unreachable-or-unparseable registry
-      output and installed-ahead-of-published both stay put (`sort -V` ranks a non-version ABOVE a
-      semver, so an error line would otherwise read as an upgrade). `TURMA_CLAUDE_AUTO_UPDATE=0`
-      pins the host.
+    - **ABSENT and UNREADABLE skip the compare and go to the same repair**, and both are then
+      VERIFIED: a missing claude means every session dies on exec, and one that runs but can't say
+      what it is is a half-written install. What must never happen is repairing blind — reporting
+      the OLD version as success and repeating forever — so `report_claude_install` reads back what
+      the agent now resolves and says when nothing moved. The start-check rate limit is what bounds
+      a repair that cannot work.
+    - **npm is only used where this agent's PATH can reach it.** An install into a prefix PATH never
+      looks at leaves claude just as missing, so the next check repairs again, on every start,
+      forever; `npm_install_claude` picks npm's global prefix if its bin is on PATH, else the
+      `~/.local` the launcher exports, else refuses and says why.
+    - Unreachable-or-unparseable registry output and installed-ahead-of-published both stay put
+      (`sort -V` ranks a non-version ABOVE a semver, so an error line would otherwise read as an
+      upgrade). `TURMA_CLAUDE_AUTO_UPDATE=0` pins the host — and so does `TURMA_BOOT_UPDATE=0`,
+      since start is the only time Claude Code is checked at all.
     - Every external call is `timeout`-bounded: the lock is held for the whole run, so one hung
       child would block every later update — including the one shipping the fix.
 - **Every start is an update check**, fired by the launcher two different ways:

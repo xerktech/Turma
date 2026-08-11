@@ -29,13 +29,16 @@ assert_eq() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$4"; fi; }
 # --- Build a valid native tarball + sha256 sidecar for a given version -------
 # The payload must satisfy install_payload's completeness check (hub-agent.py +
 # tunnel-agent.js + hooks/).
-make_tarball() {  # <version> <outdir>
+make_tarball() {  # <version> <outdir> [nohooks]
   local version="$1" out="$2" staged
   staged="$(mktemp -d)"
   mkdir -p "$staged/hooks"
   echo "# hub-agent $version" >"$staged/hub-agent.py"
   echo "// tunnel $version" >"$staged/tunnel-agent.js"
   echo "# guard" >"$staged/hooks/guard.py"
+  # A payload missing hooks/ — the swap DELETES the installed hooks before it
+  # moves the staged ones in, so this must be refused outright.
+  [ "${3:-}" = nohooks ] && rm -rf "$staged/hooks"
   echo "$version" >"$staged/VERSION"
   local tgz="$out/turma-agent-native-v${version}.tar.gz"
   tar czf "$tgz" -C "$staged" .
@@ -388,8 +391,14 @@ install_fake_claude_toolchain() {  # <bindir> <installed|none> <latest|none> <ye
     cat > "$bin/claude" <<STUB
 #!/bin/sh
 case "\$1" in
-  --version) echo "\$(cat "$bin/.claude-version") (Claude Code)" ;;
-  update) echo "claude-update" >> "\$CLAUDE_LOG"; echo "$latest" > "$bin/.claude-version" ;;
+  --version)
+     [ -n "\${STUB_CLAUDE_HANG:-}" ] && sleep "\$STUB_CLAUDE_HANG"
+     echo "\$(cat "$bin/.claude-version") (Claude Code)" ;;
+  update)
+     echo "claude-update" >> "\$CLAUDE_LOG"
+     # \$STUB_CLAUDE_UPDATE_NOOP: exits 0 having changed nothing, which is what
+     # a native-installer channel lagging npm's published latest does.
+     [ -n "\${STUB_CLAUDE_UPDATE_NOOP:-}" ] || echo "$latest" > "$bin/.claude-version" ;;
   *) exit 2 ;;
 esac
 STUB
@@ -541,13 +550,20 @@ else
   fail "a no-op install was reported as a successful update (log: $got)"
 fi
 
-# 16c. A claude that RUNS but prints no parseable version is not "missing": that
-#      classification would reinstall it on every check forever, unverified.
+# 16c. A claude that RUNS but prints no parseable version is a half-written
+#      install, not a stale one: it is REPAIRED rather than compared, and the
+#      repair is verified — a claude that still can't say what it is afterwards
+#      must be reported, never logged as a success.
 got="$(run_claude_case "garbage-not-a-version" "2.0.9" yes)"
 if printf '%s' "$got" | grep -q 'npm-install'; then
-  fail "reinstalled a claude that merely printed an unreadable version (log: $got)"
+  pass "an unreadable claude is reinstalled"
 else
-  pass "an unreadable version is reported, not treated as a missing install"
+  fail "an unreadable claude was left broken forever (log: $got)"
+fi
+if printf '%s' "$got" | grep -q 'LOG .*no readable version'; then
+  pass "a repair that changed nothing is reported, not claimed"
+else
+  fail "an unverified repair was reported as success (log: $got)"
 fi
 
 # 16d. A registry answering with something that is not a version must read as
@@ -601,6 +617,39 @@ else
   pass "a plain agent check leaves claude alone"
 fi
 rm -rf "$root" "$d"
+
+# 16g. npm's global prefix is somewhere this agent's PATH never looks. Installing
+#      there is not an install: claude still isn't runnable, the next check finds
+#      it MISSING again, and the whole thing repeats inside the boot path forever.
+#      It must go where the launcher can actually reach it.
+got="$(run_claude_case none "2.0.9" elsewhere)"
+if printf '%s' "$got" | grep -qE 'npm-install install -g --prefix .*/home/\.local'; then
+  pass "an unreachable npm prefix is installed around, not into"
+else
+  fail "installed into a prefix this agent's PATH can't reach (log: $got)"
+fi
+
+# 16h. `claude update` exits 0 whether or not it changed anything — its channel
+#      can lag npm's `latest`. An update that moved nothing must say so, or the
+#      log is indistinguishable from a real one and it re-fires on every start.
+got="$(run_claude_case "2.0.1" "2.0.9" no STUB_CLAUDE_UPDATE_NOOP=1)"
+if printf '%s' "$got" | grep -q 'LOG .*still resolves 2.0.1'; then
+  pass "a 'claude update' that changed nothing is called out"
+else
+  fail "a no-op claude update was logged as success (log: $got)"
+fi
+
+# 16i. The probe is bounded on its OWN, not merely by the launcher's outer
+#      timeout: this script holds the update lock while it runs, so a hung claude
+#      would block every later update — including the one shipping the fix.
+start=$(date +%s)
+got="$(run_claude_case "2.0.1" "2.0.9" yes STUB_CLAUDE_HANG=60 TURMA_CLAUDE_PROBE_TIMEOUT=2)"
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -lt 30 ]; then
+  pass "a hung 'claude --version' is cut short by its own timeout (${elapsed}s)"
+else
+  fail "the version probe ran unbounded (${elapsed}s)"
+fi
 
 # --- The --boot rate limit (XERK-254) ----------------------------------------
 # The launcher fires --boot on every start, and systemd's Restart=always makes a
@@ -744,6 +793,48 @@ if [ -s "$root/home/.turma/last-claude-check" ]; then
 else
   fail "no last-claude-check stamp after --claude-only"
 fi
+rm -rf "$root" "$d"
+
+# 25. A payload without hooks/ is refused BEFORE anything is swapped. The swap
+#     removes the installed hooks first, and a missing hook command is a
+#     NON-BLOCKING hook — the safety guard would fail open while VERSION, the
+#     restart and the log all reported a clean update.
+d="$(new_gh_dir)"
+echo "v0.4.0" >> "$d/tags"
+cat > "$d/manifests/v0.4.0.json" <<EOF
+{ "schema":1, "version":"0.4.0", "tag":"v0.4.0",
+  "components": { "agent-native": {
+      "version":"0.4.0", "kind":"asset",
+      "asset":"turma-agent-native-v0.4.0.tar.gz",
+      "sha256_asset":"turma-agent-native-v0.4.0.tar.gz.sha256",
+      "release_tag":"v0.4.0", "built":true } } }
+EOF
+mkdir -p "$d/assets/v0.4.0"
+cp "$d/manifests/v0.4.0.json" "$d/assets/v0.4.0/manifest.json"
+make_tarball "0.4.0" "$d/assets/v0.4.0" nohooks >/dev/null
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+export TURMA_TEST_RESTART_LOG="$root/restart.log"; : > "$TURMA_TEST_RESTART_LOG"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
+got="$(tr -d '[:space:]' < "$prefix/VERSION")"
+assert_eq "0.3.0" "$got" "a payload without hooks/ is refused (stayed $got)" \
+  "installed a hook-less payload, VERSION now $got"
+if [ -f "$prefix/hooks/guard.py" ]; then
+  pass "the installed guard hook survives a refused payload"
+else
+  fail "the guard hook was deleted by a payload that didn't carry one — the guard fails OPEN"
+fi
+if [ -s "$TURMA_TEST_RESTART_LOG" ]; then
+  fail "restarted the manager for an install that was refused"
+else
+  pass "no restart for a refused payload"
+fi
+unset TURMA_TEST_RESTART_LOG
 rm -rf "$root" "$d"
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
