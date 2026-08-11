@@ -36,6 +36,13 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     version is usually a half-written install, but equally a working claude printing a shape this
     doesn't parse — there the reinstall fixes nothing and would run on every boot forever. Retried
     only when what claude prints CHANGES, and only ever written by an install that SUCCEEDED.
+  - **`~/.turma` is writable by the DROPPED IDENTITY** — it is the manager's `REGISTRY_DIR` — so
+    every file this check opens there is a DoS surface: a session `mkfifo`s the stamp or the marker,
+    the open BLOCKS with no error for `|| true` to catch, and PID 1 sits there forever. Reads go
+    through a regular-file guard and writes through a temp file + rename (no check-then-open race),
+    and the call site adds a watchdog that bounds the whole block the way the native launcher's
+    outer `timeout` does. Guards mean it never fires; the watchdog means a future unbounded call
+    can't wedge a host.
   - **Every `claude --version` here is `timeout`-wrapped, the post-install verification included.**
     These are children of PID 1 with no outer timeout anywhere (the `||` guard only runs once the
     block returns), and a hang is reachable from the very fault the repair branch handles: an

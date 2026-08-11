@@ -544,6 +544,29 @@ else
   echo "  FAIL: the boot waited ${elapsed}s on a hung claude — running, no manager, no restart"; FAILED=1
 fi
 
+echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"
+# /root/.turma is the manager's REGISTRY_DIR, so the dropped identity — every
+# Claude session — can write there. Opening a FIFO BLOCKS until the other end
+# appears, with no error for `|| true` to catch, which is the PID-1 wedge again:
+# a `running` container with no manager, no tunnel and no restart policy firing.
+# Both state files are attacked here, and the boot is TIMED, since a wedge shows
+# up as "never finished", not as a wrong answer.
+make_fixture "$WORK/fx16" 1000 1000
+mkdir -p "$WORK/fx16/turma"
+docker run --rm -v "$WORK/fx16/turma:/t" busybox sh -c \
+  'mkfifo /t/last-claude-check /t/claude-unparseable; chmod 666 /t/*' >/dev/null 2>&1
+t0=$(date +%s)
+out="$(run_case "$WORK/fx16" -e AGENT=claude -e PUID=1000 -e PGID=1000 \
+  -e STUB_MANAGER_SLEEP=2 -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 \
+  -e TURMA_CLAUDE_UPDATE_TIMEOUT=25 -v "$WORK/fx16/turma:/root/.turma")"
+elapsed=$(( $(date +%s) - t0 ))
+if echo "$out" | grep -q "MANAGER uid=" && [ "$elapsed" -lt 25 ]; then
+  echo "  ok: booted in ${elapsed}s with both state files replaced by FIFOs"
+else
+  echo "  FAIL: a session-planted FIFO held the boot ${elapsed}s (wedge, or only the watchdog saved it)"; FAILED=1
+fi
+docker run --rm -v "$WORK/fx16/turma:/t" busybox sh -c 'rm -f /t/last-claude-check /t/claude-unparseable' >/dev/null 2>&1
+
 echo "== case: nothing in the check can stop the container booting"
 # The check is AWAITED, which puts it in `set -e`'s path at PID 1. It used to
 # use a fixed /tmp scratch dir, so any session — running as the dropped identity

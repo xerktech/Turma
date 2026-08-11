@@ -100,6 +100,11 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       returns the install's status): remembering an install that never reached the registry, because
       the host restarted while its network was down, would brick Claude Code on that host
       permanently.
+    - **Nothing opens a `~/.turma` path that isn't a regular file.** That dir is writable by the
+      identity the SESSIONS run as, so a `mkfifo` there blocks the open forever with no error —
+      inside an awaited start. Stamp and marker go through `safe_read`/`safe_write` (temp file +
+      rename, no check-then-open race), `logmsg` skips a non-regular log target, and `with_lock`
+      removes a non-regular lock path rather than opening it.
     - Every external call is `timeout`-bounded, `npm prefix -g`/`npm ls -g` included and the prefix
       read once per run: the lock is held for the whole run, so one hung child would block every
       later update — including the one shipping the fix — and this runs inside a start.

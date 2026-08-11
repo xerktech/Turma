@@ -725,6 +725,44 @@ else
   fail "the version probe ran unbounded (${elapsed}s)"
 fi
 
+# 16j. ~/.turma is writable by the identity the SESSIONS run as, so every file
+#      this script opens there is a denial-of-service surface: opening a FIFO
+#      blocks until the other end appears, with NO error for `|| true` to catch,
+#      and this runs inside an awaited agent start. Stamp, marker, log and lock
+#      are all attacked at once; the run must complete regardless.
+if command -v mkfifo >/dev/null 2>&1; then
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+  echo "0.3.0" >"$prefix/VERSION"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  install_fake_claude_toolchain "$bin" "2.0.1" "2.0.1" yes
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+  mkdir -p "$root/home/.turma"
+  mkfifo "$root/home/.turma/last-claude-check" \
+         "$root/home/.turma/claude-unparseable" \
+         "$root/home/.turma/update.log" \
+         "$root/home/.turma/update.lock" 2>/dev/null || true
+  rc=0
+  env FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
+    TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" \
+    timeout 30 "$bin/turma-agent-update" --claude-only >"$root/out.log" 2>&1 || rc=$?
+  if [ "$rc" = 124 ]; then
+    fail "a FIFO in ~/.turma blocked the check — on a real host that is a delayed or wedged start"
+  else
+    pass "FIFOs planted in ~/.turma don't block the check"
+  fi
+  if grep -q 'claude up to date' "$root/out.log"; then
+    pass "and it still did its job"
+  else
+    fail "the check didn't run with FIFOs present: $(cat "$root/out.log")"
+  fi
+  rm -rf "$root" "$d"
+else
+  pass "mkfifo unavailable; FIFO case skipped"
+fi
+
 # --- The --boot rate limit (XERK-254) ----------------------------------------
 # The launcher fires --boot on every start, and systemd's Restart=always makes a
 # crash-looping manager start every 5s. Unthrottled that is a release+registry

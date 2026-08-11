@@ -68,7 +68,19 @@ BOOT_MIN_INTERVAL="${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}"
 CLAUDE_PKG="@anthropic-ai/claude-code"
 mkdir -p "$HOME/.turma" 2>/dev/null || true
 
-logmsg() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG" >&2; }
+# The log lives in ~/.turma, which the identity the SESSIONS run as can write.
+# `tee` opening a FIFO there would block forever — and this runs inside an
+# awaited agent start — so a log target that exists and is NOT a regular file is
+# simply not opened; the line still reaches stderr, which is the journal.
+logmsg() {
+  local line
+  line="[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"
+  if [ -e "$LOG" ] && [ ! -f "$LOG" ]; then
+    printf '%s\n' "$line" >&2
+  else
+    printf '%s\n' "$line" | tee -a "$LOG" >&2
+  fi
+}
 
 have_gh() { command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; }
 
@@ -309,7 +321,7 @@ update_claude() {
     # raw string, so a claude that later updates itself gets a fresh attempt.
     local raw marker
     raw="$(claude_raw_version)"
-    marker="$(cat "$CLAUDE_UNPARSEABLE" 2>/dev/null || true)"
+    marker="$(safe_read "$CLAUDE_UNPARSEABLE" | head -n1)"
     if [ -n "$raw" ] && [ "$raw" = "$marker" ]; then
       logmsg "claude: $(command -v claude) still reports an unrecognised version ($raw);" \
              "a repair already failed to change that, so leaving it alone"
@@ -323,7 +335,7 @@ update_claude() {
     # log line as the evidence.
     if install_claude ""; then
       if [ -z "$(claude_version)" ]; then
-        printf '%s\n' "$(claude_raw_version)" >"$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+        safe_write "$CLAUDE_UNPARSEABLE" "$(claude_raw_version)"
       else
         rm -f "$CLAUDE_UNPARSEABLE" 2>/dev/null || true
       fi
@@ -603,7 +615,30 @@ run_once() {
   try_legacy "$cur" "$stage"
 }
 
-stamp_now() { date +%s >"$1" 2>/dev/null || true; }
+# ~/.turma is writable by the identity the SESSIONS run as, so any file this
+# script opens there can be replaced with a FIFO — and opening a FIFO blocks
+# until the other end appears, with no error for `|| true` to catch. These two
+# never open anything that isn't a regular file, and the write goes through a
+# fresh temp file and a rename, so there is no check-then-open window to race.
+# The launcher's outer `timeout` would bound the damage to a delayed start; this
+# is what stops there being a delay at all.
+safe_read() {  # <path>
+  [ -f "$1" ] || return 0
+  cat "$1" 2>/dev/null || true
+}
+
+safe_write() {  # <path> <content>
+  local dir tmp
+  dir="$(dirname "$1")"
+  [ -d "$dir" ] || return 0
+  tmp="$(mktemp "$dir/.turma-tmp.XXXXXX" 2>/dev/null)" || return 0
+  if printf '%s\n' "$2" >"$tmp" 2>/dev/null && mv -f "$tmp" "$1" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+stamp_now() { safe_write "$1" "$(date +%s)"; }
 
 # Has a check of this kind run recently enough that this one is redundant?
 #
@@ -617,8 +652,7 @@ stamp_now() { date +%s >"$1" 2>/dev/null || true; }
 # is what makes "check on every restart" safe to promise.
 throttled() {  # <stampfile> <label>
   local file="$1" label="$2" now last age
-  [ -f "$file" ] || return 1
-  last="$(tr -cd '0-9' <"$file" 2>/dev/null || true)"
+  last="$(safe_read "$file" | tr -cd '0-9')"
   [ -n "$last" ] || return 1
   now="$(date +%s)"
   # 10# so a zero-padded or partially-written stamp is read as decimal: bash
@@ -642,6 +676,13 @@ throttled() {  # <stampfile> <label>
 # on a non-systemd host exit immediately as "another update run holds the lock",
 # i.e. silently never run at all.
 with_lock() {  # <cmd...>
+  # Same surface as the log: `exec 9>` on a FIFO planted at the lock path blocks
+  # before flock is ever reached. Nothing but this script owns that path, so a
+  # non-regular file there is removed rather than opened.
+  if [ -e "$LOCK" ] && [ ! -f "$LOCK" ]; then
+    rm -f "$LOCK" 2>/dev/null \
+      || { logmsg "lock path $LOCK is not a regular file and cannot be removed; skipping"; return 1; }
+  fi
   exec 9>"$LOCK"
   if ! flock -n 9; then
     logmsg "another update run holds the lock; skipping"

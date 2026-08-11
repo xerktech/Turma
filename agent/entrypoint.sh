@@ -194,17 +194,41 @@ fi
 # `export HOME=/root` invariant the identity block above exists to hold. The
 # `||` guard that keeps this off `set -e`'s path lives at the CALL site, so
 # making the body a subshell costs nothing.
+#
+# Its two state files live in /root/.turma, which the DROPPED IDENTITY can write
+# — it is the manager's own REGISTRY_DIR. So a session can replace either with a
+# FIFO, and opening a FIFO for reading or writing BLOCKS until the other end
+# appears: `2>/dev/null || true` cannot help, because there is no error, only a
+# block. That is the PID-1 wedge again through a different door — a `running`
+# container with no manager, no tunnel and no restart. Hence these two helpers:
+# nothing here ever opens a path that isn't a regular file, and the write goes
+# through a fresh temp file and a rename, so there is no check-then-open window
+# to race either.
+turma_read_file() {  # <path> — prints nothing for anything that isn't a plain file
+  [ -f "$1" ] || return 0
+  cat "$1" 2>/dev/null || true
+}
+
+turma_write_file() {  # <path> <content>
+  _dir="$(dirname "$1")"
+  [ -d "$_dir" ] || return 0
+  _tmp="$(mktemp "$_dir/.turma-tmp.XXXXXX" 2>/dev/null)" || return 0
+  printf '%s\n' "$2" >"$_tmp" 2>/dev/null \
+    && mv -f "$_tmp" "$1" 2>/dev/null && return 0
+  rm -f "$_tmp" 2>/dev/null || true
+}
+
 claude_update_check() (
   # Rate-limited like the native launcher's, and for the same reason: a
   # container in a restart loop would otherwise hit the registry every few
   # seconds, and pay the check's latency on every pass.
   stamp=/root/.turma/last-claude-check
   now="$(date +%s)"
-  # Guarded on the file EXISTING: dash reports a failed redirect itself, and the
-  # `2>/dev/null` here belongs to `tr`, so a first boot printed "cannot open
-  # /root/.turma/last-claude-check" as the very first line of the log.
-  last=""
-  [ -f "$stamp" ] && last="$(tr -cd '0-9' <"$stamp" 2>/dev/null || true)"
+  # Read through the guard above — which also fixes a first boot printing
+  # "cannot open /root/.turma/last-claude-check" as its very first log line
+  # (dash reports the failed redirect itself; a `2>/dev/null` on the pipeline
+  # belongs to `tr`, not to the shell's open).
+  last="$(turma_read_file "$stamp" | tr -cd '0-9')"
   # Strip leading zeros before the arithmetic: this is /bin/sh, where a
   # zero-padded number is OCTAL and `09` is an error — and bash's `10#` prefix
   # is undefined here. An implausibly long value is treated as no stamp rather
@@ -227,7 +251,7 @@ claude_update_check() (
   # block exists to end.
   scratch="$(mktemp -d /tmp/turma-claude-update.XXXXXX)" || exit 1
   mkdir -p /root/.turma 2>/dev/null || true
-  echo "$now" >"$stamp" 2>/dev/null || true
+  turma_write_file "$stamp" "$now"
   HOME="$scratch"; export HOME
   npm_config_cache="$scratch/npm"; export npm_config_cache
 
@@ -254,7 +278,7 @@ claude_update_check() (
     # Installed is NEWER than the registry's latest — a version pinned by hand
     # or an unpublished build. Never downgrade it.
     echo "[entrypoint] claude: installed $cur is ahead of published $latest; leaving it"
-  elif [ -z "$cur" ] && [ -n "$raw" ] && [ "$raw" = "$(cat "$unparseable" 2>/dev/null)" ]; then
+  elif [ -z "$cur" ] && [ -n "$raw" ] && [ "$raw" = "$(turma_read_file "$unparseable" | head -n1)" ]; then
     # Present, running, and printing a version shape this can't parse — a future
     # two-component or calver string, say. Reinstalling fixed nothing last time,
     # so don't do it again until what claude prints CHANGES. Without this memory
@@ -277,7 +301,7 @@ claude_update_check() (
       if printf '%s' "$now_raw" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
         rm -f "$unparseable" 2>/dev/null || true
       else
-        printf '%s\n' "$now_raw" >"$unparseable" 2>/dev/null || true
+        turma_write_file "$unparseable" "$now_raw"
       fi
     else
       echo "[entrypoint] claude: update FAILED; staying at ${cur:-none}"
@@ -291,7 +315,21 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
    && command -v npm >/dev/null 2>&1; then
   # `|| echo` so nothing inside can abort the boot: this runs at PID 1 under
   # `set -e`, and an agent that will not start is far worse than a stale claude.
-  claude_update_check || echo "[entrypoint] claude: update check failed; carrying on"
+  #
+  # Bounded as a WHOLE, the way the native launcher wraps its check in
+  # `timeout`, and not only call by call. Every call inside is individually
+  # bounded today, but this block runs as a child of PID 1 with nothing above it
+  # — so one future unbounded call, or one blocking open nobody predicted, is a
+  # container that stays `running` forever with no manager and no restart. The
+  # watchdog is the structural guarantee; the per-call bounds and the
+  # regular-file guards are what stop it ever firing.
+  claude_update_check &
+  _check_pid=$!
+  ( sleep "${TURMA_CLAUDE_UPDATE_TIMEOUT:-420}"; kill -TERM "$_check_pid" 2>/dev/null ) &
+  _watchdog_pid=$!
+  wait "$_check_pid" \
+    || echo "[entrypoint] claude: update check did not finish; carrying on"
+  kill -TERM "$_watchdog_pid" 2>/dev/null || true
 fi
 
 # --- GitHub auth preflight (agent-agnostic) --------------------------------
