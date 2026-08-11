@@ -126,6 +126,19 @@ class AgentDecodeTest {
         assertEquals("subscription", off.sessions[0].modelSource)
     }
 
+    // What hub-agent actually emits for a session that never moved:
+    // `_session_payload` sends `modelSourceAt: sess.get("modelSourceAt")`, i.e.
+    // a JSON null, on EVERY such session. A non-nullable field would throw and
+    // take the whole fleet's decode with it.
+    @Test fun `a null modelSourceAt does not break the decode`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+              "sessions": [ { "id": "s", "modelSource": "subscription", "modelSourceAt": null } ] } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals("", resp.agents[0].sessions[0].modelSourceAt)
+    }
+
     // An agent predating the failover reports neither field. Absent must mean
     // "that host can't do it", which is what hides the control.
     @Test fun `an agent predating the failover decodes with no local model`() {

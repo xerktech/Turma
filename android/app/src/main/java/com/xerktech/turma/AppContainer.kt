@@ -3,6 +3,7 @@ package com.xerktech.turma
 import android.content.Context
 import com.xerktech.turma.data.Config
 import com.xerktech.turma.data.DraftStore
+import com.xerktech.turma.data.ModelSwitchStore
 import com.xerktech.turma.data.OrgFilter
 import com.xerktech.turma.data.TextSizePref
 import com.xerktech.turma.net.Dictation
@@ -39,6 +40,14 @@ class AppContainer(context: Context) {
      * them — so it can't live in either screen's own state.
      */
     val drafts = DraftStore()
+
+    /**
+     * In-flight model-source switches (XERK-246). Here for the same reason as
+     * [drafts]: the chat ViewModel is scoped to its nav entry, so a memo kept
+     * there died the moment you walked back to the session list — mid-switch,
+     * which is exactly when the memo is doing its job.
+     */
+    val modelSwitches = ModelSwitchStore()
 
     /**
      * The in-session chat text size (XERK-144). Here for the same reason as [org]:

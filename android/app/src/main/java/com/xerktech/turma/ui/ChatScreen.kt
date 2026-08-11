@@ -623,7 +623,8 @@ private fun ChatFooter(
             if (canSwitchModelSource) {
                 val opts = com.xerktech.turma.core.ModelSource.options(localModel)
                 MenuChip(
-                    label = "run: ${com.xerktech.turma.core.ModelSource.label(modelSource, localModel)}",
+                    label = com.xerktech.turma.core.ModelSource.glyph(modelSource) + " run: " +
+                        com.xerktech.turma.core.ModelSource.label(modelSource, localModel),
                     options = opts.map { it.first },
                     onSelect = onModelSource,
                     optionLabel = { v -> opts.firstOrNull { it.first == v }?.second ?: v },

@@ -94,14 +94,17 @@ fun SpawnDialog(
                         singleLine = true, modifier = Modifier.fillMaxWidth(),
                     )
                 }
-                // On the local model the Claude alias picker only breaks the
-                // session — every alias that endpoint refuses — so it goes, the
-                // same way the web hides it for a local session.
-                if (ModelSource.modelPickable(modelSource)) {
-                    DropdownField("Model", MODELS, model) { model = it }
-                }
+                // The Model picker stays for a local spawn, matching the web
+                // composer (sessions.html), which offers and sends it whatever
+                // the source. The agent drops `--model` for a local session
+                // itself, and the alias is what that session goes back to if it
+                // is ever switched to the subscription — so discarding it here
+                // would silently give an Android-spawned session a different
+                // model from a web-spawned one. Only the CHAT bar fixes the
+                // model, because there the picker would break a live session.
+                DropdownField("Model", MODELS, model) { model = it }
                 DropdownField("Permission mode", MODES, mode) { mode = it }
-                if (localModel?.available == true) {
+                if (ModelSource.composerOffers(localModel)) {
                     DropdownField(
                         label = "Run against",
                         options = sourceOpts.map { it.first },
@@ -112,13 +115,9 @@ fun SpawnDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = {
-                // A local session's model comes from the host's ANTHROPIC_MODEL and
-                // the agent drops --model for it; send blank so the request says
-                // what the composer showed rather than a stale hidden alias.
-                val picked = if (ModelSource.modelPickable(modelSource)) model else ""
-                onSpawn(prompt, label, baseRef, picked, mode, modelSource)
-            }) { Text("Spawn") }
+            TextButton(onClick = { onSpawn(prompt, label, baseRef, model, mode, modelSource) }) {
+                Text("Spawn")
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )

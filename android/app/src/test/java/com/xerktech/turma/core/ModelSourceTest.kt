@@ -4,6 +4,7 @@ import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.SessionInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -61,11 +62,52 @@ class ModelSourceTest {
         assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(sess, other, 1_100))
     }
 
+    @Test fun `a memo retires on the heartbeat agreeing, not on a blind timer`() {
+        val p = ModelSource.Pending("s1", ModelSource.LOCAL, at = 1_000)
+        // Heartbeat still reports the old value: hold.
+        assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s1", modelSource = "subscription")))
+        // Heartbeat caught up: retire, well inside the TTL.
+        assertNull(ModelSource.settle(p, SessionInfo(id = "s1", modelSource = "local")))
+        // A memo is never judged by a DIFFERENT session's record.
+        assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s2", modelSource = "local")))
+        assertEquals(p, ModelSource.settle(p, null))
+        assertNull(ModelSource.settle(null, SessionInfo(id = "s1")))
+    }
+
+    @Test fun `a spawn sends the source only when it is local`() {
+        // "subscription" is what a spawn already meant, so omitting it keeps a
+        // bare spawn byte-identical to what it was before the failover existed.
+        assertEquals("local", ModelSource.spawnValue(ModelSource.LOCAL))
+        assertNull(ModelSource.spawnValue(ModelSource.SUBSCRIPTION))
+        assertNull(ModelSource.spawnValue(""))
+        assertNull(ModelSource.spawnValue(null))
+    }
+
+    @Test fun `the spawn composer offers the row only on a host reporting one`() {
+        assertTrue(ModelSource.composerOffers(configured))
+        assertFalse(ModelSource.composerOffers(unconfigured))
+        assertFalse(ModelSource.composerOffers(null))
+    }
+
+    @Test fun `a memo with no session id is never honoured`() {
+        // Else it would paint every record-less session at once.
+        val blank = ModelSource.Pending("", ModelSource.LOCAL, at = 0)
+        assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(null, blank, 1))
+        assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(SessionInfo(id = ""), blank, 1))
+    }
+
+    @Test fun `the chip carries the web's cloud-or-house glyph`() {
+        // The colour alone can't answer "which model wrote this turn" for a
+        // colour-blind reader.
+        assertEquals("🏠", ModelSource.glyph(ModelSource.LOCAL))
+        assertEquals("☁", ModelSource.glyph(ModelSource.SUBSCRIPTION))
+    }
+
     @Test fun `a local session reads as the model name, not the word local`() {
         // It is a weaker model than Claude; nobody should have to wonder which
         // one wrote a turn.
         assertEquals("gpt-oss:120b", ModelSource.label(ModelSource.LOCAL, configured))
-        assertEquals("subscription", ModelSource.label(ModelSource.SUBSCRIPTION, configured))
+        assertEquals("Subscription", ModelSource.label(ModelSource.SUBSCRIPTION, configured))
         // A host that stopped reporting a name still labels the row honestly.
         assertEquals("local model", ModelSource.label(ModelSource.LOCAL, null))
         assertEquals("Self-hosted model", ModelSource.options(null)[1].second)

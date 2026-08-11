@@ -133,11 +133,22 @@ class ChatViewModel(
      */
     private val draft = container.drafts.of(host, sessionId)
 
+    /**
+     * The in-flight model-source switch, held in the container for the SAME
+     * reason as [draft] (XERK-246): this ViewModel is scoped to the chat's nav
+     * entry, so a memo kept here died the moment you walked back to the session
+     * list — mid-switch, which is when it is doing its job.
+     */
+    private val modelSwitch = container.modelSwitches.of(host, sessionId)
+
     init {
         // Collected on viewModelScope (not the onEnter/onLeave jobs): the mirror
         // must survive a detail-pane swap, or a re-entry would paint an empty box
         // until the next keystroke.
         viewModelScope.launch { draft.collect { text -> _state.update { it.copy(draft = text) } } }
+        viewModelScope.launch {
+            modelSwitch.collect { p -> _state.update { it.copy(modelSourcePending = p) } }
+        }
     }
 
     private var liveJob: Job? = null
@@ -179,12 +190,15 @@ class ChatViewModel(
                 val agent = fleet.agents.firstOrNull { it.key == host }
                 val session = agent?.sessions?.firstOrNull { it.id == sessionId }
                 val label = agent?.device?.ifBlank { host } ?: host
+                // Retire a memo the heartbeat has caught up with, through the
+                // store — the state copy is a mirror, so clearing only that
+                // would let the next emission paint the stale memo back.
+                modelSwitch.value = ModelSource.settle(modelSwitch.value, session)
                 _state.update {
                     it.copy(session = session, hostLabel = label,
                         tunnelOnline = tunnelOnlineOf(agent),
                         uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
-                        localModel = agent?.localModel,
-                        modelSourcePending = settledPending(it.modelSourcePending, session))
+                        localModel = agent?.localModel)
                 }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
@@ -203,21 +217,10 @@ class ChatViewModel(
                 tunnelOnline = tunnelOnlineOf(agent),
                 uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
                 localModel = agent?.localModel,
+                modelSourcePending = modelSwitch.value,
                 entries = mergeTail(it.entries, seed))
         }
     }
-
-    /**
-     * Retire an in-flight model-source switch once the heartbeat reports it —
-     * the same "clears on its own completion signal, not a blind timer" rule the
-     * dashboard's per-session pending follows. The TTL inside [ModelSource] is
-     * only the backstop for a switch that never lands.
-     */
-    private fun settledPending(
-        pending: ModelSource.Pending?,
-        session: SessionInfo?,
-    ): ModelSource.Pending? =
-        if (pending != null && session?.modelSource == pending.value) null else pending
 
     private fun startLive() {
         liveJob?.cancel()
@@ -518,9 +521,7 @@ class ChatViewModel(
      */
     fun setModelSource(source: String) = viewModelScope.launch {
         if (source == _state.value.modelSource()) return@launch
-        _state.update {
-            it.copy(modelSourcePending = ModelSource.Pending(sessionId, source, System.currentTimeMillis()))
-        }
+        modelSwitch.value = ModelSource.Pending(sessionId, source, System.currentTimeMillis())
         val res = runCatching { client.api.setModelSource(host, sessionId, ModelSourceRequest(source)) }
         res.onSuccess {
             _messages.tryEmit(
@@ -529,7 +530,7 @@ class ChatViewModel(
             )
             container.fleet.nudge()
         }.onFailure { e ->
-            _state.update { it.copy(modelSourcePending = null) }
+            modelSwitch.value = null
             _messages.tryEmit("✗ " + (hubErrorMessage(e) ?: "could not switch model"))
         }
     }

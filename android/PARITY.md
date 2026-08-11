@@ -332,12 +332,22 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   agent reporting nothing cannot do it, so the control is hidden rather than offered and refused.
   The compose-bar chip is also shown when the session is already `local`, so one whose host later
   lost its configuration keeps a visible way back.
-- **The Claude model picker is hidden on a local session** (a static chip states the model instead),
-  matching the web: every alias it could offer — "default" included, since that resolves to the
-  shared login's default — is one the self-hosted endpoint refuses. The spawn composer drops the
-  alias for the same reason.
-- Pure half in `core/ModelSource.kt` (`ModelSourceTest.kt`); the wire block is locked in
-  `AgentDecodeTest.kt`, including the all-nulls shape an unconfigured host reports.
+- **The Claude model picker is hidden on a live local session** (a static chip states the model
+  instead), matching the web's `cc-model-fixed`: every alias it could offer — "default" included,
+  since that resolves to the shared login's default — is one the self-hosted endpoint refuses. The
+  **spawn composer keeps its Model row**, also matching the web (`sessions.html` renders and sends
+  it whatever the source): the agent drops `--model` for a local session itself, and the alias is
+  what that session goes back to if it is later switched to the subscription, so discarding it
+  would give an Android-spawned session a different model from a web-spawned one.
+- The memo lives in `AppContainer.modelSwitches`, not the chat ViewModel, for the same reason
+  `drafts` does — the VM is scoped to the chat's nav entry, so a memo kept there died the moment
+  you walked back to the session list, mid-switch, which is when it is doing its job.
+- Pure half in `core/ModelSource.kt` (`ModelSourceTest.kt`), the state reads in `ChatUiStateTest.kt`;
+  the wire block is locked in `AgentDecodeTest.kt`, including the all-nulls shape an unconfigured
+  host reports and the null `modelSourceAt` every unmoved session carries.
+- **Divergence:** the web chip carries a hover tooltip naming the self-hosted model; the Android
+  chip carries the same ☁/🏠 glyph and label but no tooltip — a phone has no hover, and the model
+  name is already the chip's own text.
 - **Still open:** the 🏠 mark on live and ended session CARDS (see below) — inside a session the
   compose-bar chip already names the model.
 

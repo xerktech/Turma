@@ -50,7 +50,11 @@ object ModelSource {
      * failover) reads as the subscription — the only thing it can run.
      */
     fun current(session: SessionInfo?, pending: Pending?, now: Long): String {
-        if (pending != null && pending.sessionId == (session?.id ?: "") &&
+        // The id must MATCH, not merely be equal-to-blank: a memo with no
+        // session id would otherwise be honoured against every record-less
+        // session at once. The web refuses it the same way (chat.js `mine`).
+        val id = session?.id.orEmpty()
+        if (pending != null && id.isNotBlank() && pending.sessionId == id &&
             now - pending.at < SWITCH_SETTLE_MS
         ) {
             return pending.value
@@ -59,13 +63,49 @@ object ModelSource {
     }
 
     /**
+     * Retire a memo the heartbeat has caught up with.
+     *
+     * The same "clears on its own completion signal, not a blind timer" rule the
+     * dashboard's per-session pending follows; [SWITCH_SETTLE_MS] is only the
+     * backstop for a switch that never lands. A memo for a DIFFERENT session is
+     * never judged by this session's record.
+     */
+    fun settle(pending: Pending?, session: SessionInfo?): Pending? {
+        if (pending == null) return null
+        if (session?.id != pending.sessionId) return pending
+        return if (session.modelSource == pending.value) null else pending
+    }
+
+    /**
+     * The `modelSource` a spawn should carry, or null to omit it.
+     *
+     * Only "local" is ever sent: "subscription" is what a spawn already meant,
+     * so omitting it keeps a bare spawn byte-identical to what it was before the
+     * failover existed.
+     */
+    fun spawnValue(source: String?): String? = source?.takeIf { it == LOCAL }
+
+    /**
+     * Should the spawn composer offer a "Run against" row? Unlike [offered]
+     * there is no session yet, so the host's capability flag is the whole rule.
+     */
+    fun composerOffers(local: LocalModelInfo?): Boolean = local?.available == true
+
+    /**
      * Human label for a source. A local session reads as the MODEL NAME, not the
      * word "local": it is a weaker model than Claude, and nobody should have to
      * wonder which one wrote a turn.
      */
     fun label(source: String, local: LocalModelInfo?): String =
         if (source == LOCAL) local?.model?.takeIf { it.isNotBlank() } ?: "local model"
-        else "subscription"
+        else "Subscription"
+
+    /**
+     * The chip's leading glyph, matching the web's ☁ / 🏠 (`chat.js`). It is the
+     * at-a-glance answer to "which model wrote this turn", which the colour
+     * alone can't give a colour-blind reader.
+     */
+    fun glyph(source: String): String = if (source == LOCAL) "🏠" else "☁"
 
     /** Menu rows as (value, label) pairs, in the web menu's order. */
     fun options(local: LocalModelInfo?): List<Pair<String, String>> =
@@ -75,11 +115,16 @@ object ModelSource {
         )
 
     /**
-     * Is the Claude model picker meaningful for this session? It is not on the
-     * local model: every alias it could offer — "Default" included, since that
-     * resolves to the shared login's default — is one the self-hosted endpoint
-     * refuses, so the chip states the fixed model instead of offering a menu
-     * that can only break the session. Mirrors web `cc-model-fixed`.
+     * Is the Claude model picker meaningful for a RUNNING session's compose bar?
+     * It is not on the local model: every alias it could offer — "Default"
+     * included, since that resolves to the shared login's default — is one the
+     * self-hosted endpoint refuses, so the chip states the fixed model instead
+     * of offering a menu that can only break the session. Mirrors web
+     * `cc-model-fixed`.
+     *
+     * The SPAWN composer deliberately does not use this — see [composerOffers]'
+     * call site — because there the alias is stored for a session that may later
+     * move back to the subscription, and the web sends it either way.
      */
     fun modelPickable(source: String): Boolean = source != LOCAL
 }
