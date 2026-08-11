@@ -14,6 +14,7 @@ import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.entryTruncated
+import com.xerktech.turma.core.hostHoldNotice
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
 import com.xerktech.turma.model.SessionInfo
@@ -66,6 +67,11 @@ data class ChatUiState(
     // The host this session's agent runs on, shown in the header (XERK-121):
     // the agent's device name, falling back to its registration key.
     val hostLabel: String = "",
+    // Whether that host can currently answer for the session (XERK-252). Both
+    // default TRUE and both mean "as far as we know": a fleet beat that carries
+    // no record for this host tells us nothing, and must not be read as a fault.
+    val hostOnline: Boolean = true,
+    val terminalOnline: Boolean = true,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     val question: String get() = session?.session?.question ?: ""
@@ -78,6 +84,11 @@ data class ChatUiState(
     // Attaching is off while a question is pending: the draft then routes to
     // POST .../answer, which carries no files (web chat.js renderAttachments).
     val canAttach: Boolean get() = Uploads.canAttach(uploadMaxBytes) && question.isBlank()
+
+    // Why the conversation has gone quiet when it is the host, not the session,
+    // that is out of reach (XERK-252). Shared with the terminal screen, which
+    // has the same strip over the same fault — see core/Sessions.kt.
+    val holdNotice: String? get() = hostHoldNotice(hostLabel, hostOnline, terminalOnline)
 }
 
 class ChatViewModel(
@@ -155,7 +166,10 @@ class ChatViewModel(
                 val label = agent?.device?.ifBlank { host } ?: host
                 _state.update {
                     it.copy(session = session, hostLabel = label,
-                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0)
+                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
+                        // No record for this host = no news, not a fault (XERK-252).
+                        hostOnline = agent?.online ?: true,
+                        terminalOnline = agent?.terminalOnline ?: true)
                 }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
@@ -172,6 +186,8 @@ class ChatViewModel(
         _state.update {
             it.copy(session = session, hostLabel = label,
                 uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
+                hostOnline = agent?.online ?: true,
+                terminalOnline = agent?.terminalOnline ?: true,
                 entries = mergeTail(it.entries, seed))
         }
     }

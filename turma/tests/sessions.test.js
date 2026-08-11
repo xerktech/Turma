@@ -75,7 +75,10 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const els = {};
   const opened = [];
   const posts = [];
-  const chat = { busy: false, stopped: 0, failed: null };
+  // `closed`/`woken` are how the held-stage tests (XERK-252) observe that a
+  // tunnel flap leaves the live tail alone and that the host's return nudges it
+  // back rather than rebuilding it.
+  const chat = { busy: false, stopped: 0, failed: null, closed: 0, woken: 0 };
   // Window-level listeners the page registers (e.g. popstate), so a test can
   // drive the mobile back-button flow that `history.back()` triggers.
   const winListeners = {};
@@ -114,7 +117,9 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     URL: global.URL, URLSearchParams: global.URLSearchParams,
     TurmaChat: {
       open: (hostKey, id) => opened.push(id),
-      onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
+      onPoll: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
+      close: () => { chat.closed++; },
+      wake: () => { chat.woken++; },
       // The chat engine owns the live busy read and the interrupt; the terminal's
       // compose button just defers to it. `busy` is what a test flips to model a
       // turn being in flight, and `stopped` records the delegation.
@@ -150,6 +155,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
+  // Narrow the header's org filter mid-test, the way clicking it would.
+  api.setOrg = (k) => { stubs.TurmaOrg._k = k; };
   return { ...api, els, opened, posts, chat, body: document.body };
 }
 // The card's ⋯/menu buttons pass their click event on; the shim has no events.
@@ -692,6 +699,90 @@ test("picking a session cancels a pending follow, so the spawn can't yank the st
   h.sessions = [...h.sessions, { ...working("99999", "Late Arrival"), spawnCmdId: "cmd-77" }];
   beat({ now, agents: [h] });
   assert.deepEqual(opened, ["11111"], "an explicit pick wins over the pending follow");
+});
+
+// XERK-252. A host's terminal tunnel drops on every hub restart — a deploy or a
+// Watchtower pull reconnects every host's tunnel in the same second — and the
+// page read that as the session having vanished, dumping the operator back on
+// "No session attached" mid-turn. Only the session's OWN host, actually
+// reporting, may say it is gone.
+function staged(opts) {
+  const page = loadPage(opts);
+  const { now, host: h } = host([working("11111", "Reading This")]);
+  page.beat({ now, agents: [h] });
+  page.selectSession("11111");
+  return { ...page, now, h };
+}
+
+test("a terminal tunnel flap holds the staged session instead of closing it", () => {
+  const { beat, els, chat, now, h } = staged();
+  assert.equal(els.chatPane.hidden, false);
+
+  // The tunnel drops. The host is still online and still reports the session
+  // running — only its pane is unreachable.
+  beat({ now: now + 5000, agents: [{ ...h, terminalOnline: false }] });
+
+  assert.equal(els.chatPane.hidden, false, "the chat pane stays up");
+  assert.equal(els.stageEmpty.hidden, true, "no 'No session attached'");
+  assert.equal(chat.closed, 0, "the live tail is never torn down");
+  assert.equal(els.stageHold.hidden, false, "the operator is told why it is quiet");
+  assert.match(els.stageHold.innerHTML, /terminal tunnel is down/);
+});
+
+test("an offline host holds the stage too, worded as offline rather than a dead tunnel", () => {
+  const { beat, els, chat, now, h } = staged();
+  beat({ now: now + 5000, agents: [{ ...h, online: false }] });
+
+  assert.equal(els.chatPane.hidden, false);
+  assert.equal(chat.closed, 0);
+  assert.match(els.stageHold.innerHTML, /hostA is offline/);
+});
+
+test("the host coming back heals the staged session in place", () => {
+  const { beat, els, chat, opened, now, h } = staged();
+  beat({ now: now + 5000, agents: [{ ...h, terminalOnline: false }] });
+  assert.equal(els.stageHold.hidden, false);
+
+  beat({ now: now + 9000, agents: [h] });
+
+  assert.equal(els.stageHold.hidden, true, "the strip goes away on its own");
+  assert.equal(els.chatPane.hidden, false);
+  assert.equal(chat.woken, 1, "the chat socket is nudged, not rebuilt");
+  assert.equal(chat.closed, 0);
+  assert.deepEqual(opened, ["11111"], "and the operator never had to re-select it");
+});
+
+test("the session's own host reporting it gone still clears the stage", () => {
+  const { beat, els, chat, now, h } = staged();
+  // Killed elsewhere: the host is answering for itself and no longer lists it.
+  beat({ now: now + 5000, agents: [{ ...h, sessions: [] }] });
+
+  assert.equal(els.stageEmpty.hidden, false, "back to the empty prompt");
+  assert.equal(els.chatPane.hidden, true);
+  assert.equal(els.stageHold.hidden, true, "and no stale hold strip left behind");
+  assert.equal(chat.closed, 1);
+});
+
+test("a session its host reports as no longer running clears the stage", () => {
+  const { beat, els, chat, now, h } = staged();
+  beat({ now: now + 5000, agents: [{ ...h, sessions: [{ ...h.sessions[0], status: "stopped" }] }] });
+
+  assert.equal(els.stageEmpty.hidden, false);
+  assert.equal(chat.closed, 1);
+});
+
+// XERK-62: the org filter scopes the SIDEBAR. The vanish check used to run
+// against the filtered list, so narrowing the header closed the open session.
+test("narrowing the org filter leaves the staged session on the stage (XERK-62)", () => {
+  const { beat, setOrg, els, chat, now, h } = staged();
+  setOrg("someOtherOrg");   // this host polls a different org, so it drops out
+  beat({ now: now + 5000, agents: [h] });
+
+  assert.equal(els.chatPane.hidden, false, "the stage is untouched by scoping");
+  assert.equal(els.stageEmpty.hidden, true);
+  assert.equal(els.stageHold.hidden, true, "and it is not 'held' either — the host is fine");
+  assert.equal(chat.closed, 0);
+  assert.ok(!els.active.innerHTML.includes("11111"), "but the sidebar IS scoped");
 });
 
 test("mobile: re-selecting a session after backing out re-reveals its stage (XERK-17)", () => {

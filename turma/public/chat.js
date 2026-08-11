@@ -570,6 +570,11 @@
   // ---- /history fallback (initial scrollback + WS-down updates) -------------
   async function loadHistory(myGen, retries) {
     retries = retries || 0;
+    // Bail BEFORE the fetch, not after it (XERK-252). The 202-retry timer below
+    // outlives a close(), and a fetch built from the nulled ids goes out as
+    // /api/agents/null/sessions/null/history — a 404 whose only effect is to
+    // make a QA pass wonder what asked for it.
+    if (myGen !== gen || !hostKey || !sessionId) return;
     let r;
     try { r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/history"); }
     catch { return; }
@@ -2298,6 +2303,22 @@
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
+  // The session's host came back after a tunnel flap (XERK-252). The hub holds
+  // the browser's /live socket across most flaps, so the common case here is a
+  // socket that never dropped — hence the OPEN/CONNECTING early-out, and hence
+  // the /history pull first, which is what actually closes any gap. Only a
+  // socket that really did die gets restarted, with the backoff reset so the
+  // heal is immediate rather than up to a backoff step away.
+  function wake() {
+    if (!hostKey || !sessionId) return;
+    const myGen = gen;
+    loadHistory(myGen);
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+    backoffIdx = 0;
+    startWs(myGen);
+  }
+
   // Called from the page's render() on each heartbeat/SSE while chat is open.
   // `a` is the session's host payload when the caller has a fresh one — it
   // carries the probed `models` block the model menu is built from, which would
@@ -2315,7 +2336,7 @@
   }
 
   if (typeof window !== "undefined") {
-    window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
+    window.TurmaChat = { open, close, wake, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
       // sendFailure/isTooLong are shared with the terminal composer so the two
       // compose bars word a refusal identically (XERK-227).
       isBusy, stop, actionFailed, sendFailure, isTooLong,
@@ -2365,6 +2386,10 @@
       modelChipLabel, modeChipValue,
       __setSess: (s) => { sess = s; sessionId = s && s.id; },
       __setHostKey: (k) => { hostKey = k; },
+      // The tunnel-flap heal (XERK-252): `loadHistory` is exported to prove it
+      // refuses to fetch once the ids are gone, `wake` to prove what it does
+      // (and doesn't do) to a socket that is still open.
+      loadHistory, wake, __gen: () => gen, __setWs: (s) => { ws = s; },
       __setAgent: (a) => { agent = a; },
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
       localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,

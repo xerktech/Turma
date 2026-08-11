@@ -1782,3 +1782,74 @@ test("model source: choosing one actually issues the switch request", () => {
   assert.deepEqual(calls[0].body, { modelSource: "local" });
   __setModelSourcePending(null);
 });
+
+// --- tunnel-flap heal + the /history retry's nulled ids (XERK-252) ------------
+
+// The 202-retry timer outlives close(), and close() nulls hostKey/sessionId, so
+// the retry used to fire a request for /api/agents/null/sessions/null/history.
+test("/history refuses to fetch once the session is closed", async () => {
+  const { loadHistory, __gen, __setSess, __setHostKey } = require("../public/chat.js");
+  const realFetch = global.fetch;
+  const calls = [];
+  global.fetch = (url) => { calls.push(url); return Promise.resolve({ ok: true, status: 200, json: async () => ({ entries: [] }) }); };
+  try {
+    __setHostKey(null);
+    __setSess(null);
+    await loadHistory(__gen());
+  } finally { global.fetch = realFetch; }
+  assert.deepEqual(calls, [], "no request built from the nulled ids");
+});
+
+// A stale generation is the other way in: an open() that superseded this load.
+test("/history refuses to fetch for a superseded generation", async () => {
+  const { loadHistory, __gen, __setSess, __setHostKey } = require("../public/chat.js");
+  const realFetch = global.fetch;
+  const calls = [];
+  global.fetch = (url) => { calls.push(url); return Promise.resolve({ ok: true, status: 200, json: async () => ({ entries: [] }) }); };
+  try {
+    __setHostKey("hostA");
+    __setSess({ id: "AAAAA" });
+    await loadHistory(__gen() - 1);
+  } finally { global.fetch = realFetch; }
+  assert.deepEqual(calls, [], "no request for a generation that has been retired");
+});
+
+// The hub holds the browser's /live socket across most flaps, so the healthy
+// case is a socket that never dropped: wake() must pull the gap from /history
+// without disturbing it.
+test("wake() refreshes history but leaves a live socket alone", async () => {
+  const { wake, __setSess, __setHostKey, __setWs } = require("../public/chat.js");
+  const realFetch = global.fetch;
+  const calls = [];
+  let made = 0;
+  const realWS = global.WebSocket;
+  global.WebSocket = class { constructor() { made++; } };
+  global.WebSocket.OPEN = 1; global.WebSocket.CONNECTING = 0;
+  // An entry-less body: the load is observed by the URL it asked for, and
+  // returning nothing to merge keeps it clear of repaint()'s DOM.
+  global.fetch = (url) => { calls.push(url); return Promise.resolve({ ok: true, status: 200, json: async () => ({}) }); };
+  try {
+    __setHostKey("hostA");
+    __setSess({ id: "AAAAA" });
+    __setWs({ readyState: 1 });
+    wake();
+    await new Promise((r) => setImmediate(r));
+  } finally { global.fetch = realFetch; global.WebSocket = realWS; __setWs(null); }
+  assert.equal(made, 0, "an open socket is not replaced");
+  assert.ok(calls.some((u) => u.includes("/sessions/AAAAA/history")), "but the gap is pulled");
+});
+
+test("wake() is inert with no session staged", async () => {
+  const { wake, __setSess, __setHostKey, __setWs } = require("../public/chat.js");
+  const realFetch = global.fetch;
+  const calls = [];
+  global.fetch = (url) => { calls.push(url); return Promise.resolve({ ok: true, status: 200, json: async () => ({ entries: [] }) }); };
+  try {
+    __setHostKey(null);
+    __setSess(null);
+    __setWs(null);
+    wake();
+    await new Promise((r) => setImmediate(r));
+  } finally { global.fetch = realFetch; }
+  assert.deepEqual(calls, []);
+});

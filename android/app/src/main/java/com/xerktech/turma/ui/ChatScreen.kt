@@ -252,7 +252,15 @@ fun ChatScreen(
             }
         },
     ) { pad ->
-        Box(Modifier.fillMaxSize().padding(pad)) {
+      Column(Modifier.fillMaxSize().padding(pad)) {
+        // The held-session strip (web #stageHold, XERK-252): the host is out of
+        // reach, so the transcript below is frozen rather than finished. Above
+        // the conversation and outside the scroll, so it can't be scrolled away.
+        state.holdNotice?.let { HoldBar(it) }
+        // weight(1f), not fillMaxSize: the strip above is an unweighted sibling,
+        // and a fill-max child would measure against the whole column and push it
+        // out of view.
+        Box(Modifier.weight(1f).fillMaxWidth()) {
             // Wrap the transcript so its text is selectable + copyable, matching the
             // web chat, which relies on native browser selection to copy session text
             // (XERK-64). Long-press selects; tap still toggles tool/thinking cards.
@@ -296,6 +304,7 @@ fun ChatScreen(
                 }
             }
         }
+      }
     }
 }
 

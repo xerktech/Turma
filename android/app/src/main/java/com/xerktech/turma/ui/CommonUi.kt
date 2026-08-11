@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -19,6 +20,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -151,6 +153,43 @@ fun KillAction(onKill: () -> Unit, modifier: Modifier = Modifier) {
 }
 
 private const val ARM_MS = 3500L
+
+/**
+ * The held-session strip (web sessions.html `#stageHold`, XERK-252): the host
+ * this session runs on is out of reach, so the conversation/terminal below is
+ * frozen rather than finished. Shown by BOTH the chat and the terminal, which
+ * is why it lives here — a tunnel flap breaks the terminal hardest (ttyd is
+ * served through it) and leaves the chat merely quiet, but the reason is one
+ * reason. Text comes from `core.hostHoldNotice`.
+ *
+ * Deliberately tertiary-toned, not error-toned: nothing has been lost, the view
+ * is intact, and the strip clears itself the moment the host reports again.
+ */
+@Composable
+fun HoldBar(notice: String, modifier: Modifier = Modifier) {
+    Surface(
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        tonalElevation = 2.dp,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(
+                Modifier.size(11.dp),
+                strokeWidth = 2.dp,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Text(
+                notice,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+        }
+    }
+}
 
 // ---- fields ----------------------------------------------------------------
 

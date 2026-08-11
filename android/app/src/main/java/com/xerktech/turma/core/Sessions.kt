@@ -156,6 +156,32 @@ fun sessionHeaderMeta(host: String, session: SessionInfo): String =
         .joinToString(" · ")
 
 /**
+ * Why an open session has gone quiet when it is its HOST that is out of reach,
+ * rather than the session that ended — the port of the web Sessions page's
+ * held-stage strip (`#stageHold`, XERK-252). Null means the host is answering
+ * for itself, which is what makes the notice clear itself.
+ *
+ * The two faults are worded apart because they mean different things: an offline
+ * host isn't reporting at all, while a live host with a dead tunnel is still
+ * working — only its pane and live tail are unreachable. Offline wins when both
+ * are true, since a silent host's tunnel is down as a consequence.
+ *
+ * Neither one closes the view. A tunnel drops on every hub restart (a deploy
+ * reconnects every host's in the same second), and an unreachable host is not an
+ * ended session. Both flags default to TRUE at every call site: a beat carrying
+ * no record for this host is no news, never a fault.
+ */
+fun hostHoldNotice(hostLabel: String, hostOnline: Boolean, terminalOnline: Boolean): String? {
+    val who = hostLabel.ifBlank { "This session's host" }
+    val what = when {
+        !hostOnline -> "$who is offline"
+        !terminalOnline -> "$who's terminal tunnel is down"
+        else -> return null
+    }
+    return "$what — holding this session. Nothing is lost; it reconnects on its own."
+}
+
+/**
  * Work-safety facts for a session (web index.html `unpushedCommits`): how many
  * commits aren't on origin yet — relative to origin/<branch> when it was ever
  * pushed, else everything past the base branch. Null = unknown (first beat,

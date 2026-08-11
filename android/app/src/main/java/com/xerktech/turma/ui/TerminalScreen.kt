@@ -49,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.hostHoldNotice
 import com.xerktech.turma.net.InputRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -76,6 +77,8 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
 
     var reload by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
+    // The fleet beat, for the host-reachability strip below (XERK-252).
+    val fleet by container.fleet.state.collectAsStateWithLifecycle()
 
     val ready by produceState(initialValue = false, sessionId, reload) {
         error = null
@@ -107,6 +110,16 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         },
     ) { pad ->
       Column(Modifier.fillMaxSize().padding(pad)) {
+        // The held-session strip (web #stageHold, XERK-252). The terminal is the
+        // surface a dead tunnel breaks hardest — ttyd is served THROUGH it, so
+        // the WebView below is an unexplained failed load — which is exactly why
+        // the reason belongs here and not only in the chat.
+        val agent = fleet.agents.firstOrNull { it.key == host }
+        hostHoldNotice(
+            hostLabel = agent?.device?.ifBlank { host } ?: host,
+            hostOnline = agent?.online ?: true,
+            terminalOnline = agent?.terminalOnline ?: true,
+        )?.let { HoldBar(it) }
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when {
                 !ready -> Text("Connecting terminal…", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onBackground)

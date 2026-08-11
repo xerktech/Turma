@@ -167,6 +167,17 @@ auto-start/auto-stop and the two tracker writes.
   the raw ttyd terminal, streaming over the `/live/<host>/<id>` WebSocket (ws-token auth, seeded
   from the heartbeat's cached tail, scrollback from `GET .../history`, `/history`-poll fallback when
   the socket is down).
+- **The stage is HELD, not torn down, when a session's host goes unreachable** (XERK-252). Only that
+  session's OWN host, actually reporting, may clear it — gone from its `sessions[]`, or not running.
+  - Tunnel flaps are ROUTINE: a hub restart reconnects EVERY host's in the same second, so clearing
+    on `terminalOnline` evicted every operator from whatever they were mid-read of, on every deploy.
+  - `#stageHold` names which fault it is; `releaseStage()` heals in place on the host's return —
+    re-point the ttyd iframe (its socket died with the tunnel, and never retries) and
+    `TurmaChat.wake()` the live tail, a no-op for a socket the hub held across the flap.
+  - Read from a remembered `currentHostKey` against the **whole fleet**, never the org-scoped list
+    (the XERK-62 rule `sessionHit` follows). Android: `core.hostHoldNotice` + `ui.HoldBar`.
+  - `loadHistory` bails BEFORE its fetch: the 202-retry timer outlives `close()`, which nulls the
+    ids, so it used to request `/api/agents/null/sessions/null/history`.
 - It renders chat bubbles — **user right, agent left** — with collapsible tool-action cards
   (tool_use + its paired tool_result, error-styled) and collapsed thinking traces, and the
   in-progress turn as a trailing bubble.
