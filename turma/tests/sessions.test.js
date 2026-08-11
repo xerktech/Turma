@@ -75,7 +75,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const els = {};
   const opened = [];
   const posts = [];
-  const chat = { busy: false, stopped: 0, failed: null };
+  const chat = { busy: false, stopped: 0, failed: null, closed: 0, reconnected: 0 };
   // Window-level listeners the page registers (e.g. popstate), so a test can
   // drive the mobile back-button flow that `history.back()` triggers.
   const winListeners = {};
@@ -114,7 +114,12 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     URL: global.URL, URLSearchParams: global.URLSearchParams,
     TurmaChat: {
       open: (hostKey, id) => opened.push(id),
-      onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
+      // `close` and `reconnectNow` are counted: the stage tears the chat down
+      // when its session goes, and nudges it back when a flapped tunnel
+      // returns (XERK-252) — both are observable only from here.
+      close: () => { chat.closed++; },
+      reconnectNow: () => { chat.reconnected++; },
+      onPoll: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
       // The chat engine owns the live busy read and the interrupt; the terminal's
       // compose button just defers to it. `busy` is what a test flips to model a
       // turn being in flight, and `stopped` records the delegation.
@@ -150,7 +155,10 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts, chat, body: document.body };
+  return { ...api, els, opened, posts, chat, body: document.body,
+    // `setOrg` narrows the header's org filter, the way picking an org in the
+    // menu does — the sidebar lists only that org's hosts afterwards.
+    setOrg: (k) => { stubs.TurmaOrg._k = k; } };
 }
 // The card's ⋯/menu buttons pass their click event on; the shim has no events.
 const click = { stopPropagation() {} };
@@ -713,6 +721,103 @@ test("mobile: re-selecting a session after backing out re-reveals its stage (XER
   selectSession("11111");
   assert.ok(body.classList.contains("showing-term"), "re-selecting re-reveals the stage");
   assert.deepEqual(opened, ["11111"], "the warm chat is NOT torn down and rebuilt");
+});
+
+// XERK-252. The host's terminal tunnel (the agent's control-channel WebSocket)
+// flaps in normal operation — a Cloudflare hiccup, an agent restart, a hub
+// deploy — and reconnects within a second or two. The session never stops
+// running and never stops being heartbeated, so the operator must not be thrown
+// off the conversation they are reading.
+test("a tunnel flap holds the staged session, and heals it when the tunnel returns", () => {
+  const { beat, selectSession, els, chat, opened } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  assert.deepEqual(opened, ["11111"]);
+  const closedAtOpen = chat.closed;
+
+  // The tunnel drops: same running session, host still heartbeating, only
+  // `terminalOnline` flips. The stage stays, and says why it has gone quiet.
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  assert.equal(chat.closed, closedAtOpen, "the chat's live tail is NOT torn down");
+  assert.equal(els.chatTunnelOff.hidden, false, "the chat bar shows the tunnel is down");
+  assert.equal(els.termTunnelOff.hidden, false, "and so does the terminal bar");
+  assert.equal(chat.reconnected, 0, "nothing to reconnect while it's still down");
+
+  // ...and comes back: the chip clears and the chat is nudged to reconnect at
+  // once rather than waiting out its backoff.
+  beat({ now, agents: [h] });
+  assert.equal(els.chatTunnelOff.hidden, true);
+  assert.equal(chat.reconnected, 1, "the live socket is reconnected on the spot");
+  assert.equal(chat.closed, closedAtOpen, "still never closed");
+
+  // A steady stream of online beats must not re-nudge (or the terminal iframe
+  // below would restart every few seconds).
+  beat({ now, agents: [h] });
+  beat({ now, agents: [h] });
+  assert.equal(chat.reconnected, 1, "only the transition acts");
+});
+
+test("a tunnel flap re-attaches the terminal iframe, whose socket cannot self-heal", () => {
+  const { beat, selectSession, chatToTerminal, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  chatToTerminal();
+  els.termFrame.src = "";  // forget the initial attach so the re-attach is unambiguous
+
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  assert.equal(els.termFrame.src, "", "nothing to re-attach while the tunnel is down");
+  beat({ now, agents: [h] });
+  assert.equal(els.termFrame.src, "/term/11111/", "the ttyd frame is re-navigated on return");
+});
+
+// A beat that doesn't mention the host at all says nothing about its sessions:
+// the hub restarts with its persisted fleet but can also answer before the
+// first heartbeat lands, and a refresh can fail outright. Silence is not
+// evidence the session died (XERK-252).
+test("a beat that can't see the host holds the stage rather than clearing it", () => {
+  const { beat, selectSession, chat } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  const closedAtOpen = chat.closed;
+
+  beat({ now, agents: [] });
+  assert.equal(chat.closed, closedAtOpen, "an empty payload doesn't evict the operator");
+  beat({ now, agents: [h] });
+  assert.equal(chat.closed, closedAtOpen);
+});
+
+// The org filter is a SIDEBAR scope (XERK-62) — sessionHit deliberately ignores
+// it so an open session isn't torn off the stage when its org leaves the list.
+// The vanish check has to read the same whole fleet, or narrowing the filter
+// closed the session the operator was reading.
+test("narrowing the org filter doesn't tear the staged session off the stage", () => {
+  const { beat, selectSession, setOrg, chat } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  h.jira = { siteKey: "acme.atlassian.net" };
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  const closedAtOpen = chat.closed;
+
+  setOrg("other.atlassian.net");   // the staged session's host leaves the sidebar
+  beat({ now, agents: [h] });
+  assert.equal(chat.closed, closedAtOpen, "the stage keeps the session it was showing");
+});
+
+// The other half of the rule: a session that genuinely went (killed elsewhere,
+// or its host stopped reporting it at all) still drops the stage.
+test("a vanished session still clears the stage", () => {
+  const { beat, selectSession, els, chat } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  const closedAtOpen = chat.closed;
+
+  beat({ now, agents: [{ ...h, sessions: [] }] });
+  assert.ok(chat.closed > closedAtOpen, "the chat's live tail is torn down");
+  assert.equal(els.stageEmpty.hidden, false, "and the stage is back to the empty prompt");
 });
 
 test("desktop: re-selecting the current session stays a no-op", () => {

@@ -557,6 +557,19 @@
     sock.onerror = () => { try { sock.close(); } catch {} };
   }
 
+  // Reconnect the live socket NOW instead of waiting out the backoff — the page
+  // calls this the moment the staged session's host gets its tunnel back
+  // (XERK-252), so a flap costs the operator a second rather than up to a whole
+  // BACKOFF_MS step. A socket that's still open (the hub holds it across a flap
+  // and re-arms the agent's watch on control reconnect) needs nothing.
+  function reconnectNow() {
+    if (!hostKey || !sessionId) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+    backoffIdx = 0;
+    startWs(gen);
+  }
+
   function scheduleReconnect(myGen) {
     if (myGen !== gen || wsRetryTimer) return;
     const delay = BACKOFF_MS[Math.min(backoffIdx, BACKOFF_MS.length - 1)];
@@ -570,6 +583,11 @@
   // ---- /history fallback (initial scrollback + WS-down updates) -------------
   async function loadHistory(myGen, retries) {
     retries = retries || 0;
+    // A closed view has no URL to fetch: close() nulls hostKey/sessionId, and a
+    // 202-retry timer already in flight would otherwise build (and 404 on)
+    // `/api/agents/null/sessions/null/history`. The gen check downstream only
+    // discards the RESULT — this is what stops the request.
+    if (myGen !== gen || !hostKey || !sessionId) return;
     let r;
     try { r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/history"); }
     catch { return; }
@@ -2319,6 +2337,8 @@
       // sendFailure/isTooLong are shared with the terminal composer so the two
       // compose bars word a refusal identically (XERK-227).
       isBusy, stop, actionFailed, sendFailure, isTooLong,
+      // The page calls this when the host's tunnel comes back (XERK-252).
+      reconnectNow,
       // The terminal composer sends through the same /input, so it reads the
       // staged attachments from here rather than keeping a second list
       // (XERK-234).
@@ -2352,6 +2372,9 @@
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
+      loadHistory, reconnectNow,
+      __setSessionRef: (hk, id) => { hostKey = hk; sessionId = id; },
+      __gen: () => gen,
       attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, attachFiles,
       clearAttachments, MAX_ATTACHMENTS,
       __setAttachments: (a) => { attachments = a; },

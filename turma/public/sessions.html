@@ -272,6 +272,14 @@
   .term-pane iframe { flex: 1; border: 0; width: 100%; background: #000; }
   .term-bar .back-btn { display: none; }
   .term-bar .t-title .name { font-weight: 600; }
+  /* The staged session's host lost its terminal tunnel (XERK-252). The stage
+     stays put — the session is still running — so this says why the view has
+     stopped moving, and disappears when the tunnel returns. */
+  .term-bar .tunnel-off {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+    color: var(--warning); border: 1px solid var(--warning); background: transparent;
+  }
+  .term-bar .tunnel-off[hidden] { display: none; }
 
   /* ---- Search box + archive (durable, searchable ended-session history) ----- */
   .searchbox { margin-bottom: 8px; position: relative; }
@@ -828,6 +836,8 @@
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="chatTitle"></span> · <span class="path" id="chatPath"></span></span>
+          <span class="tunnel-off" id="chatTunnelOff" hidden
+                title="This host's terminal tunnel is down. The session keeps running; the view reconnects on its own when the tunnel comes back.">⚠ tunnel offline</span>
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
           <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
@@ -863,6 +873,8 @@
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <button class="seg-toggle" id="termChatBtn" onclick="terminalToChat()" title="Back to the native chat view">◂ Chat</button>
           <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
+          <span class="tunnel-off" id="termTunnelOff" hidden
+                title="This host's terminal tunnel is down. The session keeps running; the terminal re-attaches on its own when the tunnel comes back.">⚠ tunnel offline</span>
           <span class="spacer"></span>
           <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
           <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
@@ -1780,16 +1792,34 @@ function render(data) {
   restoreComposerScrolls();
   if ($sidebar && scrollTop && $sidebar.scrollTop !== scrollTop) $sidebar.scrollTop = scrollTop;
 
-  // If the attached session vanished (killed elsewhere, host offline), drop the
-  // stage back to the empty prompt.
+  // If the attached SESSION vanished (killed elsewhere, stopped), drop the
+  // stage back to the empty prompt — but only on POSITIVE evidence, and only
+  // about the session itself (XERK-252):
+  //
+  //  - the question is asked of the WHOLE fleet (`sessionRecord`, like
+  //    sessionHit), never of `running` above, which is org-scoped: the org
+  //    filter is a sidebar scope, and an open session must not be torn off the
+  //    stage because its org left the list (XERK-62);
+  //  - the host has to be REPORTING for its silence to mean anything. A payload
+  //    that doesn't mention it at all (a hub restarted before the first
+  //    heartbeat landed, a failed refresh) is not evidence the session is gone;
+  //  - a host whose terminal tunnel merely went offline is not evidence either.
+  //    The control channel flaps every time the hub redeploys — every host
+  //    reconnects within a second or two — while the session keeps running and
+  //    keeps being heartbeated. Tearing the stage down on that beat evicted the
+  //    operator from the conversation they were reading, closed its /live
+  //    socket (leaving the hub nothing to re-arm when the tunnel returned), and
+  //    left re-selecting the session as the only way back.
   if (currentId) {
-    const still = running.find(x => x.s.id === currentId && x.a.terminalOnline);
-    if (!still) clearStage();
-    else if ((viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
+    const rec = sessionRecord(currentId);
+    const host = rec ? rec.a : agentByKey(currentHostKey);
+    if (host) setStageTunnel(!!host.terminalOnline);
+    if (host && (!rec || rec.s.status !== "running")) clearStage();
+    else if (rec && (viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
       // Refresh the chat header + pending-question region from the new
       // heartbeat; the host payload rides along so the model menu tracks the
       // agent's probed `models` block rather than open()'s snapshot.
-      TurmaChat.onPoll(still.s, still.a);
+      TurmaChat.onPoll(rec.s, rec.a);
     }
   }
 
@@ -2106,6 +2136,10 @@ const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
 const $stageEmpty = document.getElementById("stageEmpty");
 let currentId = null;
+// The host the staged session belongs to, remembered across beats — see
+// render()'s vanish check, which needs it to tell a host that has dropped the
+// session from a host we simply can't see this beat.
+let currentHostKey = null;
 let viewMode = null; // "chat" | "terminal" | "transcript" | "subagent" | null — what the stage shows
 // When a subagent transcript is open (clicked from a live session's agent list),
 // this holds the live session id to return to, so the transcript pane's Back
@@ -2221,6 +2255,7 @@ function navFrame(src) {
 }
 function setFrame(id, s, a) {
   currentId = id;
+  if (a && a.key) currentHostKey = a.key;
   const src = `/term/${encodeURIComponent(id)}/`;
   document.getElementById("termTitle").textContent = s ? sessTitle(s) : id;
   document.getElementById("termPath").textContent =
@@ -2231,15 +2266,29 @@ function setFrame(id, s, a) {
   const inp = document.getElementById("termInput");
   if (inp) { inp.value = ""; autoGrowTermInput(); }
 }
+// The last-reported {host, session} for a session id, whatever its state and
+// whatever the org filter is currently showing: this reads the WHOLE fleet
+// (like sessionHit), because an open session belongs to the stage, not to the
+// sidebar's scope.
+function sessionRecord(id) {
+  for (const a of (cache.agents || [])) {
+    const s = (a.sessions || []).find(x => x.id === id);
+    if (s) return { a, s };
+  }
+  return null;
+}
 // The last-reported record for a session, whatever its state — unlike
 // sessionHit() this doesn't require the host's terminal tunnel, since renaming
 // touches the registry rather than the session's pane.
 function findSession(id) {
-  for (const a of (cache.agents || [])) {
-    const s = (a.sessions || []).find(x => x.id === id);
-    if (s) return s;
-  }
-  return null;
+  const rec = sessionRecord(id);
+  return rec ? rec.s : null;
+}
+// The host a session was staged from, so a beat that doesn't mention the
+// session at all can still tell "its host is reporting and has dropped it"
+// from "we can't see its host right now". See render()'s vanish check.
+function agentByKey(key) {
+  return key ? (cache.agents || []).find(a => a.key === key) || null : null;
 }
 function sessionHit(id) {
   const now = cache.now || Date.now();
@@ -2275,6 +2324,7 @@ function selectSession(id) {
   $stageEmpty.hidden = true;
   $chatPane.hidden = false;
   disarmChatKill();
+  currentHostKey = hit.a.key;
   if (window.TurmaChat) TurmaChat.open(hit.a.key, id, hit.s, hit.a);
   enterStage();
   render(cache); // refresh the .cur highlight
@@ -2337,8 +2387,33 @@ function enterStage() {
     if (!viewPushed) { history.pushState({ term: true }, ""); viewPushed = true; }
   }
 }
+// Whether the staged session's host had its terminal tunnel up on the last
+// beat. The stage survives a tunnel flap (see render()), so this is what says
+// so on screen and what heals each view when the tunnel returns:
+//   - chat reconnects its /live socket at once rather than waiting out its
+//     backoff (the hub kept the watch and re-arms it on control reconnect);
+//   - the terminal's ttyd iframe is re-navigated, because its WebSocket died
+//     with the tunnel and nothing in the frame retries it.
+// Transitions only — every beat calls this, and re-navigating the iframe on
+// each one would restart the terminal every few seconds.
+let stageTunnelOnline = true;
+function setStageTunnel(online) {
+  const chip = document.getElementById("chatTunnelOff");
+  const termChip = document.getElementById("termTunnelOff");
+  if (chip) chip.hidden = online;
+  if (termChip) termChip.hidden = online;
+  if (online === stageTunnelOnline) return;
+  const returned = online && !stageTunnelOnline;
+  stageTunnelOnline = online;
+  if (!returned || !currentId) return;
+  if (viewMode === "terminal") navFrame(`/term/${encodeURIComponent(currentId)}/`);
+  if (window.TurmaChat && TurmaChat.reconnectNow) TurmaChat.reconnectNow();
+}
 function clearStage() {
   currentId = null;
+  currentHostKey = null;
+  stageTunnelOnline = true;
+  setStageTunnel(true);
   currentTranscriptId = null;
   subagentReturn = null;
   resetEndedBar();

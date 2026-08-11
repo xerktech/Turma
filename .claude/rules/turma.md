@@ -167,6 +167,25 @@ auto-start/auto-stop and the two tracker writes.
   the raw ttyd terminal, streaming over the `/live/<host>/<id>` WebSocket (ws-token auth, seeded
   from the heartbeat's cached tail, scrollback from `GET .../history`, `/history`-poll fallback when
   the socket is down).
+- **The stage is dropped only on POSITIVE evidence that the SESSION went** (XERK-252) — its own host
+  reporting it stopped, or reporting without it. Three things that are NOT that evidence, each of
+  which used to evict the operator mid-read:
+  - **A host whose terminal tunnel went offline.** Every hub restart flaps every host's control
+    channel (they all reconnect within a second or two) while the sessions keep running and keep
+    heartbeating. The stage holds, both bars show a **"⚠ tunnel offline"** chip
+    (`setStageTunnel`, mirrored by Android's header marker), and the RETURN heals in place: the chat
+    reconnects its socket at once (`TurmaChat.reconnectNow`, since the hub held the watch and
+    re-arms it) and the ttyd iframe is re-navigated, because its WebSocket died with the tunnel and
+    nothing inside the frame retries. Transitions only — re-navigating per beat restarts the
+    terminal every few seconds.
+  - **A beat that doesn't mention the host at all** (a hub answering before the first heartbeat
+    lands, a failed refresh). Silence about a host says nothing about its sessions;
+    `currentHostKey` is what tells the two apart.
+  - **The org filter.** The check reads the WHOLE fleet (`sessionRecord`, like `sessionHit`), never
+    the org-scoped `running` — scoping is a sidebar concern (XERK-62).
+  - `loadHistory` bails before building its URL when the view has closed; without it a 202-retry
+    timer fetches `/api/agents/null/sessions/null/history`. Tests: the tunnel-flap cases in
+    `sessions.test.js`, `chat-live.test.js`.
 - It renders chat bubbles — **user right, agent left** — with collapsible tool-action cards
   (tool_use + its paired tool_result, error-styled) and collapsed thinking traces, and the
   in-progress turn as a trailing bubble.

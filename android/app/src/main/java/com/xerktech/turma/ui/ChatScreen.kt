@@ -167,9 +167,19 @@ fun ChatScreen(
                         Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
                         state.session?.let {
                             // Host · repo · branch (XERK-121), + a live indicator.
+                            // A host whose tunnel is down outranks it: our own
+                            // socket stays open across a flap, so "live" would
+                            // claim a stream that has stopped (XERK-252). The
+                            // session keeps running and the screen stays put —
+                            // this only says why it has gone quiet.
                             val hostLabel = state.hostLabel.ifBlank { host }
+                            val liveMark = when {
+                                !state.tunnelOnline -> " · ⚠ tunnel offline"
+                                state.connected -> " · live"
+                                else -> ""
+                            }
                             Text(
-                                sessionHeaderMeta(hostLabel, it) + if (state.connected) " · live" else "",
+                                sessionHeaderMeta(hostLabel, it) + liveMark,
                                 style = MaterialTheme.typography.bodySmall,
                                 fontFamily = FontFamily.Monospace,
                                 maxLines = 1,
