@@ -94,9 +94,6 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   200. Now `BoardViewModel.fetchIssue` polls with backoff to a 45s deadline and unwraps the nested
   `issue` (`JiraIssueEnvelope`), surfacing a terminal failure as an error message — a port of
   board.html `fetchDetail`. `core/Board.kt` `classifyIssueResponse`/`IssueFetch` tested in `BoardTest`.
-- **Typewriter reveal snap on live-turn block swaps.** `core/Reveal.kt` `liveRevealBase` +
-  `ChatViewModel` — the non-monotonic pane scrape no longer re-streams the last line from a stale
-  offset (the web `chat.js` `startsWith` check, XERK-19). Tested in `RevealTest`.
 - **Sign out.** A ⋮ overflow on the shared `ScreenHeader` (every top-level screen) that unregisters
   push, clears credentials, and returns to Login — the web has Sign out in its nav on every page.
 - **Move a session to another agent (XERK-101).** The session card ⋯ menu gains "Move to another
@@ -232,7 +229,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   inline arm/confirm Cancel, no attach (no pane yet).
 - **Chat stick-to-bottom + jump-to-latest pill.** Auto-scroll follows the tail only while the reader
   is AT the tail (was: unconditional scroll-to-end on every new item, fighting the reader); scrolling
-  up unpins, a "↓ Jump to latest" pill re-pins, and the reveal growing the last bubble keeps the tail
+  up unpins, a "↓ Jump to latest" pill re-pins, and a growing live turn keeps the tail
   in view while pinned (web chat.js `stickBottom`/`#chatJump`).
 - **Dashboard session card detail.** Status badge (queued/error + the optimistic "stopping"), id,
   worktree/branch (or "repos root (no worktree)"), work-risk line (`core/Sessions.kt workLine` ←

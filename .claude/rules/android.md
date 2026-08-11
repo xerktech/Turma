@@ -16,8 +16,8 @@ the Android change or add a line to `android/PARITY.md`.
 
 Mirrors the glasses pure-core/adapter-shell split:
 
-- `core/` — JVM-unit-tested reducers ported 1:1 from `glasses/src` (`Reveal` typewriter,
-  `Transcript` grow-only merge, `Sessions` working/idle/waiting, `ChatItems` buildItems+verbosity).
+- `core/` — JVM-unit-tested reducers ported 1:1 from `glasses/src` (`Transcript` grow-only merge,
+  `Sessions` working/idle/waiting, `ChatItems` buildItems+verbosity).
 - `model/` — the wire shapes + shared `TurmaJson` decoder. `vm/` — the ViewModels.
 - `net/` — the `HubClient` (Retrofit/OkHttp/kotlinx.serialization), `LiveTail`+`FleetRepository`
   (WebSocket `/live` + SSE `/api/events` with a 6s `/api/agents` poll floor), and `Dictation` (16kHz
@@ -40,8 +40,8 @@ When you touch one of these web files, check its Android counterpart:
 | `org.js` | `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt` |
 
 - **Pure logic ports live in `core/` and are JVM-unit-tested against the web behavior** — the board
-  category carve-out (`core/Board.kt` ↔ `board.js` `categoryOf`), the typewriter reveal
-  (`core/Reveal.kt` ↔ `chat.js` `repaint`), the summary-tile reducers (`core/Fleet.kt` ↔
+  category carve-out (`core/Board.kt` ↔ `board.js` `categoryOf`), the chat item builder
+  (`core/ChatItems.kt` ↔ `chat.js` `buildItems`), the summary-tile reducers (`core/Fleet.kt` ↔
   `index.html` `fleetTokens`/`mergeModels`), the Ready-for-review split (`core/Sessions.kt`
   `rankRunning` → `LiveGroups`), the sessions search (`core/Search.kt`, XERK-243 — its ONE box
   filters the live lists AND appends archive matches). Port the *logic* there and keep the Compose

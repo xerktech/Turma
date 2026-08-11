@@ -123,9 +123,8 @@ fun ChatScreen(
             state.entries + TailEntry(id = ChatViewModel.LIVE_TURN_ID, role = "assistant", text = state.liveTurn)
         else state.entries
     }
-    val revealNewestId = if (state.liveTurn.isNotBlank()) ChatViewModel.LIVE_TURN_ID else state.entries.lastOrNull()?.key
-    val items = remember(displayEntries, state.verbosity, state.reveal) {
-        buildItems(displayEntries, state.prefs, revealNewestId, state.reveal.shown)
+    val items = remember(displayEntries, state.verbosity) {
+        buildItems(displayEntries, state.prefs)
     }
 
     val listState = rememberLazyListState()
@@ -145,9 +144,8 @@ fun ChatScreen(
             if (!autoScrolling[0] && (scrolling || !canFwd)) stickBottom = !canFwd
         }
     }
-    // Keyed on `items` (not just its size) so the typewriter reveal growing the
-    // last bubble keeps the tail in view too, exactly as the web pins on every
-    // repaint tick.
+    // Keyed on `items` (not just its size) so a growing live turn keeps the tail
+    // in view too, exactly as the web pins on every repaint.
     LaunchedEffect(items) {
         if (stickBottom && items.isNotEmpty()) {
             autoScrolling[0] = true

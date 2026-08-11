@@ -140,14 +140,21 @@ Hard rules:
 
 ## 2. Building and running each component
 
-Baselines below are from `main` at v0.6 (commit c8347a9), so a deviation is
+Baselines below are from `main` at v0.6 + XERK-251 (commit 5c78834), so a deviation is
 either your environment or a regression — find out which before filing.
+
+**Pin your copy on `/mnt/data`, never in the `/tmp` scratchpad.** §4 tells you to
+`git archive HEAD | tar -x` into a scratch dir; do it under `/mnt/data/tmp-qa/`,
+because `/tmp` is `noexec` and that breaks the toolchains silently-ish:
+`npm ci` dies in esbuild's postinstall (`spawnSync .../esbuild EACCES`) and
+`bun run typecheck` dies on `node_modules/.bin/tsc: Permission denied`. Same
+reason `--cache` must point at `/mnt/data/tmp-qa/npm-cache`, not `/tmp`.
 
 ### 2.1 Hub (`turma/`) — node, no build step
 
 ```bash
 export PATH=/root/.local/node/bin:$PATH
-cd turma && node --test tests/*.test.js        # baseline: 808 pass, ~5s
+cd turma && node --test tests/*.test.js        # baseline: 911 pass, ~6s
 ```
 
 Boot a real hub with everything pointed at temp paths:
@@ -165,7 +172,7 @@ redirected — miss one and you write into the operator's `/data`.
 
 ```bash
 cd agent
-python3 -m unittest tests.test_hub_agent                       # 986 pass, ~9s
+python3 -m unittest tests.test_hub_agent                       # 1138 pass, ~14s
 python3 -m unittest tests.test_guard tests.test_guard_settings tests.test_ask   # 48 pass
 node --test tests/tunnel-agent.test.js                         # 80 pass
 for t in tests/test_*.sh; do bash "$t"; done                   # native/entrypoint suites
@@ -173,46 +180,78 @@ for t in tests/test_*.sh; do bash "$t"; done                   # native/entrypoi
 
 **There is no pytest.** `python3 -m unittest` is the only runner.
 
+The single node command `code-scan.yml` really runs (1042 pass) — use this to
+reproduce that gate rather than per-directory runs:
+
+```bash
+node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
+```
+
 ### 2.3 Glasses (`glasses/`) — npm + vite + vitest
 
 ```bash
 export PATH=/root/.local/node/bin:$PATH
 cd glasses
-npm ci --cache /tmp/claude-0/npm-cache
-npm run typecheck && npx vitest run                            # baseline: 463 tests
+npm ci --cache /mnt/data/tmp-qa/npm-cache
+npm run typecheck && npx vitest run                            # baseline: 455 tests
+npm run build                                                  # glasses-ci gates on this too
 ```
+
+`src/vendor/vendor.test.ts` asserts `chat.cjs`/`board.cjs` are **byte-identical**
+to their `turma/public/` sources. Editing `turma/public/chat.js` without
+re-copying both vendored files fails here and in `veiller-ci` — verified by
+mutating one byte.
 
 ### 2.4 Veiller (`veiller/`) — bun
 
 ```bash
-cd veiller && bun install && bun test                          # baseline: 357 pass
+cd veiller && bun install && bun test                          # baseline: 344 pass
 bun run typecheck                                              # needs devDeps installed first
+bun run build                                                  # veiller-ci gates on this too
 ```
 
 `bun run typecheck` calls bare `tsc`, so it fails with `command not found`
 until `bun install` has run.
 
-### 2.5 Android (`android/`) — only inside the agent image
+### 2.5 Android (`android/`) — inside the agent image, and it does work
 
-There is no JDK on this host. Build in the container, which bundles JDK 17 +
-Gradle + the Android SDK:
+There is no JDK on this host, but the **whole `android-ci` gate runs locally** in
+`ghcr.io/xerktech/turma-agent:latest` in ~3.5 min. Do not report Android as
+unbuildable — that is only true of the *UI*, below. The image already carries
+JDK 17.0.20, Gradle **8.11.1** at `/opt/gradle` (the same version android-ci
+pins) and `/opt/android-sdk` with `platforms/android-35` + `build-tools/35.0.0`,
+so nothing needs downloading in-job:
 
 ```bash
-docker pull ghcr.io/xerktech/turma-agent:latest
+mkdir -p /mnt/data/tmp-qa/andhome /mnt/data/tmp-qa/gradlehome
+docker run --rm --entrypoint bash \
+  -v <checkout>/android:/work \
+  -v /mnt/data/tmp-qa/andhome:/andhome -v /mnt/data/tmp-qa/gradlehome:/gradlehome \
+  -e ANDROID_USER_HOME=/andhome -e GRADLE_USER_HOME=/gradlehome \
+  ghcr.io/xerktech/turma-agent:latest -c \
+  'cd /work && gradle :app:testDebugUnitTest --no-daemon && gradle :app:assembleDebug --no-daemon'
 ```
 
-Two traps, both from the verify skill and both still true:
+Baseline: **278 JVM unit tests**, 0 failures, and a ~21 MB
+`app/build/outputs/apk/debug/app-debug.apk`. Per-suite counts are in
+`app/build/test-results/testDebugUnitTest/TEST-*.xml`.
 
+Traps:
+
+- **`--entrypoint bash` is required.** The image's own entrypoint resolves a
+  run-as identity and `setpriv`s; a plain `docker run … bash -lc '…'` just hangs.
 - `assembleDebug` needs `ANDROID_USER_HOME` somewhere writable, or
-  `validateSigningDebug` fails trying to create a debug keystore in
-  `/root/.android`.
+  `validateSigningDebug` fails creating a debug keystore in `/root/.android`.
+  Mount `GRADLE_USER_HOME` too, or every run re-resolves dependencies.
 - The SDK in the image ships **build-tools 35.0.0 only**, and
   `app/build.gradle.kts` pins it.
+- Kotlin does **not** treat warnings as errors here, so an import left dangling
+  by a deletion compiles clean — grep for the removed symbol as well as building.
 
 `:latest` is the `android-build` tier — **no emulator, no system image**. An
 install-and-drive-the-app run needs the separate `:emulator` tag (6.4 GB, built
 on demand) or a real device over `adb connect`. If you cannot reach one, the
-honest verdict is PARTIAL; say so rather than claiming you drove the UI.
+honest verdict is PARTIAL for the UI; say so rather than claiming you drove it.
 
 There is **no committed gradle wrapper** — CI generates it.
 `.github/workflows/android-ci.yml` is the reliable spec for how this is really
@@ -241,6 +280,43 @@ Also: `curl -sf -u user:pass /api/agents` returns an **empty body**, not JSON �
 the 302 to `/login` is a 3xx, which `-f` does not treat as failure. If you are
 parsing an empty string as JSON, that is why. Authenticate the way the client
 does, or assert on the status code first.
+
+On the **native host** run Chrome with `--network host` (the verify skill's
+`--network container:$CID` is for the agent container, where 127.0.0.1 is shared
+with the hub). Name the container after your ticket — a stray `qa-chrome` from
+another run is usually already up. `connectOverCDP` reuses one long-lived
+browser context, so **`ctx.clearCookies()` first** or `/login` 302s away and
+`page.fill("#username")` times out looking for a form that isn't there.
+
+### 3.1 Driving the live chat end to end (no real agent needed)
+
+The chat view is fed by the hub's fanout, so a fake tunnel-agent is enough to
+drive every live path. Node 22+ has a global `WebSocket`, so no `ws` dep:
+
+```js
+// 1. heartbeat a host + running session (needs worktreePath AND transcriptId)
+POST /api/heartbeat  Authorization: Bearer $TURMA_AGENT_TOKEN
+// 2. the control channel — this is what makes the session card clickable
+new WebSocket(`ws://127.0.0.1:PORT/agent/control?name=<host>&token=<agent token>`)
+// 3. push frames the hub fans out to every browser watching that session
+ws.send(JSON.stringify({ turn: sid, text, status }))            // in-progress turn
+ws.send(JSON.stringify({ tail: sid, entries, queued }))         // committed delta
+```
+
+Three things that each cost a run:
+
+- **Session cards are `<button class="s-card" onclick="selectSession('<id>')">`
+  and are `disabled` unless `terminalOnline`** — i.e. unless the control channel
+  above is open. Open it *before* loading the page, and click the real button
+  (or call `selectSession(id)`); there is no `data-id` to query.
+- **A tail entry's blocks are keyed `t`, not `type`**:
+  `{t:"text"|"thinking"|"tool_use"|"tool_result", …}`. A fixture using `type:`
+  produces entries that render as **nothing at all**, and it looks like a bug in
+  the code you are QA'ing. `buildItems` in `turma/public/chat.js` is the spec.
+- Verbosity presets are plain buttons labelled `Concise`/`Normal`/`Verbose`;
+  a thinking trace renders as `<details class="thought">` (not `.think*`), and
+  `renderInline` supports **code spans and links only — there is no bold/italic**,
+  so `**x**` staying literal is correct, not a regression.
 
 ---
 
@@ -465,6 +541,22 @@ The guard is a **backstop against catastrophe, not a sandbox**. It is one layer
 under `permissions.deny` and the operator's own host hardening; treat a gap as
 worth closing, not as a breach of a boundary it never claimed to be.
 
+### 6.2 Pre-existing behaviours — confirm against `main` before filing
+
+Each of these reproduces identically on `main`, so it is not whatever branch you
+are holding. Re-confirm with the same script on both before you spend time.
+
+- **An agent tunnel flap permanently kills an open chat's live stream.** Drop the
+  `/agent/control` channel: the browser's `/live/<host>/<id>` socket closes and
+  never reopens, the bubble freezes on the last text, and the poll fallback then
+  requests `/api/agents/null/sessions/null/history` (404) because `close()` has
+  already nulled `hostKey`/`sessionId`. Reconnecting the agent does not recover
+  it; re-selecting the session does. Verified identical on `main` at 5c78834.
+- **`preserveScrollOffset` in the glasses `App.onTurn` path has no test.**
+  Deleting the call leaves all 455 vitest tests green while a scrolled-up view
+  gets yanked down by a growing live turn. The behaviour is correct on both
+  `main` and HEAD — it is the coverage that is missing.
+
 ---
 
 ## 7. Reporting
@@ -488,6 +580,13 @@ Three habits that paid off in XERK-235 and cost almost nothing:
   process and run a corpus through each. "main denied this and HEAD allows it"
   found three regressions in the guard alone that no test covered — including
   one the fixing commit introduced.
+- **For UI changes, diff the DOM, not your impressions.** Boot two hubs (one per
+  pin, different ports), drive the identical script against both, and compare
+  `chatScroll.innerHTML` at each step. On XERK-251 that proved 12/12 states
+  byte-identical to `main`, which no amount of clicking would have established.
+  It also gives you a **sensitivity control**: run your detector against the
+  pin that still has the old behaviour and confirm it actually fires. A sampler
+  that reports "no problem found" against both pins has proven nothing.
 
 - **Mutation-test your own verification.** Break three behaviors the suite
   claims to protect and confirm it notices. Every agent that did this found at

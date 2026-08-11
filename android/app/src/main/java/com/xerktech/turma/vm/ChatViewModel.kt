@@ -10,13 +10,10 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.core.Attachment
-import com.xerktech.turma.core.RevealState
 import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
-import com.xerktech.turma.core.advanceReveal
 import com.xerktech.turma.core.entryTruncated
-import com.xerktech.turma.core.liveRevealBase
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
 import com.xerktech.turma.model.SessionInfo
@@ -54,7 +51,6 @@ data class ChatUiState(
     // outlives the turn: a background agent keeps running after the main one
     // stops, which is exactly when the bar used to vanish (XERK-245).
     val liveAgents: List<com.xerktech.turma.model.AgentRow> = emptyList(),
-    val reveal: RevealState = RevealState(),
     val verbosity: Verbosity = Verbosity.CONCISE,
     val connected: Boolean = false,
     val hasMore: Boolean = false,
@@ -119,10 +115,6 @@ class ChatViewModel(
     }
 
     private var liveJob: Job? = null
-    private var revealJob: Job? = null
-    // The live text the current reveal offset indexes into, for the non-monotonic
-    // pane-scrape snap check (see liveRevealBase / startRevealLoop).
-    private var lastLiveText: String = ""
     private var historyJob: Job? = null
     private var fleetJob: Job? = null
     private var pollJob: Job? = null
@@ -140,7 +132,6 @@ class ChatViewModel(
         seedFromFleet()
         observeFleet()
         startLive()
-        startRevealLoop()
         loadHistory()
         startPollFallback()
     }
@@ -149,7 +140,7 @@ class ChatViewModel(
     // two-pane detail swapping back to a session whose VM lingered in the store)
     // restarts cleanly rather than stacking a second collector on each job.
     fun onLeave() {
-        liveJob?.cancel(); revealJob?.cancel(); historyJob?.cancel(); fleetJob?.cancel()
+        liveJob?.cancel(); historyJob?.cancel(); fleetJob?.cancel()
         pollJob?.cancel(); refreshJob?.cancel()
         cancelDictation()
     }
@@ -218,39 +209,6 @@ class ChatViewModel(
                 }
             }
         }
-    }
-
-    // Typewriter tick (~12fps). Reveals the newest entry (the live turn types;
-    // a committed entry snaps). Cheap idle loop when nothing is changing.
-    private fun startRevealLoop() {
-        revealJob?.cancel()
-        revealJob = viewModelScope.launch {
-            while (isActive) {
-                val s = _state.value
-                val (newestId, targetLen, live) = newestTarget(s)
-                if (newestId.isNotEmpty()) {
-                    // The live pane scrape isn't monotonic: when the new capture no
-                    // longer continues what we've revealed, snap the base so we don't
-                    // re-stream from a stale offset (XERK-19). Non-live entries are
-                    // monotonic and need no snap.
-                    val prev = if (live && newestId == s.reveal.entryId) {
-                        s.reveal.copy(shown = liveRevealBase(lastLiveText, s.reveal.shown, s.liveTurn))
-                    } else s.reveal
-                    val next = advanceReveal(prev, newestId, targetLen, 80, live)
-                    if (next != s.reveal) _state.update { it.copy(reveal = next) }
-                }
-                lastLiveText = if (live) s.liveTurn else ""
-                delay(80)
-            }
-        }
-    }
-
-    private fun newestTarget(s: ChatUiState): Triple<String, Int, Boolean> {
-        if (s.liveTurn.isNotBlank()) return Triple(LIVE_TURN_ID, s.liveTurn.length, true)
-        val last = s.entries.lastOrNull() ?: return Triple("", 0, false)
-        val len = if (last.text.isNotEmpty()) last.text.length
-        else last.blocks.sumOf { b -> (b as? com.xerktech.turma.model.TextBlock)?.text?.length ?: 0 }
-        return Triple(last.key, len, false)
     }
 
     private fun loadHistory(attempt: Int = 0) {

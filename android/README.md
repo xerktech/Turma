@@ -13,7 +13,7 @@ notifications** and **voice** for starting sessions and mid-session prompts.
   Restart / Resume / Delete, per-session model/mode switch, Clone from GitHub,
   and arm/confirm Prune.
 - **Native chat** — user/agent bubbles, collapsible tool-action cards and
-  thinking traces, a **typewriter reveal** on the in-progress turn, a
+  thinking traces, the in-progress turn appearing as it arrives, a
   **verbosity** control (Concise / Normal / Verbose), and a raw **Terminal**
   (ttyd) toggle for debugging. Streams over the hub's `/live` WebSocket, seeded
   from the heartbeat tail + `/history`, with a poll fallback.
@@ -44,8 +44,8 @@ notifications** and **voice** for starting sessions and mid-session prompts.
 Mirrors the glasses client's pure-core / adapter-shell split:
 
 - `model/` — wire shapes + the shared `TurmaJson` decoder.
-- `core/` — pure, JVM-tested reducers ported from `glasses/src`: `Reveal`,
-  `Transcript` (grow-only merge), `Sessions` (working/idle/waiting), `ChatItems`
+- `core/` — pure, JVM-tested reducers ported from `glasses/src`: `Transcript`
+  (grow-only merge), `Sessions` (working/idle/waiting), `ChatItems`
   (buildItems + verbosity). Unit tests in `src/test/`.
 - `net/` — `HubClient` (Retrofit + OkHttp + kotlinx.serialization),
   `LiveTail`/`FleetRepository` (WebSocket + SSE), `Dictation` (mic → `/audio`),

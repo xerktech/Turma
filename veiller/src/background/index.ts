@@ -113,8 +113,8 @@ class TurmaBackground {
     });
     const display = new MentraDisplay(this.session);
     // Per-App gate (fresh on every sign-in): onState fires on every glasses
-    // repaint — 80ms reveal ticks included — but the phone payload only
-    // changes on the fields the gate compares. Broadcasting per tick floods
+    // repaint — a ~1s live-turn frame included — but the phone payload only
+    // changes on the fields the gate compares. Broadcasting per repaint floods
     // the WebView bridge with large payloads for nothing (XERK-215).
     const stateGate = createPhoneStateGate();
     const app = new App({
@@ -139,7 +139,7 @@ class TurmaBackground {
 
   // Upstream reloaded the whole page on sign-out; the App has no stop().
   // pause({hard:true}) is the sanctioned full-stop (cancels dictation, the
-  // poll loop, live tail, reveal + history timers), and disposing the
+  // poll loop, live tail, history timers), and disposing the
   // display unsubscribes its input stream — after which dropping the
   // references retires the instance completely.
   private stopApp(): void {

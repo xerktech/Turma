@@ -3,13 +3,6 @@ import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
 import { emptyBuffer, mergeTail, prependHistory, type TranscriptBuffer } from "./transcript.ts";
 import { NoopLiveTail, type LiveTailLike } from "./live.ts";
-import {
-  advanceReveal,
-  emptyReveal,
-  fullReveal,
-  revealComplete,
-  type RevealState,
-} from "./reveal.ts";
 import { flattenSessions } from "./sessions.ts";
 import { draftMaxViewOffset, type MicState } from "./input-box.ts";
 import {
@@ -21,7 +14,6 @@ import {
   sessionContentLines,
   sessionTranscriptArea,
   SESSION_SCROLL_STEP,
-  LIVE_TURN_ID,
   type HomeRow,
   type SessionFocus,
 } from "./render.ts";
@@ -62,11 +54,6 @@ export const FLASH_QUEUED = "✓ queued — agent picks up in ~20s";
 export const FLASH_HUB_UNREACHABLE = "hub unreachable";
 export const HISTORY_RETRY_MS = 3000;
 export const WORKING_WINDOW_SEC = 90;
-// How often the typewriter reveal advances while a session's newest entry is
-// still catching up to its full text. ~12fps — smooth enough to read as
-// typing, cheap enough for the BLE render path's debounce (display/debounce.ts).
-export const REVEAL_TICK_MS = 80;
-
 export function pendingKeyForSpawn(hostKey: string, repo: string): string {
   return `spawn:${hostKey}:${repo}`;
 }
@@ -168,10 +155,6 @@ export interface AppState {
   autoStartOrgs: Record<string, boolean>;
   sessionRefs: SessionRef[];
   transcripts: Record<string, TranscriptBuffer>;
-  // Typewriter state for the focused session's newest transcript entry (see
-  // reveal.ts). Only ever describes state.session's newest entry; reset to
-  // empty whenever the session screen isn't the one in view.
-  reveal: RevealState;
   // The in-progress assistant turn scraped live from the session's TUI pane
   // (real-time streaming — the transcript JSONL only lands on completion).
   // Only for the focused session; cleared on completion, session change, and
@@ -204,7 +187,6 @@ export function createInitialState(now: number): AppState {
     autoStartOrgs: {},
     sessionRefs: [],
     transcripts: {},
-    reveal: emptyReveal(),
     liveTurn: null,
     pending: {},
     loadingHistory: {},
@@ -271,8 +253,6 @@ export class App {
   private state: AppState;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private historyTimers: Record<string, ReturnType<typeof setTimeout>> = {};
-  private revealTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastRevealAt = 0;
   private paused = false;
   // While `now() < graceUntil`, the poll loop is allowed to keep running even
   // when paused (backgrounded). Set by nudgePoll() after a list mutation; the
@@ -346,12 +326,11 @@ export class App {
     // just spawned/killed before backgrounding still reaches the frozen HUD
     // frame. The loop self-terminates once graceUntil elapses.
     this.schedulePoll(this.pollMs);
-    // Backgrounding also stops the live transcript stream and its reveal
-    // animation — both re-established on resume() if we come back to a
-    // session screen. Leaving the live WS open while backgrounded would keep
-    // the agent tailing a transcript nobody's watching.
+    // Backgrounding also stops the live transcript stream — re-established on
+    // resume() if we come back to a session screen. Leaving the live WS open
+    // while backgrounded would keep the agent tailing a transcript nobody's
+    // watching.
     this.liveTail.stop();
-    this.clearRevealTimer();
     if (this.state.liveTurn) this.state = { ...this.state, liveTurn: null };
     // Backgrounding stops the poll loop above, but history-fetch retry
     // timers are independent `setTimeout`s keyed by sessionId — without
@@ -370,8 +349,6 @@ export class App {
     // (lifecycle can restore us there via restoreScreen).
     if (this.state.screen === "session" && this.state.session) {
       this.startLiveTail(this.state.session.hostKey, this.state.session.sessionId);
-      this.reanchorReveal(this.state.session.sessionId);
-      this.scheduleRevealTick();
     }
     this.schedulePoll(0);
   }
@@ -482,8 +459,8 @@ export class App {
     this.repaint();
   }
 
-  // Attach/detach the near-real-time transcript stream (and its reveal
-  // animation) to whatever session — if any — the session screen now shows.
+  // Attach/detach the near-real-time transcript stream to whatever session —
+  // if any — the session screen now shows.
   // Called from every setState, so it fires on entering a session, switching
   // between two sessions, and leaving the session screen. LiveTail.start is
   // idempotent for the same session, so same-session setStates (scrolling,
@@ -505,22 +482,12 @@ export class App {
       // The phone bridge mirrors this into the embedded web view (XERK-171).
       this.onEnterSession?.(cur!.hostKey, cur!.sessionId);
       this.startLiveTail(cur!.hostKey, cur!.sessionId);
-      // The existing buffer is history, not a live stream — show it in full,
-      // and let only subsequent growth type in. Any live turn from a previous
-      // session is dropped (a fresh session has no in-progress turn until the
-      // stream delivers one).
-      const entries = this.state.transcripts[cur!.sessionId]?.entries ?? [];
-      const last = entries[entries.length - 1];
-      this.state = {
-        ...this.state,
-        liveTurn: null,
-        reveal: fullReveal(last?.id ?? null, last?.text.length ?? 0),
-      };
-      this.lastRevealAt = this.now();
+      // Any live turn from a previous session is dropped (a fresh session has
+      // no in-progress turn until the stream delivers one).
+      this.state = { ...this.state, liveTurn: null };
     } else if (wasSession) {
       this.liveTail.stop();
-      this.clearRevealTimer();
-      this.state = { ...this.state, liveTurn: null, reveal: emptyReveal() };
+      this.state = { ...this.state, liveTurn: null };
     }
   }
 
@@ -532,9 +499,8 @@ export class App {
   }
 
   // A committed transcript delta for the focused session: merge it into the
-  // buffer (same dedup/append as a poll's tail), re-anchor the reveal, and
-  // repaint. Frames for a session no longer in view are dropped (a stale close
-  // race).
+  // buffer (same dedup/append as a poll's tail) and repaint. Frames for a
+  // session no longer in view are dropped (a stale close race).
   private onLiveTail(_hostKey: string, sessionId: string, entries: TailEntry[]): void {
     if (this.state.screen !== "session" || this.state.session?.sessionId !== sessionId) return;
     // Forward the RAW entries (with their rich blocks) to the phone UI before the
@@ -549,10 +515,8 @@ export class App {
       now: this.now(),
       transcripts: { ...this.state.transcripts, [sessionId]: merged },
     };
-    this.reanchorReveal(sessionId);
     this.preserveScrollOffset(beforeLen);
     this.repaint();
-    this.scheduleRevealTick();
   }
 
   // Keep the visible transcript window pinned to the same lines when content
@@ -563,7 +527,7 @@ export class App {
   // from-bottom offset by however many lines were added so the same slice stays
   // put. At the tail (offset === 0) this is a deliberate no-op, so new text
   // still auto-scrolls in. `beforeLen` is the content length captured *before*
-  // the transcript/reveal mutation that may have grown it.
+  // the transcript mutation that may have grown it.
   private preserveScrollOffset(beforeLen: number): void {
     const s = this.state.session;
     if (!s || s.offset <= 0) return;
@@ -579,39 +543,15 @@ export class App {
     if (this.state.screen !== "session" || this.state.session?.sessionId !== sessionId) return;
     const beforeLen = this.sessionContentLength(_hostKey, sessionId);
     if (text) {
-      // Still generating — update the live turn and let the reveal type it in.
+      // Still generating — show the capture as it stands.
       this.state = { ...this.state, now: this.now(), liveTurn: { sessionId, text } };
-      this.reanchorReveal(sessionId);
-      this.preserveScrollOffset(beforeLen);
     } else {
-      // Turn completed: drop the live turn (the committed tail owns the message
-      // now) and show the now-committed newest entry in FULL — it was already
-      // streamed live via the turn, so don't re-type it from scratch.
-      const entries = this.state.transcripts[sessionId]?.entries ?? [];
-      const last = entries[entries.length - 1];
-      this.state = {
-        ...this.state,
-        now: this.now(),
-        liveTurn: null,
-        reveal: fullReveal(last?.id ?? null, last?.text.length ?? 0),
-      };
-      this.lastRevealAt = this.now();
-      this.preserveScrollOffset(beforeLen);
+      // Turn completed: drop the live turn (the committed tail owns the
+      // message now).
+      this.state = { ...this.state, now: this.now(), liveTurn: null };
     }
+    this.preserveScrollOffset(beforeLen);
     this.repaint();
-    this.scheduleRevealTick();
-  }
-
-  // The newest entry the reveal should type: the live in-progress turn if one
-  // is streaming for this session, else the newest committed transcript entry.
-  // `live` distinguishes the genuinely-streamed turn (types char-by-char) from
-  // a committed entry that lands whole (snaps in) — see advanceReveal.
-  private newestRevealTarget(sessionId: string): { id: string | null; len: number; live: boolean } {
-    const lt = this.state.liveTurn;
-    if (lt && lt.sessionId === sessionId && lt.text) return { id: LIVE_TURN_ID, len: lt.text.length, live: true };
-    const entries = this.state.transcripts[sessionId]?.entries ?? [];
-    const last = entries[entries.length - 1];
-    return { id: last?.id ?? null, len: last?.text.length ?? 0, live: false };
   }
 
   private repaint(): void {
@@ -627,58 +567,6 @@ export class App {
   private flash(text: string): void {
     const now = this.now();
     this.state = { ...this.state, now, flash: text, flashUntil: now + FLASH_DURATION_MS };
-  }
-
-  // ---- reveal (streaming typewriter) ----------------------------------
-
-  private clearRevealTimer(): void {
-    if (this.revealTimer) {
-      clearTimeout(this.revealTimer);
-      this.revealTimer = null;
-    }
-  }
-
-  // Re-anchor the reveal to the focused session's current newest entry with
-  // dt=0 (see reveal.ts): starts a brand-new entry hidden and snaps blocks,
-  // but types nothing yet — the tick loop does the typing. Called on every
-  // transcript change (live delta or poll) so the reveal tracks the newest id.
-  private reanchorReveal(sessionId: string): void {
-    if (this.state.session?.sessionId !== sessionId) return;
-    const target = this.newestRevealTarget(sessionId);
-    const reveal = advanceReveal(this.state.reveal, target.id, target.len, 0, { live: target.live });
-    this.state = { ...this.state, reveal };
-    this.lastRevealAt = this.now();
-  }
-
-  private scheduleRevealTick(): void {
-    if (this.paused || this.revealTimer) return;
-    if (this.state.screen !== "session") return;
-    // While the user has scrolled up to read history (offset > 0) the newest
-    // entry is off-screen, so typing it in is invisible work that also creeps
-    // the visible window; freeze the tick loop. It re-arms when they scroll
-    // back to the tail (offset 0) — see onSession.
-    if (this.state.session && this.state.session.offset > 0) return;
-    this.revealTimer = setTimeout(() => {
-      this.revealTimer = null;
-      this.revealTick();
-    }, REVEAL_TICK_MS);
-  }
-
-  private revealTick(): void {
-    const s = this.state.session;
-    if (this.state.screen !== "session" || !s) return;
-    // Scrolled up since this tick was scheduled — pause without advancing or
-    // repainting; onSession re-arms on the return to the tail.
-    if (s.offset > 0) return;
-    const target = this.newestRevealTarget(s.sessionId);
-    const targetLen = target.len;
-    const now = this.now();
-    const dt = now - this.lastRevealAt;
-    this.lastRevealAt = now;
-    const reveal = advanceReveal(this.state.reveal, target.id, targetLen, dt, { live: target.live });
-    this.state = { ...this.state, now, reveal };
-    this.repaint();
-    if (!revealComplete(reveal, targetLen)) this.scheduleRevealTick();
   }
 
   // ---- polling --------------------------------------------------------
@@ -732,15 +620,11 @@ export class App {
       // on a row that no longer exists or never was tappable.
       this.state = { ...this.state, home: { cursor: clampHomeCursor(this.homeRows(), this.state.home.cursor) } };
       // A poll can grow the focused session's transcript too (the 20s
-      // heartbeat, or a beat the live stream missed) — re-anchor the reveal so
-      // that growth snaps (block) or types (small delta) exactly as a live
-      // delta would, rather than flashing in at full length.
-      // Skip while paused: a grace-window poll (backgrounded) should refresh
-      // the list without re-arming the reveal timer that pause() just cleared.
+      // heartbeat, or a beat the live stream missed) — keep a scrolled-up view
+      // pinned to the same lines when it does. Skipped while paused: a
+      // grace-window poll (backgrounded) refreshes the list, nothing on screen.
       if (!this.paused && this.state.screen === "session" && this.state.session) {
-        this.reanchorReveal(this.state.session.sessionId);
         this.preserveScrollOffset(beforeLen);
-        this.scheduleRevealTick();
       }
       // Keep the answer sheet's state coherent when a question arrives on (or
       // is replaced on) the focused session. The sheet now takes over the
@@ -945,9 +829,6 @@ export class App {
     if (e.type === "scrollDown") {
       const offset = Math.max(0, s.offset - SESSION_SCROLL_STEP);
       this.setState({ session: { ...s, offset } });
-      // Back at the tail — resume the typewriter (frozen while scrolled up),
-      // catching up to whatever streamed in meanwhile.
-      if (offset === 0) this.resumeRevealAtTail(s.sessionId);
       return;
     }
     if (e.type === "scrollUp") {
@@ -969,20 +850,10 @@ export class App {
     if (e.type === "tap") {
       if (s.offset > 0) {
         this.setState({ session: { ...s, offset: 0 } }); // snap to newest
-        this.resumeRevealAtTail(s.sessionId); // resume the frozen typewriter
       } else {
         this.setState({ session: { ...s, focus: "bottom" } });
       }
     }
-  }
-
-  // Re-anchor and restart the reveal tick after the user scrolls back to the
-  // tail. reanchorReveal snaps a large backlog (a block that streamed in while
-  // scrolled up) or leaves a small one to type; scheduleRevealTick (now
-  // unblocked, offset === 0) resumes the animation.
-  private resumeRevealAtTail(sessionId: string): void {
-    this.reanchorReveal(sessionId);
-    this.scheduleRevealTick();
   }
 
   // Bottom-box focus gestures. A pending AskUserQuestion turns the box into
