@@ -18,6 +18,7 @@ import com.xerktech.turma.core.entryTruncated
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
 import com.xerktech.turma.core.tunnelOnlineOf
+import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TurnStatus
@@ -104,6 +105,24 @@ data class ChatUiState(
 
     fun canSwitchModelSource(now: Long = System.currentTimeMillis()): Boolean =
         ModelSource.offered(localModel, modelSource(now))
+
+    /**
+     * Everything this screen takes from a fleet beat, in one place.
+     *
+     * Extracted from the two callers (the poll collector and the initial seed)
+     * so the set of carried fields is pinned by a test rather than by whoever
+     * last resolved a merge on that `copy(...)`. A field silently dropped there
+     * disables its whole feature — [localModel] going missing hides both
+     * local-model controls forever — and nothing else in the suite notices,
+     * because a Composable's body has no gate at all.
+     */
+    fun fromFleet(agent: AgentInfo?, session: SessionInfo?, host: String): ChatUiState = copy(
+        session = session,
+        hostLabel = agent?.device?.ifBlank { host } ?: host,
+        tunnelOnline = tunnelOnlineOf(agent),
+        uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
+        localModel = agent?.localModel,
+    )
 }
 
 class ChatViewModel(
@@ -189,17 +208,11 @@ class ChatViewModel(
             container.fleet.state.collect { fleet ->
                 val agent = fleet.agents.firstOrNull { it.key == host }
                 val session = agent?.sessions?.firstOrNull { it.id == sessionId }
-                val label = agent?.device?.ifBlank { host } ?: host
                 // Retire a memo the heartbeat has caught up with, through the
                 // store — the state copy is a mirror, so clearing only that
                 // would let the next emission paint the stale memo back.
                 modelSwitch.value = ModelSource.settle(modelSwitch.value, session)
-                _state.update {
-                    it.copy(session = session, hostLabel = label,
-                        tunnelOnline = tunnelOnlineOf(agent),
-                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
-                        localModel = agent?.localModel)
-                }
+                _state.update { it.fromFleet(agent, session, host) }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
                 }
@@ -210,15 +223,11 @@ class ChatViewModel(
     private fun seedFromFleet() {
         val agent = container.fleet.state.value.agents.firstOrNull { it.key == host }
         val session = agent?.sessions?.firstOrNull { it.id == sessionId }
-        val label = agent?.device?.ifBlank { host } ?: host
         val seed = session?.session?.tail ?: emptyList()
         _state.update {
-            it.copy(session = session, hostLabel = label,
-                tunnelOnline = tunnelOnlineOf(agent),
-                uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
-                localModel = agent?.localModel,
-                modelSourcePending = modelSwitch.value,
-                entries = mergeTail(it.entries, seed))
+            it.fromFleet(agent, session, host)
+                .copy(modelSourcePending = modelSwitch.value,
+                    entries = mergeTail(it.entries, seed))
         }
     }
 
@@ -530,9 +539,11 @@ class ChatViewModel(
             )
             container.fleet.nudge()
         }.onFailure { e ->
-            modelSwitch.value = null
             _messages.tryEmit("✗ " + (hubErrorMessage(e) ?: "could not switch model"))
         }
+        // One place decides what survives the attempt, success or failure, so
+        // the drop-on-refusal can't be deleted without a test noticing.
+        modelSwitch.value = ModelSource.afterAttempt(modelSwitch.value, res.isSuccess)
     }
 
     // ---- voice dictation into the draft --------------------------------------

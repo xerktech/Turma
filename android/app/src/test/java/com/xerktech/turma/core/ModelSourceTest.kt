@@ -50,10 +50,13 @@ class ModelSourceTest {
         // back and reads as a control that did nothing.
         assertEquals(ModelSource.LOCAL, ModelSource.current(sess, pending, 1_500))
         // ...but it ages out, so a switch that never lands can't pin it on a lie.
-        assertEquals(
-            ModelSource.SUBSCRIPTION,
-            ModelSource.current(sess, pending, 1_000 + ModelSource.SWITCH_SETTLE_MS + 1),
-        )
+        // The boundary is a LITERAL, not `at + SWITCH_SETTLE_MS + 1`: derived
+        // from the constant it only bounds the TTL from below, and raising it to
+        // 16.7 hours — a chip pinned on a lie for the rest of the day, the exact
+        // failure the constant exists to prevent — would keep the test green.
+        assertEquals(60_000L, ModelSource.SWITCH_SETTLE_MS)
+        assertEquals(ModelSource.LOCAL, ModelSource.current(sess, pending, 60_999))
+        assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(sess, pending, 61_001))
     }
 
     @Test fun `a memo for another session never paints this one`() {
@@ -72,6 +75,15 @@ class ModelSourceTest {
         assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s2", modelSource = "local")))
         assertEquals(p, ModelSource.settle(p, null))
         assertNull(ModelSource.settle(null, SessionInfo(id = "s1")))
+    }
+
+    @Test fun `a refused switch drops the memo instead of letting it age out`() {
+        val p = ModelSource.Pending("s1", ModelSource.LOCAL, at = 1_000)
+        // The hub 409s a host with no local model. Holding the memo for a full
+        // minute with the answer already in hand is the same lie the TTL bounds.
+        assertEquals(p, ModelSource.afterAttempt(p, ok = true))
+        assertNull(ModelSource.afterAttempt(p, ok = false))
+        assertNull(ModelSource.afterAttempt(null, ok = true))
     }
 
     @Test fun `a spawn sends the source only when it is local`() {

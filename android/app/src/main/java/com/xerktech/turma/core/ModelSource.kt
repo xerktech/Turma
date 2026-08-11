@@ -77,6 +77,18 @@ object ModelSource {
     }
 
     /**
+     * The memo to keep once the POST has come back.
+     *
+     * A refusal DROPS it rather than letting it age out: the hub 409s a host
+     * with no local model, and a chip that keeps claiming a switch that was
+     * rejected is worse than one that never moved — it is the same lie the TTL
+     * exists to bound, just held for a full minute with the answer already in
+     * hand. Pure so the rule is pinned by a test; inline in the ViewModel it was
+     * the one decision a mutation could still delete unnoticed.
+     */
+    fun afterAttempt(pending: Pending?, ok: Boolean): Pending? = if (ok) pending else null
+
+    /**
      * The `modelSource` a spawn should carry, or null to omit it.
      *
      * Only "local" is ever sent: "subscription" is what a spawn already meant,

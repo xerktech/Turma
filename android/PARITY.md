@@ -28,6 +28,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **No tooltip on the "run against" chip** (XERK-246). The web chip carries a hover title naming the
+  self-hosted model; Android carries the same ☁/🏠 glyph and the same label, but a phone has no
+  hover and the model name is already the chip's own text, so there is nothing left for a tooltip
+  to add.
 - **Ticket-detail fields tap-to-change** (XERK-138 follow-up). The web detail panel shows each editable
   field's value beside a separate "Change" link/control that swaps in a `<select>`. Android instead
   renders the value itself as the control — a pill with a trailing ▾ (`SelectableValue` in
@@ -345,11 +349,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - Pure half in `core/ModelSource.kt` (`ModelSourceTest.kt`), the state reads in `ChatUiStateTest.kt`;
   the wire block is locked in `AgentDecodeTest.kt`, including the all-nulls shape an unconfigured
   host reports and the null `modelSourceAt` every unmoved session carries.
-- **Divergence:** the web chip carries a hover tooltip naming the self-hosted model; the Android
-  chip carries the same ☁/🏠 glyph and label but no tooltip — a phone has no hover, and the model
-  name is already the chip's own text.
 - **Still open:** the 🏠 mark on live and ended session CARDS (see below) — inside a session the
-  compose-bar chip already names the model.
+  compose-bar chip already names the model. The chip's missing tooltip is a deliberate difference,
+  recorded above.
 
 ## Open (subsequent installments), by screen and priority
 

@@ -2,10 +2,12 @@ package com.xerktech.turma.vm
 
 import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Verbosity
+import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.SessionInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -52,10 +54,9 @@ class ChatUiStateTest {
             modelSourcePending = ModelSource.Pending("s1", ModelSource.LOCAL, at = 1_000),
         )
         assertEquals(ModelSource.LOCAL, state.modelSource(now = 1_500))
-        assertEquals(
-            ModelSource.SUBSCRIPTION,
-            state.modelSource(now = 1_000 + ModelSource.SWITCH_SETTLE_MS + 1),
-        )
+        // Literal, not `at + SWITCH_SETTLE_MS + 1` — see ModelSourceTest: a
+        // boundary derived from the constant under test only bounds it below.
+        assertEquals(ModelSource.SUBSCRIPTION, state.modelSource(now = 61_001))
         // Another session's memo must never paint this one.
         val other = state.copy(modelSourcePending = ModelSource.Pending("s2", ModelSource.LOCAL, 1_000))
         assertEquals(ModelSource.SUBSCRIPTION, other.modelSource(now = 1_100))
@@ -65,5 +66,35 @@ class ChatUiStateTest {
     fun `no session record yet reads as the subscription`() {
         assertEquals(ModelSource.SUBSCRIPTION, ChatUiState().modelSource(now = 1))
         assertFalse(ChatUiState().canSwitchModelSource(now = 1))
+    }
+
+    @Test
+    fun `a fleet beat carries every field this screen reads off it`() {
+        // This is the line a merge resolution silently truncates. Dropping
+        // `localModel` from it hides both local-model controls forever, and
+        // without this test the whole suite stays green — a Composable's body
+        // has no gate at all.
+        val sess = SessionInfo(id = "s1", modelSource = "local")
+        val agent = AgentInfo(
+            key = "h1", device = "maxai", online = true,
+            uploadMaxBytes = 5_000, localModel = configured, sessions = listOf(sess),
+        )
+        val s = ChatUiState().fromFleet(agent, sess, host = "h1")
+        assertEquals(sess, s.session)
+        assertEquals("maxai", s.hostLabel)          // device name, not the key
+        assertEquals(5_000L, s.uploadMaxBytes)      // gates the 📎
+        assertEquals(configured, s.localModel)      // gates BOTH new controls
+        assertTrue(s.canSwitchModelSource())
+    }
+
+    @Test
+    fun `a beat from a host with no local model clears the capability`() {
+        // Not merely "leaves it alone": a host that lost its configuration must
+        // stop offering the switch, and a stale carried-over block would keep it.
+        val before = ChatUiState(localModel = configured)
+        val after = before.fromFleet(AgentInfo(key = "h1", online = true), null, host = "h1")
+        assertNull(after.localModel)
+        assertEquals("h1", after.hostLabel)          // no device name: fall back to the key
+        assertFalse(after.canSwitchModelSource())
     }
 }
