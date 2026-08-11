@@ -1833,3 +1833,41 @@ test("createFormHtml: the created state shows a link and hides the form", () => 
   assert.match(html, /data-cf-another/);
   assert.doesNotMatch(html, /data-cf-submit/);
 });
+
+// ---- The columns are one horizontal row at every width (XERK-253) ----------
+// The layout lives in app.css, which no other test reads for layout, so nothing
+// stopped a breakpoint that stacks the columns from coming back. These read the
+// stylesheet directly — cheap, and they are the only guard the rule has.
+const fs = require("node:fs");
+const path = require("node:path");
+const APP_CSS = fs.readFileSync(path.join(__dirname, "../public/app.css"), "utf8");
+
+test("board: the column strip is a flex row that scrolls sideways", () => {
+  const rule = /\.kanban-cols\s*\{([^}]*)\}/.exec(APP_CSS);
+  assert.ok(rule, "no .kanban-cols rule in app.css");
+  assert.match(rule[1], /display:\s*flex/, "the strip must be a row, not a wrapping grid");
+  assert.match(rule[1], /overflow-x:\s*auto/, "a column that doesn't fit must scroll, not restack");
+  assert.doesNotMatch(rule[1], /flex-wrap:\s*wrap/);
+});
+
+test("board: no media query stacks the status columns", () => {
+  // Every @media block's body, checked for a rule that re-lays the strip out as
+  // a grid or lets it wrap — that is exactly how the columns ended up 2x2.
+  for (const [, body] of APP_CSS.matchAll(/@media[^{]*\{((?:[^{}]*\{[^{}]*\})*)/g)) {
+    const strip = /\.kanban-cols\s*\{([^}]*)\}/.exec(body);
+    if (!strip) continue;
+    assert.doesNotMatch(strip[1], /grid-template-columns/,
+      "a media query lays .kanban-cols out as a grid — the columns must stay one horizontal row");
+    assert.doesNotMatch(strip[1], /display:\s*(grid|block)/);
+    assert.doesNotMatch(strip[1], /flex-wrap:\s*wrap/);
+  }
+});
+
+test("board: the strip carries the id preserveScroll anchors its sideways scroll to", () => {
+  // Without it the strip is keyed by child index, and the notes rendered above
+  // it appear/clear with a poll error — throwing the scroll back to column one.
+  const html = boardHtml([{
+    siteKey: "o", orgName: "o", tickets: [ticket("A-1")], fetchedAt: "2026-01-01T00:00:00Z",
+  }], "", { now: Date.parse("2026-01-01T00:00:00Z"), allKeys: ["o"] });
+  assert.match(html, /class="kanban-cols" id="kanbanCols"/);
+});

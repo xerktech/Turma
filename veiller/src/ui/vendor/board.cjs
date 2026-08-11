@@ -1174,7 +1174,11 @@
     for (const s of shown) {
       if (s.error) notes.push(`<div class="kc-note kc-err">${esc(s.siteKey)}: last poll failed — ${esc(s.error)} (showing last good data)</div>`);
     }
-    return notes.join("") + `<div class="kanban-cols">${cols.join("")}</div>`;
+    // The id is `preserveScroll`'s stable anchor for the strip's SIDEWAYS scroll
+    // (XERK-253): the notes above it come and go with a poll error, which moves
+    // the strip's child index and would otherwise throw the scroll back to the
+    // first column on the beat a note appears or clears.
+    return notes.join("") + `<div class="kanban-cols" id="kanbanCols">${cols.join("")}</div>`;
   }
 
   // Newest `fetchedAt` across every agent's jira block ("" when none report
