@@ -28,6 +28,11 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     so the name is the only thing that can place it. A Jira "Resolved" is normally a `done` status,
     which the carve-out cannot pull from.
   - **The rule has FIVE mirrors** — see `CLAUDE.md`'s cross-cutting contracts for the list.
+- **The columns are ALWAYS one horizontal row, at every width** (XERK-253, `.kanban-cols` in
+  `app.css`): a flex strip that scrolls sideways once four readable columns stop fitting. Never
+  re-introduce a breakpoint that wraps them underneath each other — stacked columns stop reading as
+  a Kanban, and the position of a column would then depend on the viewport. Android's `BoardScreen`
+  has always been a scrolling `Row`, so this is also what keeps the two surfaces the same shape.
 - Scoped by the **header's org filter**, not a strip of its own: `TurmaOrg.getKeys()` each render,
   passed to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as
