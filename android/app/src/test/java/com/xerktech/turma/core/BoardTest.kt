@@ -50,6 +50,19 @@ class BoardTest {
         assertEquals("todo", categoryOf(ticket("A", "todo", status = "Ready for review")))
     }
 
+    @Test fun `azure devops states land in the columns the board names`() {
+        // XERK-250: ADO's New / Active / Resolved / Closed / Removed. Resolved
+        // reaches the client as `inprogress` and is placed by name, like Jira's
+        // review statuses; the other four are already category-placed.
+        assertEquals("todo", categoryOf(ticket("A", "todo", status = "New")))
+        assertEquals("inprogress", categoryOf(ticket("A", "inprogress", status = "Active")))
+        assertEquals("review", categoryOf(ticket("A", "inprogress", status = "Resolved")))
+        assertEquals("done", categoryOf(ticket("A", "done", status = "Closed")))
+        assertEquals("done", categoryOf(ticket("A", "done", status = "Removed")))
+        // A Jira "Resolved" is normally a done status and stays in Done.
+        assertEquals("done", categoryOf(ticket("A", "done", status = "Resolved")))
+    }
+
     @Test fun `ticketSort orders by updated descending`() {
         val a = ticket("A", updated = "2026-07-16T01:00:00Z")
         val b = ticket("B", updated = "2026-07-16T05:00:00Z")

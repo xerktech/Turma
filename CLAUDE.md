@@ -207,9 +207,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   **It comes from the TRANSCRIPT** (`_scan_agent_entry`: `agentId:` on launch, `<task-notification>`
   on stop), never from the TUI's footer rows — those are forgeable pane content and linger ~24s past
   completion, so they cannot answer "is one running right now".
-- **`_board_column` (py) mirrors `categoryOf` (`turma/public/board.js`)**, review carve-out included
-  — the agent resolves a dropped column against its own options read, so a drift silently refuses
-  valid drops. Tests: `TestBoardColumn`, `board.test.js`.
+- **`turma/public/board.js` has FIVE mirrors of its column rule** (`categoryOf` /
+  `REVIEW_STATUS_RE`), and changing it means changing all five: the source, its **two
+  byte-identical vendored copies** (`glasses/src/vendor/board.cjs`, `veiller/src/ui/vendor/
+  board.cjs` — each asserted by that client's own `vendor.test.ts`, and `veiller-ci` is
+  path-filtered on the SOURCE so a one-sided edit fails there, not here), and the two ports,
+  `_board_column` in `hub-agent.py` and `categoryOf` in android's `core/Board.kt`. The agent
+  resolves a dropped column against its OWN read, so a drift silently refuses valid drops. Tests:
+  `TestBoardColumn`, `board.test.js`, `BoardTest.kt`.
 - **`hub-agent.py` ↔ `tunnel-agent.js` are a parity contract** for everything both parse:
   `_entry_blocks`/`entryBlocks`, `_entry_text`, `transcript_tail`, `_busy_from_capture`/
   `paneShowsBusy`, `_fold_queue_op`/`foldQueueOp`, `_send_user_file_detail`/`sendUserFileDetail`.

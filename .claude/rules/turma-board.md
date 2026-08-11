@@ -21,8 +21,13 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   key). Columns are Jira's three status categories, each card's pill showing the org's status name.
 - A fourth **In Review** column (XERK-23) sits between In Progress and Done. Jira has no cross-org
   category for review/testing (both `indeterminate` → `inprogress`), so `categoryOf` carves it out
-  on the org-specific status NAME (`isReviewStatus`, word-boundary: review/testing/QA), only ever
-  pulling FROM `inprogress`.
+  on the org-specific status NAME (`isReviewStatus`, word-boundary: review/testing/QA/**resolved**),
+  only ever pulling FROM `inprogress`.
+  - `resolved` is there for **Azure DevOps** (XERK-250), whose state set is New/Active/Resolved/
+    Closed/Removed: `Resolved` means "fixed, not yet verified" and reaches clients as `inprogress`,
+    so the name is the only thing that can place it. A Jira "Resolved" is normally a `done` status,
+    which the carve-out cannot pull from.
+  - **The rule has FIVE mirrors** — see `CLAUDE.md`'s cross-cutting contracts for the list.
 - Scoped by the **header's org filter**, not a strip of its own: `TurmaOrg.getKeys()` each render,
   passed to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as

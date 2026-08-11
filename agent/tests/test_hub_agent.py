@@ -12030,8 +12030,8 @@ class TestAzureCategory(unittest.TestCase):
     def test_states_api_metastate_wins(self):
         def fake_req(path, params, body=None):
             self.assertTrue(path.endswith("/states"))
-            return {"value": [{"name": "Peer Review", "stateCategory": "InProgress"},
-                              {"name": "Shipped", "stateCategory": "Completed"}]}
+            return {"value": [{"name": "Peer Review", "category": "InProgress"},
+                              {"name": "Shipped", "category": "Completed"}]}
         with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
              mock.patch.object(ha, "azure_req", fake_req):
             self.assertEqual(ha._azure_category("s", "P", "Bug", "Peer Review"),
@@ -12054,12 +12054,76 @@ class TestAzureCategory(unittest.TestCase):
 
         def fake_req(path, params, body=None):
             calls.append(path)
-            return {"value": [{"name": "Active", "stateCategory": "InProgress"}]}
+            return {"value": [{"name": "Active", "category": "InProgress"}]}
         with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
              mock.patch.object(ha, "azure_req", fake_req):
             ha._azure_category("s", "P", "Bug", "Active")
             ha._azure_category("s", "P", "Bug", "Active")
         self.assertEqual(len(calls), 1)   # second lookup hits the cache
+
+    def test_reads_the_apis_own_category_field(self):
+        # XERK-250: the states API's WorkItemStateColor is {name, color,
+        # category} — reading `stateCategory` matched nothing on every real org,
+        # so the list came back EMPTY and the whole feature silently degraded.
+        # This payload is the API reference's own sample response verbatim.
+        doc = {"count": 5, "value": [
+            {"name": "New", "color": "b2b2b2", "category": "Proposed"},
+            {"name": "Active", "color": "007acc", "category": "InProgress"},
+            {"name": "CustomState", "color": "5688E0", "category": "InProgress"},
+            {"name": "Resolved", "color": "ff9d00", "category": "Resolved"},
+            {"name": "Closed", "color": "339933", "category": "Completed"},
+        ]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=doc):
+            states = ha._azure_states("s", "P", "Bug")
+        self.assertEqual(states, [
+            {"name": "New", "category": "todo"},
+            {"name": "Active", "category": "inprogress"},
+            {"name": "CustomState", "category": "inprogress"},
+            {"name": "Resolved", "category": "inprogress"},
+            {"name": "Closed", "category": "done"},
+        ])
+
+    def test_removed_metastate_is_done(self):
+        doc = {"value": [{"name": "Removed", "color": "ffffff", "category": "Removed"}]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=doc):
+            self.assertEqual(ha._azure_category("s", "P", "Task", "Removed"), "done")
+
+    def test_an_empty_read_is_retried_but_a_good_one_is_kept(self):
+        # A failed states read must not be cached for the life of the process:
+        # the Status row and every drag key on this list, so one 503 would
+        # disable ADO status changes until someone restarted the agent.
+        calls = []
+        doc = {"value": [{"name": "Active", "category": "InProgress"}]}
+
+        def flaky(path, params, body=None):
+            calls.append(path)
+            if len(calls) == 1:
+                raise RuntimeError("503")
+            return doc
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "AZDO_META_RETRY_SEC", 0), \
+             mock.patch.object(ha, "azure_req", flaky):
+            self.assertEqual(ha._azure_states("s", "P", "Bug"), [])       # blip
+            self.assertEqual(len(ha._azure_states("s", "P", "Bug")), 1)   # retried
+            ha._azure_states("s", "P", "Bug")                             # now cached
+        self.assertEqual(len(calls), 2)
+
+    def test_a_permanent_failure_is_logged_once_not_every_retry(self):
+        # A locked-down endpoint is re-tried per type forever; logging each
+        # retry buries the log for as long as the org stays misconfigured.
+        lines = []
+
+        def boom(*a, **k):
+            raise RuntimeError("403")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "AZDO_META_RETRY_SEC", 0), \
+             mock.patch.object(ha, "azure_req", boom), \
+             mock.patch.object(ha, "log", lines.append):
+            for _ in range(5):
+                ha._azure_states("s", "P", "Bug")
+        self.assertEqual(len(lines), 1, lines)
 
 
 class TestAzureStatusOptions(unittest.TestCase):
@@ -12068,9 +12132,9 @@ class TestAzureStatusOptions(unittest.TestCase):
 
     def _states(self):
         return {"value": [
-            {"name": "New", "stateCategory": "Proposed"},
-            {"name": "Active", "stateCategory": "InProgress"},
-            {"name": "Closed", "stateCategory": "Completed"},
+            {"name": "New", "category": "Proposed"},
+            {"name": "Active", "category": "InProgress"},
+            {"name": "Closed", "category": "Completed"},
         ]}
 
     def test_lists_states_except_current(self):
@@ -12081,6 +12145,172 @@ class TestAzureStatusOptions(unittest.TestCase):
             {"id": "New", "name": "New", "category": "todo"},
             {"id": "Closed", "name": "Closed", "category": "done"},
         ])
+
+    def test_the_agile_bug_workflow_reaches_every_column(self):
+        # XERK-250 end to end: the four board columns a New Bug can be dropped
+        # onto, resolved from the real ADO state set. Before the fix this list
+        # was empty, so the panel's Change button never appeared and every drop
+        # refused with "nothing can move it to …".
+        doc = {"value": [
+            {"name": "New", "color": "b2b2b2", "category": "Proposed"},
+            {"name": "Active", "color": "007acc", "category": "InProgress"},
+            {"name": "Resolved", "color": "ff9d00", "category": "Resolved"},
+            {"name": "Closed", "color": "339933", "category": "Completed"},
+        ]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=doc):
+            opts = ha._azure_status_options("s", "P", "Bug", "New")
+        landed = {c: (ha._status_option_for_column(opts, c) or {}).get("id")
+                  for c in ("todo", "inprogress", "review", "done")}
+        self.assertEqual(landed, {"todo": None,          # it is already New
+                                  "inprogress": "Active",
+                                  "review": "Resolved",  # ADO's review column
+                                  "done": "Closed"})
+
+    # -- what the type's PROCESS actually permits (XERK-250) -----------------
+
+    _TYPE_DOC = {"transitions": {
+        "New": [{"to": "New"}, {"to": "Active"}, {"to": "Removed"}],
+        "Removed": [{"to": "New"}],
+        "Active": [{"to": "Active"}, {"to": "Resolved"}, {"to": "Removed"}],
+    }}
+
+    def _both(self, states, type_doc):
+        """azure_req answering the states call and the type call differently."""
+        def req(path, params, body=None, **k):
+            return type_doc if path.endswith(("/Bug", "/Task")) else states
+        return req
+
+    def test_a_state_the_process_forbids_is_not_offered(self):
+        # Offering a state ADO will refuse turns a drop into an error the
+        # operator can do nothing about — as much a "can't change the status"
+        # as an empty picker. From Removed, this process allows only New.
+        states = {"value": [
+            {"name": "New", "category": "Proposed"},
+            {"name": "Active", "category": "InProgress"},
+            {"name": "Resolved", "category": "Resolved"},
+            {"name": "Removed", "category": "Removed"},
+        ]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, self._TYPE_DOC)):
+            opts = ha._azure_status_options("s", "P", "Bug", "Removed")
+            self.assertEqual([o["id"] for o in opts], ["New"])
+            # The drag that used to be offered and then refused now refuses
+            # up front, before anything is written.
+            self.assertIsNone(ha._status_option_for_column(opts, "review"))
+            # …and from Active the review column is reachable again.
+            self.assertEqual(
+                ha._status_option_for_column(
+                    ha._azure_status_options("s", "P", "Bug", "Active"),
+                    "review")["id"], "Resolved")
+
+    def test_an_unreadable_transition_map_offers_everything(self):
+        # A server that won't report a map must not read as a workflow that
+        # permits nothing — that is the pre-XERK-250 behaviour, kept.
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Active", "category": "InProgress"}]}
+
+        def req(path, params, body=None, **k):
+            if path.endswith("/states"):
+                return states
+            raise RuntimeError("403 on the type definition")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            opts = ha._azure_status_options("s", "P", "Bug", "New")
+        self.assertEqual([o["id"] for o in opts], ["Active"])
+
+    def test_a_state_with_no_way_out_offers_nothing(self):
+        # A KNOWN but absent/empty entry is a real answer and is honoured.
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Shipped", "category": "Completed"}]}
+        doc = {"transitions": {"New": [{"to": "Shipped"}], "Shipped": []}}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, doc)):
+            self.assertEqual(ha._azure_status_options("s", "P", "Bug", "Shipped"), [])
+
+    def test_an_unreadable_entry_fails_OPEN_not_closed(self):
+        # The one direction this must never get wrong. A malformed entry means
+        # "can't tell" -> offer everything; failing closed would hide the Change
+        # button and refuse every drop, which IS the bug XERK-250 is about.
+        # ADO's contract makes none of these reachable today; that is the point.
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Active", "category": "InProgress"},
+                            {"name": "Closed", "category": "Completed"}]}
+        unreadable = [
+            "New",                       # entry is not a list at all
+            None,                        # entry is null
+            ["New", 3, None],            # members aren't dicts
+            [{"actions": None}],         # member carries no `to`
+            [{"to": None}],              # `to` is null
+            [{"to": 7}],                 # `to` isn't a string
+            [{"to": "   "}],             # `to` is blank
+        ]
+        for moves in unreadable:
+            doc = {"transitions": {"Active": moves}}
+            with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+                 mock.patch.object(ha, "azure_req", self._both(states, doc)):
+                opts = ha._azure_status_options("s", "P", "Bug", "Active")
+            self.assertEqual([o["id"] for o in opts], ["New", "Closed"],
+                             f"{moves!r} should read as 'can't tell'")
+        # A PARTLY-readable entry is can't-tell too, deliberately: the realistic
+        # break is a partial schema change, and keeping only the readable
+        # members would silently narrow the picker with no log line.
+        doc = {"transitions": {"Active": [{"to": "Closed"}, {"to": None}, 3]}}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, doc)):
+            opts = ha._azure_status_options("s", "P", "Bug", "Active")
+        self.assertEqual([o["id"] for o in opts], ["New", "Closed"])
+        # …but an entry every member of which reads IS a verdict, self
+        # transitions and all.
+        doc = {"transitions": {"Active": [{"to": "Active"}, {"to": "Closed"}]}}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, doc)):
+            opts = ha._azure_status_options("s", "P", "Bug", "Active")
+        self.assertEqual([o["id"] for o in opts], ["Closed"])
+
+    def test_one_unreadable_entry_doesnt_cost_the_readable_ones(self):
+        # The guard is per-ENTRY: a state whose entry can't be iterated must not
+        # take the rest of the map down with it, which is what an exception out
+        # of the parse would do.
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Active", "category": "InProgress"},
+                            {"name": "Closed", "category": "Completed"}]}
+        doc = {"transitions": {"Active": None, "New": [{"to": "Active"}]}}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._both(states, doc)):
+            self.assertEqual(
+                [o["id"] for o in ha._azure_status_options("s", "P", "Bug", "New")],
+                ["Active"])                       # New's own entry survived
+            self.assertEqual(
+                [o["id"] for o in ha._azure_status_options("s", "P", "Bug", "Active")],
+                ["New", "Closed"])                # Active's is "can't tell"
+
+    def test_a_malformed_transitions_block_never_raises(self):
+        states = {"value": [{"name": "New", "category": "Proposed"},
+                            {"name": "Active", "category": "InProgress"}]}
+        for block in (None, [], "nope", 7, {"": [{"to": "New"}]}):
+            with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+                 mock.patch.object(ha, "azure_req",
+                                   self._both(states, {"transitions": block})):
+                opts = ha._azure_status_options("s", "P", "Bug", "New")
+            self.assertEqual([o["id"] for o in opts], ["Active"], repr(block))
+
+    def test_the_path_segments_are_fully_encoded(self):
+        # project/wtype come from ADO's own response, but they land in a REST
+        # path, so a "/" must not be able to extend it.
+        seen = []
+
+        def spy(path, params, body=None, **k):
+            seen.append(path)
+            raise RuntimeError("stop")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", spy):
+            ha._azure_states("s", "My Prøject", "User Story")
+            ha._azure_transitions("s", "a/b", "Bug/../../workitems/1")
+        self.assertEqual(seen[0],
+                         "/My%20Pr%C3%B8ject/_apis/wit/workItemTypes/User%20Story/states")
+        self.assertEqual(seen[1],
+                         "/a%2Fb/_apis/wit/workItemTypes/Bug%2F..%2F..%2Fworkitems%2F1")
 
     def test_empty_when_states_api_unavailable(self):
         def boom(*a, **k):
@@ -12692,6 +12922,11 @@ class TestBoardColumn(unittest.TestCase):
         self.assertEqual(ha._board_column("QA", "inprogress"), "review")
         self.assertEqual(ha._board_column("Attestation", "inprogress"), "inprogress")
         self.assertEqual(ha._board_column("Testing complete", "done"), "done")
+        # Azure DevOps' "fixed, not yet verified" state (XERK-250).
+        self.assertEqual(ha._board_column("Resolved", "inprogress"), "review")
+        # Still only ever pulled FROM inprogress: a Jira "Resolved" is normally
+        # in the done category and stays in Done.
+        self.assertEqual(ha._board_column("Resolved", "done"), "done")
 
     def test_first_matching_option_wins(self):
         opts = [{"id": "a", "name": "First Done", "category": "done"},

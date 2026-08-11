@@ -39,9 +39,38 @@ lives in `hub-agent.py`; the hub/UI half is `.claude/rules/turma-board.md`.
 - **Work-item ids are bare integers**, so `AZDO_KEY_RE`/`valid_issue_key` accept `^[0-9]+$`
   alongside `PROJECT-123`. Ticket sessions get a human branch base `<project>-<id>`
   (`ticket_branch_base`), not a bare number.
-- **State → column**: Azure's per-type `stateCategory` comes from the states API when reachable
+- **State → column**: Azure's per-type metastate comes from the states API when reachable
   (`_azure_state_map`, cached), falling back to a static name map then `todo` — mapping to
   todo/inprogress/done as Jira's `statusCategory` does. The raw name rides as `status`.
+  - **The metastate field is `category`**, per the API's own `WorkItemStateColor` ({name, color,
+    category}) — unchanged 4.1→7.2. Reading `stateCategory` matched nothing, so `_azure_states`
+    returned `[]` on every real org: no `statusOptions`, hence no Change button and a refusal on
+    every drop, plus categories silently reduced to the static name map (XERK-250).
+  - Both per-type reads go through `_azure_type_meta`: a good answer cached `AZDO_META_TTL_SEC`
+    (never re-reading means a template edit needs an agent restart), an **EMPTY one only
+    `AZDO_META_RETRY_SEC`** — status changes key on these lists, so caching one 503 for the life of
+    the process disables them until someone restarts it. A failure logs **once per key** until a
+    success intervenes; a permanently locked-down endpoint is retried forever and would otherwise
+    bury the log.
+  - **`_azure_status_options` also drops what the type's PROCESS forbids** (`_azure_transitions`,
+    off the work-item-type definition): an Agile Task cannot go `Removed`→`Active`, and offering a
+    state ADO will refuse turns a drop into an error the operator can do nothing about — as much a
+    "can't change the status" as an empty picker. An **unreadable** map means "offer everything"
+    (the older behaviour); a **known but empty** entry means nothing is allowed and is honoured.
+    Kept off the per-ticket path — that response carries the type's whole form definition (~35 KiB
+    measured), so a board poll costs zero of these and a detail-open costs one per type per TTL.
+  - **A malformed transitions entry fails OPEN.** An entry that yields no readable target is
+    OMITTED, not stored empty: storing it would read as "nothing is allowed" and reproduce the very
+    symptom — no Change button, every drop refused. Only an entry ADO reports as genuinely empty is
+    kept. Tests: `test_an_unreadable_entry_fails_OPEN_not_closed`.
+  - Known gap: the two reads have **independent TTLs** and only states is refreshed by the poll, so
+    for up to `AZDO_META_TTL_SEC` after a template gains a state, that state can be live but not
+    offered. Bounded, and still better than the restart it replaced.
+  - ADO's `Resolved` metastate is `inprogress` on the wire and the BOARD carves it into **In Review**
+    by the state's NAME (`_REVIEW_STATUS_RE`) — the wire has no fourth category, and emitting one
+    would land those tickets in To Do on every older client. Cost: a Resolved-metastate state not
+    NAMED "resolved" — a custom one, or a non-English process template (`Résolu`) — shows as In
+    Progress.
 - Tests: `TestAdfText`, `TestShapeIssueDetail`, `TestFetchJiraIssue`, `TestStageJiraIssue`,
   `TestNormalizeAzureSite`, `TestAzureBase`, `TestCollectAzure`, `TestShapeAzureItem`,
   `TestAzureCategory`, `TestAzureHtmlToText`, `TestFetchAzureIssue`, `TestBoardSourceDispatch`.

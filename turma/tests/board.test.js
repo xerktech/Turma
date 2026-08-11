@@ -156,6 +156,20 @@ test("isReviewStatus: matches on word boundaries, no substring leaks", () => {
   assert.ok(!isReviewStatus(null));
 });
 
+test("categoryOf: Azure DevOps' Resolved lands in In Review (XERK-250)", () => {
+  // ADO's fixed state set is New / Active / Resolved / Closed / Removed; the
+  // agent reports Resolved's metastate as `inprogress`, and this is what places
+  // it in the review column. The other four are already category-placed.
+  assert.equal(categoryOf({ statusCategory: "inprogress", status: "Resolved" }), "review");
+  assert.equal(categoryOf({ statusCategory: "todo", status: "New" }), "todo");
+  assert.equal(categoryOf({ statusCategory: "inprogress", status: "Active" }), "inprogress");
+  assert.equal(categoryOf({ statusCategory: "done", status: "Closed" }), "done");
+  assert.equal(categoryOf({ statusCategory: "done", status: "Removed" }), "done");
+  // A Jira "Resolved" is normally a done status, and review only pulls from
+  // inprogress — so it stays in Done.
+  assert.equal(categoryOf({ statusCategory: "done", status: "Resolved" }), "done");
+});
+
 test("ticketSort: newest updated first", () => {
   const list = [ticket("A", { updated: "2026-07-01T00:00:00Z" }),
                 ticket("B", { updated: "2026-07-10T00:00:00Z" })];
