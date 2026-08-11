@@ -566,6 +566,42 @@ else
   fail "an unverified repair was reported as success (log: $got)"
 fi
 
+# 16c-ii. ...and it is not attempted AGAIN while claude keeps printing the same
+#      thing. An unreadable version is usually a half-written install, but it can
+#      equally be a working claude whose version shape this doesn't parse (a
+#      future two-component or calver string) — and there, reinstalling fixes
+#      nothing, so repeating it every start is a real `npm install -g` on every
+#      boot forever, inside the awaited path.
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+# A claude whose version this cannot parse, and an npm install that (correctly)
+# does not change that — the shape where the repair is futile.
+install_fake_claude_toolchain "$bin" "not-a-parseable-version" "not-a-parseable-version" yes
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+: > "$root/claude.log"
+for _ in 1 2 3; do
+  env FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
+    TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" \
+    TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
+    "$bin/turma-agent-update" --claude-only >>"$root/out.log" 2>&1 || true
+done
+installs="$(grep -c 'npm-install' "$root/claude.log" 2>/dev/null || true)"
+if [ "${installs:-0}" = "1" ]; then
+  pass "a futile repair is tried once, not on every start ($installs install)"
+else
+  fail "an unparseable version was reinstalled $installs time(s) — once per start, forever"
+fi
+if grep -q 'a repair already failed to change that' "$root/out.log"; then
+  pass "and says why it is leaving it alone"
+else
+  fail "no explanation for skipping the repair: $(cat "$root/out.log")"
+fi
+rm -rf "$root" "$d"
+
 # 16d. A registry answering with something that is not a version must read as
 #      "stay put": sort -V ranks any non-numeric string ABOVE a semver, so a
 #      proxy error line would otherwise look like an upgrade every single time.

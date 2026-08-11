@@ -27,6 +27,15 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     the `mkdir` failure killed PID 1 on every boot, forever. That scratch `HOME` also keeps npm's
     cache and claude's own writes out of the bind-mounted `/root`; the install itself is root's,
     since only root writes `/usr/local`.
+  - **`claude_update_check` is a SUBSHELL body — `() ( … )`, never `() { … }`.** A `/bin/sh`
+    function is not a subshell and has no `local`, so the scratch `HOME` escaped into the manager,
+    the tunnel and every session — pointing `~/.turma` and `~/.claude` at a `/tmp` dir the check
+    then deleted, against this file's own `HOME stays /root` invariant. The `||` guard is at the
+    CALL site, so a subshell body costs nothing. Tests assert the manager's and tunnel's `HOME`.
+  - **A repair that doesn't help is remembered** (`/root/.turma/claude-unparseable`): an unreadable
+    version is usually a half-written install, but equally a working claude printing a shape this
+    doesn't parse — there the reinstall fixes nothing and would run on every boot forever. Retried
+    only when what claude prints CHANGES.
 - **Cloud CLIs** (terraform/`az`/`aws`, pinned via
   `TERRAFORM_VERSION`/`AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`) live in the
   `tooling` stage, so **every tier carries them and the CI scan covers them** — they are

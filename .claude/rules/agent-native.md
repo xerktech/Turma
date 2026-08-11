@@ -92,8 +92,14 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       (`sort -V` ranks a non-version ABOVE a semver, so an error line would otherwise read as an
       upgrade). `TURMA_CLAUDE_AUTO_UPDATE=0` pins the host — and so does `TURMA_BOOT_UPDATE=0`,
       since start is the only time Claude Code is checked at all.
-    - Every external call is `timeout`-bounded: the lock is held for the whole run, so one hung
-      child would block every later update — including the one shipping the fix.
+    - **A repair that doesn't help is remembered** (`~/.turma/claude-unparseable`, the raw
+      `--version` string): an unreadable version is usually a half-written install, but equally a
+      working claude printing a shape this doesn't parse — there the reinstall fixes nothing and
+      would run on every start forever, inside the awaited boot path. Retried only when what claude
+      prints CHANGES.
+    - Every external call is `timeout`-bounded, `npm prefix -g`/`npm ls -g` included and the prefix
+      read once per run: the lock is held for the whole run, so one hung child would block every
+      later update — including the one shipping the fix — and this runs inside a start.
 - **Every start is an update check**, fired by the launcher two different ways:
   - **Claude Code, awaited** (`--claude-only`, bounded by `TURMA_CLAUDE_UPDATE_TIMEOUT`) — it must
     finish before the manager exists, per the window above. A slow registry may delay the start; it

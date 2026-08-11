@@ -61,6 +61,9 @@ LOCK="$HOME/.turma/update.lock"
 # separately by the launcher and must not throttle each other. See throttled().
 STAMP="$HOME/.turma/last-update-check"
 CLAUDE_STAMP="$HOME/.turma/last-claude-check"
+# The raw `claude --version` output of a repair that did NOT make it readable,
+# so the same futile reinstall isn't attempted on every start forever.
+CLAUDE_UNPARSEABLE="$HOME/.turma/claude-unparseable"
 BOOT_MIN_INTERVAL="${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}"
 CLAUDE_PKG="@anthropic-ai/claude-code"
 mkdir -p "$HOME/.turma" 2>/dev/null || true
@@ -118,8 +121,15 @@ bounded() {  # <seconds> <cmd...>
 # it can't be parsed — which is NOT the same as claude being absent, see below.
 claude_version() {
   command -v claude >/dev/null 2>&1 || return 0
+  claude_raw_version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+}
+
+# What claude actually printed, first line, whitespace-collapsed. Used to tell a
+# version this can't PARSE from one it can — see the unreadable branch below.
+claude_raw_version() {
+  command -v claude >/dev/null 2>&1 || return 0
   bounded "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+    | head -n1 | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true
 }
 
 # Latest published version, per the npm registry. Empty when it is unreachable
@@ -147,9 +157,9 @@ claude_latest() {
 # compare the resolved paths.
 claude_is_npm_managed() {
   command -v npm >/dev/null 2>&1 || return 1
-  npm ls -g --depth=0 "$CLAUDE_PKG" >/dev/null 2>&1 || return 1
+  bounded "${TURMA_NPM_META_TIMEOUT:-30}" npm ls -g --depth=0 "$CLAUDE_PKG" >/dev/null 2>&1 || return 1
   local prefix on_path
-  prefix="$(npm prefix -g 2>/dev/null || true)"
+  prefix="$(npm_global_prefix)"
   [ -n "$prefix" ] || return 1
   on_path="$(command -v claude 2>/dev/null || true)"
   [ -n "$on_path" ] || return 0   # nothing on PATH yet: npm is who installs it
@@ -160,11 +170,22 @@ claude_is_npm_managed() {
 # reach it? An install into a prefix PATH never looks at is not an install: the
 # agent still can't run claude, the next check finds it MISSING again, and the
 # whole thing repeats — inside the boot path — on every start, forever.
-npm_bin_dir() {  # <prefix override, or empty for npm's own>
-  if [ -n "${1:-}" ]; then printf '%s/bin' "$1"; else
-    local p; p="$(npm prefix -g 2>/dev/null || true)"
-    [ -n "$p" ] && printf '%s/bin' "$p"
+# npm's own global prefix, asked ONCE per run and bounded like every other
+# external call: this runs inside the awaited boot path, and a stalled mount
+# under the prefix would otherwise add unbounded time to a start.
+NPM_GLOBAL_PREFIX=""
+NPM_GLOBAL_PREFIX_READ=no
+npm_global_prefix() {
+  if [ "$NPM_GLOBAL_PREFIX_READ" = no ]; then
+    NPM_GLOBAL_PREFIX="$(bounded "${TURMA_NPM_META_TIMEOUT:-30}" npm prefix -g 2>/dev/null || true)"
+    NPM_GLOBAL_PREFIX_READ=yes
   fi
+  printf '%s' "$NPM_GLOBAL_PREFIX"
+}
+
+npm_bin_dir() {
+  local p; p="$(npm_global_prefix)"
+  [ -n "$p" ] && printf '%s/bin' "$p"
 }
 
 on_path() {  # <dir>
@@ -174,7 +195,7 @@ on_path() {  # <dir>
 
 npm_install_claude() {
   local gbin lbin
-  gbin="$(npm_bin_dir "")"
+  gbin="$(npm_bin_dir)"
   lbin="$HOME/.local/bin"   # the prefix install.sh blesses and the launcher exports
 
   if on_path "$gbin"; then
@@ -274,13 +295,35 @@ update_claude() {
 
   cur="$(claude_version)"
   if [ -z "$cur" ]; then
-    # Present but unable to say what it is — a half-written install (an install
-    # killed mid-write, a partial extract). Reinstalling is the repair, and the
-    # start-check rate limit is what bounds it to once per window.
-    logmsg "claude: $(command -v claude) reports no readable version — reinstalling"
+    # Present but unable to say what it is — usually a half-written install (one
+    # killed mid-write, a partial extract), which reinstalling repairs.
+    #
+    # But it can equally be a claude that works perfectly and simply prints a
+    # shape this doesn't parse — a future two-component or calver version, say.
+    # Reinstalling that fixes nothing, so a repair that leaves the SAME
+    # unreadable output is remembered and not attempted again until the output
+    # changes. Without that memory this is a real `npm install -g` on every
+    # agent start, forever, inside the awaited boot path. The marker holds the
+    # raw string, so a claude that later updates itself gets a fresh attempt.
+    local raw marker
+    raw="$(claude_raw_version)"
+    marker="$(cat "$CLAUDE_UNPARSEABLE" 2>/dev/null || true)"
+    if [ -n "$raw" ] && [ "$raw" = "$marker" ]; then
+      logmsg "claude: $(command -v claude) still reports an unrecognised version ($raw);" \
+             "a repair already failed to change that, so leaving it alone"
+      return 0
+    fi
+    logmsg "claude: $(command -v claude) reports no readable version ($raw) — reinstalling"
     install_claude ""
+    if [ -z "$(claude_version)" ]; then
+      printf '%s\n' "$(claude_raw_version)" >"$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+    else
+      rm -f "$CLAUDE_UNPARSEABLE" 2>/dev/null || true
+    fi
     return 0
   fi
+  # A readable version means any past unparseable one is behind us.
+  rm -f "$CLAUDE_UNPARSEABLE" 2>/dev/null || true
 
   latest="$(claude_latest)"
   if [ -z "$latest" ]; then

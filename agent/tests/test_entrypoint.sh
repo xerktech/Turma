@@ -59,7 +59,7 @@ echo "LEFTOVER_ROOT_PATHS=$(find "$REPOS_ROOT" /root/.claude -uid 0 2>/dev/null 
 sleep "${STUB_MANAGER_SLEEP:-1}"
 STUB
 cp "$WORK/python3" "$WORK/hub-agent.py"
-echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid());' \
+echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid() + " TUNNELHOME=" + process.env.HOME);' \
   > "$WORK/tunnel-agent.js"
 
 # Stand-ins for the cloud CLIs the real image bundles. The preflight only ever
@@ -446,6 +446,29 @@ else
   echo "  FAIL: the manager started while claude was being replaced (claude=$claude_line manager=$mgr_line)"; FAILED=1
 fi
 
+echo "== case: the check does not leak its throwaway HOME into the boot"
+# The scratch HOME is for npm and for `claude --version` — and for nothing else.
+# A /bin/sh function is NOT a subshell (and has no `local`), so an exported HOME
+# here escapes into the manager, the tunnel and every session, pointing them at
+# a /tmp dir this same check then deletes: the registry, the usage ledger and
+# the archive would silently move off the mount, and the operator's ~/.claude
+# would vanish from under the agent. Assert on the run that actually INSTALLS —
+# the rate limit short-circuits before the leak, so a throttled run hides it.
+mgr_home="$(field "$out" home)"
+if [ "$mgr_home" = "/root" ]; then
+  echo "  ok: the manager still boots with HOME=/root"
+else
+  echo "  FAIL: the manager inherited the check's scratch HOME ($mgr_home)"; FAILED=1
+fi
+tunnel_home="$(echo "$out" | grep -o 'TUNNELHOME=[^ ]*' | head -1 | cut -d= -f2)"
+if [ "$tunnel_home" = "/root" ]; then
+  echo "  ok: so does the tunnel"
+elif [ -z "$tunnel_home" ]; then
+  echo "  FAIL: the tunnel never reported its HOME — this assertion would pass vacuously"; FAILED=1
+else
+  echo "  FAIL: the tunnel inherited the check's scratch HOME ($tunnel_home)"; FAILED=1
+fi
+
 echo "== case: the update writes nothing into the operator's mounted HOME"
 # npm's cache and anything claude touches would otherwise land in /root — which
 # is a bind mount, ROOT-owned, on a host whose sessions run as somebody else.
@@ -464,6 +487,34 @@ if [ "$leftover" = "0" ]; then
   echo "  ok: nothing new under the mounted /root/.claude"
 else
   echo "  FAIL: the update left $leftover new path(s) in the operator's ~/.claude"; FAILED=1
+fi
+
+echo "== case: a futile repair is not repeated on every boot"
+# An unreadable version is usually a half-written install, which reinstalling
+# repairs — but it can equally be a working claude printing a version shape this
+# doesn't parse. There the repair fixes nothing, and repeating it is a real
+# `npm install -g` on every boot, forever, inside the awaited path.
+make_fixture "$WORK/fx14" 0 0
+out="$(run_case "$WORK/fx14" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=not-a-version -e STUB_NPM_LATEST=2.0.9 \
+  -v "$WORK/fx14/turma:/root/.turma")"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  ok: the first boot tries to repair it"
+else
+  echo "  FAIL: an unreadable claude was not repaired at all"; FAILED=1
+fi
+out="$(run_case "$WORK/fx14" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=not-a-version -e STUB_NPM_LATEST=2.0.9 \
+  -e TURMA_BOOT_UPDATE_MIN_INTERVAL=0 -v "$WORK/fx14/turma:/root/.turma")"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: repeated a repair that changed nothing — every boot, forever"; FAILED=1
+else
+  echo "  ok: the next boot leaves it alone"
+fi
+if echo "$out" | grep -q "a repair already failed to change that"; then
+  echo "  ok: and says why"
+else
+  echo "  FAIL: no explanation for skipping the repair"; FAILED=1
 fi
 
 echo "== case: nothing in the check can stop the container booting"

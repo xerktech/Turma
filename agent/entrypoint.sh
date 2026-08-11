@@ -186,13 +186,25 @@ fi
 # with a one-line error and no self-heal, on every restart, forever.
 #
 # TURMA_CLAUDE_AUTO_UPDATE=0 pins the image's bundled version.
-claude_update_check() {
+# A SUBSHELL body — `() ( … )`, not `() { … }`. A /bin/sh function is not a
+# subshell and has no `local`, so the throwaway HOME below would escape into
+# everything the entrypoint starts afterwards: the manager (whose ~/.turma
+# registry, usage ledger and archive state would land in a /tmp dir this
+# function then deletes), the tunnel, and every session. That is precisely the
+# `export HOME=/root` invariant the identity block above exists to hold. The
+# `||` guard that keeps this off `set -e`'s path lives at the CALL site, so
+# making the body a subshell costs nothing.
+claude_update_check() (
   # Rate-limited like the native launcher's, and for the same reason: a
   # container in a restart loop would otherwise hit the registry every few
   # seconds, and pay the check's latency on every pass.
   stamp=/root/.turma/last-claude-check
   now="$(date +%s)"
-  last="$(tr -cd '0-9' <"$stamp" 2>/dev/null || true)"
+  # Guarded on the file EXISTING: dash reports a failed redirect itself, and the
+  # `2>/dev/null` here belongs to `tr`, so a first boot printed "cannot open
+  # /root/.turma/last-claude-check" as the very first line of the log.
+  last=""
+  [ -f "$stamp" ] && last="$(tr -cd '0-9' <"$stamp" 2>/dev/null || true)"
   # Strip leading zeros before the arithmetic: this is /bin/sh, where a
   # zero-padded number is OCTAL and `09` is an error — and bash's `10#` prefix
   # is undefined here. An implausibly long value is treated as no stamp rather
@@ -203,7 +215,7 @@ claude_update_check() {
     age=$((now - last))
     if [ "$age" -ge 0 ] && [ "$age" -lt "${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}" ]; then
       echo "[entrypoint] claude check skipped: last check ${age}s ago"
-      return 0
+      exit 0
     fi
   fi
 
@@ -213,13 +225,19 @@ claude_update_check() {
   # its version would land there ROOT-owned on a host whose sessions run as
   # somebody else — re-creating, one file at a time, the breakage the identity
   # block exists to end.
-  scratch="$(mktemp -d /tmp/turma-claude-update.XXXXXX)" || return 1
+  scratch="$(mktemp -d /tmp/turma-claude-update.XXXXXX)" || exit 1
   mkdir -p /root/.turma 2>/dev/null || true
   echo "$now" >"$stamp" 2>/dev/null || true
   HOME="$scratch"; export HOME
   npm_config_cache="$scratch/npm"; export npm_config_cache
 
-  cur="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  # Both the parsed version and what claude actually PRINTED: an unparseable
+  # version is not the same fault as a missing one, and telling them apart is
+  # what stops a futile reinstall on every boot (see the marker below).
+  raw=""
+  command -v claude >/dev/null 2>&1 && raw="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
+  cur="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  unparseable=/root/.turma/claude-unparseable
   latest="$(timeout "${TURMA_NPM_VIEW_TIMEOUT:-45}" npm view @anthropic-ai/claude-code version \
             --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]')"
   # A registry that answers with anything but a version is "stay put", not an
@@ -236,20 +254,32 @@ claude_update_check() {
     # Installed is NEWER than the registry's latest — a version pinned by hand
     # or an unpublished build. Never downgrade it.
     echo "[entrypoint] claude: installed $cur is ahead of published $latest; leaving it"
+  elif [ -z "$cur" ] && [ -n "$raw" ] && [ "$raw" = "$(cat "$unparseable" 2>/dev/null)" ]; then
+    # Present, running, and printing a version shape this can't parse — a future
+    # two-component or calver string, say. Reinstalling fixed nothing last time,
+    # so don't do it again until what claude prints CHANGES. Without this memory
+    # it is a real install on every boot, forever, inside the awaited path.
+    echo "[entrypoint] claude: unrecognised version ($raw); a repair already failed to change that"
   else
-    # An unreadable version reaches here too (claude present, $cur empty): that
-    # is a half-written install, and reinstalling is the repair. Bounded to once
-    # per rate-limit window, and verified below rather than assumed.
+    # An unreadable version reaches here too (claude present, $cur empty): most
+    # often a half-written install, which reinstalling repairs. Verified below
+    # rather than assumed, and remembered when it doesn't help.
     echo "[entrypoint] claude update: ${cur:-none-or-unreadable} -> $latest"
     if timeout "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
          npm install -g "@anthropic-ai/claude-code@$latest"; then
-      echo "[entrypoint] claude: now $(claude --version 2>/dev/null || echo '?')"
+      now_raw="$(claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
+      echo "[entrypoint] claude: now ${now_raw:-?}"
+      if printf '%s' "$now_raw" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
+        rm -f "$unparseable" 2>/dev/null || true
+      else
+        printf '%s\n' "$now_raw" >"$unparseable" 2>/dev/null || true
+      fi
     else
       echo "[entrypoint] claude: update FAILED; staying at ${cur:-none}"
     fi
   fi
   rm -rf "$scratch"
-}
+)
 
 if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
    && { [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; } \
