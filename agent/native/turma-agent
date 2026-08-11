@@ -274,7 +274,13 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
     # i.e. one BELOW the sum it exists to exceed — so magnitude is capped too.
     _num() {
       case "$1" in ''|*[!0-9]*) printf '%s' "$2"; return ;; esac
-      if [ "${#1}" -le 6 ] && [ "$1" -le 86400 ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+      # Leading zeros stripped (they break the length test); all-zero, and so a
+      # literal 0, reads as "use the default" — `timeout 0` DISABLES the bound,
+      # which would leave that call unbounded and subtract its whole share from
+      # the floor at the same time.
+      local v="${1#"${1%%[!0]*}"}"
+      [ -n "$v" ] || { printf '%s' "$2"; return; }
+      if [ "${#v}" -le 6 ] && [ "$v" -le 86400 ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
     }
     claude_grace="$(_num "${TURMA_KILL_GRACE:-10}" 10)"
     claude_slack="$(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60)"

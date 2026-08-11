@@ -763,6 +763,20 @@ else
   pass "mkfifo unavailable; FIFO case skipped"
 fi
 
+# 16k. A malformed timeout knob must not be mistaken for a broken claude.
+#      `timeout -k abc 30 cmd` exits 125 WITHOUT running the command, so an
+#      unsanitised value doesn't disable a check — it makes every `claude
+#      --version` look unreadable, and every start then attempts a futile repair
+#      while no update check ever happens.
+for bad in abc -5 0 30.5; do
+  got="$(run_claude_case "2.0.1" "2.0.9" yes "TURMA_KILL_GRACE=$bad")"
+  if printf '%s' "$got" | grep -q 'LOG .*no readable version'; then
+    fail "TURMA_KILL_GRACE=$bad made a healthy claude read as broken (log: $got)"
+  else
+    pass "TURMA_KILL_GRACE=$bad is sanitised, not obeyed"
+  fi
+done
+
 # --- The --boot rate limit (XERK-254) ----------------------------------------
 # The launcher fires --boot on every start, and systemd's Restart=always makes a
 # crash-looping manager start every 5s. Unthrottled that is a release+registry

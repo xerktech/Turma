@@ -414,6 +414,15 @@ if grep -q "claudecheck=done" "$WORK/manager.log"; then
 else
   fail "the manager started while claude was still being replaced — sessions launched then die on exec"
 fi
+# The SHIPPED default deadline, pinned: 2x30 probe + 45 view + 300 install +
+# 2x30 npm-metadata + 6x10 kill-grace + 60 slack. The tuned cases below would
+# still pass if a future edit left this below the default per-call bounds.
+bound="$(sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' "$WORK/run5.log" | head -1)"
+if [ "$bound" = "585" ]; then
+  ok "default deadline is 585s"
+else
+  fail "default deadline is ${bound:-unreported}s, not the 585s the per-call defaults imply"
+fi
 pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent-update" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true

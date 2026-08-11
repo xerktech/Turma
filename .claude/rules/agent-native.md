@@ -105,8 +105,13 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       inside an awaited start. Stamp and marker go through `safe_read`/`safe_write` (temp file +
       rename, no check-then-open race), `logmsg` skips a non-regular log target, and `with_lock`
       removes a non-regular lock path rather than opening it.
-    - Every external call is `timeout`-bounded, `npm prefix -g`/`npm ls -g` included and the prefix
-      read once per run: the lock is held for the whole run, so one hung child would block every
+    - **Every timeout value is sanitised where it is USED, not only where the floor is computed**
+      (`num` in both files): `timeout -k abc …` exits 125 WITHOUT running the command, so one typo
+      in the config stops being "no timeout" and becomes "every claude read looks broken, every
+      start attempts a futile repair, no check ever runs". `0` reads as the default too — it
+      disables `timeout` outright. Shipped default deadline (585s) pinned by a test.
+    - Every external call is `timeout -k`-bounded, `npm prefix -g`/`npm ls -g` included and the
+      prefix read once per run: the lock is held for the whole run, so one hung child would block every
       later update — including the one shipping the fix — and this runs inside a start.
 - **Every start is an update check**, fired by the launcher two different ways:
   - **Claude Code, awaited** (`--claude-only`, bounded by a deadline DERIVED from the updater's own

@@ -56,8 +56,16 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
   - **Those per-call bounds use `timeout -k`.** Without `-k`, `timeout` only SIGNALS at the deadline
     and then waits for the child to leave (measured: 30s for a `trap "" TERM` child given `timeout
     2`), so every bound would be nominal and the derived floor would be arithmetic over numbers
-    nothing keeps. `_num` also caps magnitude: an all-digit but oversized value overflows `$(( ))`
-    to a NEGATIVE floor, i.e. one below the sum it exists to exceed.
+    nothing keeps. The cost is that a killed install is SIGKILLed: npm rolls back cleanly on
+    SIGTERM but leaves NO claude at all when killed outright — self-healing (the next start finds
+    it missing and installs), but the failure lasts until that start rather than seconds, which is
+    what the grace period buys back.
+  - **`_num` rejects magnitude AND zero, not just non-digits.** An all-digit but oversized value
+    overflows `$(( ))` to a NEGATIVE floor — below the sum it exists to exceed. And `timeout 0 cmd`
+    DISABLES the timeout, so a `0` (the value an operator reaches for meaning "no limit") would
+    leave that call unbounded and subtract its whole share from the floor: both halves of the
+    orphan at once. Both read as "use the default". The effective deadline is logged every boot and
+    the shipped default (505s) is pinned by a test, so the arithmetic can't drift unnoticed.
   - **Every `claude --version` here is `timeout`-wrapped, the post-install verification included.**
     These are children of PID 1 with no outer timeout anywhere (the `||` guard only runs once the
     block returns), and a hang is reachable from the very fault the repair branch handles: an

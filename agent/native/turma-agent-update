@@ -120,8 +120,20 @@ newer_than() {
 # an unbounded child would block every LATER update too — including the one that
 # would ship the fix). `timeout` is coreutils and effectively always there;
 # degrade to running unbounded rather than skipping the work if it isn't.
+# A plausible whole number of seconds, or the default. The same guard the
+# launcher applies to the floor arithmetic, applied HERE too because these
+# values are handed to `timeout` — which exits 125 on a malformed one WITHOUT
+# running the command, so a typo in the config doesn't disable a check, it makes
+# every claude read look broken and every start attempt a futile repair.
+num() {  # <value> <default>
+  case "$1" in ''|*[!0-9]*) printf '%s' "$2"; return ;; esac
+  local v="${1#"${1%%[!0]*}"}"          # leading zeros are not octal, but they break the length test
+  [ -n "$v" ] || { printf '%s' "$2"; return; }   # 0 disables `timeout` — read it as "use the default"
+  if [ "${#v}" -le 6 ] && [ "$v" -le 86400 ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+}
+
 bounded() {  # <seconds> <cmd...>
-  local secs="$1"; shift
+  local secs; secs="$(num "$1" 60)"; shift
   if command -v timeout >/dev/null 2>&1; then
     # -k, because `timeout` without it only SIGNALS at the deadline and then
     # waits for the child to leave — measured at 30s for a `trap "" TERM` child
@@ -129,7 +141,7 @@ bounded() {  # <seconds> <cmd...>
     # numbers, so a nominal one that a child can ignore would make that floor a
     # promise about nothing. (Uninterruptible sleep takes neither signal;
     # nothing in userspace bounds that.)
-    timeout -k "${TURMA_KILL_GRACE:-10}" "$secs" "$@"
+    timeout -k "$(num "${TURMA_KILL_GRACE:-10}" 10)" "$secs" "$@"
   else
     "$@"
   fi

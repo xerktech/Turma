@@ -576,6 +576,37 @@ else
   echo "  FAIL: silently honoured a deadline below the floor"; FAILED=1
 fi
 
+echo "== case: the SHIPPED default floor is what it is supposed to be"
+# The scale-invariant cases below tune the knobs down to stay fast, so they would
+# still pass if a future edit left the DEFAULT floor below the DEFAULT per-call
+# bounds. This pins the shipped number itself: 2x30 probe + 45 view + 300 install
+# + 4x10 kill-grace + 60 slack.
+make_fixture "$WORK/fx19" 0 0
+out="$(run_case "$WORK/fx19" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.9 -e STUB_NPM_LATEST=2.0.9)"
+bound="$(echo "$out" | sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' | head -1)"
+if [ "$bound" = "505" ]; then
+  echo "  ok: default deadline is 505s"
+else
+  echo "  FAIL: default deadline is ${bound:-unreported}s, not the 505s the per-call defaults imply"; FAILED=1
+fi
+
+echo "== case: a timeout of 0 does not disable a bound and shrink the floor"
+# `timeout 0 cmd` DISABLES the timeout — so a 0 would leave that call unbounded
+# and subtract its whole share from the derived floor at the same time, which is
+# both halves of the orphan. 0 is the value an operator reaches for when they
+# mean "no limit", so it has to read as "use the default".
+out="$(run_case "$WORK/fx19" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_INSTALL_SLEEP=12 \
+  -e TURMA_NPM_INSTALL_TIMEOUT=0 -e TURMA_CLAUDE_UPDATE_TIMEOUT=20)"
+done_line="$(echo "$out" | grep -n "NPMINSTALL install -g" | head -1 | cut -d: -f1 || true)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1 || true)"
+if [ -n "$done_line" ] && [ -n "$mgr_line" ] && [ "$done_line" -lt "$mgr_line" ]; then
+  echo "  ok: a 0 install timeout reads as the default, floor intact"
+else
+  echo "  FAIL: a 0 timeout disabled the bound and orphaned the install (install=$done_line manager=$mgr_line)"; FAILED=1
+fi
+
 echo "== case: an oversized timeout cannot overflow the derived floor"
 # The floor is arithmetic, and `$(( ))` WRAPS: an all-digit but oversized value
 # produced a NEGATIVE floor, i.e. one below the very sum it exists to exceed, and

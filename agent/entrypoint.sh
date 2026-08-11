@@ -218,7 +218,16 @@ _num() {  # <value> <default>
   case "$1" in
     ''|*[!0-9]*) printf '%s' "$2"; return ;;
   esac
-  if [ "${#1}" -le 6 ] && [ "$1" -le 86400 ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+  # Leading zeros stripped first: they are not octal here, but they DO make a
+  # sane value fail the length test below. All-zero then reads as empty, which
+  # is the point of the next line.
+  _v="${1#"${1%%[!0]*}"}"
+  # ZERO IS NOT "no limit" here, however much it looks like it: `timeout 0 cmd`
+  # disables the timeout, so a 0 would leave that call unbounded AND subtract
+  # its whole share from the derived floor — the two halves of the orphan this
+  # arithmetic exists to prevent. It reads as "use the default" instead.
+  [ -n "$_v" ] || { printf '%s' "$2"; return; }
+  if [ "${#_v}" -le 6 ] && [ "$_v" -le 86400 ]; then printf '%s' "$_v"; else printf '%s' "$2"; fi
 }
 
 turma_write_file() {  # <path> <content>
@@ -362,12 +371,17 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
              + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
              + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
              + _grace * 4 + _slack ))
+  # `_num`'s default is 0 here on purpose — "not set" — and 0 can no longer come
+  # from an operator value, so the two are distinguishable.
   _deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
   if [ "$_deadline" -lt "$_floor" ]; then
     [ "$_deadline" -gt 0 ] && echo "[entrypoint] claude: TURMA_CLAUDE_UPDATE_TIMEOUT=${_deadline}s is" \
       "below the ${_floor}s floor implied by the per-call timeouts; using ${_floor}s"
     _deadline="$_floor"
   fi
+  # Reported every boot, so the shipped default is observable (and pinned by a
+  # test) rather than something only arithmetic knows.
+  echo "[entrypoint] claude check bounded at ${_deadline}s"
   claude_update_check &
   _check_pid=$!
   ( sleep "$_deadline"; kill -TERM "$_check_pid" 2>/dev/null ) &
