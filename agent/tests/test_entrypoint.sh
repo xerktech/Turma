@@ -89,6 +89,9 @@ case "$1 $2" in
     echo "$STUB_NPM_LATEST" ;;
   "install -g")
     echo "NPMINSTALL $*"
+    # Where npm was pointed. The whole reason the block sets its own HOME is that
+    # /root is the operator's bind mount, so this is the assertion that keeps it.
+    echo "NPMHOME=$HOME NPMCACHE=${npm_config_cache:-unset}"
     # What a real install changes, so the version echoed afterwards moves.
     STUB_CLAUDE_VERSION="${STUB_NPM_LATEST}"; export STUB_CLAUDE_VERSION ;;
   *) exit 2 ;;
@@ -409,16 +412,58 @@ else
   echo "  ok: pinned"
 fi
 
-echo "== case: the check never delays the manager"
-# The whole reason it is backgrounded: an npm registry that hangs must not hold
-# up the container's boot. A `view` that blocks for longer than the manager's
-# whole lifetime here proves the manager doesn't wait for it.
+echo "== case: a hanging registry delays the boot but cannot stop it"
+# Awaiting the check (see the ordering case below) is only safe because every
+# call it makes is bounded. A `view` that never answers must end in "stay put"
+# and a started manager, not a container that never comes up.
 out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=3 \
-  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_HANG=30)"
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_HANG=30 \
+  -e TURMA_NPM_VIEW_TIMEOUT=2)"
 if echo "$out" | grep -q "MANAGER uid="; then
-  echo "  ok: the manager started while the check was still hanging"
+  echo "  ok: the manager started after the check timed out"
 else
-  echo "  FAIL: a hanging registry blocked the container's boot"; FAILED=1
+  echo "  FAIL: a hanging registry blocked the container's boot for good"; FAILED=1
+fi
+if echo "$out" | grep -q "registry unreachable"; then
+  echo "  ok: the timed-out probe read as stay-put"
+else
+  echo "  FAIL: a timed-out probe did not read as stay-put"; FAILED=1
+fi
+
+echo "== case: the check finishes before the manager can launch anything"
+# The ordering IS the safety argument. `npm install -g` leaves claude absent
+# from PATH for ~1.7s, and resume_on_boot relaunches this host's sessions on a
+# 1s stagger right after the manager starts — so a check that ran alongside the
+# manager would put that hole under the first relaunches, which then die on exec
+# with ENOENT. Every claude line must therefore precede the manager's first.
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=4 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9)"
+claude_line="$(echo "$out" | grep -n "claude update:" | head -1 | cut -d: -f1)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1)"
+if [ -n "$claude_line" ] && [ -n "$mgr_line" ] && [ "$claude_line" -lt "$mgr_line" ]; then
+  echo "  ok: claude was replaced before the manager existed"
+else
+  echo "  FAIL: the manager started while claude was being replaced (claude=$claude_line manager=$mgr_line)"; FAILED=1
+fi
+
+echo "== case: the update writes nothing into the operator's mounted HOME"
+# npm's cache and anything claude touches would otherwise land in /root — which
+# is a bind mount, ROOT-owned, on a host whose sessions run as somebody else.
+if echo "$out" | grep -q "NPMHOME=/tmp/"; then
+  echo "  ok: ran against a throwaway HOME"
+else
+  echo "  FAIL: the update ran against the mounted HOME ($(echo "$out" | grep -o 'NPMHOME=[^ ]*'))"; FAILED=1
+fi
+if echo "$out" | grep -q "NPMCACHE=/tmp/"; then
+  echo "  ok: npm cached outside the mount"
+else
+  echo "  FAIL: npm's cache was not redirected ($(echo "$out" | grep -o 'NPMCACHE=[^ ]*'))"; FAILED=1
+fi
+leftover="$(docker run --rm -v "$WORK/fx11:/f" busybox find /f/claude -newer /f/claude/.credentials.json | wc -l | tr -d ' ')"
+if [ "$leftover" = "0" ]; then
+  echo "  ok: nothing new under the mounted /root/.claude"
+else
+  echo "  FAIL: the update left $leftover new path(s) in the operator's ~/.claude"; FAILED=1
 fi
 
 echo

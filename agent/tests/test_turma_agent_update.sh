@@ -369,8 +369,21 @@ rm -rf "$d"
 
 # A `claude` that reports a version, and an `npm` serving a canned registry.
 # Both record what they were asked to do in $CLAUDE_LOG, which is the assertion.
-install_fake_claude_toolchain() {  # <bindir> <installed|none> <latest|none> <npm_managed:yes|no>
-  local bin="$1" installed="$2" latest="$3" managed="$4"
+# <managed> picks which install path the code should take:
+#   yes        npm knows the package AND npm's global prefix is where PATH finds
+#              claude -> the npm path
+#   no         npm doesn't know it (Anthropic's native installer) -> claude update
+#   elsewhere  npm knows it, but PATH resolves claude from somewhere else -> the
+#              npm copy is not the one this host runs, so npm must NOT be used
+install_fake_claude_toolchain() {  # <bindir> <installed|none> <latest|none> <yes|no|elsewhere>
+  local bin="$1" installed="$2" latest="$3" managed="$4" prefix
+  prefix="$(dirname "$bin")"
+  # `npm prefix -g` — the dir npm installs into. Only "yes" has it contain the
+  # claude that PATH resolves ($bin is $prefix/bin).
+  case "$managed" in
+    yes) echo "$prefix" > "$bin/.npm-prefix" ;;
+    *)   echo "$prefix/somewhere-else" > "$bin/.npm-prefix" ;;
+  esac
   if [ "$installed" != "none" ]; then
     cat > "$bin/claude" <<STUB
 #!/bin/sh
@@ -381,7 +394,7 @@ case "\$1" in
 esac
 STUB
     chmod +x "$bin/claude"
-    echo "$installed" > "$bin/.claude-version"
+    printf '%s\n' "$installed" > "$bin/.claude-version"
   else
     rm -f "$bin/claude" "$bin/.claude-version"
   fi
@@ -393,21 +406,32 @@ case "\$1 \$2" in
      echo "$latest" ;;
   "ls -g")
      echo "ls-g" >> "\$CLAUDE_LOG"
-     [ "$managed" = yes ] ;;
+     [ "$managed" != no ] ;;
+  "prefix -g") cat "$bin/.npm-prefix" ;;
   "install -g")
      echo "npm-install \$*" >> "\$CLAUDE_LOG"
-     echo "$latest" > "$bin/.claude-version" ;;
+     # \$STUB_NPM_FAIL makes the FIRST install fail the way an EACCES against a
+     # root-owned global prefix does, so the fallback is observable.
+     if [ -n "\${STUB_NPM_FAIL:-}" ] && [ ! -f "$bin/.npm-failed-once" ]; then
+       : > "$bin/.npm-failed-once"; exit 243
+     fi
+     # \$STUB_NPM_NOOP installs "successfully" without moving the version PATH
+     # resolves — what really happens when npm's copy isn't the one on PATH.
+     [ -n "\${STUB_NPM_NOOP:-}" ] && exit 0
+     printf '%s\n' "$latest" > "$bin/.claude-version" ;;
   *) exit 2 ;;
 esac
 STUB
   chmod +x "$bin/npm"
 }
 
-# Run the updater with the release half pinned to a NO-OP (the installed version
-# is what the only release carries), so what the log shows is the claude half.
+# Run the Claude Code check the way the launcher does (--claude-only). The
+# release half is a no-op here — it is a separate command now, precisely so a
+# claude update only ever happens at agent start.
 # Echoes the recorded claude/npm calls, one per line.
-run_claude_case() {  # <installed_claude|none> <latest|none> <npm_managed:yes|no>
-  local installed="$1" latest="$2" managed="$3" root prefix bin ghdir
+run_claude_case() {  # <installed_claude|none> <latest|none> <yes|no|elsewhere> [env=val...]
+  local installed="$1" latest="$2" managed="$3"; shift 3
+  local root prefix bin ghdir
   root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
   cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
   echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
@@ -423,11 +447,13 @@ run_claude_case() {  # <installed_claude|none> <latest|none> <npm_managed:yes|no
   # missing if the developer's own claude (typically ~/.local/bin, the very
   # prefix install.sh blesses) can't be found behind the stubs. $bin carries
   # every stub; /usr/bin + /bin carry the coreutils the script needs.
-  FAKE_GH_DIR="$ghdir" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
-    TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" \
-    "$bin/turma-agent-update" >/dev/null 2>&1 || true
+  env FAKE_GH_DIR="$ghdir" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
+    TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" "$@" \
+    "$bin/turma-agent-update" --claude-only >"$root/out.log" 2>&1 || true
 
   cat "$root/claude.log" 2>/dev/null || true
+  # The updater's own log lines, so a case can assert on what it REPORTED.
+  sed 's/^/LOG /' "$root/out.log" 2>/dev/null || true
   rm -rf "$root" "$ghdir"
 }
 
@@ -487,6 +513,78 @@ else
 fi
 
 # 16. TURMA_CLAUDE_AUTO_UPDATE=0 pins the host.
+got="$(run_claude_case "2.0.1" "2.0.9" yes TURMA_CLAUDE_AUTO_UPDATE=0)"
+if printf '%s' "$got" | grep -q 'npm-install\|claude-update'; then
+  fail "TURMA_CLAUDE_AUTO_UPDATE=0 still touched claude (log: $got)"
+else
+  pass "TURMA_CLAUDE_AUTO_UPDATE=0 pins the installed Claude Code"
+fi
+
+# 16a. npm KNOWS the package, but PATH resolves claude from somewhere else — the
+#      shape this host is one `npm i -g` away from (npm's prefix is ~/.local/node,
+#      claude lives in ~/.local/bin). Using npm here "updates" a copy nobody runs,
+#      reports the unchanged old version as success, and does it again on every
+#      check, forever.
+got="$(run_claude_case "2.0.1" "2.0.9" elsewhere)"
+if printf '%s' "$got" | grep -q 'npm-install'; then
+  fail "npm-updated a copy that is not the claude on PATH (log: $got)"
+else
+  pass "an npm copy that isn't the claude on PATH is not the one updated"
+fi
+
+# 16b. An install that reports success without moving the version on PATH is
+#      REPORTED as such, not logged as if it had worked.
+got="$(run_claude_case "2.0.1" "2.0.9" yes STUB_NPM_NOOP=1)"
+if printf '%s' "$got" | grep -q 'LOG .*still resolves 2.0.1'; then
+  pass "an install that changes nothing is called out, not reported as success"
+else
+  fail "a no-op install was reported as a successful update (log: $got)"
+fi
+
+# 16c. A claude that RUNS but prints no parseable version is not "missing": that
+#      classification would reinstall it on every check forever, unverified.
+got="$(run_claude_case "garbage-not-a-version" "2.0.9" yes)"
+if printf '%s' "$got" | grep -q 'npm-install'; then
+  fail "reinstalled a claude that merely printed an unreadable version (log: $got)"
+else
+  pass "an unreadable version is reported, not treated as a missing install"
+fi
+
+# 16d. A registry answering with something that is not a version must read as
+#      "stay put": sort -V ranks any non-numeric string ABOVE a semver, so a
+#      proxy error line would otherwise look like an upgrade every single time.
+got="$(run_claude_case "2.0.1" "not-a-version" yes)"
+if printf '%s' "$got" | grep -q 'npm-install'; then
+  fail "treated unparseable registry output as a newer version (log: $got)"
+else
+  pass "unparseable registry output is not an upgrade"
+fi
+
+# 16e. The EACCES fallback. A non-root user against a root-owned global prefix
+#      must retry into the prefix install.sh blesses and the launcher puts on
+#      PATH — and ROOT must not, because root can write the real prefix and a
+#      retry would put claude somewhere PATH may not reach.
+got="$(run_claude_case "2.0.1" "2.0.9" yes STUB_NPM_FAIL=1)"
+if [ "$(id -u)" = 0 ]; then
+  if printf '%s' "$got" | grep -q 'npm-install .*--prefix'; then
+    fail "root retried into a user prefix instead of failing (log: $got)"
+  else
+    pass "root does not fall back to a user prefix"
+  fi
+else
+  # run_claude_case gives the updater its own HOME and then discards it, so
+  # match the shape rather than this shell's $HOME.
+  if printf '%s' "$got" | grep -qE 'npm-install install -g --prefix .*/home/\.local'; then
+    pass "a non-root EACCES retries into \$HOME/.local"
+  else
+    fail "no ~/.local retry after an EACCES-shaped failure (log: $got)"
+  fi
+fi
+
+# 16f. Claude Code is NOT part of the hourly/manual agent check: replacing the
+#      package makes `claude` briefly absent from PATH, which is only safe when
+#      no session can be launching — i.e. at agent start, before the manager
+#      exists. A plain run must therefore touch claude not at all.
 root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
 cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
 echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
@@ -495,13 +593,12 @@ echo "0.3.0" >"$prefix/VERSION"
 install_fake_restart "$bin"; install_fake_gh "$bin"
 install_fake_claude_toolchain "$bin" "2.0.1" "2.0.9" yes
 d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
-FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
-  CLAUDE_LOG="$root/claude.log" TURMA_CLAUDE_AUTO_UPDATE=0 \
-  "$bin/turma-agent-update" >/dev/null 2>&1 || true
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" TURMA_REPO="xerktech/turma" \
+  CLAUDE_LOG="$root/claude.log" "$bin/turma-agent-update" >/dev/null 2>&1 || true
 if [ -s "$root/claude.log" ]; then
-  fail "TURMA_CLAUDE_AUTO_UPDATE=0 still touched claude ($(cat "$root/claude.log"))"
+  fail "the hourly/manual agent check touched claude ($(cat "$root/claude.log"))"
 else
-  pass "TURMA_CLAUDE_AUTO_UPDATE=0 pins the installed Claude Code"
+  pass "a plain agent check leaves claude alone"
 fi
 rm -rf "$root" "$d"
 
@@ -575,6 +672,77 @@ if [ -s "$root/home/.turma/last-update-check" ]; then
   pass "a plain run stamps the last-check time"
 else
   fail "no last-update-check stamp after a run"
+fi
+rm -rf "$root" "$d"
+
+# 22. A zero-padded / partially-written stamp must not wedge the check. bash
+#     reads a leading-zero number as OCTAL, so `09` is an arithmetic ERROR that
+#     (under set -e) took the whole boot check down on every restart until
+#     somebody deleted the file.
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.4.0" "0.4.0" "v0.4.0"
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+mkdir -p "$root/home/.turma"; echo "09" > "$root/home/.turma/last-update-check"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" --boot >/dev/null 2>&1 || true
+got="$(tr -d '[:space:]' < "$prefix/VERSION")"
+assert_eq "0.4.0" "$got" "an octal-looking stamp doesn't wedge the check (-> $got)" \
+  "a stamp of 09 killed the boot check, VERSION stayed $got"
+rm -rf "$root" "$d"
+
+# 23. The --loop poller must NOT hold the update lock across its hour-long sleep.
+#     It did, and since turma-agentctl starts that poller on every non-systemd
+#     host, EVERY start-fired check on those hosts exited immediately as
+#     "another update run holds the lock" — the whole feature, silently inert.
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" --loop --interval 60 \
+  >"$root/loop.log" 2>&1 &
+loop_pid=$!
+for _ in $(seq 1 60); do grep -q "up to date" "$root/loop.log" 2>/dev/null && break; sleep 0.2; done
+out="$(FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_BOOT_UPDATE_MIN_INTERVAL=0 \
+  "$bin/turma-agent-update" --boot 2>&1 || true)"
+kill "$loop_pid" 2>/dev/null || true; wait "$loop_pid" 2>/dev/null || true
+if printf '%s' "$out" | grep -q "holds the lock"; then
+  fail "a sleeping --loop poller blocked the start-fired check (that host never updates)"
+else
+  pass "the poller releases the lock between runs"
+fi
+rm -rf "$root" "$d"
+
+# 24. The two start checks throttle INDEPENDENTLY. They are fired back to back by
+#     the launcher, so one shared stamp would mean the first always suppressed
+#     the second.
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+install_fake_claude_toolchain "$bin" "2.0.1" "2.0.1" yes
+d="$(new_gh_dir)"; add_unified_release "$d" "v0.4.0" "0.4.0" "v0.4.0"
+env FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" TURMA_REPO="xerktech/turma" \
+  CLAUDE_LOG="$root/claude.log" "$bin/turma-agent-update" --claude-only >/dev/null 2>&1 || true
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" --boot >/dev/null 2>&1 || true
+got="$(tr -d '[:space:]' < "$prefix/VERSION")"
+assert_eq "0.4.0" "$got" "a claude check doesn't throttle the agent check (-> $got)" \
+  "the claude check's stamp suppressed the agent check, VERSION stayed $got"
+if [ -s "$root/home/.turma/last-claude-check" ]; then
+  pass "the claude check keeps its own stamp"
+else
+  fail "no last-claude-check stamp after --claude-only"
 fi
 rm -rf "$root" "$d"
 

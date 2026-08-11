@@ -61,23 +61,44 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
 - `turma-agent-update` — self-updater: compares the release `manifest.json`'s **agent-native
   component version** (never the tag), verifies the sha256, swaps files, restarts the manager. Falls
   back to the legacy `agent-native-v*` stream. Tests: `test_turma_agent_update.sh`.
-  - It also updates **Claude Code** (XERK-254), which the agent otherwise installs once and never
-    touches again. A version COMPARE, never a blind `npm i -g @latest` — the install replaces the
-    package under live sessions. `npm` only when npm-manages it; a claude from Anthropic's native
-    installer goes through `claude update`, since `npm i -g` would lay a SECOND one beside it and
-    leave PATH order deciding the version. A MISSING claude is installed, not reported: without it
-    every session dies on exec. Registry unreachable and installed-ahead-of-latest both stay put.
-    `TURMA_CLAUDE_AUTO_UPDATE=0` pins the host.
-  - **Claude Code goes first**, because the self-update after it can restart the manager (and on the
-    non-systemd path is the last thing the process does).
-- **Every start is an update check**: the launcher fires `turma-agent-update --boot` **detached**
-  before the manager, so a restart for any reason lands on current code. Detached because it does
-  network I/O (a start must not wait on GitHub/npm) and because a successful self-update restarts
-  this unit — `setsid` + `KillMode=process` is what lets it survive to finish its own swap.
-  - `--boot` **rate-limits itself** off `~/.turma/last-update-check` (every run stamps it;
+  - The lock is taken **per run and released before the sleep**. `--loop` held it for its whole
+    life, and since `turma-agentctl start` runs that poller on every non-systemd host, every
+    start-fired check there exited at once as "another update run holds the lock".
+  - `install_payload` requires `hooks/` in the payload before it swaps: the swap DELETES the
+    installed hooks first, and a missing hook command is a non-blocking hook — the safety guard
+    would fail open while VERSION, the restart and the log all reported a clean update.
+  - It also updates **Claude Code** (XERK-254, `--claude-only`), which the agent otherwise installs
+    once and never touches again.
+    - **Only ever at agent start**, never on the timer or in `--loop`. Replacing the package leaves
+      `claude` absent from PATH for ~1.7s and a session launched then dies on exec; before the
+      manager exists nothing can be launching, at any later moment a hub-requested spawn can land in
+      the hole. Restarting the agent is therefore how a host takes a new Claude Code.
+    - A version COMPARE, so there is no window at all unless something newer is really published.
+      `npm` only when npm's global prefix is **where PATH resolves `claude` from** — `npm ls -g`
+      alone answers a different question, and on a host with both (npm prefix `~/.local/node`,
+      claude in `~/.local/bin`) it "updates" the copy nobody runs, reports the unchanged version as
+      success, and repeats forever. Otherwise `claude update`, the installer that owns it.
+    - **ABSENT ≠ unreadable**: keyed on `command -v`, since a claude that runs but prints an
+      unrecognised version would otherwise be reinstalled on every check. A genuinely missing claude
+      IS installed — without it every session dies on exec. Unreachable-or-unparseable registry
+      output and installed-ahead-of-published both stay put (`sort -V` ranks a non-version ABOVE a
+      semver, so an error line would otherwise read as an upgrade). `TURMA_CLAUDE_AUTO_UPDATE=0`
+      pins the host.
+    - Every external call is `timeout`-bounded: the lock is held for the whole run, so one hung
+      child would block every later update — including the one shipping the fix.
+- **Every start is an update check**, fired by the launcher two different ways:
+  - **Claude Code, awaited** (`--claude-only`, bounded by `TURMA_CLAUDE_UPDATE_TIMEOUT`) — it must
+    finish before the manager exists, per the window above. A slow registry may delay the start; it
+    cannot stop it, and a late start is visible where a session that died on a missing binary is
+    not.
+  - **The agent self-update, detached** (`--boot`) — it waits on GitHub, and a successful one
+    restarts this very unit, so it has to be outside the process tree that restart tears down.
+    `setsid` + `KillMode=process` is what lets it survive to finish its own swap.
+  - Both **rate-limit themselves** off their own stamp (`~/.turma/last-update-check`,
+    `last-claude-check` — separate, or the first would always suppress the second;
     `TURMA_BOOT_UPDATE_MIN_INTERVAL`, 300s). Not optional: `Restart=always` restarts a crash-looping
-    manager every 5s, and unthrottled that is a release+registry check — and possibly a swap and
-    restart — at that same rate. A future-dated stamp reads as no stamp.
+    manager every 5s. A future-dated stamp reads as no stamp, and the age is computed base-10 (bash
+    reads a zero-padded stamp as OCTAL, and `09` is an arithmetic error that killed the check).
   - Fired **before** the credential gate (a host idling for want of a login should still pick up
     builds) and **never** by `--preflight`, which `install.sh --verify` calls. `TURMA_BOOT_UPDATE=0`
     opts out. Tests: `test_turma_agent.sh`.

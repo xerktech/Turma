@@ -456,12 +456,14 @@ See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_se
   "Run-as identity". Tests: `test_entrypoint.sh`.
 - **Every start re-checks Claude Code** (XERK-254), otherwise frozen at the image's
   `CLAUDE_CODE_VERSION` for the life of the tag. The agent can't self-update here — it IS the image,
-  and the Watchtower pull's recreate is what re-runs this code. A version COMPARE (a blind `npm i -g
-  @latest` would replace the package under live sessions every boot), never a downgrade, unreachable
-  registry = stay put. As **root** (only root writes `/usr/local`) under a **throwaway `HOME`**, so
-  npm's cache and claude's own writes can't land root-owned in the bind-mounted `/root`.
-  **Backgrounded**, so a slow registry delays no boot — at the cost of sessions relaunched seconds
-  later starting on the old version. `TURMA_CLAUDE_AUTO_UPDATE=0` pins it.
+  and the Watchtower pull's recreate re-runs this code. A version COMPARE, never a downgrade;
+  unreachable/unparseable registry output = stay put. As **root** (only root writes `/usr/local`)
+  under a **throwaway `HOME`**, so npm's cache and claude's writes can't land root-owned in the
+  bind-mounted `/root`. `TURMA_CLAUDE_AUTO_UPDATE=0` pins it.
+  - **AWAITED, before the manager starts.** The install leaves `claude` off PATH for ~1.7s and
+    `resume_on_boot` relaunches sessions 1s apart just after, so backgrounding it put that hole
+    under the first relaunches, which died on exec. Calls are `timeout`-bounded instead: a wedged
+    registry delays the boot, never stops it, and an install it kills self-heals next boot.
 - **Cloud CLIs** (terraform/`az`/`aws`, pinned via
   `TERRAFORM_VERSION`/`AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`) live in the
   `tooling` stage, so **every tier carries them and the CI scan covers them** — they are

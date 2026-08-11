@@ -28,13 +28,18 @@ a QA session.
 
 ### Native-host facts
 
-- **`npm`/`npx` are installed but not linked.** `node` is symlinked into
-  `/root/.local/bin`, `npm` is not. Every npm command must start with:
-  ```bash
-  export PATH=/root/.local/node/bin:$PATH
-  ```
-  Without it you get `command not found: npm` and may wrongly conclude Node
-  tooling is unavailable.
+- **`npm`/`npx` live in `/root/.local/node/bin` and are now symlinked into
+  `/root/.local/bin`** (`node`, `npm`), so they ARE on the systemd units' PATH
+  (the launcher and updater both prepend `$HOME/.local/bin`). `npx` is not
+  linked; for it, prepend `/root/.local/node/bin` yourself.
+- **npm's global prefix is `/root/.local/node`, NOT `~/.local`** (`npm config
+  get prefix`). So `npm i -g <pkg>` lands a binary in `/root/.local/node/bin`,
+  which is *not* on the agent's PATH. Anything that installs a tool and then
+  expects to find it must pass `--prefix ~/.local` or set `npm_config_prefix`.
+- **`claude` here is Anthropic's NATIVE installer build**, not npm:
+  `/root/.local/bin/claude -> /root/.local/share/claude/versions/<ver>`, and
+  `npm ls -g @anthropic-ai/claude-code` exits 1. Code that branches on
+  "npm-managed?" takes the `claude update` path on this host.
 - **npm's cache must be redirected** — `/root/.npm` is root-owned and npm dies
   with EACCES: `npm ci --cache /tmp/claude-0/npm-cache`.
 - **`bun` is available** at `/root/.local/bin/bun` — this is what `veiller/`
@@ -196,6 +201,57 @@ reproduce that gate rather than per-directory runs:
 ```bash
 node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
 ```
+
+### 2.2b The native agent's launcher + self-updater (`agent/native/`)
+
+These run as **root under systemd on this box** and touch the operator's live
+install, so QA them against a staged `$PREFIX` and a scratch `$HOME`, never the
+real ones.
+
+- **Never run `turma-agent-update` with `HOME=/root`.** It writes
+  `~/.turma/last-update-check` (suppressing the production agent's next boot
+  check for `TURMA_BOOT_UPDATE_MIN_INTERVAL`), `~/.turma/update.log`, and can
+  `claude update` / restart `turma-agent.service` for real.
+- Stage a fake prefix the way `agent/tests/test_turma_agent_update.sh` does:
+  `$PREFIX/{VERSION,hub-agent.py,tunnel-agent.js,hooks/}` + `$PREFIX/bin/` with
+  the script under test, a fake `gh` serving canned releases from
+  `$FAKE_GH_DIR`, and stub `systemctl`/`turma-agentctl` so a successful install
+  cannot touch the host's real units. **Stub all three restart paths** — on this
+  host `/etc/systemd/system/turma-agent.service` exists, so the updater's
+  system-scope branch is live.
+- Real systemd behaviour (`Restart=always`, `KillMode=process`, survival of a
+  detached child across a unit restart) is reproducible without touching /etc:
+  ```bash
+  systemd-run --unit=qa-$$ --collect --property=Restart=always \
+    --property=RestartSec=1 --property=KillMode=process --property=Type=exec \
+    --setenv=HOME=$SCRATCH --setenv=PATH=$BIN:/usr/bin:/bin $BIN/turma-agent
+  ```
+  Stop it with `systemctl stop qa-$$`, then `rm /run/systemd/transient/qa-$$.service`
+  and `systemctl daemon-reload` — a stopped transient unit lingers as `loaded`
+  otherwise.
+- **The updater takes `flock` on `~/.turma/update.lock` for its WHOLE run, and
+  `--loop` holds it for its whole LIFE** (it sleeps inside the lock). Any second
+  run — the boot check, the hourly timer — exits with "another update run holds
+  the lock". Check the lock before concluding a code path "didn't fire".
+- Exercising the Claude Code half against the **real** registry is cheap and
+  safe if you sandbox npm: `export npm_config_prefix=$SCRATCH/pfx
+  npm_config_cache=$SCRATCH/cache`; `npm install -g @anthropic-ai/claude-code`
+  is ~170 KB of package + a ~250 MB platform binary and takes ~3 s.
+  `npm view @anthropic-ai/claude-code version` answers in <0.5 s.
+- **`npm install -g` unlinks the package before extracting the new one**, so
+  `claude` is *absent from PATH* for ~1.5–2 s during an upgrade. If you are
+  measuring session-launch behaviour around an update, sample `claude --version`
+  in a 50 ms loop; a single probe will miss it.
+- A **running** claude survives that swap (the bin is one static ELF and the
+  kernel keeps the inode); only a *new* exec in the window fails.
+- The container half (`agent/entrypoint.sh`) is drivable end to end with a real
+  claude: build `node:24-bookworm-slim` + `npm i -g @anthropic-ai/claude-code@<older>`
+  + the real `entrypoint.sh` + stub `python3`/`hub-agent.py`/`tunnel-agent.js`,
+  then `docker run -e AGENT=claude -v $fx/repos:/f/repos -v $fx/claude:/root/.claude`.
+  Keep the stub manager alive (`sleep`) or the container exits before the
+  backgrounded update prints anything. `agent/tests/test_entrypoint.sh` stubs
+  claude+npm, so it observes the DECISION only — it cannot see file ownership,
+  writes under `/root`, or install timing.
 
 ### 2.3 Glasses (`glasses/`) — npm + vite + vitest
 

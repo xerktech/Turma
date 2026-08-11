@@ -165,15 +165,20 @@ fi
 # the tag, so a host that only ever pulls a carried-forward agent image runs a
 # Claude Code that keeps aging. This closes that half.
 #
-# As root, BEFORE the manager starts: `npm install -g` writes /usr/local, which
-# the dropped identity cannot. The result is world-readable, so the sessions —
-# which run as that dropped identity — execute it fine.
+# As root, because `npm install -g` writes /usr/local, which the dropped
+# identity cannot. The result is world-readable, so the sessions — which run as
+# that dropped identity — execute it fine.
 #
-# BACKGROUNDED, so a slow or unreachable npm registry delays no boot. The cost
-# is a race: sessions relaunched by resume_on_boot in the next few seconds may
-# start on the old version and pick the new one up on their next launch. That is
-# the right trade — blocking here would hold every session on this host hostage
-# to registry latency, and the version they run is never wrong, only behind.
+# AWAITED, and deliberately not backgrounded: `npm install -g` leaves `claude`
+# absent from PATH for ~1.7s while it replaces the package, and resume_on_boot
+# relaunches this host's sessions on a 1s stagger seconds after the manager
+# starts — so a backgrounded check puts the hole exactly under the first
+# relaunches, which then die on exec with ENOENT. Finishing before the manager
+# exists means nothing can be launching while the package moves. Each call is
+# bounded by `timeout` instead, so a wedged registry delays the boot but cannot
+# stop it; it is two version reads unless something newer is really published.
+# An install killed by that timeout leaves a claude that can't report a version,
+# which the next boot reinstalls — the check heals its own interruption.
 #
 # TURMA_CLAUDE_AUTO_UPDATE=0 pins the image's bundled version.
 if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
@@ -189,10 +194,16 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
     export HOME=/tmp/.turma-claude-update
     export npm_config_cache="$HOME/npm"
     mkdir -p "$HOME"
-    cur="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-    latest="$(npm view @anthropic-ai/claude-code version 2>/dev/null | tr -d '[:space:]')"
+    cur="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+    latest="$(timeout "${TURMA_NPM_VIEW_TIMEOUT:-60}" npm view @anthropic-ai/claude-code version \
+              --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]')"
+    # A registry that answers with anything but a version is "stay put", not an
+    # upgrade: `sort -V` ranks a non-numeric string ABOVE a semver, so a proxy
+    # error line or a warning on stdout would otherwise replace the package on
+    # every single boot.
+    echo "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' || latest=""
     if [ -z "$latest" ]; then
-      echo "[entrypoint] claude: registry unreachable; staying at ${cur:-unknown}"
+      echo "[entrypoint] claude: registry unreachable or unreadable; staying at ${cur:-unknown}"
     elif [ -n "$cur" ] && [ "$cur" = "$latest" ]; then
       echo "[entrypoint] claude up to date ($cur)"
     elif [ -n "$cur" ] \
@@ -202,14 +213,15 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
       echo "[entrypoint] claude: installed $cur is ahead of published $latest; leaving it"
     else
       echo "[entrypoint] claude update: ${cur:-none} -> $latest"
-      if npm install -g "@anthropic-ai/claude-code@$latest"; then
+      if timeout "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+           npm install -g "@anthropic-ai/claude-code@$latest"; then
         echo "[entrypoint] claude: now $(claude --version 2>/dev/null || echo '?')"
       else
         echo "[entrypoint] claude: update FAILED; staying at ${cur:-none}"
       fi
     fi
     rm -rf /tmp/.turma-claude-update
-  ) &
+  )
 fi
 
 # --- GitHub auth preflight (agent-agnostic) --------------------------------

@@ -224,33 +224,51 @@ fi
 
 report_creds
 
-# ---- update check on every start (XERK-254) --------------------------------
+# ---- update checks on every start (XERK-254) -------------------------------
 # A restart — an operator's, systemd's after a crash, the hub's, a host reboot —
-# is the moment to be running current code, so every start fires the same
-# updater the hourly timer runs: it bumps Claude Code and, when a newer native
-# build exists, swaps this install and restarts the manager (sessions survive,
-# see resume_on_boot).
+# is the moment to be running current code, so every start checks both halves of
+# what this host runs. They are fired DIFFERENTLY, and the difference is the
+# whole safety argument:
 #
-# DETACHED, never inline, for two reasons:
-#   * it does network I/O against GitHub and the npm registry, and a start that
-#     waits on those is a start an unreachable network can hold up indefinitely
-#     — the agent must come up and heartbeat regardless;
-#   * a successful self-update restarts this very unit, so it has to be outside
-#     the process tree that restart tears down. setsid + KillMode=process is
-#     what lets it survive to finish the swap it started.
-# --boot rate-limits itself (see boot_throttled) so a crash-looping unit can't
-# turn Restart=always into an update check every five seconds.
+#   * Claude Code, AWAITED, right here, before the manager exists. Replacing the
+#     package leaves `claude` briefly absent from PATH (~1.7s for an npm
+#     install), and a session launched in that window dies on exec with ENOENT.
+#     Before the manager starts, nothing can be launching — after it starts, a
+#     hub-requested spawn can land right in the hole. So this one blocks, and is
+#     bounded by `timeout` instead: a slow registry may delay the manager, but
+#     it cannot delay it forever, and a late start is visible while a session
+#     that died on a missing binary is not. It is a no-op (two version reads)
+#     unless something newer is actually published.
+#
+#   * The agent self-update, DETACHED. It does network I/O against GitHub (a
+#     start must not wait on that), and a successful update restarts this very
+#     unit — so it has to be outside the process tree that restart tears down.
+#     setsid + KillMode=process is what lets it survive to finish its own swap.
+#
+# Both rate-limit themselves (see throttled()) so a crash-looping unit can't turn
+# Restart=always into an update check every five seconds.
 #
 # Placed BEFORE the credential gate below on purpose: a host idling for want of
 # a Claude login is exactly a host that should still be picking up new builds,
 # and a MISSING claude is something this check installs rather than reports.
 # TURMA_BOOT_UPDATE=0 opts out (a checkout you are editing in place).
 if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]; then
-  echo "[turma-agent] checking for agent + Claude Code updates (detached)"
-  # The updater logs to this file itself; create the dir here because the
-  # redirect below is evaluated by THIS shell, before it ever runs.
+  # The updater tees its own log; create the dir here because the redirect below
+  # is evaluated by THIS shell, before it ever runs. stdout goes to /dev/null
+  # for the detached run — the updater already writes to the log, so letting
+  # both land there records every line twice.
   mkdir -p "$HOME/.turma" 2>/dev/null || true
-  setsid "$SELF_DIR/turma-agent-update" --boot >>"$HOME/.turma/update.log" 2>&1 &
+  echo "[turma-agent] checking Claude Code (before any session can launch)"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${TURMA_CLAUDE_UPDATE_TIMEOUT:-420}" \
+      "$SELF_DIR/turma-agent-update" --claude-only \
+      || echo "[turma-agent] claude update check did not finish; carrying on"
+  else
+    "$SELF_DIR/turma-agent-update" --claude-only \
+      || echo "[turma-agent] claude update check failed; carrying on"
+  fi
+  echo "[turma-agent] checking for a newer agent build (detached)"
+  setsid "$SELF_DIR/turma-agent-update" --boot >/dev/null 2>&1 &
 fi
 
 # The one fatal check: Remote Control needs a subscription OAuth login. Idle

@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # turma-agent-update — self-updater for the native Turma agent.
 #
-# Updates TWO things, in this order (XERK-254):
-#   1. Claude Code — the binary every session exec's. Bumping it never restarts
-#      anything, so it goes first, before the step that can pull the manager out
-#      from under us.
-#   2. The agent itself — polls the release stream and, when a newer native
-#      build exists, downloads + verifies it, swaps the runtime files into
-#      $PREFIX, and restarts JUST the manager, which re-adopts the live sessions
-#      on boot (see resume_on_boot in hub-agent.py). So an update never stops
-#      active claude sessions; the web UI briefly disconnects and reconnects.
+# Updates TWO things, on DIFFERENT schedules (XERK-254):
+#   * The agent itself — polls the release stream and, when a newer native build
+#     exists, downloads + verifies it, swaps the runtime files into $PREFIX, and
+#     restarts JUST the manager, which re-adopts the live sessions on boot (see
+#     resume_on_boot in hub-agent.py). So an update never stops active claude
+#     sessions; the web UI briefly disconnects and reconnects. Runs hourly AND
+#     on every agent start.
+#   * Claude Code (`--claude-only`) — ONLY at agent start, before the manager
+#     exists. See the Claude Code section for why that placement is the whole
+#     safety argument.
 #
-# Three entry points: a one-shot (the systemd timer), `--loop` (the non-systemd
-# poller turma-agentctl runs), and `--boot` — the same one-shot with a rate
-# limit, fired detached by the launcher on every agent start so a restart is
-# itself an update check. See the --boot throttle below for why that limit is
-# not optional.
+# Entry points:
+#   (none)         one-shot agent self-update — the systemd timer, and by hand
+#   --loop         the same, on an interval (the non-systemd poller)
+#   --boot         the same, rate-limited; fired detached by the launcher
+#   --claude-only  the Claude Code check, rate-limited; fired by the launcher
+#                  and awaited, before it execs the manager
+# The rate limit is not optional — see throttled().
 #
 # Two release schemes, tried in order:
 #   1. UNIFIED (current): one `v<M>.<m>.<p>` release per build carries all
@@ -53,9 +56,11 @@ LEGACY_TAG_PREFIX="agent-native-v"
 INTERVAL="${TURMA_UPDATE_INTERVAL:-3600}"   # 1h default for --loop
 LOG="$HOME/.turma/update.log"
 LOCK="$HOME/.turma/update.lock"
-# When the last check ran (epoch seconds), written by every run and read only by
-# --boot. See boot_throttled().
+# When each kind of check last ran (epoch seconds), read only by the start-fired
+# runs. Two files, because the agent check and the Claude Code check are fired
+# separately by the launcher and must not throttle each other. See throttled().
 STAMP="$HOME/.turma/last-update-check"
+CLAUDE_STAMP="$HOME/.turma/last-claude-check"
 BOOT_MIN_INTERVAL="${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}"
 CLAUDE_PKG="@anthropic-ai/claude-code"
 mkdir -p "$HOME/.turma" 2>/dev/null || true
@@ -80,43 +85,106 @@ newer_than() {
 # up for months runs whatever Claude Code was current on the day it was set up.
 # That is the half of an update this script used to leave stale (XERK-254).
 #
+# ONLY EVER RUN AT AGENT START (`--claude-only`, which the launcher calls before
+# it execs the manager) or when an operator asks for it by hand. Never on the
+# hourly timer, and never inside `--loop`. Replacing the package means `claude`
+# is briefly absent from PATH — measured at ~1.7s for an npm install — and a
+# session launched in that window dies on exec with ENOENT. At agent start the
+# manager does not exist yet, so nothing can be launching; at any other moment a
+# hub-requested spawn can land right in the hole. Restarting the agent is
+# therefore how a host takes a new Claude Code, which is what XERK-254 asks for.
+#
 # Deliberately version-compared rather than an unconditional `npm install -g
-# ...@latest`: the install REPLACES the package directory under live sessions,
-# so it must happen only when there is genuinely something newer, not on every
-# hourly poll and every restart.
+# ...@latest`, for the same reason: no window at all unless there is genuinely
+# something newer.
 #
 # Set TURMA_CLAUDE_AUTO_UPDATE=0 to pin a host to whatever it has.
 
+# Run a command under a time limit, so a wedged registry or a hung claude cannot
+# stall the boot behind it (this script holds the update lock while it runs, so
+# an unbounded child would block every LATER update too — including the one that
+# would ship the fix). `timeout` is coreutils and effectively always there;
+# degrade to running unbounded rather than skipping the work if it isn't.
+bounded() {  # <seconds> <cmd...>
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
 # The bare semver claude reports ("2.0.14 (Claude Code)" -> 2.0.14). Empty when
-# claude isn't installed or can't run.
+# it can't be parsed — which is NOT the same as claude being absent, see below.
 claude_version() {
   command -v claude >/dev/null 2>&1 || return 0
-  claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+  bounded "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
 }
 
-# Latest published version, per the npm registry. Empty when it is unreachable,
-# which must read as "stay put", never as "reinstall".
+# Latest published version, per the npm registry. Empty when it is unreachable
+# OR answers with something that isn't a version, both of which must read as
+# "stay put": `sort -V` ranks any non-numeric string ABOVE a semver, so an error
+# line or a warning on stdout would otherwise look like an upgrade and replace
+# the package on every check.
 claude_latest() {
   command -v npm >/dev/null 2>&1 || return 0
-  npm view "$CLAUDE_PKG" version 2>/dev/null | tr -d '[:space:]' || true
+  local out
+  out="$(bounded "${TURMA_NPM_VIEW_TIMEOUT:-60}" npm view "$CLAUDE_PKG" version \
+         --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]' || true)"
+  printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' || return 0
+  printf '%s' "$out"
 }
 
-# Is the claude on PATH the one npm -g manages? `npm ls -g` resolves against the
-# user's own npm prefix (install.sh blesses ~/.local), so this answers for the
-# identity the agent actually runs as. False for a claude laid down by
-# Anthropic's native installer, which updates itself through `claude update`.
+# Is the claude ON PATH the one npm -g manages?
+#
+# `npm ls -g` only answers "does npm know about this package", which is a
+# DIFFERENT question: a host can have an npm-installed copy under npm's global
+# prefix AND resolve `claude` from somewhere else entirely (Anthropic's native
+# installer puts it in ~/.local/bin, while npm's prefix here is ~/.local/node).
+# Answering the wrong question makes every check "upgrade" the copy nobody runs,
+# report the unchanged old version as success, and do it again forever. So
+# compare the resolved paths.
 claude_is_npm_managed() {
-  command -v npm >/dev/null 2>&1 && npm ls -g --depth=0 "$CLAUDE_PKG" >/dev/null 2>&1
+  command -v npm >/dev/null 2>&1 || return 1
+  npm ls -g --depth=0 "$CLAUDE_PKG" >/dev/null 2>&1 || return 1
+  local prefix on_path
+  prefix="$(npm prefix -g 2>/dev/null || true)"
+  [ -n "$prefix" ] || return 1
+  on_path="$(command -v claude 2>/dev/null || true)"
+  [ -n "$on_path" ] || return 0   # nothing on PATH yet: npm is who installs it
+  case "$on_path" in "$prefix"/*) return 0 ;; *) return 1 ;; esac
 }
 
 npm_install_claude() {
-  npm install -g "$CLAUDE_PKG@latest" >>"$LOG" 2>&1 && return 0
+  bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+    npm install -g "$CLAUDE_PKG@latest" >>"$LOG" 2>&1 && return 0
   # A non-root user against a root-owned global prefix fails with EACCES. Retry
   # into the prefix install.sh blesses and the launcher puts on PATH, which is
-  # where this fleet's claude lives anyway.
+  # where this fleet's claude lives anyway. Root takes no retry: it can write
+  # the real global prefix, so a failure there is a real failure, and installing
+  # into /root/.local instead would just put claude somewhere PATH may not reach.
   [ "$(id -u)" = 0 ] && return 1
   logmsg "claude: global npm install failed; retrying into $HOME/.local"
-  npm install -g --prefix "$HOME/.local" "$CLAUDE_PKG@latest" >>"$LOG" 2>&1
+  bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+    npm install -g --prefix "$HOME/.local" "$CLAUDE_PKG@latest" >>"$LOG" 2>&1
+}
+
+# Report what an install actually achieved. An install that reports success
+# while the version on PATH doesn't move means the copy we updated is not the
+# copy this host runs — say so, rather than logging the old version as if it
+# were the new one and repeating the whole thing on the next check.
+report_claude_install() {  # <version_before> <want>
+  local before="$1" want="$2" now
+  now="$(claude_version)"
+  if [ "$now" = "$want" ] || [ -z "$want" ]; then
+    logmsg "claude: now ${now:-unknown}"
+  elif [ "$now" = "$before" ]; then
+    logmsg "claude: install reported success but PATH still resolves $before at" \
+           "$(command -v claude 2>/dev/null || echo '?') — that copy is not the one that was updated"
+  else
+    logmsg "claude: now ${now:-unknown} (wanted $want)"
+  fi
 }
 
 update_claude() {
@@ -126,12 +194,13 @@ update_claude() {
   fi
 
   local cur latest
-  cur="$(claude_version)"
-
-  # No claude at all is not a stale install, it is a broken host: every session
-  # this agent launches dies seconds later on exec. Installing it IS the fix, so
-  # do that rather than report and move on.
-  if [ -z "$cur" ]; then
+  # ABSENT and UNREADABLE are different faults. Keyed on `command -v`, not on
+  # whether a version could be parsed: a claude that runs but prints something
+  # this doesn't recognise (or exits nonzero) would otherwise be "missing" on
+  # every single check, reinstalled every time, forever, and never verified.
+  if ! command -v claude >/dev/null 2>&1; then
+    # Every session this agent launches dies seconds later on exec, so
+    # installing it IS the fix rather than something to report and move on from.
     if ! command -v npm >/dev/null 2>&1; then
       logmsg "claude: MISSING and npm is not installed — every session launch will fail"
       return 0
@@ -145,9 +214,16 @@ update_claude() {
     return 0
   fi
 
+  cur="$(claude_version)"
+  if [ -z "$cur" ]; then
+    logmsg "claude: installed at $(command -v claude) but reports no readable version;" \
+           "leaving it alone"
+    return 0
+  fi
+
   latest="$(claude_latest)"
   if [ -z "$latest" ]; then
-    logmsg "claude: registry unreachable; staying at $cur"
+    logmsg "claude: registry unreachable or unreadable; staying at $cur"
     return 0
   fi
   if ! newer_than "$latest" "$cur"; then
@@ -158,16 +234,17 @@ update_claude() {
   logmsg "claude update available: $cur -> $latest"
   if claude_is_npm_managed; then
     if npm_install_claude; then
-      logmsg "claude: now $(claude_version)"
+      report_claude_install "$cur" "$latest"
     else
       logmsg "claude: update FAILED; staying at $cur"
     fi
-  elif claude update >>"$LOG" 2>&1; then
+  elif bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" claude update >>"$LOG" 2>&1; then
     # Not npm-managed: Anthropic's native installer owns this claude, and `npm
     # install -g` would lay a SECOND one down beside it, with whichever PATH
     # entry wins deciding the version — so hand the update to the installer that
-    # owns it.
-    logmsg "claude: now $(claude_version) (native installer)"
+    # owns it. Its channel can lag npm's `latest`, so don't demand the version
+    # we compared against; report whatever it landed on.
+    report_claude_install "$cur" ""
   else
     logmsg "claude: not npm-managed and 'claude update' failed; staying at $cur"
   fi
@@ -288,7 +365,13 @@ install_payload() {  # <tgz> <version>
   src="$PREFIX.update"
   # Some tarballs wrap contents in a single top dir — descend if so.
   [ -f "$src/hub-agent.py" ] || src="$(dirname "$(find "$PREFIX.update" -name hub-agent.py | head -n1)")"
-  if [ ! -f "$src/hub-agent.py" ] || [ ! -f "$src/tunnel-agent.js" ]; then
+  # hooks/ is checked HERE and not merely mv'd below, because the swap deletes
+  # the installed hooks before moving the staged ones in: a payload without them
+  # would leave the host with no guard hook at all, and a missing hook command
+  # is a non-blocking hook — the safety guard would fail OPEN while VERSION,
+  # the restart and the log all reported a clean update.
+  if [ ! -f "$src/hub-agent.py" ] || [ ! -f "$src/tunnel-agent.js" ] \
+     || [ ! -d "$src/hooks" ]; then
     logmsg "staged payload incomplete; refusing to install"; return 1
   fi
 
@@ -304,7 +387,13 @@ install_payload() {  # <tgz> <version>
     [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }
   done
   chmod +x "$PREFIX/hooks/"*.py 2>/dev/null || true
-  echo "$version" >"$PREFIX/VERSION"
+  # An unstampable VERSION means the next check sees the OLD version and does the
+  # whole download, swap and restart again, every hour, forever. Say so instead
+  # of reporting a clean update.
+  if ! echo "$version" >"$PREFIX/VERSION"; then
+    logmsg "installed $version but could NOT stamp $PREFIX/VERSION — every later" \
+           "check will reinstall it; fix that file's permissions"
+  fi
   logmsg "installed $version; restarting manager (sessions preserved)"
 
   # Leave the running manager a hint that its imminent SIGTERM is an EXPECTED
@@ -398,16 +487,13 @@ try_legacy() {  # <cur> <stage>
   verify_and_install "$dl" "$latest" || true
 }
 
+# The agent self-update. Claude Code is NOT part of this — see the Claude Code
+# section for why it only ever runs at agent start.
 run_once() {
   local cur stage
-  # Stamp FIRST, so a run that then wedges or dies still bounds the next --boot
-  # check. Every run writes it; only --boot reads it.
-  date +%s >"$STAMP" 2>/dev/null || true
-
-  # Claude Code before the agent: the self-update below can restart the manager
-  # (and, on the non-systemd path, is the last thing this process does), so
-  # anything sequenced after it is not guaranteed to run.
-  update_claude || logmsg "claude update check errored (continuing)"
+  # Stamp FIRST, so a run that then wedges or dies still bounds the next
+  # start-fired check.
+  stamp_now "$STAMP"
 
   cur="$(installed_version)"
   stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.XXXXXX")"
@@ -418,63 +504,101 @@ run_once() {
   try_legacy "$cur" "$stage"
 }
 
-# --boot only: has a check run recently enough that this one is redundant?
+stamp_now() { date +%s >"$1" 2>/dev/null || true; }
+
+# Has a check of this kind run recently enough that this one is redundant?
 #
-# The launcher fires --boot on EVERY start, and a start is not always an
-# operator asking for one: systemd's Restart=always brings the unit back every
+# The launcher fires the start checks on EVERY start, and a start is not always
+# an operator asking for one: systemd's Restart=always brings the unit back every
 # RestartSec=5 while the manager is crash-looping (a bad config, a missing
 # login, an exception at import). Unthrottled, that is a check — two network
 # round trips, and potentially a download + swap + restart — every five seconds,
 # which turns a local fault into a self-inflicted hammering of GitHub and the
 # npm registry, and can rewrite $PREFIX under itself in a loop. The rate limit
 # is what makes "check on every restart" safe to promise.
-boot_throttled() {
-  local now last age
-  [ -f "$STAMP" ] || return 1
-  last="$(tr -cd '0-9' <"$STAMP" 2>/dev/null || true)"
+throttled() {  # <stampfile> <label>
+  local file="$1" label="$2" now last age
+  [ -f "$file" ] || return 1
+  last="$(tr -cd '0-9' <"$file" 2>/dev/null || true)"
   [ -n "$last" ] || return 1
   now="$(date +%s)"
-  age=$((now - last))
+  # 10# so a zero-padded or partially-written stamp is read as decimal: bash
+  # treats a leading-zero number as OCTAL, and `09` is an arithmetic ERROR that
+  # (under set -e) would take the whole check down on every restart until
+  # somebody deleted the file.
+  age=$((now - 10#$last))
   # A stamp from the future (clock skew, a restored backup) is not a recent
   # check; treat it as no stamp rather than blocking checks until time catches up.
   [ "$age" -ge 0 ] || return 1
   if [ "$age" -lt "$BOOT_MIN_INTERVAL" ]; then
-    logmsg "boot check skipped: last check ${age}s ago (< ${BOOT_MIN_INTERVAL}s)"
+    logmsg "$label skipped: last check ${age}s ago (< ${BOOT_MIN_INTERVAL}s)"
     return 0
   fi
   return 1
 }
 
+# Single-flight: never let two update runs race on the swap. Taken and RELEASED
+# per run, never held across a sleep — the --loop poller sleeps for an hour
+# between runs, and holding the lock through that made every start-fired check
+# on a non-systemd host exit immediately as "another update run holds the lock",
+# i.e. silently never run at all.
+with_lock() {  # <cmd...>
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    logmsg "another update run holds the lock; skipping"
+    exec 9>&-
+    return 1
+  fi
+  "$@"
+  local rc=$?
+  exec 9>&-
+  return "$rc"
+}
+
+usage() {
+  echo "usage: turma-agent-update [--loop [--interval SECONDS]] [--boot] [--claude-only]" >&2
+  exit 2
+}
+
+claude_check() {
+  stamp_now "$CLAUDE_STAMP"
+  update_claude || logmsg "claude update check errored (continuing)"
+}
+
 main() {
-  local loop=no boot=no
+  local loop=no boot=no claude_only=no
   while [ $# -gt 0 ]; do
     case "$1" in
       --loop) loop=yes ;;
       --boot) boot=yes ;;
+      --claude-only) claude_only=yes ;;
       --interval) shift; INTERVAL="$1" ;;
-      *) echo "usage: turma-agent-update [--loop|--boot] [--interval SECONDS]" >&2; exit 2 ;;
+      *) usage ;;
     esac
     shift
   done
 
-  # Single-flight: never let two update runs race on the swap.
-  exec 9>"$LOCK"
-  if ! flock -n 9; then
-    logmsg "another update run holds the lock; exiting"; exit 0
-  fi
-
-  if [ "$boot" = yes ] && boot_throttled; then
-    exit 0
+  # --claude-only: the launcher's start-time Claude Code check, run to
+  # completion BEFORE the manager exists so no session can be launching while
+  # the package is replaced. Its own stamp, so it and the agent check throttle
+  # independently instead of one suppressing the other.
+  if [ "$claude_only" = yes ]; then
+    if throttled "$CLAUDE_STAMP" "claude check"; then return 0; fi
+    with_lock claude_check || return 0
+    return 0
   fi
 
   if [ "$loop" = yes ]; then
     logmsg "auto-update poller started (every ${INTERVAL}s, repo $REPO)"
     while true; do
-      run_once || logmsg "update check errored (continuing)"
+      with_lock run_once || logmsg "update check skipped/errored (continuing)"
       sleep "$INTERVAL"
     done
+  elif [ "$boot" = yes ]; then
+    if throttled "$STAMP" "boot check"; then return 0; fi
+    with_lock run_once || return 0
   else
-    run_once
+    with_lock run_once || return 0
   fi
 }
 
