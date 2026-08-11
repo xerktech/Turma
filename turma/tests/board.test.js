@@ -1847,10 +1847,13 @@ const APP_CSS = fs.readFileSync(path.join(__dirname, "../public/app.css"), "utf8
 // just the first. A guard that reads one rule is beaten by a later unscoped
 // override, which is the exact idiom the glasses/veiller vendored board.css
 // already uses, so it is one copy-paste away from re-stacking the columns.
-function rulesFor(cls) {
+function allRules() {
   return [...APP_CSS.matchAll(/([^{}]*)\{([^{}]*)\}/g)]
-    .filter(([, sel]) => new RegExp(`\\.${cls}(?![\\w-])`).test(sel))
     .map(([, sel, body]) => [sel.trim().split("\n").pop().trim(), body]);
+}
+function rulesFor(cls) {
+  const names = new RegExp(`\\.${cls}(?![\\w-])`);
+  return allRules().filter(([sel]) => names.test(sel));
 }
 
 test("board: the column strip is a flex row that scrolls sideways", () => {
@@ -1877,19 +1880,44 @@ test("board: nothing anywhere in app.css re-stacks the status columns", () => {
 
 test("board: a column is one fixed width at every viewport", () => {
   // Fixed, not fluid: the column must not grow into a wide board or shrink as
-  // the window narrows, and no media query may re-size it — a card is the same
-  // size on a phone as on a desktop, and 300px is Android's `.width(300.dp)`.
-  const rules = rulesFor("kanban-col").filter(([sel]) => /\.kanban-col(?![\w-])/.test(sel));
+  // the window narrows, and nothing may re-size it — a card is the same size on
+  // a phone as on a desktop, and 300px is Android's `.width(300.dp)`.
+  //
+  // Two ways a width creeps back in, both found by mutating this stylesheet and
+  // both of which an earlier version of this test let through: a SECOND rule on
+  // `.kanban-col` (a bare `min-width` re-sizes it just as well as `flex` does),
+  // and a rule that reaches the columns WITHOUT naming them — `.kanban-cols >
+  // div`, which is the later-unscoped-override idiom the vendored board.css
+  // files already use. So this collects every rule that can size a column by
+  // either route, and insists exactly one of them does.
+  const SIZES = /(?:^|;)\s*(?:flex|flex-basis|width|min-width|max-width)\s*:/;
+  const canSizeAColumn = ([sel]) =>
+    /\.kanban-col(?![\w-])/.test(sel) ||          // names the column
+    /\.kanban-cols\s*[>+~]/.test(sel) ||          // a combinator into the strip
+    /\.kanban-cols\s+\S/.test(sel);               // a descendant of the strip
+  // Over EVERY rule in the stylesheet, not a pre-filtered set — a pre-filter on
+  // the class name is what let `.kanban-cols > div` through in the first place.
+  const rules = allRules().filter(canSizeAColumn);
   assert.ok(rules.length, "no .kanban-col rule in app.css");
-  const sized = rules.filter(([, b]) => /(?:^|;)\s*flex\s*:/.test(b));
-  assert.equal(sized.length, 1, "the column's width must be set in exactly one place");
+
+  const sized = rules.filter(([, b]) => SIZES.test(b));
+  assert.deepEqual(sized.map(([sel]) => sel), [".kanban-col"],
+    "exactly one rule may size a column, and it must be the bare `.kanban-col` one");
   assert.match(sized[0][1], /flex:\s*0\s+0\s+300px/, "the column must be a fixed 300px");
   assert.match(sized[0][1], /min-width:\s*0/,
     "without this a long card widens the column past its fixed width");
-  for (const [sel, body] of rules) {
-    assert.doesNotMatch(body, /(?:^|;)\s*width:/, `\`${sel}\` re-sizes the column`);
-    assert.doesNotMatch(body, /flex-basis:/, `\`${sel}\` re-sizes the column`);
-  }
+});
+
+test("board: the focused card is scrolled into the strip, not left clipped", () => {
+  // The browser only auto-scrolls a focused element in when it is ENTIRELY out
+  // of view, so on a strip that scrolls a half-visible card keeps its focus ring
+  // clipped and the keyboard user loses the card they are on.
+  const src = fs.readFileSync(path.join(__dirname, "../public/board.html"), "utf8");
+  assert.match(src, /addEventListener\("focusin"/, "no focusin handler on the board");
+  const fn = /addEventListener\("focusin",[\s\S]{0,400}?\}\);/.exec(src)[0];
+  assert.match(fn, /scrollIntoView\(\{\s*block:\s*"nearest",\s*inline:\s*"nearest"\s*\}\)/,
+    "must move the minimum, in both axes");
+  assert.match(fn, /dragActive\(\)/, "a drag owns the scroll — focus must not fight it");
 });
 
 test("board: the strip carries the id preserveScroll anchors its sideways scroll to", () => {

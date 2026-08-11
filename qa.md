@@ -495,12 +495,37 @@ all. A green suite proves nothing here; measure it in a browser.
 - **A regex-over-CSS guard only sees the FIRST rule matching its selector**, so a
   later unscoped override — the pattern the vendored `board.css` files use — sails
   past it while winning the cascade. Prove any such test by mutating the stylesheet
-  and re-running it, never by reading it.
+  and re-running it, never by reading it — and re-measure the mutation in a browser,
+  because an escape is only a finding once you have shown it changes what renders.
 - `overflow-x: auto` computes `overflow-y` to `auto` too — confirm
   `scrollHeight === clientHeight` or a vertical wheel over it gets swallowed.
 - A scroll container's horizontal scrollbar sits at the bottom of **its own
   box** — on a tall board, thousands of px down the page and never on screen.
   "It scrolls" is not "the user can tell it scrolls".
+- **Swapping a stylesheet under a RUNNING hub changes nothing** — `server.js`
+  `readFileSync`s `public/*` at boot and serves `/app.css` `max-age=300`. Restart
+  the hub, and give each CSS variant **its own PORT**: `connectOverCDP` reuses one
+  browser context, so its cache outlives `clearCookies` and even
+  `Network.setCacheDisabled`, and a new origin is the only bust that always works.
+- **A snap strip whose column is WIDER than the scrollport** (the board below
+  ~330px) settles mid-column after a gesture, not at 0 — Chrome keeps the
+  over-large snap area covering the port. Not stuck: keep scrolling and it reaches
+  0/max. Sample the rest ~700ms after the wheel, and scroll BACK before calling
+  anything unreachable.
+- **Keyboard focus does not scroll a horizontal strip** (Chromium 124): `focus()`
+  and a real `Tab` onto a card in a sliced column both leave `scrollLeft` alone,
+  drawing the focus ring half off the scrollport. Compare `activeElement`'s rect
+  with the strip's rather than eyeballing it.
+- **Driving the board's drag (XERK-141) has three aims to get right**: hold
+  **still** >300ms (`LONG_PRESS_MS`; >10px first disarms it as a scroll); avoid
+  `CARD_OWN` (`.kc-key, .kc-sess, .kc-start` — that is most of a card's header
+  row); and stay INSIDE the strip's box, since past its edge `elementFromPoint`
+  is null and `highlightColAt` drops the target. A good drop POSTs
+  `/api/jira/<siteKey>/<key>/status {"category":…}` — assert on that, not on the
+  card moving (with no agent to ack, "couldn't move" is correct).
+- **Session chips need `session.ticket = {key, siteKey}`** on the beat; a flat
+  `ticketKey` indexes to nothing and the card renders chipless, which reads as a
+  renderer bug.
 
 ---
 
@@ -622,6 +647,12 @@ are holding. Re-confirm with the same script on both before you spend time.
   Deleting the call leaves all 455 vitest tests green while a scrolled-up view
   gets yanked down by a growing live turn. The behaviour is correct on both
   `main` and HEAD — it is the coverage that is missing.
+- **The board drag's edge auto-scroll is dead on a phone (≤560px).** `edgeScroll`
+  nudges `scrollLeft += 18` per pointermove and `scroll-snap-type: x proximity`
+  snaps it back, so a card only reaches a column already on screen (a peek is
+  enough). Above 560px, snap off, the same code scrolls. Reproduces on `main`'s
+  `app.css` too — snap and strip both predate XERK-253. Trace `scrollLeft` while
+  holding the pointer within 48px of the strip's right edge.
 
 ---
 
