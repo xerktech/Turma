@@ -1081,6 +1081,43 @@ function normalizeLimits(payload) {
   payload.limits = out;
 }
 
+// Coerce the local-model block at ingest, for exactly the reason normalizeLimits
+// above does it (XERK-246): this fans out to web, Android and glasses, and
+// Android decodes it into TYPED fields — `available: Boolean`, `contextTokens:
+// Int?` — so an `available` of "yes" or a contextTokens past 2^31 from ONE buggy
+// host fails the decode of the WHOLE /api/agents array, and every other host
+// silently vanishes from that phone's fleet.
+//
+// Anything unusable becomes null, which every client already reads as "this host
+// cannot fail over" — the same degradation as an agent too old to report it.
+function normalizeLocalModel(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const lm = payload.localModel;
+  if (!lm || typeof lm !== "object" || Array.isArray(lm)) {
+    if ("localModel" in payload) payload.localModel = null;
+    return;
+  }
+  // Strictly boolean: a truthy string would turn a host that cannot fail over
+  // into one the UI offers the switch on, and the command would be dropped.
+  if (lm.available !== true) {
+    payload.localModel = { available: false, model: null, contextTokens: null };
+    return;
+  }
+  const name = typeof lm.model === "string" ? lm.model.trim().slice(0, 60) : "";
+  const ctx = lm.contextTokens;
+  payload.localModel = {
+    available: true,
+    // The name is display-only here (the agent validates its own charset before
+    // launching), but it must be A STRING or the decode dies.
+    model: name || null,
+    // Int-safe or nothing: the field is unused by the UI, so dropping a bad one
+    // costs nothing and keeps the fleet decodable.
+    contextTokens:
+      typeof ctx === "number" && Number.isSafeInteger(ctx) &&
+      ctx > 0 && ctx <= 2_147_483_647 ? ctx : null,
+  };
+}
+
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
 // into the host's per-session cache, then bound its memory: drop entries older
 // than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
@@ -3417,6 +3454,7 @@ const server = http.createServer(async (req, res) => {
       // anything (the record, the cache, every client) sees them.
       normalizeUsage(payload);
       normalizeLimits(payload);
+      normalizeLocalModel(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.
@@ -5146,6 +5184,10 @@ if (process.env.TURMA_TEST) {
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
     HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+    // Ingest coercion for the local-model block. Exported for the same reason
+    // as the rest of this group: Android decodes /api/agents atomically, so one
+    // host's wrong-typed field hides the WHOLE fleet from that phone (XERK-246).
+    normalizeLocalModel,
 
     queueCommand,
     findSession,

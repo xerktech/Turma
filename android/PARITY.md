@@ -28,10 +28,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
-- **No tooltip on the "run against" chip** (XERK-246). The web chip carries a hover title naming the
-  self-hosted model; Android carries the same ☁/🏠 glyph and the same label, but a phone has no
-  hover and the model name is already the chip's own text, so there is nothing left for a tooltip
-  to add.
+- **No hover tooltips on the two compose-bar model chips** (XERK-246); a phone has no hover, so the
+  web's `title=` text goes to the accessibility layer or nowhere.
+  - The **"run against"** chip: nowhere. Its tooltip only names the self-hosted model, which is
+    already the chip's own text.
+  - The **fixed-model** chip on a local session: it carries the web's wording as a
+    `contentDescription` instead. That tooltip is not redundant — it explains why the chip is inert
+    and names the way out — so dropping it entirely would leave a dead-looking control beside two
+    live ones with no account of itself.
 - **Ticket-detail fields tap-to-change** (XERK-138 follow-up). The web detail panel shows each editable
   field's value beside a separate "Change" link/control that swaps in a `<select>`. Android instead
   renders the value itself as the control — a pill with a trailing ▾ (`SelectableValue` in

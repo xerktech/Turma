@@ -6455,3 +6455,59 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
 });
 
+test("normalizeLocalModel coerces the block so one host cannot hide the fleet", () => {
+  // Android decodes /api/agents ATOMICALLY into typed fields, so a wrong-typed
+  // localModel from ONE host throws for the whole array and every other host
+  // silently disappears from that phone. Same contract, and same reason, as
+  // normalizeLimits beside it.
+  const norm = (localModel) => {
+    const p = { device: "h", localModel };
+    hub.normalizeLocalModel(p);
+    return p.localModel;
+  };
+
+  // A good block passes through unchanged.
+  assert.deepEqual(
+    norm({ available: true, model: "gpt-oss:120b", contextTokens: 81920 }),
+    { available: true, model: "gpt-oss:120b", contextTokens: 81920 },
+  );
+
+  // `available` is STRICTLY boolean: a truthy string would offer the switch on
+  // a host that cannot do it, and the command would be acked and dropped.
+  assert.deepEqual(norm({ available: "yes", model: "x" }),
+    { available: false, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: 1 }),
+    { available: false, model: null, contextTokens: null });
+
+  // A non-string model and an out-of-Int contextTokens degrade to null rather
+  // than failing the decode. contextTokens is unused by the UI, so this is free.
+  assert.deepEqual(norm({ available: true, model: 12345, contextTokens: 9999999999 }),
+    { available: true, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: true, model: "m", contextTokens: 1.5 }),
+    { available: true, model: "m", contextTokens: null });
+
+  // Not an object at all -> null, which every client reads as "cannot fail over".
+  assert.equal(norm("yes"), null);
+  assert.equal(norm([1, 2]), null);
+  assert.equal(norm(null), null);
+
+  // An agent predating the failover sends nothing; the key must stay absent
+  // rather than become an explicit null, so the payload is byte-identical.
+  const old = { device: "h" };
+  hub.normalizeLocalModel(old);
+  assert.ok(!("localModel" in old));
+});
+
+test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm6", localModel: { available: "yes", contextTokens: 9999999999 } },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "lm6");
+  assert.equal(host.localModel.available, false);
+  assert.equal(host.localModel.contextTokens, null);
+  // And the whole fleet is still served — the point of coercing at ingest.
+  assert.ok(res.body.agents.length > 1);
+});
+

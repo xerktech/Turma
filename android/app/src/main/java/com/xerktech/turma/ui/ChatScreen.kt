@@ -66,6 +66,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -614,7 +616,11 @@ private fun ChatFooter(
             if (com.xerktech.turma.core.ModelSource.modelPickable(modelSource)) {
                 MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
             } else {
-                StaticChip("model: ${com.xerktech.turma.core.ModelSource.label(modelSource, localModel)}")
+                StaticChip(
+                    "model: ${com.xerktech.turma.core.ModelSource.label(modelSource, localModel)}",
+                    why = "Fixed by this host's self-hosted model configuration. "
+                        + "Switch \"run\" back to the subscription to choose a Claude model.",
+                )
             }
             MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
             // "Run against" — the local-model failover (XERK-246). Hidden on a
@@ -814,13 +820,22 @@ private fun MenuChip(
 
 /** A compose-bar chip stating a setting that isn't the operator's to change. */
 @Composable
-private fun StaticChip(label: String) {
-    Text(
-        label,
+private fun StaticChip(label: String, why: String) {
+    // An inert chip beside two live ones reads as broken unless it says why. The
+    // web puts this in a hover title; a phone has no hover, so it goes to the
+    // accessibility layer. It has to sit on a MERGING wrapper rather than on the
+    // Text itself — Text writes its own semantics last, so a contentDescription
+    // in the same modifier chain never reaches the tree.
+    Box(
         Modifier
+            .semantics(mergeDescendants = true) { contentDescription = "$label. $why" }
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }

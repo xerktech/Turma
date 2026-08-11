@@ -69,19 +69,25 @@ class ChatUiStateTest {
     }
 
     @Test
-    fun `a fleet beat carries every field this screen reads off it`() {
-        // This is the line a merge resolution silently truncates. Dropping
-        // `localModel` from it hides both local-model controls forever, and
-        // without this test the whole suite stays green — a Composable's body
-        // has no gate at all.
+    fun `a fleet beat carries EVERY field this screen reads off it`() {
+        // This is the line a merge resolution silently truncates, and it must
+        // name every field or it does not do its job: XERK-246 and XERK-252 both
+        // landed a field in this one `copy(...)`, so the conflict was over the
+        // list itself. Dropping `localModel` hides both local-model controls
+        // forever; dropping `tunnelOnline` is worse than a lost warning, because
+        // it defaults TRUE — the header then asserts the tunnel is up while the
+        // hub says it is down. Neither shows up anywhere else in the suite: a
+        // Composable's body has no gate at all. Add an assert here whenever you
+        // add a field there.
         val sess = SessionInfo(id = "s1", modelSource = "local")
         val agent = AgentInfo(
-            key = "h1", device = "maxai", online = true,
+            key = "h1", device = "maxai", online = true, terminalOnline = false,
             uploadMaxBytes = 5_000, localModel = configured, sessions = listOf(sess),
         )
         val s = ChatUiState().fromFleet(agent, sess, host = "h1")
         assertEquals(sess, s.session)
         assertEquals("maxai", s.hostLabel)          // device name, not the key
+        assertFalse(s.tunnelOnline)                 // drives the ⚠ header marker
         assertEquals(5_000L, s.uploadMaxBytes)      // gates the 📎
         assertEquals(configured, s.localModel)      // gates BOTH new controls
         assertTrue(s.canSwitchModelSource())
@@ -91,10 +97,12 @@ class ChatUiStateTest {
     fun `a beat from a host with no local model clears the capability`() {
         // Not merely "leaves it alone": a host that lost its configuration must
         // stop offering the switch, and a stale carried-over block would keep it.
-        val before = ChatUiState(localModel = configured)
-        val after = before.fromFleet(AgentInfo(key = "h1", online = true), null, host = "h1")
+        val before = ChatUiState(localModel = configured, tunnelOnline = false)
+        val after = before.fromFleet(
+            AgentInfo(key = "h1", online = true, terminalOnline = true), null, host = "h1")
         assertNull(after.localModel)
         assertEquals("h1", after.hostLabel)          // no device name: fall back to the key
+        assertTrue(after.tunnelOnline)               // recovers, not just degrades
         assertFalse(after.canSwitchModelSource())
     }
 }

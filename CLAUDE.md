@@ -224,6 +224,11 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
+  - **Any heartbeat field Android decodes into a TYPED one needs a `normalize*` coercion at hub
+    ingest** — `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`. `/api/agents` decodes
+    ATOMICALLY on Android, so one buggy host's wrong-typed field hides the WHOLE fleet from that
+    phone, silently: the app keeps painting its last good snapshot and still says "N / N online".
+    Coerce to the "can't tell you" value every client already handles, never to a plausible default.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 
