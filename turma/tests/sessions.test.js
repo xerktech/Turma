@@ -150,7 +150,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
-      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput,"
+      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -770,6 +770,63 @@ test("a tunnel flap re-attaches the terminal iframe, whose socket cannot self-he
   assert.equal(els.termFrame.src, "", "nothing to re-attach while the tunnel is down");
   beat({ now, agents: [h] });
   assert.equal(els.termFrame.src, "/term/11111/", "the ttyd frame is re-navigated on return");
+});
+
+// The stage's tunnel state belongs to ONE staged subject. Left over from the
+// previous one, the next session's first beat reads as a tunnel RETURN and
+// fires the heal — which in the browser meant TurmaChat.reconnectNow() landing
+// inside the open()'s own connect and opening a second /live socket the page
+// could never close (found in QA of this change).
+test("switching sessions while a tunnel is down doesn't fire the heal at the new one", () => {
+  const { beat, selectSession, els, chat } = loadPage();
+  const now = Date.now();
+  const h1 = { key: "hostA", device: "hostA", online: true, terminalOnline: true, lastSeen: now,
+    repos: [{ name: "repoX" }], sessions: [working("11111", "First")] };
+  const h2 = { key: "hostB", device: "hostB", online: true, terminalOnline: true, lastSeen: now,
+    repos: [{ name: "repoY" }], sessions: [working("22222", "Second")] };
+  beat({ now, agents: [h1, h2] });
+  selectSession("11111");
+
+  // hostA's tunnel drops while its session is staged.
+  beat({ now, agents: [{ ...h1, terminalOnline: false }, h2] });
+  assert.equal(els.chatTunnelOff.hidden, false);
+  const nudgesBefore = chat.reconnected;
+
+  // The operator picks hostB's session instead — nothing about THAT view ever
+  // went offline, so nothing about it needs healing.
+  selectSession("22222");
+  beat({ now, agents: [{ ...h1, terminalOnline: false }, h2] });
+  assert.equal(chat.reconnected, nudgesBefore, "no stale heal on the new session");
+  assert.equal(els.chatTunnelOff.hidden, true, "and no stale chip either");
+});
+
+// A host that has stopped heartbeating altogether is a different story from a
+// flapping tunnel, and the chip must not keep promising the session is fine.
+// The stage still holds (the machine may be up and merely unreachable), so it
+// also has to offer a way off it.
+test("a host that goes silent says so, and offers a way off the stage", () => {
+  const { beat, selectSession, els, clearStage } = loadPage();
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  beat({ now, agents: [{ ...h, terminalOnline: false, online: false }] });
+  assert.match(els.chatTunnelOff.textContent, /host offline/);
+  assert.doesNotMatch(els.chatTunnelOff.title, /keeps running/,
+    "no promise the page can't keep about a host it hasn't heard from");
+  assert.equal(els.chatTunnelClose.hidden, false, "and an explicit way out");
+
+  // The tunnel-only case keeps the softer wording.
+  beat({ now, agents: [{ ...h, terminalOnline: false }] });
+  assert.match(els.chatTunnelOff.textContent, /tunnel offline/);
+  assert.match(els.chatTunnelOff.title, /keeps running/);
+
+  // What that button does (its onclick): drop the stage, and the chip with it.
+  // The session itself is untouched — it is still running on its host.
+  clearStage();
+  assert.equal(els.stageEmpty.hidden, false);
+  assert.equal(els.chatTunnelOff.hidden, true);
+  assert.equal(els.chatTunnelClose.hidden, true);
 });
 
 // A beat that doesn't mention the host at all says nothing about its sessions:

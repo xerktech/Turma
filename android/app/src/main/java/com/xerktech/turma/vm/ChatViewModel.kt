@@ -16,6 +16,7 @@ import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.entryTruncated
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
+import com.xerktech.turma.core.tunnelOnlineOf
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TurnStatus
@@ -162,7 +163,7 @@ class ChatViewModel(
                 val label = agent?.device?.ifBlank { host } ?: host
                 _state.update {
                     it.copy(session = session, hostLabel = label,
-                        tunnelOnline = agent?.terminalOnline ?: true,
+                        tunnelOnline = tunnelOnlineOf(agent),
                         uploadMaxBytes = agent?.uploadMaxBytes ?: 0)
                 }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
@@ -179,7 +180,7 @@ class ChatViewModel(
         val seed = session?.session?.tail ?: emptyList()
         _state.update {
             it.copy(session = session, hostLabel = label,
-                tunnelOnline = agent?.terminalOnline ?: true,
+                tunnelOnline = tunnelOnlineOf(agent),
                 uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
                 entries = mergeTail(it.entries, seed))
         }

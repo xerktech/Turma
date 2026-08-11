@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.GitState
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.SessionInfo
@@ -180,6 +181,29 @@ class SessionsTest {
             "truenas · Turma · detached",
             sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "HEAD"))),
         )
+    }
+
+    // ---- liveMarker / tunnelOnlineOf (web's tunnel chip, XERK-252) -----------
+
+    @Test fun `a host with no tunnel outranks our own open socket`() {
+        // The hub holds our /live socket across a control-channel flap, so
+        // `connected` stays true while nothing flows. Saying "live" there claims
+        // a stream that has stopped.
+        assertEquals("⚠ tunnel offline", liveMarker(tunnelOnline = false, connected = true))
+        assertEquals("⚠ tunnel offline", liveMarker(tunnelOnline = false, connected = false))
+    }
+
+    @Test fun `a healthy host marks live only while our socket is up`() {
+        assertEquals("live", liveMarker(tunnelOnline = true, connected = true))
+        assertEquals("", liveMarker(tunnelOnline = true, connected = false))
+    }
+
+    @Test fun `a host missing from the payload is unknown, never offline`() {
+        // Nothing heard about the host is not a fault we may claim (and it is
+        // the state every screen starts in, before the first fleet payload).
+        assertEquals(true, tunnelOnlineOf(null))
+        assertEquals(true, tunnelOnlineOf(AgentInfo(key = "h1", terminalOnline = true)))
+        assertEquals(false, tunnelOnlineOf(AgentInfo(key = "h1", terminalOnline = false)))
     }
 
     // ---- workLine (web index.html workLine/unpushedCommits, XERK-78) ---------

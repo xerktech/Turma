@@ -89,6 +89,46 @@ test("reconnectNow reopens a dropped socket at once, against the right session",
   assert.match(sockets[1].url, /^wss:\/\/hub\.example\/live\/hostA\/sess-1\?auth=/);
 });
 
+// The window that made this bite in the browser: open() sets hostKey/sessionId
+// synchronously but only assigns `ws` after the ws-token round trip, and the
+// page's render() — which runs on the same tick as selectSession() — could fire
+// the reconnect nudge inside it. Two sockets were opened for one view and
+// close() could only ever close the last, so the other leaked and the hub, still
+// seeing a live client, never unwatched the session.
+test("a nudge landing inside open()'s connect doesn't open a second socket", async () => {
+  const startAndNudge = chat.startWs(chat.__gen());  // mid ws-token fetch
+  chat.reconnectNow();
+  await startAndNudge;
+  await settle();
+  assert.equal(sockets.length, 1, "one view, one socket");
+});
+
+// The guard the one above leans on, on its own: connecting is async, so two
+// concurrent connects for the same view (a retry timer and a nudge, open() and
+// a nudge) must still leave exactly one socket — `ws` holds only the last, and
+// close() can only close what `ws` holds.
+test("two concurrent connects for one view build one socket", async () => {
+  const a = chat.startWs(chat.__gen());
+  const b = chat.startWs(chat.__gen());
+  await Promise.all([a, b]);
+  await settle();
+  assert.equal(sockets.length, 1);
+});
+
+// ...but the guard is per view, not global: opening a DIFFERENT session while
+// the previous connect is still in flight must still connect.
+test("a new session connects even while the previous view is mid-connect", async () => {
+  const pending = chat.startWs(chat.__gen());
+  chat.__nextGen();                      // what close()/open() do between sessions
+  chat.__setSessionRef("hostB", "sess-2");
+  await chat.startWs(chat.__gen());
+  await pending;
+  await settle();
+  const urls = sockets.map((s) => s.url);
+  assert.equal(urls.length, 1, "the abandoned view's socket is never built");
+  assert.match(urls[0], /\/live\/hostB\/sess-2\?auth=/, "the new session got the socket");
+});
+
 test("reconnectNow is a no-op with no session on the stage", async () => {
   chat.__setSessionRef(null, null);
   await chat.reconnectNow();

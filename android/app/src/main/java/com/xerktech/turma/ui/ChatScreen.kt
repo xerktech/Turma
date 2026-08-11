@@ -83,6 +83,7 @@ import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.TextSize
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.buildItems
+import com.xerktech.turma.core.liveMarker
 import com.xerktech.turma.core.sessionHeaderMeta
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.model.TailEntry
@@ -166,25 +167,34 @@ fun ChatScreen(
                     Column {
                         Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
                         state.session?.let {
-                            // Host · repo · branch (XERK-121), + a live indicator.
-                            // A host whose tunnel is down outranks it: our own
-                            // socket stays open across a flap, so "live" would
-                            // claim a stream that has stopped (XERK-252). The
-                            // session keeps running and the screen stays put —
-                            // this only says why it has gone quiet.
+                            // Host · repo · branch (XERK-121), then whether
+                            // anything is reaching us (core `liveMarker`, the
+                            // web's tunnel chip). The marker is its OWN Text and
+                            // the meta line is what gives way: appended to that
+                            // ellipsized line, a warning nobody can read is
+                            // worse than a truncated branch name.
                             val hostLabel = state.hostLabel.ifBlank { host }
-                            val liveMark = when {
-                                !state.tunnelOnline -> " · ⚠ tunnel offline"
-                                state.connected -> " · live"
-                                else -> ""
+                            val mark = liveMarker(state.tunnelOnline, state.connected)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    sessionHeaderMeta(hostLabel, it),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false),
+                                )
+                                if (mark.isNotEmpty()) {
+                                    Text(
+                                        " · " + mark,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        maxLines = 1,
+                                        color = if (state.tunnelOnline) Color.Unspecified
+                                                else MaterialTheme.colorScheme.error,
+                                    )
+                                }
                             }
-                            Text(
-                                sessionHeaderMeta(hostLabel, it) + liveMark,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontFamily = FontFamily.Monospace,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
                         }
                     }
                 },

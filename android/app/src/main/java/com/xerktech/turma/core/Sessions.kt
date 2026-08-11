@@ -156,6 +156,29 @@ fun sessionHeaderMeta(host: String, session: SessionInfo): String =
         .joinToString(" · ")
 
 /**
+ * The marker that follows the session header's meta line: whether anything is
+ * actually reaching this screen. Web parity: the Sessions page's "⚠ tunnel
+ * offline" chip (XERK-252).
+ *
+ * A host whose terminal tunnel is down OUTRANKS [connected], which only says
+ * our own /live socket is open — the hub accepts and holds that socket across a
+ * control-channel flap, so "live" would claim a stream that has stopped.
+ */
+fun liveMarker(tunnelOnline: Boolean, connected: Boolean): String = when {
+    !tunnelOnline -> "⚠ tunnel offline"
+    connected -> "live"
+    else -> ""
+}
+
+/**
+ * Whether a session's host still has its terminal tunnel up, off the fleet
+ * heartbeat. A host missing from the payload is NOT offline — it is unknown,
+ * and the chat says nothing rather than claiming a fault it can't see.
+ */
+fun tunnelOnlineOf(agent: com.xerktech.turma.model.AgentInfo?): Boolean =
+    agent?.terminalOnline ?: true
+
+/**
  * Work-safety facts for a session (web index.html `unpushedCommits`): how many
  * commits aren't on origin yet — relative to origin/<branch> when it was ever
  * pushed, else everything past the base branch. Null = unknown (first beat,

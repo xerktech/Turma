@@ -280,6 +280,14 @@
     color: var(--warning); border: 1px solid var(--warning); background: transparent;
   }
   .term-bar .tunnel-off[hidden] { display: none; }
+  /* Shown with the chip: the stage no longer clears itself when a host goes
+     quiet, so this is the way off it when there's no other session to pick. */
+  .term-bar .tunnel-close {
+    font: inherit; font-size: 11px; padding: 2px 8px; border-radius: 999px; cursor: pointer;
+    color: var(--ink-2); background: var(--surface); border: 1px solid var(--border);
+  }
+  .term-bar .tunnel-close:hover { border-color: var(--accent); color: var(--accent); }
+  .term-bar .tunnel-close[hidden] { display: none; }
 
   /* ---- Search box + archive (durable, searchable ended-session history) ----- */
   .searchbox { margin-bottom: 8px; position: relative; }
@@ -836,8 +844,9 @@
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="chatTitle"></span> · <span class="path" id="chatPath"></span></span>
-          <span class="tunnel-off" id="chatTunnelOff" hidden
-                title="This host's terminal tunnel is down. The session keeps running; the view reconnects on its own when the tunnel comes back.">⚠ tunnel offline</span>
+          <span class="tunnel-off" id="chatTunnelOff" hidden></span>
+          <button class="tunnel-close" id="chatTunnelClose" hidden onclick="clearStage()"
+                  title="Close this view. The session is unaffected — reopen it from the list.">Close</button>
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
           <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
@@ -873,8 +882,9 @@
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <button class="seg-toggle" id="termChatBtn" onclick="terminalToChat()" title="Back to the native chat view">◂ Chat</button>
           <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
-          <span class="tunnel-off" id="termTunnelOff" hidden
-                title="This host's terminal tunnel is down. The session keeps running; the terminal re-attaches on its own when the tunnel comes back.">⚠ tunnel offline</span>
+          <span class="tunnel-off" id="termTunnelOff" hidden></span>
+          <button class="tunnel-close" id="termTunnelClose" hidden onclick="clearStage()"
+                  title="Close this view. The session is unaffected — reopen it from the list.">Close</button>
           <span class="spacer"></span>
           <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
           <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
@@ -1813,7 +1823,7 @@ function render(data) {
   if (currentId) {
     const rec = sessionRecord(currentId);
     const host = rec ? rec.a : agentByKey(currentHostKey);
-    if (host) setStageTunnel(!!host.terminalOnline);
+    if (host) setStageTunnel(!!host.terminalOnline, !!host.online);
     if (host && (!rec || rec.s.status !== "running")) clearStage();
     else if (rec && (viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
       // Refresh the chat header + pending-question region from the new
@@ -2256,6 +2266,7 @@ function navFrame(src) {
 function setFrame(id, s, a) {
   currentId = id;
   if (a && a.key) currentHostKey = a.key;
+  stageTunnelReset();   // a fresh subject starts with a clean tunnel state
   const src = `/term/${encodeURIComponent(id)}/`;
   document.getElementById("termTitle").textContent = s ? sessTitle(s) : id;
   document.getElementById("termPath").textContent =
@@ -2325,6 +2336,7 @@ function selectSession(id) {
   $chatPane.hidden = false;
   disarmChatKill();
   currentHostKey = hit.a.key;
+  stageTunnelReset();   // this session's tunnel is up — it's how we reached it
   if (window.TurmaChat) TurmaChat.open(hit.a.key, id, hit.s, hit.a);
   enterStage();
   render(cache); // refresh the .cur highlight
@@ -2396,12 +2408,41 @@ function enterStage() {
 //     with the tunnel and nothing in the frame retries it.
 // Transitions only — every beat calls this, and re-navigating the iframe on
 // each one would restart the terminal every few seconds.
+//
+// It belongs to ONE staged subject, so every path that changes what the stage
+// shows resets it through stageTunnelReset() — otherwise the previous
+// subject's `false` makes the next session's first beat look like a tunnel
+// RETURN and fires the heal at a view that never lost anything.
 let stageTunnelOnline = true;
-function setStageTunnel(online) {
+function stageTunnelReset() {
+  stageTunnelOnline = true;
+  for (const id of ["chatTunnelOff", "termTunnelOff", "chatTunnelClose", "termTunnelClose"]) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = true;
+  }
+}
+// `online` is the host's terminal tunnel; `hostUp` is the host itself (its
+// heartbeat). A host that has gone silent altogether is a different — and
+// worse — story than a flapping tunnel, and the chip must not keep promising
+// that "the session keeps running" when nothing has been heard from the
+// machine for over a minute.
+function setStageTunnel(online, hostUp) {
   const chip = document.getElementById("chatTunnelOff");
   const termChip = document.getElementById("termTunnelOff");
-  if (chip) chip.hidden = online;
-  if (termChip) termChip.hidden = online;
+  const label = hostUp === false ? "⚠ host offline" : "⚠ tunnel offline";
+  const title = hostUp === false
+    ? "This host has stopped reporting. Its session may still be running there — nothing is streaming until the host is back."
+    : "This host's terminal tunnel is down. The session keeps running; the view reconnects on its own when the tunnel comes back.";
+  for (const el of [chip, termChip]) {
+    if (!el) continue;
+    el.hidden = online;
+    el.textContent = label;
+    el.title = title;
+  }
+  for (const id of ["chatTunnelClose", "termTunnelClose"]) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = online;
+  }
   if (online === stageTunnelOnline) return;
   const returned = online && !stageTunnelOnline;
   stageTunnelOnline = online;
@@ -2412,8 +2453,7 @@ function setStageTunnel(online) {
 function clearStage() {
   currentId = null;
   currentHostKey = null;
-  stageTunnelOnline = true;
-  setStageTunnel(true);
+  stageTunnelReset();
   currentTranscriptId = null;
   subagentReturn = null;
   resetEndedBar();
@@ -2665,6 +2705,8 @@ async function openEndedSession(id) {
   followedSpawn = false;
   endedViewId = id;
   currentId = null;
+  currentHostKey = null;
+  stageTunnelReset();   // this view isn't a live session's; it has no tunnel
   currentTranscriptId = null;
   subagentReturn = null;
   trHighlight = null;
@@ -2741,6 +2783,8 @@ async function openTranscript(id, title, hi) {
   subagentReturn = null; // an archive open -> Back goes to the list
   document.getElementById("trBackLabel").textContent = " Sessions";
   currentId = null;
+  currentHostKey = null;
+  stageTunnelReset();
   disarmTermKill();
   document.getElementById("trTitle").textContent = title || id;
   document.getElementById("trPath").textContent = "loading…";

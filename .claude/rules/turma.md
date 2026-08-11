@@ -172,20 +172,30 @@ auto-start/auto-stop and the two tracker writes.
   which used to evict the operator mid-read:
   - **A host whose terminal tunnel went offline.** Every hub restart flaps every host's control
     channel (they all reconnect within a second or two) while the sessions keep running and keep
-    heartbeating. The stage holds, both bars show a **"⚠ tunnel offline"** chip
-    (`setStageTunnel`, mirrored by Android's header marker), and the RETURN heals in place: the chat
-    reconnects its socket at once (`TurmaChat.reconnectNow`, since the hub held the watch and
-    re-arms it) and the ttyd iframe is re-navigated, because its WebSocket died with the tunnel and
-    nothing inside the frame retries. Transitions only — re-navigating per beat restarts the
-    terminal every few seconds.
+    heartbeating. The stage holds, both bars show a chip (`setStageTunnel`, mirrored by Android's
+    `liveMarker`), and the RETURN heals in place: the chat reconnects its socket at once
+    (`TurmaChat.reconnectNow`, since the hub held the watch and re-arms it) and the ttyd iframe is
+    re-navigated, because its WebSocket died with the tunnel and nothing inside the frame retries.
+    Transitions only — re-navigating per beat restarts the terminal every few seconds.
+    - The chip **says which fault it is**: a host still heartbeating reads "⚠ tunnel offline" and
+      promises the session is running; one that has gone silent reads "⚠ host offline" and promises
+      nothing. Since the stage no longer clears itself, the chip carries a **Close** beside it —
+      otherwise a dead host with no other session to pick leaves no way off the stage.
+    - `stageTunnelOnline` belongs to ONE staged subject: every path that re-points the stage calls
+      `stageTunnelReset()`. Left stale, the next session's first beat reads as a tunnel RETURN and
+      fires the heal at a view that never lost anything — which opened a duplicate `/live` socket.
   - **A beat that doesn't mention the host at all** (a hub answering before the first heartbeat
     lands, a failed refresh). Silence about a host says nothing about its sessions;
     `currentHostKey` is what tells the two apart.
   - **The org filter.** The check reads the WHOLE fleet (`sessionRecord`, like `sessionHit`), never
     the org-scoped `running` — scoping is a sidebar concern (XERK-62).
   - `loadHistory` bails before building its URL when the view has closed; without it a 202-retry
-    timer fetches `/api/agents/null/sessions/null/history`. Tests: the tunnel-flap cases in
-    `sessions.test.js`, `chat-live.test.js`.
+    timer fetches `/api/agents/null/sessions/null/history`.
+  - **`startWs` is single-flight PER GENERATION** (`wsStarting`): it assigns `ws` only after the
+    ws-token round trip, so two connects for one view (a retry timer and a nudge) each built a
+    socket and `close()` — which knows only the last — leaked the other, leaving the hub a live
+    client it never unwatched. Keyed by generation, not a bare flag, so opening a DIFFERENT session
+    still connects. Tests: the tunnel-flap cases in `sessions.test.js`, `chat-live.test.js`.
 - It renders chat bubbles — **user right, agent left** — with collapsible tool-action cards
   (tool_use + its paired tool_result, error-styled) and collapsed thinking traces, and the
   in-progress turn as a trailing bubble.
