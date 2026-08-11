@@ -156,30 +156,27 @@ fun sessionHeaderMeta(host: String, session: SessionInfo): String =
         .joinToString(" · ")
 
 /**
- * Why an open session has gone quiet when it is its HOST that is out of reach,
- * rather than the session that ended — the port of the web Sessions page's
- * held-stage strip (`#stageHold`, XERK-252). Null means the host is answering
- * for itself, which is what makes the notice clear itself.
+ * The marker that follows the session header's meta line: whether anything is
+ * actually reaching this screen. Web parity: the Sessions page's "⚠ tunnel
+ * offline" chip (XERK-252).
  *
- * The two faults are worded apart because they mean different things: an offline
- * host isn't reporting at all, while a live host with a dead tunnel is still
- * working — only its pane and live tail are unreachable. Offline wins when both
- * are true, since a silent host's tunnel is down as a consequence.
- *
- * Neither one closes the view. A tunnel drops on every hub restart (a deploy
- * reconnects every host's in the same second), and an unreachable host is not an
- * ended session. Both flags default to TRUE at every call site: a beat carrying
- * no record for this host is no news, never a fault.
+ * A host whose terminal tunnel is down OUTRANKS [connected], which only says
+ * our own /live socket is open — the hub accepts and holds that socket across a
+ * control-channel flap, so "live" would claim a stream that has stopped.
  */
-fun hostHoldNotice(hostLabel: String, hostOnline: Boolean, terminalOnline: Boolean): String? {
-    val who = hostLabel.ifBlank { "This session's host" }
-    val what = when {
-        !hostOnline -> "$who is offline"
-        !terminalOnline -> "$who's terminal tunnel is down"
-        else -> return null
-    }
-    return "$what — holding this session. Nothing is lost; it reconnects on its own."
+fun liveMarker(tunnelOnline: Boolean, connected: Boolean): String = when {
+    !tunnelOnline -> "⚠ tunnel offline"
+    connected -> "live"
+    else -> ""
 }
+
+/**
+ * Whether a session's host still has its terminal tunnel up, off the fleet
+ * heartbeat. A host missing from the payload is NOT offline — it is unknown,
+ * and the chat says nothing rather than claiming a fault it can't see.
+ */
+fun tunnelOnlineOf(agent: com.xerktech.turma.model.AgentInfo?): Boolean =
+    agent?.terminalOnline ?: true
 
 /**
  * Work-safety facts for a session (web index.html `unpushedCommits`): how many

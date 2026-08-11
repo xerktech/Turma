@@ -14,9 +14,9 @@ import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.entryTruncated
-import com.xerktech.turma.core.hostHoldNotice
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
+import com.xerktech.turma.core.tunnelOnlineOf
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TurnStatus
@@ -54,6 +54,13 @@ data class ChatUiState(
     val liveAgents: List<com.xerktech.turma.model.AgentRow> = emptyList(),
     val verbosity: Verbosity = Verbosity.CONCISE,
     val connected: Boolean = false,
+    // Whether the session's HOST still has its terminal tunnel (control
+    // channel) up, off the fleet heartbeat. Distinct from [connected], which
+    // only says our own /live socket is open: the hub accepts and holds that
+    // socket across a tunnel flap, so it stays open while nothing flows
+    // (XERK-252). True until a beat says otherwise, so the very first frames —
+    // before any fleet payload has arrived — don't flash "tunnel offline".
+    val tunnelOnline: Boolean = true,
     val hasMore: Boolean = false,
     val loadingHistory: Boolean = false,
     val mic: MicState = MicState.IDLE,
@@ -67,11 +74,6 @@ data class ChatUiState(
     // The host this session's agent runs on, shown in the header (XERK-121):
     // the agent's device name, falling back to its registration key.
     val hostLabel: String = "",
-    // Whether that host can currently answer for the session (XERK-252). Both
-    // default TRUE and both mean "as far as we know": a fleet beat that carries
-    // no record for this host tells us nothing, and must not be read as a fault.
-    val hostOnline: Boolean = true,
-    val terminalOnline: Boolean = true,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     val question: String get() = session?.session?.question ?: ""
@@ -84,11 +86,6 @@ data class ChatUiState(
     // Attaching is off while a question is pending: the draft then routes to
     // POST .../answer, which carries no files (web chat.js renderAttachments).
     val canAttach: Boolean get() = Uploads.canAttach(uploadMaxBytes) && question.isBlank()
-
-    // Why the conversation has gone quiet when it is the host, not the session,
-    // that is out of reach (XERK-252). Shared with the terminal screen, which
-    // has the same strip over the same fault — see core/Sessions.kt.
-    val holdNotice: String? get() = hostHoldNotice(hostLabel, hostOnline, terminalOnline)
 }
 
 class ChatViewModel(
@@ -166,10 +163,8 @@ class ChatViewModel(
                 val label = agent?.device?.ifBlank { host } ?: host
                 _state.update {
                     it.copy(session = session, hostLabel = label,
-                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
-                        // No record for this host = no news, not a fault (XERK-252).
-                        hostOnline = agent?.online ?: true,
-                        terminalOnline = agent?.terminalOnline ?: true)
+                        tunnelOnline = tunnelOnlineOf(agent),
+                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0)
                 }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
@@ -185,9 +180,8 @@ class ChatViewModel(
         val seed = session?.session?.tail ?: emptyList()
         _state.update {
             it.copy(session = session, hostLabel = label,
+                tunnelOnline = tunnelOnlineOf(agent),
                 uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
-                hostOnline = agent?.online ?: true,
-                terminalOnline = agent?.terminalOnline ?: true,
                 entries = mergeTail(it.entries, seed))
         }
     }

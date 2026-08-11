@@ -17,8 +17,9 @@ that component's files.
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**` | guard hook, AskUserQuestion bridge |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
-| `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, sessions/chat, archive, notifications, auth |
+| `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
+| `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
 | `.claude/rules/release.md` | `.github/**`, `VERSION`, Dockerfiles | releases, PR gates, image tiers |
@@ -34,8 +35,8 @@ that component's files.
     cost of a large file is context tokens and weaker adherence, which is what the ceiling protects.
     A ceiling stated as a truncation cliff was wrong; do not restore that framing.
   - **When a file approaches the ceiling, split it by path into another rules file** — that is the
-    remedy, not raising the number and not deleting rationale. `agent-board.md` and `turma-board.md`
-    exist for exactly that reason.
+    remedy, not raising the number and not deleting rationale. `agent-board.md`, `turma-board.md`
+    and `turma-sessions.md` exist for exactly that reason.
 - **Put a fact in the narrowest file that always sees it.** Component detail → that component's
   rules file. A rule spanning two components → "Cross-cutting contracts" below, since a
   `paths:`-scoped file does not load when Claude works on the other side of the contract.

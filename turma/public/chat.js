@@ -456,6 +456,10 @@
   // see what is still going, and where the list used to blink out.
   let liveAgents = [];
   let ws = null, backoffIdx = 0, wsRetryTimer = null;
+  // The generation a startWs() is currently mid-connect for (null = none). See
+  // startWs — it is keyed by generation, not a bare flag, so opening a DIFFERENT
+  // session always gets its socket.
+  let wsStarting = null;
   let pollTimer = null;
   // Whether the reader is following the tail. True on open (so we land at the
   // bottom even after the async /history load grows the transcript below the
@@ -511,7 +515,24 @@
     return base + "/live/" + enc(hostKey) + "/" + enc(sessionId) + "?auth=" + enc(token);
   }
 
+  // Single-flight PER GENERATION, because connecting is ASYNC: `ws` is only
+  // assigned after the ws-token round trip, so two callers landing in that
+  // window for the same view (open() and the page's reconnect nudge, a retry
+  // timer and a nudge) would each build a socket, and `close()` — which only
+  // knows the last one assigned — could never close the other. It would sit
+  // open, and the hub, still seeing a live client, would never unwatch the
+  // session.
+  //
+  // Keyed by generation rather than a bare flag: opening a DIFFERENT session
+  // must always connect, and the older connect then discards itself at its own
+  // generation check below rather than being suppressed here.
   async function startWs(myGen) {
+    if (wsStarting === myGen) return;
+    wsStarting = myGen;
+    try { await openWs(myGen); } finally { if (wsStarting === myGen) wsStarting = null; }
+  }
+
+  async function openWs(myGen) {
     let token;
     try { token = await getToken(); }
     catch { scheduleReconnect(myGen); return; }
@@ -557,6 +578,19 @@
     sock.onerror = () => { try { sock.close(); } catch {} };
   }
 
+  // Reconnect the live socket NOW instead of waiting out the backoff — the page
+  // calls this the moment the staged session's host gets its tunnel back
+  // (XERK-252), so a flap costs the operator a second rather than up to a whole
+  // BACKOFF_MS step. A socket that's still open (the hub holds it across a flap
+  // and re-arms the agent's watch on control reconnect) needs nothing.
+  function reconnectNow() {
+    if (!hostKey || !sessionId || wsStarting === gen) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+    backoffIdx = 0;
+    startWs(gen);
+  }
+
   function scheduleReconnect(myGen) {
     if (myGen !== gen || wsRetryTimer) return;
     const delay = BACKOFF_MS[Math.min(backoffIdx, BACKOFF_MS.length - 1)];
@@ -570,10 +604,10 @@
   // ---- /history fallback (initial scrollback + WS-down updates) -------------
   async function loadHistory(myGen, retries) {
     retries = retries || 0;
-    // Bail BEFORE the fetch, not after it (XERK-252). The 202-retry timer below
-    // outlives a close(), and a fetch built from the nulled ids goes out as
-    // /api/agents/null/sessions/null/history — a 404 whose only effect is to
-    // make a QA pass wonder what asked for it.
+    // A closed view has no URL to fetch: close() nulls hostKey/sessionId, and a
+    // 202-retry timer already in flight would otherwise build (and 404 on)
+    // `/api/agents/null/sessions/null/history`. The gen check downstream only
+    // discards the RESULT — this is what stops the request.
     if (myGen !== gen || !hostKey || !sessionId) return;
     let r;
     try { r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/history"); }
@@ -2303,32 +2337,6 @@
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
-  // The session's host came back after a tunnel flap (XERK-252). The hub holds
-  // the browser's /live socket across most flaps, so the common case here is a
-  // socket that never dropped — hence the OPEN/CONNECTING early-out. Restarting
-  // a socket that really did die is this function's actual job, with the backoff
-  // reset so the next attempt starts NOW rather than a backoff step away. That
-  // is all it buys: the attempt can still fail and fall back into the ordinary
-  // reconnect ladder, so this shortens recovery, it doesn't guarantee it.
-  function wake() {
-    if (!hostKey || !sessionId) return;
-    const myGen = gen;
-    // NOT what closes the gap on an ordinary flap: the hub serves /history from
-    // a cache for HISTORY_FRESH_MS (5 min), so a shorter outage gets a 200 of
-    // the same entries we already have. What re-delivers the missed ones is the
-    // agent's watch being re-armed on control reconnect, which re-emits its
-    // tail. This is here for the LONGER outage, where that cache has expired.
-    loadHistory(myGen);
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    // Anything else (CLOSING, CLOSED) is replaced, not waited on — but detach
-    // its onclose first, or that socket's own scheduleReconnect() mints a THIRD
-    // socket which orphans the one started here.
-    if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
-    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
-    backoffIdx = 0;
-    startWs(myGen);
-  }
-
   // Called from the page's render() on each heartbeat/SSE while chat is open.
   // `a` is the session's host payload when the caller has a fresh one — it
   // carries the probed `models` block the model menu is built from, which would
@@ -2346,10 +2354,12 @@
   }
 
   if (typeof window !== "undefined") {
-    window.TurmaChat = { open, close, wake, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
+    window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
       // sendFailure/isTooLong are shared with the terminal composer so the two
       // compose bars word a refusal identically (XERK-227).
       isBusy, stop, actionFailed, sendFailure, isTooLong,
+      // The page calls this when the host's tunnel comes back (XERK-252).
+      reconnectNow,
       // The terminal composer sends through the same /input, so it reads the
       // staged attachments from here rather than keeping a second list
       // (XERK-234).
@@ -2383,6 +2393,12 @@
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
+      loadHistory, reconnectNow, startWs,
+      __setSessionRef: (hk, id) => { hostKey = hk; sessionId = id; },
+      __gen: () => gen,
+      // What open()/close() do between two sessions: everything in flight for
+      // the old view is invalidated by the bump alone.
+      __nextGen: () => { gen++; },
       attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, attachFiles,
       clearAttachments, MAX_ATTACHMENTS,
       __setAttachments: (a) => { attachments = a; },
@@ -2396,10 +2412,6 @@
       modelChipLabel, modeChipValue,
       __setSess: (s) => { sess = s; sessionId = s && s.id; },
       __setHostKey: (k) => { hostKey = k; },
-      // The tunnel-flap heal (XERK-252): `loadHistory` is exported to prove it
-      // refuses to fetch once the ids are gone, `wake` to prove what it does
-      // (and doesn't do) to a socket that is still open.
-      loadHistory, wake, __gen: () => gen, __setWs: (s) => { ws = s; },
       __setAgent: (a) => { agent = a; },
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
       localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,

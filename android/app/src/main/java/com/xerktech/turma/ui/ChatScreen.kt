@@ -83,6 +83,7 @@ import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.TextSize
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.buildItems
+import com.xerktech.turma.core.liveMarker
 import com.xerktech.turma.core.sessionHeaderMeta
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.model.TailEntry
@@ -166,15 +167,34 @@ fun ChatScreen(
                     Column {
                         Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
                         state.session?.let {
-                            // Host · repo · branch (XERK-121), + a live indicator.
+                            // Host · repo · branch (XERK-121), then whether
+                            // anything is reaching us (core `liveMarker`, the
+                            // web's tunnel chip). The marker is its OWN Text and
+                            // the meta line is what gives way: appended to that
+                            // ellipsized line, a warning nobody can read is
+                            // worse than a truncated branch name.
                             val hostLabel = state.hostLabel.ifBlank { host }
-                            Text(
-                                sessionHeaderMeta(hostLabel, it) + if (state.connected) " · live" else "",
-                                style = MaterialTheme.typography.bodySmall,
-                                fontFamily = FontFamily.Monospace,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                            val mark = liveMarker(state.tunnelOnline, state.connected)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    sessionHeaderMeta(hostLabel, it),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false),
+                                )
+                                if (mark.isNotEmpty()) {
+                                    Text(
+                                        " · " + mark,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        maxLines = 1,
+                                        color = if (state.tunnelOnline) Color.Unspecified
+                                                else MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                            }
                         }
                     }
                 },
@@ -252,15 +272,7 @@ fun ChatScreen(
             }
         },
     ) { pad ->
-      Column(Modifier.fillMaxSize().padding(pad)) {
-        // The held-session strip (web #stageHold, XERK-252): the host is out of
-        // reach, so the transcript below is frozen rather than finished. Above
-        // the conversation and outside the scroll, so it can't be scrolled away.
-        state.holdNotice?.let { HoldBar(it) }
-        // weight(1f), not fillMaxSize: the strip above is an unweighted sibling,
-        // and a fill-max child would measure against the whole column and push it
-        // out of view.
-        Box(Modifier.weight(1f).fillMaxWidth()) {
+        Box(Modifier.fillMaxSize().padding(pad)) {
             // Wrap the transcript so its text is selectable + copyable, matching the
             // web chat, which relies on native browser selection to copy session text
             // (XERK-64). Long-press selects; tap still toggles tool/thinking cards.
@@ -304,7 +316,6 @@ fun ChatScreen(
                 }
             }
         }
-      }
     }
 }
 

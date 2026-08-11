@@ -262,18 +262,6 @@
   .stage-empty .big { font-size: 15px; color: var(--ink-2); font-weight: 600; }
   .stage-empty .hint { font-size: 12.5px; max-width: 420px; line-height: 1.5; }
 
-  /* The held-stage strip (XERK-252): the session's host is unreachable, so the
-     pane below it is frozen rather than dead. Warning-coloured, not critical —
-     nothing has been lost and it heals itself. */
-  .stage-hold {
-    display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
-    padding: 7px 12px; font-size: 12.5px; line-height: 1.4;
-    color: var(--ink); background: color-mix(in srgb, var(--warning) 22%, var(--surface));
-    border-bottom: 1px solid color-mix(in srgb, var(--warning) 45%, var(--hairline));
-  }
-  .stage-hold[hidden] { display: none; }
-  .stage-hold .what { font-weight: 600; }
-
   .term-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   /* Both panes set `display: flex`, an author rule that would otherwise beat the
      UA `[hidden] { display: none }` (author origin wins over UA regardless of
@@ -284,6 +272,22 @@
   .term-pane iframe { flex: 1; border: 0; width: 100%; background: #000; }
   .term-bar .back-btn { display: none; }
   .term-bar .t-title .name { font-weight: 600; }
+  /* The staged session's host lost its terminal tunnel (XERK-252). The stage
+     stays put — the session is still running — so this says why the view has
+     stopped moving, and disappears when the tunnel returns. */
+  .term-bar .tunnel-off {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+    color: var(--warning); border: 1px solid var(--warning); background: transparent;
+  }
+  .term-bar .tunnel-off[hidden] { display: none; }
+  /* Shown with the chip: the stage no longer clears itself when a host goes
+     quiet, so this is the way off it when there's no other session to pick. */
+  .term-bar .tunnel-close {
+    font: inherit; font-size: 11px; padding: 2px 8px; border-radius: 999px; cursor: pointer;
+    color: var(--ink-2); background: var(--surface); border: 1px solid var(--border);
+  }
+  .term-bar .tunnel-close:hover { border-color: var(--accent); color: var(--accent); }
+  .term-bar .tunnel-close[hidden] { display: none; }
 
   /* ---- Search box + archive (durable, searchable ended-session history) ----- */
   .searchbox { margin-bottom: 8px; position: relative; }
@@ -821,10 +825,6 @@
     </aside>
 
     <main class="stage" id="stage">
-      <!-- Why the staged session has gone quiet, when its host can't answer for
-           it right now (XERK-252). Above every pane, so it reads the same in
-           chat and in the raw terminal. -->
-      <div class="stage-hold" id="stageHold" hidden></div>
       <div class="stage-empty" id="stageEmpty">
         <div class="big" id="stageEmptyBig">No session attached</div>
         <div class="hint" id="stageEmptyHint">Pick a running session to attach to its live terminal, or search the box on the left to find and read any ended session's transcript — history is kept even after a session is killed or its host goes offline. Managing sessions (restart, kill, delete) and host controls live on the Dashboard.</div>
@@ -844,6 +844,9 @@
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="chatTitle"></span> · <span class="path" id="chatPath"></span></span>
+          <span class="tunnel-off" id="chatTunnelOff" hidden></span>
+          <button class="tunnel-close" id="chatTunnelClose" hidden onclick="clearStage()"
+                  title="Close this view. The session is unaffected — reopen it from the list.">Close</button>
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
           <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
@@ -879,6 +882,9 @@
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <button class="seg-toggle" id="termChatBtn" onclick="terminalToChat()" title="Back to the native chat view">◂ Chat</button>
           <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
+          <span class="tunnel-off" id="termTunnelOff" hidden></span>
+          <button class="tunnel-close" id="termTunnelClose" hidden onclick="clearStage()"
+                  title="Close this view. The session is unaffected — reopen it from the list.">Close</button>
           <span class="spacer"></span>
           <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
           <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
@@ -1796,36 +1802,34 @@ function render(data) {
   restoreComposerScrolls();
   if ($sidebar && scrollTop && $sidebar.scrollTop !== scrollTop) $sidebar.scrollTop = scrollTop;
 
-  // What became of the attached session — decided on POSITIVE EVIDENCE only
-  // (XERK-252). Only the session's OWN host can say it is gone; an unreachable
-  // host is not an ended session, and its terminal tunnel drops on every hub
-  // deploy (a restart reconnects all of them at once), which used to evict the
-  // operator from whatever conversation they were mid-read of.
+  // If the attached SESSION vanished (killed elsewhere, stopped), drop the
+  // stage back to the empty prompt — but only on POSITIVE evidence, and only
+  // about the session itself (XERK-252):
   //
-  // Read against `data.agents` — the WHOLE fleet, never the org-scoped `agents`
-  // above. Narrowing the header's filter scopes the sidebar and must never tear
-  // an open session off the stage (XERK-62); sessionHit() reads `cache` direct
-  // for the same reason.
+  //  - the question is asked of the WHOLE fleet (`sessionRecord`, like
+  //    sessionHit), never of `running` above, which is org-scoped: the org
+  //    filter is a sidebar scope, and an open session must not be torn off the
+  //    stage because its org left the list (XERK-62);
+  //  - the host has to be REPORTING for its silence to mean anything. A payload
+  //    that doesn't mention it at all (a hub restarted before the first
+  //    heartbeat landed, a failed refresh) is not evidence the session is gone;
+  //  - a host whose terminal tunnel merely went offline is not evidence either.
+  //    The control channel flaps every time the hub redeploys — every host
+  //    reconnects within a second or two — while the session keeps running and
+  //    keeps being heartbeated. Tearing the stage down on that beat evicted the
+  //    operator from the conversation they were reading, closed its /live
+  //    socket (leaving the hub nothing to re-arm when the tunnel returned), and
+  //    left re-selecting the session as the only way back.
   if (currentId) {
-    const own = (data.agents || []).find(x => x.key === currentHostKey);
-    if (own && !(own.online && own.terminalOnline)) {
-      // Held: keep the pane, the live tail and the scrollback exactly as they
-      // are, say why on screen, and heal when the host reports again.
-      holdStage(own);
-    } else {
-      // The host is answering for itself (or we never knew which host it was),
-      // so its session list is the truth: absent or no longer running = gone.
-      const still = own && (own.sessions || []).find(s => s.id === currentId && s.status === "running");
-      if (!still) clearStage();
-      else {
-        releaseStage();
-        if ((viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
-          // Refresh the chat header + pending-question region from the new
-          // heartbeat; the host payload rides along so the model menu tracks the
-          // agent's probed `models` block rather than open()'s snapshot.
-          TurmaChat.onPoll(still, own);
-        }
-      }
+    const rec = sessionRecord(currentId);
+    const host = rec ? rec.a : agentByKey(currentHostKey);
+    if (host) setStageTunnel(!!host.terminalOnline, !!host.online);
+    if (host && (!rec || rec.s.status !== "running")) clearStage();
+    else if (rec && (viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
+      // Refresh the chat header + pending-question region from the new
+      // heartbeat; the host payload rides along so the model menu tracks the
+      // agent's probed `models` block rather than open()'s snapshot.
+      TurmaChat.onPoll(rec.s, rec.a);
     }
   }
 
@@ -2141,12 +2145,10 @@ const $termPane = document.getElementById("termPane");
 const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
 const $stageEmpty = document.getElementById("stageEmpty");
-const $stageHold = document.getElementById("stageHold");
 let currentId = null;
-// The host the staged session was attached to. Remembered rather than re-derived
-// each beat, because the whole point of the hold (XERK-252) is to survive the
-// moments when the fleet payload can't answer for the session — a host that has
-// gone quiet, or dropped its terminal tunnel, is exactly when a lookup fails.
+// The host the staged session belongs to, remembered across beats — see
+// render()'s vanish check, which needs it to tell a host that has dropped the
+// session from a host we simply can't see this beat.
 let currentHostKey = null;
 let viewMode = null; // "chat" | "terminal" | "transcript" | "subagent" | null — what the stage shows
 // When a subagent transcript is open (clicked from a live session's agent list),
@@ -2261,8 +2263,13 @@ function navFrame(src) {
   try { $frame.contentWindow.location.replace(src); }
   catch { $frame.src = src; }
 }
+// NOT a stageTunnelReset() site, unlike the four that re-point the stage: the
+// only caller is chatToTerminal(), a VIEW TOGGLE on the session already staged.
+// Resetting here would hide the chip explaining why the terminal is dead and
+// spend the tunnel's return edge, so the iframe would never re-attach.
 function setFrame(id, s, a) {
   currentId = id;
+  if (a && a.key) currentHostKey = a.key;
   const src = `/term/${encodeURIComponent(id)}/`;
   document.getElementById("termTitle").textContent = s ? sessTitle(s) : id;
   document.getElementById("termPath").textContent =
@@ -2273,15 +2280,29 @@ function setFrame(id, s, a) {
   const inp = document.getElementById("termInput");
   if (inp) { inp.value = ""; autoGrowTermInput(); }
 }
+// The last-reported {host, session} for a session id, whatever its state and
+// whatever the org filter is currently showing: this reads the WHOLE fleet
+// (like sessionHit), because an open session belongs to the stage, not to the
+// sidebar's scope.
+function sessionRecord(id) {
+  for (const a of (cache.agents || [])) {
+    const s = (a.sessions || []).find(x => x.id === id);
+    if (s) return { a, s };
+  }
+  return null;
+}
 // The last-reported record for a session, whatever its state — unlike
 // sessionHit() this doesn't require the host's terminal tunnel, since renaming
 // touches the registry rather than the session's pane.
 function findSession(id) {
-  for (const a of (cache.agents || [])) {
-    const s = (a.sessions || []).find(x => x.id === id);
-    if (s) return s;
-  }
-  return null;
+  const rec = sessionRecord(id);
+  return rec ? rec.s : null;
+}
+// The host a session was staged from, so a beat that doesn't mention the
+// session at all can still tell "its host is reporting and has dropped it"
+// from "we can't see its host right now". See render()'s vanish check.
+function agentByKey(key) {
+  return key ? (cache.agents || []).find(a => a.key === key) || null : null;
 }
 function sessionHit(id) {
   const now = cache.now || Date.now();
@@ -2310,8 +2331,6 @@ function selectSession(id) {
   // isNarrow(), so it re-reveals on mobile and no-ops on desktop (XERK-17).
   if (id === currentId && viewMode === "chat") { enterStage(); return; }
   currentId = id;
-  currentHostKey = hit.a.key;   // whose report the stage will trust from here
-  stageHoldClear();             // a fresh open() below builds its own live tail
   viewMode = "chat";
   resetEndedBar();   // leaving any ended-session view (incl. one just resumed)
   $termPane.hidden = true;
@@ -2319,6 +2338,8 @@ function selectSession(id) {
   $stageEmpty.hidden = true;
   $chatPane.hidden = false;
   disarmChatKill();
+  currentHostKey = hit.a.key;
+  stageTunnelReset();   // this session's tunnel is up — it's how we reached it
   if (window.TurmaChat) TurmaChat.open(hit.a.key, id, hit.s, hit.a);
   enterStage();
   render(cache); // refresh the .cur highlight
@@ -2353,15 +2374,9 @@ function growCompose(id) {
 function chatToTerminal() {
   if (!currentId) return;
   const hit = sessionHit(currentId);
-  // A HELD session's host reports no terminal, so sessionHit() is null — fall
-  // back to the last-known records rather than degrading the header to a bare
-  // session id at exactly the moment the operator wants to know what they are
-  // still looking at (XERK-252).
-  const s = hit ? hit.s : findSession(currentId);
-  const a = hit ? hit.a : (cache.agents || []).find(x => x.key === currentHostKey);
   // setFrame() clears the terminal's box (it's opening a session's terminal), so
   // the draft has to be carried across after it, not before.
-  setFrame(currentId, s || null, a || null);
+  setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
   viewMode = "terminal";
   $chatPane.hidden = true;
   $termPane.hidden = false;
@@ -2387,51 +2402,61 @@ function enterStage() {
     if (!viewPushed) { history.pushState({ term: true }, ""); viewPushed = true; }
   }
 }
-// ---- holding the stage through an unreachable host (XERK-252) --------------
-// A tunnel flap is routine — every hub restart drops all of them at once — so
-// the stage stays exactly as it is and says why, instead of dumping the operator
-// back on "No session attached" mid-turn.
-let stageHeld = false, stageHoldHtml = "";
-function holdStage(a) {
-  stageHeld = true;
-  // Two distinct faults, worded apart because they mean different things: an
-  // offline host isn't reporting at all (the session may be doing anything),
-  // while a live host with a dead tunnel is still working — only the terminal
-  // and its live tail are unreachable.
-  const who = a.device || a.key;
-  const what = a.online
-    ? esc(who) + "'s terminal tunnel is down"
-    : esc(who) + " is offline";
-  const html = `<span class="spin"></span><span><span class="what">${what}</span>`
-    + ` — holding this session. Nothing is lost; it reconnects on its own.</span>`;
-  // Only when it actually changes: this runs on every beat, and re-writing the
-  // markup would restart the spinner's CSS animation a few times a second.
-  if (html !== stageHoldHtml) { stageHoldHtml = html; $stageHold.innerHTML = html; }
-  $stageHold.hidden = false;
+// Whether the staged session's host had its terminal tunnel up on the last
+// beat. The stage survives a tunnel flap (see render()), so this is what says
+// so on screen and what heals each view when the tunnel returns:
+//   - chat reconnects its /live socket at once rather than waiting out its
+//     backoff (the hub kept the watch and re-arms it on control reconnect);
+//   - the terminal's ttyd iframe is re-navigated, because its WebSocket died
+//     with the tunnel and nothing in the frame retries it.
+// Transitions only — every beat calls this, and re-navigating the iframe on
+// each one would restart the terminal every few seconds.
+//
+// It belongs to ONE staged subject, so every path that changes what the stage
+// shows resets it through stageTunnelReset() — otherwise the previous
+// subject's `false` makes the next session's first beat look like a tunnel
+// RETURN and fires the heal at a view that never lost anything.
+let stageTunnelOnline = true;
+function stageTunnelReset() {
+  stageTunnelOnline = true;
+  for (const id of ["chatTunnelOff", "termTunnelOff", "chatTunnelClose", "termTunnelClose"]) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = true;
+  }
 }
-// Drop the strip without touching the panes — for a stage that is being rebuilt
-// or torn down anyway, where healing an outgoing session would be pointless.
-function stageHoldClear() {
-  stageHeld = false;
-  stageHoldHtml = "";
-  if (!$stageHold) return;
-  $stageHold.hidden = true;
-  $stageHold.innerHTML = "";
-}
-// The host is back. Heal the staged session IN PLACE rather than making the
-// operator re-select it: re-point the ttyd iframe (its socket died with the
-// tunnel and its error page never retries) and nudge the chat's /live socket,
-// which is a no-op when the hub held it across the flap.
-function releaseStage() {
-  if (!stageHeld) return;
-  stageHoldClear();
-  if (viewMode === "terminal" && currentId) navFrame(`/term/${encodeURIComponent(currentId)}/`);
-  if (window.TurmaChat && TurmaChat.wake) TurmaChat.wake();
+// `online` is the host's terminal tunnel; `hostUp` is the host itself (its
+// heartbeat). A host that has gone silent altogether is a different — and
+// worse — story than a flapping tunnel, and the chip must not keep promising
+// that "the session keeps running" when nothing has been heard from the
+// machine for over a minute.
+function setStageTunnel(online, hostUp) {
+  const chip = document.getElementById("chatTunnelOff");
+  const termChip = document.getElementById("termTunnelOff");
+  const label = hostUp === false ? "⚠ host offline" : "⚠ tunnel offline";
+  const title = hostUp === false
+    ? "This host has stopped reporting. Its session may still be running there — nothing is streaming until the host is back."
+    : "This host's terminal tunnel is down. The session keeps running; the view reconnects on its own when the tunnel comes back.";
+  for (const el of [chip, termChip]) {
+    if (!el) continue;
+    el.hidden = online;
+    el.textContent = label;
+    el.title = title;
+  }
+  for (const id of ["chatTunnelClose", "termTunnelClose"]) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = online;
+  }
+  if (online === stageTunnelOnline) return;
+  const returned = online && !stageTunnelOnline;
+  stageTunnelOnline = online;
+  if (!returned || !currentId) return;
+  if (viewMode === "terminal") navFrame(`/term/${encodeURIComponent(currentId)}/`);
+  if (window.TurmaChat && TurmaChat.reconnectNow) TurmaChat.reconnectNow();
 }
 function clearStage() {
   currentId = null;
   currentHostKey = null;
-  stageHoldClear();
+  stageTunnelReset();
   currentTranscriptId = null;
   subagentReturn = null;
   resetEndedBar();
@@ -2684,7 +2709,7 @@ async function openEndedSession(id) {
   endedViewId = id;
   currentId = null;
   currentHostKey = null;
-  stageHoldClear();
+  stageTunnelReset();   // this view isn't a live session's; it has no tunnel
   currentTranscriptId = null;
   subagentReturn = null;
   trHighlight = null;
@@ -2762,7 +2787,7 @@ async function openTranscript(id, title, hi) {
   document.getElementById("trBackLabel").textContent = " Sessions";
   currentId = null;
   currentHostKey = null;
-  stageHoldClear();
+  stageTunnelReset();
   disarmTermKill();
   document.getElementById("trTitle").textContent = title || id;
   document.getElementById("trPath").textContent = "loading…";

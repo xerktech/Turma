@@ -49,7 +49,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.TurmaApplication
-import com.xerktech.turma.core.hostHoldNotice
+import com.xerktech.turma.core.liveMarker
+import com.xerktech.turma.core.tunnelOnlineOf
 import com.xerktech.turma.net.InputRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -77,29 +78,25 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
 
     var reload by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
-    // The fleet beat: the host-reachability strip below (XERK-252) and the
-    // compose bar's busy read both come off it, so it is collected ONCE here
-    // rather than a second time further down.
+    // The fleet beat: the tunnel marker below (XERK-252) and the compose bar's
+    // busy read both come off it, so it is collected ONCE here rather than a
+    // second time further down.
     val fleet by container.fleet.state.collectAsStateWithLifecycle()
     val agent = fleet.agents.firstOrNull { it.key == host }
-    val holdNotice = hostHoldNotice(
-        hostLabel = agent?.device?.ifBlank { host } ?: host,
-        hostOnline = agent?.online ?: true,
-        terminalOnline = agent?.terminalOnline ?: true,
-    )
-    // Heal in place when the host comes back, the way the web's releaseStage()
-    // re-points its iframe (XERK-252): ttyd is served THROUGH the tunnel, so the
-    // WebView died with it and its error page never retries. Clearing the strip
-    // alone would leave the operator looking at a stale failure with a manual
-    // Retry — which is not "holding this session".
+    val tunnelOnline = tunnelOnlineOf(agent)
+    // Heal in place when the tunnel comes back, the way the web re-navigates its
+    // ttyd iframe (XERK-252). This screen needs it MORE than the chat does: ttyd
+    // is served THROUGH the control channel, so the WebView died with it and
+    // nothing inside the frame retries — without this the operator is left on a
+    // stale 502 with a manual Retry, long after the host is fine again.
     //
-    // Only on the held -> clear EDGE. Keying the effect on `holdNotice == null`
-    // alone would fire on first composition and reload a terminal that just
-    // loaded.
-    var wasHeld by remember { mutableStateOf(false) }
-    LaunchedEffect(holdNotice) {
-        if (holdNotice == null && wasHeld) reload++
-        wasHeld = holdNotice != null
+    // The RETURN edge only. Keying on `tunnelOnline` alone would fire on first
+    // composition and reload a terminal that had just loaded, and re-firing per
+    // beat while it stays up would restart the terminal every few seconds.
+    var sawTunnelDown by remember { mutableStateOf(false) }
+    LaunchedEffect(tunnelOnline) {
+        if (tunnelOnline && sawTunnelDown) reload++
+        sawTunnelDown = !tunnelOnline
     }
 
     val ready by produceState(initialValue = false, sessionId, reload) {
@@ -114,7 +111,26 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text("Terminal") },
+                title = {
+                    // Whether anything can actually reach this pane (XERK-252),
+                    // the same marker the chat header carries. `connected` is
+                    // false here by construction — this screen keeps no /live
+                    // socket of its own — so the only thing liveMarker can say
+                    // is the warning, which is the half that matters: the
+                    // WebView below is dead and this is why.
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Terminal", maxLines = 1)
+                        val mark = liveMarker(tunnelOnline, false)
+                        if (mark.isNotEmpty()) {
+                            Text(
+                                " · " + mark,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 actions = {
                     IconButton(onClick = { reload++ }) { Icon(Icons.Filled.Refresh, "Reload") }
@@ -132,11 +148,6 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         },
     ) { pad ->
       Column(Modifier.fillMaxSize().padding(pad)) {
-        // The held-session strip (web #stageHold, XERK-252). The terminal is the
-        // surface a dead tunnel breaks hardest — ttyd is served THROUGH it, so
-        // the WebView below is an unexplained failed load — which is exactly why
-        // the reason belongs here and not only in the chat.
-        holdNotice?.let { HoldBar(it) }
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when {
                 !ready -> Text("Connecting terminal…", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onBackground)

@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -20,7 +19,6 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -153,48 +151,6 @@ fun KillAction(onKill: () -> Unit, modifier: Modifier = Modifier) {
 }
 
 private const val ARM_MS = 3500L
-
-/**
- * The held-session strip (web sessions.html `#stageHold`, XERK-252): the host
- * this session runs on is out of reach, so the conversation/terminal below is
- * frozen rather than finished. Shown by BOTH the chat and the terminal, which
- * is why it lives here — a tunnel flap breaks the terminal hardest (ttyd is
- * served through it) and leaves the chat merely quiet, but the reason is one
- * reason. Text comes from `core.hostHoldNotice`.
- *
- * Amber, mixed into the surface exactly as the web strip is
- * (`color-mix(in srgb, var(--warning) 22%, var(--surface))`) — warning, never
- * error. Nothing has been lost, the view is intact, and it clears itself the
- * moment the host reports again. Do NOT reach for `tertiaryContainer` here: it
- * renders pink in this theme and reads as a failure.
- */
-@Composable
-fun HoldBar(notice: String, modifier: Modifier = Modifier) {
-    Surface(
-        color = lerp(MaterialTheme.colorScheme.surface, TurmaColors.warning, HOLD_TINT_AMOUNT),
-        modifier = modifier.fillMaxWidth(),
-    ) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            CircularProgressIndicator(
-                Modifier.size(11.dp),
-                strokeWidth = 2.dp,
-                color = TurmaColors.warning,
-            )
-            Text(
-                notice,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-        }
-    }
-}
-
-/** How far the warning colour is mixed into the strip — matches the web's 22%. */
-private const val HOLD_TINT_AMOUNT = 0.22f
 
 // ---- fields ----------------------------------------------------------------
 
