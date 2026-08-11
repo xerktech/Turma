@@ -2305,15 +2305,23 @@
 
   // The session's host came back after a tunnel flap (XERK-252). The hub holds
   // the browser's /live socket across most flaps, so the common case here is a
-  // socket that never dropped — hence the OPEN/CONNECTING early-out, and hence
-  // the /history pull first, which is what actually closes any gap. Only a
-  // socket that really did die gets restarted, with the backoff reset so the
-  // heal is immediate rather than up to a backoff step away.
+  // socket that never dropped — hence the OPEN/CONNECTING early-out. Restarting
+  // a socket that really did die is this function's actual job, with the backoff
+  // reset so the heal is immediate rather than a backoff step away.
   function wake() {
     if (!hostKey || !sessionId) return;
     const myGen = gen;
+    // NOT what closes the gap on an ordinary flap: the hub serves /history from
+    // a cache for HISTORY_FRESH_MS (5 min), so a shorter outage gets a 200 of
+    // the same entries we already have. What re-delivers the missed ones is the
+    // agent's watch being re-armed on control reconnect, which re-emits its
+    // tail. This is here for the LONGER outage, where that cache has expired.
     loadHistory(myGen);
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    // Anything else (CLOSING, CLOSED) is replaced, not waited on — but detach
+    // its onclose first, or that socket's own scheduleReconnect() mints a THIRD
+    // socket which orphans the one started here.
+    if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
     backoffIdx = 0;
     startWs(myGen);

@@ -752,6 +752,31 @@ test("the host coming back heals the staged session in place", () => {
   assert.deepEqual(opened, ["11111"], "and the operator never had to re-select it");
 });
 
+// The ttyd iframe's socket dies with the tunnel and its error page never
+// retries, so clearing the strip alone would leave the operator staring at a
+// stale failure. The heal has to re-point the frame.
+test("healing in the terminal view re-points the iframe at the session", () => {
+  const { beat, chatToTerminal, els, now, h } = staged();
+  chatToTerminal();
+  const src = els.termFrame.src;
+  assert.match(src, /\/term\/11111\//);
+
+  beat({ now: now + 5000, agents: [{ ...h, terminalOnline: false }] });
+  els.termFrame.src = "about:blank#dead";   // stand in for the failed load
+  beat({ now: now + 9000, agents: [h] });
+
+  assert.equal(els.termFrame.src, src, "the dead frame is re-pointed on the heal");
+});
+
+test("the terminal header still names a held session rather than a bare id", () => {
+  const { beat, chatToTerminal, els, now, h } = staged();
+  beat({ now: now + 5000, agents: [{ ...h, terminalOnline: false }] });
+  chatToTerminal();
+
+  assert.equal(els.termTitle.textContent, "Reading This");
+  assert.equal(els.termPath.textContent, "hostA · repoX");
+});
+
 test("the session's own host reporting it gone still clears the stage", () => {
   const { beat, els, chat, now, h } = staged();
   // Killed elsewhere: the host is answering for itself and no longer lists it.

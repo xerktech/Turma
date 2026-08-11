@@ -162,14 +162,16 @@ private const val ARM_MS = 3500L
  * served through it) and leaves the chat merely quiet, but the reason is one
  * reason. Text comes from `core.hostHoldNotice`.
  *
- * Deliberately tertiary-toned, not error-toned: nothing has been lost, the view
- * is intact, and the strip clears itself the moment the host reports again.
+ * Amber, mixed into the surface exactly as the web strip is
+ * (`color-mix(in srgb, var(--warning) 22%, var(--surface))`) — warning, never
+ * error. Nothing has been lost, the view is intact, and it clears itself the
+ * moment the host reports again. Do NOT reach for `tertiaryContainer` here: it
+ * renders pink in this theme and reads as a failure.
  */
 @Composable
 fun HoldBar(notice: String, modifier: Modifier = Modifier) {
     Surface(
-        color = MaterialTheme.colorScheme.tertiaryContainer,
-        tonalElevation = 2.dp,
+        color = lerp(MaterialTheme.colorScheme.surface, TurmaColors.warning, HOLD_TINT_AMOUNT),
         modifier = modifier.fillMaxWidth(),
     ) {
         Row(
@@ -180,16 +182,19 @@ fun HoldBar(notice: String, modifier: Modifier = Modifier) {
             CircularProgressIndicator(
                 Modifier.size(11.dp),
                 strokeWidth = 2.dp,
-                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                color = TurmaColors.warning,
             )
             Text(
                 notice,
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                color = MaterialTheme.colorScheme.onSurface,
             )
         }
     }
 }
+
+/** How far the warning colour is mixed into the strip — matches the web's 22%. */
+private const val HOLD_TINT_AMOUNT = 0.22f
 
 // ---- fields ----------------------------------------------------------------
 

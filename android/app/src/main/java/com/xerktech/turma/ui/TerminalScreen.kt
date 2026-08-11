@@ -77,8 +77,30 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
 
     var reload by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
-    // The fleet beat, for the host-reachability strip below (XERK-252).
+    // The fleet beat: the host-reachability strip below (XERK-252) and the
+    // compose bar's busy read both come off it, so it is collected ONCE here
+    // rather than a second time further down.
     val fleet by container.fleet.state.collectAsStateWithLifecycle()
+    val agent = fleet.agents.firstOrNull { it.key == host }
+    val holdNotice = hostHoldNotice(
+        hostLabel = agent?.device?.ifBlank { host } ?: host,
+        hostOnline = agent?.online ?: true,
+        terminalOnline = agent?.terminalOnline ?: true,
+    )
+    // Heal in place when the host comes back, the way the web's releaseStage()
+    // re-points its iframe (XERK-252): ttyd is served THROUGH the tunnel, so the
+    // WebView died with it and its error page never retries. Clearing the strip
+    // alone would leave the operator looking at a stale failure with a manual
+    // Retry — which is not "holding this session".
+    //
+    // Only on the held -> clear EDGE. Keying the effect on `holdNotice == null`
+    // alone would fire on first composition and reload a terminal that just
+    // loaded.
+    var wasHeld by remember { mutableStateOf(false) }
+    LaunchedEffect(holdNotice) {
+        if (holdNotice == null && wasHeld) reload++
+        wasHeld = holdNotice != null
+    }
 
     val ready by produceState(initialValue = false, sessionId, reload) {
         error = null
@@ -114,12 +136,7 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         // surface a dead tunnel breaks hardest — ttyd is served THROUGH it, so
         // the WebView below is an unexplained failed load — which is exactly why
         // the reason belongs here and not only in the chat.
-        val agent = fleet.agents.firstOrNull { it.key == host }
-        hostHoldNotice(
-            hostLabel = agent?.device?.ifBlank { host } ?: host,
-            hostOnline = agent?.online ?: true,
-            terminalOnline = agent?.terminalOnline ?: true,
-        )?.let { HoldBar(it) }
+        holdNotice?.let { HoldBar(it) }
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when {
                 !ready -> Text("Connecting terminal…", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onBackground)
@@ -234,9 +251,7 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         // destroy it), and briefly after a tap (the heartbeat takes a beat to
         // read the turn as over; if it outlives the suppression the interrupt
         // didn't take and Stop comes back — web chat.js STOP_SUPPRESS_MS).
-        val fleet by container.fleet.state.collectAsStateWithLifecycle()
-        val live = fleet.agents.firstOrNull { it.key == host }
-            ?.sessions?.firstOrNull { it.id == sessionId }?.session
+        val live = agent?.sessions?.firstOrNull { it.id == sessionId }?.session
         var stopPending by remember { mutableStateOf(false) }
         LaunchedEffect(stopPending) {
             if (stopPending) {

@@ -2353,9 +2353,15 @@ function growCompose(id) {
 function chatToTerminal() {
   if (!currentId) return;
   const hit = sessionHit(currentId);
+  // A HELD session's host reports no terminal, so sessionHit() is null — fall
+  // back to the last-known records rather than degrading the header to a bare
+  // session id at exactly the moment the operator wants to know what they are
+  // still looking at (XERK-252).
+  const s = hit ? hit.s : findSession(currentId);
+  const a = hit ? hit.a : (cache.agents || []).find(x => x.key === currentHostKey);
   // setFrame() clears the terminal's box (it's opening a session's terminal), so
   // the draft has to be carried across after it, not before.
-  setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
+  setFrame(currentId, s || null, a || null);
   viewMode = "terminal";
   $chatPane.hidden = true;
   $termPane.hidden = false;
