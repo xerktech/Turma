@@ -209,13 +209,16 @@ turma_read_file() {  # <path> — prints nothing for anything that isn't a plain
   cat "$1" 2>/dev/null || true
 }
 
-# A positive integer, or the given default — env values reach arithmetic here,
-# and a non-numeric one would abort the shell rather than degrade.
+# A plausible whole number of seconds, or the given default. Env values reach
+# arithmetic here: a non-numeric one would abort the shell, and an ALL-DIGIT but
+# oversized one silently overflows `$(( ))` to a NEGATIVE result — which would
+# put the derived floor below the sum it exists to exceed. A day is far past any
+# sane timeout, so anything beyond it is a typo, not an intention.
 _num() {  # <value> <default>
   case "$1" in
-    ''|*[!0-9]*) printf '%s' "$2" ;;
-    *) printf '%s' "$1" ;;
+    ''|*[!0-9]*) printf '%s' "$2"; return ;;
   esac
+  if [ "${#1}" -le 6 ] && [ "$1" -le 86400 ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
 }
 
 turma_write_file() {  # <path> <content>
@@ -228,6 +231,15 @@ turma_write_file() {  # <path> <content>
 }
 
 claude_update_check() (
+  # `timeout` WITHOUT -k only signals at the deadline and then waits for the
+  # child to leave: measured at 30s for a `trap "" TERM` child given `timeout 2`.
+  # Every bound below would then be nominal, and the watchdog floor at the call
+  # site is arithmetic over those numbers — so they have to be enforceable. -k
+  # escalates to SIGKILL after a grace period. (A process in uninterruptible
+  # sleep on stalled storage takes neither signal; nothing in userspace can
+  # bound that, which is why the watchdog's message is worded the way it is.)
+  _grace="$(_num "${TURMA_KILL_GRACE:-10}" 10)"
+
   # Rate-limited like the native launcher's, and for the same reason: a
   # container in a restart loop would otherwise hit the registry every few
   # seconds, and pay the check's latency on every pass.
@@ -268,10 +280,10 @@ claude_update_check() (
   # version is not the same fault as a missing one, and telling them apart is
   # what stops a futile reinstall on every boot (see the marker below).
   raw=""
-  command -v claude >/dev/null 2>&1 && raw="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
+  command -v claude >/dev/null 2>&1 && raw="$(timeout -k "$_grace" "$(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30)" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
   cur="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
   unparseable=/root/.turma/claude-unparseable
-  latest="$(timeout "${TURMA_NPM_VIEW_TIMEOUT:-45}" npm view @anthropic-ai/claude-code version \
+  latest="$(timeout -k "$_grace" "$(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45)" npm view @anthropic-ai/claude-code version \
             --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]')"
   # A registry that answers with anything but a version is "stay put", not an
   # upgrade: `sort -V` ranks a non-numeric string ABOVE a semver, so a proxy
@@ -298,14 +310,14 @@ claude_update_check() (
     # often a half-written install, which reinstalling repairs. Verified below
     # rather than assumed, and remembered when it doesn't help.
     echo "[entrypoint] claude update: ${cur:-none-or-unreadable} -> $latest"
-    if timeout "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+    if timeout -k "$_grace" "$(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300)" \
          npm install -g "@anthropic-ai/claude-code@$latest"; then
       # BOUNDED, like the probe above. This is a child of PID 1 with no outer
       # timeout anywhere: an unbounded read that never returns leaves the
       # container `running` with no manager, no tunnel and no sessions, and
       # since PID 1 is alive and healthy-looking, no restart policy ever fires.
       # A hang here is reachable from exactly the fault this branch repairs.
-      now_raw="$(timeout "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
+      now_raw="$(timeout -k "$_grace" "$(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30)" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
       echo "[entrypoint] claude: now ${now_raw:-?}"
       if printf '%s' "$now_raw" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
         rm -f "$unparseable" 2>/dev/null || true
@@ -341,10 +353,15 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
   # OTHER than a bounded call is stuck, and there is then nothing to orphan.
   # An operator value below the floor is raised, out loud: the way to shorten a
   # boot is to lower the per-call timeouts, which are what actually take time.
+  _grace="$(_num "${TURMA_KILL_GRACE:-10}" 10)"
+  _slack="$(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60)"
+  # A slack of 0 leaves nothing for the unbounded local work between the bounded
+  # calls (mktemp, mkdir, the greps, deleting the npm cache, plain scheduling).
+  [ "$_slack" -lt 10 ] && _slack=10
   _floor=$(( $(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30) * 2 \
              + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
              + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
-             + $(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60) ))
+             + _grace * 4 + _slack ))
   _deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
   if [ "$_deadline" -lt "$_floor" ]; then
     [ "$_deadline" -gt 0 ] && echo "[entrypoint] claude: TURMA_CLAUDE_UPDATE_TIMEOUT=${_deadline}s is" \
@@ -356,7 +373,9 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
   ( sleep "$_deadline"; kill -TERM "$_check_pid" 2>/dev/null ) &
   _watchdog_pid=$!
   wait "$_check_pid" \
-    || echo "[entrypoint] claude: update check did not finish; carrying on"
+    || echo "[entrypoint] claude: update check did not finish in ${_deadline}s; carrying on." \
+            "If it was mid-install, that install can still be replacing claude —" \
+            "a session started in the next few minutes may fail to launch."
   kill -TERM "$_watchdog_pid" 2>/dev/null || true
 fi
 

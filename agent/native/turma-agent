@@ -269,12 +269,23 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
     # stuck, where there is nothing to orphan. An operator value below the floor
     # is raised, out loud; the way to shorten a boot is to lower the per-call
     # timeouts, which are what actually take the time.
-    _num() { case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
+    # A plausible whole number of seconds, or the default. An all-digit but
+    # oversized value would overflow the arithmetic below to a NEGATIVE floor —
+    # i.e. one BELOW the sum it exists to exceed — so magnitude is capped too.
+    _num() {
+      case "$1" in ''|*[!0-9]*) printf '%s' "$2"; return ;; esac
+      if [ "${#1}" -le 6 ] && [ "$1" -le 86400 ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+    }
+    claude_grace="$(_num "${TURMA_KILL_GRACE:-10}" 10)"
+    claude_slack="$(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60)"
+    # Nothing left for the unbounded local work between the bounded calls if the
+    # slack is 0.
+    [ "$claude_slack" -lt 10 ] && claude_slack=10
     claude_floor=$(( $(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30) * 2 \
                      + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
                      + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
                      + $(_num "${TURMA_NPM_META_TIMEOUT:-30}" 30) * 2 \
-                     + $(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60) ))
+                     + claude_grace * 6 + claude_slack ))
     claude_deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
     if [ "$claude_deadline" -lt "$claude_floor" ]; then
       [ "$claude_deadline" -gt 0 ] && echo "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${claude_deadline}s is below" \
@@ -284,7 +295,9 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
     echo "[turma-agent] claude check bounded at ${claude_deadline}s"
     timeout "$claude_deadline" \
       "$SELF_DIR/turma-agent-update" --claude-only \
-      || echo "[turma-agent] claude update check did not finish; carrying on"
+      || echo "[turma-agent] claude update check did not finish in ${claude_deadline}s; carrying on." \
+              "If it was mid-install, that install can still be replacing claude — a session" \
+              "started in the next few minutes may fail to launch."
   else
     "$SELF_DIR/turma-agent-update" --claude-only \
       || echo "[turma-agent] claude update check failed; carrying on"

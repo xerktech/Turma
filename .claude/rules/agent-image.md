@@ -49,7 +49,15 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     — 100 launch failures out of 100, the very window this design closes. Above the sum, it can only
     fire when something OTHER than a bounded call is stuck, where there is nothing to orphan. An
     operator value below the floor is raised, out loud; shorten a boot by lowering the PER-CALL
-    timeouts (`TURMA_CLAUDE_UPDATE_SLACK` is the headroom above them).
+    timeouts (`TURMA_CLAUDE_UPDATE_SLACK` is the headroom above them). Raising, rather than
+    honouring, is deliberate: scaling the inner bounds down to fit a 60s budget would GUARANTEE a
+    killed install on a slow link, which is worse than a slower boot — and the floor is a worst
+    case only reached when there is really something to install, not what a start normally costs.
+  - **Those per-call bounds use `timeout -k`.** Without `-k`, `timeout` only SIGNALS at the deadline
+    and then waits for the child to leave (measured: 30s for a `trap "" TERM` child given `timeout
+    2`), so every bound would be nominal and the derived floor would be arithmetic over numbers
+    nothing keeps. `_num` also caps magnitude: an all-digit but oversized value overflows `$(( ))`
+    to a NEGATIVE floor, i.e. one below the sum it exists to exceed.
   - **Every `claude --version` here is `timeout`-wrapped, the post-install verification included.**
     These are children of PID 1 with no outer timeout anywhere (the `||` guard only runs once the
     block returns), and a hang is reachable from the very fault the repair branch handles: an

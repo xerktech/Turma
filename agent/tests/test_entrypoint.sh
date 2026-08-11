@@ -576,7 +576,24 @@ else
   echo "  FAIL: silently honoured a deadline below the floor"; FAILED=1
 fi
 
-echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"
+echo "== case: an oversized timeout cannot overflow the derived floor"
+# The floor is arithmetic, and `$(( ))` WRAPS: an all-digit but oversized value
+# produced a NEGATIVE floor, i.e. one below the very sum it exists to exceed, and
+# the operator's short deadline was then honoured verbatim — orphaning the
+# install again. Nineteen digits is the shape; a millisecond-style 300000 is not.
+make_fixture "$WORK/fx18" 0 0
+out="$(run_case "$WORK/fx18" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_INSTALL_SLEEP=12 \
+  -e TURMA_NPM_INSTALL_TIMEOUT=9999999999999999999 -e TURMA_CLAUDE_UPDATE_TIMEOUT=5)"
+done_line="$(echo "$out" | grep -n "NPMINSTALL install -g" | head -1 | cut -d: -f1 || true)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1 || true)"
+if [ -n "$done_line" ] && [ -n "$mgr_line" ] && [ "$done_line" -lt "$mgr_line" ]; then
+  echo "  ok: an absurd per-call timeout falls back to the default, floor intact"
+else
+  echo "  FAIL: an oversized timeout overflowed the floor and orphaned the install (install=$done_line manager=$mgr_line)"; FAILED=1
+fi
+
+echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"
 # /root/.turma is the manager's REGISTRY_DIR, so the dropped identity — every
 # Claude session — can write there. Opening a FIFO BLOCKS until the other end
 # appears, with no error for `|| true` to catch, which is the PID-1 wedge again:

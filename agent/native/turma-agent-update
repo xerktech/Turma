@@ -123,7 +123,13 @@ newer_than() {
 bounded() {  # <seconds> <cmd...>
   local secs="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    # -k, because `timeout` without it only SIGNALS at the deadline and then
+    # waits for the child to leave — measured at 30s for a `trap "" TERM` child
+    # given `timeout 2`. The launcher's outer bound is arithmetic over these
+    # numbers, so a nominal one that a child can ignore would make that floor a
+    # promise about nothing. (Uninterruptible sleep takes neither signal;
+    # nothing in userspace bounds that.)
+    timeout -k "${TURMA_KILL_GRACE:-10}" "$secs" "$@"
   else
     "$@"
   fi

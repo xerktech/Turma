@@ -429,7 +429,8 @@ rm -f "$WORK/manager.log" "$WORK/claude-done"
 # next case), precisely so it can never be set below a running install.
 TEST_CLAUDE_CHECK_SLEEP=60 TURMA_CLAUDE_UPDATE_TIMEOUT=2 \
   TURMA_CLAUDE_PROBE_TIMEOUT=1 TURMA_NPM_VIEW_TIMEOUT=1 TURMA_NPM_INSTALL_TIMEOUT=1 \
-  TURMA_NPM_META_TIMEOUT=1 TURMA_CLAUDE_UPDATE_SLACK=2 PATH="$WORK/stub-bin:$PATH" \
+  TURMA_NPM_META_TIMEOUT=1 TURMA_CLAUDE_UPDATE_SLACK=10 TURMA_KILL_GRACE=1 \
+  PATH="$WORK/stub-bin:$PATH" \
   setsid "$PREFIX/bin/turma-agent" >"$WORK/run7.log" 2>&1 &
 if wait_longer file_has_content "$WORK/manager.log"; then
   ok "the manager started despite a check that never returns"
