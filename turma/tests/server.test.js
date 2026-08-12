@@ -7084,6 +7084,74 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
     [{ sel: true, type: "[object Object]", label: "x" }]);
 });
 
+// Boot the real module against a fixture state file and hand back its `agents`.
+// Shares the child-process approach of "the restore actually RUNS" above: the
+// restore happens at module init, so nothing short of a real load exercises it.
+function bootWithState(t, raw) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-key-"));
+  fs.writeFileSync(path.join(dir, "state.json"), raw);
+  // console.warn goes to stderr, which this harness discards, so it is captured
+  // BEFORE the require — the restore runs during module init — and handed back
+  // on stdout with the agents.
+  return require("child_process").execFileSync(process.execPath, ["-e", `
+    process.env.TURMA_TEST = "1";
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(" "));
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    process.stdout.write("<<<" + JSON.stringify({ agents: hub.agents, warns }) + ">>>");
+    process.exit(0);
+  `], {
+    env: { ...process.env, TURMA_TEST: "1", STATE_FILE: path.join(dir, "state.json"),
+           ARCHIVE_DIR: path.join(dir, "a"), ARCHIVE_DB: path.join(dir, "a.db"),
+           NODE_NO_WARNINGS: "1" },
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
+test("a restored state file cannot carry a host the hub could not address", () => {
+  // The end-to-end form of the drop: not "the call is in the source" and not
+  // "the helper works", but a real module init over a real file. The ghost this
+  // prevents was uncommandable AND undeletable, so it outlived every route that
+  // could have cleared it (XERK-269).
+  // Written as raw JSON, not via JSON.stringify of a literal: `"__proto__":` in
+  // an object literal sets the PROTOTYPE and creates no key, so a stringified
+  // fixture silently omits the very case XERK-235 is about. JSON.parse does
+  // make it an own property, which is the real hazard.
+  const out = bootWithState(this, '{' +
+    '"__proto__":{"device":"proto"},' +
+    '".":{"device":"."},' +
+    '"truenas":{"device":"truenas"},' +
+    '"..":{"device":".."},' +
+    '"HOST.local.":{"device":"HOST.local."},' +
+    '"...":{"device":"..."}}');
+  const { agents: restored, warns } = JSON.parse(
+    out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+  assert.deepEqual(Object.keys(restored).sort(), ["...", "HOST.local.", "truenas"],
+    "dot segments and prototype keys must not survive a restore");
+  // The log line alone is NOT evidence — a drop that reports but does not
+  // delete still prints it, which is how the earlier version passed. The key
+  // list above is the proof; this only checks the operator is told at all.
+  assert.equal(warns.filter((w) => /dropping restored agent/.test(w)).length, 3);
+});
+
+test("a corrupt state file restores nothing, rather than a registry of characters", () => {
+  // `Object.keys("hello")` is ["0".."4"], so a bare JSON string loaded as "5
+  // agents" and then threw deeper in, into the restore's silent catch. The
+  // parse now lands in a local and is shape-checked BEFORE `agents` is assigned,
+  // so a throw cannot leave the junk installed.
+  for (const junk of ['"hello"', "[]", "12", "null", "true"]) {
+    const out = bootWithState(this, junk);
+    const { agents: restored } = JSON.parse(
+      out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+    assert.deepEqual(restored, {}, `state.json of ${junk} must restore nothing`);
+    assert.doesNotMatch(out, /loaded \d+ agents/,
+      `${junk} must not report a successful load`);
+  }
+  // A well-formed file still loads, so the guard isn't refusing everything.
+  const ok = bootWithState(this, JSON.stringify({ truenas: { device: "truenas" } }));
+  assert.match(ok, /loaded 1 agents from/);
+});
+
 test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
   // `[...s]` allocates per code point over the WHOLE string, so an unbounded
   // spread let one agent-authed heartbeat with a 24 MiB name OOM-kill the hub
