@@ -59,7 +59,7 @@ echo "LEFTOVER_ROOT_PATHS=$(find "$REPOS_ROOT" /root/.claude -uid 0 2>/dev/null 
 sleep "${STUB_MANAGER_SLEEP:-1}"
 STUB
 cp "$WORK/python3" "$WORK/hub-agent.py"
-echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid());' \
+echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid() + " TUNNELHOME=" + process.env.HOME);' \
   > "$WORK/tunnel-agent.js"
 
 # Stand-ins for the cloud CLIs the real image bundles. The preflight only ever
@@ -70,13 +70,55 @@ for cli in aws az terraform; do
     > "$WORK/$cli"
 done
 
+# Stand-ins for the Claude Code update check (XERK-254). The real image bakes
+# claude at build time and has a real npm; both are stubbed so the case observes
+# the DECISION without reaching the npm registry — and so a test run can never
+# install anything. Driven by STUB_CLAUDE_VERSION / STUB_NPM_LATEST.
+cat > "$WORK/claude" <<'STUB'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  # STUB_CLAUDE_HANG: a claude that never answers. Reachable from the very fault
+  # the repair branch exists for, so both the probe AND the post-install read
+  # have to be bounded.
+  [ -n "${STUB_CLAUDE_HANG:-}" ] && sleep "$STUB_CLAUDE_HANG"
+  echo "${STUB_CLAUDE_VERSION:-1.0.0} (Claude Code)"
+  exit 0
+fi
+exit 2
+STUB
+cat > "$WORK/npm" <<'STUB'
+#!/bin/sh
+case "$1 $2" in
+  "view @anthropic-ai/claude-code")
+    # A registry that never answers, for the does-it-block case.
+    [ -n "${STUB_NPM_HANG:-}" ] && sleep "$STUB_NPM_HANG"
+    [ -n "${STUB_NPM_LATEST:-}" ] || exit 1
+    echo "$STUB_NPM_LATEST" ;;
+  "install -g")
+    echo "NPMINSTALL start $(date +%s) $*"
+    # A real `npm install -g` leaves claude absent from PATH while it unpacks;
+    # $STUB_NPM_INSTALL_SLEEP makes that window long enough to observe.
+    [ -n "${STUB_NPM_INSTALL_SLEEP:-}" ] && sleep "$STUB_NPM_INSTALL_SLEEP"
+    echo "NPMINSTALL $*"
+    # Where npm was pointed. The whole reason the block sets its own HOME is that
+    # /root is the operator's bind mount, so this is the assertion that keeps it.
+    echo "NPMHOME=$HOME NPMCACHE=${npm_config_cache:-unset}"
+    # What a real install changes, so the version echoed afterwards moves.
+    STUB_CLAUDE_VERSION="${STUB_NPM_LATEST}"; export STUB_CLAUDE_VERSION ;;
+  *) exit 2 ;;
+esac
+STUB
+
 cat > "$WORK/Dockerfile" <<'DOCKERFILE'
 FROM node:24-bookworm-slim
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY python3 /usr/local/bin/python3
 COPY hub-agent.py tunnel-agent.js aws az terraform /usr/local/bin/
+# Last, so they shadow the base image's real npm.
+COPY claude npm /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/python3 \
-      /usr/local/bin/aws /usr/local/bin/az /usr/local/bin/terraform
+      /usr/local/bin/aws /usr/local/bin/az /usr/local/bin/terraform \
+      /usr/local/bin/claude /usr/local/bin/npm
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 DOCKERFILE
 
@@ -324,6 +366,324 @@ if echo "$out" | grep -q "tunnel-agent exited; restarting"; then
   echo "  ok: the restart is logged"
 else
   echo "  FAIL: no restart log line"; FAILED=1
+fi
+
+# --- Case 11: Claude Code is updated on every start (XERK-254) ---------------
+# The container cannot self-update — it IS the image, and an image pull is what
+# brings it back through this code — but the Claude Code baked in at build time
+# then ages for the life of the tag. These cases pin the decision: only when the
+# registry really has something newer, never a downgrade, and never at all when
+# the operator has pinned it.
+#
+# STUB_MANAGER_SLEEP keeps the container alive past the backgrounded check, which
+# is the only reason its output lands in the same capture.
+echo "== case: a newer published Claude Code is installed at boot"
+make_fixture "$WORK/fx11" 0 0
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9)"
+if echo "$out" | grep -q "NPMINSTALL install -g @anthropic-ai/claude-code@2.0.9"; then
+  echo "  ok: installed the newer version"
+else
+  echo "  FAIL: no claude install at boot — the bundled version would age forever"; FAILED=1
+fi
+
+echo "== case: an already-current Claude Code is a no-op"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.9 -e STUB_NPM_LATEST=2.0.9)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: reinstalled an up-to-date claude on every container start"; FAILED=1
+else
+  echo "  ok: nothing installed"
+fi
+
+echo "== case: an installed version ahead of the registry is not downgraded"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.1.0 -e STUB_NPM_LATEST=2.0.9)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: downgraded a hand-pinned/unpublished claude"; FAILED=1
+else
+  echo "  ok: left the newer install alone"
+fi
+
+echo "== case: an unreachable registry leaves the install alone"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.1)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: installed something with no answer from the registry"; FAILED=1
+else
+  echo "  ok: stayed put"
+fi
+
+echo "== case: TURMA_CLAUDE_AUTO_UPDATE=0 pins the image's bundled version"
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=6 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e TURMA_CLAUDE_AUTO_UPDATE=0)"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: updated claude despite TURMA_CLAUDE_AUTO_UPDATE=0"; FAILED=1
+else
+  echo "  ok: pinned"
+fi
+
+echo "== case: a hanging registry delays the boot but cannot stop it"
+# Awaiting the check (see the ordering case below) is only safe because every
+# call it makes is bounded. A `view` that never answers must end in "stay put"
+# and a started manager, not a container that never comes up.
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=3 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_HANG=30 \
+  -e TURMA_NPM_VIEW_TIMEOUT=2)"
+if echo "$out" | grep -q "MANAGER uid="; then
+  echo "  ok: the manager started after the check timed out"
+else
+  echo "  FAIL: a hanging registry blocked the container's boot for good"; FAILED=1
+fi
+if echo "$out" | grep -q "registry unreachable"; then
+  echo "  ok: the timed-out probe read as stay-put"
+else
+  echo "  FAIL: a timed-out probe did not read as stay-put"; FAILED=1
+fi
+
+echo "== case: the check finishes before the manager can launch anything"
+# The ordering IS the safety argument. `npm install -g` leaves claude absent
+# from PATH for ~1.7s, and resume_on_boot relaunches this host's sessions on a
+# 1s stagger right after the manager starts — so a check that ran alongside the
+# manager would put that hole under the first relaunches, which then die on exec
+# with ENOENT. Every claude line must therefore precede the manager's first.
+out="$(run_case "$WORK/fx11" -e AGENT=claude -e STUB_MANAGER_SLEEP=4 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9)"
+claude_line="$(echo "$out" | grep -n "claude update:" | head -1 | cut -d: -f1)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1)"
+if [ -n "$claude_line" ] && [ -n "$mgr_line" ] && [ "$claude_line" -lt "$mgr_line" ]; then
+  echo "  ok: claude was replaced before the manager existed"
+else
+  echo "  FAIL: the manager started while claude was being replaced (claude=$claude_line manager=$mgr_line)"; FAILED=1
+fi
+
+echo "== case: the check does not leak its throwaway HOME into the boot"
+# The scratch HOME is for npm and for `claude --version` — and for nothing else.
+# A /bin/sh function is NOT a subshell (and has no `local`), so an exported HOME
+# here escapes into the manager, the tunnel and every session, pointing them at
+# a /tmp dir this same check then deletes: the registry, the usage ledger and
+# the archive would silently move off the mount, and the operator's ~/.claude
+# would vanish from under the agent. Assert on the run that actually INSTALLS —
+# the rate limit short-circuits before the leak, so a throttled run hides it.
+mgr_home="$(field "$out" home)"
+if [ "$mgr_home" = "/root" ]; then
+  echo "  ok: the manager still boots with HOME=/root"
+else
+  echo "  FAIL: the manager inherited the check's scratch HOME ($mgr_home)"; FAILED=1
+fi
+tunnel_home="$(echo "$out" | grep -o 'TUNNELHOME=[^ ]*' | head -1 | cut -d= -f2)"
+if [ "$tunnel_home" = "/root" ]; then
+  echo "  ok: so does the tunnel"
+elif [ -z "$tunnel_home" ]; then
+  echo "  FAIL: the tunnel never reported its HOME — this assertion would pass vacuously"; FAILED=1
+else
+  echo "  FAIL: the tunnel inherited the check's scratch HOME ($tunnel_home)"; FAILED=1
+fi
+
+echo "== case: the update writes nothing into the operator's mounted HOME"
+# npm's cache and anything claude touches would otherwise land in /root — which
+# is a bind mount, ROOT-owned, on a host whose sessions run as somebody else.
+if echo "$out" | grep -q "NPMHOME=/tmp/"; then
+  echo "  ok: ran against a throwaway HOME"
+else
+  echo "  FAIL: the update ran against the mounted HOME ($(echo "$out" | grep -o 'NPMHOME=[^ ]*'))"; FAILED=1
+fi
+if echo "$out" | grep -q "NPMCACHE=/tmp/"; then
+  echo "  ok: npm cached outside the mount"
+else
+  echo "  FAIL: npm's cache was not redirected ($(echo "$out" | grep -o 'NPMCACHE=[^ ]*'))"; FAILED=1
+fi
+leftover="$(docker run --rm -v "$WORK/fx11:/f" busybox find /f/claude -newer /f/claude/.credentials.json | wc -l | tr -d ' ')"
+if [ "$leftover" = "0" ]; then
+  echo "  ok: nothing new under the mounted /root/.claude"
+else
+  echo "  FAIL: the update left $leftover new path(s) in the operator's ~/.claude"; FAILED=1
+fi
+
+echo "== case: a futile repair is not repeated on every boot"
+# An unreadable version is usually a half-written install, which reinstalling
+# repairs — but it can equally be a working claude printing a version shape this
+# doesn't parse. There the repair fixes nothing, and repeating it is a real
+# `npm install -g` on every boot, forever, inside the awaited path.
+make_fixture "$WORK/fx14" 0 0
+out="$(run_case "$WORK/fx14" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=not-a-version -e STUB_NPM_LATEST=2.0.9 \
+  -v "$WORK/fx14/turma:/root/.turma")"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  ok: the first boot tries to repair it"
+else
+  echo "  FAIL: an unreadable claude was not repaired at all"; FAILED=1
+fi
+out="$(run_case "$WORK/fx14" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=not-a-version -e STUB_NPM_LATEST=2.0.9 \
+  -e TURMA_BOOT_UPDATE_MIN_INTERVAL=0 -v "$WORK/fx14/turma:/root/.turma")"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  FAIL: repeated a repair that changed nothing — every boot, forever"; FAILED=1
+else
+  echo "  ok: the next boot leaves it alone"
+fi
+if echo "$out" | grep -q "a repair already failed to change that"; then
+  echo "  ok: and says why"
+else
+  echo "  FAIL: no explanation for skipping the repair"; FAILED=1
+fi
+
+echo "== case: a claude that never answers cannot wedge the boot"
+# Every read of `claude --version` is a child of PID 1 with no outer timeout
+# anywhere — the `||` guard only runs once the block RETURNS. An unbounded one
+# leaves the container `running` with no manager, no tunnel and no sessions, and
+# because PID 1 looks alive no restart policy ever fires: worse than a crash
+# loop. The hang is reachable from the same fault the repair branch handles, so
+# the post-install verification needs the bound just as much as the probe.
+make_fixture "$WORK/fx15" 0 0
+t0=$(date +%s)
+out="$(run_case "$WORK/fx15" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_HANG=120 -e TURMA_CLAUDE_PROBE_TIMEOUT=2 -e STUB_NPM_LATEST=2.0.9)"
+elapsed=$(( $(date +%s) - t0 ))
+# Timed, not just "did it eventually boot": an unbounded read boots too, 120s
+# later, so only the clock tells the fixed code from the broken code.
+if echo "$out" | grep -q "MANAGER uid=" && [ "$elapsed" -lt 60 ]; then
+  echo "  ok: the manager started in ${elapsed}s despite a claude that never answers"
+else
+  echo "  FAIL: the boot waited ${elapsed}s on a hung claude — running, no manager, no restart"; FAILED=1
+fi
+
+echo "== case: the watchdog cannot fire while an install is running"
+# A `kill` reaches the check's shell, NEVER its npm grandchild. Fire the watchdog
+# mid-install and npm keeps replacing the package while the manager starts
+# launching sessions into it — 100 launch failures out of 100 when measured, the
+# exact window this design exists to close. So the deadline is DERIVED from the
+# per-call bounds and an operator value below that floor is raised, not honoured.
+make_fixture "$WORK/fx17" 0 0
+out="$(run_case "$WORK/fx17" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 \
+  -e STUB_NPM_INSTALL_SLEEP=12 -e TURMA_CLAUDE_UPDATE_TIMEOUT=5 \
+  -e TURMA_CLAUDE_PROBE_TIMEOUT=2 -e TURMA_NPM_VIEW_TIMEOUT=2 -e TURMA_NPM_INSTALL_TIMEOUT=30)"
+# `|| true` on both: under `set -o pipefail` a grep that finds nothing fails the
+# whole pipeline and would abort the suite instead of reporting the defect —
+# and "the install line is missing entirely" is exactly what a killed install
+# looks like, i.e. the case this is here to catch.
+done_line="$(echo "$out" | grep -n "NPMINSTALL install -g" | head -1 | cut -d: -f1 || true)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1 || true)"
+if [ -n "$done_line" ] && [ -n "$mgr_line" ] && [ "$done_line" -lt "$mgr_line" ]; then
+  echo "  ok: the install finished before the manager, despite a too-low outer timeout"
+else
+  echo "  FAIL: the watchdog orphaned an install into the session-relaunch window (install=$done_line manager=$mgr_line)"; FAILED=1
+fi
+if echo "$out" | grep -q "could fire while an install is running"; then
+  echo "  ok: and said it was raising the deadline"
+else
+  echo "  FAIL: silently honoured a deadline that could fire mid-install"; FAILED=1
+fi
+
+echo "== case: the SHIPPED default floor is what it is supposed to be"
+# A FIXED generous number, deliberately not arithmetic over the per-call bounds:
+# the deadline only ever needed to sit above the legitimate worst case, and every
+# attempt to make it tight coupled it to the exact set of calls in the check.
+make_fixture "$WORK/fx19" 0 0
+out="$(run_case "$WORK/fx19" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.9 -e STUB_NPM_LATEST=2.0.9)"
+bound="$(echo "$out" | sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' | head -1)"
+if [ "$bound" = "1800" ]; then
+  echo "  ok: default deadline is 1800s"
+else
+  echo "  FAIL: default deadline is ${bound:-unreported}s, not the shipped 1800s"; FAILED=1
+fi
+
+echo "== case: a timeout of 0 does not disable a bound and shrink the floor"
+# `timeout 0 cmd` DISABLES the timeout — so a 0 would leave that call unbounded
+# and subtract its whole share from the derived floor at the same time, which is
+# both halves of the orphan. 0 is the value an operator reaches for when they
+# mean "no limit", so it has to read as "use the default".
+out="$(run_case "$WORK/fx19" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_INSTALL_SLEEP=12 \
+  -e TURMA_NPM_INSTALL_TIMEOUT=0 -e TURMA_CLAUDE_UPDATE_TIMEOUT=20)"
+done_line="$(echo "$out" | grep -n "NPMINSTALL install -g" | head -1 | cut -d: -f1 || true)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1 || true)"
+if [ -n "$done_line" ] && [ -n "$mgr_line" ] && [ "$done_line" -lt "$mgr_line" ]; then
+  echo "  ok: a 0 install timeout reads as the default, floor intact"
+else
+  echo "  FAIL: a 0 timeout disabled the bound and orphaned the install (install=$done_line manager=$mgr_line)"; FAILED=1
+fi
+
+echo "== case: an oversized timeout cannot overflow the derived floor"
+# The floor is arithmetic, and `$(( ))` WRAPS: an all-digit but oversized value
+# produced a NEGATIVE floor, i.e. one below the very sum it exists to exceed, and
+# the operator's short deadline was then honoured verbatim — orphaning the
+# install again. Nineteen digits is the shape; a millisecond-style 300000 is not.
+make_fixture "$WORK/fx18" 0 0
+out="$(run_case "$WORK/fx18" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -e STUB_NPM_INSTALL_SLEEP=12 \
+  -e TURMA_NPM_INSTALL_TIMEOUT=9999999999999999999 -e TURMA_CLAUDE_UPDATE_TIMEOUT=5)"
+done_line="$(echo "$out" | grep -n "NPMINSTALL install -g" | head -1 | cut -d: -f1 || true)"
+mgr_line="$(echo "$out" | grep -n "MANAGER uid=" | head -1 | cut -d: -f1 || true)"
+if [ -n "$done_line" ] && [ -n "$mgr_line" ] && [ "$done_line" -lt "$mgr_line" ]; then
+  echo "  ok: an absurd per-call timeout falls back to the default, floor intact"
+else
+  echo "  FAIL: an oversized timeout overflowed the floor and orphaned the install (install=$done_line manager=$mgr_line)"; FAILED=1
+fi
+
+echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"
+# /root/.turma is the manager's REGISTRY_DIR, so the dropped identity — every
+# Claude session — can write there. Opening a FIFO BLOCKS until the other end
+# appears, with no error for `|| true` to catch, which is the PID-1 wedge again:
+# a `running` container with no manager, no tunnel and no restart policy firing.
+# Both state files are attacked here, and the boot is TIMED, since a wedge shows
+# up as "never finished", not as a wrong answer.
+make_fixture "$WORK/fx16" 1000 1000
+mkdir -p "$WORK/fx16/turma"
+docker run --rm -v "$WORK/fx16/turma:/t" busybox sh -c \
+  'mkfifo /t/last-claude-check /t/claude-unparseable; chmod 666 /t/*' >/dev/null 2>&1
+t0=$(date +%s)
+out="$(run_case "$WORK/fx16" -e AGENT=claude -e PUID=1000 -e PGID=1000 \
+  -e STUB_MANAGER_SLEEP=2 -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 \
+  -e TURMA_CLAUDE_UPDATE_TIMEOUT=25 -v "$WORK/fx16/turma:/root/.turma")"
+elapsed=$(( $(date +%s) - t0 ))
+if echo "$out" | grep -q "MANAGER uid=" && [ "$elapsed" -lt 25 ]; then
+  echo "  ok: booted in ${elapsed}s with both state files replaced by FIFOs"
+else
+  echo "  FAIL: a session-planted FIFO held the boot ${elapsed}s (wedge, or only the watchdog saved it)"; FAILED=1
+fi
+docker run --rm -v "$WORK/fx16/turma:/t" busybox sh -c 'rm -f /t/last-claude-check /t/claude-unparseable' >/dev/null 2>&1
+
+echo "== case: nothing in the check can stop the container booting"
+# The check is AWAITED, which puts it in `set -e`'s path at PID 1. It used to
+# use a fixed /tmp scratch dir, so any session — running as the dropped identity
+# — could `touch /tmp/.turma-claude-update` and the next `mkdir -p` failure
+# killed PID 1 with a one-line error, on every restart, forever. /tmp is the
+# image's writable layer, so it survived restarts and never self-healed.
+make_fixture "$WORK/fx12" 1000 1000
+out="$(docker run --rm -e AGENT=claude -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
+  -e STUB_MANAGER_SLEEP=2 -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 \
+  -v "$WORK/fx12/repos:/f/repos" -v "$WORK/fx12/claude:/root/.claude" \
+  --entrypoint /bin/sh "$IMG" -c \
+  'mkdir -p /tmp/.turma-claude-update /tmp/turma-claude-update.XXXXXX; \
+   chmod 000 /tmp/turma-claude-update.XXXXXX 2>/dev/null; \
+   exec /usr/local/bin/entrypoint.sh' 2>&1)"
+if echo "$out" | grep -q "MANAGER uid="; then
+  echo "  ok: booted with the scratch paths already taken"
+else
+  echo "  FAIL: a pre-existing /tmp path stopped the container booting: $out"; FAILED=1
+fi
+
+echo "== case: the boot check is rate-limited"
+# A container in a restart loop would otherwise hit the registry every few
+# seconds and pay the check's latency on every pass. ~/.turma is the agent's own
+# state dir, so the stamp rides the same mount the rest of its state does.
+make_fixture "$WORK/fx13" 0 0
+out="$(run_case "$WORK/fx13" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -v "$WORK/fx13/turma:/root/.turma")"
+if echo "$out" | grep -q "NPMINSTALL"; then
+  echo "  ok: the first start checks"
+else
+  echo "  FAIL: the first start ran no check"; FAILED=1
+fi
+out="$(run_case "$WORK/fx13" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
+  -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 -v "$WORK/fx13/turma:/root/.turma")"
+if echo "$out" | grep -q "claude check skipped"; then
+  echo "  ok: a restart seconds later skips it"
+else
+  echo "  FAIL: a restart loop would check on every pass: $(echo "$out" | grep claude)"; FAILED=1
 fi
 
 echo

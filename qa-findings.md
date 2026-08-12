@@ -143,3 +143,90 @@ exercised code in the tree.
   `ws`, so through that await `ws` is null and the guard waves a second
   connection through. Unit tests that hand the guard a socket object never see
   it. Count the sockets (§3, `page.on("websocket")`), don't read the guard.
+
+### 5.8 Shapes that only appear when you RUN it (XERK-254, thirteen rounds)
+
+Every one of these passed review, shellcheck and a green suite. Attack these before anything else
+in shell that runs at boot.
+
+- **A `/bin/sh` function is not a subshell and has no `local`.** An `export` inside one escapes into
+  everything the script starts afterwards. A scratch `HOME` set that way, then `rm -rf`'d, gave the
+  container's manager, tunnel and every session a `$HOME` that did not exist — `~/.turma` (the
+  session registry) and `~/.claude` (the login) both silently missed. Use `f() ( ... )` when the
+  body changes the environment.
+- **A blocking open at PID 1 is unrecoverable.** The container stays `running`, PID 1 is alive and
+  healthy-looking, so no restart policy ever fires — worse than a crash loop, which at least
+  retries. Signature: no manager line in the log, `docker inspect` says running; confirm with
+  `/proc/1` and the child chain (there is no `ps` in the image).
+- **`kill` on a shell does not reach its grandchildren.** A watchdog that kills a check leaves that
+  check's `npm install` running — which then replaces `claude` while the manager relaunches
+  sessions into it. Either signal the process group, or keep the outer deadline clear of the inner
+  ones by construction.
+- **`timeout` without `-k` does not bound anything a child can ignore.** It signals at the deadline
+  and then WAITS: measured 30s for a `trap "" TERM; sleep` child given `timeout 2`. And
+  `timeout ... 0 ...` DISABLES the bound — `0` is the value an operator reaches for when they mean
+  "no limit". Sanitise timeout knobs where they are USED, not only where arithmetic reads them: a
+  malformed one makes `timeout` exit 125 without running the command, which reads as "the tool is
+  broken" rather than "the config is wrong".
+- **SIGKILL and SIGTERM leave different wreckage.** A SIGTERM'd `npm install -g` rolls back (5/5
+  kill points left the old version working); a SIGKILL'd one leaves NO `claude` at all (4/5). Any
+  `-k` grace is what buys the rollback.
+- **Arithmetic derived from a call graph rots.** A deadline computed from per-call timeouts has to
+  be re-derived whenever the call graph changes, and each miscount was a defect (wrong multipliers,
+  an overflowing floor, a count taken as the wrong uid, a clock-skewed budget). A fixed generous
+  number with one explicit coupling retired the whole class. Prefer that shape.
+
+### 5.9 Techniques that found what reading the source did not (XERK-254)
+
+For `agent/native/` and `agent/entrypoint.sh`; each of these surfaced a defect that
+review, shellcheck and a green suite had all passed.
+
+- **Measure as the identity the code runs as.** `[ "$(id -u)" = 0 ]` guards a whole branch of the
+  updater (the EACCES retry into `~/.local`), so a root-only fixture set cannot see it and every
+  count taken with one is wrong. Drive it with
+  `setpriv --reuid 1000 --regid 1000 --clear-groups env HOME=... PATH=... <script>` after
+  `chown -R 1000:1000` on the staged prefix. The shell suites pass under uid 1000 too — run them
+  both ways.
+- **Count bounded calls by shimming `timeout` on PATH**, never by reading them off the source:
+  ```sh
+  printf '#!/bin/sh\n{ printf "%s " "$@"; echo; } >> LOG\nexec /usr/bin/timeout "$@"\n' > $bin/timeout
+  ```
+  This is how a memo that never memoised (`$(...)` is a subshell, so the global never propagates)
+  and a deadline derived from the wrong call count both showed up.
+- **`mkfifo` in `~/.turma` is the cheapest wedge test.** That dir is writable by the identity the
+  SESSIONS run as, so a session can replace any state file there with a FIFO — and opening one
+  blocks forever, with no error for `|| true` to catch. Plant one at every path the start-time
+  check opens and assert the agent still boots.
+- **Stub `date +%s`** to test elapsed-time arithmetic. Clocks step BACKWARDS at boot (chrony /
+  timesyncd on a host with no battery-backed RTC), which is exactly when this code runs, and
+  `$(( now - started ))` is then negative.
+- **Time the recovery, don't just assert it happened.** "Never blocked" and "rescued by a watchdog
+  after N seconds" both end with a booted container; only the elapsed time tells them apart.
+- **Sample fast when measuring a swap window.** `npm install -g` unlinks the bin before extracting,
+  so `claude` is absent from PATH for ~1.5-2s; a single probe misses it, a 50ms loop doesn't.
+
+Staging and driving them, which every case above needed:
+
+- Stage a fake prefix the way `agent/tests/test_turma_agent_update.sh` does:
+  `$PREFIX/{VERSION,hub-agent.py,tunnel-agent.js,hooks/}` + `$PREFIX/bin/` with the script under
+  test, a fake `gh` serving canned releases from `$FAKE_GH_DIR`, and stub
+  `systemctl`/`turma-agentctl`.
+- Real systemd behaviour (`Restart=always`, `KillMode=process`, a detached child surviving a unit
+  restart) without touching /etc:
+  ```bash
+  systemd-run --unit=qa-$$ --collect --property=Restart=always \
+    --property=RestartSec=1 --property=KillMode=process --property=Type=exec \
+    --setenv=HOME=$SCRATCH --setenv=PATH=$BIN:/usr/bin:/bin $BIN/turma-agent
+  ```
+  Stop with `systemctl stop qa-$$`, then `rm /run/systemd/transient/qa-$$.service` and
+  `systemctl daemon-reload` — a stopped transient unit lingers as `loaded` otherwise.
+- The **real** npm registry is cheap and safe if you sandbox it: `export
+  npm_config_prefix=$SCRATCH/pfx npm_config_cache=$SCRATCH/cache`. The install is ~250 MB and ~3s;
+  `npm view @anthropic-ai/claude-code version` answers in <0.5s.
+- The container half is drivable end to end with a REAL claude: `node:24-bookworm-slim` + `npm i -g
+  @anthropic-ai/claude-code@<older>` + the real `entrypoint.sh` + stub
+  `python3`/`hub-agent.py`/`tunnel-agent.js`. Keep the stub manager alive (`sleep`) or the container
+  exits first. `test_entrypoint.sh` stubs claude+npm, so it observes the DECISION only — never file
+  ownership, writes under `/root`, or timing.
+- A **running** claude survives the package swap (one static ELF, the kernel keeps the inode); only
+  a new exec in the window fails.

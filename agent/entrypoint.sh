@@ -154,6 +154,238 @@ if [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; then
   fi
 fi
 
+# --- Claude Code update on every start (XERK-254) --------------------------
+# The native launcher fires its updater on every start; this is the container's
+# half of the same rule, and it covers ONE of the two things that updater does.
+#
+# The agent itself cannot self-update here: it IS the image, so its update is an
+# image pull (Watchtower, per DockerOps) followed by a recreate — which is what
+# brings us through this code again. Claude Code, though, is baked in at build
+# time (CLAUDE_CODE_VERSION in agent/Dockerfile) and then frozen for the life of
+# the tag, so a host that only ever pulls a carried-forward agent image runs a
+# Claude Code that keeps aging. This closes that half.
+#
+# As root, because `npm install -g` writes /usr/local, which the dropped
+# identity cannot. The result is world-readable, so the sessions — which run as
+# that dropped identity — execute it fine.
+#
+# AWAITED, and deliberately not backgrounded: `npm install -g` leaves `claude`
+# absent from PATH for ~1.7s while it replaces the package, and resume_on_boot
+# relaunches this host's sessions on a 1s stagger seconds after the manager
+# starts — so a backgrounded check puts the hole exactly under the first
+# relaunches, which then die on exec with ENOENT. Finishing before the manager
+# exists means nothing can be launching while the package moves. Each call is
+# bounded by `timeout` instead, so a wedged registry delays the boot but cannot
+# stop it; it is two version reads unless something newer is really published.
+#
+# Being awaited puts it in `set -e`'s path at PID 1, so NOTHING in here may be
+# allowed to abort the boot: the whole block is `||`-guarded, and its scratch
+# HOME is an mktemp dir rather than a fixed path. A fixed /tmp path was a denial
+# of service — any session, running as the dropped identity, could `touch
+# /tmp/.turma-claude-update`, and the next `mkdir -p` failure then killed PID 1
+# with a one-line error and no self-heal, on every restart, forever.
+#
+# TURMA_CLAUDE_AUTO_UPDATE=0 pins the image's bundled version.
+# A SUBSHELL body — `() ( … )`, not `() { … }`. A /bin/sh function is not a
+# subshell and has no `local`, so the throwaway HOME below would escape into
+# everything the entrypoint starts afterwards: the manager (whose ~/.turma
+# registry, usage ledger and archive state would land in a /tmp dir this
+# function then deletes), the tunnel, and every session. That is precisely the
+# `export HOME=/root` invariant the identity block above exists to hold. The
+# `||` guard that keeps this off `set -e`'s path lives at the CALL site, so
+# making the body a subshell costs nothing.
+#
+# Its two state files live in /root/.turma, which the DROPPED IDENTITY can write
+# — it is the manager's own REGISTRY_DIR. So a session can replace either with a
+# FIFO, and opening a FIFO for reading or writing BLOCKS until the other end
+# appears: `2>/dev/null || true` cannot help, because there is no error, only a
+# block. That is the PID-1 wedge again through a different door — a `running`
+# container with no manager, no tunnel and no restart. Hence these two helpers:
+# nothing here ever opens a path that isn't a regular file, and the write goes
+# through a fresh temp file and a rename, so there is no check-then-open window
+# to race either.
+turma_read_file() {  # <path> — prints nothing for anything that isn't a plain file
+  [ -f "$1" ] || return 0
+  cat "$1" 2>/dev/null || true
+}
+
+# A plausible whole number of seconds, or the given default. Env values reach
+# arithmetic here: a non-numeric one would abort the shell, and an ALL-DIGIT but
+# oversized one silently overflows `$(( ))` to a NEGATIVE result — which would
+# put the derived floor below the sum it exists to exceed. A day is far past any
+# sane timeout, so anything beyond it is a typo, not an intention.
+_num() {  # <value> <default>
+  case "$1" in
+    ''|*[!0-9]*) printf '%s' "$2"; return ;;
+  esac
+  # Leading zeros stripped first: they are not octal here, but they DO make a
+  # sane value fail the length test below. All-zero then reads as empty, which
+  # is the point of the next line.
+  _v="${1#"${1%%[!0]*}"}"
+  # ZERO IS NOT "no limit" here, however much it looks like it: `timeout 0 cmd`
+  # disables the timeout, so a 0 would leave that call unbounded AND subtract
+  # its whole share from the derived floor — the two halves of the orphan this
+  # arithmetic exists to prevent. It reads as "use the default" instead.
+  [ -n "$_v" ] || { printf '%s' "$2"; return; }
+  if [ "${#_v}" -le 6 ] && [ "$_v" -le 86400 ]; then printf '%s' "$_v"; else printf '%s' "$2"; fi
+}
+
+turma_write_file() {  # <path> <content>
+  _dir="$(dirname "$1")"
+  [ -d "$_dir" ] || return 0
+  _tmp="$(mktemp "$_dir/.turma-tmp.XXXXXX" 2>/dev/null)" || return 0
+  printf '%s\n' "$2" >"$_tmp" 2>/dev/null \
+    && mv -f "$_tmp" "$1" 2>/dev/null && return 0
+  rm -f "$_tmp" 2>/dev/null || true
+}
+
+claude_update_check() (
+  # `timeout` WITHOUT -k only signals at the deadline and then waits for the
+  # child to leave: measured at 30s for a `trap "" TERM` child given `timeout 2`.
+  # Every bound below would then be nominal, and the watchdog floor at the call
+  # site is arithmetic over those numbers — so they have to be enforceable. -k
+  # escalates to SIGKILL after a grace period. (A process in uninterruptible
+  # sleep on stalled storage takes neither signal; nothing in userspace can
+  # bound that, which is why the watchdog's message is worded the way it is.)
+  _grace="$(_num "${TURMA_KILL_GRACE:-10}" 10)"
+
+  # Rate-limited like the native launcher's, and for the same reason: a
+  # container in a restart loop would otherwise hit the registry every few
+  # seconds, and pay the check's latency on every pass.
+  stamp=/root/.turma/last-claude-check
+  now="$(date +%s)"
+  # Read through the guard above — which also fixes a first boot printing
+  # "cannot open /root/.turma/last-claude-check" as its very first log line
+  # (dash reports the failed redirect itself; a `2>/dev/null` on the pipeline
+  # belongs to `tr`, not to the shell's open).
+  last="$(turma_read_file "$stamp" | tr -cd '0-9')"
+  # Strip leading zeros before the arithmetic: this is /bin/sh, where a
+  # zero-padded number is OCTAL and `09` is an error — and bash's `10#` prefix
+  # is undefined here. An implausibly long value is treated as no stamp rather
+  # than risking an overflow whose result is unspecified.
+  last="$(printf '%s' "$last" | sed 's/^0*//')"
+  [ "${#last}" -le 12 ] || last=""
+  if [ -n "$last" ]; then
+    age=$((now - last))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}" ]; then
+      echo "[entrypoint] claude check skipped: last check ${age}s ago"
+      exit 0
+    fi
+  fi
+
+  # Run against a throwaway HOME. /root is the operator's bind mount: npm would
+  # leave a cache of tarballs nothing reads later (the Dockerfile deletes them
+  # for the same reason), and anything `claude` touches on the way to printing
+  # its version would land there ROOT-owned on a host whose sessions run as
+  # somebody else — re-creating, one file at a time, the breakage the identity
+  # block exists to end.
+  scratch="$(mktemp -d /tmp/turma-claude-update.XXXXXX)" || exit 1
+  mkdir -p /root/.turma 2>/dev/null || true
+  turma_write_file "$stamp" "$now"
+  HOME="$scratch"; export HOME
+  npm_config_cache="$scratch/npm"; export npm_config_cache
+
+  # Both the parsed version and what claude actually PRINTED: an unparseable
+  # version is not the same fault as a missing one, and telling them apart is
+  # what stops a futile reinstall on every boot (see the marker below).
+  raw=""
+  command -v claude >/dev/null 2>&1 && raw="$(timeout -k "$_grace" "$(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30)" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
+  cur="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  unparseable=/root/.turma/claude-unparseable
+  latest="$(timeout -k "$_grace" "$(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45)" npm view @anthropic-ai/claude-code version \
+            --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]')"
+  # A registry that answers with anything but a version is "stay put", not an
+  # upgrade: `sort -V` ranks a non-numeric string ABOVE a semver, so a proxy
+  # error line or a warning on stdout would otherwise replace the package on
+  # every single boot.
+  echo "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' || latest=""
+  if [ -z "$latest" ]; then
+    echo "[entrypoint] claude: registry unreachable or unreadable; staying at ${cur:-unknown}"
+  elif [ -n "$cur" ] && [ "$cur" = "$latest" ]; then
+    echo "[entrypoint] claude up to date ($cur)"
+  elif [ -n "$cur" ] \
+       && [ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" = "$cur" ]; then
+    # Installed is NEWER than the registry's latest — a version pinned by hand
+    # or an unpublished build. Never downgrade it.
+    echo "[entrypoint] claude: installed $cur is ahead of published $latest; leaving it"
+  elif [ -z "$cur" ] && [ -n "$raw" ] && [ "$raw" = "$(turma_read_file "$unparseable" | head -n1)" ]; then
+    # Present, running, and printing a version shape this can't parse — a future
+    # two-component or calver string, say. Reinstalling fixed nothing last time,
+    # so don't do it again until what claude prints CHANGES. Without this memory
+    # it is a real install on every boot, forever, inside the awaited path.
+    echo "[entrypoint] claude: unrecognised version ($raw); a repair already failed to change that"
+  else
+    # An unreadable version reaches here too (claude present, $cur empty): most
+    # often a half-written install, which reinstalling repairs. Verified below
+    # rather than assumed, and remembered when it doesn't help.
+    echo "[entrypoint] claude update: ${cur:-none-or-unreadable} -> $latest"
+    if timeout -k "$_grace" "$(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300)" \
+         npm install -g "@anthropic-ai/claude-code@$latest"; then
+      # BOUNDED, like the probe above. This is a child of PID 1 with no outer
+      # timeout anywhere: an unbounded read that never returns leaves the
+      # container `running` with no manager, no tunnel and no sessions, and
+      # since PID 1 is alive and healthy-looking, no restart policy ever fires.
+      # A hang here is reachable from exactly the fault this branch repairs.
+      now_raw="$(timeout -k "$_grace" "$(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30)" claude --version 2>/dev/null | head -n1 | tr -s '[:space:]' ' ')"
+      echo "[entrypoint] claude: now ${now_raw:-?}"
+      if printf '%s' "$now_raw" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
+        rm -f "$unparseable" 2>/dev/null || true
+      else
+        turma_write_file "$unparseable" "$now_raw"
+      fi
+    else
+      echo "[entrypoint] claude: update FAILED; staying at ${cur:-none}"
+    fi
+  fi
+  rm -rf "$scratch"
+)
+
+if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
+   && { [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; } \
+   && command -v npm >/dev/null 2>&1; then
+  # `|| echo` so nothing inside can abort the boot: this runs at PID 1 under
+  # `set -e`, and an agent that will not start is far worse than a stale claude.
+  #
+  # Bounded as a WHOLE, and not only call by call. Every call inside is
+  # individually bounded today, but this block runs as a child of PID 1 with
+  # nothing above it — so one future unbounded call, or one blocking open nobody
+  # predicted, is a container that stays `running` forever with no manager and
+  # no restart. The watchdog is the structural guarantee; the per-call bounds
+  # and the regular-file guards are what stop it ever firing.
+  #
+  # Its deadline is a FIXED, deliberately generous number — not arithmetic over
+  # the per-call bounds. It only ever needed to sit above the legitimate worst
+  # case; every attempt to make it TIGHT coupled it to the exact set of calls
+  # below and produced a run of defects (a floor that overflowed on a large
+  # value, multipliers that miscounted the calls, a count taken as the wrong
+  # uid, clock arithmetic inside the budget that fed it). What must remain true
+  # is only that it cannot fire while an install is running — a `kill` reaches
+  # this shell and NOT its npm grandchild, and npm would then keep replacing the
+  # package while the manager starts launching sessions into it. So the single
+  # coupling kept is to the one bound that dominates: 2.5x the install budget —
+  # two for the install's own clock-skewed worst case and a half for the bounded
+  # work that runs before it — so the deadline cannot land inside an install
+  # however that knob is set. Interrupting a version read or a registry query
+  # orphans nothing, so nothing else needs covering.
+  _deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-1800}" 1800)"
+  _min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 5 / 2 ))
+  if [ "$_deadline" -lt "$_min" ]; then
+    echo "[entrypoint] claude: TURMA_CLAUDE_UPDATE_TIMEOUT=${_deadline}s could fire while an" \
+      "install is running; using ${_min}s"
+    _deadline="$_min"
+  fi
+  echo "[entrypoint] claude check bounded at ${_deadline}s"
+  claude_update_check &
+  _check_pid=$!
+  ( sleep "$_deadline"; kill -TERM "$_check_pid" 2>/dev/null ) &
+  _watchdog_pid=$!
+  wait "$_check_pid" \
+    || echo "[entrypoint] claude: update check did not finish in ${_deadline}s; carrying on." \
+            "If it was mid-install, that install can still be replacing claude —" \
+            "a session started in the next few minutes may fail to launch."
+  kill -TERM "$_watchdog_pid" 2>/dev/null || true
+fi
+
 # --- GitHub auth preflight (agent-agnostic) --------------------------------
 # git authenticates through the image's system credential helper
 # (`gh auth git-credential`, set in /etc/gitconfig), so private clone/fetch/push

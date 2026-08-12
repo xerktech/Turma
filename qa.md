@@ -28,13 +28,18 @@ a QA session.
 
 ### Native-host facts
 
-- **`npm`/`npx` are installed but not linked.** `node` is symlinked into
-  `/root/.local/bin`, `npm` is not. Every npm command must start with:
-  ```bash
-  export PATH=/root/.local/node/bin:$PATH
-  ```
-  Without it you get `command not found: npm` and may wrongly conclude Node
-  tooling is unavailable.
+- **`npm`/`npx` live in `/root/.local/node/bin` and are now symlinked into
+  `/root/.local/bin`** (`node`, `npm`), so they ARE on the systemd units' PATH
+  (the launcher and updater both prepend `$HOME/.local/bin`). `npx` is not
+  linked; for it, prepend `/root/.local/node/bin` yourself.
+- **npm's global prefix is `/root/.local/node`, NOT `~/.local`** (`npm config
+  get prefix`). So `npm i -g <pkg>` lands a binary in `/root/.local/node/bin`,
+  which is *not* on the agent's PATH. Anything that installs a tool and then
+  expects to find it must pass `--prefix ~/.local` or set `npm_config_prefix`.
+- **`claude` here is Anthropic's NATIVE installer build**, not npm:
+  `/root/.local/bin/claude -> /root/.local/share/claude/versions/<ver>`, and
+  `npm ls -g @anthropic-ai/claude-code` exits 1. Code that branches on
+  "npm-managed?" takes the `claude update` path on this host.
 - **npm's cache must be redirected** — `/root/.npm` is root-owned and npm dies
   with EACCES: `npm ci --cache /tmp/claude-0/npm-cache`.
 - **`bun` is available** at `/root/.local/bin/bun` — this is what `veiller/`
@@ -196,6 +201,13 @@ reproduce that gate rather than per-directory runs:
 ```bash
 node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
 ```
+
+`agent/native/`'s launcher and updater run as **root under systemd here** and
+touch the live install: stage a fake `$PREFIX` + scratch `$HOME`, never
+`HOME=/root` (it stamps `last-update-check`, suppressing the real agent's
+next boot check, and can restart it); stub **all three** restart paths (a real
+system unit exists here); it holds `flock` on `update.lock` for the whole run.
+Recipes: `qa-findings.md` §5.9.
 
 ### 2.3 Glasses (`glasses/`) — npm + vite + vitest
 
