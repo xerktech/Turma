@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -35,24 +36,45 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.xerktech.turma.core.ModelSource
+import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.RepoInfo
 
 private val MODELS = listOf("default", "opus", "sonnet", "haiku")
 private val MODES = listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default")
 
+/**
+ * The "New session" composer (web `sessions.html`'s spawn options block).
+ *
+ * [localModel] is the target HOST's self-hosted-model block (XERK-246): when it
+ * reports one, the composer offers a "Run against" row, because spawning onto
+ * the local model is how new work starts once Claude usage is gone — without it
+ * you could fail existing sessions over from a phone but not begin anything.
+ * Absent, the row is hidden rather than shown-and-refused (the hub 409s it).
+ */
 @Composable
 fun SpawnDialog(
     host: String,
     repo: String,
     isRoot: Boolean,
+    localModel: LocalModelInfo? = null,
     onDismiss: () -> Unit,
-    onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String) -> Unit,
+    onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String, modelSource: String) -> Unit,
 ) {
     var prompt by remember { mutableStateOf("") }
     var label by remember { mutableStateOf("") }
     var baseRef by remember { mutableStateOf("") }
     var model by remember { mutableStateOf("default") }
     var mode by remember { mutableStateOf("auto") }
+    var modelSource by remember { mutableStateOf(ModelSource.SUBSCRIPTION) }
+    val sourceOpts = remember(localModel) { ModelSource.options(localModel) }
+    // Never keep a choice the operator can no longer see. If the host stops
+    // reporting a local model while the composer is open, the "Run against" row
+    // disappears — and a `local` left behind in state would spawn into a
+    // guaranteed 409 with nothing on screen explaining it or able to change it.
+    LaunchedEffect(localModel?.available) {
+        if (!ModelSource.composerOffers(localModel)) modelSource = ModelSource.SUBSCRIPTION
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -80,22 +102,53 @@ fun SpawnDialog(
                         singleLine = true, modifier = Modifier.fillMaxWidth(),
                     )
                 }
+                // The Model picker stays for a local spawn, matching the web
+                // composer (sessions.html), which offers and sends it whatever
+                // the source. The agent drops `--model` for a local session
+                // itself, and the alias is what that session goes back to if it
+                // is ever switched to the subscription — so discarding it here
+                // would silently give an Android-spawned session a different
+                // model from a web-spawned one. Only the CHAT bar fixes the
+                // model, because there the picker would break a live session.
                 DropdownField("Model", MODELS, model) { model = it }
                 DropdownField("Permission mode", MODES, mode) { mode = it }
+                if (ModelSource.composerOffers(localModel)) {
+                    DropdownField(
+                        label = "Run against",
+                        options = sourceOpts.map { it.first },
+                        selected = modelSource,
+                        optionLabel = { v -> sourceOpts.firstOrNull { it.first == v }?.second ?: v },
+                    ) { modelSource = it }
+                }
             }
         },
-        confirmButton = { TextButton(onClick = { onSpawn(prompt, label, baseRef, model, mode) }) { Text("Spawn") } },
+        confirmButton = {
+            TextButton(onClick = { onSpawn(prompt, label, baseRef, model, mode, modelSource) }) {
+                Text("Spawn")
+            }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 
+/**
+ * A read-only `<select>`. [optionLabel] separates what a row READS from the
+ * value it SENDS, for a field whose wire values aren't labels ("subscription" →
+ * "Claude subscription"); by default they are the same string.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DropdownField(label: String, options: List<String>, selected: String, onSelect: (String) -> Unit) {
+fun DropdownField(
+    label: String,
+    options: List<String>,
+    selected: String,
+    optionLabel: (String) -> String = { it },
+    onSelect: (String) -> Unit,
+) {
     var expanded by remember { mutableStateOf(false) }
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
         OutlinedTextField(
-            value = selected,
+            value = optionLabel(selected),
             onValueChange = {},
             readOnly = true,
             label = { Text(label) },
@@ -104,7 +157,7 @@ fun DropdownField(label: String, options: List<String>, selected: String, onSele
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             options.forEach { opt ->
-                DropdownMenuItem(text = { Text(opt) }, onClick = { onSelect(opt); expanded = false })
+                DropdownMenuItem(text = { Text(optionLabel(opt)) }, onClick = { onSelect(opt); expanded = false })
             }
         }
     }

@@ -247,6 +247,16 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # large sessions; the guard is a backstop, not an expected limit (XERK-101).
 MIGRATION_BLOB_MAX = int(os.environ.get("TURMA_MIGRATION_BLOB_MAX", str(1 << 26)))  # 64 MiB
 
+# How many staged session-start refusals (XERK-265) a beat may carry, and how
+# long one reason may be. Neither is a normal limit — a refusal only exists where
+# a command was declined, and the reasons are one line. They are here because the
+# reason can interpolate an exception (`the session failed to launch: {e}`) whose
+# text is unbounded, and it lands in a hub cache that COUNTS against the record
+# ceiling: an 8 MiB beat would wedge this host's control plane. Matches the 500
+# `_set_error` already truncates a session's errorMsg to.
+SPAWN_FAILURES_MAX = 40
+SPAWN_FAILURE_REASON_MAX = 500
+
 
 def _project_slug(path):
     """Claude Code's project-dir slug for a cwd: EVERY non-alphanumeric
@@ -415,15 +425,32 @@ def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
 
 
-def run(cmd, cwd=None):
-    """Run a command, return stripped stdout or '' on any failure."""
+def run(cmd, cwd=None, timeout=15):
+    """Run a command, return stripped stdout or '' on any failure.
+
+    Failure and "no output" are the SAME answer here, so callers that must tell
+    them apart (a `git status --porcelain` deciding a worktree is clean, say)
+    want run_out instead."""
     try:
         out = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=15
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
         )
         return out.stdout.strip() if out.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def run_out(cmd, cwd=None, timeout=15):
+    """Run a command, return (rc, stripped stdout). rc is None if it couldn't
+    launch or timed out — the distinction run() collapses, and the one that
+    matters when EMPTY output is itself a verdict."""
+    try:
+        out = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        )
+        return out.returncode, (out.stdout or "").strip()
+    except Exception:
+        return None, ""
 
 
 def run_stdin(cmd, data, timeout=15):
@@ -5365,7 +5392,14 @@ GH_ORG_MAX = 20             # orgs to auto-sweep for repos (bounds the gh calls)
 CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
 CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
 CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
-PRUNE_RESULT_LINGER_SEC = 60  # keep a repo's prune summary in the heartbeat
+PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the heartbeat
+# A prune runs on its own worker thread (XERK-256), so its git commands are NOT
+# on the heartbeat's critical path and can be bounded generously instead of
+# short: a single `git worktree remove` of a node_modules-carrying tree on a ZFS
+# pool was measured at 10-37s, and reaping one mid-removal at run()'s 15s default
+# turned a removable worktree into a "kept" one on every sweep.
+PRUNE_GIT_TIMEOUT_SEC = 600
+PRUNE_QUEUE_MAX = 64          # repos that may be waiting on the prune worker
 # A GitHub owner or repo-name segment: alnum start, then GitHub's own limited
 # set. Deliberately strict — the result becomes part of a URL and a path.
 _GH_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -5754,7 +5788,20 @@ def normalize_jira_site(raw):
 BOARD_ERROR_MAX_CHARS = 200
 
 
-def _http_error_detail(err):
+def _refusal_kind(body):
+    """Which refusal a 413's JSON body describes — "body" or "record" — or None
+    when it cannot be read (an older hub sends no `kind`, and a mid-upload refusal
+    reaches us as a broken pipe with nothing to parse at all, which is exactly why
+    the cap is advertised on every beat reply instead). See XERK-258."""
+    try:
+        d = json.loads(body or "{}")
+        kind = d.get("kind") if isinstance(d, dict) else None
+        return kind if isinstance(kind, str) else None
+    except Exception:
+        return None
+
+
+def _http_error_detail(err, body=None):
     """A failed tracker request as text an operator can act on.
 
     urllib's HTTPError stringifies to just "HTTP Error 400: Bad Request" and
@@ -5765,11 +5812,14 @@ def _http_error_detail(err):
     to tell two unrelated failures apart.
     """
     code = getattr(err, "code", None) or "?"
-    body = ""
-    try:
-        body = (err.read() or b"").decode("utf-8", "replace")
-    except Exception:
-        pass
+    # `body` may be passed in by a caller that has already read it — HTTPError is a
+    # stream and only the first reader gets anything.
+    if body is None:
+        body = ""
+        try:
+            body = (err.read() or b"").decode("utf-8", "replace")
+        except Exception:
+            pass
     msg = ""
     try:
         parsed = json.loads(body) if body.strip() else None
@@ -5779,6 +5829,13 @@ def _http_error_detail(err):
             msg = str(parsed.get("message") or "").strip()
             if not msg:
                 msg = "; ".join(str(m) for m in (parsed.get("errorMessages") or []))
+            # The TURMA HUB says {"error": ...} — same need, same function: its
+            # refusals name the host a credential is for and whether
+            # TURMA_AGENT_STRICT is on (XERK-268), and the status line alone
+            # cannot say either. Checked AFTER both tracker shapes, so adding it
+            # cannot change what an existing Jira/ADO failure reports.
+            if not msg:
+                msg = str(parsed.get("error") or "").strip()
             errors = parsed.get("errors")
             if not msg and isinstance(errors, dict):
                 msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
@@ -8495,6 +8552,15 @@ class SessionManager:
         # same held-across-a-failed-POST lifecycle as jira_issue_results.
         self.create_meta_results = []
         self.create_ticket_results = []
+        # Staged refusals of a command that was supposed to PRODUCE a session
+        # (XERK-265) — each `{cmdId, migrationId, error, at}`, same lifecycle as
+        # the results above. A resume/import this agent declined used to be a
+        # container log line and nothing more: the command is ACKed either way,
+        # so the hub saw a session that simply never arrived and a migration sat
+        # in `importing` until MIGRATE_TIMEOUT_MS, failing with no reason. The
+        # cmdId is what the UI followed the spawn by; the migrationId is what the
+        # hub's migration bookkeeping keys on.
+        self.spawn_failures = []
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -8519,9 +8585,21 @@ class SessionManager:
         # or on a hub `refreshJira` command, reported every beat; stays the
         # empty shape on unconfigured hosts).
         self.jira = board_empty()
-        # Recent per-repo prune results (merged branches + safe worktrees swept),
-        # keyed by repo name, lingered briefly so the UI can show the summary.
+        # Per-repo prune state (merged branches + safe worktrees swept), keyed by
+        # repo name: queued/running while the worker is on it, then the summary
+        # lingered briefly so the UI can show it. Written by the prune WORKER
+        # thread and read by the beat, so every touch holds _prune_lock.
         self.prunes = {}
+        self._prune_lock = threading.Lock()
+        self._prune_queue = deque()   # repo names the worker has yet to reach
+        self._prune_worker = None
+        # Worktrees the worker removed, drained by _poll_prunes. self.closed is
+        # the BEAT's to mutate — the worker only ever names paths for it.
+        self._prune_swept = []
+        # Worktrees a `git worktree remove` is running against RIGHT NOW. The
+        # resume paths refuse a cwd listed here (_claim_worktree), so a session
+        # can't be launched into a directory that is halfway unlinked.
+        self._prune_removing = set()
         # In-flight session-summary subprocesses keyed by session id (the Popen
         # + its output file live here; the finished text lands on the session
         # record). Empty when no session has a prompt to summarize.
@@ -10201,7 +10279,7 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def resume(self, sid):
+    def resume(self, sid, cmd_id=None):
         """Bring back a KILLED session with its conversation: re-register it and
         relaunch claude in its kept worktree, resuming its newest transcript
         (re-adding a detached worktree off the recorded base only if the dir has
@@ -10252,7 +10330,17 @@ class SessionManager:
             "stoppedAt": None,
             "errorMsg": None,
         }
-        self.registry.append(sess)
+        # A prune removing this very worktree would leave claude running in a
+        # half-unlinked dir, so the registration and that check are one step.
+        if not self._claim_worktree(sess["worktreePath"], sess):
+            # Same prune race as _resume_at_cwd's, and reported the same way. The
+            # PAGE can't consume this one yet — a killed resume keeps its id, so
+            # the dashboard deep-links `?session=<id>`, whose wait never times
+            # out (XERK-275). Staging it still gets the refusal off the container
+            # log and onto the wire, where that fix will read it.
+            self._refuse_start(f"a prune is removing the worktree at "
+                               f"{sess['worktreePath']}", cmd_id=cmd_id)
+            return
         self.closed = [c for c in self.closed if c.get("id") != sid]
         try:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
@@ -10281,7 +10369,8 @@ class SessionManager:
         in spawn(): a resume-by-transcript creates a session whose id the hub
         can't predict, so that's the UI's only handle on the one it asked for."""
         if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
-            log(f"resumeTranscript: bad transcript id {transcript_id!r}")
+            self._refuse_start(f"bad transcript id {transcript_id!r}",
+                               cmd_id=cmd_id, context="resumeTranscript")
             return
         # Find the transcript dir: trust the picker's cwd hint if it still holds
         # the file, else scan PROJECTS_ROOT for it.
@@ -10293,7 +10382,8 @@ class SessionManager:
         if proj is None:
             proj = self._find_transcript_dir(transcript_id)
         if proj is None:
-            log(f"resumeTranscript: no transcript {transcript_id}")
+            self._refuse_start(f"no transcript {transcript_id} on this host",
+                               cmd_id=cmd_id, context="resumeTranscript")
             return
         path = os.path.join(proj, transcript_id + ".jsonl")
         cwd = _transcript_cwd(path) or cwd_hint
@@ -10331,7 +10421,37 @@ class SessionManager:
         extra = {"modelSource": closed.get("modelSource")} if closed else None
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
-    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None):
+    def _refuse_start(self, reason, *, cmd_id=None, migration_id=None,
+                      context="resume"):
+        """Log a refused session-creating command AND stage it for the next beat
+        so whatever asked for it learns why (XERK-265).
+
+        Every one of these paths used to end at a `log()` the hub never saw: the
+        command is ACKed regardless, so a refused resume left the Sessions page
+        spinning out its follow window and a refused migration import left the
+        move in `importing` until MIGRATE_TIMEOUT_MS, failing with no reason
+        attached. `reason` is therefore operator-facing — it is what the UI and
+        the migration record show, so it says WHY, not just that it failed.
+
+        A refusal with neither handle is logged only: `cmdId`/`migrationId` are
+        the correlation, and a malformed migration id (the very field being
+        rejected) has nothing to report against."""
+        log(f"{context} refused: {reason}")
+        if not cmd_id and not migration_id:
+            return
+        self.spawn_failures.append({
+            "cmdId": cmd_id,
+            "migrationId": migration_id,
+            # Truncated for the same reason _set_error truncates errorMsg: a
+            # reason can carry an exception's text, and this one rides the beat
+            # into a hub cache that counts against the record ceiling.
+            "error": reason[:SPAWN_FAILURE_REASON_MAX],
+            "at": now_iso(),
+        })
+        del self.spawn_failures[:-SPAWN_FAILURES_MAX]
+
+    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None,
+                       migration_id=None):
         """Launch `claude --resume <transcript_id>` cwd'd at `cwd`, the shared
         core of resume_transcript (host-local resume-any) and import_session
         (a session migrated in from another agent). The transcript file must
@@ -10344,20 +10464,27 @@ class SessionManager:
         `extra` carries fields a plain resume-any has no source for but a
         migration does — the session's ticket, name, model and mode — so the
         moved session lands looking like its old self rather than an anonymous
-        resume. Returns the new session record, or None if it couldn't launch."""
+        resume. Returns the new session record, or None if it couldn't launch —
+        and every such refusal is staged for the hub by `_refuse_start`, since
+        both callers discard the return value and the command is ACKed anyway.
+        `migration_id` is passed by import_session so the hub can fail THAT
+        migration now instead of waiting out its timeout."""
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd_id, migration_id=migration_id)
+
         # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
         # path reach git/tmux.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"resume: cwd {cwd!r} not resumable on this host")
+            refuse(f"cwd {cwd!r} is not resumable on this host")
             return None
         repo, _origin, is_root = cls
         cwd = os.path.normpath(cwd)
         if self._running_count() >= MAX_SESSIONS:
-            log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
             return None
         if is_root and self._root_running():
-            log("resume refused: a root session is already running")
+            refuse("a root session is already running on this host")
             return None
         # One live session per cwd: two claudes in the same dir share a project
         # slug + RC bridge pointer and would collide (the same reason root is
@@ -10366,11 +10493,11 @@ class SessionManager:
         if any(s.get("status") == "running"
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
-            log(f"resume refused: a session is already running in {cwd}")
+            refuse(f"a session is already running in {cwd}")
             return None
         repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
         if not is_root and not os.path.isdir(repo_path):
-            log(f"resume: repo {repo!r} is gone; cannot resume")
+            refuse(f"repo {repo!r} is gone from this host")
             return None
         extra = extra or {}
         sid = self._new_id()
@@ -10412,7 +10539,15 @@ class SessionManager:
             "errorMsg": None,
             "spawnCmdId": cmd_id,
         }
-        self.registry.append(sess)
+        # Same handshake as resume(): never register onto a worktree a prune is
+        # removing right now — the dir still exists for most of that removal, so
+        # the isdir check below would skip the re-add and launch into it.
+        if not self._claim_worktree(cwd, sess):
+            # THE refusal this ticket exists for: ordinary timing between two
+            # features the operator is not thinking about, so it must not read
+            # as "the migration randomly hung for the timeout" (XERK-256).
+            refuse(f"a prune is removing the worktree at {cwd}")
+            return None
         try:
             # A deleted/pruned Turma worktree (or a migrated session, whose
             # worktree only ever existed on the source host): re-add a detached
@@ -10434,6 +10569,11 @@ class SessionManager:
             return sess
         except Exception as e:
             self._set_error(sess, e)
+            # The record survives carrying the error, but it is `status:"error"`
+            # — the hub's migration handoff waits for a RUNNING session with this
+            # cmdId, so without this the move waits out its timeout exactly like
+            # a refusal above.
+            refuse(f"the session failed to launch: {e}")
             return None
 
     # --- session migration across hosts (XERK-101) ------------------------
@@ -10452,24 +10592,31 @@ class SessionManager:
         if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
             log(f"exportSession: bad migration id {migration_id!r}")
             return
+        # Every refusal below is staged against the migration id (XERK-265): the
+        # hub is waiting on a blob that will never arrive, and without a reason
+        # the move sits in `exporting` for the whole MIGRATE_TIMEOUT_MS.
+        def refuse(reason):
+            self._refuse_start(reason, migration_id=migration_id,
+                               context="exportSession")
         sess = self._find(session_id)
         if not sess:
-            log(f"exportSession: no such session {session_id}")
+            refuse(f"no such session {session_id} on the source host")
             return
         path = _session_transcript_path(sess)
         if not path or not os.path.isfile(path):
-            log(f"exportSession: session {session_id} has no transcript to move")
+            refuse(f"session {session_id} has no transcript to move")
             return
         try:
             blob = self._pack_transcript(path)
         except Exception as e:
-            log(f"exportSession: pack failed for {session_id}: {e}")
+            refuse(f"packing the transcript failed: {e}")
             return
         if len(blob) > MIGRATION_BLOB_MAX:
-            log(f"exportSession: transcript bundle {len(blob)} bytes exceeds "
-                f"{MIGRATION_BLOB_MAX}; migration aborted")
+            refuse(f"the transcript bundle is {len(blob)} bytes, over the "
+                   f"{MIGRATION_BLOB_MAX} limit")
             return
-        self._migration_upload(migration_id, blob)
+        if not self._migration_upload(migration_id, blob):
+            refuse("uploading the transcript bundle to the hub failed")
 
     def import_session(self, cmd):
         """Target half of a migration: pull the transcript bundle the source
@@ -10485,21 +10632,30 @@ class SessionManager:
         # below use this localized cwd, so they stay self-consistent.
         cwd = self._localize_migrated_cwd(cmd.get("cwd"))
         if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
+            # The one refusal with nothing to report against — the migration id
+            # IS the handle, and this is it being rejected.
             log(f"importSession: bad migration id {migration_id!r}")
             return
+        # Everything past here is staged against the migration id (XERK-265) so
+        # advanceMigrations can fail the move now, with a reason, instead of the
+        # operator watching it hang for MIGRATE_TIMEOUT_MS.
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd.get("cmdId"),
+                               migration_id=migration_id,
+                               context="importSession")
         if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
-            log(f"importSession: bad transcript id {transcript_id!r}")
+            refuse(f"bad transcript id {transcript_id!r}")
             return
         # Classify the cwd BEFORE spending a download — a foreign path or a
         # missing repo can't be resumed here, and the hub already vetted the org
         # + repo, so this only trips on a genuinely inconsistent target.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"importSession: cwd {cwd!r} not resumable on this host")
+            refuse(f"cwd {cwd!r} is not resumable on this host")
             return
         blob = self._migration_download(migration_id)
         if blob is None:
-            log(f"importSession: could not fetch bundle for {migration_id}")
+            refuse("fetching the transcript bundle from the hub failed")
             return
         slug_dir = os.path.join(PROJECTS_ROOT,
                                 _project_slug(os.path.normpath(cwd)))
@@ -10507,7 +10663,7 @@ class SessionManager:
             os.makedirs(slug_dir, exist_ok=True)
             self._unpack_transcript(blob, slug_dir)
         except Exception as e:
-            log(f"importSession: unpack failed for {migration_id}: {e}")
+            refuse(f"unpacking the transcript bundle failed: {e}")
             return
         extra = {
             "ticket": cmd.get("ticket"),
@@ -10519,8 +10675,8 @@ class SessionManager:
             "modelSource": cmd.get("modelSource"),
             "migratedFrom": cmd.get("migratedFrom"),
         }
-        self._resume_at_cwd(transcript_id, cwd,
-                            cmd_id=cmd.get("cmdId"), extra=extra)
+        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
+                            extra=extra, migration_id=migration_id)
 
     def _pack_transcript(self, path):
         """Bundle a transcript file (+ its subagents/ dir, if any) into gzipped
@@ -10573,8 +10729,9 @@ class SessionManager:
 
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,
-        agent-authed). Best-effort: a failure leaves the migration to time out
-        hub-side rather than raising into the command loop."""
+        agent-authed). Returns True on success; a failure is reported (never
+        raised into the command loop) so the caller can tell the hub rather than
+        leaving the move to time out."""
         try:
             headers = {"Content-Type": "application/octet-stream",
                        "User-Agent": "hub-agent/1.0"}
@@ -10588,8 +10745,10 @@ class SessionManager:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 resp.read()
             log(f"migration {migration_id}: uploaded {len(blob)} bytes")
+            return True
         except Exception as e:
             log(f"migration upload failed for {migration_id}: {e}")
+            return False
 
     def _migration_download(self, migration_id):
         """GET a transcript bundle from the hub's migration relay. Returns the
@@ -13133,11 +13292,12 @@ class SessionManager:
 
     # --- prune merged branches + safe worktrees ----------------------------
 
-    def _repo_worktrees(self, repo_path):
+    def _repo_worktrees(self, repo_path, timeout=15):
         """Parse `git worktree list --porcelain` into [{path, head, branch}].
         branch is the short name or None when detached; the main checkout is
         included (callers filter it out by path)."""
-        out = run(["git", "-C", repo_path, "worktree", "list", "--porcelain"])
+        out = run(["git", "-C", repo_path, "worktree", "list", "--porcelain"],
+                  timeout=timeout)
         trees, cur = [], None
         for line in out.splitlines():
             if line.startswith("worktree "):
@@ -13153,26 +13313,169 @@ class SessionManager:
         return trees
 
     def prune_repo(self, repo_name):
+        """QUEUE a repo for the prune worker and return — the sweep itself is
+        _run_prune, on its own thread.
+
+        It used to run inline here, on the heartbeat loop, and a sweep is minutes
+        of git on a real repo: 31 `git worktree remove`s measured at 10-37s each
+        on a ZFS pool carrying node_modules, i.e. ~20 minutes of one blocked loop
+        for a single repo. The hub marks a host offline after 75s of silence
+        (OFFLINE_AFTER_MS), so every prune past a minute greyed the host's
+        sessions out and made its terminals read unreachable — a fleet-wide sweep
+        took truenas dark for ~50 minutes (XERK-256). Off the beat, the host keeps
+        heartbeating and publishes `running` + progress instead of going dark.
+
+        ONE worker, FIFO across repos, deliberately: per-repo threads would put
+        several `worktree remove`s on the same spindle at once, which is what
+        makes each one slow to begin with. A repo already queued or running is
+        not stacked again — its record's `at` is re-stamped so the click still
+        registers on the dashboard."""
+        repo_name = (repo_name or "").strip()
+        if not repo_name:
+            log("prune refused: no repo named")
+            return
+        with self._prune_lock:
+            cur = self.prunes.get(repo_name)
+            if cur and cur.get("status") in ("queued", "running"):
+                cur["at"] = now_iso()
+                log(f"prune {repo_name}: already {cur['status']}")
+                return
+            if len(self._prune_queue) >= PRUNE_QUEUE_MAX:
+                self.prunes[repo_name] = {
+                    "repo": repo_name, "status": "error", "at": now_iso(),
+                    "error": "too many prunes queued", "summary": "prune queue full",
+                    "removedWorktrees": 0, "deletedBranches": 0,
+                    "skippedWorktrees": 0, "finishedMono": time.time()}
+                log(f"prune refused: queue full ({repo_name})")
+                return
+            self.prunes[repo_name] = {
+                "repo": repo_name, "status": "queued", "at": now_iso(),
+                "error": None, "summary": "queued for pruning",
+                "removedWorktrees": 0, "deletedBranches": 0,
+                "skippedWorktrees": 0, "finishedMono": None}
+            self._prune_queue.append(repo_name)
+            worker = self._prune_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._prune_worker_loop, name="prune-worker",
+                    daemon=True)
+                self._prune_worker = worker
+                worker.start()
+
+    def _prune_worker_loop(self):
+        """Drain the queue one repo at a time, then exit — the next command
+        starts a fresh worker. Clearing _prune_worker under the same lock the
+        enqueue takes is what makes that handoff lossless.
+
+        Daemon, and never joined on shutdown: a prune is idempotent, so a sweep
+        cut short by a restart is simply re-run, and making the manager wait
+        minutes to exit would recreate the outage this moved off the beat."""
+        while True:
+            with self._prune_lock:
+                if not self._prune_queue:
+                    self._prune_worker = None
+                    return
+                repo_name = self._prune_queue.popleft()
+            try:
+                self._run_prune(repo_name)
+            except Exception as e:
+                log(f"prune {repo_name} failed: {e}")
+                self._finish_prune(repo_name, "error", str(e), "prune failed")
+
+    def _publish_prune(self, repo_name, **fields):
+        """Merge fields into a repo's prune record. Every touch of self.prunes
+        holds the lock: the worker writes it while the beat reads it, and a bare
+        `list(self.prunes)` on the beat would raise mid-insert."""
+        with self._prune_lock:
+            rec = self.prunes.setdefault(repo_name, {"repo": repo_name})
+            rec.update(fields)
+            rec["at"] = now_iso()
+
+    def _finish_prune(self, repo_name, status, error, summary, **fields):
+        """Publish a terminal prune record. `finishedMono` is what starts the
+        linger clock, so ONLY a finished prune carries it — a running sweep must
+        never age out of the heartbeat mid-flight."""
+        self._publish_prune(repo_name, status=status, error=error,
+                            summary=summary, finishedMono=time.time(), **fields)
+        if status == "done":
+            log(f"pruned {repo_name}: {summary}")
+        else:
+            log(f"prune {repo_name}: {error or summary}")
+
+    def _live_worktree_paths(self):
+        """Worktrees currently backing a registry record, read fresh. list()
+        copies the registry in one C-level step, which is what makes this safe to
+        call from the prune worker while the beat mutates sessions."""
+        return {s.get("worktreePath") for s in list(self.registry)}
+
+    def _claim_for_removal(self, path):
+        """Prune-worker side of the removal handshake: take `path` if no session
+        holds it, marking it as being-removed so the beat can't claim it while
+        `git worktree remove` runs. False = a session has it; leave it alone.
+
+        Reading the registry INSIDE the lock is the whole point. `worktree
+        remove` takes 10-37s on a real pool, and for almost all of that the dir
+        still exists — so a resume landing mid-removal would see `os.path.isdir`
+        True, skip _worktree_add, and launch claude into a directory about to be
+        unlinked. A bare check before the removal doesn't close that: only
+        pairing it with the beat's own claim under ONE lock does."""
+        with self._prune_lock:
+            if path in {s.get("worktreePath") for s in list(self.registry)}:
+                return False
+            self._prune_removing.add(path)
+            return True
+
+    def _release_removal(self, path):
+        with self._prune_lock:
+            self._prune_removing.discard(path)
+
+    def _claim_worktree(self, path, sess):
+        """Beat side of that handshake: register `sess` unless a prune is
+        removing its worktree right now. The registry append happens INSIDE the
+        lock — a check that merely preceded the append would let the worker claim
+        in between, which is the race this exists to close.
+
+        Only the resume paths need it. A spawn mints a fresh random path, and a
+        stopped session's record is still in the registry, so a prune never
+        considers either."""
+        with self._prune_lock:
+            if path in self._prune_removing:
+                return False
+            self.registry.append(sess)
+            return True
+
+    def _run_prune(self, repo_name):
         """Sweep a repo's finished work: remove session worktrees whose commits
         are fully merged into the latest default branch (skipping any still
         backing a hub session or holding uncommitted changes), then delete local
         branches merged into that default (this also clears branches whose PR was
         merged and remote deleted). Nothing unmerged or dirty is ever touched, so
-        no in-progress work is lost. The summary rides the heartbeat briefly."""
+        no in-progress work is lost. Progress rides the heartbeat as it goes.
+
+        Runs on the prune worker, never the beat (see prune_repo), which is what
+        these two rules are about — the beat is now free to change things
+        underneath a sweep:
+
+        * The live-worktree set is re-read before EVERY removal, never
+          snapshotted once. Resuming a killed session RE-CREATES its worktree at
+          the very path a sweep already listed as removable, and a spawn/migrate
+          can land mid-sweep too.
+        * self.closed is not touched here. Removed paths go on _prune_swept and
+          _poll_prunes folds them in on the beat thread, which owns that list —
+          rebinding it from here would drop a concurrent append."""
         repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
         if not repo:
-            self.prunes[repo_name] = {
-                "repo": repo_name, "status": "error", "at": now_iso(),
-                "error": f"unknown repo {repo_name!r}", "summary": "unknown repo",
-                "finishedMono": time.time()}
-            log(f"prune refused: unknown repo {repo_name!r}")
+            self._finish_prune(repo_name, "error", f"unknown repo {repo_name!r}",
+                               "unknown repo")
             return
         path = repo["path"]
+        self._publish_prune(repo_name, status="running", summary="pruning…")
         default = default_branch_name(path)
         # Refresh remote-tracking refs so "merged into main" reflects upstream.
-        # Short-bounded: prune runs on the main loop, so a slow fetch must not
-        # stall the heartbeat — a stale/failed fetch just compares against the
-        # refs we already have.
+        # Still short-bounded now that this is off the beat: one unreachable
+        # remote must not hold the worker (and every repo behind it in the
+        # queue), and a stale/failed fetch just compares against the refs we
+        # already have.
         if default and valid_ref_name(default):
             run_ok(["git", "-C", path, "fetch", "--prune", "origin"],
                    timeout=FETCH_TIMEOUT_SEC)
@@ -13182,53 +13485,78 @@ class SessionManager:
                 tip = cand
                 break
         if not tip:
-            self.prunes[repo_name] = {
-                "repo": repo_name, "status": "error", "at": now_iso(),
-                "error": "no default branch to compare against",
-                "summary": "no default branch — nothing pruned",
-                "finishedMono": time.time()}
-            log(f"prune {repo_name}: no default branch resolved")
+            self._finish_prune(repo_name, "error",
+                               "no default branch to compare against",
+                               "no default branch — nothing pruned")
             return
 
         wt_prefix = os.path.join(WORKTREES_ROOT, repo_name) + os.sep
-        live = {s.get("worktreePath") for s in self.registry}
+        # main checkout / another repo's trees — left alone, and out of the count.
+        trees = [wt for wt in self._repo_worktrees(path, timeout=PRUNE_GIT_TIMEOUT_SEC)
+                 if wt["path"].startswith(wt_prefix)]
         removed_wt, skipped_wt = 0, 0
-        for wt in self._repo_worktrees(path):
+        for i, wt in enumerate(trees, 1):
             p = wt["path"]
-            if not p.startswith(wt_prefix):
-                continue                      # main checkout / other repo — leave
-            if p in live:
+            self._publish_prune(
+                repo_name, status="running",
+                summary=f"pruning… worktree {i} of {len(trees)}",
+                removedWorktrees=removed_wt, skippedWorktrees=skipped_wt)
+            if p in self._live_worktree_paths():
                 continue                      # backs a hub session — never touch
-            if run(["git", "-C", p, "status", "--porcelain"]):
-                skipped_wt += 1               # uncommitted work — keep it
+            rc, dirty = run_out(["git", "-C", p, "status", "--porcelain"],
+                                timeout=PRUNE_GIT_TIMEOUT_SEC)
+            if rc != 0 or dirty:
+                skipped_wt += 1               # uncommitted work, or unreadable
                 continue
-            head = wt["head"]
-            merged = head and run_ok(
-                ["git", "-C", path, "merge-base", "--is-ancestor", head, tip])[0] == 0
+            # HEAD is re-read HERE and NEVER taken from the listing above. On a
+            # long sweep that listing is minutes old, and in between a session
+            # can be given work, COMMIT it and be killed — which keeps the
+            # worktree and takes it out of the live set. Judged by the stale HEAD
+            # it still looks merged, and the removal destroys commits reachable
+            # from no ref. A failed read reads as unmerged, so it keeps the tree.
+            rc, head = run_out(["git", "-C", p, "rev-parse", "HEAD"],
+                               timeout=PRUNE_GIT_TIMEOUT_SEC)
+            merged = rc == 0 and head and run_ok(
+                ["git", "-C", path, "merge-base", "--is-ancestor", head, tip],
+                timeout=PRUNE_GIT_TIMEOUT_SEC)[0] == 0
             if not merged:
                 skipped_wt += 1               # unmerged commits — keep it
                 continue
-            if run_ok(["git", "-C", path, "worktree", "remove", p])[0] == 0:
+            if not self._claim_for_removal(p):
+                continue                      # claimed while we were checking it
+            try:
+                rc = run_ok(["git", "-C", path, "worktree", "remove", p],
+                            timeout=PRUNE_GIT_TIMEOUT_SEC)[0]
+            finally:
+                self._release_removal(p)
+            if rc == 0:
                 removed_wt += 1
-                self.closed = [c for c in self.closed
-                               if c.get("worktreePath") != p]
+                with self._prune_lock:
+                    self._prune_swept.append(p)
             else:
                 skipped_wt += 1
-        run(["git", "-C", path, "worktree", "prune"])
+        run(["git", "-C", path, "worktree", "prune"], timeout=PRUNE_GIT_TIMEOUT_SEC)
 
         # Branches merged into the default tip are safe to delete; exclude the
         # default itself and any branch still checked out in a remaining worktree
         # (git would refuse those anyway). -D is safe here: we verified merged.
-        checked_out = {wt["branch"] for wt in self._repo_worktrees(path)
+        checked_out = {wt["branch"] for wt in
+                       self._repo_worktrees(path, timeout=PRUNE_GIT_TIMEOUT_SEC)
                        if wt.get("branch")}
         merged_out = run(["git", "-C", path, "branch", "--merged", tip,
-                          "--format", "%(refname:short)"])
+                          "--format", "%(refname:short)"],
+                         timeout=PRUNE_GIT_TIMEOUT_SEC)
+        candidates = [b for b in (x.strip() for x in merged_out.splitlines())
+                      if b and b != default and b != tip and b not in checked_out]
         deleted_br, kept_br = 0, 0
-        for b in merged_out.splitlines():
-            b = b.strip()
-            if not b or b == default or b == tip or b in checked_out:
-                continue
-            if run_ok(["git", "-C", path, "branch", "-D", b])[0] == 0:
+        for i, b in enumerate(candidates, 1):
+            self._publish_prune(
+                repo_name, status="running",
+                summary=f"pruning… branch {i} of {len(candidates)}",
+                removedWorktrees=removed_wt, skippedWorktrees=skipped_wt,
+                deletedBranches=deleted_br)
+            if run_ok(["git", "-C", path, "branch", "-D", b],
+                      timeout=PRUNE_GIT_TIMEOUT_SEC)[0] == 0:
                 deleted_br += 1
             else:
                 kept_br += 1
@@ -13238,27 +13566,37 @@ class SessionManager:
         summary = "removed " + " · ".join(bits)
         if skipped_wt:
             summary += f" · kept {skipped_wt} in-progress worktree" + ("" if skipped_wt == 1 else "s")
-        self.prunes[repo_name] = {
-            "repo": repo_name, "status": "done", "at": now_iso(),
-            "error": None, "summary": summary,
-            "removedWorktrees": removed_wt, "deletedBranches": deleted_br,
-            "skippedWorktrees": skipped_wt, "finishedMono": time.time()}
-        log(f"pruned {repo_name}: {summary}")
+        self._finish_prune(repo_name, "done", None, summary,
+                           removedWorktrees=removed_wt,
+                           deletedBranches=deleted_br,
+                           skippedWorktrees=skipped_wt)
 
     def _poll_prunes(self):
-        """Drop prune summaries once they've lingered past their window."""
+        """Beat-thread half of the prune: fold the worker's removals into
+        self.closed (which only this thread may rebind), then drop FINISHED
+        summaries once they've lingered past their window. A queued/running
+        record carries no finishedMono and so is never dropped mid-sweep."""
+        with self._prune_lock:
+            swept, self._prune_swept = self._prune_swept, []
+        if swept:
+            gone = set(swept)
+            self.closed = [c for c in self.closed
+                           if c.get("worktreePath") not in gone]
         now = time.time()
-        for repo in list(self.prunes):
-            if now - self.prunes[repo].get("finishedMono", now) > PRUNE_RESULT_LINGER_SEC:
-                self.prunes.pop(repo, None)
+        with self._prune_lock:
+            for repo in list(self.prunes):
+                fin = self.prunes[repo].get("finishedMono")
+                if fin is not None and now - fin > PRUNE_RESULT_LINGER_SEC:
+                    self.prunes.pop(repo, None)
 
     def _prunes_payload(self):
-        return [
-            {"repo": j.get("repo"), "status": j.get("status"),
-             "error": j.get("error"), "summary": j.get("summary"),
-             "at": j.get("at")}
-            for j in self.prunes.values()
-        ]
+        with self._prune_lock:
+            return [
+                {"repo": j.get("repo"), "status": j.get("status"),
+                 "error": j.get("error"), "summary": j.get("summary"),
+                 "at": j.get("at")}
+                for j in list(self.prunes.values())
+            ]
 
     # --- boot auto-resume --------------------------------------------------
 
@@ -13347,7 +13685,7 @@ class SessionManager:
                 elif ctype == "restart":
                     self.restart(cmd.get("sessionId"))
                 elif ctype == "resume":
-                    self.resume(cmd.get("sessionId"))
+                    self.resume(cmd.get("sessionId"), cmd_id=cid)
                 elif ctype == "resumeTranscript":
                     self.resume_transcript(
                         cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
@@ -14351,6 +14689,8 @@ class SessionManager:
             payload["createMetaResults"] = list(self.create_meta_results)
         if self.create_ticket_results:
             payload["createTicketResults"] = list(self.create_ticket_results)
+        if self.spawn_failures:
+            payload["spawnFailures"] = list(self.spawn_failures)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -14369,18 +14709,29 @@ class SessionManager:
     # sheds them in this order (see post): the first tier is what actually makes a
     # beat multi-megabyte, and shedding the small caches with it would throw away
     # a create/status outcome the UI is polling for, for no size gain.
-    # (attribute, payload key) for each staged on-demand deliverable, grouped into
-    # shed tiers — biggest first. A 413 (or a pre-flight over-cap) sheds ONE tier:
-    # the first is what actually makes a beat multi-megabyte, and taking the small
-    # caches with it would throw away a create/status outcome the UI is polling for,
-    # for no size gain.
+    # (attribute, payload key) for EVERY staged on-demand deliverable. A 200 clears
+    # only the ones the body actually carried (see post), so this list is what
+    # "delivered" means — add a new staged result here or it is never cleared and
+    # re-sent forever.
+    STAGED_RESULTS = (
+        ("history_results", "historyResults"),
+        ("subagent_history_results", "subagentHistoryResults"),
+        ("jira_issue_results", "jiraIssueResults"),
+        ("ticket_status_results", "ticketStatusResults"),
+        ("create_meta_results", "createMetaResults"),
+        ("create_ticket_results", "createTicketResults"),
+        ("spawn_failures", "spawnFailures"),
+    )
+
+    # Which of those a 413 may SHED, biggest first. One tier per refusal: the first
+    # is what actually makes a beat multi-megabyte, and taking the small caches with
+    # it would throw away a create/status outcome the UI is polling for, for no size
+    # gain. `spawn_failures` is in NO tier deliberately — it is a few bytes and it is
+    # what stops the Sessions page spinning on a refused spawn (XERK-265).
     SHED_TIERS = (
-        (("history_results", "historyResults"),
-         ("subagent_history_results", "subagentHistoryResults")),
-        (("jira_issue_results", "jiraIssueResults"),
-         ("ticket_status_results", "ticketStatusResults"),
-         ("create_meta_results", "createMetaResults"),
-         ("create_ticket_results", "createTicketResults")),
+        ("history_results", "subagent_history_results"),
+        ("jira_issue_results", "ticket_status_results",
+         "create_meta_results", "create_ticket_results"),
     )
 
     def _shed_staged_results(self, payload=None):
@@ -14394,15 +14745,16 @@ class SessionManager:
         `unsupported`, and every board write to that host is then refused with "your
         agent is too old" for `UNSUPPORTED_TTL_MS` — half an hour of refusals
         earned by a beat that was merely too big."""
+        keys = dict(self.STAGED_RESULTS)
         for tier in self.SHED_TIERS:
             shed = [f"{attr}={len(getattr(self, attr))}"
-                    for attr, _ in tier if getattr(self, attr)]
+                    for attr in tier if getattr(self, attr)]
             if not shed:
                 continue
-            for attr, key in tier:
+            for attr in tier:
                 getattr(self, attr).clear()
                 if payload is not None:
-                    payload.pop(key, None)
+                    payload.pop(keys[attr], None)
             return ", ".join(shed)
         return None
 
@@ -14426,7 +14778,8 @@ class SessionManager:
         # result removed, then dropping them costs the operator their results and
         # buys nothing — so keep them and send. Shedding for no size gain is the
         # same mistake as shedding what was never sent.
-        keys = [key for tier in self.SHED_TIERS for _, key in tier]
+        sheddable = {attr for tier in self.SHED_TIERS for attr in tier}
+        keys = [key for attr, key in self.STAGED_RESULTS if attr in sheddable]
         floor = len(json.dumps({k: v for k, v in payload.items() if k not in keys}).encode())
         if floor > cap:
             # The base payload alone is over the cap. It still goes out: the hub
@@ -14449,24 +14802,6 @@ class SessionManager:
                 f"dropped staged {shed} before sending; re-open the view to fetch them again")
             body = json.dumps(payload).encode()
         return body
-
-    def _refusal_kind(self, err):
-        """`(kind, detail)` off a refusal's JSON body — "body" or "record" — or
-        (None, None) when it cannot be read. The body is only readable when the hub
-        answered a request it had FULLY received; a mid-upload refusal reaches us as
-        a broken pipe with nothing to parse, which is exactly why the cap is
-        advertised on every beat reply instead."""
-        try:
-            raw = err.read(4096)
-            d = json.loads(raw.decode("utf-8", "replace") or "{}")
-            if not isinstance(d, dict):
-                return None, None
-            kind = d.get("kind")
-            detail = d.get("error")
-            return (kind if isinstance(kind, str) else None,
-                    detail if isinstance(detail, str) else None)
-        except Exception:
-            return None, None
 
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
@@ -14505,12 +14840,19 @@ class SessionManager:
             # list on any 200 destroys a result staged after the payload was built,
             # or one a pre-flight shed removed — and the hub reads a missing result
             # as a missing capability (see _shed_staged_results).
-            for tier in self.SHED_TIERS:
-                for attr, key in tier:
-                    if key in payload:
-                        getattr(self, attr).clear()
+            for attr, key in self.STAGED_RESULTS:
+                if key in payload:
+                    getattr(self, attr).clear()
             return reply if isinstance(reply, dict) else {}
         except urllib.error.HTTPError as e:
+            # Read the body ONCE. urllib's HTTPError is a stream, so the second
+            # reader gets nothing — and BOTH the 413's `kind` and the operator-facing
+            # detail (XERK-268: whose token this is, whether the hub is strict) come
+            # out of it. Reading it twice silently emptied one of them.
+            try:
+                raw = (e.read() or b"").decode("utf-8", "replace")
+            except Exception:
+                raw = ""
             # 413 and 503 mean OPPOSITE things and must not be handled alike
             # (CLAUDE.md's heartbeat wire contract, XERK-258):
             #   503 — the hub is momentarily holding too many concurrent bodies.
@@ -14528,11 +14870,12 @@ class SessionManager:
                 # reason. `kind` tells them apart; an older hub sends none, and the
                 # body-size reading is the safe default there (it is the refusal the
                 # advertised cap already prevents).
-                kind, detail = self._refusal_kind(e)
+                kind = _refusal_kind(raw)
                 if kind == "record":
                     log(f"heartbeat refused: this host's RECORD is too large for the hub "
-                        f"({detail or 'no detail'}) — staged results are not counted in it, so "
-                        f"nothing is dropped; reduce what this host reports (sessions/repos)")
+                        f"({_http_error_detail(e, raw)}) — staged results are not counted in "
+                        f"it, so nothing is dropped; reduce what this host reports "
+                        f"(sessions/repos)")
                 else:
                     # No payload to keep in step here: this one has already gone out
                     # and is discarded, so clearing the staging lists alone is right.
@@ -14544,7 +14887,7 @@ class SessionManager:
                         log("heartbeat refused as too large (413) with nothing staged to drop — "
                             "the base payload itself is over the hub's cap")
             else:
-                log(f"heartbeat failed: {e}")
+                log(f"heartbeat failed: {_http_error_detail(e, raw)}")
             return None
         except Exception as e:
             log(f"heartbeat failed: {e}")
@@ -14588,6 +14931,8 @@ class SessionManager:
                 resp.read()
             log(f"announced updating to hub (reason={reason or 'restart'}"
                 f"{', v' + version if version else ''})")
+        except urllib.error.HTTPError as e:
+            log(f"updating announce failed (continuing shutdown): {_http_error_detail(e)}")
         except Exception as e:
             log(f"updating announce failed (continuing shutdown): {e}")
 

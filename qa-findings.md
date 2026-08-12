@@ -1,8 +1,10 @@
 # qa-findings.md — the defects a QA pass actually found
 
-The case-study half of `qa.md` §5, split out to keep that file readable and
-under the 40,000-character ceiling this repo holds its instruction files to.
-`qa.md` is the method; this is the evidence. Ranked by what each would have
+The case-study half of `qa.md` §5, split out to keep that file readable.
+Neither file is auto-loaded into a session, so the 40,000-character ceiling that
+governs `CLAUDE.md` and `.claude/rules/**` does not apply to them and CI does not
+gate them — `qa.md` has since grown past it, and that is a readability question
+rather than a context-budget one. `qa.md` is the method; this is the evidence. Ranked by what each would have
 cost in the field, and every one was found by RUNNING the thing, not reading
 it. Use them as a hunting guide, not a checklist — the shapes repeat.
 
@@ -230,3 +232,73 @@ Staging and driving them, which every case above needed:
   ownership, writes under `/root`, or timing.
 - A **running** claude survives the package swap (one static ELF, the kernel keeps the inode); only
   a new exec in the window fails.
+
+### 5.10 What the ELEVENTH round found — again in the previous round's own fix
+
+- **`typeof [] === "object"`, in a validator whose whole job is "is this an
+  object".** `normalizeSessions` dropped a `null` and a bare string from
+  `sessions` and served a nested ARRAY element raw, because its predicate was
+  `!s || typeof s !== "object"`. The comment above it named the two cases the
+  fixture used, and the fixture used the two cases the comment named — so the
+  third non-object shape existed in neither, and the fix read as complete from
+  every angle except running it. Measured as the phone unable to SIGN IN, since
+  the login probe decodes `/api/agents` and reads the throw as "Could not reach
+  the hub". **When you write an is-an-object test in JS, write `Array.isArray`
+  in the same breath, and put every non-object shape in the fixture — `null`,
+  a string, a number, `[]`, and a non-empty array — not a representative one.**
+  This is §5.3 again, one round later, in the code that fixed §5.3.
+- **A TTL read from a Composable body is a timer that never fires.** The
+  model-switch memo aged out inside `canSwitchModelSource()`, evaluated at
+  composition time from `System.currentTimeMillis()`. Compose skips
+  recomposition while the state compares equal, so on a quiet fleet nothing
+  re-read the clock: the control vanished on an unconfirmed switch and was still
+  gone at t+120s, with the bar naming a model the session was not running.
+  **Expiry has to change STATE, not merely change what a read would return** —
+  retire the value from the store on a bounded alarm. The web had no such bug
+  because its poll recomputes the same predicate unconditionally every beat;
+  when porting a per-beat web computation to Compose, ask what re-runs it.
+- **A discarded `Result` turns every refusal into a success.** `setModel` and
+  `setMode` ran `runCatching { … }` and then emitted "✓ queued" unconditionally.
+  Harmless while those routes only failed on the network — and then a sibling
+  commit gave the hub a first-class 409 for them, which the bar reported as a
+  success. **Grep for `runCatching` whose result is not bound**; each one is a
+  silent success waiting for someone to add a refusal to that route. The same
+  shape one layer in: branching on the HTTP status alone and ignoring
+  `OkResponse.error`, so a `200 {ok:false,error:…}` reads as success.
+
+### 5.11 What the TWELFTH round found — in the eleventh round's fixes
+
+The eleventh round's three fixes all held. Every finding below is a defect in
+one of those fixes, which is the pattern §5.7 named and this file keeps proving.
+
+- **Fixing the instance instead of the class.** The `typeof [] === "object"` fix
+  landed on `normalizeSessions`' element filter, and the identical predicate sat
+  **five lines below it**, on `s.session` — where `"agents" in []` is also false,
+  so an array fell through both halves of the guard. One heartbeat of
+  `sessions:[{id,session:[]}]` reproduced the original symptom exactly: the app
+  could not sign in. **When a bug is a wrong predicate, `grep` the predicate and
+  fix every hit in the same commit**, then hoist it into one named helper so
+  there is nothing left to grep. (When you hoist, use a `function` declaration —
+  a `const` used above its own line is the TDZ bug §5.10's siblings already
+  cost this file once.) Note which of the remaining hits are safe and WHY: here
+  `normalizeLimits` and `sanitizeLiveAgents` also test `typeof x === "object"`,
+  but both rebuild a whitelist from scratch, so an array falls out at the next
+  field read rather than reaching a client.
+- **Skipping a bad value is not coercing it.** The first attempt at the above
+  guarded the *sanitize* with the fixed predicate — and left the raw array sitting
+  in the record, which is the thing that gets served. A coercion has to REWRITE
+  (here, to `null`, the "can't tell you" value every client handles), not decline
+  to touch. Caught only because the test asserted the served VALUE rather than
+  that the code did not throw.
+- **A wall-clock deadline slept through with an uptime timer.** The memo alarm
+  computed its delay from `System.currentTimeMillis()`, slept on `delay` (which
+  measures uptime), then re-checked the wall clock — so a backward clock jump
+  made the re-check false, `settle` returned the same instance, `MutableStateFlow`
+  did not emit an equal value, the collector never ran, and no new alarm was
+  armed. The memo pinned a lie for the length of the skew (measured at t+190s
+  after a 10-minute jump). **After a `delay`, retire by IDENTITY**
+  (`compareAndSet(theSameMemo, null)`) rather than re-deriving the decision from
+  a clock that may have moved under you.
+- **Asserting either side of a boundary is not asserting the boundary.** The new
+  TTL test checked 60_999 and 61_001 and never 61_000, so `>=` → `>` survived a
+  mutation battery. Always assert the exact edge.

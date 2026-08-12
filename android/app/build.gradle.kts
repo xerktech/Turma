@@ -87,6 +87,40 @@ android {
     // lets debug-only behaviour actually be debug-only — see TerminalScreen's
     // setWebContentsDebuggingEnabled (XERK-235).
     buildFeatures { compose = true; buildConfig = true }
+
+    // XERK-262. `core/` is fully gated by plain JVM tests, but the CALL SITES
+    // were not: a mutation battery deleted `ModelSource.afterAttempt(...)`,
+    // forced `composerOffers(...)` true and set `localModel = null` at a spawn
+    // site, and the whole suite stayed green — a fix behind a call site nothing
+    // reaches (qa.md §5.7). ViewModels need an Application and Composables need
+    // a host Activity, so neither had anywhere to live.
+    //
+    // Robolectric supplies both INSIDE `testDebugUnitTest`, which is the one
+    // Android gate CI actually runs (android-ci.yml). The alternative — Compose
+    // tests in `androidTest` — would need an emulator job this repo does not
+    // have, so those tests would never gate anything, which is the exact failure
+    // this ticket exists to fix.
+    //
+    // `isIncludeAndroidResources` is what makes it work at all: Compose resolves
+    // real resources, and without the merged resource table `createComposeRule`
+    // fails at inflate time. `isReturnDefaultValues` is deliberately NOT set —
+    // it would silently paper over an un-shadowed Android call in the existing
+    // pure tests rather than failing it.
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            all {
+                // Gradle defaults the test JVM to 512m, which is comfortable for
+                // the pure `core/` tests and nowhere near enough once Robolectric
+                // loads a whole instrumented android-all and Compose builds a
+                // real semantics tree on top of it — it OOMs during the FIRST
+                // composition, not at some later scale. Raised here rather than
+                // in gradle.properties so it applies to the test JVM only, and
+                // not to the compiler daemon that shares that file.
+                it.maxHeapSize = "2g"
+            }
+        }
+    }
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
@@ -140,6 +174,32 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+
+    // XERK-262 — the call-site harness. See the `testOptions` block above for
+    // why this lives in the unit-test source set and not in androidTest.
+    //
+    // Robolectric 4.14.1 is the first release that ships an android-all for
+    // SDK 35, which is this module's compileSdk/targetSdk; pinning an older one
+    // forces every test to @Config(sdk=…) down to a platform the app does not
+    // build against.
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core-ktx:1.6.1")
+    // The compose-test artifacts are BOM-versioned like the rest of Compose, so
+    // the test stack can never drift from the UI stack it drives.
+    testImplementation(composeBom)
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    // Supplies the ComponentActivity that `createComposeRule()` hosts. It is a
+    // manifest-only artifact and must be `debugImplementation`, not
+    // `testImplementation`: it is merged into the DEBUG app manifest, which is
+    // the manifest Robolectric loads.
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+    // Lets a ViewModel test drive the REAL Retrofit/OkHttp/kotlinx stack against
+    // a scripted hub, rather than a fake HubApi that would prove only that the
+    // fake was called. The hub's refusals are HTTP-shaped (a 409 with a JSON
+    // `error` body), and `hubErrorMessage` digs the reason back out of exactly
+    // that — a seam a hand-rolled fake would step over.
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
 }

@@ -99,6 +99,19 @@ interface HubApi {
         @Body body: ModeRequest,
     ): OkResponse
 
+    /**
+     * Move a RUNNING session between the host's Claude subscription and its
+     * self-hosted model (XERK-246), keeping the conversation. The hub 409s when
+     * the host reports no local model, so the caller must gate on
+     * `localModel.available` rather than let the operator press a dead button.
+     */
+    @POST("api/agents/{host}/sessions/{id}/model-source")
+    suspend fun setModelSource(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Body body: ModelSourceRequest,
+    ): OkResponse
+
     @POST("api/agents/{host}/sessions/{id}/summary")
     suspend fun setSummary(
         @Path("host") host: String,
@@ -302,6 +315,18 @@ fun hubErrorMessage(e: Throwable): String? {
     return msg?.takeIf { it.isNotBlank() }
 }
 
+/**
+ * The same reading for a call that returns a typed [retrofit2.Response] instead
+ * of throwing — the hub's own `{error}` text, falling back to the bare status,
+ * which beats reporting nothing at all (XERK-264). Worded to match the web
+ * client's `TurmaNav.refusalText`, so the same refusal reads the same on both.
+ */
+fun hubErrorMessage(resp: retrofit2.Response<*>): String {
+    val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
+    val msg = runCatching { TurmaJson.decodeFromString<OkResponse>(body).error }.getOrNull()
+    return msg?.takeIf { it.isNotBlank() } ?: "the hub answered HTTP ${resp.code()}"
+}
+
 @Serializable
 data class JiraSessionResponse(
     val ok: Boolean = false,
@@ -322,6 +347,10 @@ data class SpawnRequest(
     val baseRef: String? = null,
     val model: String? = null,
     val permissionMode: String? = null,
+    // Which model the new session runs against (XERK-246). Omitted unless the
+    // operator picked one, so a bare spawn is the exact body it always was; the
+    // hub 409s "local" at a host reporting no local model.
+    val modelSource: String? = null,
 )
 
 @Serializable
@@ -346,6 +375,9 @@ data class ModelRequest(val model: String)
 
 @Serializable
 data class ModeRequest(val permissionMode: String)
+
+@Serializable
+data class ModelSourceRequest(val modelSource: String)
 
 /** Rename a session — a blank [summary] clears the name back to the fallback. */
 @Serializable

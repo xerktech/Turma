@@ -11,9 +11,10 @@ that component's files.
 | File | Loads when Claude touches | Covers |
 |------|---------------------------|--------|
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
-| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, PR status, usage ledger, transcript blocks, archive, image |
+| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
+| `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**` | guard hook, AskUserQuestion bridge |
 | `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | container boot, start-time Claude Code check, bundled toolchains |
@@ -36,8 +37,8 @@ that component's files.
     cost of a large file is context tokens and weaker adherence, which is what the ceiling protects.
     A ceiling stated as a truncation cliff was wrong; do not restore that framing.
   - **When a file approaches the ceiling, split it by path into another rules file** — that is the
-    remedy, not raising the number and not deleting rationale. `agent-board.md`, `turma-board.md`
-    and `turma-sessions.md` exist for exactly that reason.
+    remedy, not raising the number and not deleting rationale. `agent-board.md`, `agent-prs.md`,
+    `turma-board.md` and `turma-sessions.md` exist for exactly that reason.
 - **Put a fact in the narrowest file that always sees it.** Component detail → that component's
   rules file. A rule spanning two components → "Cross-cutting contracts" below, since a
   `paths:`-scoped file does not load when Claude works on the other side of the contract.
@@ -183,8 +184,42 @@ One agent container per host, multiplexing sessions across every repo it scans.
   repo-cloned + running/non-root/has-conversation, single-flight per session. State is in-memory; a
   hub restart mid-move aborts it, leaving the source intact. **The target must already have the repo
   cloned** (v1).
+- **The bundle NEVER rides in the hub's heap** (XERK-263): the relay spools it to `MIGRATE_SPOOL_DIR`
+  (`/data/migrations`) and streams it back out, so a 65 MiB move costs a hub capped at 256 MiB a
+  buffer rather than a quarter of its memory. The record keeps only the path/size; every settle,
+  timeout and failure unlinks it, and boot sweeps the dir (nothing there outlives a restart usefully).
+  `MIGRATE_INFLIGHT_MAX` bounds the disk that burst can hold — refused where a move STARTS, since the
+  agent's upload is best-effort with no retry and refusing THAT strands the migration.
 - Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
   `eligibleMoveTargets` in android `SessionsTest`.
+
+### A refused session start is REPORTED, never just logged (XERK-265)
+
+- **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only
+  `log()`s is indistinguishable from a slow spawn: the move sat in `importing` until
+  `MIGRATE_TIMEOUT_MS` and failed with no reason, and the Sessions page spun out `SPAWN_FOLLOW_MS`.
+- Every refusal in `_resume_at_cwd`, `import_session` and `export_session` therefore goes through
+  **`_refuse_start`**, staging `{cmdId, migrationId, error}` onto the beat's **`spawnFailures`** with
+  the same held-across-a-failed-POST lifecycle as `ticketStatusResults`. The `error` is
+  operator-facing — it is what the UI and the migration record show.
+- Hub-side `ingestSpawnFailures` caches it per cmdId as **`spawnRefusals`** (served with the record,
+  NOT stripped like the other caches — the client following that spawn is who needs it) and stamps
+  `m.refusal`, which `advanceMigrations` applies **after** its handoff check, so a success always
+  wins the tie. Absent = "that agent can't tell", i.e. the old timeout wait, on both halves. The
+  Sessions page mirrors that order: the session lookup runs first and clears `pendingSpawn`.
+- **Both handles are checked against what the HUB knows, never taken on the agent's word** — the
+  migrationId against that move's own src/target, the cmdId against the queue that host was actually
+  given. All agents share one token, so unchecked either one lets any host fail another host's move
+  or end its spawn wait with arbitrary text.
+- **The reason is length-capped at both ends** (agent `SPAWN_FAILURE_REASON_MAX`, hub
+  `SPAWN_FAILURE_ERROR_MAX`). It interpolates exception text, and `spawnRefusals` is the first
+  served cache that `agentRecordSize` COUNTS while the ceiling check runs BEFORE the ingest: one
+  unbounded reason lands, pushes the record past `AGENT_RECORD_MAX`, and then 413s every later beat
+  from that host — including the ones that would have swept it (XERK-235's failure class).
+- A refusal with neither handle stays a log line: the id being rejected IS the correlation.
+- **Every refusal on a session-creating path is expected to go through it**, including `resume()`'s
+  — the prune handshake (`_claim_worktree`, XERK-256) is the one this exists for, and it is ordinary
+  timing rather than operator error. A new refusal that only `log()`s re-opens the bug.
 
 ## Cross-cutting contracts
 
@@ -225,6 +260,51 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
+  - **A full `/api/agents` decode is ATOMIC on Android**, so one host's wrong-typed field throws for
+    the whole array — the poll fails silently while the app keeps its last snapshot and the tile
+    still says "N / N online". Per-agent SSE events decode individually, so the bad host is simply
+    missing from the list while SSE is healthy; with SSE down too, the raw decoder exception
+    replaces the screen. **Most of the payload is served raw**, so this is a live hazard, not a
+    solved one: grep `normalize`/`sanitize` in `turma/server.js` for what is actually covered rather
+    than trusting a list here, which has been wrong repeatedly.
+  - **A field becomes decode-fatal the moment a client TYPES it** — until then `ignoreUnknownKeys`
+    skips it and any value is harmless. So typing one on `SessionInfo`/`AgentInfo` and adding its
+    hub-side coercion are the SAME change; `normalizeRecord` is where it goes, and it runs on both
+    the heartbeat ingest and the `state.json` restore (a restart is when a coercion ships, and the
+    restore is the first thing it serves). Coerce to the "can't tell you" value every client already
+    handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer agent
+    adds is dropped fleet-wide unless it is added there too.
+- **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses
+  commands with a status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host
+  offline, 404 stale attachment, 413 too long, 429 queue full); a client that reads the body and
+  ignores `res.status` shows a refused kill/rename/spawn as one that worked.
+  - Web: `post()`/`del()` (both pages) resolve **null on a refusal, having already toasted**
+    `TurmaNav.refusalText`, and callers roll back whatever they painted optimistically on that null.
+    `TurmaNav.toast` (nav.js, `.toast` in app.css) is the ONE failure surface — nothing announces
+    success through it, so a toast on screen always means a command did not run.
+  - Android: `hubErrorMessage` reads the `{error}` off an `HttpException` **or** a typed `Response`;
+    `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
+    pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
+    a refusal, and folding them together burned 60s and then said nothing.
+  - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+- **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
+  agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
+  the tunnel's `?name=` — and each agent runs on its OWN token,
+  `<base64url(device)>.<HMAC(TURMA_AGENT_TOKEN, device)>`, which the hub re-derives against the host
+  that was named. **The token NAMES its host on purpose**: an HMAC can't be inverted, so a bare
+  digest could only be checked once the host was known, and `/api/heartbeat` — whose host is buried
+  in a 32 MiB body — would have had to admit any bearer before reading it.
+  - **Scoping a route to a host is not a security check on its own.** Under one fleet-shared token
+    `<host>` was self-asserted, so `m.srcHost !== host` refused a caller naming ITSELF and passed one
+    naming the victim; `device` was the same, so any token-holder could beat as another host and be
+    handed the commands queued for it. Both halves — the scope AND the binding — or neither is worth
+    stating. Never write a comment claiming a `<host>` compare keeps one agent out of another's data
+    without checking the credential is bound.
+  - That is also why a **per-relay one-time secret is not the fix** and must not be re-proposed: it
+    would ride on exactly the commands an impersonated heartbeat hands out.
+  - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
+    **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
+    `.claude/rules/turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
 - **A refused heartbeat means one of two different things, and the agent tells them apart**
   (XERK-258): **413 = resize** (this body will never fit — the per-request cap), **503 = retry** (the
   hub is holding too many concurrent bodies right now). The agent holds its staged `*Results` until a
@@ -344,14 +424,19 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 ## Deployment (DockerOps, not here)
 
 - `compose/turma-truenas.yaml` defines the `turma` service and a single per-host `agent-host`
-  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, the shared
-  `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
+  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, that host's OWN
+  `TURMA_TOKEN` (`node turma/server.js --agent-token <device>` against the hub's master
+  `TURMA_AGENT_TOKEN`; `TURMA_AGENT_STRICT` on the hub once every host has one — see XERK-268 in the
+  contracts above), the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
   basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
   env — usage is counted in tokens per model, so there is no rate table.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
+  - It also carries the migration spool (`MIGRATE_SPOOL_DIR`), which is transient by design and
+    shares that volume's SPACE with the archive — hence `MIGRATE_INFLIGHT_MAX`. No compose change:
+    both default under `/data`.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
   `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
   the agent reports `localModel.available:false` so clients hide the control.

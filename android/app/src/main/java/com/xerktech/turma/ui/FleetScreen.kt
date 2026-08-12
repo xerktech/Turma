@@ -155,9 +155,14 @@ fun FleetScreen(
     spawnFor?.let { (host, repo, isRoot) ->
         SpawnDialog(
             host = host, repo = repo, isRoot = isRoot,
+            // The TARGET host's own local model, not the fleet's: the failover
+            // is configured per host, so only the one being spawned on can
+            // offer it. Pure + tested, because "the wrong loop" is a shape this
+            // repo has shipped before.
+            localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
             onDismiss = { spawnFor = null },
-            onSpawn = { prompt, label, baseRef, model, mode ->
-                vm.spawn(host, repo, prompt, label, baseRef, model, mode); spawnFor = null
+            onSpawn = { prompt, label, baseRef, model, mode, source ->
+                vm.spawn(host, repo, prompt, label, baseRef, model, mode, source); spawnFor = null
             },
         )
     }

@@ -39,6 +39,8 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -468,6 +470,15 @@ fun SessionsListPane(
     archiveVm: ArchiveViewModel = viewModel(),
 ) {
     LaunchedEffect(Unit) { vm.start() }
+    // Every command this screen fires — kill, rename, move, resume from the
+    // ended list — reports through FleetViewModel.messages, which ONLY the
+    // dashboard used to collect: a refusal raised here reached nobody, which is
+    // the same "it looked like it worked" bug the hub's `{error}` text exists to
+    // prevent (XERK-264). One host, like FleetScreen's. The "Run against" row
+    // on this pane's spawn composer gives it a first-class refusal to carry
+    // (409 "host has no local model configured", XERK-246).
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
     // The archive half of the box. The VM debounces and drops anything under
@@ -510,8 +521,8 @@ fun SessionsListPane(
     // New-session picker: pick an online host + repo, then the spawn composer.
     var pickerOpen by remember { mutableStateOf(false) }
     var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
-
-    Column(modifier.fillMaxSize()) {
+    Box(modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize()) {
         ScreenHeader("Sessions") {
             IconButton(onClick = { pickerOpen = true }) { Icon(Icons.Filled.Add, "New session") }
         }
@@ -701,6 +712,8 @@ fun SessionsListPane(
             }
         }
     }
+        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(16.dp))
+    }
 
     if (pickerOpen) {
         NewSessionPickerDialog(
@@ -712,9 +725,14 @@ fun SessionsListPane(
     spawnFor?.let { (host, repo, isRoot) ->
         SpawnDialog(
             host = host, repo = repo, isRoot = isRoot,
+            // The TARGET host's own local model, not the fleet's: the failover
+            // is configured per host, so only the one being spawned on can
+            // offer it. Pure + tested, because "the wrong loop" is a shape this
+            // repo has shipped before.
+            localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
             onDismiss = { spawnFor = null },
-            onSpawn = { prompt, label, baseRef, model, mode ->
-                vm.spawn(host, repo, prompt, label, baseRef, model, mode); spawnFor = null
+            onSpawn = { prompt, label, baseRef, model, mode, source ->
+                vm.spawn(host, repo, prompt, label, baseRef, model, mode, source); spawnFor = null
             },
         )
     }
