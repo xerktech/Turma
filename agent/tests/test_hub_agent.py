@@ -10927,6 +10927,33 @@ class TestPruneRepo(unittest.TestCase):
         # With the session registered, the worker no longer gets the tree.
         self.assertFalse(sm._claim_for_removal(wt))
 
+    def test_a_removal_always_releases_its_claim(self):
+        """Nothing else ever empties _prune_removing, so a claim leaked by a
+        failed removal would refuse every future resume onto that path, forever
+        — hence the `finally`. Checked on both exits: a removal that works and
+        one that fails."""
+        sm = ha.SessionManager()
+        self._add_worktree("merged")
+        sm.prune_repo("demo")
+        self._await_prune(sm)
+        self.assertEqual(sm._prune_removing, set())
+
+        sm2 = ha.SessionManager()
+        doomed = self._add_worktree("doomed")
+        real_run_ok = ha.run_ok
+
+        def failing_removal(cmd, *a, **kw):
+            if "worktree" in cmd and "remove" in cmd:
+                return 1, "boom"
+            return real_run_ok(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_ok", side_effect=failing_removal):
+            sm2.prune_repo("demo")
+            res = self._await_prune(sm2)
+        self.assertTrue(os.path.isdir(doomed))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertEqual(sm2._prune_removing, set())
+
     def test_progress_updates_never_stamp_a_finish(self):
         """finishedMono is what starts the linger clock, so only a terminal
         record may carry it — else a long sweep ages out of the heartbeat while
@@ -10943,10 +10970,21 @@ class TestPruneRepo(unittest.TestCase):
 
     def test_prune_keeps_a_worktree_whose_status_cannot_be_read(self):
         """`git status` failing or timing out must not read as CLEAN — run()
-        collapses both to '', which is why this path uses run_out."""
+        collapses both to '', which is why this path uses run_out.
+
+        The patch is command-SELECTIVE: `rev-parse HEAD` goes through run_out too
+        now, and a blanket patch would fail that instead, leaving this guard
+        passing for the wrong reason."""
         sm = ha.SessionManager()
         merged_wt = self._add_worktree("merged")
-        with mock.patch.object(ha, "run_out", return_value=(None, "")):
+        real_run_out = ha.run_out
+
+        def unreadable_status(cmd, *a, **kw):
+            if "status" in cmd and "--porcelain" in cmd:
+                return None, ""
+            return real_run_out(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_out", side_effect=unreadable_status):
             sm.prune_repo("demo")
             res = self._await_prune(sm)
         self.assertTrue(os.path.isdir(merged_wt))
