@@ -6761,12 +6761,24 @@ test("drain: only so many refused bodies may drain at once", async () => {
   assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
 });
 
-test("budget: a body that goes silent while holding budget is taken back", async () => {
+// Reclaim only fires under CONTENTION, so these hold the big lane to create it.
+// The suite does not run in a container, where the ceilings are container-sized;
+// here they are host-RAM-sized, so pressure has to be staged rather than assumed.
+function withBudgetPressure(fn) {
+  return async () => {
+    // Occupy the LANE, not the budget: pressure must still leave room for the
+    // body under test to be admitted, or it is refused 503 and never charged.
+    hub.chargeBody(1, "big");
+    try { await fn(); } finally { hub.releaseBody(hub.bodyInflightHeld(), "big"); }
+  };
+}
+
+test("budget: under pressure, a body that goes SILENT is taken back", withBudgetPressure(async () => {
   // The budget bounds how MUCH may be held; this bounds how LONG. One socket
   // that streamed 22 MiB and then stopped took the big lane and refused every
   // other body on the hub -- tiny heartbeats and the operator's own login --
   // until the 300s request timeout, renewably, for ~0.6 kbit/s.
-  assert.equal(hub.bodyInflightHeld(), 0);
+  const held0 = hub.bodyInflightHeld();
   const sock = net.connect(server.address().port, "127.0.0.1");
   try {
     await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
@@ -6778,28 +6790,27 @@ test("budget: a body that goes silent while holding budget is taken back", async
     );
     // ...and then nothing. Wait for the charge to land, then for it to be taken.
     await new Promise((r) => setTimeout(r, 200));
-    assert.ok(hub.bodyInflightHeld() > 0, "the bytes it DID send are charged");
+    assert.ok(hub.bodyInflightHeld() > held0, "the bytes it DID send are charged");
 
     const deadline = Date.now() + hub.BODY_IDLE_TIMEOUT_MS + 5000;
-    while (hub.bodyInflightHeld() > 0 && Date.now() < deadline) {
+    while (hub.bodyInflightHeld() > held0 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
     }
-    assert.equal(hub.bodyInflightHeld(), 0, "a hold with no progress must not be permanent");
-    // The lane has to come back too, or every large body is refused from here on.
-    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), "big");
+    assert.equal(hub.bodyInflightHeld(), held0,
+      "a hold with no progress must not be permanent");
   } finally {
     sock.destroy();
   }
-});
+}));
 
-test("budget: a DRIBBLE cannot hold budget open forever", async () => {
+test("budget: under pressure, a DRIBBLE cannot hold its charge open", withBudgetPressure(async () => {
   // The idle window alone was not enough. Reset by any byte, it is a liveness
   // check an attacker can forge: one byte per window is neither silence nor
   // slowness, and it held the big lane -- refusing every POST on the hub,
   // operator login included -- indefinitely, for ~0.5 bit/s after a one-time
   // warmup, without ever having to re-stream. The window must therefore reopen
   // on real PROGRESS, not on a sign of life.
-  assert.equal(hub.bodyInflightHeld(), 0);
+  const held0 = hub.bodyInflightHeld();
   const sock = net.connect(server.address().port, "127.0.0.1");
   let dribbler = null;
   try {
@@ -6810,30 +6821,29 @@ test("budget: a DRIBBLE cannot hold budget open forever", async () => {
         `{"device":"dribbler","pad":"${"d".repeat(256 * 1024)}`
     );
     await new Promise((r) => setTimeout(r, 150));
-    assert.ok(hub.bodyInflightHeld() > 0, "the warmup is charged");
+    assert.ok(hub.bodyInflightHeld() > held0, "the warmup is charged");
 
-    // One byte per window -- comfortably under BODY_MIN_PROGRESS_BYTES, and
-    // often enough that a reset-on-any-byte rule would never expire.
+    // One byte per window -- under BODY_MIN_PROGRESS_BYTES, and often enough
+    // that a reset-on-any-byte rule would never expire.
     dribbler = setInterval(() => { try { sock.write("d"); } catch {} },
       Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 3)));
 
     const deadline = Date.now() + hub.BODY_IDLE_TIMEOUT_MS * 4 + 2000;
-    while (hub.bodyInflightHeld() > 0 && Date.now() < deadline) {
+    while (hub.bodyInflightHeld() > held0 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert.equal(hub.bodyInflightHeld(), 0, "dribbling must not renew the hold");
-    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), "big",
-      "and the lane must come back");
+    assert.equal(hub.bodyInflightHeld(), held0, "dribbling must not renew the hold");
   } finally {
     if (dribbler) clearInterval(dribbler);
     sock.destroy();
   }
-});
+}));
 
-test("budget: a body making REAL progress is never reclaimed", async () => {
+test("budget: under pressure, a body making REAL progress is never reclaimed",
+  withBudgetPressure(async () => {
   // The other half: the rule is a minimum RATE, and anything clearing it must be
   // left alone however long it takes. A real slow migration lives here.
-  assert.equal(hub.bodyInflightHeld(), 0);
+  const held0 = hub.bodyInflightHeld();
   const chunk = Math.max(hub.BODY_MIN_PROGRESS_BYTES * 2, 128 * 1024);
   const sock = net.connect(server.address().port, "127.0.0.1");
   let pump = null;
@@ -6846,12 +6856,39 @@ test("budget: a body making REAL progress is never reclaimed", async () => {
     );
     pump = setInterval(() => { try { sock.write("s".repeat(chunk)); } catch {} },
       Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 2)));
-    // Outlast several windows; a body clearing the floor must still be alive.
     await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
-    assert.ok(hub.bodyInflightHeld() > 0,
+    assert.ok(hub.bodyInflightHeld() > held0,
       "a body meeting the progress floor must not be reclaimed");
   } finally {
     if (pump) clearInterval(pump);
     sock.destroy();
   }
+}));
+
+test("budget: with room to spare, a slow body is NOT reclaimed", async () => {
+  // The false positive the pressure gate exists to prevent. A small request over
+  // a bad link holds a few hundred KB of a 64 MiB budget -- it monopolizes
+  // nothing, and dropping it would break a legitimate call to protect capacity
+  // that was never scarce. Reclaiming is for contention, not for slowness.
+  assert.equal(hub.bodyInflightHeld(), 0, "this one runs on an UNcontended hub");
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${8 << 20}\r\n\r\n` +
+        `{"device":"slowpoke","pad":"${"p".repeat(32 * 1024)}`
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    const held = hub.bodyInflightHeld();
+    assert.ok(held > 0, "it is holding a charge");
+    // Silent for several windows -- and still alive, because nobody is waiting.
+    await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
+    assert.equal(hub.bodyInflightHeld(), held,
+      "an uncontended hub must not drop a slow caller");
+  } finally {
+    sock.destroy();
+  }
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(hub.bodyInflightHeld(), 0);
 });

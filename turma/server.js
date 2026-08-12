@@ -1877,6 +1877,16 @@ function bodyLaneFor(n) {
 }
 
 /**
+ * Whether the budget is contended enough for a non-progressing read to be worth
+ * reclaiming. True while the one big lane is occupied, or the shared budget is
+ * more than half spent — the two states in which one body holding on actually
+ * costs another body its turn.
+ */
+function budgetUnderPressure() {
+  return bigLaneTaken || bodyInflightBytes * 2 > BODY_INFLIGHT_TOTAL_MAX;
+}
+
+/**
  * The same decision for a read that is ALREADY under way and wants `delta` more
  * units, given the lane it is in.
  *
@@ -2000,6 +2010,13 @@ function readBody(req, cap = BODY_MAX) {
       progressNeeded = Math.max(1, Math.min(BODY_MIN_PROGRESS_BYTES, left));
       idleTimer = setTimeout(() => {
         if (over) return;
+        // Reclaiming exists to relieve CONTENTION, so it only fires under it.
+        // On a hub with room to spare a stalled read is blocking nobody, and
+        // dropping it would be a pure false positive — a small request over a
+        // bad link holds a few hundred KB of a 64 MiB budget and monopolizes
+        // nothing. Under pressure the non-progressing reads are exactly the
+        // ones that should give way.
+        if (!budgetUnderPressure()) return armIdle();
         over = true;
         release();
         reject(new BodyStalled());
@@ -2199,6 +2216,13 @@ function readRawBody(req, cap) {
       progressNeeded = Math.max(1, Math.min(BODY_MIN_PROGRESS_BYTES, left));
       idleTimer = setTimeout(() => {
         if (over) return;
+        // Reclaiming exists to relieve CONTENTION, so it only fires under it.
+        // On a hub with room to spare a stalled read is blocking nobody, and
+        // dropping it would be a pure false positive — a small request over a
+        // bad link holds a few hundred KB of a 64 MiB budget and monopolizes
+        // nothing. Under pressure the non-progressing reads are exactly the
+        // ones that should give way.
+        if (!budgetUnderPressure()) return armIdle();
         over = true;
         release();
         reject(new BodyStalled());

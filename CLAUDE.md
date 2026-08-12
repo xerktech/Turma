@@ -291,6 +291,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
       enough; a dribble is neither silent nor slow.
     - The floor gives way to what the body has LEFT, so a nearly-complete upload is never reclaimed
       over its last bytes. That is not exploitable: holding a big charge needs a large remainder.
+    - **Reclaim fires only under CONTENTION** (`budgetUnderPressure`: the big lane taken, or the
+      shared budget over half spent). It relieves scarcity, so with room to spare a slow caller is
+      left alone — a small request over a bad link holds a few hundred KB of a 64 MiB budget and
+      monopolizes nothing, and dropping it would be a pure false positive.
   - **Known gap: CHUNKED bodies bypass the declared-length pre-check** and can still OOM the hub at
     256m (XERK-287). Fixing it means capping undeclared-body concurrency, which is only safe once
     it's known whether the Cloudflare tunnel preserves agent framing — measure before capping.
