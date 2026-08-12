@@ -3625,22 +3625,26 @@ const server = http.createServer(async (req, res) => {
     // the real source passes — it is not "the attacker must know the hosts",
     // because the route would otherwise hand the name back (below). What it
     // buys is that the migration id alone no longer lets any token-holder make
-    // the real target `claude --resume` bytes it chose: a wrong address now
-    // fails, so this cannot happen by mis-addressing, and a would-be injector
-    // must commit the injection itself against each candidate host rather than
-    // finding the right one first. Binding the segment to the credential —
-    // which is the actual fix — is XERK-268.
+    // the real target `claude --resume` bytes it chose *by mis-addressing*: a
+    // wrong address now fails. Binding the segment to the credential — which is
+    // the actual fix, and the only thing that stops a DELIBERATE attacker — is
+    // XERK-268.
     // **Every refusal here answers the SAME 404**, and that uniformity is the
     // point, not tidiness: this route is otherwise a free host-name ORACLE.
-    // Any response that a non-source can't also get identifies the source, and
-    // with the id (which rides the user-authed fleet payload, so it is not only
-    // the two agents') a few hundred silent probes then find it. So a wrong
-    // host, a wrong phase and an empty body are deliberately indistinguishable
-    // — do NOT restore a friendlier 409/400 here, and note the real source
-    // loses nothing it acts on (it logs the failure and the move times out
-    // either way). The residual leak is the 413, which cannot be closed without
-    // reading an unbounded body from an unverified caller; it costs a
-    // >MIGRATE_BLOB_MAX upload per probe and fails the migration loudly.
+    // Any RESPONSE a non-source can't also get identifies the source, and with
+    // the id (which rides the user-authed fleet payload, so it is not only the
+    // two agents') a few hundred silent probes then find it. So a wrong host, a
+    // wrong phase and an empty body are deliberately indistinguishable — do NOT
+    // restore a friendlier 409/400 here, and note the real source loses nothing
+    // it acts on (it logs the failure and the move times out either way).
+    // Two residual leaks remain, and neither is closeable without reading an
+    // unbounded body from an unverified caller — so **the oracle is narrowed,
+    // not shut**, and only XERK-268 shuts it: the TIMING of an accepted vs
+    // rejected POST (this guard runs BEFORE the body read, so an accepted
+    // caller blocks while a rejected one answers at once — measured at 15
+    // probes and 960 bytes to find a source, mutating nothing), and the 413,
+    // which costs a >MIGRATE_BLOB_MAX upload per probe and fails the migration
+    // loudly.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);

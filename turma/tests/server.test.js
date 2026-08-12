@@ -6207,6 +6207,9 @@ test("migrate: every POST refusal is the same 404, so the relay is no host oracl
   // also get names the source to anyone holding the id — and then the injection
   // above is a matter of re-addressing. The refusals are therefore uniform: a
   // wrong host, a wrong phase and an empty body must be indistinguishable.
+  // This pins the RESPONSES only. The route still leaks the source through the
+  // timing of an accepted vs rejected POST, which no test here can close —
+  // see the route's comment; that one needs XERK-268.
   await migHost("orA", "or.atlassian.net");
   await migHost("orB", "or.atlassian.net");
   await migHost("orC", "or.atlassian.net");
