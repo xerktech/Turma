@@ -2004,8 +2004,11 @@ MR_URL_RE = re.compile(r"https://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/
 # `git push` hint ends in `/pullrequestcreate?sourceRef=…` — a link to the
 # CREATE form, which the `/<digits>` deliberately doesn't match, exactly as
 # GitLab's `/merge_requests/new` doesn't.
+# http as well as https: an on-prem collection is routinely served over plain
+# http on the LAN, and a scheme-only mismatch would drop the chip in silence on
+# exactly the deployment this half exists for.
 AZDO_PR_URL_RE = re.compile(
-    r"https://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
+    r"https?://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
     re.IGNORECASE)
 # The pull-request id inside such a URL, for the places that need the number
 # without re-deciding whether the URL is ours.
@@ -2017,9 +2020,67 @@ AZDO_PR_URL_ID_RE = re.compile(r"/pullrequest/(\d+)", re.IGNORECASE)
 # PR/MR as its own output, and that pairing — this command, this output — is
 # the only thing in a transcript that says the session opened the PR rather
 # than merely looked at one. See _scan_pr_line.
-PR_CREATE_RE = re.compile(
-    r"\bgh\s+pr\s+create\b|\bglab\s+mr\s+create\b|\bmerge_request\.create\b"
-    r"|\baz\s+repos\s+pr\s+create\b")
+#
+# An on-prem Azure DevOps Server host has NO vendor CLI to name here: the
+# `azure-devops` az extension refuses a self-hosted collection outright ("works
+# only with Azure DevOps Services"), so those hosts open their PRs through a
+# local wrapper over the REST API. `ado pr-create` is the common spelling and
+# is built in; TURMA_PR_CREATE_CMDS registers any other wrapper, so a host
+# whose PRs are opened by its own tool still gets chips.
+PR_CREATE_CMDS = os.environ.get("TURMA_PR_CREATE_CMDS", "")
+
+# An entry whose longest word is shorter than this is ignored: a one- or
+# two-character token matches half the commands a session runs, and attribution
+# failing OPEN hangs other people's PRs on this session's card.
+PR_CREATE_CMD_MIN = 3
+
+# The built-in creating commands, as (word, ...) prefixes. A wrapper is named
+# with and without the `.py` its script carries, because a host that loses it
+# from PATH runs it as `python3 .../ado.py pr-create` — the same PR, opened the
+# same way, and silently unchipped if only the bare name were known.
+PR_CREATE_BUILTINS = (
+    ("gh", "pr", "create"),
+    ("glab", "mr", "create"),
+    ("az", "repos", "pr", "create"),
+    ("ado", "pr-create"),
+    ("ado.py", "pr-create"),
+)
+
+
+def _pr_create_alt(words):
+    """One alternative matching `words` as a whole command: every word escaped
+    and matched literally, the run anchored so it can only be a whole command.
+
+    The anchors exclude `-` as well as word characters, so this can't match the
+    tail of `run-mkpr` or the head of `mkpr-old`; the trailing one excludes `.`
+    too, so `ado.py pr-create.md` is a filename, not a create. The leading one
+    deliberately does NOT, since a path-qualified `./mkpr` or
+    `~/.local/bin/ado` is the same command."""
+    return (r"(?<![\w-])" + r"\s+".join(re.escape(w) for w in words)
+            + r"(?![\w.-])")
+
+
+def _pr_create_pattern(extra=""):
+    """The PR_CREATE_RE source: the built-in creating commands, plus one
+    alternative per comma-separated entry in `extra`.
+
+    Each entry is a whitespace-separated command prefix (`mkpr`, `tfs pr new`)
+    and goes through the same literal, anchored treatment as a built-in, so
+    nothing free-form reaches the regex engine. An entry that is blank or
+    shorter than PR_CREATE_CMD_MIN widens nothing."""
+    pats = [_pr_create_alt(w) for w in PR_CREATE_BUILTINS]
+    pats.append(r"\bmerge_request\.create\b")   # a push OPTION, not a command
+    for entry in (extra or "").split(","):
+        words = entry.split()
+        # The LONGEST word, not the joined length: `a b` is three characters
+        # but still two one-character tokens, and would match `cat a b`.
+        if not words or max(len(w) for w in words) < PR_CREATE_CMD_MIN:
+            continue
+        pats.append(_pr_create_alt(words))
+    return "|".join(pats)
+
+
+PR_CREATE_RE = re.compile(_pr_create_pattern(PR_CREATE_CMDS))
 # Unresolved `gh pr create` tool_use ids remembered per session between beats.
 # Capped: a call whose result never lands (the turn was interrupted, the pane
 # died) must not grow the set for the life of the session.
@@ -3352,7 +3413,8 @@ def _scan_pr_line(raw, state, report):
 
     Attribution is deliberately narrow: a URL counts only when it comes back in
     a PR/MR-creating call's OWN tool_result (`gh pr create`, `glab mr create`,
-    `az repos pr create`, or a `git push` carrying the `merge_request.create`
+    `az repos pr create`, `ado pr-create`, a host wrapper registered via
+    TURMA_PR_CREATE_CMDS, or a `git push` carrying the `merge_request.create`
     push option — see PR_CREATE_RE) — i.e. the session literally opened that PR. A PR link reaches a transcript a dozen other ways (`gh pr
     list`/`view`/`checks` output, a link the operator pasted, the model quoting
     a PR another session opened), and taking any of those as "this session's
@@ -3374,7 +3436,7 @@ def _scan_pr_line(raw, state, report):
 # PR's browser link is built on. Anchored whole so nothing but a repo root is
 # ever extended into a PR link.
 AZDO_REPO_WEB_RE = re.compile(
-    r"^https://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
+    r"^https?://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
 # `{` probes tried when looking for a JSON object in a tool result. The az
 # output starts with one, so a real create hits on the first; the cap keeps a
 # result that is merely full of braces from costing a re-parse per brace.
@@ -3421,9 +3483,11 @@ def _azdo_created_pr_url(text):
     if not isinstance(repo, dict) or not isinstance(pr_id, int):
         return None
     web = str(repo.get("webUrl") or repo.get("remoteUrl") or "").strip()
-    # `remoteUrl` can carry a `user@` prefix on some collections; the link the
-    # chip points at must not.
-    web = re.sub(r"^(https://)[^/@]+@", r"\1", web).rstrip("/")
+    # ADO's `remoteUrl` carries an `<org>@` prefix, and the az extension's SDK
+    # has no `webUrl` field at all, so this strip is on the ONLY path a vendor
+    # create can take. It must know both schemes, or a plain-http on-prem
+    # collection composes nothing and the chip is dropped in silence.
+    web = re.sub(r"^(https?://)[^/@]+@", r"\1", web, flags=re.IGNORECASE).rstrip("/")
     if not AZDO_REPO_WEB_RE.match(web):
         return None
     return f"{web}/pullrequest/{pr_id}"

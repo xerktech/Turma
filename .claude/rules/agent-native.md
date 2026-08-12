@@ -157,6 +157,11 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
 - Not installed natively: cloud CLIs, PowerShell, docker CLI, the Android toolchain.
 - **Container ⇄ native parity (XERK-34)**: the same runtime files run in both, so session model,
   heartbeat, board/PR/usage/archive features are identical. Known deltas:
+  - **Azure DevOps git/CLI enablement is container-only**: `--wire-azure-git` and
+    `AZURE_DEVOPS_EXT_PAT` are wired by `entrypoint.sh`, and `az` isn't installed natively at all, so
+    a native ADO host authenticates git and opens PRs with its own tooling. PR chips still work —
+    attribution is the creating COMMAND (`TURMA_PR_CREATE_CMDS`, see `.claude/rules/agent.md`), not
+    the CLI — but nothing here provides that tooling.
   - `startedAt` is docker's StartedAt where docker can answer, else the manager's OWN start time —
     **never empty** (`TestStartedAt`), keeping the restart-loop alert (keyed on `startedAt`
     CHANGING) and card Uptime working natively. The log tail stays container-only.

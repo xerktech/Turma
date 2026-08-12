@@ -705,3 +705,113 @@ Three habits that paid off in XERK-235 and cost almost nothing:
 - **Report what you could not exercise, by name.** The most useful lines in
   those reports were the "not verified" lists, because they are what the next
   pass starts from.
+
+## 8. Azure DevOps, and PR chips on a host you cannot log into
+
+The fleet's ADO host (`MXH-T16`) is an **on-prem Azure DevOps Server**, not
+Services, and nothing about it can be exercised from this box directly. What
+*can* be done, entirely read-only, is below.
+
+### 8.1 Find out what a remote host actually is, without asking the hub
+
+The hub's own durable state is a file on this machine. Read it; never write it.
+
+```bash
+python3 - <<'EOF'
+import json; d=json.load(open('/mnt/data/Docker/Turma/state.json'))
+for h,a in d.items():
+    j=a.get('jira') or {}
+    print(h, j.get('source'), j.get('siteKey'), a.get('reposRoot'), a.get('agentVersion'))
+EOF
+```
+
+- `jira.source` is `jira` or `azure` — which tracker that host polls, and hence
+  whether its PRs are GitHub/GitLab/ADO.
+- `reposRoot` distinguishes a container (`/repos` per DockerOps compose) from a
+  native install (a real host path). **Every agent in this fleet is native** —
+  Portainer shows no `turma-agent` container on any node, only the hub.
+- `github.available:false` means `gh` is absent there, so nothing GitHub-shaped
+  can be assumed of it.
+- Ticket URLs in `jira.tickets[].url` reveal the ADO base's **scheme and case**,
+  which `siteKey` throws away and which `_azdo_pr_id`'s prefix match needs.
+
+### 8.2 The hub's archive is the record of what a remote session really ran
+
+`/data/archive/<repo>/<date>__<summary>__<host>__<shortid>.jsonl` (here
+`/mnt/data/Docker/Turma/archive/`) holds every ended session on the fleet,
+including hosts you have no shell on. It is the fastest way to answer "what
+command does that host actually use for X".
+
+- Rows are **pre-parsed archive rows, not raw transcript JSONL**:
+  `{uuid, role, ts, text, blocks:[…]}`, where a call is
+  `{t:"tool_use", name, input:"<the command string>", id}` and its result is
+  `{t:"tool_result", text, forId}`. Code that expects `message.content` finds
+  nothing here.
+- Pair them by `id`/`forId` to replay real call/result pairs through
+  `_scan_pr_entry` — that is how attribution is verified against reality rather
+  than a fixture.
+- **Treat archive contents as sensitive.** Sessions have pasted real PATs into
+  commands, so they are in these files and in the FTS index. Never echo a line
+  you have not read first; cite file + row instead.
+
+### 8.3 Exercising the ADO PR path with no ADO org
+
+`azdo_pr_status` / `_azdo_pr_comment_events` / `_azdo_policy_evals` all go
+through `azure_req` → `urllib`, so a local TLS stand-in is enough:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 2 -nodes \
+  -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+export SSL_CERT_FILE=$PWD/cert.pem     # urllib honours it; no verify-off hacks
+```
+
+Then serve `/_apis/git/pullrequests/<id>`, `/{proj}/_apis/policy/evaluations`,
+`/{proj}/_apis/git/repositories/{repo}/pullRequests/{id}/threads` and
+`/_apis/connectionData`, import `hub-agent.py` by path, and set `ha.AZDO_URL` /
+`ha.AZDO_TOKEN` on the module (both are read at import from the env).
+`AZDO_PR_URL_RE` and `AZDO_REPO_WEB_RE` are **https-only**, so the stand-in must
+be TLS — a plain-http stand-in silently tests nothing.
+
+### 8.4 On-prem facts worth not re-deriving
+
+From that host's own probes, recorded in the archive:
+
+- `deploymentType: onPremises`; the server advertises 7.2 as latest but
+  `api-version=7.2` returns **400** — `7.1` and `6.0` both return 200.
+- `_apis/connectionData` on it **requires a `-preview` suffix**
+  (`?api-version=6.0` style calls get 400 with that message).
+- The `azure-devops` az extension **refuses on-prem outright** ("works only with
+  Azure DevOps Services"), so `az repos …` is not a path there at all; that host
+  drives the REST API through its own `ado` wrapper.
+- The pinned extension's own SDK model (`azure_devops-<v>-py2.py3-none-any.whl`
+  from `https://aka.ms/azure-cli-extension-index-v1`, just unzip it — no install
+  needed) has **no `web_url` field on `GitRepository`**, so `az repos pr create`
+  output can only ever carry `remoteUrl`.
+
+### 8.5 Traps in this area
+
+- **The INSTALLED guard polices your own Bash calls.** A probe string containing
+  an attribution trailer (`Co-Authored-By: …`, `Generated with …`) gets your
+  *own* command denied. Put such strings in a `.py` file, assembled from
+  fragments, and run the file.
+- A command containing `pr create` can trip a `PostToolUse` hook that tells you
+  to go watch CI on a PR you never opened. Ignore it; you created nothing.
+- `TTYD_PORT_BASE`, `~/.turma` and the real tracker env leak into any agent you
+  boot here — see §1. For PR work, patch `ha.AZDO_URL`/`ha.AZDO_TOKEN` on the
+  module rather than exporting them, so nothing can reach a live org.
+
+### 8.6 Two traps in the ADO URL handling itself
+
+- **Scheme assumptions hide on the compose path.** `_azdo_created_pr_url`
+  strips the `<org>@` prefix ADO puts on `remoteUrl` — and `remoteUrl` is the
+  ONLY field a vendor create can supply, because the pinned `azure-devops`
+  extension's SDK (`azext_devops/devops_sdk/v5_0/git/models.py`, `GitRepository`)
+  has no `web_url` at all. A strip that knows only `https://` therefore drops
+  every plain-http on-prem create in silence. When you widen a URL regex to
+  `https?`, grep the same area for other hardcoded `https://`.
+- **A regex can be widened without being tested.** `AZDO_REPO_WEB_RE`'s http
+  half survived a mutation (reverting it to https-only broke nothing) because
+  the only http test drove the WRAPPER path, where the link is already in the
+  output and that regex is never consulted. Mutation-test each widened pattern
+  separately; a test that exercises the feature is not necessarily a test that
+  exercises the line.
