@@ -33,6 +33,10 @@ const archive = require("./archive.js");
 // Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
 // FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
 const push = require("./push.js");
+// The wire-shape coercion (XERK-259). Required, not inlined: the state.json
+// restore below runs at module init and calls it, so its table must already be
+// evaluated — see the header of wire-shape.js.
+const { normalizeWireShapes, AGENT_WIRE_SHAPE } = require("./wire-shape.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
@@ -1087,6 +1091,12 @@ function normalizeLimits(payload) {
     return;
   }
   const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  // The two epoch fields are `Long` on Android, and a Long cannot take a
+  // FRACTIONAL literal — `resetsAt: 1.5` and a value past 2^63 both pass
+  // `Number.isFinite` and then throw for the whole fleet payload, exactly the
+  // failure this function exists to prevent. `usedPct` is a Double, so it keeps
+  // the looser check.
+  const epoch = (v) => (typeof v === "number" && Number.isSafeInteger(v) ? v : undefined);
   const out = {};
   for (const key of ["fiveHour", "sevenDay"]) {
     const win = lim[key];
@@ -1094,11 +1104,11 @@ function normalizeLimits(payload) {
     const pct = num(win.usedPct);
     if (pct === undefined) continue;   // a window with no percentage draws nothing
     const clean = { usedPct: Math.min(100, Math.max(0, pct)) };
-    const resets = num(win.resetsAt);
+    const resets = epoch(win.resetsAt);
     if (resets !== undefined) clean.resetsAt = resets;
     out[key] = clean;
   }
-  const captured = num(lim.capturedAt);
+  const captured = epoch(lim.capturedAt);
   if (!Object.keys(out).length || captured === undefined) {
     payload.limits = null;
     return;
@@ -1876,15 +1886,24 @@ function objectish(x) {
  * host silently disappears from that phone.
  */
 function normalizeRecord(a) {
-  // Order is NOT load-bearing, and must not become so: each of these guards its
-  // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
-  // here lands in the restore's silent `catch {}` and abandons every host after
-  // this one, uncoerced, on every boot. Sessions first only because it is the
-  // one that rewrites a shape the others iterate.
+  // Each of these guards its own input shape (`Array.isArray`, not `|| []`),
+  // because a throw anywhere in here lands in the restore's silent `catch {}`
+  // and abandons every host after this one, uncoerced, on every boot.
+  //
+  // The block-specific passes run FIRST and `normalizeWireShapes` LAST, and that
+  // order IS load-bearing: the shape sweep coerces `usage.models` to the objects
+  // Android types, so run before normalizeModelUsage it would DROP an old
+  // agent's bare model-name strings instead of letting that pass rewrite them.
+  // A block one of them REBUILDS (`limits`, `localModel`) is in the table too,
+  // not exempted from it: a rebuild is only as good as its own gates, and
+  // `limits` shipped one that let a fractional `resetsAt` — decode-fatal for the
+  // whole fleet — straight through. Each pass keeps its own semantics; the sweep
+  // is the type backstop under all of them.
   normalizeSessions(a);
   normalizeUsage(a);
   normalizeLimits(a);
   normalizeLocalModel(a);
+  normalizeWireShapes(a);
 }
 
 // The per-SESSION coercions (see normalizeRecord).
@@ -5367,6 +5386,9 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    // The shape table itself, so a test can walk it rather than re-listing what
+    // it covers — a hand-copied list of fields is what drifts (XERK-259).
+    AGENT_WIRE_SHAPE,
 
     queueCommand,
     findSession,

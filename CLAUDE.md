@@ -230,16 +230,29 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     the whole array — the poll fails silently while the app keeps its last snapshot and the tile
     still says "N / N online". Per-agent SSE events decode individually, so the bad host is simply
     missing from the list while SSE is healthy; with SSE down too, the raw decoder exception
-    replaces the screen. **Most of the payload is served raw**, so this is a live hazard, not a
-    solved one: grep `normalize`/`sanitize` in `turma/server.js` for what is actually covered rather
-    than trusting a list here, which has been wrong repeatedly.
+    replaces the screen.
   - **A field becomes decode-fatal the moment a client TYPES it** — until then `ignoreUnknownKeys`
     skips it and any value is harmless. So typing one on `SessionInfo`/`AgentInfo` and adding its
     hub-side coercion are the SAME change; `normalizeRecord` is where it goes, and it runs on both
     the heartbeat ingest and the `state.json` restore (a restart is when a coercion ships, and the
     restore is the first thing it serves). Coerce to the "can't tell you" value every client already
-    handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer agent
-    adds is dropped fleet-wide unless it is added there too.
+    handles, never to a plausible default.
+  - **The whole record is held to that shape by `turma/wire-shape.js`** (XERK-259), a table mirroring
+    `Models.kt` — per-block `normalize*`s covered only what someone had got to, and `repoUsage:[null]`
+    from one host stopped the phone signing in at all. A LIST's ELEMENTS are as fatal as its type,
+    and `typeof [] === "object"`, so element tests go through `isPlainObject`.
+    - It coerces **IN PLACE, touching only the keys it names**, which is what keeps it from being a
+      whitelist: a sub-key a newer agent adds rides through untouched, where rebuilding an object
+      drops it fleet-wide until the table catches up (`normalizeLimits`/`normalizeLocalModel` DO
+      rebuild, so a new sub-key of theirs must be added to them).
+    - **A block those two rebuild is in the table anyway** — a rebuild is only as good as its own
+      gates, and `limits` shipped one gating its epoch fields on `Number.isFinite`, so a fractional
+      `resetsAt` (Kotlin `Long` takes no fraction) went out raw. Nothing agent-authored is exempt.
+    - Its own module because the restore runs at `server.js` module init: a `const` declared below
+      that point is in its temporal dead zone, and the ReferenceError dies in the restore's own
+      `catch {}`, leaving records half-coerced with nothing logged.
+    - Typing a field in `Models.kt` without adding it there **fails the hub's suite** — the test
+      parses `Models.kt` and walks it, so this pairing is enforced, not remembered.
 - **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses
   commands with a status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host
   offline, 404 stale attachment, 413 too long, 429 queue full); a client that reads the body and
