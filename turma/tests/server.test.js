@@ -5998,19 +5998,33 @@ const migHost = (device, site, {
   });
 
 // A raw-body request (the JSON `request` helper can't carry an octet-stream).
-function requestRaw(method, pathName, { body, headers } = {}) {
+//
+// It TIMES OUT rather than waiting forever. A route that stops answering — the
+// spool relay has two failure paths that could, and both were live bugs — would
+// otherwise hang whichever test reached it and take the CI job's whole budget
+// with it, reported as a timeout with no failing assertion to read. The
+// sentinel status makes the assertion that was going to run fail instead.
+const RAW_REQUEST_TIMEOUT_MS = 10_000;
+function requestRaw(method, pathName, { body, headers, timeoutMs = RAW_REQUEST_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      req.destroy();
+      resolve({ status: `no reply in ${timeoutMs}ms — the route hung`, body: null,
+        buf: Buffer.alloc(0), headers: {} });
+    }, timeoutMs);
+    timer.unref?.(); // never hold the loop open on its own
     const req = http.request(baseUrl + pathName, { method, headers }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
+        clearTimeout(timer);
         const buf = Buffer.concat(chunks);
         let parsed = null;
         try { parsed = JSON.parse(buf.toString()); } catch {}
         resolve({ status: res.statusCode, body: parsed, buf, headers: res.headers });
       });
     });
-    req.on("error", reject);
+    req.on("error", (e) => { clearTimeout(timer); reject(e); });
     if (body) req.write(body);
     req.end();
   });
@@ -6227,13 +6241,10 @@ test("migrate: a spool that can't be written fails the move, and doesn't hang", 
   const r = await migrate("errA", "s1", { host: "errB" });
   const mid = r.body.migrationId;
   fs.mkdirSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true });
-  // Raced against a timer, so an unanswerable POST fails HERE in a second
-  // rather than by running the whole CI job out of time.
-  const up = await Promise.race([
-    requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
-      { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } }),
-    new Promise((r2) => setTimeout(() => r2({ status: "no reply — the route hung" }), 2000)),
-  ]);
+  // requestRaw times out on its own, so an unanswerable POST fails on this
+  // assertion rather than by running the whole CI job out of time.
+  const up = await requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
+    { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" }, timeoutMs: 2000 });
   assert.equal(up.status, 500);
   // The reply must not hand the agent the hub's filesystem layout.
   assert.doesNotMatch(up.body.error, /\//);
