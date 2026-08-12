@@ -15,6 +15,12 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
 
 ## The page
 
+- **The fleet payload is polled ONCE, at load, whenever SSE is healthy** — `fastPoll` returns early
+  and the fallback interval only fires when it isn't. So anything on `cache` that must MOVE in the
+  browser needs its own `es.addEventListener` in `connectSSE`; `agent`, `removed`, `orgColors` and
+  `migrations` each have one. A hub-broadcast event with no listener here reads as a feature that
+  works in tests and never updates in front of the operator (that was every in-flight move: its
+  phase stayed at load state, so the follow never saw `importCmdId` and never surfaced a failure).
 - Opens a running session in a **native chat view by default** (`turma/public/chat.js`) instead of
   the raw ttyd terminal, streaming over the `/live/<host>/<id>` WebSocket (ws-token auth, seeded
   from the heartbeat's cached tail, scrollback from `GET .../history`, `/history`-poll fallback when

@@ -251,10 +251,38 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 
 - UI, API, and the click-to-attach live terminal (`/term/<sessionId>/`, reverse-tunneled to that
   session's ttyd by port) sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`).
-  Agents authenticate heartbeats, tunnel WebSockets, and ttyd with one shared token (`TURMA_TOKEN`
-  in the agent's env = `TURMA_AGENT_TOKEN` on the hub).
-  - **One token means the heartbeat's `device` is attacker-chosen**, so it names a record but never
-    authorizes one. Anything keyed on it needs its own bound.
+  Agents authenticate heartbeats, tunnel WebSockets, and ttyd with a **per-host** token —
+  `TURMA_TOKEN` in the agent's env, `hostAgentToken()` = `<base64url(device)>.<HMAC(master, device)>`
+  on the hub. See `CLAUDE.md`'s cross-cutting contracts for the rule; the mechanics:
+  - The hub keeps only the master and **re-derives** the expected value for whatever host a request
+    names, so adding a host needs no hub-side list and no restart. Print one with `node
+    turma/server.js --agent-token <device>`. The name is IN the token, so a **host rename
+    invalidates it** — deliberate, since the hub cannot tell a rename from an impersonation.
+  - `agentBearerKind(req, host)` is the single resolver → `proved` (that host's derived token) /
+    `operator` (the user login, allowed to name any host — it already drives them all) / `legacy`
+    (the raw master, refused under `TURMA_AGENT_STRICT`) / null. `agentHostRefusal` turns it into
+    the response. **Never settle for `agentAuthorized` where a host is in hand**: it answers "an
+    agent", not "which".
+  - The heartbeat is the one surface bound in its HANDLER, not at the route gate, since `device` is
+    in the body. `agentPresented` is the gate: it says the credential is one the hub ISSUED, without
+    saying which host, and **must keep refusing an unknown bearer** — it stands in front of a 32 MiB
+    `readBody`, so admitting any `Bearer <anything>` is an unauthenticated remote OOM of the hub,
+    and with it the whole fleet's control plane. **`TURMA_AGENT_STRICT` has to bite HERE too**, not
+    only at the authorization check past it, or a leaked master still OOMs a fleet whose whole point
+    was that the master had been retired. `agentPresentedRefusal` words that 403 without a host,
+    since the host is still unread behind the gate.
+  - **A wrong-host token answers 403 naming both hosts, not a bare 401.** The overwhelmingly likely
+    cause is a host RENAME (the name is inside the token, so the credential silently stops matching);
+    it leaks nothing, since the token names its own host on its face. `hub-agent.py` logs the hub's
+    `{error}` body via `_http_error_detail` — the status line alone cannot say any of this.
+  - `controlChannels`/`pendingChannels` are **null-prototype**: their keys come off the wire, and on
+    a plain object a `ch` of `__proto__` read back as `Object.prototype` — truthy, so it passed the
+    "is there a pending channel" check and killed the hub on the next property access.
+  - `ttydAuth(host)` sends the token that host's ttyd is actually running (`tokenBound` on the
+    record, from how its own heartbeat authenticated), so a half-rolled fleet keeps every terminal
+    working. It is hub-derived and **stripped from the fleet payload** — putting it on the wire
+    would make it a client contract.
+  - Tests: the `XERK-268:` cases in `server.test.js`.
 
 ### The agent registry's ceiling (XERK-272)
 
@@ -262,6 +290,11 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   ONE record and `prune()` only reclaims at 7 days, so an unbounded NUMBER of `device` names was an
   unbounded amount of retained memory — 512 beats of 0.9 MiB under 512 names OOM-killed a 256 MiB
   hub, while the same 512 beats under ONE name peaked at 169 MiB.
+  - **XERK-268 shrank who can do this; it did not bound it.** `device` is now PROVED by the
+    credential, so this is no longer any-token-holder — but a compromised or buggy host still mints
+    names under its own token, the `legacy` master a mid-rollover fleet accepts is not yet retired,
+    and a host deriving its name from something unstable grows records with no attacker at all.
+    Per-agent tokens and this cap are complementary, not alternatives.
 - Two budgets, bounding different things: **`AGENTS_TOTAL_MAX`** (aggregate record bytes, defaulting
   to an eighth of the container's own cgroup limit, clamped 8–64 MiB) and **`AGENTS_MAX`** (record
   count, default 64). The count cap is not redundant — the byte budget measures what
@@ -273,8 +306,7 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   an offline host's last known sessions, PR chips and usage, so a host rebooting or updating keeps
   its slot and the new `device` gets a 429 instead. Nothing is evicted when eviction could not
   satisfy the request anyway. The accepted cost is that a flood of names can squat slots and block
-  onboarding a genuinely new host until it stops or `AGENTS_MAX` is raised; per-agent tokens are the
-  real fix and are not this.
+  onboarding a genuinely new host until it stops or `AGENTS_MAX` is raised.
 - A host **already in the registry is always admitted** — turning the cap into a wall for the fleet's
   own hosts is the same outage from the other side.
 - **The aggregate refuses only a host OVER its share** (`AGENT_FAIR_SHARE` = total/count, floored at

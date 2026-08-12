@@ -275,6 +275,69 @@ const UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
 const TURMA_USER = process.env.TURMA_USER || "";
 const TURMA_PASSWORD = process.env.TURMA_PASSWORD || "";
 const TURMA_AGENT_TOKEN = process.env.TURMA_AGENT_TOKEN || "";
+// Per-host agent identity (XERK-268). TURMA_AGENT_TOKEN is the fleet MASTER; a
+// host's own credential is derived from it and its host name, and each agent is
+// given ONLY that derived value as its TURMA_TOKEN (DockerOps, per service —
+// `node turma/server.js --agent-token <host>` prints one). The hub never needs a
+// list of hosts or a token map: it re-derives the expected value for whatever
+// host a request NAMES and compares.
+//
+// Why this exists: `<host>` in /api/agents/<host>/… and `device` on the
+// heartbeat are values the CALLER types. With one shared token they proved
+// nothing, so any token-holder could beat as another host, collect the commands
+// queued for it (migration/upload ids ride there) and act as either half of a
+// move. Deriving per host makes the host the CREDENTIAL's, not the caller's.
+//
+// A per-relay one-time secret was the other candidate and does not work: it
+// would ride on exactly the commands an impersonated heartbeat hands out.
+const TURMA_AGENT_STRICT = /^(1|true|yes|on)$/i.test(process.env.TURMA_AGENT_STRICT || "");
+// A host's own agent token: `<base64url(host)>.<HMAC(master, host)>`.
+//
+// It NAMES the host it is for, and the HMAC is what makes that name unforgeable
+// — so the hub can identify a caller from the token ALONE, before it has read a
+// body or looked at a path. That is what lets `/api/heartbeat`, whose host is
+// buried in its payload, refuse an unknown credential BEFORE reading 32 MiB
+// (an HMAC cannot be inverted, so a bare digest could not be placed without
+// already knowing the host, and the gate would have had to let anything
+// through). The name half is not a secret: whoever holds the token is that
+// host, and host names travel in the URL anyway.
+//
+// Keyed on the host name the agent reports as `device`, so a host RENAME
+// invalidates its token by design — the hub cannot tell a rename from an
+// impersonation, and guessing would be the bug.
+function hostAgentToken(host) {
+  // Non-strings never get a token: `String(host)` would coerce an array or a
+  // toString()-carrying object into a host name and mint a REAL credential for
+  // it. No caller passes one today; this is so none can start.
+  if (!TURMA_AGENT_TOKEN || typeof host !== "string" || !host) return "";
+  const name = Buffer.from(host);
+  // A name that doesn't survive the UTF-8 round trip gets no token: a lone
+  // surrogate encodes to the replacement character, so two different host names
+  // would derive the SAME credential. No real host name does this — the point
+  // is that the derivation is injective, not that anyone would hit it.
+  if (name.toString() !== host) return "";
+  return name.toString("base64url") + "." +
+    crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
+}
+
+// The host a bearer token proves it is, or null if it proves nothing. Reads the
+// name off the token and re-derives to check it, so an attacker editing the name
+// half invalidates the HMAC half.
+function tokenHost(token) {
+  if (!TURMA_AGENT_TOKEN || typeof token !== "string") return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0) return null;
+  let host;
+  try {
+    host = Buffer.from(token.slice(0, dot), "base64url").toString();
+  } catch {
+    return null;
+  }
+  // Compare the WHOLE token, so a name that doesn't round-trip through base64url
+  // (padding games, a different encoding of the same bytes) fails here rather
+  // than resolving to a host it isn't the token for.
+  return host && safeEqual(token, hostAgentToken(host)) ? host : null;
+}
 // A dedicated bearer token for the programmatic session-trigger endpoint
 // (POST /api/trigger), so external automation (CI, webhooks, cron) can start a
 // session without the single-user login. It never opens the endpoint on its
@@ -300,7 +363,18 @@ const SESSION_KEY =
 // (-c term:$TURMA_TOKEN, loopback-bound in the container) is satisfied without
 // the browser ever seeing the credentials. The terminal shares the agent
 // token — one credential per agent container for heartbeat, tunnel, and ttyd.
-const TTYD_AUTH = "Basic " + Buffer.from(`term:${TURMA_AGENT_TOKEN || "changeme"}`).toString("base64");
+//
+// Which token that IS is per host now (XERK-268), and the hub must send the one
+// this host's ttyd was actually started with: its derived token if the host
+// authenticates with it, the legacy master while it hasn't rolled over yet. We
+// know which from how its own heartbeat authenticated (`tokenBound` on the
+// record), so a half-rolled fleet keeps every terminal working rather than
+// 401ing the hosts that haven't moved.
+function ttydAuth(host) {
+  const a = agents[host];
+  const token = (a && a.tokenBound ? hostAgentToken(host) : TURMA_AGENT_TOKEN) || "changeme";
+  return "Basic " + Buffer.from(`term:${token}`).toString("base64");
+}
 
 // ---- LiteLLM backend (OpenAI-compatible: Whisper STT) -----------------------
 // Whisper STT is served by a LiteLLM instance's `/v1` base: LITELLM_URL points
@@ -358,13 +432,19 @@ let agents = {};
 
 // ---- the registry's own ceiling (XERK-272) ---------------------------------
 //
-// `device` is attacker-chosen: every agent shares one TURMA_AGENT_TOKEN, so any
-// buggy or compromised host can mint an unlimited number of DISTINCT keys, and
-// every one of them becomes a retained record that also lands in state.json,
-// every /api/agents body and every SSE frame. `prune()` only reclaims at seven
-// days and AGENT_RECORD_MAX bounds ONE record, so 512 beats of 0.9 MiB under
-// 512 names OOM-killed a 256 MiB hub while the same 512 beats under ONE name
-// peaked at 169 MiB. The per-record bound was never the aggregate.
+// Nothing capped how many DISTINCT `device` names the registry could hold, and
+// every one of them is a retained record that also lands in state.json, every
+// /api/agents body and every SSE frame. `prune()` only reclaims at seven days
+// and AGENT_RECORD_MAX bounds ONE record, so 512 beats of 0.9 MiB under 512
+// names OOM-killed a 256 MiB hub while the same 512 beats under ONE name peaked
+// at 169 MiB. The per-record bound was never the aggregate.
+//
+// XERK-268 binds `device` to the credential, so this is no longer reachable by
+// anyone holding the fleet token — but it does not BOUND anything: a
+// compromised or buggy host still mints names under its own proved token, the
+// `legacy` master a mid-rollover fleet accepts is not yet retired, and a host
+// whose name derives from something unstable grows records with no attacker at
+// all. The two are complementary; neither replaces the other.
 //
 // Two budgets, because they bound different things:
 //   * AGENTS_TOTAL_MAX — the aggregate BYTES of every record, sized from the
@@ -630,10 +710,17 @@ function trimRestoredAgents() {
 }
 
 // Reverse-tunnel state. controlChannels[name] = the live control connection for
-// that container's tunnel-agent; pendingChannels[ch] = resolver awaiting the
+// that container's tunnel-agent; pendingChannels[ch] = the record awaiting the
 // agent's data-WS dial-back for channel `ch`.
-const controlChannels = {};
-const pendingChannels = {};
+//
+// Both are NULL-PROTOTYPE: the keys are attacker-influenced (a `?name=`/`?ch=`
+// off the wire), and on a plain object `__proto__` is not a key. It read back as
+// Object.prototype — truthy, so a `ch` of `__proto__` sailed past the "is there
+// a pending channel" check and died on `.resolve is not a function`, out of an
+// async upgrade handler with no unhandledRejection hook: an instant hub exit.
+// Assignment was worse, silently re-parenting the map.
+const controlChannels = Object.create(null);
+const pendingChannels = Object.create(null);
 // Live transcript subscribers: liveClients[host][sessionId] = Set of glasses
 // WebSocket sockets watching that session's transcript in near-real-time (see
 // the /live upgrade handler). The hub asks the host's tunnel-agent to tail a
@@ -1141,10 +1228,13 @@ function publicCommands(cmds) {
 
 function serializeAgent(key, agent, now) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
-  // internal state, stripped like the caches. `unsupported` is NOT: it's a tiny,
-  // rarely-changing map of what this host's agent can't do, worth reading.
+  // internal state, stripped like the caches. `tokenBound` likewise: it is the
+  // hub's note of which credential this host beat with (XERK-268), read only by
+  // ttydAuth, and putting it on the wire would make it a client contract.
+  // `unsupported` is NOT: it's a tiny, rarely-changing map of what this host's
+  // agent can't do, worth reading.
   const { history, subagentHistory, jiraIssues, statusResults,
-          createMeta, createTypes, createResults, resultWaits, ...a } = agent;
+          createMeta, createTypes, createResults, resultWaits, tokenBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     key,
@@ -1348,6 +1438,10 @@ function startMigration(srcHost, s, targetHost) {
     // how big it is (for the target's Content-Length) — see MIGRATE_SPOOL_DIR.
     blobPath: null, blobSize: 0, uploading: false,
     importCmdId: null, targetSessionId: null,
+    // The reason an agent gave for declining its half (XERK-265), staged here by
+    // ingestSpawnFailures and turned into a terminal failure by advanceMigrations
+    // rather than applied on the spot — the handoff check must still win the tie.
+    refusal: null,
     error: null, startedAt: Date.now(), at: Date.now(),
   };
   migrations.set(id, m);
@@ -1380,6 +1474,19 @@ function advanceMigrations() {
         publishMigrations();
         continue;
       }
+    }
+    // The agent REFUSED its half of the move and said so on a beat (XERK-265):
+    // fail now, carrying its reason, instead of leaving the operator watching a
+    // move that can no longer complete for the whole MIGRATE_TIMEOUT_MS. Read
+    // after the handoff above so a success always wins the tie, and covers both
+    // halves — an export that never shipped a blob as well as a refused import.
+    if ((m.phase === "exporting" || m.phase === "importing") && m.refusal) {
+      m.phase = "failed";
+      m.error = m.refusal;
+      dropMigrationBlob(m);   // the spool file, exactly as the timeout below
+      m.at = now;
+      publishMigrations();
+      continue;
     }
     // A move that never completed: fail it so the UI stops waiting. The source
     // session was never killed, so nothing is lost — the operator retries.
@@ -1645,6 +1752,84 @@ function ingestStatusResults(agent, ticketStatusResults) {
       .sort((a, b) => a[1].at - b[1].at)
       .slice(0, over)
       .forEach(([id]) => delete agent.statusResults[id]);
+  }
+}
+
+// How long a staged session-start refusal (XERK-265) stays readable, and how
+// many one host may hold. It exists to answer a wait that is already running —
+// the Sessions page's SPAWN_FOLLOW_MS, or a migration — so minutes is generous.
+const SPAWN_FAILURE_MAX_AGE_MS = 10 * 60 * 1000;
+const SPAWN_FAILURE_MAX = 40;
+// And how long one reason / one cmdId key may be. These are NOT stylistic: this
+// cache is served with the record, so `agentRecordSize` counts it, and the
+// ceiling check runs BEFORE the ingest — an unbounded reason would land, push
+// the record past AGENT_RECORD_MAX, and then 413 every following beat from that
+// host, including the ones that would have swept it. The agent truncates too;
+// this is the boundary that makes a buggy or hostile one survivable (XERK-235).
+const SPAWN_FAILURE_ERROR_MAX = 500;
+const SPAWN_FAILURE_CMDID_MAX = 200;
+
+// Merge the agent's refusals of a session-creating command (heartbeat
+// `spawnFailures`, XERK-265) into a per-cmdId cache, and stamp any it names onto
+// the migration waiting on it.
+//
+// Every one of these used to be a line in the agent's container log: the command
+// is ACKed whether the agent ran it or refused it, so the hub could not tell a
+// refused resume from a slow one. It kept the Sessions page spinning out its
+// follow window with no reason, and left a migration in `importing` until
+// MIGRATE_TIMEOUT_MS — which XERK-256's prune/resume race made an ordinary event
+// rather than an operator error.
+//
+// Unlike `statusResults` this cache is NOT stripped from the fleet payload: the
+// point is that the client following the spawn can see it. It is small, capped
+// and short-lived, so it costs the record almost nothing. It is named apart from
+// the wire field it comes from (`spawnRefusals`, keyed by cmdId, vs the beat's
+// `spawnFailures` list) so the two shapes can't be mistaken for each other.
+// `ownCmdIds` is the set of command ids this host was actually GIVEN (its queue
+// before this beat's acks were applied). Both handles are checked against what
+// the hub knows, never taken on the agent's word: all agents share one token, so
+// an unchecked cmdId lets any host end another host's spawn wait with arbitrary
+// text, and an unchecked migrationId lets it fail a move it has no part in.
+function ingestSpawnFailures(hostKey, agent, ownCmdIds, results) {
+  const now = Date.now();
+  // A non-array here would throw mid-handler, AFTER the record was replaced and
+  // before the ack/publish/save — costing the host its commands every beat.
+  for (const r of (Array.isArray(results) ? results : [])) {
+    if (!r) continue;
+    const error = typeof r.error === "string" && r.error
+      ? r.error.slice(0, SPAWN_FAILURE_ERROR_MAX)
+      : "the agent refused it";
+    // The length and key-name checks are belt-and-braces BEHIND `ownCmdIds`:
+    // `queueCommand` mints ids from crypto.randomBytes, so the hub can never
+    // have issued one called `__proto__` or 200 chars long, and no test can
+    // fail on their removal today. They are here for the day that membership
+    // check is relaxed — `__proto__` would then invoke the prototype setter
+    // rather than store an entry, silently dropping the refusal, which is why
+    // `device` refuses the same names.
+    if (typeof r.cmdId === "string" && r.cmdId &&
+        r.cmdId.length <= SPAWN_FAILURE_CMDID_MAX &&
+        r.cmdId !== "__proto__" && r.cmdId !== "constructor" &&
+        r.cmdId !== "prototype" && ownCmdIds.has(r.cmdId)) {
+      agent.spawnRefusals[r.cmdId] = { error, at: now };
+    }
+    // A migration's own handle. The refusal can arrive for either half, so match
+    // the record by id — the export half has no importCmdId to key on. Only a
+    // host actually IN the move may fail it.
+    if (r.migrationId) {
+      const m = migrations.get(r.migrationId);
+      if (m && (m.phase === "exporting" || m.phase === "importing") &&
+          (m.srcHost === hostKey || m.targetHost === hostKey)) m.refusal = error;
+    }
+  }
+  for (const [id, e] of Object.entries(agent.spawnRefusals)) {
+    if (now - e.at > SPAWN_FAILURE_MAX_AGE_MS) delete agent.spawnRefusals[id];
+  }
+  const over = Object.keys(agent.spawnRefusals).length - SPAWN_FAILURE_MAX;
+  if (over > 0) {
+    Object.entries(agent.spawnRefusals)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.spawnRefusals[id]);
   }
 }
 
@@ -2123,6 +2308,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "sessions", "startedAt", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
+  "spawnFailures",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -2612,13 +2798,111 @@ function userAuthorized(req) {
   return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1));
 }
 
-// Agent auth (heartbeats). The user credentials also work here, so a curl
-// with the basic-auth login can exercise the endpoint.
-function agentAuthorized(req) {
+// Did this request carry a VALID agent credential, whatever host it is for?
+// Weaker than agentBearerKind only in that it doesn't say which host — it still
+// refuses an unknown token outright, which is what keeps an anonymous caller off
+// the heartbeat's 32 MiB body read (XERK-268). The one caller is that pre-body
+// gate; everywhere else has a host in hand and must bind to it.
+function agentPresented(req) {
   if (!TURMA_AGENT_TOKEN) return true;
   const header = req.headers.authorization || "";
-  if (header.startsWith("Bearer ")) return safeEqual(header.slice(7), TURMA_AGENT_TOKEN);
+  if (header.startsWith("Bearer ")) {
+    const token = header.slice(7);
+    if (tokenHost(token)) return true;
+    // Under TURMA_AGENT_STRICT the master is not a credential at all, and that
+    // has to hold HERE and not only at the authorization check past it: this
+    // gate stands in front of the 32 MiB read, so leaving the master usable
+    // through it means a leaked master still OOMs the hub on a fleet whose
+    // whole point was that the master had been retired.
+    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
+  }
   return userAuthorized(req) && !!TURMA_PASSWORD;
+}
+
+// The heartbeat's pre-body gate as a response. Refusing the master under strict
+// costs the caller the host-named 403 that agentHostRefusal gives every other
+// surface — the host is still unread, in the body behind this gate — so say the
+// same thing without it, rather than dropping an agent mid-rollover onto a bare
+// "unauthorized" it cannot act on (XERK-268).
+function agentPresentedRefusal(req) {
+  if (agentPresented(req)) return null;
+  const token = (req.headers.authorization || "").startsWith("Bearer ")
+    ? req.headers.authorization.slice(7) : "";
+  if (TURMA_AGENT_STRICT && TURMA_AGENT_TOKEN && token && safeEqual(token, TURMA_AGENT_TOKEN)) {
+    return {
+      status: 403,
+      error: "this hub requires each agent's own token (TURMA_AGENT_STRICT is set), not the fleet master",
+    };
+  }
+  return { status: 401, error: "unauthorized" };
+}
+
+// WHAT an agent-authed request proved about which host it is (XERK-268). Every
+// agent-authed surface names a host — the `<host>` path segment, the heartbeat's
+// `device`, the tunnel's `?name=` — and this says whether the credential backs
+// that claim. Four outcomes:
+//
+//   "proved"   the bearer is this host's derived token, so `host` is the
+//              credential's and not the caller's to pick;
+//   "operator" the ordinary user login (Basic/cookie). The operator owns the
+//              whole fleet and can already drive every host through the user
+//              API, so they may name any host — this is what keeps the
+//              documented curl paths working;
+//   "legacy"   the raw fleet master. It authenticates "some agent in this
+//              fleet" and NOTHING about which one, which is the pre-XERK-268
+//              trust model, kept so a host that hasn't been given its derived
+//              token yet keeps working. TURMA_AGENT_STRICT refuses it;
+//   null       not an agent credential at all (or the wrong host's).
+//
+// `host` null asks only "is this an agent at all" — the coarse gate before a
+// body has been parsed. Never let a route settle for that when it has a host to
+// check: "authenticated" is not "is who it says it is".
+function agentBearerKind(req, host) {
+  // Unconfigured hub: no token check at all (warned about loudly at boot).
+  if (!TURMA_AGENT_TOKEN) return "legacy";
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) {
+    const token = header.slice(7);
+    const bound = tokenHost(token);
+    // A host token proves exactly one host. Naming any other is the
+    // impersonation this exists to refuse — not a fallback to `legacy`.
+    if (bound) return host != null && bound === host ? "proved" : null;
+    if (safeEqual(token, TURMA_AGENT_TOKEN)) return "legacy";
+    return null;
+  }
+  return userAuthorized(req) && !!TURMA_PASSWORD ? "operator" : null;
+}
+
+// The gate every host-scoped agent route goes through: resolve the credential
+// against the host the caller NAMED and turn it into a response, or null to
+// carry on. Refusals are worded so the operator can act on them, per the hub's
+// refusal contract — a rolled-over agent hitting a strict hub, or a strict hub
+// meeting a host still on the master, must not read as a generic 401.
+function agentHostRefusal(req, host) {
+  const kind = agentBearerKind(req, host);
+  if (!kind) {
+    // A token that IS a host token, for a different host, gets said out loud.
+    // The commonest cause by far is not an attack but a host RENAME — the name
+    // is inside the token, so the agent's credential silently stops matching —
+    // and "unauthorized" sends the operator hunting for a wrong secret instead
+    // of a changed name. It tells the caller nothing it doesn't already hold:
+    // the token names its own host on its face.
+    const bound = tokenHost((req.headers.authorization || "").slice(7));
+    if (bound) {
+      return {
+        status: 403,
+        error: `this agent token is ${bound}'s, not ${host}'s — a host's token is derived from its name, so re-derive it if the host was renamed`,
+      };
+    }
+    return { status: 401, error: "unauthorized" };
+  }
+  if (kind === "legacy" && TURMA_AGENT_STRICT && TURMA_AGENT_TOKEN) {
+    return {
+      status: 403,
+      error: `this hub requires ${host}'s own agent token (TURMA_AGENT_STRICT is set), not the fleet master`,
+    };
+  }
+  return null;
 }
 
 // Trigger auth (POST /api/trigger). A caller passes either the dedicated
@@ -2641,11 +2925,19 @@ function triggerAuthorized(req) {
 // Agent auth for the tunnel WebSockets. Node's browser-style WebSocket client
 // (used by tunnel-agent.js) can't set headers, so the token rides a query
 // param; a Bearer header is accepted too for tools that can send one.
-function agentWsAuthorized(url, req) {
+//
+// `host` is the host this socket claims to be (XERK-268): `?name=` on the
+// control channel, and the host the data channel's `ch` was opened FOR on the
+// data channel — a socket may only be the host its credential derives to. Null
+// means there is no claim to check, which is not a state either caller is in.
+function agentWsAuthorized(url, req, host) {
   if (!TURMA_AGENT_TOKEN) return true;
   const token = url.searchParams.get("token");
-  if (token) return safeEqual(token, TURMA_AGENT_TOKEN);
-  return agentAuthorized(req);
+  if (token) {
+    if (host != null && safeEqual(token, hostAgentToken(host))) return true;
+    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
+  }
+  return !agentHostRefusal(req, host);
 }
 
 // ---- push alerts (Firebase Cloud Messaging) ---------------------------------
@@ -3696,10 +3988,16 @@ function openChannel(name, port) {
       delete pendingChannels[ch];
       reject(new Error("channel open timeout"));
     }, 10000);
-    pendingChannels[ch] = (duplex) => {
-      clearTimeout(timer);
-      delete pendingChannels[ch];
-      resolve(duplex);
+    // `host` is carried so the dial-back can be checked against the host the
+    // channel was opened FOR (XERK-268) — `ch` alone identifies the channel but
+    // proves nothing about who answered it.
+    pendingChannels[ch] = {
+      host: name,
+      resolve: (duplex) => {
+        clearTimeout(timer);
+        delete pendingChannels[ch];
+        resolve(duplex);
+      },
     };
     cc.sendOpen(ch, port);
   });
@@ -3805,7 +4103,7 @@ function dropTermAgents(name) {
   }
 }
 async function proxyTerm(req, res, name, port) {
-  const headers = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH };
+  const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
   // so ttyd keeps the tunnel channel open for the next asset instead of closing.
   delete headers.connection;
@@ -3942,9 +4240,26 @@ const server = http.createServer(async (req, res) => {
       req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "uploads" && parts[5] === "blob" && parts.length === 6;
 
-    if (url.pathname === "/api/heartbeat" || isArchiveIngest || isUpdatingSignal ||
-        isMigrationBlob || isUploadBlob) {
-      if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    if (url.pathname === "/api/heartbeat") {
+      // The heartbeat names the host it acts as in its BODY, so it is bound to
+      // the credential in the handler, once that is parsed (XERK-268). All this
+      // can do is refuse a caller carrying no agent credential at ALL: a bearer
+      // that isn't the master is indistinguishable from some host's derived
+      // token until we know which host it claims to be. That keeps the
+      // credential-less case refused before the body is read, as it always was.
+      const gate = agentPresentedRefusal(req);
+      if (gate) return json(res, gate.status, { error: gate.error });
+    } else if (isArchiveIngest || isUpdatingSignal || isMigrationBlob || isUploadBlob) {
+      // These all carry the host they act as in `<host>`, so the credential is
+      // checked AGAINST it rather than merely being a valid agent token. The
+      // decode is the same expression each route runs on the same segment, so
+      // the host checked here and the host compared there cannot diverge; a
+      // segment that does not decode is matched raw so an anonymous caller
+      // still gets 401 here rather than the route's 400 before any auth ran.
+      let claimed;
+      try { claimed = decodeURIComponent(parts[2]); } catch { claimed = parts[2]; }
+      const refusal = agentHostRefusal(req, claimed);
+      if (refusal) return json(res, refusal.status, { error: refusal.error });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isLoginRoute) {
@@ -4135,14 +4450,29 @@ const server = http.createServer(async (req, res) => {
           key === "__proto__" || key === "constructor" || key === "prototype") {
         return json(res, 400, { error: "device must be a plain host name" });
       }
+      // `device` is the host this beat claims to BE, and the whole record —
+      // sessions, capacity, the command queue it drains — hangs off it. Bind it
+      // to the credential now that it's parsed (XERK-268): unbound, any
+      // token-holder could beat as another host and be handed the commands
+      // queued for it, which is how a migration/upload id leaves the fleet.
+      const beatRefusal = agentHostRefusal(req, key);
+      if (beatRefusal) return json(res, beatRefusal.status, { error: beatRefusal.error });
+      // Which credential it used decides which token its ttyd is running with
+      // (see ttydAuth). Hub-derived, never read off the payload.
+      const tokenBound = agentBearerKind(req, key) === "proved";
+      // Admission control (XERK-272), ordered AFTER the binding above so an
+      // unbound beat can never spend a registry slot. A host already in the
+      // registry always gets in — its record is bounded below and replacing it
+      // frees what it held — but a name the hub has never seen only gets a slot
+      // if there is room, or one can be reclaimed from a host gone longer than
+      // AGENT_EVICT_IDLE_MS.
+      //
+      // XERK-268 makes `device` PROVED rather than self-asserted, which shrinks
+      // this from an anyone-with-the-token attack to a compromised-or-buggy host
+      // and the `legacy` master credential a mid-rollover fleet still accepts —
+      // neither of which is nothing, and a host deriving its name from something
+      // unstable grows records with no attacker at all.
       const known = Object.prototype.hasOwnProperty.call(agents, key);
-      // Admission control (XERK-272). A host already in the registry always gets
-      // in — its record is bounded below and replacing it frees what it held —
-      // but a name the hub has never seen only gets a slot if there is room, or
-      // one can be reclaimed from a host gone longer than AGENT_EVICT_IDLE_MS.
-      // Refusing here, BEFORE the record is built, is the point: `device` is
-      // attacker-chosen, so an unbounded number of names is an unbounded number
-      // of retained records.
       if (!known && !makeRegistryRoom(0, 1)) {
         // Throttled like the over-half warning, and for the same reason: the
         // flood this exists to survive is exactly the traffic that would write
@@ -4184,6 +4514,11 @@ const server = http.createServer(async (req, res) => {
       delete payload.createMetaResults;
       const createTicketResults = payload.createTicketResults;
       delete payload.createTicketResults;
+      // Session-creating commands this agent REFUSED since the last beat
+      // (XERK-265) — cached by cmdId below and applied to any migration they
+      // name, so a refusal fails the move now rather than at its timeout.
+      const spawnFailures = payload.spawnFailures;
+      delete payload.spawnFailures;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -4201,6 +4536,11 @@ const server = http.createServer(async (req, res) => {
         // Pending host commands (spawn/kill/start/restart/resume/delete)
         // queued by the UI; re-sent on every reply below until acked.
         commands,
+        // Whether this host authenticated with its OWN derived token or the
+        // fleet master (XERK-268). Assigned AFTER the payload spread so a
+        // heartbeat claiming it is bound cannot make itself so; read only by
+        // ttydAuth, and stripped from the fleet payload like the caches.
+        tokenBound,
         lastSeen: Date.now(),
         // Per-agent alert bookkeeping survives across beats and hub restarts.
         alerts: prev.alerts || {},
@@ -4216,6 +4556,10 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId board-status-change outcome cache (see the /status route,
         // XERK-138); survives across beats like `jiraIssues`.
         statusResults: prev.statusResults || {},
+        // Per-cmdId refusals of a session-creating command (XERK-265). Survives
+        // across beats like the caches above, but is SERVED with the record
+        // rather than stripped — the client following that spawn is who needs it.
+        spawnRefusals: prev.spawnRefusals || {},
         // New-ticket create caches (XERK-137): the org's project/label metadata,
         // per-project issue types, and per-cmdId create outcomes. Like the other
         // on-demand caches, they survive across beats and are stripped from the
@@ -4317,6 +4661,17 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
+      // Scoped to the commands this host was actually given: `prev.commands` is
+      // the queue BEFORE this beat's acks were filtered out, and the agent
+      // stages a refusal in the same handle_commands call that acks it, so the
+      // two always ride together. A hub restart inside `scheduleSave`'s debounce
+      // forgets the queue and therefore drops that refusal — correctly: the hub
+      // can no longer tell whose command it was, and the wait simply degrades to
+      // the pre-XERK-265 timeout. Never authenticate it from the beat's own
+      // `ackedCommands` instead; that is the agent's word, which is the thing
+      // being checked.
+      ingestSpawnFailures(key, next,
+        new Set((prev.commands || []).map((c) => c && c.cmdId)), spawnFailures);
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);
@@ -4379,7 +4734,9 @@ const server = http.createServer(async (req, res) => {
 
     // POST /api/agents/<host>/archive/<transcriptId> — an agent pushing one delta
     // chunk of an inactive session's transcript into the durable hub archive.
-    // Agent-authed above. Body: {startOffset, endOffset, size, entries, meta}.
+    // Agent-authed above, and `<host>` — which is the archive row's owner — is
+    // bound to the credential there (XERK-268), so a host cannot file transcript
+    // chunks under another's name. Body: {startOffset, endOffset, size, entries, meta}.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "archive" && parts.length === 5) {
       const key = decodeURIComponent(parts[2]);
@@ -4399,38 +4756,30 @@ const server = http.createServer(async (req, res) => {
     }
 
     // POST /api/agents/<host>/migrations/<id>/blob — the SOURCE agent uploading
-    // a migrated session's raw transcript bundle. Agent-authed above. Body is
-    // the raw gzipped tar; storing it advances the migration to `importing` and
-    // queues importSession on the target (XERK-101).
-    // Scoped to the migration's OWN source host (XERK-266), like the uploads
-    // route below. **Defense in depth, NOT an identity check**: every agent
-    // shares one token, so `<host>` is the CALLER's to pick and one naming the
-    // real source passes. What it buys is that no token-holder can make the
-    // real target `claude --resume` bytes it chose *by mis-addressing*. Binding
-    // the segment to the credential — the actual fix, and the only thing that
-    // stops a deliberate attacker — is XERK-268.
+    // a migrated session's raw transcript bundle. Body is the raw gzipped tar;
+    // storing it advances the migration to `importing` and queues importSession
+    // on the target (XERK-101).
+    //
+    // Only this migration's OWN source host may post it (XERK-266), and `<host>`
+    // is PROVED by the credential at the gate above rather than typed
+    // (XERK-268) — it takes both halves to make this an identity check. With
+    // the scope alone an attacker simply named the real source and passed.
     // **Every refusal answers the SAME 404** — wrong host, wrong phase, an
     // upload already in flight, a spool that could not be written, empty body,
     // vanished source session; the 413 below is the one exception, and is
-    // discussed there — and that uniformity is the point, not
-    // tidiness: any RESPONSE a non-source cannot also get names the source to a
-    // prober. So do NOT restore a friendlier 409/400/500 at any of them, and
-    // **enumerate what this route can answer rather than eyeballing the guard**
-    // — the `source session gone` branch below is why. The real source loses
-    // nothing it acts on: it only logs the failure, and the RECORD still
-    // carries the true reason for the operator.
-    // **Never reason as if the migration id were the two participants' alone.**
-    // It rides the user-authed fleet payload, and `device` on /api/heartbeat is
-    // self-asserted just like `<host>` here, so any token-holder beating as a
-    // host is handed that host's queued commands — `migrationId` among them.
-    // Two residual leaks remain, so **the oracle is narrowed, not shut**, and
-    // only XERK-268 shuts it: the TIMING of the reply (this guard runs BEFORE
-    // the body read, so a caller that PASSES it blocks while one that doesn't
-    // answers at once — 15 probes and 960 bytes to find a source, mutating
-    // nothing), and the 413 (loud, and ~1 MiB per wrong-host probe since the
-    // guard cuts it off early — the full >MIGRATE_BLOB_MAX only on the hit).
-    // Neither is closeable without reading an unbounded body from an unverified
-    // caller.
+    // discussed there — and that uniformity is the point, not tidiness: any
+    // RESPONSE a non-source cannot also get names the source to a prober. So do
+    // NOT restore a friendlier 409/400/500 at any of them, and **enumerate what
+    // this route can answer rather than eyeballing the guard** — the `source
+    // session gone` branch below is why. The real source loses nothing it acts
+    // on: it only logs the failure, and the RECORD still carries the true
+    // reason for the operator.
+    // The uniform 404s are now belt AND braces rather than the whole defence:
+    // the two residual oracles they could not close — the TIMING of the reply
+    // (this guard runs before the body read) and the 413 — needed an unverified
+    // caller to be exploitable, and there is no longer any such caller. Keep
+    // them anyway: they are what still holds if a future route reaches this
+    // code with a weaker credential.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
@@ -4481,6 +4830,17 @@ const server = http.createServer(async (req, res) => {
         try { fs.unlinkSync(spool); } catch {}
         return json(res, 404, { error: "unknown migration" });
       }
+      // The move may have SETTLED while those bytes were being written — a
+      // refusal the source staged for this very upload (its POST timed out
+      // while the hub was still spooling, XERK-265) fails it within one beat,
+      // and the timeout can land here too. Advancing anyway would resurrect a
+      // move the operator was already told had failed, queue an importSession
+      // for it, and then kill the source when the target came up. Same careful
+      // unlink as the empty-body path: this file is now nobody's.
+      if (m.phase !== "exporting") {
+        try { fs.unlinkSync(spool); } catch {}
+        return json(res, 404, { error: "unknown migration" });
+      }
       m.blobPath = spool;
       m.blobSize = size;
       m.phase = "importing";
@@ -4524,14 +4884,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     // GET /api/agents/<host>/migrations/<id>/blob — the TARGET agent pulling the
-    // bundle to unpack + resume. Agent-authed above, and scoped to the
-    // migration's OWN target host (XERK-266) on the same defense-in-depth
-    // terms as the POST above — the bundle is the raw transcript of another
-    // host's conversation, so the id alone should not be enough to read it,
-    // but a caller naming the real target still passes (XERK-268). Unlike the
-    // POST, the oracle here CANNOT be closed by making the refusals uniform:
-    // the success IS the disclosure, so a token-holder with the id can walk
-    // the host names until one returns bytes. Only XERK-268 fixes that.
+    // bundle to unpack + resume. Scoped to the migration's OWN target host
+    // (XERK-266), over a `<host>` the credential proves (XERK-268) — and here
+    // that binding is the ONLY thing that can work: uniform refusals cannot
+    // help a route whose success IS the disclosure, so while the segment was
+    // merely typed, a token-holder with the id could walk the host names until
+    // one returned the bytes. The bundle is another host's raw conversation.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
@@ -4570,13 +4928,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
-    // operator attached to a message (XERK-234). Agent-authed above. Scoped to
-    // the host the upload was staged for — like the migration GET above and
-    // with the same limit: `<host>` is self-asserted, and a hit returns the
-    // bytes, so an agent-token holder knowing the upload id can walk the host
-    // names until the operator's attached file comes back. Read that comment
-    // before trusting this line; binding the segment to the credential covers
-    // this route too (XERK-268). The blob is NOT dropped on read: the
+    // operator attached to a message (XERK-234). Scoped to the host the upload
+    // was staged for, and since `<host>` is proved at the gate above (XERK-268)
+    // that now means what this line always claimed: one host's agent token
+    // cannot pull another host's pending attachment. Same shape as the
+    // migration GET above and closed the same way — a hit returns the bytes, so
+    // nothing but binding the segment could have stopped a token-holder who
+    // knew the upload id from walking the host names. The blob is NOT dropped
+    // on read: the
     // agent may be re-issued the command (at-least-once delivery), and letting it
     // expire on the TTL costs nothing a re-download doesn't.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
@@ -5696,9 +6055,12 @@ server.on("upgrade", async (req, socket, head) => {
 
   // Agent control channel: persistent, carries {open:ch, port} requests to the agent.
   if (parts[0] === "agent" && parts[1] === "control") {
-    if (!agentWsAuthorized(url, req)) return socket.destroy();
+    // `name` is read BEFORE the auth check, because it is what the credential
+    // has to back (XERK-268) — registering another host's tunnel would route
+    // that host's terminals through the impostor.
     const name = url.searchParams.get("name");
     if (!name) return socket.destroy();
+    if (!agentWsAuthorized(url, req, name)) return socket.destroy();
     wsHandshake(socket, req);
     const send = (op, payload) => {
       try { socket.write(wsEncode(op, payload)); } catch {}
@@ -5813,12 +6175,14 @@ server.on("upgrade", async (req, socket, head) => {
 
   // Agent data channel: pair it with the pending openChannel() awaiting `ch`.
   if (parts[0] === "agent" && parts[1] === "data") {
-    if (!agentWsAuthorized(url, req)) return socket.destroy();
     const ch = url.searchParams.get("ch");
-    const resolver = pendingChannels[ch];
-    if (!resolver) return socket.destroy();
+    const pending = pendingChannels[ch];
+    if (!pending) return socket.destroy();
+    // Only the host this channel was opened for may answer it (XERK-268): the
+    // duplex becomes that host's terminal stream.
+    if (!agentWsAuthorized(url, req, pending.host)) return socket.destroy();
     wsHandshake(socket, req);
-    resolver(channelDuplex(socket));
+    pending.resolve(channelDuplex(socket));
     return;
   }
 
@@ -6005,7 +6369,7 @@ server.on("upgrade", async (req, socket, head) => {
     // 101 + WS frames flow straight back (its accept is keyed off the browser's
     // Sec-WebSocket-Key, which we forward verbatim).
     let reqLines = `${req.method} ${req.url} HTTP/1.1\r\n`;
-    const hdrs = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH };
+    const hdrs = { ...req.headers, host: "ttyd", authorization: ttydAuth(loc.host) };
     for (const [k, v] of Object.entries(hdrs)) reqLines += `${k}: ${v}\r\n`;
     channel.write(Buffer.from(reqLines + "\r\n"));
     if (head && head.length) channel.write(head);
@@ -6092,8 +6456,20 @@ if (process.env.TURMA_TEST) {
     uploads,
     UPLOAD_MAX_PER_MESSAGE,
     userAuthorized,
-    agentAuthorized,
+    agentPresented,
+    agentBearerKind,
+    agentHostRefusal,
+    agentPresentedRefusal,
+    tokenHost,
+    // The reverse-tunnel maps, exported so their null prototype can be asserted
+    // directly. Reaching it through a socket instead means the regression is
+    // detected by the hub DYING mid-run, which reads as a CI timeout rather
+    // than a failing test (XERK-268).
+    controlChannels,
+    pendingChannels,
     agentWsAuthorized,
+    hostAgentToken,
+    ttydAuth,
     triggerAuthorized,
     safeEqual,
     credentialsMatch,
@@ -6135,10 +6511,32 @@ if (process.env.TURMA_TEST) {
     migrationSpoolPath,
     siteKeyOf,
   };
+} else if (process.argv[2] === "--agent-token") {
+  // `node turma/server.js --agent-token <host>` prints the token that host's
+  // agent must run with (XERK-268) — the value DockerOps sets as its TURMA_TOKEN.
+  // Run it on the hub, where the master lives; nothing is started or bound.
+  const host = process.argv[3];
+  if (!host) {
+    console.error("usage: node server.js --agent-token <host>   (the host name the agent reports as `device`)");
+    process.exit(2);
+  } else if (!TURMA_AGENT_TOKEN) {
+    console.error("TURMA_AGENT_TOKEN is not set — there is no master to derive from");
+    process.exit(2);
+  } else {
+    console.log(hostAgentToken(host));
+  }
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
   if (!TURMA_AGENT_TOKEN) console.warn("WARNING: TURMA_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
+  // The fleet master proves only "some agent", never WHICH one, so until every
+  // host runs on its own derived token and TURMA_AGENT_STRICT is set, a host is
+  // still free to name another in `device` or a `<host>` segment (XERK-268).
+  // Said at boot rather than left to the docs — a half-finished rollover looks
+  // exactly like a finished one from the outside.
+  if (TURMA_AGENT_TOKEN && !TURMA_AGENT_STRICT) {
+    console.warn("WARNING: TURMA_AGENT_STRICT not set — the shared TURMA_AGENT_TOKEN is still accepted, so an agent can act as any host. Give each agent `node server.js --agent-token <host>` as its TURMA_TOKEN, then set TURMA_AGENT_STRICT=1");
+  }
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT}`);
     // The effective registry budget, printed because it is DERIVED (from this
