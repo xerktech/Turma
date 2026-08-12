@@ -1656,9 +1656,15 @@ test("usableHostname refuses URL dot segments", () => {
 
 test("deviceName refuses a dot-segment DEVICE_NAME override", () => {
   const { deviceName } = require("../tunnel-agent.js");
-  const saved = { d: process.env.DEVICE_NAME, c: process.env.COMPUTERNAME };
+  const saved = { d: process.env.DEVICE_NAME, c: process.env.COMPUTERNAME,
+    p: process.env.PATH };
   try {
     delete process.env.COMPUTERNAME;
+    // Falling through reaches dockerHostName(), whose execFileSync has a 15s
+    // timeout and runs once per call. Blanking PATH makes it fail instantly
+    // with ENOENT instead of waiting on a possibly-cold daemon on a CI runner;
+    // the assertions below hold whichever source it lands on.
+    process.env.PATH = "";
     for (const bad of [".", ".."]) {
       process.env.DEVICE_NAME = bad;
       const got = deviceName();
@@ -1674,5 +1680,6 @@ test("deviceName refuses a dot-segment DEVICE_NAME override", () => {
     if (saved.d === undefined) delete process.env.DEVICE_NAME;
     else process.env.DEVICE_NAME = saved.d;
     if (saved.c !== undefined) process.env.COMPUTERNAME = saved.c;
+    process.env.PATH = saved.p;
   }
 });

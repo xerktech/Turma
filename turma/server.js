@@ -379,6 +379,18 @@ try {
   // restart is exactly when a new coercion ships. `normalizeRecord` is shared
   // with the ingest path so the two cannot drift; adding a coercion in one
   // place covers both. Tests: `the state.json restore coerces too`.
+  // The KEY is coerced here too, for the same reason the record is: a record
+  // written before the key guard existed carries a name the ingest path would
+  // now refuse, and the restore is the first thing served after a restart. A
+  // dot-segment key is the case that matters — it is uncommandable AND
+  // undeletable (`DELETE /api/agents/.` is itself one of the routes whose path
+  // collapses), so without this it sits there until `prune()` ages it out days
+  // later. Dropping it is safe: a live host re-registers on its next beat.
+  for (const key of Object.keys(agents)) {
+    if (isPlainHostKey(key)) continue;
+    console.warn(`dropping restored agent under unusable device name ${JSON.stringify(key)}`);
+    delete agents[key];
+  }
   for (const a of Object.values(agents)) normalizeRecord(a);
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
 } catch {
@@ -1949,6 +1961,30 @@ function objectish(x) {
  * so one host's wrong-typed value throws for the whole array and every OTHER
  * host silently disappears from that phone.
  */
+/**
+ * Whether a string is usable as the `agents` key, i.e. as a host this hub can
+ * actually address. Shared by the heartbeat ingest and the `state.json` restore
+ * so the two cannot drift — the same reason `normalizeRecord` is shared.
+ *
+ * Two families are refused. `agents` is a plain object, so a prototype key is
+ * not a host: `__proto__` 200'd while the beat was silently discarded, and
+ * replaced the registry's prototype (XERK-235). And a URL dot segment is
+ * unaddressable: percent-encoding leaves "." and ".." untouched (both are
+ * unreserved), and the URL parser resolving /api/agents/<host>/... then
+ * collapses the segment — "." drops it, ".." climbs a level — so such a host
+ * shows online and healthy while every route against it 404s (XERK-269).
+ *
+ * Exact match, deliberately: the padded forms (" . ", ".\n") ARE addressable,
+ * since the padding percent-encodes to %20/%0A and no parser collapses those.
+ * Names that merely contain dots ("...", ".hidden", "a.b", "HOST.local.") are
+ * ordinary host names and must keep working.
+ */
+function isPlainHostKey(key) {
+  return typeof key === "string" && key.length > 0 && key.length <= 200 &&
+    key !== "__proto__" && key !== "constructor" && key !== "prototype" &&
+    key !== "." && key !== "..";
+}
+
 function normalizeRecord(a) {
   // Order is NOT load-bearing, and must not become so: each of these guards its
   // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
@@ -3838,20 +3874,14 @@ const server = http.createServer(async (req, res) => {
       // fallback if the host name couldn't be read.
       const key = payload.device || payload.agentId;
       if (!key) return json(res, 400, { error: "device/agentId required" });
-      // `agents` is a plain object keyed by host name, so a non-string or a
-      // prototype key is not a host: `__proto__` 200'd while the beat was
-      // silently discarded (and replaced the registry's prototype), and an
-      // object key landed as "[object Object]" (XERK-235). Refuse it loudly —
-      // a beat the hub throws away must never report success.
-      // "." and ".." are refused for the same reason, one layer up: they survive
-      // percent-encoding untouched and the URL parser resolving
-      // /api/agents/<host>/... then collapses the segment, so such a host shows
-      // online while every route against it 404s and even DELETE can't remove it
-      // (XERK-269). The agent no longer reports them, but an un-upgraded one in a
-      // mixed fleet still can, and a loud 400 in its log beats a 7-day ghost.
-      if (typeof key !== "string" || key.length > 200 ||
-          key === "__proto__" || key === "constructor" || key === "prototype" ||
-          key === "." || key === "..") {
+      // A beat the hub would throw away must never report success — see
+      // isPlainHostKey for which names are refused and why. Logged because the
+      // agent side cannot say why on its own: urllib's HTTPError stringifies
+      // without the body, so the agent's log shows a bare "HTTP Error 400" and
+      // the host simply vanishes from the dashboard. This line is the only
+      // place the reason is recoverable.
+      if (!isPlainHostKey(key)) {
+        console.warn(`refused heartbeat: device ${JSON.stringify(key)} is not a plain host name`);
         return json(res, 400, { error: "device must be a plain host name" });
       }
       const prev = agents[key] || {};
@@ -5729,6 +5759,9 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    // The KEY half of that pair, shared by the ingest and the restore for the
+    // same anti-drift reason (XERK-269).
+    isPlainHostKey,
     // The holder the heartbeat's coercion step goes through, exported so a test
     // can make it throw and hold the rollback that follows (XERK-262). See its
     // declaration for why that rollback cannot be reached from the wire.

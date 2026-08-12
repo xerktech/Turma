@@ -6909,6 +6909,24 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
   assert.ok(!("localModel" in old));
 });
 
+test("isPlainHostKey refuses exactly the names the hub cannot address", () => {
+  // Prototype keys (XERK-235) and URL dot segments (XERK-269): the first is not
+  // a host at all, the second is a host no /api/agents/<host>/... route can
+  // reach, because the URL parser collapses the segment before it ever matches.
+  for (const bad of ["__proto__", "constructor", "prototype", ".", "..",
+    "", "x".repeat(201), null, undefined, 12, {}, ["x"]]) {
+    assert.equal(hub.isPlainHostKey(bad), false, `${JSON.stringify(bad)} must be refused`);
+  }
+  // Padded dots ARE addressable — the padding percent-encodes to %20/%0A, which
+  // no parser collapses — so refusing them would be over-scoping the guard.
+  // Names that merely contain dots are ordinary host names.
+  for (const good of ["truenas", "WIN-DESK01", "HOST.local.", "...", ".hidden",
+    "a.b", "..host", " . ", ".\n", "\t..\n", "x".repeat(200),
+    "日本語ホスト", "host%name", "a/b"]) {
+    assert.equal(hub.isPlainHostKey(good), true, `${JSON.stringify(good)} must be accepted`);
+  }
+});
+
 test("the state.json restore coerces too, not just the ingest path", () => {
   // A hub restart is exactly when a new coercion ships, and the restore is the
   // FIRST thing it serves. A record written before it — or belonging to an
@@ -6943,6 +6961,14 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   // the restore share ONE function, not a list of coercions to keep in step.
   assert.ok(/recordCoercion\.normalize\(next\)/.test(ingest),
     "the heartbeat ingest must go through the same normalizeRecord");
+  // The KEY needs the same treatment as the record, and for the same reason: a
+  // guard shipped only at ingest leaves an already-persisted bad key restored
+  // verbatim at boot. A dot-segment key is uncommandable AND undeletable, so it
+  // would sit there until prune() ages it out days later (XERK-269).
+  assert.ok(/isPlainHostKey\(key\)/.test(loader),
+    "the state.json restore must drop keys the ingest path would refuse");
+  assert.ok(/isPlainHostKey\(key\)/.test(ingest),
+    "the heartbeat ingest must go through the same key guard");
   // ...and BETWEEN the two size measurements. Before the raw check it could
   // shrink away the amplifier the ceiling exists to refuse (an 8 MiB string
   // `sessions` became `[]` and the beat 200'd); after the coerced check, an
