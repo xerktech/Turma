@@ -6767,6 +6767,17 @@ test("XERK-268: a host's token names its host and proves that name", () => {
   for (const bad of [["nas01"], { toString: () => "nas01" }, 5, null, undefined, ""]) {
     assert.equal(hostAgentToken(bad), "");
   }
+  // Nor a name the hub would refuse to REGISTER (XERK-269). Minting one is the
+  // worst outcome available: the agent renames itself to its next naming
+  // source, the token stops matching, and the tunnel reconnect-loops forever
+  // without ever naming the cause. `x`.repeat(201) is over the key length cap.
+  for (const bad of [".", "..", "__proto__", "constructor", "prototype", "x".repeat(201)]) {
+    assert.equal(hostAgentToken(bad), "", `must not mint for ${JSON.stringify(bad)}`);
+  }
+  // ...while names that merely contain dots still mint, since they register fine.
+  for (const good of ["...", ".hidden", "..host", "HOST.local."]) {
+    assert.match(hostAgentToken(good), /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/, good);
+  }
 });
 
 test("XERK-268: a bearer proves at most the ONE host it derives to", () => {

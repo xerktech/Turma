@@ -316,6 +316,12 @@ function hostAgentToken(host) {
   // would derive the SAME credential. No real host name does this — the point
   // is that the derivation is injective, not that anyone would hit it.
   if (name.toString() !== host) return "";
+  // Nor a name the hub would refuse to register anyway (XERK-269): minting a
+  // valid credential for an unusable host produces the worst outcome of all —
+  // the agent renames ITSELF to its next naming source, the token no longer
+  // matches, and the tunnel reconnect-loops forever without ever mentioning the
+  // name. Refusing at mint time is where the operator can still act on it.
+  if (!isPlainHostKey(host)) return "";
   return name.toString("base64url") + "." +
     crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
 }
@@ -6271,7 +6277,15 @@ if (process.env.TURMA_TEST) {
     console.error("TURMA_AGENT_TOKEN is not set — there is no master to derive from");
     process.exit(2);
   } else {
-    console.log(hostAgentToken(host));
+    const token = hostAgentToken(host);
+    if (!token) {
+      // Say WHY. A blank line here sent the operator looking at the master, and
+      // the failure it prevents (a reconnect loop with no mention of the name)
+      // gives them nothing to go on either.
+      console.error(`refusing to mint a token for ${JSON.stringify(host)}: the hub cannot register that host name, so its agent would rename itself and this token would never match`);
+      process.exit(2);
+    }
+    console.log(token);
   }
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
