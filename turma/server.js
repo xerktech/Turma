@@ -3621,35 +3621,31 @@ const server = http.createServer(async (req, res) => {
     // queues importSession on the target (XERK-101).
     // Scoped to the migration's OWN source host (XERK-266), like the uploads
     // route below. **Defense in depth, NOT an identity check**: every agent
-    // shares one token, so `<host>` is the CALLER's to pick, and one that names
-    // the real source passes — it is not "the attacker must know the hosts",
-    // because the route would otherwise hand the name back (below). What it
-    // buys is that the migration id alone no longer lets any token-holder make
-    // the real target `claude --resume` bytes it chose *by mis-addressing*: a
-    // wrong address now fails. Binding the segment to the credential — which is
-    // the actual fix, and the only thing that stops a DELIBERATE attacker — is
-    // XERK-268.
-    // **Every refusal here answers the SAME 404**, and that uniformity is the
-    // point, not tidiness: this route is otherwise a free host-name ORACLE.
-    // Any RESPONSE a non-source can't also get identifies the source, and with
-    // the id (which rides the user-authed fleet payload, so it is not only the
-    // two agents') a few hundred silent probes then find it. So a wrong host, a
-    // wrong phase, an empty body and a vanished source session are deliberately
-    // indistinguishable — do NOT restore a friendlier 409/400 at any of them,
-    // and note the real source loses nothing it acts on (it logs the failure
-    // and the move times out either way; the RECORD still carries the real
-    // reason for the operator). Adding a reply only the source can reach
-    // re-opens this, so **enumerate what this route can answer, don't eyeball
-    // the guard** — the `source session gone` branch below is why.
+    // shares one token, so `<host>` is the CALLER's to pick and one naming the
+    // real source passes. What it buys is that no token-holder can make the
+    // real target `claude --resume` bytes it chose *by mis-addressing*. Binding
+    // the segment to the credential — the actual fix, and the only thing that
+    // stops a deliberate attacker — is XERK-268.
+    // **Every refusal answers the SAME 404** (wrong host, wrong phase, empty
+    // body, vanished source session), and that uniformity is the point, not
+    // tidiness: any RESPONSE a non-source cannot also get names the source to a
+    // prober. So do NOT restore a friendlier 409/400 at any of them, and
+    // **enumerate what this route can answer rather than eyeballing the guard**
+    // — the `source session gone` branch below is why. The real source loses
+    // nothing it acts on: it only logs the failure, and the RECORD still
+    // carries the true reason for the operator.
+    // **Never reason as if the migration id were the two participants' alone.**
+    // It rides the user-authed fleet payload, and `device` on /api/heartbeat is
+    // self-asserted just like `<host>` here, so any token-holder beating as a
+    // host is handed that host's queued commands — `migrationId` among them.
     // Two residual leaks remain, so **the oracle is narrowed, not shut**, and
-    // only XERK-268 shuts it — neither is closeable here without reading an
-    // unbounded body from an unverified caller: the TIMING of an accepted vs
-    // rejected POST (this guard runs BEFORE the body read, so an accepted
-    // caller blocks while a rejected one answers at once — measured at 15
-    // probes and 960 bytes to find a source, mutating nothing), and the 413,
-    // which fails the migration loudly and costs an upload per probe — ~1 MiB
-    // at a wrong host, which the guard cuts off early, and the full
-    // >MIGRATE_BLOB_MAX only on the hit.
+    // only XERK-268 shuts it: the TIMING of the reply (this guard runs BEFORE
+    // the body read, so a caller that PASSES it blocks while one that doesn't
+    // answers at once — 15 probes and 960 bytes to find a source, mutating
+    // nothing), and the 413 (loud, and ~1 MiB per wrong-host probe since the
+    // guard cuts it off early — the full >MIGRATE_BLOB_MAX only on the hit).
+    // Neither is closeable without buffering an unbounded body from an
+    // unverified caller.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
