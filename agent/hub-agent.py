@@ -5792,13 +5792,17 @@ def _http_error_detail(err):
         parsed = json.loads(body) if body.strip() else None
         if isinstance(parsed, dict):
             # Azure DevOps says {"message": ...}; Jira says {"errorMessages":
-            # [...]} and/or a per-field {"errors": {field: why}}. The TURMA HUB
-            # says {"error": ...} — same need, same function: its refusals name
-            # the host a credential is for and whether TURMA_AGENT_STRICT is on
-            # (XERK-268), and the status line alone cannot say either.
-            msg = str(parsed.get("message") or parsed.get("error") or "").strip()
+            # [...]} and/or a per-field {"errors": {field: why}}.
+            msg = str(parsed.get("message") or "").strip()
             if not msg:
                 msg = "; ".join(str(m) for m in (parsed.get("errorMessages") or []))
+            # The TURMA HUB says {"error": ...} — same need, same function: its
+            # refusals name the host a credential is for and whether
+            # TURMA_AGENT_STRICT is on (XERK-268), and the status line alone
+            # cannot say either. Checked AFTER both tracker shapes, so adding it
+            # cannot change what an existing Jira/ADO failure reports.
+            if not msg:
+                msg = str(parsed.get("error") or "").strip()
             errors = parsed.get("errors")
             if not msg and isinstance(errors, dict):
                 msg = "; ".join(f"{k}: {v}" for k, v in errors.items())

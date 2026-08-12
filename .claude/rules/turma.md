@@ -267,7 +267,10 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
     in the body. `agentPresented` is the gate: it says the credential is one the hub ISSUED, without
     saying which host, and **must keep refusing an unknown bearer** — it stands in front of a 32 MiB
     `readBody`, so admitting any `Bearer <anything>` is an unauthenticated remote OOM of the hub,
-    and with it the whole fleet's control plane.
+    and with it the whole fleet's control plane. **`TURMA_AGENT_STRICT` has to bite HERE too**, not
+    only at the authorization check past it, or a leaked master still OOMs a fleet whose whole point
+    was that the master had been retired. `agentPresentedRefusal` words that 403 without a host,
+    since the host is still unread behind the gate.
   - **A wrong-host token answers 403 naming both hosts, not a bare 401.** The overwhelmingly likely
     cause is a host RENAME (the name is inside the token, so the credential silently stops matching);
     it leaks nothing, since the token names its own host on its face. `hub-agent.py` logs the hub's

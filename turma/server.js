@@ -301,7 +301,13 @@ function hostAgentToken(host) {
   // toString()-carrying object into a host name and mint a REAL credential for
   // it. No caller passes one today; this is so none can start.
   if (!TURMA_AGENT_TOKEN || typeof host !== "string" || !host) return "";
-  return Buffer.from(host).toString("base64url") + "." +
+  const name = Buffer.from(host);
+  // A name that doesn't survive the UTF-8 round trip gets no token: a lone
+  // surrogate encodes to the replacement character, so two different host names
+  // would derive the SAME credential. No real host name does this — the point
+  // is that the derivation is injective, not that anyone would hit it.
+  if (name.toString() !== host) return "";
+  return name.toString("base64url") + "." +
     crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
 }
 
@@ -2026,9 +2032,33 @@ function agentPresented(req) {
   const header = req.headers.authorization || "";
   if (header.startsWith("Bearer ")) {
     const token = header.slice(7);
-    return !!tokenHost(token) || safeEqual(token, TURMA_AGENT_TOKEN);
+    if (tokenHost(token)) return true;
+    // Under TURMA_AGENT_STRICT the master is not a credential at all, and that
+    // has to hold HERE and not only at the authorization check past it: this
+    // gate stands in front of the 32 MiB read, so leaving the master usable
+    // through it means a leaked master still OOMs the hub on a fleet whose
+    // whole point was that the master had been retired.
+    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
   }
   return userAuthorized(req) && !!TURMA_PASSWORD;
+}
+
+// The heartbeat's pre-body gate as a response. Refusing the master under strict
+// costs the caller the host-named 403 that agentHostRefusal gives every other
+// surface — the host is still unread, in the body behind this gate — so say the
+// same thing without it, rather than dropping an agent mid-rollover onto a bare
+// "unauthorized" it cannot act on (XERK-268).
+function agentPresentedRefusal(req) {
+  if (agentPresented(req)) return null;
+  const token = (req.headers.authorization || "").startsWith("Bearer ")
+    ? req.headers.authorization.slice(7) : "";
+  if (TURMA_AGENT_STRICT && TURMA_AGENT_TOKEN && token && safeEqual(token, TURMA_AGENT_TOKEN)) {
+    return {
+      status: 403,
+      error: "this hub requires each agent's own token (TURMA_AGENT_STRICT is set), not the fleet master",
+    };
+  }
+  return { status: 401, error: "unauthorized" };
 }
 
 // WHAT an agent-authed request proved about which host it is (XERK-268). Every
@@ -3409,7 +3439,8 @@ const server = http.createServer(async (req, res) => {
       // that isn't the master is indistinguishable from some host's derived
       // token until we know which host it claims to be. That keeps the
       // credential-less case refused before the body is read, as it always was.
-      if (!agentPresented(req)) return json(res, 401, { error: "unauthorized" });
+      const gate = agentPresentedRefusal(req);
+      if (gate) return json(res, gate.status, { error: gate.error });
     } else if (isArchiveIngest || isUpdatingSignal || isMigrationBlob || isUploadBlob) {
       // These all carry the host they act as in `<host>`, so the credential is
       // checked AGAINST it rather than merely being a valid agent token. The
@@ -5385,6 +5416,14 @@ if (process.env.TURMA_TEST) {
     agentPresented,
     agentBearerKind,
     agentHostRefusal,
+    agentPresentedRefusal,
+    tokenHost,
+    // The reverse-tunnel maps, exported so their null prototype can be asserted
+    // directly. Reaching it through a socket instead means the regression is
+    // detected by the hub DYING mid-run, which reads as a CI timeout rather
+    // than a failing test (XERK-268).
+    controlChannels,
+    pendingChannels,
     agentWsAuthorized,
     hostAgentToken,
     ttydAuth,

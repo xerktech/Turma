@@ -117,7 +117,8 @@ const {
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
   userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
-  agentBearerKind, agentHostRefusal, hostAgentToken, ttydAuth,
+  agentBearerKind, agentHostRefusal, agentPresentedRefusal, hostAgentToken, tokenHost, ttydAuth,
+  controlChannels, pendingChannels,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
@@ -6345,6 +6346,53 @@ test("XERK-268: a heartbeat's `device` is bound to the credential too", async ()
   assert.ok(real.body.commands.some((c) => c.type === "exportSession" && c.migrationId === mid));
 });
 
+test("XERK-268: only the CANONICAL encoding of a host name authenticates", () => {
+  // tokenHost compares the WHOLE token, not just the HMAC half. Verifying only
+  // the MAC would leave the name half free to re-encode — still the same host,
+  // so not directly exploitable, but it would make a credential have many valid
+  // spellings, and every equality this system rests on assumes it has one.
+  for (const host of ["alpha", "ab", "ÿÿÿ", "a.b"]) {
+    const real = hostAgentToken(host);
+    assert.equal(tokenHost(real), host);
+    const [name, mac] = real.split(".");
+    const variants = [
+      Buffer.from(host).toString("base64") + "." + mac,         // std alphabet + padding
+      name + "=." + mac,                                        // padded
+      name.replace(/-/g, "+").replace(/_/g, "/") + "." + mac,   // +/ instead of -_
+      name.toUpperCase() + "." + mac,
+      "." + name + "." + mac,
+      name + "." + mac.toUpperCase(),
+      name + "." + mac + ".junk",
+      mac,
+      name + ".",
+    ];
+    for (const v of variants) {
+      if (v === real) continue;
+      assert.equal(tokenHost(v), null, `${host}: ${v.slice(0, 24)}… must not authenticate`);
+    }
+  }
+  // Swapping a name onto another host's MAC fails: the MAC is over the name.
+  const [aName] = hostAgentToken("alpha").split(".");
+  const [, vMac] = hostAgentToken("victim").split(".");
+  assert.equal(tokenHost(`${aName}.${vMac}`), null);
+  // A host name that does not survive the UTF-8 round trip gets no token at all,
+  // so two names can never derive one credential.
+  assert.equal(hostAgentToken("\uD800"), "");
+  assert.notEqual(hostAgentToken("�"), "");
+});
+
+test("XERK-268: a malformed <host> segment is refused, not 400'd before auth", async () => {
+  // The gate decodes the segment to check the credential against it, so a bad
+  // percent-escape must not throw there — that turned an anonymous caller's 401
+  // into a 400 that ran before any auth did.
+  for (const seg of ["%", "a%ZZb", "%E0%A4%A"]) {
+    const anon = await requestRaw("GET", `/api/agents/${seg}/uploads/x/blob`);
+    assert.equal(anon.status, 401, `anonymous ${seg}`);
+    const wrong = await requestRaw("GET", `/api/agents/${seg}/uploads/x/blob`, { headers: asHost("someone") });
+    assert.equal(wrong.status, 403, `wrong-host ${seg}`);
+  }
+});
+
 test("XERK-268: TURMA_AGENT_STRICT retires the fleet master", () => {
   const strict = freshServerModule((env) => { env.TURMA_AGENT_STRICT = "1"; });
   const bearer = (t) => ({ headers: { authorization: `Bearer ${t}` } });
@@ -6363,6 +6411,24 @@ test("XERK-268: TURMA_AGENT_STRICT retires the fleet master", () => {
   // Non-strict (the suite's own module) still accepts the master, so a fleet
   // mid-rollover keeps beating.
   assert.equal(agentWsAuthorized(q("agenttok"), { headers: {} }, "hA"), true);
+
+  // Strict must retire the master AT THE HEARTBEAT'S PRE-BODY GATE too, not
+  // only at the authorization check past it: that gate stands in front of a
+  // 32 MiB read, so a master still usable through it means a leaked master
+  // OOMs the hub on a fleet whose whole point was that it had been retired.
+  assert.equal(strict.agentPresented(bearer("agenttok")), false);
+  assert.equal(strict.agentPresented(bearer(strict.hostAgentToken("hA"))), true);
+  // ...and it refuses with the rollover message, host-less because the host is
+  // still unread behind that gate — never a bare "unauthorized" an agent
+  // mid-rollover cannot act on.
+  const gate = strict.agentPresentedRefusal(bearer("agenttok"));
+  assert.equal(gate.status, 403);
+  assert.match(gate.error, /each agent's own token \(TURMA_AGENT_STRICT is set\)/);
+  assert.deepEqual(strict.agentPresentedRefusal(bearer("garbage")),
+    { status: 401, error: "unauthorized" });
+  assert.equal(strict.agentPresentedRefusal(bearer(strict.hostAgentToken("hA"))), null);
+  // Non-strict lets the master through that gate, as a rollover needs.
+  assert.equal(agentPresented(bearer("agenttok")), true);
 });
 
 test("XERK-268: the tunnel control channel can only register its own host", async () => {
@@ -6413,10 +6479,24 @@ test("XERK-268: a data channel can only be answered by the host it was opened fo
   }
 });
 
-test("XERK-268: a `ch` of __proto__ is not a pending channel", async () => {
-  // On a plain object it read back as Object.prototype — truthy, so it sailed
+test("XERK-268: the tunnel maps are null-prototype", () => {
+  // Asserted on the maps THEMSELVES, not through a socket: on a plain object a
+  // `ch` of `__proto__` read back as Object.prototype — truthy, so it sailed
   // past the "is there a pending channel" check and died on `.resolve is not a
-  // function`, out of an async upgrade handler: an instant hub exit.
+  // function`, out of an async upgrade handler. Reaching that through the wire
+  // means the regression is detected by the hub DYING mid-run, which reads as a
+  // CI timeout rather than as a failing test.
+  assert.equal(Object.getPrototypeOf(controlChannels), null);
+  assert.equal(Object.getPrototypeOf(pendingChannels), null);
+  // The property that actually matters: an attacker-supplied key is absent, not
+  // inherited-and-truthy.
+  for (const k of ["__proto__", "constructor", "prototype", "toString", "valueOf"]) {
+    assert.equal(pendingChannels[k], undefined, `pendingChannels[${k}]`);
+    assert.equal(controlChannels[k], undefined, `controlChannels[${k}]`);
+  }
+});
+
+test("XERK-268: a `ch` of __proto__ is not a pending channel", async () => {
   await assert.rejects(
     () => wsConnect("/agent/data?ch=__proto__&token=agenttok", 1500),
     /closed before headers|timed out/
