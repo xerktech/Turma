@@ -6558,21 +6558,71 @@ test("the state.json restore coerces too, not just the ingest path", () => {
 
 test("the restore actually RUNS — it must not throw into its own catch", () => {
   // The restore sits at module init inside `try { … } catch {}`, so anything it
-  // throws is swallowed and the record loads HALF-coerced with no log line and
-  // no error. That is not hypothetical: `sanitizeLiveAgents` reads two module
-  // `const`s that were declared 1700 lines BELOW the restore, i.e. in their
-  // temporal dead zone at that moment — the localModel half was applied, the
-  // session half silently was not, and every suite stayed green.
+  // throws is swallowed: the record loads HALF-coerced, with no log line and no
+  // error anywhere. That is not hypothetical — `sanitizeLiveAgents` read two
+  // module `const`s declared 1700 lines BELOW the restore, i.e. in their
+  // temporal dead zone at that moment, so the localModel half was applied and
+  // the session half silently was not, with every suite green.
   //
-  // Held structurally: every identifier the restore path reaches must be
-  // declared above it.
-  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  const lineOf = (needle) => src.slice(0, src.indexOf(needle)).split("\n").length;
-  const restoreLine = lineOf("for (const a of Object.values(agents)) normalizeRecord(a)");
-  for (const c of ["LIVE_AGENTS_MAX", "LIVE_AGENT_FIELD_MAX"]) {
-    assert.ok(lineOf(`const ${c} =`) < restoreLine,
-      `${c} is declared below the state.json restore, so reading it there throws`);
-  }
+  // Held BEHAVIOURALLY, by loading the real module against a fixture in a child
+  // process. An earlier version asserted the line order of two constants BY
+  // NAME, which a third constant walks straight past — the same enumerate-the-
+  // instances mistake that let the original hole exist.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-"));
+  const state = {
+    h1: {
+      device: "h1", online: true,
+      localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+      limits: { fiveHour: { usedPct: "lots" } },
+      sessions: [
+        null,                                        // decode-fatal element
+        { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"],
+          session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+        "not-a-session",
+      ],
+    },
+  };
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(state));
+  const out = require("child_process").execFileSync(process.execPath, ["-e", `
+    process.env.TURMA_TEST = "1";
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    // Marker-delimited: the loader logs "loaded N agents …" to stdout on the
+    // way past, and that line landing here is itself the proof it ran.
+    process.stdout.write("<<<" + JSON.stringify(hub.agents) + ">>>");
+    process.exit(0);
+  `], {
+    env: { ...process.env, TURMA_TEST: "1", STATE_FILE: path.join(dir, "state.json"),
+           ARCHIVE_DIR: path.join(dir, "a"), ARCHIVE_DB: path.join(dir, "a.db"),
+           NODE_NO_WARNINGS: "1" },
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+  assert.match(out, /loaded 1 agents from/,
+    "the restore did not run — it threw into its own catch");
+  const rec = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>"))).h1;
+  assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null });
+  assert.equal(rec.limits, null);
+  assert.equal(rec.sessions.length, 1, "non-object session elements must be dropped");
+  assert.equal(rec.sessions[0].modelSource, "");
+  assert.equal(rec.sessions[0].modelSourceAt, "");
+  assert.deepEqual(rec.sessions[0].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+});
+
+test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
+  // `[...s]` allocates per code point over the WHOLE string, and this runs
+  // before the AGENT_RECORD_MAX check — so an unbounded spread let one
+  // agent-authed heartbeat with a 24 MiB name OOM-kill the hub at its deployed
+  // `mem_limit: 256m`, on repeat. Held as a time+memory budget rather than by
+  // reading the source, so any rewrite that reintroduces the spread fails.
+  const huge = { device: "h", localModel: { available: true, model: "x".repeat(8 << 20) } };
+  const before = process.memoryUsage().heapUsed;
+  const t0 = process.hrtime.bigint();
+  hub.normalizeRecord(huge);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  const grewMb = (process.memoryUsage().heapUsed - before) / (1 << 20);
+  assert.equal(huge.localModel.model, "x".repeat(60));
+  assert.ok(ms < 50, `coercing an 8 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
+  assert.ok(grewMb < 64, `coercing an 8 MiB name grew the heap ${grewMb.toFixed(0)}MB`);
 });
 
 test("normalizeSessions coerces the per-session fields Android types", () => {

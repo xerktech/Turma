@@ -34,6 +34,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.VerticalDivider
@@ -510,8 +512,18 @@ fun SessionsListPane(
     // New-session picker: pick an online host + repo, then the spawn composer.
     var pickerOpen by remember { mutableStateOf(false) }
     var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
+    // Every action fired from this pane — spawn, kill, rename, resume — used to
+    // be SILENT whatever the hub answered, because nothing collected the VM's
+    // messages here (the Dashboard and the chat both do). That was survivable
+    // while the routes this pane reaches only ever failed on the network; the
+    // "Run against" row below gives it a first-class refusal (409 "host has no
+    // local model configured"), and a refusal you cannot see is worse than no
+    // control at all.
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
 
-    Column(modifier.fillMaxSize()) {
+    Box(modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize()) {
         ScreenHeader("Sessions") {
             IconButton(onClick = { pickerOpen = true }) { Icon(Icons.Filled.Add, "New session") }
         }
@@ -722,6 +734,8 @@ fun SessionsListPane(
                 vm.spawn(host, repo, prompt, label, baseRef, model, mode, source); spawnFor = null
             },
         )
+    }
+    SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(16.dp))
     }
 }
 

@@ -1117,15 +1117,26 @@ function normalizeLocalModel(payload) {
     return;
   }
   // Nothing XML-ILLEGAL may leave here, from either direction — the whole class,
-  // not just the one case that bit us. A lone surrogate and a C0 control are
-  // both unencodable in XML, and both kill Android's `uiautomator dump`
-  // outright (`KXmlSerializer: Illegal character` / a 0-byte file), i.e. the
-  // tool a QA pass drives the app with. Cutting with `slice(60)` through an
-  // astral pair MANUFACTURES a lone surrogate, so the cut is on CODE POINTS and
-  // runs after the strip. Only a rogue agent reaches this — a real one is
-  // bounded by LOCAL_MODEL_NAME_RE — which is this function's whole threat model.
+  // not just the one case that bit us. A lone surrogate, a C0 control and the
+  // noncharacters U+FFFE/U+FFFF are all unencodable in XML, and each kills
+  // Android's `uiautomator dump` outright (`KXmlSerializer: Illegal character`
+  // / a 0-byte file), i.e. the tool a QA pass drives the app with. Cutting with
+  // `slice(60)` through an astral pair MANUFACTURES a lone surrogate, so that
+  // cut is on CODE POINTS and runs after the strip. Only a rogue agent reaches
+  // this — a real one is bounded by LOCAL_MODEL_NAME_RE — which is this
+  // function's whole threat model.
+  //
+  // BOUND FIRST, THEN SPREAD. `[...s]` materialises one array element per code
+  // point over the WHOLE string, and this runs BEFORE the AGENT_RECORD_MAX check
+  // that refuses an oversized beat — so spreading the raw value let a single
+  // agent-authed heartbeat with a 24 MiB name OOM-kill the hub at its deployed
+  // `mem_limit: 256m` (32M chars measured at 288 MB heap), which
+  // `restart: unless-stopped` turns into an outage loop of the fleet's whole
+  // control plane. 512 UTF-16 units is far more than the 60 code points that
+  // survive, and cutting there can only split an astral pair — which the
+  // surrogate replace immediately below then handles.
   const name = typeof lm.model === "string"
-    ? [...lm.model
+    ? [...lm.model.slice(0, 512)
         .replace(/\p{Surrogate}/gu, "�")     // unpaired halves -> replacement
         .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]/g, "")  // XML-illegal
         .trim()]
@@ -1834,9 +1845,20 @@ function normalizeRecord(a) {
 // which is why `modelSource`/`modelSourceAt` are here from the commit that
 // declared them on `SessionInfo`.
 function normalizeSessions(payload) {
+  // A non-array `sessions` is left ALONE, deliberately. It is decode-fatal on
+  // Android, but rewriting it here would erase the amplifier that
+  // AGENT_RECORD_MAX exists to refuse — this runs before that check, so a
+  // `sessions` of 8 MiB of "A" would be quietly turned into `[]` and the beat
+  // would 200 instead of 413 (XERK-235's guard, caught by "an oversized record
+  // is refused"). Coercions here may only ever SHRINK a record.
   if (!Array.isArray(payload?.sessions)) return;
+  // DROP a non-object element, never skip past it: `sessions` is typed
+  // `List<SessionInfo>` on Android, so a `null` or a bare string in the array is
+  // as fatal as a wrong-typed field inside one — measured as a host silently
+  // missing from the phone while the tile still counted it.
+  const bad = payload.sessions.some((s) => !s || typeof s !== "object");
+  if (bad) payload.sessions = payload.sessions.filter((s) => s && typeof s === "object");
   for (const s of payload.sessions) {
-    if (!s || typeof s !== "object") continue;
     // Live agent rows come from a pane scrape: re-shaped and bounded for the
     // same reason the `turn` frame's are — clients turn this into a count and
     // a label, and nothing else bounds it.

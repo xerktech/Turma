@@ -334,7 +334,29 @@ adb -s <device> install -r app/build/outputs/apk/debug/app-debug.apk
 
 `--rerun` is not optional for a mutation test: without it Gradle says
 `UP-TO-DATE`, nothing executes, and **every mutation reads as caught**. Same
-trap as the container's `FROM-CACHE`, different wording.
+trap as the container's `FROM-CACHE`, different wording. (`assembleDebug` on its
+own is safe to trust: Gradle hashes CONTENT, so a mutated-then-reverted file
+reports `UP-TO-DATE` correctly even though its mtime moved.)
+
+**Run a throwaway probe test without editing the repo** — an init script can add
+a scratch source dir, which is how you measure "is this wire shape actually
+decode-fatal?" against the app's own `TurmaJson` and data classes:
+
+```bash
+cat > /tmp/qa-init.gradle <<'EOF'
+gradle.projectsEvaluated { gradle.rootProject.allprojects.each { p ->
+  if (p.plugins.hasPlugin('com.android.application'))
+    p.android.sourceSets.getByName('test').java.srcDir('/tmp/qa-kt') } }
+EOF
+gradle --no-daemon --init-script /tmp/qa-init.gradle \
+  :app:testDebugUnitTest --tests "qa.MyProbeTest" -i | grep PROBE
+```
+
+Measured that way: `coerceInputValues` saves a `null` and a wrong-typed
+PRIMITIVE (`modelSource: 5` and `: true` decode fine, `device: 5` too), but an
+object or an array where a `String`/`Boolean`/`Int` is declared always throws,
+as does any non-object element of a typed `List<…>`. So "it is typed" is not the
+test — "an object or array can land there" is.
 
 **Stand up your own AVD.** The shared `turma228` is used by other sessions whose
 apps steal the foreground every 30–60s and which have force-stopped
@@ -375,10 +397,11 @@ started `-read-only`, which is why you cannot simply reuse the shared one.
   **lone surrogates**, **C0/DEL controls**, and **U+FFFE/U+FFFF** (the two
   noncharacters XML 1.0 also excludes). Everything else survives — `U+FDD0` and
   `U+1FFFE` dump fine, so do not blame "noncharacters" generally.
-  `normalizeLocalModel` closes the first two for `localModel.model` in both
-  directions (manufactured by its 60-code-point cut, and arriving in a rogue
-  agent's input) and **misses the third**; every other agent-supplied string
-  reaching the UI is unguarded entirely. Screenshot instead when a dump goes
+  `normalizeLocalModel` closes ALL THREE for `localModel.model`, in both
+  directions (manufactured by its own 60-code-point cut, and arriving in a rogue
+  agent's input); every other agent-supplied string reaching the UI is unguarded
+  entirely, so re-probe per field rather than assuming the guard travels.
+  Screenshot instead when a dump goes
   empty for no reason, suspect the payload before the tooling, and always run
   the same screen with a benign name as the control before filing.
 - **`ChatViewModel` is scoped to the chat's nav back-stack entry**, so all of its
@@ -406,9 +429,13 @@ and point the app at `http://10.0.2.2:<port>`.
 - A host the app has decoded once stays in its `byKey` map, so **re-probing a
   malformed payload under a name the app has already seen hides the failure** —
   use a fresh host name for every decode probe.
-- Kill the rig by PID, not `pkill -f`: the pattern matches your own shell's
-  command line, so `pkill` kills the caller (exit 144) before the next command
-  in the chain runs, and you carry on against a rig you think you restarted.
+- Kill the rig by PID, not `pkill -f`, and not by grepping `/proc/*/cmdline`
+  either: BOTH match your own shell, whose command line quotes the pattern you
+  are searching for. `pkill` kills the caller (exit 144); the `/proc` version
+  kills it too, and the replacement rig then dies on `EADDRINUSE` while the OLD
+  one keeps serving — so the whole A/B runs against the unmutated code and reads
+  as "no difference". Match `argv[0] == "node"`, skip your own PID's ancestry
+  (`scratchpad/qa8/killrig.py`), and assert the port is free before restarting.
 - **Refuse `/api/events` at the proxy to see what a decode failure really
   costs.** With SSE healthy a bad host loses only itself (per-agent events
   decode in `runCatching`); poll-only, the whole fleet is replaced by the raw
@@ -690,17 +717,21 @@ act on every time.
   `now = at + SETTLE_MS + 1` bounds the constant from below only: raising it to
   16.7 hours keeps the test green, which is the exact failure the constant
   exists to prevent. Assert one side with a literal.
-- **Which heartbeat fields are actually coerced at ingest.** FOUR things, not
-  three: `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`, and
-  `sanitizeHeartbeat`'s `sanitizeLiveAgents`, which reshapes
-  `sessions[].session.agents` to `{sel:Boolean, type:String, label:String}` —
-  load-bearing, since Android types those too (`type:{}` raw throws at
-  `$.agents[N].sessions[0].session.agents[0].type`). Everything else is raw:
-  every other host-level block Android types (`capacity`, `github`, `models`,
-  `jira`, `claudeAuth`, `closedSessions`, …) and every other per-session field
-  (`prs`, `modelSource`, …), where an object or array throws for the WHOLE
-  `/api/agents` array. Verify by probing, not by reading the doc — this count
-  has been wrong in `CLAUDE.md` more than once. Two-line repro in §6.2.
+- **Which heartbeat fields are actually coerced.** Read `normalizeRecord` — it is
+  the one list, and both the ingest and the `state.json` restore call it. Today:
+  `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`, `normalizeSessions`
+  (which reshapes `sessions[].session.agents` via `sanitizeLiveAgents`, and
+  coerces `modelSource`/`modelSourceAt`). Everything else is raw: every other
+  host-level block Android types (`capacity`, `github`, `models`, `jira`,
+  `claudeAuth`, `closedSessions`, …) and every other per-session field (`prs`,
+  `id`, …), where an object or array throws for the WHOLE `/api/agents` array.
+  `normalizeSessions` DROPS a non-object element (`sessions:[null]` used to hide
+  that host from the phone, and the whole SCREEN with SSE also down), but a
+  non-array `sessions` is deliberately left alone: this runs BEFORE the
+  `AGENT_RECORD_MAX` check, so rewriting it would erase the amplifier that check
+  exists to refuse. **A coercion here may only ever SHRINK a record** — that is
+  the rule to hold a new one against. Verify by probing, not by reading any doc:
+  this list has been wrong in `CLAUDE.md` and here more than once.
 - **Check the state.json RESTORE, not just the ingest path**, and check it
   against the LIST above rather than against what the loader looks like it does.
   A hub restart is when a new coercion ships and the restore is the first thing
@@ -716,6 +747,34 @@ act on every time.
   what the raw record costs it.
   A `normalize*` is also a WHITELIST: a sub-key a newer agent adds is dropped
   fleet-wide with nothing failing.
+- **The restore runs inside `try { … } catch {}`, so ANY throw in it is silent** —
+  the record loads half-coerced, no log line, every suite green. `console.log`
+  the `loaded N agents from …` line is the only tell; its ABSENCE with a
+  non-empty state file means the loop threw. Two things cause it: a module
+  `const` the restore path reads that is declared BELOW the restore (temporal
+  dead zone at module init — function declarations hoist, `const`s do not), and
+  a shape the coercions don't guard. Check the first mechanically rather than by
+  eye: BFS the call graph from `normalizeRecord`, collect the top-level
+  `const`/`let` each reached function references, and flag any declared after the
+  loader (`scratchpad/qa8/tdz_scan.py`). A line-order assert naming two constants
+  by hand does not see the third.
+- **The hub's deployed memory ceiling is `mem_limit: 256m`** (DockerOps
+  `compose/turma.yaml`), so ANY per-request allocation over ~200 MB is a
+  one-request kill of the whole fleet's control plane, not a slow page.
+  `HEARTBEAT_MAX` is 32 MiB and `AGENT_RECORD_MAX` (8 MiB) is checked AFTER
+  `normalizeRecord`, so a coercion that expands an agent-controlled string before
+  bounding it — `[...s]` spreads to one array element per code point — routes
+  straight around that guard. **Bound with `slice()` BEFORE any spread/split/
+  match over an agent string.** Reproduce at the deployed shape rather than
+  arguing about it:
+  ```bash
+  docker run -d --name qa-hub -m 256m --memory-swap 256m -p 127.0.0.1:8993:8993 \
+    -e PORT=8993 -e TURMA_USER=qa -e TURMA_PASSWORD=qa-pass -e TURMA_AGENT_TOKEN=t \
+    -e STATE_FILE=/tmp/state.json -e ARCHIVE_DIR=/tmp/a -e ARCHIVE_DB=/tmp/a.db \
+    -v "$PWD/turma:/app:ro" -w /app node:24-bookworm-slim node server.js
+  # then POST one beat with a ~24 MiB string in the field under test and read
+  docker inspect -f '{{.State.Status}} {{.State.OOMKilled}}' qa-hub
+  ```
 
 Mutation-testing mechanics, since a broken harness reads as a passing one:
 
@@ -734,8 +793,12 @@ Mutation-testing mechanics, since a broken harness reads as a passing one:
   A pure `core/` rule with a test is gated; the CALL to it is not, and neither is
   which value a Composable passes it. Judge an Android change on where its rule
   lives, and quote the survivor count rather than "a few".
-- The same battery over `turma/server.js` left **0 of 12** alive, so a hub-side
-  rule genuinely is gated — the asymmetry is the Android gap, not the method.
+- A hub-side rule genuinely is gated by comparison, but not completely: 24
+  mutations over `turma/server.js`'s coercion path left **3** alive — an
+  `Array.isArray` guard nothing feeds a non-array to, a NEW late-declared `const`
+  on the restore path (the TDZ class again, which the hand-written line-order
+  assert cannot see), and the restore body simply throwing. The asymmetry with
+  Android is real; "0 escapes" usually means the battery was too small.
 - `gradle --no-daemon --offline :app:testDebugUnitTest --rerun` is ~13s per
   mutation once the first compile is warm, so a 50-mutation battery is ~12
   minutes; run it in the background and do UI work meanwhile (the emulator does
