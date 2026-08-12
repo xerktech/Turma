@@ -6455,3 +6455,793 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
 });
 
+test("normalizeLocalModel coerces the block so one host cannot hide the fleet", () => {
+  // Android decodes /api/agents ATOMICALLY into typed fields, so a wrong-typed
+  // localModel from ONE host throws for the whole array and every other host
+  // silently disappears from that phone. Same contract, and same reason, as
+  // normalizeLimits beside it.
+  const norm = (localModel) => {
+    const p = { device: "h", localModel };
+    hub.normalizeLocalModel(p);
+    return p.localModel;
+  };
+
+  // A good block passes through unchanged.
+  assert.deepEqual(
+    norm({ available: true, model: "gpt-oss:120b", contextTokens: 81920 }),
+    { available: true, model: "gpt-oss:120b", contextTokens: 81920 },
+  );
+
+  // `available` is STRICTLY boolean: a truthy string would offer the switch on
+  // a host that cannot do it, and the command would be acked and dropped.
+  assert.deepEqual(norm({ available: "yes", model: "x" }),
+    { available: false, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: 1 }),
+    { available: false, model: null, contextTokens: null });
+
+  // A non-string model and an out-of-Int contextTokens degrade to null rather
+  // than failing the decode. contextTokens is unused by the UI, so this is free.
+  assert.deepEqual(norm({ available: true, model: 12345, contextTokens: 9999999999 }),
+    { available: true, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: true, model: "m", contextTokens: 1.5 }),
+    { available: true, model: "m", contextTokens: null });
+
+  // The name is BOUNDED, and cut on code points. A UTF-16 `slice` through an
+  // astral pair emits a lone surrogate — unencodable, and it kills Android's
+  // uiautomator outright. Nothing else pins this length.
+  const long = norm({ available: true, model: "x".repeat(500) });
+  assert.equal(long.model.length, 60);
+  const astral = norm({ available: true, model: "x".repeat(59) + "😀" + "tail" });
+  assert.equal([...astral.model].length, 60);
+  assert.ok(astral.model.isWellFormed(), "the cut manufactured a lone surrogate");
+  // ...and one that ARRIVES that way is replaced, not passed through. Either
+  // direction kills uiautomator, so the guarantee has to cover both.
+  for (const evil of ["qwen\uD83Dcoder", "abc\uDE00def", "x".repeat(59) + "\uD83Dtail"]) {
+    assert.ok(norm({ available: true, model: evil }).model.isWellFormed(),
+      `a lone surrogate survived: ${JSON.stringify(evil)}`);
+  }
+  // The guarantee is the whole XML-ILLEGAL class, not just surrogates: a C0
+  // control and the noncharacters U+FFFE/U+FFFF each kill `uiautomator dump`
+  // the same way (a 0-byte file), and closing only the case that bit us leaves
+  // the next one to be rediscovered — which is how the second and third of
+  // these were found, one pass apart.
+  const ctl = norm({ available: true, model: "qwen\x01ctl\x00nul\x0bvt\x7fdel" });
+  assert.equal(ctl.model, "qwenctlnulvtdel");
+  assert.equal(norm({ available: true, model: "qwen\uffffbad\ufffemore" }).model, "qwenbadmore");
+  // ...but U+FDD0 and U+1FFFE are LEGAL XML and must survive: over-stripping
+  // would mangle a name for no reason.
+  assert.equal(norm({ available: true, model: "a\ufdd0b\u{1FFFE}c" }).model, "a\ufdd0b\u{1FFFE}c");
+  // Tab/newline/CR are legal XML and are only trimmed at the edges.
+  assert.equal(norm({ available: true, model: "  a\tb  " }).model, "a\tb");
+
+  // Not an object at all -> null, which every client reads as "cannot fail over".
+  assert.equal(norm("yes"), null);
+  assert.equal(norm([1, 2]), null);
+  assert.equal(norm(null), null);
+
+  // An agent predating the failover sends nothing; the key must stay absent
+  // rather than become an explicit null, so the payload is byte-identical.
+  const old = { device: "h" };
+  hub.normalizeLocalModel(old);
+  assert.ok(!("localModel" in old));
+});
+
+test("the state.json restore coerces too, not just the ingest path", () => {
+  // A hub restart is exactly when a new coercion ships, and the restore is the
+  // FIRST thing it serves. A record written before it — or belonging to an
+  // OFFLINE host, where no beat will ever rewrite it — would otherwise reach
+  // the phone raw and throw for the whole fleet. Held here rather than by
+  // booting a second hub: the loader is a bare `for` over the parsed blob, so
+  // what matters is that all three coercions are applied to a loaded record.
+  const restored = {
+    device: "old",
+    localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+    limits: { fiveHour: { usedPct: "lots" } },
+  };
+  hub.normalizeLocalModel(restored);
+  assert.deepEqual(restored.localModel,
+    { available: false, model: null, contextTokens: null });
+
+  // The durable form of "the restore can't fall behind the ingest": both go
+  // through ONE function, so there is no list here to keep in step. A previous
+  // version of this test named three coercions and therefore could not notice
+  // the fourth (`sanitizeLiveAgents`) missing from the restore — enumerating is
+  // exactly the shape that let the hole exist.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const loader = src.slice(src.indexOf("agents = JSON.parse"), src.indexOf("first boot or no volume"));
+  assert.ok(/normalizeRecord\(a\)/.test(loader),
+    "the state.json restore must go through normalizeRecord, like the ingest path");
+  const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
+    src.indexOf("ingestHistory(next, historyResults)"));
+  assert.ok(/normalizeRecord\(next\)/.test(ingest),
+    "the heartbeat ingest must go through the same normalizeRecord");
+  // ...and BETWEEN the two size measurements. Before the raw check it could
+  // shrink away the amplifier the ceiling exists to refuse (an 8 MiB string
+  // `sessions` became `[]` and the beat 200'd); after the coerced check, an
+  // EXPANDING coercion escapes the ceiling entirely (normalizeModelUsage is
+  // ~3.5x, and an 8 MiB beat parked 28 MiB per host for a week).
+  const iRaw = ingest.indexOf("rawSize > AGENT_RECORD_MAX");
+  const iCoerce = ingest.indexOf("normalizeRecord(next)");
+  const iStored = ingest.indexOf("recordSize > AGENT_RECORD_MAX");
+  assert.ok(iRaw > -1 && iCoerce > iRaw && iStored > iCoerce,
+    "the ingest must measure raw size, THEN coerce, THEN measure the stored size");
+});
+
+test("the restore actually RUNS — it must not throw into its own catch", () => {
+  // The restore sits at module init inside `try { … } catch {}`, so anything it
+  // throws is swallowed: the record loads HALF-coerced, with no log line and no
+  // error anywhere. That is not hypothetical — `sanitizeLiveAgents` read two
+  // module `const`s declared 1700 lines BELOW the restore, i.e. in their
+  // temporal dead zone at that moment, so the localModel half was applied and
+  // the session half silently was not, with every suite green.
+  //
+  // Held BEHAVIOURALLY, by loading the real module against a fixture in a child
+  // process. An earlier version asserted the line order of two constants BY
+  // NAME, which a third constant walks straight past — the same enumerate-the-
+  // instances mistake that let the original hole exist.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-"));
+  const state = {
+    h1: {
+      device: "h1", online: true,
+      localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+      limits: { fiveHour: { usedPct: "lots" } },
+      sessions: [
+        null,                                        // decode-fatal element
+        { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"],
+          session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+        "not-a-session",
+      ],
+    },
+  };
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(state));
+  const out = require("child_process").execFileSync(process.execPath, ["-e", `
+    process.env.TURMA_TEST = "1";
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    // Marker-delimited: the loader logs "loaded N agents …" to stdout on the
+    // way past, and that line landing here is itself the proof it ran.
+    process.stdout.write("<<<" + JSON.stringify(hub.agents) + ">>>");
+    process.exit(0);
+  `], {
+    env: { ...process.env, TURMA_TEST: "1", STATE_FILE: path.join(dir, "state.json"),
+           ARCHIVE_DIR: path.join(dir, "a"), ARCHIVE_DB: path.join(dir, "a.db"),
+           NODE_NO_WARNINGS: "1" },
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+  assert.match(out, /loaded 1 agents from/,
+    "the restore did not run — it threw into its own catch");
+  const rec = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>"))).h1;
+  assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null });
+  assert.equal(rec.limits, null);
+  assert.equal(rec.sessions.length, 1, "non-object session elements must be dropped");
+  assert.equal(rec.sessions[0].modelSource, "");
+  assert.equal(rec.sessions[0].modelSourceAt, "");
+  assert.deepEqual(rec.sessions[0].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+});
+
+test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
+  // `[...s]` allocates per code point over the WHOLE string, so an unbounded
+  // spread let one agent-authed heartbeat with a 24 MiB name OOM-kill the hub
+  // at its deployed `mem_limit: 256m`, on repeat.
+  //
+  // Two assertions, because neither is sufficient alone. A RESOURCE BUDGET is
+  // the honest behavioural check but is nondeterministic at close margins — an
+  // earlier version used 8 MiB against 50ms/64MB and caught the reintroduced
+  // bug only 5 runs in 8, decided by whether a GC landed between the samples.
+  // So the budget runs at 32 MiB (`HEARTBEAT_MAX`, the largest a beat can carry)
+  // with ~10x headroom, and a STRUCTURAL assertion holds the ordering exactly.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const spread = src.slice(src.indexOf("const name = typeof lm.model"), src.indexOf(".slice(0, 60)"));
+  assert.match(spread, /\[\.\.\.lm\.model\.slice\(/,
+    "the model name must be bounded BEFORE the per-code-point spread");
+
+  const huge = { device: "h", localModel: { available: true, model: "x".repeat(32 << 20) } };
+  const t0 = process.hrtime.bigint();
+  hub.normalizeRecord(huge);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.equal(huge.localModel.model, "x".repeat(60));
+  // Bounded: ~0.1ms. Unbounded at this size: several hundred ms and ~600 MB.
+  assert.ok(ms < 60, `coercing a 32 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
+});
+
+test("http: an EXPANDING coercion cannot escape the record ceiling", async () => {
+  // normalizeModelUsage rewrites `"m"` to `{model:"m"}` — ~3.5x. Measuring only
+  // the raw size let an 8 MiB beat of bare model names park 28 MiB per host for
+  // a week, in state.json, in every /api/agents response and every SSE frame:
+  // exactly the amplification the ceiling was added to stop.
+  const host = "fat-expand";
+  const models = new Array(2_000_000).fill("m");
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [], usage: { models } },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(agents[host], undefined, "a refused beat must not install a record");
+});
+
+test("http: a beat whose coercion throws is refused, never installed raw", async () => {
+  // The coercion runs AFTER `agents[key] = next`, so a throw inside it would
+  // leave the RAW record installed — worse than refusing, because every gate
+  // downstream then reads uncoerced values (`localModelAvailable` treats the
+  // string "yes" as true and hands out a switch the host cannot honour), and
+  // the poison reaches state.json where the restore chokes on it forever.
+  const host = "throw-host";
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    // A non-iterable `repoUsage` used to throw out of normalizeUsage's `for…of`.
+    body: { device: host, sessions: [], repoUsage: { a: 1 },
+            localModel: { available: "yes" } },
+  });
+  // Either it coerces cleanly (the guards below) or it is refused — never both
+  // 4xx AND installed.
+  if (res.status !== 200) {
+    assert.equal(agents[host], undefined, "a refused beat must not install a record");
+  } else {
+    // Accepted means fully coerced — never accepted-and-raw, which is the state
+    // that defeats every gate downstream and poisons state.json.
+    assert.equal(agents[host].localModel.available, false, "served uncoerced");
+    assert.deepEqual(agents[host].repoUsage, [], "a non-array repoUsage must not be served");
+  }
+  // And the capability gate must not be fooled by the raw string either way.
+  const spawn = await request("POST", `/api/agents/${host}/sessions`, {
+    headers: userHeaders, body: { repo: "Turma", modelSource: "local" },
+  });
+  assert.equal(spawn.status, 409, "an uncoerced `available` must not pass the gate");
+});
+
+test("normalizeUsage survives a non-iterable repoUsage or sessions", () => {
+  // A bare `for (… of payload.repoUsage || [])` throws on an object, and on the
+  // restore path that throw aborts EVERY host after this one, silently.
+  for (const bad of [{ a: 1 }, "str", 7, true]) {
+    const p = { device: "h", repoUsage: bad, sessions: bad, usage: { models: ["m"] } };
+    hub.normalizeRecord(p);             // must not throw
+    // BOTH are typed lists on Android, so both are rewritten — not merely
+    // stepped around. Guarding the loop alone turned a 400 (which never
+    // installed the host) into a 200 serving a fleet-killing shape.
+    assert.deepEqual(p.sessions, []);
+    assert.deepEqual(p.repoUsage, []);
+  }
+});
+
+test("normalizeSessions coerces the per-session fields Android types", () => {
+  // Typing a field on `SessionInfo` is what makes it decode-fatal: before that
+  // `ignoreUnknownKeys` skipped it and any value was harmless. `modelSource`
+  // and `modelSourceAt` were typed by XERK-246, so they are coerced from it.
+  const payload = {
+    device: "h",
+    sessions: [
+      { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"] },
+      { id: "s2", modelSource: "local", modelSourceAt: "2026-08-11T00:00:00Z" },
+      { id: "s3", session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+      // `session` itself, not just its `agents`. `"agents" in []` is false, so
+      // a bare `typeof live === "object"` guard neither coerces nor rejects an
+      // ARRAY here and serves it raw — `LiveSignals?` is typed on Android, so
+      // that is decode-fatal for the whole payload and blocks sign-in.
+      { id: "s5", session: [] },
+      { id: "s6", session: [1, 2] },
+      { id: "s7", session: "busy" },
+      { id: "s8", session: 7 },
+      // Every non-object shape, not a representative one. An ARRAY element is
+      // the case a `typeof s !== "object"` predicate misses (`typeof [] ===
+      // "object"`), and it is decode-fatal exactly like the other two: measured
+      // as the Android app unable to SIGN IN, because the login probe decodes
+      // /api/agents and reads the throw as "Could not reach the hub".
+      null,
+      "nope",
+      [1, 2],
+      [],
+    ],
+  };
+  hub.normalizeRecord(payload);
+  assert.equal(payload.sessions.length, 7, "every non-object ELEMENT is dropped");
+  assert.deepEqual(payload.sessions.map((s) => s.id),
+    ["s1", "s2", "s3", "s5", "s6", "s7", "s8"]);
+  // ...and every non-object `session` is REWRITTEN to null, not left raw.
+  for (const id of ["s5", "s6", "s7", "s8"]) {
+    assert.equal(payload.sessions.find((s) => s.id === id).session, null, `${id}.session`);
+  }
+  // A session that never carried `session` must not gain the key.
+  assert.equal("session" in payload.sessions.find((s) => s.id === "s1"), false);
+  assert.equal(payload.sessions[0].modelSource, "");
+  assert.equal(payload.sessions[0].modelSourceAt, "");
+  assert.equal(payload.sessions[1].modelSource, "local");        // good values untouched
+  assert.equal(payload.sessions[1].modelSourceAt, "2026-08-11T00:00:00Z");
+  assert.deepEqual(payload.sessions[2].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+  // A session that never carried the keys must not gain them — an older agent's
+  // payload has to stay byte-identical.
+  hub.normalizeRecord({ device: "h", sessions: [{ id: "s4" }] });
+});
+
+// ---- the wire-shape sweep (XERK-259) ---------------------------------------
+// `/api/agents` decodes ATOMICALLY on Android, so any one of these shapes hides
+// the WHOLE fleet from the phone — measured as the app refusing to sign in at
+// all ("Could not reach the hub — check the URL"), because the login probe
+// decodes that payload.
+
+test("repoUsage ELEMENTS are coerced, not just the field's type (XERK-259)", () => {
+  // The four shapes the QA pass drove through a real heartbeat. Coercing the
+  // field to `[]` when it isn't an array, and then serving `[null]` unchanged,
+  // fixes the shape nobody sends and keeps the one that breaks the phone.
+  const p = {
+    device: "h",
+    repoUsage: [null, "nope", [1], { repo: { a: 1 } },
+                { repo: "good", remoteKey: "gh:o/r" }],
+  };
+  hub.normalizeRecord(p);
+  // Non-objects DROPPED (a null element is fatal even though a null FIELD is
+  // fine — `coerceInputValues` reaches the field's default, not the element).
+  // `[1]` is the case a `typeof el !== "object"` test lets through.
+  assert.deepEqual(p.repoUsage, [{ repo: "" }, { repo: "good", remoteKey: "gh:o/r" }]);
+});
+
+test("http: repoUsage:[null] no longer hides the fleet from the phone", async () => {
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: "ru-null", sessions: [], repoUsage: [null] },
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "ru-null");
+  assert.deepEqual(host.repoUsage, [], "the fatal element must not be served");
+  assert.ok(res.body.agents.length > 1, "and the rest of the fleet is still there");
+});
+
+test("the shape sweep drops a bad list element in EVERY typed list, not just sessions", () => {
+  // One field at a time is how this bug got filed twice. Everything a client
+  // types as a list is swept the same way, and `[]` (whose `typeof` is
+  // "object") is the element shape a careless predicate serves raw.
+  const p = {
+    device: "h",
+    repos: [[], { name: "r", resumable: [null, { transcriptId: "t" }] }],
+    closedSessions: ["x", { id: "c1", prs: [[], { url: "u", number: 3 }] }],
+    sessions: [[1, 2], { id: "s1", prs: [null] }],
+    clones: [null, { repo: "o/r" }],
+    gitSources: [7, { source: "azure", repos: ["nope", { name: "r" }] }],
+    jira: { tickets: [null, { key: "X-1", labels: [null, "ok", { a: 1 }] }],
+            repoOptions: [[], { name: "r" }] },
+    github: { repos: [null, { name: "r" }] },
+    models: { available: [null, "sonnet", { a: 1 }] },
+  };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.repos, [{ name: "r", resumable: [{ transcriptId: "t" }] }]);
+  assert.deepEqual(p.closedSessions, [{ id: "c1", prs: [{ url: "u", number: 3 }] }]);
+  assert.deepEqual(p.sessions, [{ id: "s1", prs: [] }]);
+  assert.deepEqual(p.clones, [{ repo: "o/r" }]);
+  assert.deepEqual(p.gitSources, [{ source: "azure", repos: [{ name: "r" }] }]);
+  assert.deepEqual(p.jira.tickets, [{ key: "X-1", labels: ["ok"] }]);
+  assert.deepEqual(p.jira.repoOptions, [{ name: "r" }]);
+  assert.deepEqual(p.github.repos, [{ name: "r" }]);
+  assert.deepEqual(p.models.available, ["sonnet"]);
+});
+
+test("a wrong-typed field becomes its client's can't-tell value, never a plausible one", () => {
+  const p = {
+    device: { a: 1 },                       // String <- object: decode-fatal
+    agentVersion: ["1.2"],                  // String <- array: decode-fatal
+    uploadMaxBytes: 1.5,                    // Long cannot take a fractional literal
+    capacity: { maxSessions: 99999999999999, running: "3", free: 2 }, // Int is 32-bit
+    github: "nope",                         // object <- string
+    claudeAuth: { present: "yes", refreshExpiresAt: "soon" },
+    sessions: [{
+      id: "s1", ttydPort: 2.5, restartCount: -1,
+      work: { pushed: "maybe", aheadOfBase: 9e99, baseRef: { a: 1 } },
+      session: { paneBusy: "busy", transcriptAgeSec: "3", questionIndex: 1.5 },
+      ticket: { key: "X-1", branch: ["b"] },
+    }],
+  };
+  hub.normalizeRecord(p);
+  assert.equal(p.device, "");
+  assert.equal(p.agentVersion, "");
+  assert.equal(p.uploadMaxBytes, 0);
+  assert.deepEqual(p.capacity, { maxSessions: 0, running: 0, free: 2 });
+  assert.equal(p.github, null);
+  assert.deepEqual(p.claudeAuth, { present: false, refreshExpiresAt: null });
+  const s = p.sessions[0];
+  assert.equal(s.ttydPort, 0);
+  assert.equal(s.restartCount, -1, "a legitimate value is untouched");
+  // A NULLABLE field coerces to null, not to a zero — `pushed: false` would read
+  // as "this branch is definitely not pushed" and `aheadOfBase: 0` as "nothing
+  // to lose", which is the opposite of what the work-risk line is for.
+  assert.deepEqual(s.work, { pushed: null, aheadOfBase: null, baseRef: null });
+  assert.deepEqual(s.session, { paneBusy: null, transcriptAgeSec: null,
+                                questionIndex: null });   // no `agents` key invented
+  assert.deepEqual(s.ticket, { key: "X-1", branch: null });
+});
+
+test("a map VALUE that would throw is dropped, unlike a field's", () => {
+  // `usage.days` is a Map<String, UsageBucket>: `coerceInputValues` does not
+  // reach map values, so a null there is fatal where a null FIELD is not.
+  const p = { device: "h", usage: { days: { a: null, b: "x", c: [1],
+                                            "2026-08-12": { input: 5 } } } };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.usage.days, { "2026-08-12": { input: 5 } });
+  // ...and a non-object `days` becomes the empty map, not an array.
+  const q = { device: "h", usage: { days: [1, 2] } };
+  hub.normalizeRecord(q);
+  assert.deepEqual(q.usage.days, {});
+});
+
+test("a transcript block whose `t` is not a string decodes as unknown, not as a throw", () => {
+  // Blocks are polymorphic on `t`. An unknown NAME falls back to UnknownBlock,
+  // but a non-string discriminator throws out of the decoder, so it is coerced
+  // to "" — which lands on that same fallback.
+  const p = { device: "h", sessions: [{ id: "s1", session: { tail: [
+    null,
+    { id: "e1", blocks: [null, "x", { t: { a: 1 } }, { t: "text", text: { a: 1 } },
+                         { t: "tool_use", input: { any: ["shape", 1, null] } }] },
+  ] } }] };
+  hub.normalizeRecord(p);
+  const tail = p.sessions[0].session.tail;
+  assert.equal(tail.length, 1, "a null tail entry is fatal too");
+  assert.deepEqual(tail[0].blocks, [
+    { t: "" }, { t: "text", text: "" },
+    // A tool_use block's `input` is typed JsonElement? — any shape is legal, so
+    // it must survive verbatim.
+    { t: "tool_use", input: { any: ["shape", 1, null] } },
+  ]);
+});
+
+test("the sweep is not a whitelist: untyped keys ride through untouched", () => {
+  // Rebuilding these objects instead of coercing them in place would drop every
+  // sub-key a newer agent adds, fleet-wide, until this table caught up — the
+  // failure mode that makes a whitelist worse than the hole it closes.
+  const p = {
+    device: "h", futureField: { deep: [1, { x: null }] },
+    sessions: [{ id: "s1", futureSessionField: { a: [null] } }],
+    jira: { tickets: [{ key: "X-1", futureTicketField: ["anything"] }] },
+  };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.futureField, { deep: [1, { x: null }] });
+  assert.deepEqual(p.sessions[0].futureSessionField, { a: [null] });
+  assert.deepEqual(p.jira.tickets[0].futureTicketField, ["anything"]);
+});
+
+test("an older agent's payload comes out byte-identical", () => {
+  // The sweep must never ADD a key: a field the record does not carry means
+  // "this agent can't tell you", and inventing "" or 0 for it turns that into a
+  // measurement. Nulls are left alone for the same reason — every client already
+  // reads one as its default.
+  const before = JSON.stringify({
+    device: "old", agentVersion: "0.1", repoUsage: [{ repo: "r" }],
+    sessions: [{ id: "s1", session: { paneBusy: null }, usage: null }],
+    jira: { tickets: [{ key: "X-1", dueDate: null }] },
+  });
+  const p = JSON.parse(before);
+  hub.normalizeRecord(p);
+  assert.equal(JSON.stringify(p), before);
+});
+
+test("the sweep runs AFTER normalizeModelUsage, so a legacy model list survives", () => {
+  // Old agents report `usage.models` as bare model-name STRINGS, which
+  // normalizeModelUsage rewrites into objects. Sweeping first would drop them as
+  // non-objects and silently zero that host's usage page.
+  const p = { device: "h", usage: { models: ["sonnet", "opus"] },
+              repoUsage: [{ repo: "r", usage: { models: ["haiku"] } }] };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.usage.models, [{ model: "sonnet" }, { model: "opus" }]);
+  assert.deepEqual(p.repoUsage[0].usage.models, [{ model: "haiku" }]);
+});
+
+test("limits' two epoch fields are INTEGER-bounded, not merely finite", () => {
+  // `resetsAt`/`capturedAt` are `Long` on Android and a Long cannot take a
+  // fractional literal, so `Number.isFinite` was never the right gate: a
+  // `resetsAt: 1.5` from one host passed it, was served raw, and threw for the
+  // whole fleet payload — the exact failure normalizeLimits exists to prevent,
+  // inside normalizeLimits. `usedPct` is a Double and stays loosely checked.
+  const p = { device: "h", limits: { fiveHour: { usedPct: 50.5, resetsAt: 1.5 },
+                                     sevenDay: { usedPct: 10, resetsAt: 1e21 },
+                                     capturedAt: 1700000000 } };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.limits, {
+    fiveHour: { usedPct: 50.5 },      // the window survives; the bad stamp is dropped
+    sevenDay: { usedPct: 10 },
+    capturedAt: 1700000000,
+  });
+  // A snapshot with no usable capturedAt is the whole block's own "can't tell
+  // you" — every reader ages the snapshot against that stamp.
+  const q = { device: "h", limits: { fiveHour: { usedPct: 50 }, capturedAt: 2.5 } };
+  hub.normalizeRecord(q);
+  assert.equal(q.limits, null);
+});
+
+// Blank out the parts of a source file that a pattern matching CODE must not
+// read as code, LENGTH-PRESERVINGLY so offsets into the original stay valid.
+// Comment bodies always; string bodies only when asked (the require walk below
+// needs its strings intact, the Kotlin parser must not read a default's
+// contents as syntax). Both guards below got this wrong in opposite directions:
+// one read a `//` inside a string as a comment, the other read `"/*"` as one.
+function blankNonCode(src, { blankStrings = false, regexLiterals = false } = {}) {
+  let out = "";
+  const pad = (s) => s.replace(/[^\n]/g, " ");   // keep line numbering intact
+  // Whether a `/` here opens a REGEX or is a division, by the previous
+  // significant token — the standard JS lexer rule. `regexLiterals` is off for
+  // Kotlin, which has no such literal and where `a / b / c` would otherwise read
+  // as one.
+  const opensRegex = () => {
+    const before = out.replace(/\s+$/, "");
+    if (!before) return true;
+    const last = before[before.length - 1];
+    if ("(,=:[!&|?{};+-*%~^<>".includes(last)) return true;
+    return /\b(return|typeof|case|in|of|do|else|yield|await|delete|void|new)$/.test(before);
+  };
+  for (let i = 0; i < src.length; ) {
+    if (regexLiterals && src[i] === "/" && src[i + 1] !== "/" && src[i + 1] !== "*" &&
+        opensRegex()) {
+      // A regex literal cannot span a line, so scan to the closing unescaped `/`
+      // on this one, stepping over a `[...]` class. Consuming it is the point: a
+      // quote or BACKTICK inside a character class (`` /`([^`]+)`/g ``, which
+      // glasses and veiller both contain verbatim) otherwise opens a phantom
+      // literal that runs to the next matching one — swallowing every comment in
+      // between and un-blanking them, which is the false positive this whole
+      // helper exists to prevent.
+      let j = i + 1, inClass = false, closed = false;
+      for (; j < src.length; j++) {
+        const c = src[j];
+        if (c === "\\") { j++; continue; }
+        if (c === "\n") break;                   // unterminated: not a regex
+        if (inClass) { if (c === "]") inClass = false; continue; }
+        if (c === "[") { inClass = true; continue; }
+        if (c === "/") { j++; closed = true; break; }
+      }
+      if (closed) { out += pad(src.slice(i, j)); i = j; continue; }
+    }
+    if (src.startsWith('"""', i)) {              // Kotlin raw string
+      let stop = src.length;
+      const end = src.indexOf('"""', i + 3);
+      if (end !== -1) {
+        // A raw string may END with a quote (`"""ab""""`), so the closer is the
+        // LAST three of the run, not the first: stopping at the first leaves a
+        // stray `"` that opens a phantom string over the rest of the file.
+        stop = end + 3;
+        while (src[stop] === '"') stop++;
+      }
+      out += blankStrings ? pad(src.slice(i, stop)) : src.slice(i, stop);
+      i = stop;
+    } else if (src.startsWith("//", i)) {
+      const end = src.indexOf("\n", i);
+      const stop = end === -1 ? src.length : end;
+      out += pad(src.slice(i, stop));
+      i = stop;
+    } else if (src.startsWith("/*", i)) {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? src.length : end + 2;
+      out += pad(src.slice(i, stop));
+      i = stop;
+    } else if (src[i] === '"' || src[i] === "'" || src[i] === "`") {
+      const quote = src[i];
+      let j = i + 1;
+      let quoteIsCode = false;
+      let closed = false;
+      for (; j < src.length; j++) {
+        if (src[j] === "\\") { j++; continue; }  // an escaped quote does not close
+        if (src[j] === quote) { j++; closed = true; break; }
+        // Neither language lets a `'`/`"` literal span a line, so one that does
+        // was never a string — overwhelmingly a quote inside a JS REGEX class
+        // (`/[.,;:!?'"]+$/`, which this repo really contains). Reading it as a
+        // string opens a phantom literal that swallows every comment to the next
+        // matching quote, un-blanking them: the P3 false positive, re-armed by a
+        // one-character edit to any character class.
+        if (src[j] === "\n" && quote !== "`") { quoteIsCode = true; break; }
+      }
+      // A literal that never closes was never a literal. That covers the
+      // newline rule's blind spot, the BACKTICK — exempt from it because a
+      // template literal may legitimately span lines, so a regex holding an odd
+      // number of them (`` /`([^`]+)`/g ``, which glasses and veiller both
+      // contain) would otherwise open a phantom literal that ran to EOF and
+      // stopped comment-blanking for the rest of the file.
+      if (quoteIsCode || !closed) { out += quote; i++; continue; }
+      const lit = src.slice(i, j);
+      out += blankStrings ? quote + pad(lit.slice(1, -1)) + quote : lit;
+      i = j;
+    } else {
+      out += src[i];
+      i++;
+    }
+  }
+  return out;
+}
+
+test("turma/Dockerfile copies every local module the hub requires", () => {
+  // The COPY list is hand-maintained, and a module missing from it is a
+  // container that boots to a MODULE_NOT_FOUND — invisible until deploy, since
+  // every test here requires straight off the working tree.
+  //
+  // The whole require GRAPH, not just server.js's own line: a module two hops
+  // out is just as absent from the image, and the crash reads the same. Both
+  // quote styles and a nested path count, because a pattern that only matches
+  // today's three requires is a test that passes on the shape it was written
+  // against rather than the one that breaks.
+  const dir = path.join(__dirname, "..");
+  const dockerfile = fs.readFileSync(path.join(dir, "Dockerfile"), "utf8")
+    .replace(/^\s*#[^\n]*/gm, "");             // a name in a COMMENT copies nothing
+  // Known bounds, all accepted: a require written INSIDE a string reads as a
+  // real one (the walk needs string contents to read the path out, so it cannot
+  // tell them apart without a parser), and `../`, `require.resolve` and a
+  // computed path stay invisible — two of those are not statically analysable
+  // and the hub uses none of them.
+  const local = /require\(\s*['"`]\.\/([\w./-]+)['"`]\s*\)/g;
+  const seen = new Set(["server.js"]);
+  const queue = ["server.js"];
+  const required = new Set();
+  while (queue.length) {
+    const file = queue.pop();
+    const full = path.join(dir, file);
+    // A module named only in PROSE is not a require, and this repo's comments
+    // name modules constantly — a stale note about one that has since been
+    // deleted must not redden CI. Nothing asserts the file exists: a genuinely
+    // missing local module takes the whole suite down at `require("../server.js")`
+    // long before this test runs, so an assert here could only ever fire on a
+    // false positive.
+    if (!fs.existsSync(full)) continue;
+    const code = blankNonCode(fs.readFileSync(full, "utf8"), { regexLiterals: true });
+    for (const m of code.matchAll(local)) {
+      required.add(m[1]);
+      if (!seen.has(m[1])) { seen.add(m[1]); queue.push(m[1]); }
+    }
+  }
+  assert.ok(required.size >= 3, "no local requires found — did the pattern rot?");
+  for (const f of required) {
+    // A module in a subdirectory is copied by copying that directory (the
+    // `COPY public ./public` idiom), so the first segment is what must appear.
+    const want = f.includes("/") ? f.split("/")[0] : f;
+    assert.match(dockerfile, new RegExp(`COPY[^\\n]*(^|[\\s/])${want.replace(/\./g, "\\.")}([\\s/]|$)`, "m"),
+      `${f} is required by the hub but never COPYed into the image`);
+  }
+});
+
+test("the shape table only uses tags the walker knows", () => {
+  // The walker passes an unrecognised tag THROUGH rather than throwing (a throw
+  // on ingest refuses the beat; on the restore path it abandons every record
+  // after it). That makes a typo in the table silent — so it is caught here
+  // instead.
+  const known = new Set(["s", "s?", "b", "b?", "i", "i?", "l", "l?", "d", "d?"]);
+  const seen = new Set();
+  const walk = (spec, where) => {
+    if (typeof spec === "string") {
+      assert.ok(known.has(spec), `unknown spec tag ${JSON.stringify(spec)} at ${where}`);
+      return;
+    }
+    assert.ok(["obj", "list", "map"].includes(spec.kind),
+      `unknown spec kind ${JSON.stringify(spec.kind)} at ${where}`);
+    if (spec.kind === "obj") {
+      if (seen.has(spec)) return;             // shared sub-shapes are reused by reference
+      seen.add(spec);
+      for (const [k, v] of Object.entries(spec.fields)) walk(v, `${where}.${k}`);
+    } else walk(spec.of, `${where}[]`);
+  };
+  for (const [k, v] of Object.entries(hub.AGENT_WIRE_SHAPE)) walk(v, k);
+});
+
+test("every field Android types on the fleet payload is in the shape table", () => {
+  // The durable form of "typing a field on a client and coercing it hub-side are
+  // ONE change": this reads `Models.kt` and walks it, so a field typed there
+  // without an entry here fails the hub's own suite rather than waiting for a
+  // phone to stop signing in.
+  // String and char literals are blanked BEFORE anything reads this as syntax:
+  // a default of `"https://x"` hid a comment, `"/*"` opened one, `">"` broke the
+  // bracket depth, and `"use val x: Int"` invented a field — each of which
+  // failed a paired, CORRECT change with a message accusing the reader of
+  // breaking the parser. Length-preserving, so the offsets below stay valid.
+  const src = blankNonCode(fs.readFileSync(path.join(__dirname, "..", "..", "android",
+    "app", "src", "main", "java", "com", "xerktech", "turma", "model", "Models.kt"),
+    "utf8"), { blankStrings: true });
+  // One entry per `data class X(...)`: its fields as {name, type}.
+  //
+  // Parsed by matching parens and then splitting the constructor on TOP-LEVEL
+  // commas, not by a per-line regex. Both departures are load-bearing, and a
+  // parser that quietly sees fewer fields than exist is the one failure mode
+  // this test cannot survive:
+  //   - a constructor body carries its own `()`/`<>` (`= UsageBucket()`,
+  //     `Map<String, UsageBucket>`), so "up to the next `\n)`" mis-parses;
+  //   - the block classes are written on ONE line, so an `^`-anchored field
+  //     pattern sees only the first field of each;
+  //   - a field with NO default (`val x: String,`) is the DANGEROUS kind — it is
+  //     required on the wire, so every host omitting it kills the decode — and a
+  //     pattern keyed on `=` skips exactly those.
+  const classes = {};
+  const subclassesOfBlock = [];
+  // `\s*` around the paren: `data class X` with its `(` on the next line is a
+  // legal declaration, and a class this misses is one whose sub-shape then goes
+  // unchecked — the guard's reach must not ride on brace style.
+  for (const m of src.matchAll(/data class\s+(\w+)\s*\(/g)) {
+    let depth = 1, i = m.index + m[0].length;
+    for (; i < src.length && depth; i++) {
+      if (src[i] === "(") depth++;
+      else if (src[i] === ")") depth--;
+    }
+    const body = src.slice(m.index + m[0].length, i - 1);   // already blanked
+    const params = [];
+    for (let d = 0, start = 0, j = 0; j <= body.length; j++) {
+      const ch = body[j];
+      if (ch === "(" || ch === "<" || ch === "[") d++;
+      else if (ch === ")" || ch === ">" || ch === "]") d--;
+      else if ((ch === "," && !d) || j === body.length) {
+        params.push(body.slice(start, j));
+        start = j + 1;
+      }
+    }
+    classes[m[1]] = params
+      .map((p) => /\bval (\w+)\s*:\s*([\w<>, ?]+?)\s*(?:=|$)/.exec(p))
+      .filter(Boolean)
+      .map((f) => ({ name: f[1], type: f[2].trim() }));
+    // EVERY declared field must have survived the split. The splitter counts
+    // bracket depth and does not know string literals, so a default containing a
+    // bare `>`/`(`/`[` (`= ">".length`) desynchronises it and silently folds the
+    // rest of the constructor into one param. Counting `val`s in the same
+    // comment-stripped body is the check that cannot itself drift: a field-count
+    // FLOOR would let this pass the moment the class grew past the floor, which
+    // is the state a growing class reaches on its own.
+    const declared = (body.match(/\bval\s+\w+\s*:/g) || []).length;
+    assert.equal(classes[m[1]].length, declared,
+      `parsed ${classes[m[1]].length} of ${declared} fields in ${m[1]} — the parser ` +
+      `lost some, so this test is not checking what it claims to`);
+    if (/^\s*:\s*Block\(\)/.test(src.slice(i))) subclassesOfBlock.push(m[1]);
+  }
+  // ...and the shapes a mis-parse drops first were seen AT ALL: AgentInfo is
+  // multi-line with comments between params, TextBlock is a one-liner, and
+  // CreateTicketRequest's first fields carry no default. Deliberately NOT their
+  // field counts — the per-class equality above already proves every field of
+  // every class is visible, generically, so pinning a count here would only
+  // fail the day someone legitimately adds one (and `CreateTicketRequest` is not
+  // even on the agent record).
+  assert.ok(classes.AgentInfo?.length && subclassesOfBlock.length >= 5 &&
+    classes.TextBlock?.length && classes.CreateTicketRequest?.length,
+    "Models.kt did not parse — this test is only as good as the field list it built");
+  // A transcript block is polymorphic: the table carries the UNION of every
+  // subclass's fields under one object spec.
+  classes.__Block = [{ name: "t", type: "String" },
+    ...subclassesOfBlock.flatMap((c) => classes[c])];
+
+  // Nothing agent-authored is exempt. `limits` and `localModel` are rebuilt
+  // wholesale by their own normalize*, and are in the table anyway — a rebuild
+  // is only as good as its own gates, and `limits` shipped one that let a
+  // fractional `resetsAt` through.
+  const SKIP = new Set([
+    "AgentInfo.key", "AgentInfo.online", "AgentInfo.terminalOnline",
+    "AgentInfo.lastSeen",    // hub-authored in serializeAgent, never off the wire
+    "__Block.input",         // typed JsonElement? — any shape is legal
+  ]);
+  const scalars = { String: "s", Boolean: "b", Int: "i", Long: "l", Double: "d" };
+  const missing = [];
+  const walk = (className, spec, path) => {
+    for (const f of classes[className] || []) {
+      if (SKIP.has(`${className}.${f.name}`)) continue;
+      const here = `${path}.${f.name}`;
+      const sub = spec && spec.kind === "obj" ? spec.fields[f.name] : undefined;
+      if (!sub) { missing.push(`${here} (${f.type})`); continue; }
+      const list = /^List<(\w+)>\??$/.exec(f.type);
+      const map = /^Map<String, (\w+)>\??$/.exec(f.type);
+      const bare = f.type.replace(/\?$/, "");
+      if (list || map) {
+        const el = (list || map)[1];
+        const inner = (list ? sub.kind === "list" : sub.kind === "map") ? sub.of : null;
+        if (!inner) { missing.push(`${here} (${f.type} is not a ${list ? "list" : "map"} here)`); continue; }
+        if (classes[el] || el === "Block") walk(el === "Block" ? "__Block" : el, inner, here + "[]");
+        else if (inner !== scalars[el]) missing.push(`${here} element (${el} vs ${inner})`);
+      } else if (classes[bare]) {
+        if (sub.kind !== "obj") missing.push(`${here} (${f.type} is not an object here)`);
+        else walk(bare, sub, here);
+      } else if (scalars[bare]) {
+        const want = scalars[bare] + (f.type.endsWith("?") ? "?" : "");
+        if (sub !== want) missing.push(`${here} (${f.type} wants ${want}, table has ${JSON.stringify(sub)})`);
+      }
+    }
+  };
+  walk("AgentInfo", { kind: "obj", fields: hub.AGENT_WIRE_SHAPE }, "AgentInfo");
+  assert.deepEqual(missing, [],
+    "Models.kt types these but the hub does not coerce them — add them to AGENT_WIRE_SHAPE");
+});
+
+test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm6", localModel: { available: "yes", contextTokens: 9999999999 } },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "lm6");
+  assert.equal(host.localModel.available, false);
+  assert.equal(host.localModel.contextTokens, null);
+  // And the whole fleet is still served — the point of coercing at ingest.
+  assert.ok(res.body.agents.length > 1);
+});
+

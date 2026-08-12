@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.net.AnswerRequest
 import com.xerktech.turma.net.CloneRequest
 import com.xerktech.turma.net.InputRequest
@@ -11,6 +12,7 @@ import com.xerktech.turma.net.MigrateRequest
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.OkResponse
+import com.xerktech.turma.net.hubErrorMessage
 import com.xerktech.turma.net.ResumeRequest
 import com.xerktech.turma.net.SpawnRequest
 import com.xerktech.turma.net.SummaryRequest
@@ -83,6 +85,10 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 "✗ " + (hubErrorMessage(e) ?: "hub unreachable")
             }
+            // Main landed this same `hubErrorMessage` line independently under
+            // XERK-264, so the two sides agree on the wording; the docstring
+            // above now carries the reason this branch wrote it for. What is
+            // ONLY on main's side is the pendKeys clearing — keep it.
             if (msg.startsWith("✗") && pendKeys.isNotEmpty()) {
                 _pending.value = _pending.value - pendKeys.toSet()
             }
@@ -105,17 +111,11 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun spawn(
         host: String, repo: String, prompt: String? = null, label: String? = null,
         baseRef: String? = null, model: String? = null, permissionMode: String? = null,
+        modelSource: String? = null,
     ) = run("session queued") {
         container.client.api.spawnSession(
             host,
-            SpawnRequest(
-                repo = repo,
-                prompt = prompt?.ifBlank { null },
-                label = label?.ifBlank { null },
-                baseRef = baseRef?.ifBlank { null },
-                model = model?.ifBlank { null },
-                permissionMode = permissionMode?.ifBlank { null },
-            ),
+            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource),
         )
     }
 
@@ -177,6 +177,32 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         fun pendKey(host: String, id: String) = "$host::$id"
+
+        /**
+         * The body a "New session" spawn posts. Pure, and separate from [spawn]
+         * so the wire shape is pinned by a test rather than only by driving the
+         * app: every blank optional is omitted, so a bare one-click spawn queues
+         * exactly `{repo}` as it always did.
+         *
+         * `modelSource` is sent ONLY for the local model (XERK-246) —
+         * "subscription" is what a spawn already meant. `model` is sent whatever
+         * the source, matching the web composer: the agent drops `--model` for a
+         * local session itself, and the alias is what that session goes back to
+         * if it is later switched to the subscription.
+         */
+        fun spawnRequest(
+            repo: String, prompt: String? = null, label: String? = null,
+            baseRef: String? = null, model: String? = null, permissionMode: String? = null,
+            modelSource: String? = null,
+        ) = SpawnRequest(
+            repo = repo,
+            prompt = prompt?.ifBlank { null },
+            label = label?.ifBlank { null },
+            baseRef = baseRef?.ifBlank { null },
+            model = model?.ifBlank { null },
+            permissionMode = permissionMode?.ifBlank { null },
+            modelSource = ModelSource.spawnValue(modelSource),
+        )
 
         /** The in-flight action kind for a session, or null (web sessPending). */
         fun sessPending(pending: Map<String, SessPending>, host: String, id: String): String? =

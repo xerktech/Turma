@@ -2,6 +2,7 @@ package com.xerktech.turma.model
 
 import kotlinx.serialization.decodeFromString
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -95,6 +96,60 @@ class AgentDecodeTest {
         val closed = resp.agents[0].closedSessions[0]
         assertEquals("", closed.transcriptId)
         assertEquals(0, closed.prs.size)
+    }
+
+    // The local-model failover block (XERK-246), in the exact shape hub-agent
+    // reports it: a host with no LOCAL_MODEL_* env sends available:false with
+    // BOTH other fields explicitly null, which must decode as "cannot fail over"
+    // rather than throw and hide the whole fleet.
+    @Test fun `the localModel block decodes both configured and not`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "on", "device": "on", "online": true,
+                "localModel": { "available": true, "model": "gpt-oss:120b", "contextTokens": 81920 },
+                "sessions": [ { "id": "s1", "modelSource": "local",
+                                "modelSourceAt": "2026-08-11T02:30:00Z" } ] },
+              { "key": "off", "device": "off", "online": true,
+                "localModel": { "available": false, "model": null, "contextTokens": null },
+                "sessions": [ { "id": "s2", "modelSource": "subscription" } ] }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val on = resp.agents[0]
+        assertEquals(true, on.localModel?.available)
+        assertEquals("gpt-oss:120b", on.localModel?.model)
+        assertEquals(81920, on.localModel?.contextTokens)
+        assertEquals("local", on.sessions[0].modelSource)
+        assertEquals("2026-08-11T02:30:00Z", on.sessions[0].modelSourceAt)
+        val off = resp.agents[1]
+        assertEquals(false, off.localModel?.available)
+        assertNull(off.localModel?.model)
+        assertEquals("subscription", off.sessions[0].modelSource)
+    }
+
+    // What hub-agent actually emits for a session that never moved:
+    // `_session_payload` sends `modelSourceAt: sess.get("modelSourceAt")`, i.e.
+    // a JSON null, on EVERY such session. A non-nullable field would throw and
+    // take the whole fleet's decode with it.
+    @Test fun `a null modelSourceAt does not break the decode`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+              "sessions": [ { "id": "s", "modelSource": "subscription", "modelSourceAt": null } ] } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals("", resp.agents[0].sessions[0].modelSourceAt)
+    }
+
+    // An agent predating the failover reports neither field. Absent must mean
+    // "that host can't do it", which is what hides the control.
+    @Test fun `an agent predating the failover decodes with no local model`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+              "sessions": [ { "id": "s" } ] } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertNull(resp.agents[0].localModel)
+        assertEquals("", resp.agents[0].sessions[0].modelSource)
     }
 
     // The live-status frame (XERK-75): tunnel-agent.js scrapes up/down/elapsed as
@@ -234,5 +289,94 @@ class AgentDecodeTest {
         val plain = TurmaJson.decodeFromString<Block>("""{"t":"tool_use","id":"t2","name":"Bash"}""")
         assertTrue((plain as ToolUseBlock).files.isEmpty())
         assertEquals("", plain.caption)
+    }
+
+    // ---- the shapes the hub MUST coerce (XERK-259) --------------------------
+    //
+    // The client half of the contract `turma/wire-shape.js` holds up. Each of
+    // these was served raw by the hub, and each one is fatal for the WHOLE
+    // fleet — measured on a phone as sign-in itself failing with "Could not
+    // reach the hub — check the URL", because the login probe decodes
+    // /api/agents. They are pinned HERE so the hub's table can never be
+    // "simplified" back past them: if one of these stops throwing, the client
+    // got more tolerant and the note beside the coercion is what needs
+    // updating, not the coercion.
+
+    private fun decodes(host: String): Boolean = try {
+        TurmaJson.decodeFromString<AgentsResponse>("""{"now":1,"agents":[$host]}""")
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    @Test fun `a bad list ELEMENT is as fatal as a bad list`() {
+        val h = """"key":"h","device":"h""""
+        // The four shapes XERK-259 was filed for.
+        assertFalse(decodes("""{$h,"repoUsage":[null]}"""))
+        assertFalse(decodes("""{$h,"repoUsage":["nope"]}"""))
+        // `typeof [] === "object"` — the element shape a careless hub-side
+        // predicate lets straight through.
+        assertFalse(decodes("""{$h,"repoUsage":[[1]]}"""))
+        assertFalse(decodes("""{$h,"repoUsage":[{"repo":{"a":1}}]}"""))
+        // Not a repoUsage quirk: every typed list behaves this way.
+        assertFalse(decodes("""{$h,"sessions":[[1,2]]}"""))
+        assertFalse(decodes("""{$h,"closedSessions":[null]}"""))
+        assertFalse(decodes("""{$h,"repos":[{"name":"r","resumable":["x"]}]}"""))
+        assertFalse(decodes("""{$h,"jira":{"tickets":[{"key":"X-1","labels":[null]}]}}"""))
+    }
+
+    @Test fun `the other shapes the hub coerces are fatal too`() {
+        val h = """"key":"h","device":"h""""
+        assertFalse(decodes("""{$h,"agentVersion":{"a":1}}"""))          // String <- object
+        assertFalse(decodes("""{$h,"github":"nope"}"""))                 // object <- string
+        assertFalse(decodes("""{$h,"uploadMaxBytes":1.5}"""))            // Long <- fraction
+        assertFalse(decodes("""{$h,"capacity":{"maxSessions":99999999999999}}"""))  // Int is 32-bit
+        assertFalse(decodes("""{$h,"claudeAuth":{"present":"yes"}}"""))  // Boolean <- word
+        // A map VALUE has no `coerceInputValues` fallback, unlike a field.
+        assertFalse(decodes("""{$h,"usage":{"days":{"2026-08-12":null}}}"""))
+        // A block whose discriminator is not a string reaches neither a known
+        // block nor the UnknownBlock fallback.
+        assertFalse(decodes(
+            """{$h,"sessions":[{"session":{"tail":[{"blocks":[{"t":{"a":1}}]}]}}]}"""))
+        // ...while an unknown or absent `t` is fine, which is why the hub can
+        // coerce a bad one to "" instead of dropping the block.
+        assertTrue(decodes(
+            """{$h,"sessions":[{"session":{"tail":[{"blocks":[{"t":""},{"text":"hi"}]}]}}]}"""))
+    }
+
+    @Test fun `the record the hub now serves for those inputs decodes`() {
+        // Exactly what `normalizeRecord` emits for the poisoned beat above (the
+        // hub suite asserts the same values from the other side), plus a good
+        // host beside it — the point being that neither disappears.
+        val poisoned = """
+            { "key": "bad", "device": "", "online": true,
+              "repoUsage": [ { "repo": "" }, { "repo": "good", "remoteKey": "gh:o/r" } ],
+              "sessions": [ { "id": "s1", "ttydPort": 0,
+                              "work": { "pushed": null, "aheadOfBase": null } } ],
+              "capacity": { "maxSessions": 0 }, "github": null,
+              "usage": { "days": { } } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(
+            """{"now":1,"agents":[$plainHost,$poisoned]}""")
+        assertEquals(listOf("mxh-t16", "bad"), resp.agents.map { it.key })
+        assertEquals(2, resp.agents[1].repoUsage.size)
+        assertEquals("good", resp.agents[1].repoUsage[1].repo)
+        assertNull(resp.agents[1].sessions[0].work!!.pushed)
+    }
+
+    @Test fun `the limits block's epoch fields are Longs, and a fraction is fatal`() {
+        val h = """"key":"h","device":"h""""
+        // Both are `Long` on this class, and a Long cannot take a fractional
+        // literal — so the hub gating them on "is a finite number" served this
+        // straight through and hid the whole fleet. Pinned here because that
+        // block is rebuilt hub-side by its own function, where the shape is
+        // easy to assume rather than check.
+        assertFalse(decodes(
+            """{$h,"limits":{"fiveHour":{"usedPct":50,"resetsAt":1.5},"capturedAt":1}}"""))
+        assertFalse(decodes(
+            """{$h,"limits":{"fiveHour":{"usedPct":50,"resetsAt":1e21},"capturedAt":1}}"""))
+        // A fractional PERCENTAGE is fine — that one is a Double.
+        assertTrue(decodes(
+            """{$h,"limits":{"fiveHour":{"usedPct":50.5},"capturedAt":1700000000}}"""))
     }
 }
