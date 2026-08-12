@@ -253,6 +253,34 @@ real ones.
   claude+npm, so it observes the DECISION only — it cannot see file ownership,
   writes under `/root`, or install timing.
 
+#### Techniques these two scripts specifically need
+
+Learned across XERK-254's review; each one found a defect that reading the source did not.
+
+- **Measure as the identity the code runs as.** `[ "$(id -u)" = 0 ]` guards a whole branch of the
+  updater (the EACCES retry into `~/.local`), so a root-only fixture set cannot see it and every
+  count taken with one is wrong. Drive it with
+  `setpriv --reuid 1000 --regid 1000 --clear-groups env HOME=... PATH=... <script>` after
+  `chown -R 1000:1000` on the staged prefix. The shell suites pass under uid 1000 too — run them
+  both ways.
+- **Count bounded calls by shimming `timeout` on PATH**, never by reading them off the source:
+  ```sh
+  printf '#!/bin/sh\n{ printf "%s " "$@"; echo; } >> LOG\nexec /usr/bin/timeout "$@"\n' > $bin/timeout
+  ```
+  This is how a memo that never memoised (`$(...)` is a subshell, so the global never propagates)
+  and a deadline derived from the wrong call count both showed up.
+- **`mkfifo` in `~/.turma` is the cheapest wedge test.** That dir is writable by the identity the
+  SESSIONS run as, so a session can replace any state file there with a FIFO — and opening one
+  blocks forever, with no error for `|| true` to catch. Plant one at every path the start-time
+  check opens and assert the agent still boots.
+- **Stub `date +%s`** to test elapsed-time arithmetic. Clocks step BACKWARDS at boot (chrony /
+  timesyncd on a host with no battery-backed RTC), which is exactly when this code runs, and
+  `$(( now - started ))` is then negative.
+- **Time the recovery, don't just assert it happened.** "Never blocked" and "rescued by a watchdog
+  after N seconds" both end with a booted container; only the elapsed time tells them apart.
+- **Sample fast when measuring a swap window.** `npm install -g` unlinks the bin before extracting,
+  so `claude` is absent from PATH for ~1.5-2s; a single probe misses it, a 50ms loop doesn't.
+
 ### 2.3 Glasses (`glasses/`) — npm + vite + vitest
 
 ```bash
@@ -565,6 +593,38 @@ sees when it trips one, and whether the client can recover.
 - The two mirrors of any rule (`liveState` in `index.html` vs `sessions.html`,
   `core/*.kt` vs its web original). They drift, and the drift is invisible until
   you diff them side by side with a concrete input.
+
+### 5.6b Shapes that only appear when you RUN it (XERK-254, thirteen rounds)
+
+Every one of these passed review, shellcheck and a green suite. Attack these before anything else
+in shell that runs at boot.
+
+- **A `/bin/sh` function is not a subshell and has no `local`.** An `export` inside one escapes into
+  everything the script starts afterwards. A scratch `HOME` set that way, then `rm -rf`'d, gave the
+  container's manager, tunnel and every session a `$HOME` that did not exist — `~/.turma` (the
+  session registry) and `~/.claude` (the login) both silently missed. Use `f() ( ... )` when the
+  body changes the environment.
+- **A blocking open at PID 1 is unrecoverable.** The container stays `running`, PID 1 is alive and
+  healthy-looking, so no restart policy ever fires — worse than a crash loop, which at least
+  retries. Signature: no manager line in the log, `docker inspect` says running; confirm with
+  `/proc/1` and the child chain (there is no `ps` in the image).
+- **`kill` on a shell does not reach its grandchildren.** A watchdog that kills a check leaves that
+  check's `npm install` running — which then replaces `claude` while the manager relaunches
+  sessions into it. Either signal the process group, or keep the outer deadline clear of the inner
+  ones by construction.
+- **`timeout` without `-k` does not bound anything a child can ignore.** It signals at the deadline
+  and then WAITS: measured 30s for a `trap "" TERM; sleep` child given `timeout 2`. And
+  `timeout ... 0 ...` DISABLES the bound — `0` is the value an operator reaches for when they mean
+  "no limit". Sanitise timeout knobs where they are USED, not only where arithmetic reads them: a
+  malformed one makes `timeout` exit 125 without running the command, which reads as "the tool is
+  broken" rather than "the config is wrong".
+- **SIGKILL and SIGTERM leave different wreckage.** A SIGTERM'd `npm install -g` rolls back (5/5
+  kill points left the old version working); a SIGKILL'd one leaves NO `claude` at all (4/5). Any
+  `-k` grace is what buys the rollback.
+- **Arithmetic derived from a call graph rots.** A deadline computed from per-call timeouts has to
+  be re-derived whenever the call graph changes, and each miscount was a defect (wrong multipliers,
+  an overflowing floor, a count taken as the wrong uid, a clock-skewed budget). A fixed generous
+  number with one explicit coupling retired the whole class. Prefer that shape.
 
 ### 5.7 Shapes the SECOND round found — all of them in the FIRST round's fixes
 

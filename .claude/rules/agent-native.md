@@ -111,9 +111,9 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       (`num` in both files): `timeout -k abc …` exits 125 WITHOUT running the command, so one typo
       in the config stops being "no timeout" and becomes "every claude read looks broken, every
       start attempts a futile repair, no check ever runs". `0` reads as the default too — it
-      disables `timeout` outright. Shipped default deadline (585s) pinned by a test.
+      disables `timeout` outright. Shipped default deadline (1800s) pinned by a test.
     - The launcher's deadline is a **fixed generous number**, held clear of the install budget only
-      (2x it). Deriving it from this script's per-call timeouts coupled the launcher to this
+      (2.5x it). Deriving it from this script's per-call timeouts coupled the launcher to this
       script's call graph, and every miscount was a defect — including one that could only be seen
       by counting as a NON-ROOT user, since the EACCES retry sits behind `[ "$(id -u)" = 0 ]`.
     - **The two install attempts SHARE one budget** (`TURMA_NPM_INSTALL_TIMEOUT`, the retry gets the

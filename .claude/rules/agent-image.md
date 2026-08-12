@@ -47,7 +47,7 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     bounds.** It only ever had to sit above the legitimate worst case; deriving it TIGHTLY coupled
     it to the exact set of calls in the check, and every miscount of that was a defect (an
     overflowing floor, wrong multipliers, a count taken as the wrong uid). The one coupling kept is
-    to the bound that matters: at least 2x the install budget, because a `kill` reaches the check's
+    to the bound that matters: 2.5x the install budget, because a `kill` reaches the check's
     shell and not its npm grandchild — fire it during an install and npm keeps replacing the package
     while the manager launches sessions into it (measured: 100 launch failures out of 100).
     Interrupting a version read or a registry query orphans nothing. The effective deadline is
@@ -64,7 +64,7 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     DISABLES the timeout, so a `0` (the value an operator reaches for meaning "no limit") would
     leave that call unbounded and subtract its whole share from the floor: both halves of the
     orphan at once. Both read as "use the default". The effective deadline is logged every boot and
-    the shipped default (505s) is pinned by a test, so the arithmetic can't drift unnoticed.
+    the shipped default (1800s) is pinned by a test.
   - **Every `claude --version` here is `timeout`-wrapped, the post-install verification included.**
     These are children of PID 1 with no outer timeout anywhere (the `||` guard only runs once the
     block returns), and a hang is reachable from the very fault the repair branch handles: an

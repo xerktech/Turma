@@ -362,12 +362,13 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
   # is only that it cannot fire while an install is running — a `kill` reaches
   # this shell and NOT its npm grandchild, and npm would then keep replacing the
   # package while the manager starts launching sessions into it. So the single
-  # coupling kept is to the one bound that dominates: at least twice the install
-  # budget — one budget for the install itself and one for everything else, so the
-  # deadline cannot land inside an install however that knob is set. Interrupting
-  # a version read or a registry query orphans nothing.
+  # coupling kept is to the one bound that dominates: 2.5x the install budget —
+  # two for the install's own clock-skewed worst case and a half for the bounded
+  # work that runs before it — so the deadline cannot land inside an install
+  # however that knob is set. Interrupting a version read or a registry query
+  # orphans nothing, so nothing else needs covering.
   _deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-1800}" 1800)"
-  _min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 2 ))
+  _min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 5 / 2 ))
   if [ "$_deadline" -lt "$_min" ]; then
     echo "[entrypoint] claude: TURMA_CLAUDE_UPDATE_TIMEOUT=${_deadline}s could fire while an" \
       "install is running; using ${_min}s"

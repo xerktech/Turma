@@ -278,11 +278,13 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
     # the wrong uid, an overflowing floor). What must remain true is only that
     # it cannot fire while an install is running — `timeout` signals its direct
     # child only, so npm would keep replacing the package while the manager
-    # comes up and launches sessions into it. Hence the one coupling kept: at
-    # least twice the install budget — one budget for the install itself and one for everything else, so the
-  # deadline cannot land inside an install however that knob is set.
+    # comes up and launches sessions into it. Hence the one coupling kept: 2.5x
+    # the install budget — two for the install's own clock-skewed worst case and
+    # a half for the bounded work that runs before it — so the deadline cannot
+    # land inside an install however that knob is set. Interrupting a version
+    # read or a registry query orphans nothing, so nothing else needs covering.
     claude_deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-1800}" 1800)"
-    claude_min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 2 ))
+    claude_min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 5 / 2 ))
     if [ "$claude_deadline" -lt "$claude_min" ]; then
       echo "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${claude_deadline}s could fire while an" \
         "install is running; using ${claude_min}s"
