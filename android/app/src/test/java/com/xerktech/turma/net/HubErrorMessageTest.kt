@@ -35,3 +35,30 @@ class HubErrorMessageTest {
         assertNull(hubErrorMessage(java.io.IOException("connection reset")))
     }
 }
+
+/**
+ * The Response-shaped half of the same reading, for calls that return a typed
+ * [Response] instead of throwing — /history is the one that mattered (XERK-264).
+ * A refusal there used to be indistinguishable from "not fetched yet", so the
+ * chat polled it 20 times over 60 seconds and then gave up in silence.
+ */
+class HubResponseErrorTest {
+
+    private fun refusal(code: Int, body: String) =
+        Response.error<Any>(code, body.toResponseBody("application/json".toMediaType()))
+
+    @Test fun `the hub's own error text is surfaced`() {
+        assertEquals(
+            "the host's command queue is full",
+            hubErrorMessage(refusal(429, """{"error":"the host's command queue is full"}""")),
+        )
+    }
+
+    @Test fun `a refusal with no explanation still names the status`() {
+        // Worded to match the web client's TurmaNav.refusalText, so the same
+        // refusal reads the same on both clients.
+        assertEquals("the hub answered HTTP 502", hubErrorMessage(refusal(502, "<html>bad gateway</html>")))
+        assertEquals("the hub answered HTTP 500", hubErrorMessage(refusal(500, """{"ok":false}""")))
+        assertEquals("the hub answered HTTP 409", hubErrorMessage(refusal(409, """{"error":"   "}""")))
+    }
+}

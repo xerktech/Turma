@@ -351,6 +351,20 @@ input:focus, textarea:focus, select:focus {
 @keyframes spin { to { transform: rotate(360deg); } }
 button:disabled .spin { border-top-color: var(--ink-2); }
 
+/* ---- Failure toast (nav.js TurmaNav.toast, every page) -------------------- */
+/* A transient bottom-centre notice, raised only when the hub REFUSED something
+   (XERK-264) — nothing announces success through it, so one on screen always
+   means a command did not run. Lives here, not in a page, because every page
+   fires commands. */
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  z-index: 50; max-width: min(92vw, 480px);
+  background: var(--critical); color: #fff; font-size: 13px;
+  padding: 10px 16px; border-radius: var(--radius-md); box-shadow: var(--shadow-md);
+  opacity: 0; pointer-events: none; transition: opacity .2s;
+}
+.toast.show { opacity: 1; }
+
 /* ---- Elevated surfaces (page-specific layout stays inline; look here) ----- */
 .tile, .host-card, .scard, .stopped-row, .host-block, .chart-card, .kanban-card {
   box-shadow: var(--shadow-sm);
@@ -774,6 +788,9 @@ body.td-open { overflow: hidden; }
   .bottom-nav a svg { width: 21px; height: 21px; }
   .bottom-nav a.active { color: var(--accent); }
   body { padding-bottom: 68px; }
+  /* Clear the bottom nav: the toast is now on every page (XERK-264), and at its
+     desktop offset it lands on top of the tab bar on a phone. */
+  .toast { bottom: calc(76px + env(safe-area-inset-bottom)); }
 }
 @media (pointer: coarse) {
   button { padding: 9px 15px; }

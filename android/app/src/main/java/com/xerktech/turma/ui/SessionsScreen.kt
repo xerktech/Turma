@@ -39,6 +39,8 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -468,6 +470,13 @@ fun SessionsListPane(
     archiveVm: ArchiveViewModel = viewModel(),
 ) {
     LaunchedEffect(Unit) { vm.start() }
+    // Every command this screen fires — kill, rename, move, resume from the
+    // ended list — reports through FleetViewModel.messages, which ONLY the
+    // dashboard used to collect: a refusal raised here reached nobody, which is
+    // the same "it looked like it worked" bug the hub's `{error}` text exists to
+    // prevent (XERK-264). One host, like FleetScreen's.
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
     // The archive half of the box. The VM debounces and drops anything under
@@ -511,7 +520,8 @@ fun SessionsListPane(
     var pickerOpen by remember { mutableStateOf(false) }
     var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
 
-    Column(modifier.fillMaxSize()) {
+    Box(modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize()) {
         ScreenHeader("Sessions") {
             IconButton(onClick = { pickerOpen = true }) { Icon(Icons.Filled.Add, "New session") }
         }
@@ -700,6 +710,8 @@ fun SessionsListPane(
                 }
             }
         }
+    }
+        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(16.dp))
     }
 
     if (pickerOpen) {

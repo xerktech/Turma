@@ -226,6 +226,19 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
+- **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses
+  commands with a status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host
+  offline, 404 stale attachment, 413 too long, 429 queue full); a client that reads the body and
+  ignores `res.status` shows a refused kill/rename/spawn as one that worked.
+  - Web: `post()`/`del()` (both pages) resolve **null on a refusal, having already toasted**
+    `TurmaNav.refusalText`, and callers roll back whatever they painted optimistically on that null.
+    `TurmaNav.toast` (nav.js, `.toast` in app.css) is the ONE failure surface — nothing announces
+    success through it, so a toast on screen always means a command did not run.
+  - Android: `hubErrorMessage` reads the `{error}` off an `HttpException` **or** a typed `Response`;
+    `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
+    pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
+    a refusal, and folding them together burned 60s and then said nothing.
+  - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 
