@@ -120,9 +120,26 @@ object ModelSource {
      * [hubMessage] is the hub's own words (`hubErrorMessage`), preferred over
      * [failed] whenever it has any: "hub unreachable" for an 8ms 409 sends you
      * looking at the network for a refusal the hub already explained.
+     *
+     * [bodyError] is `OkResponse.error` on a 2xx — a refusal the hub chose to
+     * answer 200 with. Branching on the HTTP status alone is the same shape of
+     * bug one layer up: `FleetViewModel.run` already checks it, this side did
+     * not, and a `200 {ok:false,error:…}` read as "✓ queued". No route answers
+     * that for `/model` or `/mode` today, which is exactly the position `/model`
+     * was in before it grew a 409.
      */
-    fun outcomeMessage(ok: Boolean, hubMessage: String?, queued: String, failed: String): String =
-        if (ok) queued else "✗ " + (hubMessage?.takeIf { it.isNotBlank() } ?: failed)
+    fun outcomeMessage(
+        ok: Boolean,
+        bodyError: String?,
+        hubMessage: String?,
+        queued: String,
+        failed: String,
+    ): String {
+        val refusal = bodyError?.takeIf { it.isNotBlank() }
+            ?: hubMessage?.takeIf { it.isNotBlank() }
+        if (ok && refusal == null) return queued
+        return "✗ " + (refusal ?: failed)
+    }
 
     /**
      * The `modelSource` a spawn should carry, or null to omit it.

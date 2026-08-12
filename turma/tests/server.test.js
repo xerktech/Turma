@@ -6713,6 +6713,14 @@ test("normalizeSessions coerces the per-session fields Android types", () => {
       { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"] },
       { id: "s2", modelSource: "local", modelSourceAt: "2026-08-11T00:00:00Z" },
       { id: "s3", session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+      // `session` itself, not just its `agents`. `"agents" in []` is false, so
+      // a bare `typeof live === "object"` guard neither coerces nor rejects an
+      // ARRAY here and serves it raw — `LiveSignals?` is typed on Android, so
+      // that is decode-fatal for the whole payload and blocks sign-in.
+      { id: "s5", session: [] },
+      { id: "s6", session: [1, 2] },
+      { id: "s7", session: "busy" },
+      { id: "s8", session: 7 },
       // Every non-object shape, not a representative one. An ARRAY element is
       // the case a `typeof s !== "object"` predicate misses (`typeof [] ===
       // "object"`), and it is decode-fatal exactly like the other two: measured
@@ -6725,8 +6733,15 @@ test("normalizeSessions coerces the per-session fields Android types", () => {
     ],
   };
   hub.normalizeRecord(payload);
-  assert.equal(payload.sessions.length, 3, "every non-object element is dropped");
-  assert.deepEqual(payload.sessions.map((s) => s.id), ["s1", "s2", "s3"]);
+  assert.equal(payload.sessions.length, 7, "every non-object ELEMENT is dropped");
+  assert.deepEqual(payload.sessions.map((s) => s.id),
+    ["s1", "s2", "s3", "s5", "s6", "s7", "s8"]);
+  // ...and every non-object `session` is REWRITTEN to null, not left raw.
+  for (const id of ["s5", "s6", "s7", "s8"]) {
+    assert.equal(payload.sessions.find((s) => s.id === id).session, null, `${id}.session`);
+  }
+  // A session that never carried `session` must not gain the key.
+  assert.equal("session" in payload.sessions.find((s) => s.id === "s1"), false);
   assert.equal(payload.sessions[0].modelSource, "");
   assert.equal(payload.sessions[0].modelSourceAt, "");
   assert.equal(payload.sessions[1].modelSource, "local");        // good values untouched

@@ -30,6 +30,7 @@ import com.xerktech.turma.net.LiveEvent
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.ModelSourceRequest
+import com.xerktech.turma.net.OkResponse
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -195,11 +196,20 @@ class ChatViewModel(
         memoExpiryJob = viewModelScope.launch {
             val left = ModelSource.SWITCH_SETTLE_MS - (System.currentTimeMillis() - pending.at)
             if (left > 0) delay(left)
-            // Re-read the store rather than closing over `pending`: the heartbeat
-            // may have settled it and a newer switch replaced it while we slept.
-            modelSwitch.value = ModelSource.settle(
-                modelSwitch.value, _state.value.session, System.currentTimeMillis(),
-            )
+            // Retire by IDENTITY, never by re-asking the clock. `delay` measures
+            // elapsed UPTIME while `expired` re-reads the WALL clock, and a
+            // backward wall-clock jump between the two makes the re-check false:
+            // `settle` then returns the same instance, `MutableStateFlow` does
+            // not emit an equal value, the collector never runs, and no new
+            // alarm is armed — so the memo is pinned until the clock catches up.
+            // Measured with a 10-minute backward jump: the chip still claimed
+            // the subscription at t+190s while the record said `local`.
+            //
+            // This alarm's only job is the TTL, so it does not need `settle`'s
+            // other rules: the heartbeat-agreement case is handled by the fleet
+            // collector, and `compareAndSet` no-ops if a newer switch (a
+            // different `at`) or a settle has already replaced this memo.
+            modelSwitch.compareAndSet(pending, null)
         }
     }
 
@@ -554,10 +564,11 @@ class ChatViewModel(
      * [setModelSource]'s handler, and the same reason `FleetViewModel.run`
      * stopped collapsing every failure into "hub unreachable".
      */
-    private fun reportedOutcome(res: Result<*>, queued: String, failed: String) {
+    private fun reportedOutcome(res: Result<OkResponse>, queued: String, failed: String) {
         _messages.tryEmit(
             ModelSource.outcomeMessage(
                 ok = res.isSuccess,
+                bodyError = res.getOrNull()?.error,
                 hubMessage = res.exceptionOrNull()?.let { hubErrorMessage(it) },
                 queued = queued,
                 failed = failed,

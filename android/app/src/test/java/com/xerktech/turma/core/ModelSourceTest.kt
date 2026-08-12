@@ -102,6 +102,13 @@ class ModelSourceTest {
         assertEquals(false, ModelSource.expired(p, 60_999))
         assertEquals(true, ModelSource.expired(p, 61_001))
         assertEquals(false, ModelSource.expired(null, 61_001))
+        // The EXACT boundary, not just either side of it: asserting 60_999 and
+        // 61_001 alone leaves `>=` vs `>` a free choice, and that mutation
+        // survived a battery. The TTL is inclusive — at exactly one full
+        // SWITCH_SETTLE_MS the memo is spent.
+        assertEquals(true, ModelSource.expired(p, 61_000))
+        assertNull(ModelSource.settle(p, held, 61_000))
+        assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(held, p, 61_000))
         assertEquals(ModelSource.LOCAL, ModelSource.current(held, p, 60_999))
         assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(held, p, 61_001))
     }
@@ -111,18 +118,24 @@ class ModelSourceTest {
         // the 409 the hub added for a session on the self-hosted model — added
         // precisely so an out-of-parity client could not silently drop the
         // command — painted as a success.
-        assertEquals("✓ model queued",
-            ModelSource.outcomeMessage(true, null, "✓ model queued", "could not set the model"))
+        val q = "✓ model queued"
+        val f = "could not set the model"
+        assertEquals(q, ModelSource.outcomeMessage(true, null, null, q, f))
+        assertEquals(q, ModelSource.outcomeMessage(true, "", "", q, f))
         assertEquals("✗ session runs on the self-hosted model",
-            ModelSource.outcomeMessage(
-                false, "session runs on the self-hosted model",
-                "✓ model queued", "could not set the model"))
+            ModelSource.outcomeMessage(false, null, "session runs on the self-hosted model", q, f))
         // A genuinely unanswered request has no hub words: fall back, and do NOT
         // reach for a network phrase the hub never said.
-        assertEquals("✗ could not set the model",
-            ModelSource.outcomeMessage(false, null, "✓ model queued", "could not set the model"))
-        assertEquals("✗ could not set the model",
-            ModelSource.outcomeMessage(false, "   ", "✓ model queued", "could not set the model"))
+        assertEquals("✗ $f", ModelSource.outcomeMessage(false, null, null, q, f))
+        assertEquals("✗ $f", ModelSource.outcomeMessage(false, null, "   ", q, f))
+        // A refusal the hub answered 200 with. Branching on the HTTP status
+        // alone is what made this bug the first time; `FleetViewModel.run`
+        // already reads `OkResponse.error` and this side must agree.
+        assertEquals("✗ agent refused the model",
+            ModelSource.outcomeMessage(true, "agent refused the model", null, q, f))
+        // Body error outranks the transport message when somehow both exist.
+        assertEquals("✗ agent refused the model",
+            ModelSource.outcomeMessage(false, "agent refused the model", "Bad Request", q, f))
     }
 
     @Test fun `a refused switch drops the memo instead of letting it age out`() {
