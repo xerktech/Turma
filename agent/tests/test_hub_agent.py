@@ -10735,6 +10735,18 @@ class TestPruneRepo(unittest.TestCase):
         self._run("worktree", "add", "--detach", path, base)
         return path
 
+    def _await_prune(self, sm, repo="demo", timeout=30):
+        """Block until the worker finishes `repo`, then return its record. The
+        sweep is asynchronous now (XERK-256), so every test has to wait for it."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rec = sm.prunes.get(repo)
+            if rec and rec.get("finishedMono") is not None:
+                return rec
+            time.sleep(0.02)
+        self.fail(f"prune of {repo!r} did not finish within {timeout}s "
+                  f"(last: {sm.prunes.get(repo)})")
+
     def test_prune_sweeps_merged_keeps_in_progress(self):
         sm = ha.SessionManager()
 
@@ -10752,6 +10764,7 @@ class TestPruneRepo(unittest.TestCase):
         self._run("branch", "feature-wip", wip_sha)
 
         sm.prune_repo("demo")
+        res = self._await_prune(sm)
 
         # Merged/clean worktree gone; unmerged + dirty kept.
         self.assertFalse(os.path.isdir(merged_wt))
@@ -10763,7 +10776,6 @@ class TestPruneRepo(unittest.TestCase):
         self.assertIn("feature-wip", branches)         # unmerged -> kept
         self.assertIn("main", branches)                # default -> kept
 
-        res = sm.prunes["demo"]
         self.assertEqual(res["status"], "done")
         self.assertEqual(res["removedWorktrees"], 1)
         self.assertEqual(res["deletedBranches"], 1)
@@ -10772,7 +10784,227 @@ class TestPruneRepo(unittest.TestCase):
     def test_prune_unknown_repo_reports_error(self):
         sm = ha.SessionManager()
         sm.prune_repo("nope")
-        self.assertEqual(sm.prunes["nope"]["status"], "error")
+        self.assertEqual(self._await_prune(sm, "nope")["status"], "error")
+
+    def test_prune_returns_immediately_and_reports_queued(self):
+        """The whole point of XERK-256: the command must not run the sweep on the
+        caller's thread, which is the heartbeat loop."""
+        sm = ha.SessionManager()
+        self._add_worktree("merged")
+        gate = threading.Event()
+        real = sm._run_prune
+        sm._run_prune = lambda repo: (gate.wait(10), real(repo))
+
+        start = time.monotonic()
+        sm.prune_repo("demo")
+        self.assertLess(time.monotonic() - start, 1.0)
+        # ...and the beat can already report the sweep rather than going dark.
+        self.assertEqual(sm.prunes["demo"]["status"], "queued")
+        self.assertIsNone(sm.prunes["demo"]["finishedMono"])
+        payload = sm._prunes_payload()
+        self.assertEqual([p["repo"] for p in payload], ["demo"])
+        self.assertEqual(payload[0]["status"], "queued")
+        gate.set()
+        self._await_prune(sm)
+
+    def test_prune_of_a_repo_already_in_flight_is_not_stacked(self):
+        """Three clicks on a repo already queued leave ONE sweep and ONE worker.
+
+        The worker is stubbed rather than gated: gating it still lets it POP the
+        entry before the assertion runs, so reading the queue length races it —
+        which is exactly how this test first failed in CI and passed locally."""
+        sm = ha.SessionManager()
+        started = []
+
+        class FakeThread:
+            def __init__(self, **kw):
+                started.append(kw.get("name"))
+
+            def is_alive(self):
+                return True      # so a later enqueue sees a worker already up
+
+            def start(self):
+                pass
+
+        with mock.patch.object(ha.threading, "Thread", FakeThread):
+            sm.prune_repo("demo")
+            sm.prune_repo("demo")
+            sm.prune_repo("demo")
+        self.assertEqual(list(sm._prune_queue), ["demo"])
+        self.assertEqual(started, ["prune-worker"])
+        self.assertEqual(sm.prunes["demo"]["status"], "queued")
+
+    def test_running_prune_never_ages_out_of_the_heartbeat(self):
+        """_poll_prunes drops a record once it has lingered — a sweep in flight
+        has no finishedMono, so it can't be dropped out from under itself."""
+        sm = ha.SessionManager()
+        gate = threading.Event()
+        real = sm._run_prune
+        sm._run_prune = lambda repo: (gate.wait(10), real(repo))
+        sm.prune_repo("demo")
+        sm._poll_prunes()
+        self.assertIn("demo", sm.prunes)
+        gate.set()
+        res = self._await_prune(sm)
+        # Finished: now the linger clock applies.
+        sm.prunes["demo"]["finishedMono"] = time.time() - ha.PRUNE_RESULT_LINGER_SEC - 1
+        sm._poll_prunes()
+        self.assertNotIn("demo", sm.prunes)
+        self.assertEqual(res["status"], "done")
+
+    def test_prune_leaves_a_worktree_claimed_mid_sweep_alone(self):
+        """Off the beat, a session can be spawned or resumed onto a worktree this
+        sweep already listed. The live set is re-read before every removal, so
+        the claim wins."""
+        sm = ha.SessionManager()
+        claimed = self._add_worktree("claimed")
+        sm.registry.append({"id": "s1", "worktreePath": claimed})
+        sm.prune_repo("demo")
+        res = self._await_prune(sm)
+        self.assertTrue(os.path.isdir(claimed))
+        self.assertEqual(res["removedWorktrees"], 0)
+
+    def test_worker_folds_removals_into_closed_on_the_beat(self):
+        """self.closed belongs to the beat thread: the worker only names paths,
+        and _poll_prunes applies them."""
+        sm = ha.SessionManager()
+        merged_wt = self._add_worktree("merged")
+        sm.closed = [{"id": "old", "worktreePath": merged_wt},
+                     {"id": "keep", "worktreePath": "/elsewhere"}]
+        sm.prune_repo("demo")
+        self._await_prune(sm)
+        self.assertEqual(sm._prune_swept, [merged_wt])
+        sm._poll_prunes()
+        self.assertEqual([c["id"] for c in sm.closed], ["keep"])
+        self.assertEqual(sm._prune_swept, [])
+
+    def test_prune_rereads_head_and_keeps_work_committed_mid_sweep(self):
+        """The listing is minutes old on a real sweep. A session given work can
+        COMMIT it and be killed while the sweep runs — the worktree is kept, so it
+        leaves the live set, and judged by the HEAD read at listing time it still
+        looks merged. Removing it there destroys commits reachable from no ref."""
+        sm = ha.SessionManager()
+        victim = self._add_worktree("victim")            # detached at main
+
+        # Land the commit between the listing and the merged check, exactly as a
+        # session finishing its turn mid-sweep would.
+        real_run_out = ha.run_out
+
+        def commit_then_answer(cmd, *a, **kw):
+            if "status" in cmd and "--porcelain" in cmd:
+                self._run("commit", "-q", "--allow-empty", "-m", "landed mid-sweep",
+                          cwd=victim)
+            return real_run_out(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_out", side_effect=commit_then_answer):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+
+        self.assertTrue(os.path.isdir(victim))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertGreaterEqual(res["skippedWorktrees"], 1)
+        # ...and the commit is still reachable, which is the thing that matters.
+        sha = self._run("rev-parse", "HEAD", cwd=victim).stdout.strip()
+        self.assertEqual(
+            ha.run_ok(["git", "-C", self.repo, "cat-file", "-e", sha])[0], 0)
+
+    def test_prune_skips_a_worktree_claimed_between_the_checks(self):
+        """The re-check right before the removal, not the one at the top of the
+        loop: a resume can land while this tree's own status/merge checks run."""
+        sm = ha.SessionManager()
+        claimed = self._add_worktree("claimed")
+        real_run_ok = ha.run_ok
+
+        def claim_then_answer(cmd, *a, **kw):
+            if "merge-base" in cmd:
+                sm.registry.append({"id": "late", "worktreePath": claimed})
+            return real_run_ok(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_ok", side_effect=claim_then_answer):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+        self.assertTrue(os.path.isdir(claimed))
+        self.assertEqual(res["removedWorktrees"], 0)
+
+    def test_a_resume_cannot_land_on_a_worktree_being_removed(self):
+        """`git worktree remove` runs for 10-37s on a real pool and the dir
+        exists for most of it, so a resume mid-removal would skip the re-add and
+        launch claude into a directory about to be unlinked. The claim is what
+        makes the registration and the check one step."""
+        sm = ha.SessionManager()
+        wt = self._add_worktree("contested")
+        self.assertTrue(sm._claim_for_removal(wt))       # worker gets there first
+        self.assertFalse(sm._claim_worktree(wt, {"id": "r1", "worktreePath": wt}))
+        self.assertEqual(sm.registry, [])                # ...and did not register
+        sm._release_removal(wt)
+        self.assertTrue(sm._claim_worktree(wt, {"id": "r1", "worktreePath": wt}))
+        self.assertEqual([s["id"] for s in sm.registry], ["r1"])
+        # With the session registered, the worker no longer gets the tree.
+        self.assertFalse(sm._claim_for_removal(wt))
+
+    def test_a_removal_always_releases_its_claim(self):
+        """Nothing else ever empties _prune_removing, so a claim leaked by a
+        failed removal would refuse every future resume onto that path, forever
+        — hence the `finally`. Checked on both exits: a removal that works and
+        one that fails."""
+        sm = ha.SessionManager()
+        self._add_worktree("merged")
+        sm.prune_repo("demo")
+        self._await_prune(sm)
+        self.assertEqual(sm._prune_removing, set())
+
+        sm2 = ha.SessionManager()
+        doomed = self._add_worktree("doomed")
+        real_run_ok = ha.run_ok
+
+        def failing_removal(cmd, *a, **kw):
+            if "worktree" in cmd and "remove" in cmd:
+                return 1, "boom"
+            return real_run_ok(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_ok", side_effect=failing_removal):
+            sm2.prune_repo("demo")
+            res = self._await_prune(sm2)
+        self.assertTrue(os.path.isdir(doomed))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertEqual(sm2._prune_removing, set())
+
+    def test_progress_updates_never_stamp_a_finish(self):
+        """finishedMono is what starts the linger clock, so only a terminal
+        record may carry it — else a long sweep ages out of the heartbeat while
+        it is still running."""
+        sm = ha.SessionManager()
+        sm._publish_prune("demo", status="running", summary="pruning… worktree 4 of 31")
+        self.assertIsNone(sm.prunes["demo"].get("finishedMono"))
+        # Even with an `at` far in the past, a running record survives the poll.
+        sm.prunes["demo"]["at"] = "2000-01-01T00:00:00Z"
+        sm._poll_prunes()
+        self.assertIn("demo", sm.prunes)
+        sm._finish_prune("demo", "done", None, "removed 1 worktree")
+        self.assertIsNotNone(sm.prunes["demo"]["finishedMono"])
+
+    def test_prune_keeps_a_worktree_whose_status_cannot_be_read(self):
+        """`git status` failing or timing out must not read as CLEAN — run()
+        collapses both to '', which is why this path uses run_out.
+
+        The patch is command-SELECTIVE: `rev-parse HEAD` goes through run_out too
+        now, and a blanket patch would fail that instead, leaving this guard
+        passing for the wrong reason."""
+        sm = ha.SessionManager()
+        merged_wt = self._add_worktree("merged")
+        real_run_out = ha.run_out
+
+        def unreadable_status(cmd, *a, **kw):
+            if "status" in cmd and "--porcelain" in cmd:
+                return None, ""
+            return real_run_out(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_out", side_effect=unreadable_status):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+        self.assertTrue(os.path.isdir(merged_wt))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertGreaterEqual(res["skippedWorktrees"], 1)
 
 
 def _text_entry(uuid, role, text, ts="2026-07-01T10:00:00Z"):

@@ -28,6 +28,32 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   `TestInterrupt`.
 - `prune` — removes worktrees merged into the latest default branch (**skipping any backing a
   session or holding uncommitted changes**) and local branches merged into it.
+  - **It runs on a WORKER THREAD, never the beat** (XERK-256): a sweep is minutes of git (31
+    `worktree remove`s at 10-37s each on a ZFS pool), and inline it held the heartbeat throughout,
+    so the hub rendered the host offline for the whole prune. `prune_repo` only QUEUES; `_run_prune`
+    works. **ONE worker, FIFO across repos** — parallel sweeps put several removals on the same
+    spindle, which is what makes each slow; a repo already queued/running is not stacked.
+  - `self.prunes` is worker-written and beat-read, so **every touch holds `_prune_lock`**, and the
+    payload carries `queued`/`running` + progress so the dashboard shows the sweep instead of a dark
+    host. **Only a FINISHED record carries `finishedMono`**, which starts the linger clock — else a
+    sweep ages out from under itself.
+  - **Every input to "is this removable" is re-read at removal time, never taken from the listing**,
+    which is minutes old by then. The live set, the dirty check and **`HEAD`** — a session can be
+    given work, COMMIT it and be killed mid-sweep, which keeps the worktree and drops it from the
+    live set, so the listing's HEAD still says merged and the removal destroys commits reachable
+    from no ref. A failed read reads as unmerged.
+  - **The removal is a two-sided handshake, not a check** (`_claim_for_removal` / `_claim_worktree`,
+    both reading and writing under `_prune_lock`): `worktree remove` takes 10-37s and the dir exists
+    for most of it, so a resume landing mid-removal sees `isdir` True, skips `_worktree_add` and
+    launches claude into a directory about to be unlinked. The registry append happens INSIDE the
+    lock — a check merely preceding it loses the race it exists to close.
+  - **`self.closed` stays the BEAT's to mutate** — the worker only appends paths to `_prune_swept`
+    for `_poll_prunes` to fold in.
+  - Git here is bounded by `PRUNE_GIT_TIMEOUT_SEC`, not `run()`'s 15s (reaping a removal mid-flight
+    made a removable worktree "kept" every sweep); the fetch stays short so one dead remote can't
+    hold the queue. The dirty check uses **`run_out`, not `run`** — `run` collapses failure into
+    empty output, so a timed-out `git status --porcelain` read as CLEAN. Tests: `TestPruneRepo`,
+    `dashboard-prune.test.js`.
 - `refreshJira` — the /board manual refresh: re-poll now instead of waiting out
   `JIRA_REFRESH_EVERY`. Re-checks `jira_configured()`, so an unconfigured host stays at zero Jira
   calls.
