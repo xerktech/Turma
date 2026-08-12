@@ -294,16 +294,21 @@ fun prReady(pr: PrInfo): String = pr.ready.ifEmpty {
 }
 
 /**
- * The pill's "#<number>" label. A bare `{url}` chip (no status fetched yet)
- * falls back to the number in the URL — GitHub `/pull/<n>`, GitLab
+ * The pill's number label. A bare `{url}` chip (no status fetched yet) falls
+ * back to the number in the URL — GitHub `/pull/<n>`, GitLab
  * `/-/merge_requests/<n>` (XERK-162) or Azure DevOps `/pullrequest/<n>`
  * (XERK-226) — else a plain "PR", mirroring the web renderers' fallback.
+ * GitLab and Azure DevOps number their requests !n, not #n (in ADO #n is a
+ * WORK ITEM) — the sigil follows the URL's platform, mirroring the agent's
+ * `_pr_ref` and the web renderers.
  */
 fun prNumberLabel(pr: PrInfo): String {
-    if (pr.number != 0) return "#${pr.number}"
     val m = Regex("""/pull/(\d+)|/-/merge_requests/(\d+)|/pullrequest/(\d+)""",
-        RegexOption.IGNORE_CASE).find(pr.url) ?: return "PR"
-    return "#" + m.groupValues.drop(1).first { it.isNotEmpty() }
+        RegexOption.IGNORE_CASE).find(pr.url)
+    val sigil = if (m != null && m.groupValues[1].isEmpty()) "!" else "#"
+    if (pr.number != 0) return "$sigil${pr.number}"
+    if (m == null) return "PR"
+    return sigil + m.groupValues.drop(1).first { it.isNotEmpty() }
 }
 
 /**

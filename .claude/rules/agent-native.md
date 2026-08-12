@@ -37,9 +37,10 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   tunnel's `pokeHeartbeat` signals the right process. Its PID-1 fallback is right only in the
   container.
 - `install.sh` — idempotent (`--verify`/`--uninstall`): installs prereqs (apt + npm + pinned static
-  ttyd), lays files into a prefix **keeping `hub-agent.py` and `hooks/` siblings**, writes a `chmod
-  600` config, wires the service, writes `$PREFIX/VERSION`, then `try-restart`s it (`enable --now`
-  does nothing to a running service).
+  ttyd + pinned static glab — the MR counterpart of `gh`, without which a session's MR never gets a
+  chip; best-effort, absence doesn't fail `--verify`), lays files into a prefix **keeping
+  `hub-agent.py` and `hooks/` siblings**, writes a `chmod 600` config, wires the service, writes
+  `$PREFIX/VERSION`, then `try-restart`s it (`enable --now` does nothing to a running service).
   - **`have_sudo` asks** when it must, rather than probing `sudo -n` only (which makes a
     password-sudo host look sudo-less and skips every apt prereq under `curl … | bash`). Gated on `[
     -t 2 ]`; cached.

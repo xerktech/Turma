@@ -274,7 +274,19 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   BOARD's PAT and has no CI rollup, so `checks` is the **CI-bearing branch POLICY evaluations only**
   (`AZDO_CI_POLICY_IDS`) — reviewer/work-item policies would read a PR awaiting a human as "CI
   pending". `mergeable` is `mergeStatus`, conflicts alone. The image bundles `glab` and az's
-  `azure-devops` extension.
+  `azure-devops` extension; the native install ships `glab` too (`ensure_glab`) — without it a
+  session improvises with the raw GitLab API, the one MR-creation path the scan can't attribute.
+  - **An MR's `mergeable` answers conflicts ONLY, like GitHub's**: `detailed_merge_status` buckets
+    via `_MR_CONFLICT_STATUSES`/`_MR_UNVERIFIED_STATUSES`, every other KNOWN status → MERGEABLE.
+    Mapping only `"mergeable"` left every healthy MR (not_approved, ci_still_running …) at ●
+    forever where the equivalent GitHub PR shows ✓.
+  - `_mr_url_parts` matches GITLAB_URL by **host(:port), case-insensitively, ignoring scheme** — a
+    byte-prefix compare left attributed MRs as bare link chips over a trivial spelling mismatch.
+  - Every session launch exports **`GITLAB_HOST`** (from `gitlab_base()`, operator's own wins):
+    glab reads that var, never GITLAB_URL, so self-hosted `glab mr create` can't auth without it.
+  - Chips label an MR/ADO PR **`!n`, not `#n`** (in ADO `#n` is a WORK ITEM) — every renderer
+    (web ×3, android's `PrBadge`, glasses `phone/render.ts` + the vendored chat.cjs) mirrors
+    `_pr_ref`'s sigil.
 - Tests: `TestPrStatus`, `TestMr*`, `TestAzdoPr*`, `TestRefreshPrStatus`, `TestPrLedger`.
 
 ### PR comment delivery (XERK-49) and conflict nudges (XERK-223)

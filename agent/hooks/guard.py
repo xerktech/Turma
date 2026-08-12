@@ -22,8 +22,9 @@ categories.
 
 2. **policy** — PR-workflow rules, enforced hard (no override): pushing to or
    deleting ``main``/``master`` directly, and merging any pull/merge request
-   (``gh pr merge``, ``glab mr merge``, completing or auto-completing an Azure
-   DevOps PR). Work lands via a PR/MR the agent opens but never self-merges.
+   (``gh pr merge``, ``glab mr merge``, a GitLab auto-merge push option,
+   completing or auto-completing an Azure DevOps PR). Work lands via a PR/MR
+   the agent opens but never self-merges.
    Denied with a reason the agent self-corrects from.
 
 3. **attribution** — ``git commit`` / PR commands carrying AI self-attribution
@@ -1084,6 +1085,39 @@ def _azdo_completes_pr(tokens: list[str]) -> bool:
     return False
 
 
+# GitLab push options that arm auto-merge: the push itself schedules the MR to
+# merge the moment its pipeline/checks pass — the push-option spelling of
+# `glab mr merge`, which is denied. `merge_request.create` and the other
+# merge_request.* options stay allowed (the push-option path is the one MR
+# creation route that works on every host).
+_GITLAB_AUTOMERGE_OPTS = frozenset((
+    "merge_request.merge_when_pipeline_succeeds",  # classic spelling
+    "merge_request.auto_merge",                    # GitLab >= 17.11 spelling
+))
+
+
+def _gitlab_push_automerges(tokens: list[str]) -> bool:
+    """True if a ``git push`` carries a push option arming GitLab auto-merge —
+    ``-o <opt>``, ``-o<opt>``, ``--push-option <opt>`` or ``--push-option=<opt>``.
+
+    The option NAME is compared with any ``=value`` stripped: GitLab keeps the
+    value as a string and treats ANY non-empty one as truthy (Ruby), so even
+    ``merge_request.auto_merge=false`` arms auto-merge server-side — there is
+    no value that disarms, hence no value that is safe to allow."""
+    for i, tok in enumerate(tokens):
+        if tok in ("-o", "--push-option"):
+            val = tokens[i + 1] if i + 1 < len(tokens) else ""
+        elif tok.startswith("--push-option="):
+            val = tok.split("=", 1)[1]
+        elif tok.startswith("-o") and len(tok) > 2:
+            val = tok[2:]
+        else:
+            continue
+        if val.strip().lower().split("=", 1)[0] in _GITLAB_AUTOMERGE_OPTS:
+            return True
+    return False
+
+
 def policy_reason(command: str) -> str | None:
     """Return a reason if ``command`` violates the PR workflow policy.
 
@@ -1111,16 +1145,17 @@ def policy_reason(command: str) -> str | None:
                 "you must not complete pull requests — open the PR and leave "
                 "completing it to a human reviewer"
             )
-        if (
-            prog == "git"
-            and rest
-            and rest[0] == "push"
-            and any(_is_protected_ref(t) for t in rest[1:] if not t.startswith("-"))
-        ):
-            return (
-                "do not push to main/master directly — push a feature "
-                "branch and open a pull request for review"
-            )
+        if prog == "git" and rest and rest[0] == "push":
+            if _gitlab_push_automerges(rest[1:]):
+                return (
+                    "you must not arm auto-merge on a merge request — open "
+                    "the MR and leave merging to a human reviewer"
+                )
+            if any(_is_protected_ref(t) for t in rest[1:] if not t.startswith("-")):
+                return (
+                    "do not push to main/master directly — push a feature "
+                    "branch and open a pull request for review"
+                )
     return None
 
 

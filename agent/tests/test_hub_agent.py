@@ -4881,6 +4881,29 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
         self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
 
+    def test_spawn_exports_gitlab_host_for_glab(self):
+        """A GitLab-configured host tells every session's glab WHERE to auth:
+        glab reads GITLAB_HOST, never the agent's GITLAB_URL, so without this a
+        self-hosted session's `glab mr create` can't auth, the model falls back
+        to a raw API call, and the MR never gets a chip (_scan_pr_line only
+        attributes the creating command's own tool_result)."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, GITLAB_URL="gitlab.example.com",
+                                 GITLAB_TOKEN="tok"):
+            sm.spawn("Turma")
+        self.assertIn("GITLAB_HOST=https://gitlab.example.com ",
+                      self._claude_cmd())
+
+    def test_spawn_leaves_an_operator_set_gitlab_host_alone(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, GITLAB_URL="gitlab.example.com",
+                                 GITLAB_TOKEN="tok"), \
+                mock.patch.dict(os.environ, {"GITLAB_HOST": "https://other.tld"}):
+            sm.spawn("Turma")
+        self.assertNotIn("GITLAB_HOST=", self._claude_cmd())
+
     def test_spawn_onto_the_local_model(self):
         """Starting NEW work on the local model matters as much as failing an
         existing session over: once usage is gone you cannot spawn either. A
@@ -10938,8 +10961,22 @@ class TestMrStatus(unittest.TestCase):
         with self._configured():
             self.assertIsNone(ha._mr_url_parts(
                 "https://other.gitlab.tld/g/a/-/merge_requests/1"))
+            # Suffix-spoofing host: gitlab.example.com.evil.com is NOT ours.
+            self.assertIsNone(ha._mr_url_parts(
+                "https://gitlab.example.com.evil.com/g/a/-/merge_requests/1"))
         with mock.patch.multiple(ha, GITLAB_URL="", GITLAB_TOKEN=""):
             self.assertIsNone(ha._mr_url_parts(self.MR))
+
+    def test_mr_url_parts_matches_host_not_bytes(self):
+        # Hostnames are case-insensitive and the scheme doesn't change WHICH
+        # GitLab an MR lives on — a byte-for-byte prefix compare left every
+        # attributed MR a bare link chip forever over a trivial GITLAB_URL
+        # spelling difference.
+        for base in ("https://GitLab.Example.com", "http://gitlab.example.com",
+                     "gitlab.example.com", "https://gitlab.example.com/"):
+            with mock.patch.multiple(ha, GITLAB_URL=base, GITLAB_TOKEN="tok"):
+                self.assertEqual(ha._mr_url_parts(self.MR),
+                                 ("grp/sub/app", "12"), base)
 
     def test_mr_check_class(self):
         self.assertEqual(ha._mr_check_class("success"), "pass")
@@ -10976,20 +11013,36 @@ class TestMrStatus(unittest.TestCase):
             ha._summarize_mr({"state": "merged", "draft": True})["state"], "MERGED")
 
     def test_summarize_conflict_blocks_and_unknown_is_unproven(self):
-        conflicted = ha._summarize_mr({
-            "state": "opened", "detailed_merge_status": "conflict",
-            "head_pipeline": {"status": "success"},
-        })
-        self.assertEqual(conflicted["mergeable"], "CONFLICTING")
-        self.assertEqual(conflicted["ready"], "blocked")
-        # Any other detailed status (checking, need_rebase, not_approved …) is
-        # UNKNOWN — green CI alone must not claim ✓.
-        checking = ha._summarize_mr({
-            "state": "opened", "detailed_merge_status": "checking",
-            "head_pipeline": {"status": "success"},
-        })
-        self.assertEqual(checking["mergeable"], "UNKNOWN")
-        self.assertEqual(checking["ready"], "pending")
+        for status in ("conflict", "broken_status"):
+            conflicted = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(conflicted["mergeable"], "CONFLICTING", status)
+            self.assertEqual(conflicted["ready"], "blocked", status)
+        # A still-computing status is UNKNOWN — green CI alone must not claim ✓.
+        for status in ("checking", "unchecked", "preparing"):
+            out = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(out["mergeable"], "UNKNOWN", status)
+            self.assertEqual(out["ready"], "pending", status)
+
+    def test_summarize_non_conflict_statuses_read_mergeable(self):
+        # GitHub's `mergeable` answers conflicts ONLY, so a GitLab enum that
+        # reports an approvals/CI/workflow gate — not a git-level can't-merge —
+        # must read MERGEABLE, or every healthy MR sits at ● forever where the
+        # equivalent GitHub PR shows ✓.
+        for status in ("mergeable", "not_approved", "ci_still_running",
+                       "discussions_not_resolved", "need_rebase",
+                       "some_future_status"):
+            out = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(out["mergeable"], "MERGEABLE", status)
+            self.assertEqual(out["ready"], "ready", status)
 
     def test_summarize_legacy_merge_status_fallback(self):
         old = ha._summarize_mr({"state": "opened", "merge_status": "can_be_merged"})

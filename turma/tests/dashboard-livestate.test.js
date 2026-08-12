@@ -48,7 +48,7 @@ function loadDashboard() {
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
     "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
-    src + "\n;globalThis.__dash = { liveState };\n;globalThis.__setRender = (f) => { render = f; };"
+    src + "\n;globalThis.__dash = { liveState, prBadgeHtml };\n;globalThis.__setRender = (f) => { render = f; };"
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
      g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
@@ -105,4 +105,24 @@ test("dashboard liveState: agents stay behind the offline and waiting gates", ()
   assert.equal(
     liveState(sess({ agents: live.agents, transcriptAgeSec: null }), onlineHost, NOW).label,
     "no transcript yet");
+});
+
+// XERK-162: the dashboard's own prBadgeHtml copy labels a GitLab MR / ADO PR
+// with its platform's !n sigil, GitHub with #n. Guarded here because this copy
+// lives inline in index.html — a QA mutation pass flipped its sigil back to
+// "#" and every suite stayed green.
+test("dashboard prBadgeHtml: !n for GitLab/ADO, #n for GitHub", () => {
+  const { prBadgeHtml } = loadDashboard();
+  assert.match(prBadgeHtml({ url: "https://github.com/o/r/pull/7", number: 7, state: "OPEN" }), /#7/);
+  const mr = prBadgeHtml({
+    url: "https://gitlab.example.com/grp/app/-/merge_requests/12",
+    number: 12, state: "OPEN",
+  });
+  assert.match(mr, /!12/);
+  assert.doesNotMatch(mr, /#12/);
+  // The URL fallback (bare {url} chip, no status yet) takes the same sigil.
+  assert.match(
+    prBadgeHtml({ url: "https://gitlab.example.com/grp/app/-/merge_requests/13" }), /!13/);
+  assert.match(
+    prBadgeHtml({ url: "https://dev.azure.com/org/P/_git/app/pullrequest/9" }), /!9/);
 });
