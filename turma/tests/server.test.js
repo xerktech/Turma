@@ -6919,6 +6919,52 @@ test("limits' two epoch fields are INTEGER-bounded, not merely finite", () => {
   assert.equal(q.limits, null);
 });
 
+// Blank out the parts of a source file that a pattern matching CODE must not
+// read as code, LENGTH-PRESERVINGLY so offsets into the original stay valid.
+// Comment bodies always; string bodies only when asked (the require walk below
+// needs its strings intact, the Kotlin parser must not read a default's
+// contents as syntax). Both guards below got this wrong in opposite directions:
+// one read a `//` inside a string as a comment, the other read `"/*"` as one.
+function blankNonCode(src, blankStrings) {
+  let out = "";
+  const pad = (s) => s.replace(/[^\n]/g, " ");   // keep line numbering intact
+  for (let i = 0; i < src.length; ) {
+    if (src.startsWith('"""', i)) {              // Kotlin raw string
+      const end = src.indexOf('"""', i + 3);
+      const stop = end === -1 ? src.length : end + 3;
+      out += blankStrings ? pad(src.slice(i, stop)) : src.slice(i, stop);
+      i = stop;
+    } else if (src.startsWith("//", i)) {
+      const end = src.indexOf("\n", i);
+      const stop = end === -1 ? src.length : end;
+      out += pad(src.slice(i, stop));
+      i = stop;
+    } else if (src.startsWith("/*", i)) {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? src.length : end + 2;
+      out += pad(src.slice(i, stop));
+      i = stop;
+    } else if (src[i] === '"' || src[i] === "'" || src[i] === "`") {
+      const quote = src[i];
+      let j = i + 1;
+      for (; j < src.length; j++) {
+        if (src[j] === "\\") { j++; continue; }  // an escaped quote does not close
+        if (src[j] === quote) { j++; break; }
+      }
+      const lit = src.slice(i, j);
+      const closed = lit.length >= 2 && lit.endsWith(quote);
+      out += blankStrings
+        ? quote + pad(lit.slice(1, closed ? -1 : undefined)) + (closed ? quote : "")
+        : lit;
+      i = j;
+    } else {
+      out += src[i];
+      i++;
+    }
+  }
+  return out;
+}
+
 test("turma/Dockerfile copies every local module the hub requires", () => {
   // The COPY list is hand-maintained, and a module missing from it is a
   // container that boots to a MODULE_NOT_FOUND — invisible until deploy, since
@@ -6932,15 +6978,22 @@ test("turma/Dockerfile copies every local module the hub requires", () => {
   const dir = path.join(__dirname, "..");
   const dockerfile = fs.readFileSync(path.join(dir, "Dockerfile"), "utf8")
     .replace(/^\s*#[^\n]*/gm, "");             // a name in a COMMENT copies nothing
-  const local = /require\(\s*['"]\.\/([\w./-]+)['"]\s*\)/g;
+  const local = /require\(\s*['"`]\.\/([\w./-]+)['"`]\s*\)/g;
   const seen = new Set(["server.js"]);
   const queue = ["server.js"];
   const required = new Set();
   while (queue.length) {
     const file = queue.pop();
     const full = path.join(dir, file);
-    assert.ok(fs.existsSync(full), `${file} is required but does not exist`);
-    for (const m of fs.readFileSync(full, "utf8").matchAll(local)) {
+    // A module named only in PROSE is not a require, and this repo's comments
+    // name modules constantly — a stale note about one that has since been
+    // deleted must not redden CI. Nothing asserts the file exists: a genuinely
+    // missing local module takes the whole suite down at `require("../server.js")`
+    // long before this test runs, so an assert here could only ever fire on a
+    // false positive.
+    if (!fs.existsSync(full)) continue;
+    const code = blankNonCode(fs.readFileSync(full, "utf8"), false);
+    for (const m of code.matchAll(local)) {
       required.add(m[1]);
       if (!seen.has(m[1])) { seen.add(m[1]); queue.push(m[1]); }
     }
@@ -6983,8 +7036,14 @@ test("every field Android types on the fleet payload is in the shape table", () 
   // ONE change": this reads `Models.kt` and walks it, so a field typed there
   // without an entry here fails the hub's own suite rather than waiting for a
   // phone to stop signing in.
-  const src = fs.readFileSync(path.join(__dirname, "..", "..", "android", "app", "src",
-    "main", "java", "com", "xerktech", "turma", "model", "Models.kt"), "utf8");
+  // String and char literals are blanked BEFORE anything reads this as syntax:
+  // a default of `"https://x"` hid a comment, `"/*"` opened one, `">"` broke the
+  // bracket depth, and `"use val x: Int"` invented a field — each of which
+  // failed a paired, CORRECT change with a message accusing the reader of
+  // breaking the parser. Length-preserving, so the offsets below stay valid.
+  const src = blankNonCode(fs.readFileSync(path.join(__dirname, "..", "..", "android",
+    "app", "src", "main", "java", "com", "xerktech", "turma", "model", "Models.kt"),
+    "utf8"), true);
   // One entry per `data class X(...)`: its fields as {name, type}.
   //
   // Parsed by matching parens and then splitting the constructor on TOP-LEVEL
@@ -7009,9 +7068,7 @@ test("every field Android types on the fleet payload is in the shape table", () 
       if (src[i] === "(") depth++;
       else if (src[i] === ")") depth--;
     }
-    const body = src.slice(m.index + m[0].length, i - 1)
-      .replace(/\/\*[\s\S]*?\*\//g, " ")      // KDoc between params
-      .replace(/\/\/[^\n]*/g, " ");           // and line comments
+    const body = src.slice(m.index + m[0].length, i - 1);   // already blanked
     const params = [];
     for (let d = 0, start = 0, j = 0; j <= body.length; j++) {
       const ch = body[j];
@@ -7039,12 +7096,15 @@ test("every field Android types on the fleet payload is in the shape table", () 
       `lost some, so this test is not checking what it claims to`);
     if (/^\s*:\s*Block\(\)/.test(src.slice(i))) subclassesOfBlock.push(m[1]);
   }
-  // ...and the classes themselves are all there. Not a floor on any one class
-  // (see above) — these are the exact shapes a mis-parse drops first: AgentInfo
-  // is multi-line with comments between params, TextBlock is a one-liner, and
-  // CreateTicketRequest's first three fields carry no default.
+  // ...and the shapes a mis-parse drops first were seen AT ALL: AgentInfo is
+  // multi-line with comments between params, TextBlock is a one-liner, and
+  // CreateTicketRequest's first fields carry no default. Deliberately NOT their
+  // field counts — the per-class equality above already proves every field of
+  // every class is visible, generically, so pinning a count here would only
+  // fail the day someone legitimately adds one (and `CreateTicketRequest` is not
+  // even on the agent record).
   assert.ok(classes.AgentInfo?.length && subclassesOfBlock.length >= 5 &&
-    classes.TextBlock?.length === 2 && classes.CreateTicketRequest?.length === 5,
+    classes.TextBlock?.length && classes.CreateTicketRequest?.length,
     "Models.kt did not parse — this test is only as good as the field list it built");
   // A transcript block is polymorphic: the table carries the UNION of every
   // subclass's fields under one object spec.
