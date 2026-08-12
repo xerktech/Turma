@@ -49,6 +49,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.liveMarker
+import com.xerktech.turma.core.tunnelOnlineOf
 import com.xerktech.turma.net.InputRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -76,6 +78,26 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
 
     var reload by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
+    // The fleet beat: the tunnel marker below (XERK-252) and the compose bar's
+    // busy read both come off it, so it is collected ONCE here rather than a
+    // second time further down.
+    val fleet by container.fleet.state.collectAsStateWithLifecycle()
+    val agent = fleet.agents.firstOrNull { it.key == host }
+    val tunnelOnline = tunnelOnlineOf(agent)
+    // Heal in place when the tunnel comes back, the way the web re-navigates its
+    // ttyd iframe (XERK-252). This screen needs it MORE than the chat does: ttyd
+    // is served THROUGH the control channel, so the WebView died with it and
+    // nothing inside the frame retries — without this the operator is left on a
+    // stale 502 with a manual Retry, long after the host is fine again.
+    //
+    // The RETURN edge only. Keying on `tunnelOnline` alone would fire on first
+    // composition and reload a terminal that had just loaded, and re-firing per
+    // beat while it stays up would restart the terminal every few seconds.
+    var sawTunnelDown by remember { mutableStateOf(false) }
+    LaunchedEffect(tunnelOnline) {
+        if (tunnelOnline && sawTunnelDown) reload++
+        sawTunnelDown = !tunnelOnline
+    }
 
     val ready by produceState(initialValue = false, sessionId, reload) {
         error = null
@@ -89,7 +111,26 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text("Terminal") },
+                title = {
+                    // Whether anything can actually reach this pane (XERK-252),
+                    // the same marker the chat header carries. `connected` is
+                    // false here by construction — this screen keeps no /live
+                    // socket of its own — so the only thing liveMarker can say
+                    // is the warning, which is the half that matters: the
+                    // WebView below is dead and this is why.
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Terminal", maxLines = 1)
+                        val mark = liveMarker(tunnelOnline, false)
+                        if (mark.isNotEmpty()) {
+                            Text(
+                                " · " + mark,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 actions = {
                     IconButton(onClick = { reload++ }) { Icon(Icons.Filled.Refresh, "Reload") }
@@ -221,9 +262,7 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         // destroy it), and briefly after a tap (the heartbeat takes a beat to
         // read the turn as over; if it outlives the suppression the interrupt
         // didn't take and Stop comes back — web chat.js STOP_SUPPRESS_MS).
-        val fleet by container.fleet.state.collectAsStateWithLifecycle()
-        val live = fleet.agents.firstOrNull { it.key == host }
-            ?.sessions?.firstOrNull { it.id == sessionId }?.session
+        val live = agent?.sessions?.firstOrNull { it.id == sessionId }?.session
         var stopPending by remember { mutableStateOf(false) }
         LaunchedEffect(stopPending) {
             if (stopPending) {

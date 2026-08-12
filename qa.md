@@ -202,84 +202,12 @@ reproduce that gate rather than per-directory runs:
 node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
 ```
 
-### 2.2b The native agent's launcher + self-updater (`agent/native/`)
-
-These run as **root under systemd on this box** and touch the operator's live
-install, so QA them against a staged `$PREFIX` and a scratch `$HOME`, never the
-real ones.
-
-- **Never run `turma-agent-update` with `HOME=/root`.** It writes
-  `~/.turma/last-update-check` (suppressing the production agent's next boot
-  check for `TURMA_BOOT_UPDATE_MIN_INTERVAL`), `~/.turma/update.log`, and can
-  `claude update` / restart `turma-agent.service` for real.
-- Stage a fake prefix the way `agent/tests/test_turma_agent_update.sh` does:
-  `$PREFIX/{VERSION,hub-agent.py,tunnel-agent.js,hooks/}` + `$PREFIX/bin/` with
-  the script under test, a fake `gh` serving canned releases from
-  `$FAKE_GH_DIR`, and stub `systemctl`/`turma-agentctl` so a successful install
-  cannot touch the host's real units. **Stub all three restart paths** — on this
-  host `/etc/systemd/system/turma-agent.service` exists, so the updater's
-  system-scope branch is live.
-- Real systemd behaviour (`Restart=always`, `KillMode=process`, survival of a
-  detached child across a unit restart) is reproducible without touching /etc:
-  ```bash
-  systemd-run --unit=qa-$$ --collect --property=Restart=always \
-    --property=RestartSec=1 --property=KillMode=process --property=Type=exec \
-    --setenv=HOME=$SCRATCH --setenv=PATH=$BIN:/usr/bin:/bin $BIN/turma-agent
-  ```
-  Stop it with `systemctl stop qa-$$`, then `rm /run/systemd/transient/qa-$$.service`
-  and `systemctl daemon-reload` — a stopped transient unit lingers as `loaded`
-  otherwise.
-- **The updater takes `flock` on `~/.turma/update.lock` for its WHOLE run, and
-  `--loop` holds it for its whole LIFE** (it sleeps inside the lock). Any second
-  run — the boot check, the hourly timer — exits with "another update run holds
-  the lock". Check the lock before concluding a code path "didn't fire".
-- Exercising the Claude Code half against the **real** registry is cheap and
-  safe if you sandbox npm: `export npm_config_prefix=$SCRATCH/pfx
-  npm_config_cache=$SCRATCH/cache`; `npm install -g @anthropic-ai/claude-code`
-  is ~170 KB of package + a ~250 MB platform binary and takes ~3 s.
-  `npm view @anthropic-ai/claude-code version` answers in <0.5 s.
-- **`npm install -g` unlinks the package before extracting the new one**, so
-  `claude` is *absent from PATH* for ~1.5–2 s during an upgrade. If you are
-  measuring session-launch behaviour around an update, sample `claude --version`
-  in a 50 ms loop; a single probe will miss it.
-- A **running** claude survives that swap (the bin is one static ELF and the
-  kernel keeps the inode); only a *new* exec in the window fails.
-- The container half (`agent/entrypoint.sh`) is drivable end to end with a real
-  claude: build `node:24-bookworm-slim` + `npm i -g @anthropic-ai/claude-code@<older>`
-  + the real `entrypoint.sh` + stub `python3`/`hub-agent.py`/`tunnel-agent.js`,
-  then `docker run -e AGENT=claude -v $fx/repos:/f/repos -v $fx/claude:/root/.claude`.
-  Keep the stub manager alive (`sleep`) or the container exits before the
-  backgrounded update prints anything. `agent/tests/test_entrypoint.sh` stubs
-  claude+npm, so it observes the DECISION only — it cannot see file ownership,
-  writes under `/root`, or install timing.
-
-#### Techniques these two scripts specifically need
-
-Learned across XERK-254's review; each one found a defect that reading the source did not.
-
-- **Measure as the identity the code runs as.** `[ "$(id -u)" = 0 ]` guards a whole branch of the
-  updater (the EACCES retry into `~/.local`), so a root-only fixture set cannot see it and every
-  count taken with one is wrong. Drive it with
-  `setpriv --reuid 1000 --regid 1000 --clear-groups env HOME=... PATH=... <script>` after
-  `chown -R 1000:1000` on the staged prefix. The shell suites pass under uid 1000 too — run them
-  both ways.
-- **Count bounded calls by shimming `timeout` on PATH**, never by reading them off the source:
-  ```sh
-  printf '#!/bin/sh\n{ printf "%s " "$@"; echo; } >> LOG\nexec /usr/bin/timeout "$@"\n' > $bin/timeout
-  ```
-  This is how a memo that never memoised (`$(...)` is a subshell, so the global never propagates)
-  and a deadline derived from the wrong call count both showed up.
-- **`mkfifo` in `~/.turma` is the cheapest wedge test.** That dir is writable by the identity the
-  SESSIONS run as, so a session can replace any state file there with a FIFO — and opening one
-  blocks forever, with no error for `|| true` to catch. Plant one at every path the start-time
-  check opens and assert the agent still boots.
-- **Stub `date +%s`** to test elapsed-time arithmetic. Clocks step BACKWARDS at boot (chrony /
-  timesyncd on a host with no battery-backed RTC), which is exactly when this code runs, and
-  `$(( now - started ))` is then negative.
-- **Time the recovery, don't just assert it happened.** "Never blocked" and "rescued by a watchdog
-  after N seconds" both end with a booted container; only the elapsed time tells them apart.
-- **Sample fast when measuring a swap window.** `npm install -g` unlinks the bin before extracting,
-  so `claude` is absent from PATH for ~1.5-2s; a single probe misses it, a 50ms loop doesn't.
+`agent/native/`'s launcher and updater run as **root under systemd here** and
+touch the live install: stage a fake `$PREFIX` + scratch `$HOME`, never
+`HOME=/root` (it stamps `last-update-check`, suppressing the real agent's
+next boot check, and can restart it); stub **all three** restart paths (a real
+system unit exists here); it holds `flock` on `update.lock` for the whole run.
+Recipes: `qa-findings.md` §5.9.
 
 ### 2.3 Glasses (`glasses/`) — npm + vite + vitest
 
@@ -326,7 +254,7 @@ docker run --rm --entrypoint bash \
   'cd /work && gradle :app:testDebugUnitTest --no-daemon && gradle :app:assembleDebug --no-daemon'
 ```
 
-Baseline: **281 JVM unit tests**, 0 failures, and a ~21 MB
+Baseline: **281 JVM unit tests** (was 278 before XERK-252), 0 failures, and a ~21 MB
 `app/build/outputs/apk/debug/app-debug.apk`. Per-suite counts are in
 `app/build/test-results/testDebugUnitTest/TEST-*.xml`.
 
@@ -355,10 +283,46 @@ Traps:
   know the tests really ran against the tree in front of you, add
   `--rerun-tasks` (~46s).
 
-`:latest` is the `android-build` tier — **no emulator, no system image**. An
-install-and-drive-the-app run needs the separate `:emulator` tag (6.4 GB, built
-on demand) or a real device over `adb connect`. If you cannot reach one, the
-honest verdict is PARTIAL for the UI; say so rather than claiming you drove it.
+`:latest` is the `android-build` tier — no emulator and no system image **in the
+image** — but you do NOT need the `:emulator` tag (which is not pullable without
+GHCR auth) to drive the app. `/dev/kvm` exists on this host, so add the emulator
+to a throwaway container of `:latest` and boot an AVD (~4 min, mostly download):
+
+```bash
+docker run -d --name qa-emu --device /dev/kvm --network host -v /mnt/data/tmp-qa:/gh \
+  -e PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/emulator:/usr/bin:/bin \
+  --entrypoint sh ghcr.io/xerktech/turma-agent:latest -c 'sleep 100000'
+docker exec qa-emu sh -c 'ANDROID_USER_HOME=/gh/andhome HOME=/gh/emuhome \
+  yes | sdkmanager --sdk_root=/opt/android-sdk "emulator" "system-images;android-35;google_apis;x86_64" &&
+  ANDROID_USER_HOME=/gh/andhome avdmanager create avd -n qa35 -k "system-images;android-35;google_apis;x86_64" -d pixel_5 --force'
+# ANDROID_AVD_HOME, not ANDROID_USER_HOME — see the trap below
+docker exec -d qa-emu sh -c 'ANDROID_AVD_HOME=/gh/andhome/avd HOME=/gh/emuhome \
+  emulator -avd qa35 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot'
+docker exec qa-emu sh -c 'HOME=/gh/emuhome adb wait-for-device shell "while [ \"$(getprop sys.boot_completed)\" != 1 ]; do sleep 2; done"'
+```
+
+Driving it:
+
+- **`avdmanager` writes the AVD to `$ANDROID_USER_HOME/avd`, but `emulator` only
+  searches `$ANDROID_AVD_HOME`, `$ANDROID_SDK_HOME/avd` and `$HOME/.android/avd`.**
+  Set `ANDROID_AVD_HOME` on the emulator command or it dies with
+  "Unknown AVD name".
+- **`sdkmanager` installs into `/opt/android-sdk`, i.e. the CONTAINER's writable
+  layer — not into your `/gh` mount.** `docker rm` that container and the
+  emulator + system image are gone and re-download (~4 min), even though the AVD
+  under `/gh` survives. Keep the container, or expect to pay again.
+- `--network host` on the emulator container means the AVD's `10.0.2.2` reaches
+  the host loopback, so a scratch hub on `127.0.0.1:<port>` is reachable at
+  `http://10.0.2.2:<port>`. **The manifest already sets
+  `android:usesCleartextTraffic="true"`**, so plain HTTP works — no TLS or CA
+  install needed.
+- `adb install -r -t /tmp/app.apk` after `docker cp`ing the APK in.
+- **Taps do not move focus between the sign-in fields** (Compose text fields
+  under `input tap`): everything lands in whichever box has focus. Use
+  `input keyevent 61` (TAB) to advance, and `input keycombination 113 29` +
+  `keyevent 67` to clear a field you filled wrong.
+- Screenshots are 1080x2340, past the image limit most tools accept —
+  downscale with PIL before reading them.
 
 There is **no committed gradle wrapper** — CI generates it.
 `.github/workflows/android-ci.yml` is the reliable spec for how this is really
@@ -406,12 +370,27 @@ Three more that each cost a run:
   with `ws.url()` and a `close` event, which is the only way to see a duplicate or
   leaked `/live/<host>/<id>` connection the DOM says nothing about.
 
-On the **native host** run Chrome with `--network host` (the verify skill's
-`--network container:$CID` is for the agent container, where 127.0.0.1 is shared
-with the hub). Name the container after your ticket — a stray `qa-chrome` from
-another run is usually already up. `connectOverCDP` reuses one long-lived
-browser context, so **`ctx.clearCookies()` first** or `/login` 302s away and
-`page.fill("#username")` times out looking for a form that isn't there.
+How Chrome-in-Docker reaches your hub depends on the box, and the wrong answer
+looks like "CDP is down": **agent container** → `--network container:$CID` (the
+verify skill's recipe); **TrueNAS native host** → `--network host`; **WSL /
+desktop (Docker Desktop)** → neither works (that engine is its own VM, so nothing
+binds on your 127.0.0.1) — publish the port, add a gateway alias, load the hub
+through the alias:
+
+```bash
+docker run -d --name qa-chrome-<ticket> -p 127.0.0.1:9344:9344 \
+  --add-host host.docker.internal:host-gateway \
+  --entrypoint chromium-browser zenika/alpine-chrome:latest \
+  --headless --no-sandbox --disable-gpu \
+  --remote-debugging-port=9344 --remote-debugging-address=0.0.0.0 about:blank
+# connectOverCDP("http://127.0.0.1:9344"), then goto http://host.docker.internal:<port>/
+```
+
+Name the container after your ticket — a stray `qa-chrome` from another run is
+usually already up. `connectOverCDP` reuses one long-lived browser context, so
+**`ctx.clearCookies()` first** (or a fresh `newContext()`) or `/login` 302s away
+and `page.fill("#username")` times out looking for a form that isn't there. The
+image ships **Chromium 124**; claim no wider a browser matrix than that.
 
 ### 3.1 Driving the live chat end to end (no real agent needed)
 
@@ -469,6 +448,97 @@ Three things that each cost a run:
   `renderInline` supports **code spans and links only — there is no bold/italic**,
   so `**x**` staying literal is correct, not a regression.
 
+More of the same kind, learned on XERK-252:
+
+- **`terminalOnline` is exactly "is there an `/agent/control` socket right now"**
+  (`serializeAgent`), so `ws.close()` on your fake tunnel IS a tunnel flap and
+  re-opening it IS the recovery — no restart, no waiting. `online` is
+  `now - lastSeen < OFFLINE_AFTER_MS` (**75s**), so an offline host costs a real
+  75-second wait with the beats stopped; there is no env override.
+- **`GET .../sessions/<id>/history` is served from a hub-side cache for
+  `HISTORY_FRESH_MS` = 5 MINUTES.** Any test that expects a browser-side history
+  re-pull to fetch something new inside that window will see the *stale* body and
+  read as a client bug. To serve `/history` at all, your fake agent must read the
+  beat's reply, echo back `historyResults: [{sessionId, entries, …}]` and
+  `ackedCommands: [cmdId]` — the hub only queues `{type:"history"}` on a cache miss.
+- **`TurmaOrg.set("<key nothing reports>")` is inert** — `effectiveKeys` drops a
+  selection no host reports, so org-scoping tests need TWO hosts beating with
+  different `jira.siteKey` values and a `set()` to the *other* one.
+- **The terminal iframe is navigated with `contentWindow.location.replace()`**,
+  so `iframe.src` stays `about:blank` forever and tells you nothing. Spy on the
+  page's global instead: `const o = window.navFrame; window.navFrame = s => { … o(s) }`.
+  Its `/term/<id>/` load also 502s unless a real ttyd sits behind the tunnel.
+- **To prove a regression is real, boot a SECOND hub off `origin/main`'s page.**
+  `server.js` reads `public/` relative to `__dirname`, so
+  `cp -a turma /scratch/old && git show origin/main:turma/public/sessions.html >
+  /scratch/old/public/sessions.html` gives you the old UI on the same server, and
+  the same driver script can run against both.
+
+### 3.2 Verifying a CSS / layout change
+
+**Nothing in CI reads `app.css` for layout** — `nav.test.js` asserts three rules
+by regex (`.site-header`, `.site-header-in`, `html{scrollbar-gutter}`) and that is
+all. A green suite proves nothing here; measure it in a browser.
+
+- **Boot a before-hub beside the after-hub and pixel-diff.** `server.js` reads
+  assets via `path.join(__dirname, "public", …)`, so a second hub is `cp -r turma
+  /tmp/…/before` + `git show origin/main:turma/public/app.css >` over its copy +
+  its own `PORT`/`STATE_FILE`/`ARCHIVE_DIR`/`ARCHIVE_DB`. An untouched layout
+  diffs to **zero** pixels, which turns "looks the same" into a fact.
+- **Measure, don't eyeball**: per viewport read each column's
+  `getBoundingClientRect()`, the strip's `scrollWidth/clientWidth` and
+  `documentElement.scrollWidth > clientWidth`. Distinct rounded `y` values are
+  the proof of "one row, never stacked".
+- **Sweep boundaries, not round numbers**: 2560/1440/1180 (`--wrap`)/1024/901/
+  900/899/601/600/561/560/559/390/320/280 plus landscape phone (740x360). There
+  are **two** breakpoints — 600 (`.wrap` padding, bottom nav) and 560 (board).
+- **`Input.synthesizeScrollGesture` with `gestureSourceType:"touch"` is a no-op**
+  in alpine-chrome; `"mouse"` and `page.mouse.wheel` work. Touch swipe/fling is
+  **not verifiable here** — report it unverified rather than passing it.
+- **A `scroll-snap` strip does not rest at `scrollLeft: 0`.** It rests at
+  `padding-left` and snaps back if you set 0, so that padding is off-screen and
+  anything drawn in it (an `outline-offset` ring) is clipped — unless the strip
+  sets `scroll-padding` to match, which the board's now does.
+- **`preserveScroll` (`nav.js`) matches by CHILD INDEX** when no ancestor has an
+  `id`, so a repaint that adds or drops a sibling restores an offset onto the
+  wrong node. `#board` prepends `.kc-note` divs on truncation / a poll error;
+  the column strip survives it only because it carries `id="kanbanCols"`. Flip a
+  note across a beat and re-check any OTHER scrolled node.
+- **A regex-over-CSS guard only sees the FIRST rule matching its selector**, so a
+  later unscoped override — the pattern the vendored `board.css` files use — sails
+  past it while winning the cascade. Prove any such test by mutating the stylesheet
+  and re-running it, never by reading it — and re-measure the mutation in a browser,
+  because an escape is only a finding once you have shown it changes what renders.
+- `overflow-x: auto` computes `overflow-y` to `auto` too — confirm
+  `scrollHeight === clientHeight` or a vertical wheel over it gets swallowed.
+- A scroll container's horizontal scrollbar sits at the bottom of **its own
+  box** — on a tall board, thousands of px down the page and never on screen.
+  "It scrolls" is not "the user can tell it scrolls".
+- **Swapping a stylesheet under a RUNNING hub changes nothing** — `server.js`
+  `readFileSync`s `public/*` at boot and serves `/app.css` `max-age=300`. Restart
+  the hub, and give each CSS variant **its own PORT**: `connectOverCDP` reuses one
+  browser context, so its cache outlives `clearCookies` and even
+  `Network.setCacheDisabled`, and a new origin is the only bust that always works.
+- **A snap strip whose column is WIDER than the scrollport** (the board below
+  ~330px) settles mid-column after a gesture, not at 0 — Chrome keeps the
+  over-large snap area covering the port. Not stuck: keep scrolling and it reaches
+  0/max. Sample the rest ~700ms after the wheel, and scroll BACK before calling
+  anything unreachable.
+- **Keyboard focus does not scroll a horizontal strip** (Chromium 124): `focus()`
+  and a real `Tab` onto a card in a sliced column both leave `scrollLeft` alone,
+  drawing the focus ring half off the scrollport. Compare `activeElement`'s rect
+  with the strip's rather than eyeballing it.
+- **Driving the board's drag (XERK-141) has three aims to get right**: hold
+  **still** >300ms (`LONG_PRESS_MS`; >10px first disarms it as a scroll); avoid
+  `CARD_OWN` (`.kc-key, .kc-sess, .kc-start` — that is most of a card's header
+  row); and stay INSIDE the strip's box, since past its edge `elementFromPoint`
+  is null and `highlightColAt` drops the target. A good drop POSTs
+  `/api/jira/<siteKey>/<key>/status {"category":…}` — assert on that, not on the
+  card moving (with no agent to ack, "couldn't move" is correct).
+- **Session chips need `session.ticket = {key, siteKey}`** on the beat; a flat
+  `ticketKey` indexes to nothing and the card renders chipless, which reads as a
+  renderer bug.
+
 ---
 
 ## 4. Running QA agents in parallel
@@ -498,76 +568,11 @@ before you move on.
 
 ## 5. Where the bugs actually were
 
-From the XERK-235 pass, ranked by how much they'd have cost in the field. Use
-this as a hunting guide, not a checklist — the *shapes* repeat, and every one of
-these was found by running the thing rather than reading it.
-
-### 5.1 Escaping that is right for one context and useless in another
-
-The single most serious finding. `esc()` escapes `'` to `&#39;`, which is correct
-for text — and no protection at all inside `onclick="f('${esc(x)}')"`, because
-the HTML parser decodes the entity **before** the handler source is compiled. 38
-sites did that, and a repo directory name (raw `os.listdir`, never validated) was
-enough to run attacker JS in the operator's authenticated browser on page load.
-
-**Look for the sink's real context, not the escaper's name.** Grep for
-`on[a-z]*="` and check what is interpolated inside it; grep for `href="${` and
-check whether anything validates the *scheme*.
-
-### 5.2 Guards that cannot fire
-
-A test exists, is green, and is wired to nothing.
-
-- `glasses`/`veiller` vendor `turma/public/{chat,board}.js` verbatim and assert
-  byte-identity — but their CI only triggered on their own directories. A PR
-  editing the source of truth never ran the guard, and three vendored copies
-  drifted before anyone noticed.
-- `veiller`'s copy of that test compared the vendored file against a hash baked
-  in from **that same file**. It could only catch someone editing the copy,
-  never the upstream moving. Green the whole time it was wrong.
-- `code-scan.yml` omitted `android/**`, so an Android-only PR ran zero SAST —
-  while two Android files carried `nosemgrep` annotations written on the
-  assumption that it runs.
-
-**For every test that asserts two things agree, check the CI path filter covers
-both.** For every pinned hash, check what it is pinned *to*. For every
-`nosemgrep`, check the scanner actually reaches that file.
-
-### 5.3 Fixtures that encode a shape the producer never emits
-
-`ChatItemsTest` built a `tool_use` and its `tool_result` in one entry. The hub
-always puts the result in the *next* entry. The test passed; every tool card in
-the shipped Android chat rendered empty with a duplicate card beside it.
-
-**When a test double and a real producer disagree, the double wins the test and
-loses the product.** Cross-check fixtures against what the producer actually
-writes — here, `agent/hub-agent.py`'s `_entry_blocks` and the web's own tests.
-
-### 5.4 Claims in comments and CLAUDE.md the runtime does not honor
-
-`CLAUDE.md` is unusually detailed and mostly accurate, which makes it easy to
-trust:
-
-- `_GUARD_DENY_PATH_RULES` shipped `Write(~/.ssh/**)` rules Claude Code
-  **rejects at startup**, printing 7 warnings into every session pane. The unit
-  test asserted the rejected rules were present, locking it in. (The `Edit(...)`
-  twins did hold, so this was noise, not exposure — but only launching the
-  product showed it.)
-- `engines.ts` claimed "CI fails the moment they drift". It did not.
-
-Cheap way to catch this: **launch the real thing once and read its first 20 lines
-of output.** Static reading finds none of it.
-
-### 5.5 A cap that cannot say so
-
-`readBody` destroyed the socket past 1 MiB without writing a response, so the
-agent saw `ECONNRESET` with no status to branch on — and because it holds staged
-results until a POST succeeds, it re-sent the same oversized body every beat and
-the host stayed offline forever, silently. The cap was also far below a
-legitimate heartbeat.
-
-**Every limit needs an answer, not just an enforcement.** Check what the *client*
-sees when it trips one, and whether the client can recover.
+The case studies — the actual defects, how each was found and why it survived
+review — live in **`qa-findings.md`** beside this file. Read it before your
+first pass on a component you have not QA'd before: the shapes repeat, and it
+is the difference between hunting and guessing. What stays here is the part you
+act on every time.
 
 ### 5.6 Things worth attacking every time
 
@@ -593,109 +598,6 @@ sees when it trips one, and whether the client can recover.
 - The two mirrors of any rule (`liveState` in `index.html` vs `sessions.html`,
   `core/*.kt` vs its web original). They drift, and the drift is invisible until
   you diff them side by side with a concrete input.
-
-### 5.6b Shapes that only appear when you RUN it (XERK-254, thirteen rounds)
-
-Every one of these passed review, shellcheck and a green suite. Attack these before anything else
-in shell that runs at boot.
-
-- **A `/bin/sh` function is not a subshell and has no `local`.** An `export` inside one escapes into
-  everything the script starts afterwards. A scratch `HOME` set that way, then `rm -rf`'d, gave the
-  container's manager, tunnel and every session a `$HOME` that did not exist — `~/.turma` (the
-  session registry) and `~/.claude` (the login) both silently missed. Use `f() ( ... )` when the
-  body changes the environment.
-- **A blocking open at PID 1 is unrecoverable.** The container stays `running`, PID 1 is alive and
-  healthy-looking, so no restart policy ever fires — worse than a crash loop, which at least
-  retries. Signature: no manager line in the log, `docker inspect` says running; confirm with
-  `/proc/1` and the child chain (there is no `ps` in the image).
-- **`kill` on a shell does not reach its grandchildren.** A watchdog that kills a check leaves that
-  check's `npm install` running — which then replaces `claude` while the manager relaunches
-  sessions into it. Either signal the process group, or keep the outer deadline clear of the inner
-  ones by construction.
-- **`timeout` without `-k` does not bound anything a child can ignore.** It signals at the deadline
-  and then WAITS: measured 30s for a `trap "" TERM; sleep` child given `timeout 2`. And
-  `timeout ... 0 ...` DISABLES the bound — `0` is the value an operator reaches for when they mean
-  "no limit". Sanitise timeout knobs where they are USED, not only where arithmetic reads them: a
-  malformed one makes `timeout` exit 125 without running the command, which reads as "the tool is
-  broken" rather than "the config is wrong".
-- **SIGKILL and SIGTERM leave different wreckage.** A SIGTERM'd `npm install -g` rolls back (5/5
-  kill points left the old version working); a SIGKILL'd one leaves NO `claude` at all (4/5). Any
-  `-k` grace is what buys the rollback.
-- **Arithmetic derived from a call graph rots.** A deadline computed from per-call timeouts has to
-  be re-derived whenever the call graph changes, and each miscount was a defect (wrong multipliers,
-  an overflowing floor, a count taken as the wrong uid, a clock-skewed budget). A fixed generous
-  number with one explicit coupling retired the whole class. Prefer that shape.
-
-### 5.7 Shapes the SECOND round found — all of them in the FIRST round's fixes
-
-Every one of these was introduced or left behind by a pass that believed it was
-done. Re-QA a fix as hard as you QA'd the original; the fix is the newest, least
-exercised code in the tree.
-
-- **A sanitiser reached through a variable.** The first XSS pass converted every
-  `esc(` written *inside* an `on*="…"` attribute and missed all 20 sites that
-  did `const key = esc(a.key)` and interpolated `${key}` — same bug, one
-  indirection away. **The regression test had the same blind spot**, greps for a
-  literal `esc(` inside the attribute, and was green with the vulnerability
-  shipped. When you write or judge a taint guard, mutation-test it in the shape
-  the bug *actually shipped in*, not the shape it is easiest to grep for.
-- **A fix placed in the wrong loop.** The Android `repoOptions` union was added
-  over the `byUser` winners instead of over every agent — and `board.js` has a
-  comment naming that exact loop as the wrong one. It did nothing in the common
-  case, and the three tests added with it all used two different tracker users,
-  which is the one arrangement where the wrong loop still works. **Fixture
-  choice hid the bug**, exactly as it had in the commit being fixed.
-- **A cap that bounds the small thing and not the large one.** `SPAWN_FIELD_MAX`
-  bounded queued-command fields while the heartbeat spread an unbounded payload
-  onto a persisted record — and the same commit raised that body cap 32×. One
-  agent could then park 30 MiB per beat and, with enough hosts, kill the hub
-  outright: `JSON.stringify` throws past ~512 MiB and the throw was inside a
-  timer callback, so it was uncaught. Look for the *biggest* unbounded thing,
-  not the one nearest the change.
-- **A guard with a lower bound and no upper one.** The archive cursor refused a
-  rewind but accepted `endOffset` past 2^53, which SQLite stores and then
-  refuses to read back — bricking that transcript forever.
-- **Security fixes with nothing that can fail.** Reverting the Android WebView
-  debug flag left `testDebugUnitTest`, `lintVitalRelease` and semgrep all green,
-  and `android-ci.yml` runs neither of the last two on a PR. Ask of every
-  security fix: *what turns red if someone undoes this?* If the answer is
-  nothing, that is a finding.
-- **Two fixes that were regressions of their own fixes.** Substituting a
-  placeholder for an unknowable `$( )` cured one false positive and made
-  `rm -rf /$(cat x)` look like a deep path; following exec wrappers to a client
-  missed the normal spelling, where the remote command is a single quoted token.
-  **Always diff the new behaviour against `origin/main` over a corpus**, in one
-  process, and treat "main denied this and we now allow it" as a finding unless
-  it is deliberate and written down.
-- **A bound that is per-item with no aggregate.** Capping each unknown heartbeat
-  key at 64 KiB was defeated by sending 400 of them in one beat — 25 MiB through
-  the very path written to stop it — and left every KNOWN key unbounded besides.
-  When you see a per-item limit, always ask what N of them costs.
-- **A fix nothing can reach.** The glasses online gate was added as
-  `if (hostLastSeen != null)` with two optional parameters, and every production
-  caller omitted them; only the new unit test exercised it. **Check the call
-  sites, not just the function** — a fix behind an optional argument is a fix
-  only for whoever passes it.
-- **A doc that undercounts.** CLAUDE.md said "four mirrors must agree" for
-  `readyForReview`; there are five, and the fifth (`veiller/src/core/sessions.ts`,
-  a fork rather than an import) was missed for exactly that reason. When a rule
-  names its own copies, grep for a sixth before believing the list.
-- **A test that asserts presence rather than meaning.** The Android backup-rules
-  test checked that both prefs filenames appeared in the XML. Flipping `<exclude>`
-  to `<include>` keeps both names present and INVERTS the rule — those two files
-  become the only things backed up — and the suite stayed green through it.
-- **A page-global "last known" flag whose edge handler fires against a different
-  subject.** `sessions.html` remembers one `stageTunnelOnline` for whatever the
-  stage shows, and acts on the false→true edge. Selecting a session on ANOTHER
-  host while the flag is false makes that edge land on the session just opened.
-  When you see a module-level flag paired with an edge test, ask what resets it
-  when the thing it describes is REPLACED rather than changed.
-- **A guard written against an object that is null for the whole window that
-  matters.** `chat.js`'s `reconnectNow` skips work when `ws` is OPEN or
-  CONNECTING — but `startWs` awaits a `/api/ws-token` fetch before it assigns
-  `ws`, so through that await `ws` is null and the guard waves a second
-  connection through. Unit tests that hand the guard a socket object never see
-  it. Count the sockets (§3, `page.on("websocket")`), don't read the guard.
 
 ---
 
@@ -757,6 +659,12 @@ are holding. Re-confirm with the same script on both before you spend time.
   Deleting the call leaves all 455 vitest tests green while a scrolled-up view
   gets yanked down by a growing live turn. The behaviour is correct on both
   `main` and HEAD — it is the coverage that is missing.
+- **The board drag's edge auto-scroll is dead on a phone (≤560px).** `edgeScroll`
+  nudges `scrollLeft += 18` per pointermove and `scroll-snap-type: x proximity`
+  snaps it back, so a card only reaches a column already on screen (a peek is
+  enough). Above 560px, snap off, the same code scrolls. Reproduces on `main`'s
+  `app.css` too — snap and strip both predate XERK-253. Trace `scrollLeft` while
+  holding the pointer within 48px of the strip's right edge.
 
 ---
 

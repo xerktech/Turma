@@ -28,6 +28,23 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     so the name is the only thing that can place it. A Jira "Resolved" is normally a `done` status,
     which the carve-out cannot pull from.
   - **The rule has FIVE mirrors** — see `CLAUDE.md`'s cross-cutting contracts for the list.
+- **The columns are ALWAYS one horizontal row, at every width** (XERK-253, `.kanban-cols` in
+  `app.css`): a flex strip that scrolls sideways. Never re-introduce a breakpoint that wraps them
+  underneath each other — stacked columns stop reading as a Kanban, and the position of a column
+  would then depend on the viewport.
+- **A column is a FIXED 300px everywhere** — `flex: 0 0 300px`, no grow, no shrink, no media query
+  re-sizing it. It is deliberately NOT fluid: a board that re-flows as the window moves is the
+  complaint this replaced, and **horizontal scrolling is the accepted cost, not a failure mode**.
+  300 is Android's `.width(300.dp)`, so the two surfaces are the same layout rather than merely the
+  same shape; move one and move the other.
+  - Four columns exceed the 1180px content column, so the desktop board scrolls a little even at
+    full width. That is intended. On a TALL board the strip's scrollbar sits at the bottom of its
+    own box, far down the page, leaving the sliced last column as the only cue — accepted; the fix
+    if it ever matters is capping the strip to the viewport with per-column vertical scroll (what
+    the phone rule does), never wrapping the columns.
+  - Guarded by the `app.css` cases in `board.test.js`, which read **every** rule naming
+    `.kanban-cols`, not the first: a later unscoped override wins the cascade, and that is exactly
+    the idiom the vendored `board.css` copies use.
 - Scoped by the **header's org filter**, not a strip of its own: `TurmaOrg.getKeys()` each render,
   passed to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as
