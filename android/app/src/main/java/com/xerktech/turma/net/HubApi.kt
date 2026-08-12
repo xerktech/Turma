@@ -302,6 +302,18 @@ fun hubErrorMessage(e: Throwable): String? {
     return msg?.takeIf { it.isNotBlank() }
 }
 
+/**
+ * The same reading for a call that returns a typed [retrofit2.Response] instead
+ * of throwing — the hub's own `{error}` text, falling back to the bare status,
+ * which beats reporting nothing at all (XERK-264). Worded to match the web
+ * client's `TurmaNav.refusalText`, so the same refusal reads the same on both.
+ */
+fun hubErrorMessage(resp: retrofit2.Response<*>): String {
+    val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
+    val msg = runCatching { TurmaJson.decodeFromString<OkResponse>(body).error }.getOrNull()
+    return msg?.takeIf { it.isNotBlank() } ?: "the hub answered HTTP ${resp.code()}"
+}
+
 @Serializable
 data class JiraSessionResponse(
     val ok: Boolean = false,

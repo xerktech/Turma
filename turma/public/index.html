@@ -1502,18 +1502,46 @@ function sessCard(a, s, now) {
 
 // ---- actions → endpoints ---------------------------------------------------
 function enc(s) { return encodeURIComponent(s); }
-// Returns the parsed JSON reply (or null if it isn't JSON) — the spawn/resume
-// endpoints answer with the queued command's `cmdId`, which followToSessions()
-// hands the sessions page so it can open the session that command creates.
-async function post(url, body) {
-  const res = await fetch(url, body
-    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
-    : { method: "POST" });
+// The page's failures all go through the chrome's one toast (XERK-264), so a
+// refused command reads the same here and on the Sessions page.
+function toast(msg) {
+  if (window.TurmaNav && TurmaNav.toast) TurmaNav.toast(msg);
+}
+// Fire a command at the hub. Resolves to the parsed JSON reply on success (`{}`
+// when the reply wasn't JSON) — the spawn/resume endpoints answer with the
+// queued command's `cmdId`, which followToSessions() hands the sessions page so
+// it can open the session that command creates.
+//
+// **Null means the hub refused it, and the operator has already been told.**
+// The status used to be ignored entirely (XERK-264), so a 409/413/429/503 was
+// parsed for a cmdId that wasn't there and the click looked like it worked. Now
+// every refusal raises the hub's own explanation through the shared toast, and
+// callers that painted something optimistically roll it back on a null.
+// `what` names the action for that notice ("Clone", "Prune", …).
+async function post(url, body, what) {
+  let res;
+  try {
+    res = await fetch(url, body
+      ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+      : { method: "POST" });
+  } catch {
+    toast(what ? `${what} failed — the hub is unreachable` : "The hub is unreachable");
+    return null;
+  }
+  // An expired login is the one failure with somewhere better to go than a
+  // toast: the whole page is dead until it's renewed.
+  if (res.status === 401) { location.href = "/login"; return null; }
   let out = null;
   try { out = await res.json(); } catch { /* not JSON — nothing to correlate */ }
   refresh();
   fastPoll();
-  return out;
+  if (!res.ok) {
+    toast(window.TurmaNav && TurmaNav.refusalText
+      ? TurmaNav.refusalText(what, res.status, out)
+      : `${what || "That"} failed`);
+    return null;
+  }
+  return out || {};
 }
 // Starting or resuming a session is a "go work in it" action, so hand off to the
 // sessions page and let it open the session. The id doesn't exist yet — the
@@ -1523,7 +1551,24 @@ async function post(url, body) {
 function followToSessions(cmdId) {
   if (cmdId) location.href = `/sessions?spawn=${enc(cmdId)}`;
 }
-async function del(url) { await fetch(url, { method: "DELETE" }); refresh(); fastPoll(); }
+// DELETE's half of post(): same refusal contract, same toast, same null.
+async function del(url, what) {
+  let res;
+  try { res = await fetch(url, { method: "DELETE" }); }
+  catch { toast(what ? `${what} failed — the hub is unreachable` : "The hub is unreachable"); return null; }
+  if (res.status === 401) { location.href = "/login"; return null; }
+  let out = null;
+  try { out = await res.json(); } catch { /* not JSON */ }
+  refresh();
+  fastPoll();
+  if (!res.ok) {
+    toast(window.TurmaNav && TurmaNav.refusalText
+      ? TurmaNav.refusalText(what, res.status, out)
+      : `${what || "That"} failed`);
+    return null;
+  }
+  return out || {};
+}
 
 // Two-click arm/confirm for destructive actions. The armed state lives in the
 // module-level `confirming` map so the 5s re-render keeps the button armed.
@@ -1538,7 +1583,7 @@ function twoClick(actionKey, doIt) {
   doIt();
 }
 
-function removeHost(key)  { del(`/api/agents/${enc(key)}`); }
+function removeHost(key)  { del(`/api/agents/${enc(key)}`, "Remove host"); }
 
 // Restart a host's agent manager (XERK-157). Arm/confirm first, then POST; the
 // pending state captures the current startedAt so reconcilePending can clear the
@@ -1549,7 +1594,7 @@ function restartHost(key) {
     const host = (cache.agents || []).find(a => a.key === key);
     busy(pendKey("restartAgent", key, "_"),
       { kind: "restartAgent", host: key, startedAt: host ? host.startedAt : null },
-      () => post(`/api/agents/${enc(key)}/restart`));
+      () => post(`/api/agents/${enc(key)}/restart`, null, "Restart"));
   });
 }
 
@@ -1560,7 +1605,15 @@ function busy(key, val, run) {
   if (pending.has(key)) return;
   setPending(key, val);
   render(cache);
-  run();
+  // A refused command never reached the agent, so drop the optimistic row the
+  // click painted: left up it reads as a command still in flight, and sits
+  // there for the whole PENDING_TTL_MS. Runners resolve the post()'s reply, so
+  // a falsy result is exactly "the hub said no" (or the fetch never landed).
+  Promise.resolve(run()).then((ok) => {
+    if (ok) return;
+    pending.delete(key);
+    render(cache);
+  });
 }
 // Clone the selected repos into a host's REPOS_ROOT. Every checked repo plus a
 // non-empty free-text owner/repo box (always GitHub) is queued as its own clone
@@ -1585,7 +1638,7 @@ function cloneRepo(key) {
     if (!name) continue;
     const body = spec.source ? { repo: spec.repo, source: spec.source } : { repo: spec.repo };
     busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec.repo },
-      () => post(`/api/agents/${enc(key)}/clone`, body));
+      () => post(`/api/agents/${enc(key)}/clone`, body, "Clone"));
   }
   cloneDraft.set(key, {}); // clear search/picks/box; progress shows as clone-job rows
   render(cache);
@@ -1622,20 +1675,24 @@ function startSession(key, repo) {
   composerDraft.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/sessions`, body)
-      .then(r => followToSessions(r && r.cmdId)));
+    // The reply is returned so busy() can drop the "starting…" row on a refusal.
+    () => post(`/api/agents/${enc(key)}/sessions`, body, "Start")
+      .then(r => { followToSessions(r && r.cmdId); return r; }));
 }
 function sessStart(key, id) {
   busy(pendKey("start", key, id), { kind: "start", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`, null, "Start"));
 }
 // Bring back a KILLED session (from the repo's Resume picker) on its kept
 // branch with its prior conversation. Not destructive, so no arm/confirm.
 function resumeSession(key, id) {
   busy(pendKey("resume", key, id), { kind: "resume", host: key, id },
     // A killed session keeps its id, so the sessions page can wait on it by id.
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`)
-      .then(() => { location.href = `/sessions?session=${enc(id)}`; }));
+    // Only follow a resume the hub took: a refusal leaves the operator here,
+    // with the toast saying why, rather than on a session page that has nothing
+    // to open (XERK-264).
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`, null, "Resume")
+      .then(r => { if (r) location.href = `/sessions?session=${enc(id)}`; return r; }));
 }
 // Resume ANY prior Claude session by its transcript id (the broadened picker,
 // repo.resumable). The origin cwd is looked up from cached state (kept out of
@@ -1652,8 +1709,8 @@ function resumeTranscript(key, transcriptId) {
   }
   const baseline = a ? (a.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("resume", key, transcriptId), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd })
-      .then(r => followToSessions(r && r.cmdId)));
+    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd }, "Resume")
+      .then(r => { followToSessions(r && r.cmdId); return r; }));
 }
 // The destructive three still arm/confirm first; the pending state begins only
 // once confirmed (inside doIt), so it reflects a real in-flight command.
@@ -1665,16 +1722,16 @@ function sessRestart(key, id) {
     const host = (cache.agents || []).find(a => a.key === key);
     const sess = host && (host.sessions || []).find(s => s.id === id);
     busy(pendKey("restart", key, id), { kind: "restart", host: key, id, restartCount: sess && sess.restartCount != null ? sess.restartCount : null },
-      () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`));
+      () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`, null, "Restart"));
   });
 }
 function sessKill(key, id) {
   twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`)));
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
 }
 function sessDelete(key, id) {
   twoClick("sd::" + key + "::" + id, () => busy(pendKey("delete", key, id), { kind: "delete", host: key, id },
-    () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`)));
+    () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`, "Delete")));
 }
 // Prune a repo's finished work on a host: the agent removes worktrees whose
 // commits are merged into the latest default branch and deletes merged branches
@@ -1686,7 +1743,7 @@ function pruneRepo(key, repo) {
     const prev = host && (host.prunes || []).find(p => p.repo === repo);
     busy(pendKey("prune", key, repo),
       { kind: "prune", host: key, repo, prevAt: prev ? prev.at : null },
-      () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/prune`));
+      () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/prune`, null, "Prune"));
   });
 }
 
