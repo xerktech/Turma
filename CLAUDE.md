@@ -225,11 +225,16 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
-- **A refused heartbeat means one of two different things, and the agent must tell them apart**
+- **A refused heartbeat means one of two different things, and the agent tells them apart**
   (XERK-258): **413 = resize** (this body will never fit — the per-request cap), **503 = retry** (the
-  hub is holding too many concurrent bodies right now). The agent holds its staged `*Results` until
-  a POST succeeds, so re-sending the same payload next beat is the correct response to 503 and would
-  be an infinite loop for 413. Never collapse the two into one status.
+  hub is holding too many concurrent bodies right now). The agent holds its staged `*Results` until a
+  POST succeeds, so re-sending is right for 503 and an infinite loop for 413 — `post()` therefore
+  SHEDS a tier of staged results on 413 (`_shed_staged_results`) and keeps everything on 503. Never
+  collapse the two into one status.
+  - The hub's half of that contract is that a **413 has to be RECEIVABLE**: it drains the body before
+    answering, because node tears down a socket whose response finished before its request did, and
+    the agent's `urllib` writes its whole body before reading a byte. A 413 lost to a broken pipe is
+    the retry-forever loop with extra steps. Detail in `.claude/rules/turma.md`.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 

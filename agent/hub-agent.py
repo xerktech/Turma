@@ -14352,6 +14352,30 @@ class SessionManager:
         for urls in self.pending_prs.values():
             urls.clear()
 
+    # The on-demand deliverables staged for the next beat, biggest first. A 413
+    # sheds them in this order (see post): the first tier is what actually makes a
+    # beat multi-megabyte, and shedding the small caches with it would throw away
+    # a create/status outcome the UI is polling for, for no size gain.
+    SHED_TIERS = (
+        ("history_results", "subagent_history_results"),
+        ("jira_issue_results", "ticket_status_results",
+         "create_meta_results", "create_ticket_results"),
+    )
+
+    def _shed_staged_results(self):
+        """Drop staged on-demand results after the hub refused a beat as too
+        large, and describe what went. One tier per call, so a beat that is still
+        too big keeps shrinking beat by beat instead of losing everything at
+        once."""
+        for tier in self.SHED_TIERS:
+            shed = [f"{name}={len(getattr(self, name))}"
+                    for name in tier if getattr(self, name)]
+            if shed:
+                for name in tier:
+                    getattr(self, name).clear()
+                return ", ".join(shed)
+        return None
+
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
         (pending PR links are kept so they aren't lost on a failed beat)."""
@@ -14378,6 +14402,27 @@ class SessionManager:
             self.create_meta_results.clear()  # delivered — same lifecycle
             self.create_ticket_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
+        except urllib.error.HTTPError as e:
+            # 413 and 503 mean OPPOSITE things and must not be handled alike
+            # (CLAUDE.md's heartbeat wire contract, XERK-258):
+            #   503 — the hub is momentarily holding too many concurrent bodies.
+            #         Keep everything staged and re-send the SAME payload next
+            #         beat; it gets through as soon as the hub has room.
+            #   413 — this body will NEVER fit. Re-sending it is an infinite loop
+            #         that leaves the host offline forever, re-uploading the same
+            #         oversized beat every interval — the exact XERK-235 symptom
+            #         the 413 was introduced to replace. So shed what made it big.
+            if e.code == 413:
+                shed = self._shed_staged_results()
+                if shed:
+                    log(f"heartbeat refused as too large (413) — dropped staged {shed}; "
+                        f"re-open the view to fetch them again")
+                else:
+                    log("heartbeat refused as too large (413) with nothing staged to drop — "
+                        "the base payload itself is over the hub's cap")
+            else:
+                log(f"heartbeat failed: {e}")
+            return None
         except Exception as e:
             log(f"heartbeat failed: {e}")
             return None

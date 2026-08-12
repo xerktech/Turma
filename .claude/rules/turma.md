@@ -173,29 +173,56 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   `mem_limit` far below the sum of the constants it used to carry — a 32 MiB per-beat cap with no
   concurrency bound, and a 128 MiB pending-upload ceiling, inside 256m. **A ceiling above the limit
   the kernel kills on is not a ceiling**, and the kill takes every host's control plane with it.
-- **A per-request cap cannot bound concurrency, so there are two in-flight ceilings**, both reserved
-  against BEFORE a body is read (`bodyBudget`, reserving off `Content-Length` and re-reserving as
-  bytes actually arrive, so a chunked or under-declared body is bounded too):
+- **NEVER RESERVE AGAINST A LENGTH A CLIENT MERELY CLAIMS.** `bodyBudget` reserves only bytes that
+  have ACTUALLY ARRIVED (`note(len)`, per chunk). Reserving off `Content-Length` first — to refuse an
+  over-budget POST without paying to receive it — was an **unauthenticated remote DoS**: `POST
+  /api/login` reads a body before checking credentials, so 65 idle sockets that declared a body and
+  sent nothing filled the ledger and 503'd every heartbeat and login, at no cost to the sender.
+  - The declared length may still be **consulted**, because picking a status holds nothing:
+    `declaredOverCap` answers 413 on the headers, and `budget.peek` answers 503 on them. That early
+    refusal is what stops a flood of large declared bodies from streaming megabytes into the bin —
+    the sockets, not the bytes, are what OOMs at that scale.
+- **A per-request cap cannot bound concurrency, so there are two ceilings plus an escape:**
   - `BODY_INFLIGHT_MAX` (an eighth of the container) over **charged** bytes — each body's first
     `BODY_MAX` is free, so one host's multi-MiB `/history` delivery can't 503 the whole fleet's
     ordinary beats.
   - `BODY_INFLIGHT_TOTAL_MAX` (a quarter) over **every** in-flight byte. The free floor needs its own
     ceiling or it is a hole the size of the first bug: many small bodies OOM-killed the hub exactly
     as two 30 MiB beats did.
-- **A read alone in flight is always admitted to its own route cap.** `MIGRATE_BLOB_MAX` (65 MiB)
-  exceeds the budget at the deployed limit, and refusing a lone request the hub is sized for would be
-  an outage of our own making — concurrency is what the ceilings bound.
+  - **A read alone in flight escapes to its own route cap** (`MIGRATE_BLOB_MAX` is 65 MiB, over the
+    budget at the deployed limit, and refusing a lone request the hub is sized for would be an outage
+    of our own making) — but only while `retainedBytes()` + it fits `BODY_INFLIGHT_ESCAPE_MAX` (half
+    the container). Staged uploads and migration bundles are RAM too, and blobs plus one escaping body
+    was an OOM with every individual limit respected.
+  - **Retained bytes gate that escape and nothing else.** Charging them to the ceilings outright
+    refused ordinary heartbeats fleet-wide for as long as an attachment sat in a composer — a staged
+    upload lives 20 minutes.
+- **A refusal must REACH the client, and a 413 more than a 503.** The agent sheds its oversized
+  staged results only when it sees a 413, so a lost one is the retry-forever loop it replaced; a lost
+  503 costs nothing, since the client retries either way. So a 413 is **patient** — the body is read
+  to its declared end and the status sent only once the request is complete, because node tears down a
+  socket whose response finished first, and a client that writes everything before reading (python's
+  urllib, which is how the agent posts) would see a broken pipe. Patience is capped at
+  `PATIENT_REFUSALS_MAX` concurrent reads; everything else is refused terminally (paused, answered,
+  socket cut), because reading a body per refusal is what OOM-killed the hub under a flood.
+  - `Connection: close` goes only on a terminal refusal. On the patient path it IS the reset that
+    path exists to avoid.
 - **`release()` must run on every exit path**, which is why it is idempotent and guarded on `close`
   as well as `error`/`end`: a leaked reservation is never recovered, and enough of them refuse every
   large body for the life of the process.
-- **A body's bytes understate what it costs to hold** — a 30 MiB JSON beat measured ~93 MiB above
-  idle (accumulated string, then the parsed object graph). That factor is why the fractions are
-  eighths and quarters rather than halves; measurements are in the PR for XERK-258.
+- **A body's bytes understate what it costs to hold** — measured ~5x for a JSON body (accumulated
+  string, parsed object graph, then `sanitizeHeartbeat` re-serializing keys this hub doesn't know) and
+  ~2x for raw bytes (chunk list, then `Buffer.concat`). The startup banner warns when one lone body
+  could exceed the container on that basis; understating it is how the first version stayed silent at
+  the deployed limit. **`readRawBody` deliberately does NOT preallocate from `Content-Length`** — that
+  would size an allocation from a claim, one byte behind a 65 MiB header.
 - `readBody` decodes through a `StringDecoder`, not `data += chunk`: a UTF-8 sequence split across
   chunks became replacement bytes, silently corrupting transcript text hundreds of times in a
   multi-MiB beat.
-- Tests: the `XERK-258` cases in `server.test.js` (each one pinned by mutation — removing the budget,
-  the decoder or the derivation fails them).
+- **Watch for 32-bit truncation in these constants**: JS bitwise operators are 32-bit, so `64 << 30`
+  is `0` — a clamp written that way turned every derived ceiling into zero.
+- Tests: the `XERK-258` cases in `server.test.js` (each pinned by mutation — removing the budget, the
+  decoder or the derivation fails them), plus the 413/503 split in `test_hub_agent.py`.
 
 ## Durable archive
 

@@ -88,6 +88,14 @@ process.env.BODY_INFLIGHT_MAX_BYTES = String(2 << 20); // 2 MiB
 // floor. Wound down for the same reason, and to a multiple of the floor so the
 // flood case needs a dozen held sockets rather than hundreds.
 process.env.BODY_INFLIGHT_TOTAL_MAX_BYTES = String(6 << 20); // 6 MiB
+// The hard ceiling on a LONE body's escape past the two above. Deliberately kept
+// above HEARTBEAT_MAX rather than wound down with the others: a lone body has to
+// reach the handler for the checks BEYOND transport to have their say, and
+// squeezing this made an oversized-record beat answer 503 ("retry") where
+// XERK-235 requires 413 ("resize"). Under real memory pressure that swap is
+// correct — the hub protects itself first — but it must not be the normal case,
+// and at the deployed limit this is 128 MiB.
+process.env.BODY_INFLIGHT_ESCAPE_MAX_BYTES = String(40 << 20); // 40 MiB
 
 // A benign default global fetch. notify() no longer touches it (it fans out via
 // push.sendFcm, stubbed below); only transcribePcm/the audio WS use it, and
@@ -137,7 +145,7 @@ const {
   migrations, advanceMigrations,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
   detectMemoryLimit, BODY_INFLIGHT_MAX, BODY_INFLIGHT_FREE, BODY_INFLIGHT_TOTAL_MAX,
-  inFlightBodyBytes, inFlightTotalBytes,
+  BODY_INFLIGHT_ESCAPE_MAX, inFlightBodyBytes, inFlightTotalBytes, retainedBytes,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -1501,7 +1509,16 @@ test.after(() => server.close());
 
 function request(method, pathName, { body, headers } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request(baseUrl + pathName, { method, headers }, (res) => {
+    // Declare Content-Length, like every real client does (the agent's urllib,
+    // the browsers' fetch, Android/glasses' OkHttp all send a sized body). Node
+    // would otherwise send it CHUNKED, and a chunked body the hub refuses has no
+    // declared end to drain toward, so it is cut off rather than answered — a
+    // difference in what the test sees that no real caller would experience.
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const withLen = payload && !(headers && "content-length" in headers)
+      ? { ...headers, "content-length": String(payload.length) }
+      : headers;
+    const req = http.request(baseUrl + pathName, { method, headers: withLen }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
       res.on("end", () => {
@@ -1511,7 +1528,7 @@ function request(method, pathName, { body, headers } = {}) {
       });
     });
     req.on("error", reject);
-    if (body) req.write(JSON.stringify(body));
+    if (payload) req.write(payload);
     req.end();
   });
 }
@@ -1595,14 +1612,18 @@ function beatOfSize(device, bytes) {
 }
 
 /**
- * A POST that declares its full Content-Length, sends the first half, and holds
- * the socket open until `finish()`. That's what makes a second request genuinely
- * CONCURRENT with the first — an unthrottled pair of `request()` calls can
- * serialise over loopback, and then nothing is under test.
+ * A POST that sends all but the last byte of its body and holds the socket open
+ * until `finish()`. That's what makes a second request genuinely CONCURRENT with
+ * the first — an unthrottled pair of `request()` calls can serialise over
+ * loopback, and then nothing is under test.
+ *
+ * All but the LAST byte, not half, because the budget reserves only what has
+ * actually arrived (it must never reserve off a client's declared length — see
+ * the stall case below). A half-sent body would hold only half its charge.
  */
 function heldPost(pathName, body, headers) {
   const buf = Buffer.from(body);
-  const half = buf.length >> 1;
+  const half = buf.length - 1;
   let settle, fail;
   const response = new Promise((res, rej) => { settle = res; fail = rej; });
   const req = http.request(
@@ -1671,10 +1692,10 @@ test("http: a second large beat is refused (503) rather than buffered alongside 
       });
       assert.equal(second.status, 503, "over the budget is a RETRY, not a resize");
       assert.equal(second.headers["retry-after"], "1");
-      assert.ok(
-        second.body.inFlightLimit > 0,
-        "the refusal names the ceiling, so an operator can tell it from an ordinary outage"
-      );
+      // The ceiling and how full it was are LOGGED, never returned: /api/login
+      // reads a body before authenticating, so this reply is reachable by an
+      // unauthenticated caller and must not describe the hub's memory limits.
+      assert.deepEqual(Object.keys(second.body), ["error"]);
       held.finish();
       return held.response;
     }
@@ -1712,6 +1733,96 @@ test("http: an ordinary beat is never refused because a big one is in flight", a
       assert.equal(small.status, 200);
     }
   );
+});
+
+test("http: a socket that DECLARES a body and sends nothing reserves nothing (XERK-258)", async () => {
+  // The first version of this budget reserved off Content-Length before reading a
+  // byte, to refuse an over-budget POST without paying to receive it. That was an
+  // unauthenticated remote denial of service: `POST /api/login` reads its body
+  // BEFORE checking credentials, so a handful of idle sockets that declared a
+  // length and sent nothing filled the ledger and 503'd every heartbeat and every
+  // login for as long as they were held — no bytes, no credentials, no cost.
+  // Reserve only what has ARRIVED. Never trust a number a client merely claims.
+  const stalls = [];
+  try {
+    for (let i = 0; i < 8; i++) {
+      const sock = net.connect(new URL(baseUrl).port, "127.0.0.1");
+      stalls.push(sock);
+      await new Promise((r, rej) => { sock.once("connect", r); sock.once("error", rej); });
+      // Headers only, declaring a body far over both ceilings — then silence.
+      sock.write(
+        "POST /api/login HTTP/1.1\r\nHost: x\r\n" +
+          "Content-Type: application/json\r\n" +
+          `Content-Length: ${8 << 20}\r\n\r\n`
+      );
+    }
+    // Give the hub time to have parsed all eight sets of headers.
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(inFlightBodyBytes(), 0, "declared-but-unsent bytes must reserve nothing");
+    assert.equal(inFlightTotalBytes(), 0, "on either ledger");
+
+    // And the fleet is unaffected: a heartbeat and an unauthenticated login both
+    // still get a real answer rather than 503.
+    const beat = await request("POST", "/api/heartbeat", {
+      body: { device: "stall-victim" }, headers: agentHeaders,
+    });
+    assert.equal(beat.status, 200, "a stalled socket must not cost the fleet its heartbeat");
+    const login = await request("POST", "/api/login", { body: { user: "x", pass: "y" } });
+    assert.notEqual(login.status, 503, "nor lock everyone out of the dashboard");
+  } finally {
+    for (const s of stalls) s.destroy();
+  }
+  await waitUntil(() => inFlightTotalBytes() === 0, "the ledger to be clean after the stalls");
+});
+
+test("http: retained blobs gate a lone body's escape, but never an ordinary beat", async () => {
+  // A lone read escapes the concurrency ceilings up to its route cap. Held relay
+  // blobs are the same RAM, so the escape has to account for them — staged
+  // uploads plus one lone escaping body was an OOM with every individual limit
+  // respected. What must NOT happen is charging them to the ceilings outright: a
+  // staged upload lives 20 minutes, and that refused every ordinary heartbeat on
+  // the fleet for as long as an attachment sat in someone's composer.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "retHost", uploadMaxBytes: 1 << 25,
+            sessions: [{ id: "s1", repo: "R", status: "running" }] },
+    headers: agentHeaders,
+  });
+  // A body that escapes comfortably on its own...
+  const held = Math.floor(BODY_INFLIGHT_ESCAPE_MAX / 2);
+  const lone = BODY_INFLIGHT_ESCAPE_MAX - held + BODY_INFLIGHT_FREE + 1024; // just over, once held
+  assert.ok(lone - BODY_INFLIGHT_FREE < BODY_INFLIGHT_ESCAPE_MAX, "must escape when alone");
+  const before = await request("POST", "/api/heartbeat", {
+    body: JSON.parse(beatOfSize("retBefore", lone)), headers: agentHeaders,
+  });
+  assert.equal(before.status, 200);
+
+  // ...no longer fits once enough is held for retained + body to exceed the
+  // escape ceiling.
+  const staged = [];
+  const res = await requestRaw("POST",
+    "/api/agents/retHost/sessions/s1/uploads?name=held.bin",
+    { body: Buffer.alloc(held), headers: { ...userHeaders, "content-length": String(held) } });
+  assert.equal(res.status, 200, "staging the blob");
+  staged.push(res.body.uploadId);
+  try {
+    const beat = await request("POST", "/api/heartbeat", {
+      body: JSON.parse(beatOfSize("retBeat", lone)),
+      headers: { ...agentHeaders, connection: "close" },
+    });
+    assert.equal(beat.status, 503, "the escape must account for what is already held");
+    // The fleet keeps beating regardless — this is the part that must not break.
+    const small = await request("POST", "/api/heartbeat", {
+      body: { device: "retSmall" }, headers: agentHeaders,
+    });
+    assert.equal(small.status, 200, "an ordinary beat is never refused for retained memory");
+  } finally {
+    for (const id of staged) uploads.delete(id);
+  }
+  // Collected, and the lone body is admitted again.
+  const after = await request("POST", "/api/heartbeat", {
+    body: JSON.parse(beatOfSize("retAfter", lone)), headers: agentHeaders,
+  });
+  assert.equal(after.status, 200, "and the room comes back when the blob is collected");
 });
 
 test("http: many bodies each under the free floor are bounded too", async () => {
@@ -1845,18 +1956,31 @@ test("the memory ceilings are derived from the container limit, not from constan
   const at256 = freshServerModule((env) => {
     env.HUB_MEM_LIMIT_BYTES = String(256 << 20);
     delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+    delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
     delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
-  assert.equal(at256.BODY_INFLIGHT_MAX, 32 << 20, "an eighth of the container");
-  assert.equal(at256.UPLOAD_TOTAL_MAX_BYTES, 64 << 20, "a quarter of the container");
+  assert.equal(at256.BODY_INFLIGHT_MAX, 32 << 20, "charged: an eighth of the container");
+  assert.equal(at256.BODY_INFLIGHT_TOTAL_MAX, 64 << 20, "total in flight: a quarter");
+  assert.equal(at256.UPLOAD_TOTAL_MAX_BYTES, 32 << 20, "retained relay blobs: an eighth");
+  assert.equal(at256.BODY_INFLIGHT_ESCAPE_MAX, 128 << 20, "a lone body's escape: half");
+  // The numbers only mean something if the things they bound can be held AT ONCE:
+  // everything in flight plus everything retained has to leave the hub room to run
+  // in. Deriving each ceiling separately and never checking the sum is how the
+  // first version of this passed its own tests and still OOM'd.
   assert.ok(
-    at256.UPLOAD_TOTAL_MAX_BYTES + at256.BODY_INFLIGHT_MAX < (256 << 20),
-    "every ceiling together must still fit inside the container"
+    at256.BODY_INFLIGHT_TOTAL_MAX + at256.UPLOAD_TOTAL_MAX_BYTES <= (256 << 20) / 2,
+    "in-flight + retained must leave at least half the container for the hub itself"
   );
+  // A file the relay could accept but has no room to hold would be a 200 the hub
+  // cannot honour.
+  assert.ok(at256.UPLOAD_MAX_BYTES <= at256.UPLOAD_TOTAL_MAX_BYTES, "per file fits the pool");
 
   const at1g = freshServerModule((env) => {
     env.HUB_MEM_LIMIT_BYTES = String(1024 << 20);
     delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+    delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
     delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
   assert.equal(at1g.BODY_INFLIGHT_MAX, 128 << 20, "raising mem_limit raises the budget with it");
@@ -1866,6 +1990,8 @@ test("the memory ceilings are derived from the container limit, not from constan
   const tiny = freshServerModule((env) => {
     env.HUB_MEM_LIMIT_BYTES = String(64 << 20);
     delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+    delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
     delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
   assert.ok(tiny.UPLOAD_TOTAL_MAX_BYTES >= tiny.UPLOAD_MAX_BYTES);
@@ -1877,6 +2003,8 @@ test("the memory ceilings are derived from the container limit, not from constan
   const detected = freshServerModule((env) => {
     delete env.HUB_MEM_LIMIT_BYTES;
     delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+    delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
     delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
   assert.ok(Number.isFinite(detected.BODY_INFLIGHT_MAX) && detected.BODY_INFLIGHT_MAX >= (8 << 20));

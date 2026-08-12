@@ -9160,6 +9160,69 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.history_results, [])
         self.assertNotIn("historyResults", sm.build_payload(2))
 
+    def _http_error(self, code):
+        return ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", code, "refused", {}, None
+        )
+
+    def test_503_keeps_the_payload_for_the_next_beat(self):
+        # The hub answers 503 when it is momentarily holding too many concurrent
+        # request bodies (XERK-258). Re-sending the SAME beat is the correct
+        # response — it gets through as soon as the hub has room — so nothing may
+        # be dropped, or one busy moment silently costs an operator the history
+        # they asked for.
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": []})
+        sm.create_ticket_results.append({"cmdId": "c1", "key": "ENG-1"})
+        payload = sm.build_payload(0)
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                side_effect=self._http_error(503)):
+            self.assertIsNone(sm.post(payload))
+        self.assertEqual(len(sm.history_results), 1)
+        self.assertEqual(len(sm.create_ticket_results), 1)
+        self.assertEqual(sm.build_payload(1)["historyResults"], payload["historyResults"])
+
+    def test_413_sheds_the_big_results_instead_of_retrying_forever(self):
+        # A 413 says this body will NEVER fit. Re-sending it leaves the host
+        # offline forever, re-uploading the same oversized beat every interval —
+        # the XERK-235 symptom the 413 exists to replace. The big deliverables go
+        # first; the small ones survive, because they are not what made it big and
+        # a create/status outcome is something the UI is still polling for.
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": []})
+        sm.subagent_history_results.append({"sessionId": "s1", "agentId": "a1"})
+        sm.create_ticket_results.append({"cmdId": "c1", "key": "ENG-1"})
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                side_effect=self._http_error(413)):
+            self.assertIsNone(sm.post(sm.build_payload(0)))
+        self.assertEqual(sm.history_results, [])
+        self.assertEqual(sm.subagent_history_results, [])
+        self.assertEqual(len(sm.create_ticket_results), 1, "the small caches are a later tier")
+        self.assertNotIn("historyResults", sm.build_payload(1))
+
+        # Still refused with the big tier already gone: shed the next tier, so a
+        # beat that is somehow still too large keeps shrinking rather than wedging.
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                side_effect=self._http_error(413)):
+            self.assertIsNone(sm.post(sm.build_payload(2)))
+        self.assertEqual(sm.create_ticket_results, [])
+
+        # Nothing left to drop: it must still return None (and say so) rather
+        # than raise out of the heartbeat loop.
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                side_effect=self._http_error(413)):
+            self.assertIsNone(sm.post(sm.build_payload(3)))
+
+    def test_413_keeps_pending_pr_links(self):
+        # PR chips are not an on-demand deliverable and are tiny; shedding them
+        # would drop a session's PR from every surface to save nothing.
+        sm = self.make_manager()
+        sm.pending_prs["s1"] = ["https://github.com/o/r/pull/1"]
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                side_effect=self._http_error(413)):
+            self.assertIsNone(sm.post(sm.build_payload(0)))
+        self.assertEqual(sm.pending_prs["s1"], ["https://github.com/o/r/pull/1"])
+
     def test_multiple_pending_requests_batch(self):
         sm = self.make_manager()
         sm.registry = []
