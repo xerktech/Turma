@@ -232,6 +232,20 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
+  - **A full `/api/agents` decode is ATOMIC on Android**, so one host's wrong-typed field throws for
+    the whole array — the poll fails silently while the app keeps its last snapshot and the tile
+    still says "N / N online". Per-agent SSE events decode individually, so the bad host is simply
+    missing from the list while SSE is healthy; with SSE down too, the raw decoder exception
+    replaces the screen. **Most of the payload is served raw**, so this is a live hazard, not a
+    solved one: grep `normalize`/`sanitize` in `turma/server.js` for what is actually covered rather
+    than trusting a list here, which has been wrong repeatedly.
+  - **A field becomes decode-fatal the moment a client TYPES it** — until then `ignoreUnknownKeys`
+    skips it and any value is harmless. So typing one on `SessionInfo`/`AgentInfo` and adding its
+    hub-side coercion are the SAME change; `normalizeRecord` is where it goes, and it runs on both
+    the heartbeat ingest and the `state.json` restore (a restart is when a coercion ships, and the
+    restore is the first thing it serves). Coerce to the "can't tell you" value every client already
+    handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer agent
+    adds is dropped fleet-wide unless it is added there too.
 - **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses
   commands with a status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host
   offline, 404 stale attachment, 413 too long, 429 queue full); a client that reads the body and

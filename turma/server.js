@@ -90,6 +90,15 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// Bounds for a session's live agent rows (sanitizeLiveAgents, far below). They
+// live UP HERE, away from their function, because the state.json restore runs
+// at module init and calls that function: a `const` declared later is in its
+// temporal dead zone then, so reading one throws a ReferenceError that the
+// restore's own `catch {}` swallows — the record loads half-coerced and says
+// nothing. Any constant a restore-path function reads has to be declared above
+// the restore.
+const LIVE_AGENTS_MAX = 32;
+const LIVE_AGENT_FIELD_MAX = 400;
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -363,10 +372,14 @@ const liveClients = {};
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
   agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  // Records written before the ingest-side coercion below (and any host that is
-  // OFFLINE, so no beat will ever rewrite its record) still carry the legacy
-  // per-model usage shape — normalize what we load, not just what arrives.
-  for (const a of Object.values(agents)) normalizeUsage(a);
+  // Records written before a coercion existed — and any host that is OFFLINE,
+  // so no beat will ever rewrite its record — carry whatever shape was current
+  // when they were saved. Normalize what we LOAD, not just what arrives: the
+  // first `/api/agents` after a restart serves the raw record, and a hub
+  // restart is exactly when a new coercion ships. `normalizeRecord` is shared
+  // with the ingest path so the two cannot drift; adding a coercion in one
+  // place covers both. Tests: `the state.json restore coerces too`.
+  for (const a of Object.values(agents)) normalizeRecord(a);
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
 } catch {
   /* first boot or no volume mounted */
@@ -1116,8 +1129,22 @@ function normalizeModelUsage(usage) {
 function normalizeUsage(payload) {
   if (!payload || typeof payload !== "object") return;
   normalizeModelUsage(payload.usage);
-  for (const r of payload.repoUsage || []) normalizeModelUsage(r && r.usage);
-  for (const s of payload.sessions || []) normalizeModelUsage(s && s.usage);
+  // `Array.isArray`, not `|| []`: a non-iterable `repoUsage`/`sessions` (an
+  // OBJECT, say) makes a bare `for…of` THROW, and a throw here is uniquely
+  // costly — on the restore path it lands in a silent `catch {}` and abandons
+  // every host after this one, uncoerced, on every boot.
+  // Both are typed LISTS on Android, so a non-array is decode-fatal for the
+  // WHOLE fleet payload, not just this host — rewrite it rather than merely
+  // stepping around it. (Safe because normalizeRecord runs past the raw-size
+  // gate; before it, this would have shrunk away an amplifier.)
+  if (!Array.isArray(payload.repoUsage)) {
+    if ("repoUsage" in payload) payload.repoUsage = [];
+  } else {
+    for (const r of payload.repoUsage) normalizeModelUsage(r && r.usage);
+  }
+  if (Array.isArray(payload.sessions)) {
+    for (const s of payload.sessions) normalizeModelUsage(s && s.usage);
+  }
 }
 
 // The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for
@@ -1153,6 +1180,68 @@ function normalizeLimits(payload) {
   out.capturedAt = captured;
   if (typeof lim.source === "string") out.source = lim.source.slice(0, 32);
   payload.limits = out;
+}
+
+// Coerce the local-model block at ingest, for exactly the reason normalizeLimits
+// above does it (XERK-246): this fans out to web, Android and glasses, and
+// Android decodes it into TYPED fields — `available: Boolean`, `contextTokens:
+// Int?` — so an `available` of "yes" or a contextTokens past 2^31 from ONE buggy
+// host fails the decode of the WHOLE /api/agents array, and every other host
+// silently vanishes from that phone's fleet.
+//
+// Anything unusable becomes null, which every client already reads as "this host
+// cannot fail over" — the same degradation as an agent too old to report it.
+function normalizeLocalModel(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const lm = payload.localModel;
+  if (!lm || typeof lm !== "object" || Array.isArray(lm)) {
+    if ("localModel" in payload) payload.localModel = null;
+    return;
+  }
+  // Strictly boolean: a truthy string would turn a host that cannot fail over
+  // into one the UI offers the switch on, and the command would be dropped.
+  if (lm.available !== true) {
+    payload.localModel = { available: false, model: null, contextTokens: null };
+    return;
+  }
+  // Nothing XML-ILLEGAL may leave here, from either direction — the whole class,
+  // not just the one case that bit us. A lone surrogate, a C0 control and the
+  // noncharacters U+FFFE/U+FFFF are all unencodable in XML, and each kills
+  // Android's `uiautomator dump` outright (`KXmlSerializer: Illegal character`
+  // / a 0-byte file), i.e. the tool a QA pass drives the app with. Cutting with
+  // `slice(60)` through an astral pair MANUFACTURES a lone surrogate, so that
+  // cut is on CODE POINTS and runs after the strip. Only a rogue agent reaches
+  // this — a real one is bounded by LOCAL_MODEL_NAME_RE — which is this
+  // function's whole threat model.
+  //
+  // BOUND FIRST, THEN SPREAD. `[...s]` materialises one array element per code
+  // point over the WHOLE string, and this runs BEFORE the AGENT_RECORD_MAX check
+  // that refuses an oversized beat — so spreading the raw value let a single
+  // agent-authed heartbeat with a 24 MiB name OOM-kill the hub at its deployed
+  // `mem_limit: 256m` (32M chars measured at 288 MB heap), which
+  // `restart: unless-stopped` turns into an outage loop of the fleet's whole
+  // control plane. 512 UTF-16 units is far more than the 60 code points that
+  // survive, and cutting there can only split an astral pair — which the
+  // surrogate replace immediately below then handles.
+  const name = typeof lm.model === "string"
+    ? [...lm.model.slice(0, 512)
+        .replace(/\p{Surrogate}/gu, "�")     // unpaired halves -> replacement
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]/g, "")  // XML-illegal
+        .trim()]
+      .slice(0, 60).join("")
+    : "";
+  const ctx = lm.contextTokens;
+  payload.localModel = {
+    available: true,
+    // The name is display-only here (the agent validates its own charset before
+    // launching), but it must be A STRING or the decode dies.
+    model: name || null,
+    // Int-safe or nothing: the field is unused by the UI, so dropping a bad one
+    // costs nothing and keeps the fleet decodable.
+    contextTokens:
+      typeof ctx === "number" && Number.isSafeInteger(ctx) &&
+      ctx > 0 && ctx <= 2_147_483_647 ? ctx : null,
+  };
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
@@ -1810,15 +1899,146 @@ function sanitizeHeartbeat(payload, key) {
   // session's live agent rows come from a pane scrape and are re-shaped and
   // bounded here for the same reason the `turn` frame's are — the clients turn
   // this list into a count and a label, and nothing else bounds it.
+  // Pre-ceiling, so this may only ever SHRINK (see normalizeRecord, which runs
+  // past the gate and is free to rewrite). Live agent rows come from a pane
+  // scrape and are re-shaped and bounded here for the same reason the `turn`
+  // frame's are — clients turn this list into a count and a label, and nothing
+  // else bounds it.
   if (Array.isArray(payload.sessions)) {
     for (const s of payload.sessions) {
-      const live = s && typeof s === "object" ? s.session : null;
-      if (live && typeof live === "object" && "agents" in live) {
+      const live = objectish(s) ? s.session : null;
+      if (objectish(live) && "agents" in live) {
         live.agents = sanitizeLiveAgents(live.agents) || [];
       }
     }
   }
   return payload;
+}
+
+/**
+ * Is this a plain object — the thing a client that TYPED a field will accept?
+ *
+ * The one predicate every shape check in the coercion path goes through, because
+ * the obvious spelling is wrong in the same way every time: `typeof [] ===
+ * "object"`, so `!x || typeof x !== "object"` passes arrays straight through,
+ * and the follow-on `"k" in []` is false so an array is neither coerced nor
+ * rejected. Both escapes were measured the same way — the Android login probe
+ * decodes /api/agents, so one raw array anywhere in the payload reads as "Could
+ * not reach the hub" and the app cannot sign in at all.
+ *
+ * A `function` declaration, not a `const`: it is used ~70 lines ABOVE this point
+ * by `sanitizeHeartbeat`, and this file has already shipped a coercion that
+ * threw a ReferenceError at module init from exactly that pattern (a const in
+ * its temporal dead zone, swallowed by the restore's `catch {}` — see
+ * `normalizeRecord`'s ordering comment). Declarations hoist; consts do not.
+ */
+function objectish(x) {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
+
+/**
+ * Every coercion an agent record needs before a client sees it, in ONE place.
+ *
+ * Called from the heartbeat ingest and from the `state.json` restore, because a
+ * coercion applied at only one of those is a hole straight through itself: the
+ * restore serves whatever was persisted, for one beat on a live host and up to
+ * the record's whole life on an offline one. Add a new `normalize*` HERE and
+ * both paths get it.
+ *
+ * The stakes are Android's: `/api/agents` decodes atomically into typed fields,
+ * so one host's wrong-typed value throws for the whole array and every OTHER
+ * host silently disappears from that phone.
+ */
+function normalizeRecord(a) {
+  // Order is NOT load-bearing, and must not become so: each of these guards its
+  // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
+  // here lands in the restore's silent `catch {}` and abandons every host after
+  // this one, uncoerced, on every boot. Sessions first only because it is the
+  // one that rewrites a shape the others iterate.
+  normalizeSessions(a);
+  normalizeUsage(a);
+  normalizeLimits(a);
+  normalizeLocalModel(a);
+}
+
+/**
+ * The heartbeat's coercion step, reached through a holder so a test can force it
+ * to throw (XERK-262). Production always holds the real [normalizeRecord]; only
+ * a `TURMA_TEST` suite ever replaces `normalize`.
+ *
+ * The indirection exists because the backstop around this call cannot be
+ * reached from the heartbeat wire today, and a QA mutation pass deleted the
+ * whole try/catch with the suite green.
+ *
+ * Why it is unreachable: every `normalize*` guards its own input shape, so the
+ * only throw the path has ever had was `sanitizeLiveAgents`'s `String(...)` on a
+ * value with no primitive conversion (pure JSON can express one —
+ * `{"toString":1,"valueOf":1}`), and `sanitizeHeartbeat` walks those same rows
+ * BEFORE any record is installed. Do not read that as "the input is impossible":
+ * the same value reaches `sanitizeLiveAgents` from the `/agent/control` frame
+ * handler, where nothing catches it (XERK-278).
+ *
+ * Being unreachable is exactly why deleting this catch reads as safe. It is not:
+ * `agents[key] = next` has ALREADY run by the time the coercion is called, so
+ * without the rollback a throw leaves the RAW, uncoerced record installed and
+ * served — defeating every gate downstream, `normalizeLocalModel`'s
+ * strict-boolean `available` check included. One `normalize*` that can throw on
+ * an input `sanitizeHeartbeat` does not walk makes this load-bearing with no
+ * other warning.
+ */
+const recordCoercion = { normalize: normalizeRecord };
+
+// The per-SESSION coercions (see normalizeRecord).
+//
+// `sessions` is a KNOWN key, so sanitizeHeartbeat's unknown-field sweep never
+// looks inside it — everything typed under a session has to be handled here.
+// Android decodes /api/agents into typed fields, so an object or array where it
+// expects a String throws for the WHOLE array and every other host disappears
+// from that phone; a field only becomes this dangerous once a client TYPES it,
+// which is why `modelSource`/`modelSourceAt` are here from the commit that
+// declared them on `SessionInfo`.
+function normalizeSessions(payload) {
+  if (!payload || typeof payload !== "object") return;
+  // A non-array `sessions` is REWRITTEN, not skipped. It is decode-fatal on
+  // Android — measured as the app failing to sign in at all, reporting "Could
+  // not reach the hub" — and on the restore path it also throws out of
+  // normalizeUsage's `for … of`, silently abandoning the record. Rewriting is
+  // safe only because this now runs PAST the AGENT_RECORD_MAX gate: doing it
+  // before would have erased the amplifier that gate exists to refuse.
+  if (!Array.isArray(payload.sessions)) {
+    if ("sessions" in payload) payload.sessions = [];
+    return;
+  }
+  // DROP a non-object element, never skip past it: `sessions` is typed
+  // `List<SessionInfo>` on Android, so a `null` or a bare string in the array is
+  // as fatal as a wrong-typed field inside one — measured as a host silently
+  // missing from the phone while the tile still counted it.
+  if (!payload.sessions.every(objectish)) payload.sessions = payload.sessions.filter(objectish);
+  for (const s of payload.sessions) {
+    // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
+    // never goes through that: idempotent, so running twice costs nothing.
+    //
+    // REWRITE a non-object `session`, never merely skip past it. `session` is
+    // typed `LiveSignals?` on Android, so any non-object is decode-fatal for
+    // the WHOLE /api/agents array — measured as the app unable to sign in at
+    // all, since the login probe decodes it and reads the throw as "Could not
+    // reach the hub". Skipping the sanitize is NOT enough: the raw value stays
+    // in the record and is what gets served. `null` is the "can't tell you"
+    // value every client already handles.
+    //
+    // An array is the case a bare `typeof live === "object"` guard misses, and
+    // `"agents" in []` is false, so it fell through both halves of the old
+    // test. Rewriting is safe here only because normalizeSessions runs PAST the
+    // AGENT_RECORD_MAX gate — see normalizeRecord's ordering comment.
+    if ("session" in s && !objectish(s.session)) s.session = null;
+    const live = s.session;
+    if (live && "agents" in live) {
+      live.agents = sanitizeLiveAgents(live.agents) || [];
+    }
+    for (const k of ["modelSource", "modelSourceAt"]) {
+      if (k in s && typeof s[k] !== "string") s[k] = "";
+    }
+  }
 }
 
 // Thrown past the cap so a route can answer 413 instead of leaking a generic
@@ -2220,8 +2440,6 @@ function fmtDur(ms) {
 // and cost that repaint; the cap matches the agent's own PANE_AGENTS_MAX.
 // `null` (not `[]`) for a frame with no `agents` key at all, so the chat can
 // tell "this agent can't report them" from "no agents are running".
-const LIVE_AGENTS_MAX = 32;
-const LIVE_AGENT_FIELD_MAX = 400;
 function sanitizeLiveAgents(raw) {
   if (!Array.isArray(raw)) return null;
   const out = [];
@@ -3581,8 +3799,6 @@ const server = http.createServer(async (req, res) => {
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
-      normalizeUsage(payload);
-      normalizeLimits(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.
@@ -3678,6 +3894,40 @@ const server = http.createServer(async (req, res) => {
       // and then restoring `prev` restored an object the ingests had already
       // mutated — a refused beat still poisoned the caches and its content came
       // back out of /history with a 413 on the wire.
+      const refuseOversized = (size) => {
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        console.error(
+          `heartbeat from ${key}: record is ${size} bytes, over the ` +
+            `${AGENT_RECORD_MAX} limit — beat refused`
+        );
+        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+      };
+      // TWO measurements, one ceiling. The RAW size is the amplifier check: a
+      // coercion that discards junk must not be able to shrink an oversized
+      // beat into an accepted one (rewriting an 8 MiB string `sessions` to `[]`
+      // did exactly that, turning a 413 into a 200). The COERCED size is what
+      // actually gets stored and served, and a coercion can EXPAND —
+      // normalizeModelUsage rewrites `"m"` to `{model:"m"}`, ~3.5x, so an 8 MiB
+      // beat of model names parked 28 MiB per host for a week. Neither
+      // measurement alone holds the ceiling.
+      const rawSize = agentRecordSize(next);
+      if (rawSize > AGENT_RECORD_MAX) return refuseOversized(rawSize);
+      // Coercion sits BETWEEN the two, so it never walks an unbounded record —
+      // that is how a 24 MiB model name reached a per-code-point spread and
+      // OOM-killed the hub. A throw here would leave the RAW record installed
+      // (`agents[key] = next` is already done), which is worse than refusing:
+      // it defeats every gate downstream, including localModelAvailable's
+      // strict-boolean check. The coercions are written not to throw; this is
+      // the backstop that makes that not matter.
+      try {
+        recordCoercion.normalize(next);
+      } catch (e) {
+        console.error(`heartbeat from ${key}: coercion failed (${e.message}) — beat refused`);
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        return json(res, 400, { error: "malformed heartbeat" });
+      }
       const recordSize = agentRecordSize(next);
       // Visible BEFORE it 413s. Measured against the operator's real fleet the
       // largest record is 0.30 MiB, so half the ceiling means something has
@@ -3693,15 +3943,7 @@ const server = http.createServer(async (req, res) => {
         );
       }
       recordSizeWarned.set(key, overHalf);
-      if (recordSize > AGENT_RECORD_MAX) {
-        if (prev && Object.keys(prev).length) agents[key] = prev;
-        else delete agents[key];
-        console.error(
-          `heartbeat from ${key}: record is ${recordSize} bytes, over the ` +
-            `${AGENT_RECORD_MAX} limit — beat refused`
-        );
-        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
-      }
+      if (recordSize > AGENT_RECORD_MAX) return refuseOversized(recordSize);
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
@@ -5434,6 +5676,16 @@ if (process.env.TURMA_TEST) {
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
     HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+    // Ingest coercion, exported for the same reason as the rest of this group:
+    // Android decodes /api/agents atomically, so one host's wrong-typed field
+    // hides the WHOLE fleet from that phone (XERK-246). `normalizeRecord` is
+    // the one both the ingest path and the state.json restore call.
+    normalizeRecord,
+    normalizeLocalModel,
+    // The holder the heartbeat's coercion step goes through, exported so a test
+    // can make it throw and hold the rollback that follows (XERK-262). See its
+    // declaration for why that rollback cannot be reached from the wire.
+    recordCoercion,
 
     queueCommand,
     findSession,

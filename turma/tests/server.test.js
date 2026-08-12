@@ -6825,3 +6825,421 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
 });
 
+test("normalizeLocalModel coerces the block so one host cannot hide the fleet", () => {
+  // Android decodes /api/agents ATOMICALLY into typed fields, so a wrong-typed
+  // localModel from ONE host throws for the whole array and every other host
+  // silently disappears from that phone. Same contract, and same reason, as
+  // normalizeLimits beside it.
+  const norm = (localModel) => {
+    const p = { device: "h", localModel };
+    hub.normalizeLocalModel(p);
+    return p.localModel;
+  };
+
+  // A good block passes through unchanged.
+  assert.deepEqual(
+    norm({ available: true, model: "gpt-oss:120b", contextTokens: 81920 }),
+    { available: true, model: "gpt-oss:120b", contextTokens: 81920 },
+  );
+
+  // `available` is STRICTLY boolean: a truthy string would offer the switch on
+  // a host that cannot do it, and the command would be acked and dropped.
+  assert.deepEqual(norm({ available: "yes", model: "x" }),
+    { available: false, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: 1 }),
+    { available: false, model: null, contextTokens: null });
+
+  // A non-string model and an out-of-Int contextTokens degrade to null rather
+  // than failing the decode. contextTokens is unused by the UI, so this is free.
+  assert.deepEqual(norm({ available: true, model: 12345, contextTokens: 9999999999 }),
+    { available: true, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: true, model: "m", contextTokens: 1.5 }),
+    { available: true, model: "m", contextTokens: null });
+
+  // The name is BOUNDED, and cut on code points. A UTF-16 `slice` through an
+  // astral pair emits a lone surrogate — unencodable, and it kills Android's
+  // uiautomator outright. Nothing else pins this length.
+  const long = norm({ available: true, model: "x".repeat(500) });
+  assert.equal(long.model.length, 60);
+  const astral = norm({ available: true, model: "x".repeat(59) + "😀" + "tail" });
+  assert.equal([...astral.model].length, 60);
+  assert.ok(astral.model.isWellFormed(), "the cut manufactured a lone surrogate");
+  // ...and one that ARRIVES that way is replaced, not passed through. Either
+  // direction kills uiautomator, so the guarantee has to cover both.
+  for (const evil of ["qwen\uD83Dcoder", "abc\uDE00def", "x".repeat(59) + "\uD83Dtail"]) {
+    assert.ok(norm({ available: true, model: evil }).model.isWellFormed(),
+      `a lone surrogate survived: ${JSON.stringify(evil)}`);
+  }
+  // The guarantee is the whole XML-ILLEGAL class, not just surrogates: a C0
+  // control and the noncharacters U+FFFE/U+FFFF each kill `uiautomator dump`
+  // the same way (a 0-byte file), and closing only the case that bit us leaves
+  // the next one to be rediscovered — which is how the second and third of
+  // these were found, one pass apart.
+  const ctl = norm({ available: true, model: "qwen\x01ctl\x00nul\x0bvt\x7fdel" });
+  assert.equal(ctl.model, "qwenctlnulvtdel");
+  assert.equal(norm({ available: true, model: "qwen\uffffbad\ufffemore" }).model, "qwenbadmore");
+  // ...but U+FDD0 and U+1FFFE are LEGAL XML and must survive: over-stripping
+  // would mangle a name for no reason.
+  assert.equal(norm({ available: true, model: "a\ufdd0b\u{1FFFE}c" }).model, "a\ufdd0b\u{1FFFE}c");
+  // Tab/newline/CR are legal XML and are only trimmed at the edges.
+  assert.equal(norm({ available: true, model: "  a\tb  " }).model, "a\tb");
+
+  // Not an object at all -> null, which every client reads as "cannot fail over".
+  assert.equal(norm("yes"), null);
+  assert.equal(norm([1, 2]), null);
+  assert.equal(norm(null), null);
+
+  // An agent predating the failover sends nothing; the key must stay absent
+  // rather than become an explicit null, so the payload is byte-identical.
+  const old = { device: "h" };
+  hub.normalizeLocalModel(old);
+  assert.ok(!("localModel" in old));
+});
+
+test("the state.json restore coerces too, not just the ingest path", () => {
+  // A hub restart is exactly when a new coercion ships, and the restore is the
+  // FIRST thing it serves. A record written before it — or belonging to an
+  // OFFLINE host, where no beat will ever rewrite it — would otherwise reach
+  // the phone raw and throw for the whole fleet. Held here rather than by
+  // booting a second hub: the loader is a bare `for` over the parsed blob, so
+  // what matters is that all three coercions are applied to a loaded record.
+  const restored = {
+    device: "old",
+    localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+    limits: { fiveHour: { usedPct: "lots" } },
+  };
+  hub.normalizeLocalModel(restored);
+  assert.deepEqual(restored.localModel,
+    { available: false, model: null, contextTokens: null });
+
+  // The durable form of "the restore can't fall behind the ingest": both go
+  // through ONE function, so there is no list here to keep in step. A previous
+  // version of this test named three coercions and therefore could not notice
+  // the fourth (`sanitizeLiveAgents`) missing from the restore — enumerating is
+  // exactly the shape that let the hole exist.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const loader = src.slice(src.indexOf("agents = JSON.parse"), src.indexOf("first boot or no volume"));
+  assert.ok(/normalizeRecord\(a\)/.test(loader),
+    "the state.json restore must go through normalizeRecord, like the ingest path");
+  const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
+    src.indexOf("ingestHistory(next, historyResults)"));
+  // The ingest reaches it through `recordCoercion` (XERK-262) so a test can
+  // force the backstop around it to run; that holder carries `normalizeRecord`
+  // itself, which is asserted directly by "the coercion holder runs the real
+  // normalizeRecord in production". So this stays a check that the ingest and
+  // the restore share ONE function, not a list of coercions to keep in step.
+  assert.ok(/recordCoercion\.normalize\(next\)/.test(ingest),
+    "the heartbeat ingest must go through the same normalizeRecord");
+  // ...and BETWEEN the two size measurements. Before the raw check it could
+  // shrink away the amplifier the ceiling exists to refuse (an 8 MiB string
+  // `sessions` became `[]` and the beat 200'd); after the coerced check, an
+  // EXPANDING coercion escapes the ceiling entirely (normalizeModelUsage is
+  // ~3.5x, and an 8 MiB beat parked 28 MiB per host for a week).
+  const iRaw = ingest.indexOf("rawSize > AGENT_RECORD_MAX");
+  const iCoerce = ingest.indexOf("recordCoercion.normalize(next)");
+  const iStored = ingest.indexOf("recordSize > AGENT_RECORD_MAX");
+  assert.ok(iRaw > -1 && iCoerce > iRaw && iStored > iCoerce,
+    "the ingest must measure raw size, THEN coerce, THEN measure the stored size");
+});
+
+test("the restore actually RUNS — it must not throw into its own catch", () => {
+  // The restore sits at module init inside `try { … } catch {}`, so anything it
+  // throws is swallowed: the record loads HALF-coerced, with no log line and no
+  // error anywhere. That is not hypothetical — `sanitizeLiveAgents` read two
+  // module `const`s declared 1700 lines BELOW the restore, i.e. in their
+  // temporal dead zone at that moment, so the localModel half was applied and
+  // the session half silently was not, with every suite green.
+  //
+  // Held BEHAVIOURALLY, by loading the real module against a fixture in a child
+  // process. An earlier version asserted the line order of two constants BY
+  // NAME, which a third constant walks straight past — the same enumerate-the-
+  // instances mistake that let the original hole exist.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-"));
+  const state = {
+    h1: {
+      device: "h1", online: true,
+      localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+      limits: { fiveHour: { usedPct: "lots" } },
+      sessions: [
+        null,                                        // decode-fatal element
+        { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"],
+          session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+        "not-a-session",
+      ],
+    },
+  };
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(state));
+  const out = require("child_process").execFileSync(process.execPath, ["-e", `
+    process.env.TURMA_TEST = "1";
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    // Marker-delimited: the loader logs "loaded N agents …" to stdout on the
+    // way past, and that line landing here is itself the proof it ran.
+    process.stdout.write("<<<" + JSON.stringify(hub.agents) + ">>>");
+    process.exit(0);
+  `], {
+    env: { ...process.env, TURMA_TEST: "1", STATE_FILE: path.join(dir, "state.json"),
+           ARCHIVE_DIR: path.join(dir, "a"), ARCHIVE_DB: path.join(dir, "a.db"),
+           NODE_NO_WARNINGS: "1" },
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+  assert.match(out, /loaded 1 agents from/,
+    "the restore did not run — it threw into its own catch");
+  const rec = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>"))).h1;
+  assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null });
+  assert.equal(rec.limits, null);
+  assert.equal(rec.sessions.length, 1, "non-object session elements must be dropped");
+  assert.equal(rec.sessions[0].modelSource, "");
+  assert.equal(rec.sessions[0].modelSourceAt, "");
+  assert.deepEqual(rec.sessions[0].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+});
+
+test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
+  // `[...s]` allocates per code point over the WHOLE string, so an unbounded
+  // spread let one agent-authed heartbeat with a 24 MiB name OOM-kill the hub
+  // at its deployed `mem_limit: 256m`, on repeat.
+  //
+  // Two assertions, because neither is sufficient alone. A RESOURCE BUDGET is
+  // the honest behavioural check but is nondeterministic at close margins — an
+  // earlier version used 8 MiB against 50ms/64MB and caught the reintroduced
+  // bug only 5 runs in 8, decided by whether a GC landed between the samples.
+  // So the budget runs at 32 MiB (`HEARTBEAT_MAX`, the largest a beat can carry)
+  // with ~10x headroom, and a STRUCTURAL assertion holds the ordering exactly.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const spread = src.slice(src.indexOf("const name = typeof lm.model"), src.indexOf(".slice(0, 60)"));
+  assert.match(spread, /\[\.\.\.lm\.model\.slice\(/,
+    "the model name must be bounded BEFORE the per-code-point spread");
+
+  const huge = { device: "h", localModel: { available: true, model: "x".repeat(32 << 20) } };
+  const t0 = process.hrtime.bigint();
+  hub.normalizeRecord(huge);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.equal(huge.localModel.model, "x".repeat(60));
+  // Bounded: ~0.1ms. Unbounded at this size: several hundred ms and ~600 MB.
+  assert.ok(ms < 60, `coercing a 32 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
+});
+
+test("http: an EXPANDING coercion cannot escape the record ceiling", async () => {
+  // normalizeModelUsage rewrites `"m"` to `{model:"m"}` — ~3.5x. Measuring only
+  // the raw size let an 8 MiB beat of bare model names park 28 MiB per host for
+  // a week, in state.json, in every /api/agents response and every SSE frame:
+  // exactly the amplification the ceiling was added to stop.
+  const host = "fat-expand";
+  const models = new Array(2_000_000).fill("m");
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [], usage: { models } },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(agents[host], undefined, "a refused beat must not install a record");
+});
+
+test("http: a beat whose coercion throws is refused, never installed raw", async () => {
+  // The coercion runs AFTER `agents[key] = next`, so a throw inside it would
+  // leave the RAW record installed — worse than refusing, because every gate
+  // downstream then reads uncoerced values (`localModelAvailable` treats the
+  // string "yes" as true and hands out a switch the host cannot honour), and
+  // the poison reaches state.json where the restore chokes on it forever.
+  const host = "throw-host";
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    // A non-iterable `repoUsage` used to throw out of normalizeUsage's `for…of`.
+    body: { device: host, sessions: [], repoUsage: { a: 1 },
+            localModel: { available: "yes" } },
+  });
+  // Either it coerces cleanly (the guards below) or it is refused — never both
+  // 4xx AND installed.
+  if (res.status !== 200) {
+    assert.equal(agents[host], undefined, "a refused beat must not install a record");
+  } else {
+    // Accepted means fully coerced — never accepted-and-raw, which is the state
+    // that defeats every gate downstream and poisons state.json.
+    assert.equal(agents[host].localModel.available, false, "served uncoerced");
+    assert.deepEqual(agents[host].repoUsage, [], "a non-array repoUsage must not be served");
+  }
+  // And the capability gate must not be fooled by the raw string either way.
+  const spawn = await request("POST", `/api/agents/${host}/sessions`, {
+    headers: userHeaders, body: { repo: "Turma", modelSource: "local" },
+  });
+  assert.equal(spawn.status, 409, "an uncoerced `available` must not pass the gate");
+});
+
+test("normalizeUsage survives a non-iterable repoUsage or sessions", () => {
+  // A bare `for (… of payload.repoUsage || [])` throws on an object, and on the
+  // restore path that throw aborts EVERY host after this one, silently.
+  for (const bad of [{ a: 1 }, "str", 7, true]) {
+    const p = { device: "h", repoUsage: bad, sessions: bad, usage: { models: ["m"] } };
+    hub.normalizeRecord(p);             // must not throw
+    // BOTH are typed lists on Android, so both are rewritten — not merely
+    // stepped around. Guarding the loop alone turned a 400 (which never
+    // installed the host) into a 200 serving a fleet-killing shape.
+    assert.deepEqual(p.sessions, []);
+    assert.deepEqual(p.repoUsage, []);
+  }
+});
+
+test("normalizeSessions coerces the per-session fields Android types", () => {
+  // Typing a field on `SessionInfo` is what makes it decode-fatal: before that
+  // `ignoreUnknownKeys` skipped it and any value was harmless. `modelSource`
+  // and `modelSourceAt` were typed by XERK-246, so they are coerced from it.
+  const payload = {
+    device: "h",
+    sessions: [
+      { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"] },
+      { id: "s2", modelSource: "local", modelSourceAt: "2026-08-11T00:00:00Z" },
+      { id: "s3", session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+      // `session` itself, not just its `agents`. `"agents" in []` is false, so
+      // a bare `typeof live === "object"` guard neither coerces nor rejects an
+      // ARRAY here and serves it raw — `LiveSignals?` is typed on Android, so
+      // that is decode-fatal for the whole payload and blocks sign-in.
+      { id: "s5", session: [] },
+      { id: "s6", session: [1, 2] },
+      { id: "s7", session: "busy" },
+      { id: "s8", session: 7 },
+      // Every non-object shape, not a representative one. An ARRAY element is
+      // the case a `typeof s !== "object"` predicate misses (`typeof [] ===
+      // "object"`), and it is decode-fatal exactly like the other two: measured
+      // as the Android app unable to SIGN IN, because the login probe decodes
+      // /api/agents and reads the throw as "Could not reach the hub".
+      null,
+      "nope",
+      [1, 2],
+      [],
+    ],
+  };
+  hub.normalizeRecord(payload);
+  assert.equal(payload.sessions.length, 7, "every non-object ELEMENT is dropped");
+  assert.deepEqual(payload.sessions.map((s) => s.id),
+    ["s1", "s2", "s3", "s5", "s6", "s7", "s8"]);
+  // ...and every non-object `session` is REWRITTEN to null, not left raw.
+  for (const id of ["s5", "s6", "s7", "s8"]) {
+    assert.equal(payload.sessions.find((s) => s.id === id).session, null, `${id}.session`);
+  }
+  // A session that never carried `session` must not gain the key.
+  assert.equal("session" in payload.sessions.find((s) => s.id === "s1"), false);
+  assert.equal(payload.sessions[0].modelSource, "");
+  assert.equal(payload.sessions[0].modelSourceAt, "");
+  assert.equal(payload.sessions[1].modelSource, "local");        // good values untouched
+  assert.equal(payload.sessions[1].modelSourceAt, "2026-08-11T00:00:00Z");
+  assert.deepEqual(payload.sessions[2].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+  // A session that never carried the keys must not gain them — an older agent's
+  // payload has to stay byte-identical.
+  hub.normalizeRecord({ device: "h", sessions: [{ id: "s4" }] });
+});
+
+test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm6", localModel: { available: "yes", contextTokens: 9999999999 } },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "lm6");
+  assert.equal(host.localModel.available, false);
+  assert.equal(host.localModel.contextTokens, null);
+  // And the whole fleet is still served — the point of coercing at ingest.
+  assert.ok(res.body.agents.length > 1);
+});
+
+
+// ---- the coercion backstop (XERK-262) ---------------------------------------
+//
+// A QA mutation pass deleted the whole try/catch around the heartbeat's
+// coercion step and the entire node suite stayed green. It was reported as a
+// gap on dead defensive code — no input could be found that made
+// `normalizeRecord` throw. Half of that turned out to be wrong: one exists, and
+// the first test below pins it. What it does NOT do is reach the backstop,
+// because `sanitizeHeartbeat` walks the same rows first and refuses the beat
+// before any record is installed. That ordering is the reason the catch looks
+// dead, so both halves are held here — the ordering, and the rollback it hides.
+
+test("heartbeat: a live-agent field with no primitive conversion never reaches the record", async () => {
+  const host = "poison-host";
+  // Pure JSON, straight off the wire: an object whose own `toString` and
+  // `valueOf` are both non-callable has NO primitive conversion. It is the one
+  // input that reaches a throw anywhere in the coercion path — which is what
+  // makes the ordering below (sanitizeHeartbeat ahead of the record install)
+  // load-bearing rather than incidental.
+  const poison = JSON.parse('{"toString":1,"valueOf":1}');
+
+  const good = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running", repo: "r" }] },
+  });
+  assert.equal(good.status, 200);
+
+  const bad = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host,
+      sessions: [{ id: "s1", status: "running", session: { agents: [{ type: poison }] } }],
+    },
+  });
+  // A DEFINITE verdict, never a 5xx and never a hang. Deliberately not pinned to
+  // one status: this beat is refused 400 while the coercion can throw, and
+  // becomes an ordinary 200 with the row dropped once XERK-278 makes
+  // `sanitizeLiveAgents` total. Both are correct; what must never change is that
+  // the poisoned row does not survive and the hub keeps serving.
+  assert.ok(bad.status === 200 || bad.status === 400, `unexpected ${bad.status}`);
+  const live = agents[host].sessions[0].session;
+  assert.deepEqual(live ? live.agents : [], []);
+  // Still answering — the throw must not have escaped the request handler.
+  assert.equal((await request("GET", "/api/agents", { headers: userHeaders })).status, 200);
+});
+
+test("heartbeat: a coercion that throws rolls the record back rather than banking it raw", async () => {
+  const host = "coercion-throw-host";
+  const real = hub.recordCoercion.normalize;
+
+  // A first beat the host is entitled to keep.
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running", repo: "before" }] },
+  })).status, 200);
+
+  hub.recordCoercion.normalize = () => {
+    throw new TypeError("coercion blew up");
+  };
+  try {
+    const r = await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: host, sessions: [{ id: "s1", status: "running", repo: "after" }] },
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.error, "malformed heartbeat");
+  } finally {
+    hub.recordCoercion.normalize = real;
+  }
+
+  // `agents[key] = next` has ALREADY run by the time the coercion is called, so
+  // without the rollback the RAW, uncoerced record stays installed and is what
+  // every client is served — which is the whole reason the catch exists.
+  assert.equal(agents[host].sessions[0].repo, "before");
+});
+
+test("heartbeat: a coercion that throws on a host's FIRST beat leaves no record at all", async () => {
+  const host = "coercion-throw-first";
+  const real = hub.recordCoercion.normalize;
+  hub.recordCoercion.normalize = () => {
+    throw new TypeError("coercion blew up");
+  };
+  try {
+    const r = await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: host, sessions: [{ id: "s1", status: "running", repo: "r" }] },
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    hub.recordCoercion.normalize = real;
+  }
+  // No `prev` to restore, so the half-installed record must be DELETED. Leaving
+  // it would put a host on the dashboard whose payload never passed a coercion.
+  assert.ok(!(host in agents));
+});
+
+test("heartbeat: the coercion holder runs the real normalizeRecord in production", () => {
+  // The seam must not become a place a coercion can be quietly unhooked: what
+  // the holder carries by default IS the function every client's decode depends
+  // on, and the two tests above only prove the catch given that it is.
+  assert.equal(hub.recordCoercion.normalize, hub.normalizeRecord);
+});
