@@ -24,10 +24,6 @@ permissions:
 
 jobs:
   scan:
-    # The status-check context every branch protection rule and merge gate keys
-    # on. The two image-scan workflows both call their job `scan`, so without an
-    # explicit name they report the SAME context and neither can be required.
-    name: Turma image scan
     # Hosted. This job builds an image, but off the `type=gha` cache below rather
     # than a warm local one, and the turma image is a small node app — the disk
     # pressure that shaped the agent scan next door was never this job's problem.
