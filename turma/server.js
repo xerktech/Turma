@@ -716,16 +716,28 @@ const MIGRATE_SPOOL_DIR = process.env.MIGRATE_SPOOL_DIR || "/data/migrations";
 // refusing the operator's click just says "not right now" on the Move control.
 const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
 
+// The id `crypto.randomBytes(8).toString("hex")` produces in startMigration, and
+// the filename that makes — the second being the ONLY thing the boot sweep may
+// delete. Keep the two in step: they are the same name either side of `.bin`.
+const MIGRATE_ID_RE = /^[0-9a-f]{16}$/;
+const MIGRATE_SPOOL_RE = /^[0-9a-f]{16}\.bin$/;
+
 // Where a migration's spooled bundle lives. Keyed on the HUB-MINTED id (hex
 // from crypto.randomBytes, and only ever an id already in `migrations`), never
 // on the path segment the agent sent — the relay is a host boundary, so the
 // filename must not be something a caller can steer.
+// It ENFORCES that rather than trusting it: the id is checked against the shape
+// startMigration mints, so a caller-supplied one could not name a path here even
+// if some future route passed one through. Throwing is right — the request
+// handler turns it into a 500, and there is no sane fallback path to spool to.
 function migrationSpoolPath(id) {
+  if (!MIGRATE_ID_RE.test(String(id)))
+    throw new Error("refusing to spool under a migration id this hub did not mint");
+  // Not path-traversable: the guard above leaves 16 hex characters, so no
+  // component can hold a separator or '..'.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   return path.join(MIGRATE_SPOOL_DIR, `${id}.bin`);
 }
-// What a name in the spool dir must look like to be ours — the shape
-// migrationSpoolPath produces, and the ONLY thing the boot sweep may delete.
-const MIGRATE_SPOOL_RE = /^[0-9a-f]{16}\.bin$/;
 
 // Release a migration's spooled bundle. Idempotent, and safe to call while the
 // target is still streaming it out: the unlink drops the name, and the reader's
@@ -5480,6 +5492,7 @@ if (process.env.TURMA_TEST) {
     MIGRATE_SPOOL_DIR,
     sweepMigrationSpool,
     dropMigrationBlob,
+    migrationSpoolPath,
     siteKeyOf,
   };
 } else {

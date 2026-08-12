@@ -129,7 +129,7 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   orgColors, setOrgColor,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
-  dropMigrationBlob,
+  dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
 } = hub;
 
@@ -6308,6 +6308,19 @@ test("migrate: a download racing the migration's settle is not truncated", async
   assert.equal(got.status, 200);
   assert.equal(Number(got.headers["content-length"]), got.buf.length);
   assert.ok(blob.equals(got.buf), "the target must get every byte it was promised");
+});
+
+test("migrate: the spool path can only ever be a hub-minted id", async () => {
+  // The comment says the filename comes from the hub-minted id and not from the
+  // agent's path segment; this is what makes that true rather than a promise
+  // about today's one caller. Nothing here should be reachable from a route —
+  // that is the point of asserting it directly.
+  assert.equal(migrationSpoolPath("0123456789abcdef"),
+    path.join(MIGRATE_SPOOL_DIR, "0123456789abcdef.bin"));
+  for (const bad of ["../../etc/passwd", "0123456789abcde/", "0123456789ABCDEF",
+                     "0123456789abcdefff", "..", "", null, undefined]) {
+    assert.throws(() => migrationSpoolPath(bad), /did not mint/, `should refuse ${bad}`);
+  }
 });
 
 test("migrate: the boot sweep deletes only spool files, never a neighbour", async () => {
