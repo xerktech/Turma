@@ -77,6 +77,17 @@ process.env.WHISPER_MODEL = "whisper-1";
 process.env.WHISPER_API_KEY = "whisperkey";
 process.env.WHISPER_LANGUAGE = "en";
 process.env.WHISPER_TIMEOUT_MS = "30000";
+// The fleet-wide in-flight body budget (XERK-258), wound down from the deployed
+// eighth-of-the-container so overlapping bodies can be tested with 2 MiB rather
+// than 30 MiB each. The FREE floor (BODY_MAX, 1 MiB) is not env-tunable, so the
+// budget must stay above it for a charged read to exist at all. The suite's
+// other multi-MiB heartbeats are unaffected: a read that is alone in flight is
+// admitted to its route cap whatever the budget says.
+process.env.BODY_INFLIGHT_MAX_BYTES = String(2 << 20); // 2 MiB
+// The second ceiling, over EVERY in-flight byte including each body's free
+// floor. Wound down for the same reason, and to a multiple of the floor so the
+// flood case needs a dozen held sockets rather than hundreds.
+process.env.BODY_INFLIGHT_TOTAL_MAX_BYTES = String(6 << 20); // 6 MiB
 
 // A benign default global fetch. notify() no longer touches it (it fans out via
 // push.sendFcm, stubbed below); only transcribePcm/the audio WS use it, and
@@ -125,6 +136,8 @@ const {
   orgColors, setOrgColor,
   migrations, advanceMigrations,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
+  detectMemoryLimit, BODY_INFLIGHT_MAX, BODY_INFLIGHT_FREE, BODY_INFLIGHT_TOTAL_MAX,
+  inFlightBodyBytes, inFlightTotalBytes,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -1565,6 +1578,328 @@ test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare res
   assert.equal(res.status, 413);
   assert.equal(res.body.error, "body too large");
   assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
+});
+
+// ---- XERK-258: the fleet-wide in-flight body budget -------------------------
+// Two beats each LEGAL under HEARTBEAT_MAX exceeded the container's whole memory
+// limit together and the kernel OOM-killed the hub, taking every host's control
+// plane with it. The per-request cap could never have caught that, so these
+// cases are about CONCURRENCY, and each one drives real overlapping sockets.
+
+/** A heartbeat body of roughly `bytes`, shaped like the real oversized one. */
+function beatOfSize(device, bytes) {
+  return JSON.stringify({
+    device,
+    historyResults: [{ sessionId: "s1", entries: [{ text: "x".repeat(bytes) }] }],
+  });
+}
+
+/**
+ * A POST that declares its full Content-Length, sends the first half, and holds
+ * the socket open until `finish()`. That's what makes a second request genuinely
+ * CONCURRENT with the first — an unthrottled pair of `request()` calls can
+ * serialise over loopback, and then nothing is under test.
+ */
+function heldPost(pathName, body, headers) {
+  const buf = Buffer.from(body);
+  const half = buf.length >> 1;
+  let settle, fail;
+  const response = new Promise((res, rej) => { settle = res; fail = rej; });
+  const req = http.request(
+    baseUrl + pathName,
+    { method: "POST", headers: { ...headers, "content-length": String(buf.length) } },
+    (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(data); } catch { /* non-JSON body */ }
+        settle({ status: res.statusCode, body: parsed, headers: res.headers });
+      });
+    }
+  );
+  req.on("error", fail);
+  req.write(buf.subarray(0, half));
+  let finished = false;
+  return {
+    response,
+    req,
+    // Idempotent: the flood case finishes each held request once on the happy
+    // path and again in its cleanup, and a double end() would only add noise.
+    finish() {
+      if (finished) return;
+      finished = true;
+      req.end(buf.subarray(half));
+    },
+  };
+}
+
+/**
+ * Run `body` with a held-open request, and ALWAYS close that request afterwards.
+ * A held socket left open by a failed assertion hangs the whole suite instead of
+ * failing it, which is how a regression here would read as a CI timeout.
+ */
+async function withHeldPost(pathName, requestBody, headers, body) {
+  const held = heldPost(pathName, requestBody, headers);
+  try {
+    await waitUntil(() => inFlightBodyBytes() > 0, "the held body to reserve its bytes");
+    return await body(held);
+  } finally {
+    held.finish();
+    await held.response.catch(() => {});
+  }
+}
+
+async function waitUntil(cond, what, ms = 3000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+test("http: a second large beat is refused (503) rather than buffered alongside the first", async () => {
+  // The reproduction, scaled to the wound-down budget: at the deployed 256m,
+  // three 30 MiB beats OOM-killed the container.
+  const first = await withHeldPost(
+    "/api/heartbeat", beatOfSize("budget-a", 2.5 * 1024 * 1024), agentHeaders,
+    async (held) => {
+      const second = await request("POST", "/api/heartbeat", {
+        body: JSON.parse(beatOfSize("budget-b", 2.5 * 1024 * 1024)),
+        headers: { ...agentHeaders, connection: "close" },
+      });
+      assert.equal(second.status, 503, "over the budget is a RETRY, not a resize");
+      assert.equal(second.headers["retry-after"], "1");
+      assert.ok(
+        second.body.inFlightLimit > 0,
+        "the refusal names the ceiling, so an operator can tell it from an ordinary outage"
+      );
+      held.finish();
+      return held.response;
+    }
+  );
+  assert.equal(first.status, 200, "the beat that got there first must still be served in full");
+  assert.equal(
+    first.body.commands.length, 0,
+    "and served the real reply, not a truncated one"
+  );
+
+  // The refusal must not cost the fleet a host: a 503'd agent re-sends the same
+  // payload next beat, and the hub has to accept it once it has room.
+  const retry = await request("POST", "/api/heartbeat", {
+    body: JSON.parse(beatOfSize("budget-b", 2.5 * 1024 * 1024)),
+    headers: agentHeaders,
+  });
+  assert.equal(retry.status, 200);
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const key of ["budget-a", "budget-b"]) {
+    assert.ok(list.body.agents.some((a) => a.key === key), `${key} must have registered`);
+  }
+});
+
+test("http: an ordinary beat is never refused because a big one is in flight", async () => {
+  // A body's first BODY_MAX is free. Without that floor the budget would turn
+  // one host's /history delivery into an outage for every other host on the
+  // fleet — a worse failure than the one it fixes.
+  await withHeldPost(
+    "/api/heartbeat", beatOfSize("floor-big", 2.5 * 1024 * 1024), agentHeaders,
+    async () => {
+      const small = await request("POST", "/api/heartbeat", {
+        body: { device: "floor-small", sessions: [{ id: "s", repo: "R", status: "running" }] },
+        headers: agentHeaders,
+      });
+      assert.equal(small.status, 200);
+    }
+  );
+});
+
+test("http: many bodies each under the free floor are bounded too", async () => {
+  // The free floor is a hole the size of the original bug if nothing bounds it:
+  // 256 concurrent 0.9 MiB bodies are each free of the charged budget, and at
+  // 256m they OOM-killed the hub exactly as the two 30 MiB beats did. Every
+  // in-flight byte is counted against a second, higher ceiling for that reason.
+  const each = Math.floor(BODY_INFLIGHT_FREE * 0.9);
+  const n = Math.ceil((BODY_INFLIGHT_TOTAL_MAX / each) * 2); // twice what fits
+  const held = [];
+  try {
+    for (let i = 0; i < n; i++) {
+      held.push(heldPost("/api/heartbeat", beatOfSize(`flood-${i}`, each), agentHeaders));
+    }
+    await waitUntil(
+      () => inFlightTotalBytes() >= BODY_INFLIGHT_TOTAL_MAX - each,
+      "the total ledger to fill up"
+    );
+    assert.ok(
+      inFlightTotalBytes() <= BODY_INFLIGHT_TOTAL_MAX,
+      `free-floor bodies must not exceed the total ceiling ` +
+        `(${inFlightTotalBytes()} > ${BODY_INFLIGHT_TOTAL_MAX})`
+    );
+    const codes = new Set();
+    for (const h of held) { h.finish(); codes.add((await h.response.catch(() => ({}))).status); }
+    assert.ok(codes.has(503), "past the ceiling a small body is refused, not buffered");
+    assert.ok(codes.has(200), "and the ones that fitted were served");
+  } finally {
+    for (const h of held) { h.finish(); await h.response.catch(() => {}); }
+  }
+  await waitUntil(() => inFlightTotalBytes() === 0, "the total ledger to drain");
+});
+
+test("http: a lone body over the whole budget is still admitted (no self-inflicted refusal)", async () => {
+  // Several route caps exceed the budget at the deployed memory limit (the
+  // 65 MiB migration relay against 32 MiB). A lone request must be served to its
+  // own cap, or the hub would permanently refuse work it is sized for — the
+  // budget bounds CONCURRENCY, not the single request.
+  const alone = 3 * 1024 * 1024; // charged 2 MiB, i.e. the entire budget
+  assert.ok(alone - BODY_INFLIGHT_FREE >= BODY_INFLIGHT_MAX, "must exceed the budget to be a test");
+  const res = await request("POST", "/api/heartbeat", {
+    body: JSON.parse(beatOfSize("lone-big", alone)), headers: agentHeaders,
+  });
+  assert.equal(res.status, 200);
+});
+
+test("http: every read gives its reservation back — refused, oversized or served", async () => {
+  // A leaked reservation is permanent and silent: the hub keeps serving until it
+  // has leaked the whole budget, then refuses every large body for the life of
+  // the process. Nothing else in the suite would notice.
+  assert.equal(inFlightBodyBytes(), 0, "the ledger must start clean");
+
+  await request("POST", "/api/heartbeat", {
+    body: JSON.parse(beatOfSize("ledger-ok", 2.5 * 1024 * 1024)), headers: agentHeaders,
+  });
+  assert.equal(inFlightBodyBytes(), 0, "a served body releases");
+
+  const over = await request("POST", "/api/heartbeat", {
+    body: { device: "ledger-fat", pad: "y".repeat(33 << 20) },
+    headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(over.status, 413);
+  assert.equal(inFlightBodyBytes(), 0, "a body past the per-request cap releases");
+
+  await withHeldPost(
+    "/api/heartbeat", beatOfSize("ledger-a", 2.5 * 1024 * 1024), agentHeaders,
+    async () => {
+      const refused = await request("POST", "/api/heartbeat", {
+        body: JSON.parse(beatOfSize("ledger-b", 2.5 * 1024 * 1024)),
+        headers: { ...agentHeaders, connection: "close" },
+      });
+      assert.equal(refused.status, 503);
+    }
+  );
+  await waitUntil(() => inFlightBodyBytes() === 0, "the ledger to drain to zero");
+
+  // An agent that dies mid-upload has no one left to answer, but its reservation
+  // must still come back — this is the leak that a retrying flaky host would
+  // accumulate until the hub refused every large body.
+  const abandoned = heldPost("/api/heartbeat", beatOfSize("ledger-gone", 2.5 * 1024 * 1024), agentHeaders);
+  abandoned.response.catch(() => {}); // never answered: the destroy IS the case
+  await waitUntil(() => inFlightBodyBytes() > 0, "the abandoned beat to reserve");
+  abandoned.req.destroy();
+  await waitUntil(() => inFlightBodyBytes() === 0, "an abandoned upload to release its bytes");
+
+  // And the hub is still able to take a large body afterwards.
+  const after = await request("POST", "/api/heartbeat", {
+    body: JSON.parse(beatOfSize("ledger-after", 2.5 * 1024 * 1024)), headers: agentHeaders,
+  });
+  assert.equal(after.status, 200);
+  assert.equal(inFlightBodyBytes(), 0);
+});
+
+test("readBody: a multibyte character split across chunks survives intact", async () => {
+  // `data += chunk` decoded each chunk on its own, so a UTF-8 sequence
+  // straddling a boundary became replacement bytes — silent text corruption in
+  // a transcript nobody could then trace back to here. A 30 MiB beat crosses
+  // hundreds of boundaries.
+  const summary = "réstart 😀 ünïcode";
+  const body = Buffer.from(JSON.stringify({
+    device: "utf8-host",
+    sessions: [{ id: "u1", repo: "R", status: "running", summary }],
+  }));
+  // Split INSIDE the emoji's 4-byte sequence.
+  const at = body.indexOf(Buffer.from("😀")) + 2;
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request(
+      baseUrl + "/api/heartbeat",
+      { method: "POST", headers: { ...agentHeaders, "content-length": String(body.length) } },
+      (r) => {
+        let data = "";
+        r.on("data", (c) => (data += c));
+        r.on("end", () => resolve({ status: r.statusCode, raw: data }));
+      }
+    );
+    req.on("error", reject);
+    req.write(body.subarray(0, at));
+    setTimeout(() => req.end(body.subarray(at)), 20);
+  });
+  assert.equal(res.status, 200);
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = list.body.agents.find((a) => a.key === "utf8-host");
+  assert.equal(host.sessions[0].summary, summary, "the text must round-trip byte-for-byte");
+});
+
+test("the memory ceilings are derived from the container limit, not from constants", async () => {
+  // The flat defaults were larger than the whole deployed container: a 32 MiB
+  // per-beat cap with no concurrency budget, and a 128 MiB pending-upload
+  // ceiling inside a 256m limit. A ceiling above the limit the kernel kills on
+  // is not a ceiling.
+  const at256 = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(256 << 20);
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.UPLOAD_TOTAL_MAX_BYTES;
+  });
+  assert.equal(at256.BODY_INFLIGHT_MAX, 32 << 20, "an eighth of the container");
+  assert.equal(at256.UPLOAD_TOTAL_MAX_BYTES, 64 << 20, "a quarter of the container");
+  assert.ok(
+    at256.UPLOAD_TOTAL_MAX_BYTES + at256.BODY_INFLIGHT_MAX < (256 << 20),
+    "every ceiling together must still fit inside the container"
+  );
+
+  const at1g = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(1024 << 20);
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.UPLOAD_TOTAL_MAX_BYTES;
+  });
+  assert.equal(at1g.BODY_INFLIGHT_MAX, 128 << 20, "raising mem_limit raises the budget with it");
+
+  // A tiny container must still admit one whole attachment, or the composer's 📎
+  // would be dead on arrival rather than merely limited.
+  const tiny = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(64 << 20);
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.UPLOAD_TOTAL_MAX_BYTES;
+  });
+  assert.ok(tiny.UPLOAD_TOTAL_MAX_BYTES >= tiny.UPLOAD_MAX_BYTES);
+  assert.ok(tiny.BODY_INFLIGHT_MAX >= (8 << 20), "and never a budget too small to beat through");
+
+  // With no override the budget comes off whatever the cgroup says — a real
+  // limit here, nothing on a native install — and either way it stays finite.
+  // An unbounded budget would leave the original OOM in place.
+  const detected = freshServerModule((env) => {
+    delete env.HUB_MEM_LIMIT_BYTES;
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.UPLOAD_TOTAL_MAX_BYTES;
+  });
+  assert.ok(Number.isFinite(detected.BODY_INFLIGHT_MAX) && detected.BODY_INFLIGHT_MAX >= (8 << 20));
+  assert.ok(Number.isFinite(detected.UPLOAD_TOTAL_MAX_BYTES) && detected.UPLOAD_TOTAL_MAX_BYTES > 0);
+});
+
+test("detectMemoryLimit: an explicit override wins, and 'no limit' reads as uncapped", () => {
+  const saved = process.env.HUB_MEM_LIMIT_BYTES;
+  try {
+    process.env.HUB_MEM_LIMIT_BYTES = String(512 << 20);
+    assert.equal(detectMemoryLimit(), 512 << 20);
+    // Garbage must not be mistaken for a limit — falling back to the cgroup read
+    // (or to uncapped) is right, refusing every body is not.
+    for (const bad of ["0", "-1", "lots", ""]) {
+      process.env.HUB_MEM_LIMIT_BYTES = bad;
+      const n = detectMemoryLimit();
+      assert.ok(n === 0 || n > 0, "always a number");
+      assert.notEqual(n, -1);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.HUB_MEM_LIMIT_BYTES;
+    else process.env.HUB_MEM_LIMIT_BYTES = saved;
+  }
 });
 
 test("http: a heartbeat whose device is not a plain host name is refused, not silently dropped", async () => {
@@ -6250,6 +6585,32 @@ test("uploads: collecting does NOT drop the blob (commands are at-least-once)", 
   const again = await requestRaw("GET", url, { headers: agentHeaders });
   assert.equal(again.status, 200);
   assert.equal(again.buf.toString(), "keepme");
+});
+
+test("uploads: a multi-chunk file round-trips byte-for-byte (XERK-258)", async () => {
+  // readRawBody now copies into ONE preallocated buffer sized from
+  // Content-Length instead of Buffer.concat-ing a chunk list, which halves the
+  // peak for a 65 MiB migration bundle. The buffer is allocUnsafe, so the two
+  // ways to get this wrong are handing back uninitialized tail bytes or copying
+  // a chunk to the wrong offset — both invisible to a small single-chunk body.
+  await upHost("upBig");
+  const size = 3 * 1024 * 1024 + 12345; // several chunks, and not a round number
+  const file = Buffer.alloc(size);
+  for (let i = 0; i < size; i++) file[i] = (i * 31 + (i >> 8)) & 0xff; // position-dependent
+  // content-length is REQUIRED here, not incidental: without it node sends the
+  // body chunked, readRawBody has no length to preallocate from, and this test
+  // would quietly cover the concat path instead of the one it names.
+  const ok = await stage("upBig", "s1", "big.bin", file, {
+    ...userHeaders, "content-length": String(size),
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.size, size, "the recorded size must be what arrived");
+  const got = await requestRaw("GET", `/api/agents/upBig/uploads/${ok.body.uploadId}/blob`, {
+    headers: agentHeaders,
+  });
+  assert.equal(got.status, 200);
+  assert.equal(got.buf.length, size);
+  assert.ok(got.buf.equals(file), "every byte, at its own offset");
 });
 
 test("uploads: the input command carries the staged files' ids, names and sizes", async () => {

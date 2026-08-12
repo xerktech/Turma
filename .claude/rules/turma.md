@@ -166,6 +166,37 @@ auto-start/auto-stop and the two tracker writes.
 See `.claude/rules/turma-sessions.md` — the native chat view, the model/mode chips, the
 working-status bar, ready-for-review, ended sessions, the composer and the terminal.
 
+## Memory ceilings (XERK-258)
+
+- **Every memory ceiling is DERIVED from the container's memory limit** (`detectMemoryLimit`: cgroup
+  v2 then v1, `HUB_MEM_LIMIT_BYTES` to override), never a flat constant. The hub is deployed with a
+  `mem_limit` far below the sum of the constants it used to carry — a 32 MiB per-beat cap with no
+  concurrency bound, and a 128 MiB pending-upload ceiling, inside 256m. **A ceiling above the limit
+  the kernel kills on is not a ceiling**, and the kill takes every host's control plane with it.
+- **A per-request cap cannot bound concurrency, so there are two in-flight ceilings**, both reserved
+  against BEFORE a body is read (`bodyBudget`, reserving off `Content-Length` and re-reserving as
+  bytes actually arrive, so a chunked or under-declared body is bounded too):
+  - `BODY_INFLIGHT_MAX` (an eighth of the container) over **charged** bytes — each body's first
+    `BODY_MAX` is free, so one host's multi-MiB `/history` delivery can't 503 the whole fleet's
+    ordinary beats.
+  - `BODY_INFLIGHT_TOTAL_MAX` (a quarter) over **every** in-flight byte. The free floor needs its own
+    ceiling or it is a hole the size of the first bug: many small bodies OOM-killed the hub exactly
+    as two 30 MiB beats did.
+- **A read alone in flight is always admitted to its own route cap.** `MIGRATE_BLOB_MAX` (65 MiB)
+  exceeds the budget at the deployed limit, and refusing a lone request the hub is sized for would be
+  an outage of our own making — concurrency is what the ceilings bound.
+- **`release()` must run on every exit path**, which is why it is idempotent and guarded on `close`
+  as well as `error`/`end`: a leaked reservation is never recovered, and enough of them refuse every
+  large body for the life of the process.
+- **A body's bytes understate what it costs to hold** — a 30 MiB JSON beat measured ~93 MiB above
+  idle (accumulated string, then the parsed object graph). That factor is why the fractions are
+  eighths and quarters rather than halves; measurements are in the PR for XERK-258.
+- `readBody` decodes through a `StringDecoder`, not `data += chunk`: a UTF-8 sequence split across
+  chunks became replacement bytes, silently corrupting transcript text hundreds of times in a
+  multi-MiB beat.
+- Tests: the `XERK-258` cases in `server.test.js` (each one pinned by mutation — removing the budget,
+  the decoder or the derivation fails them).
+
 ## Durable archive
 
 - The hub hosts a **durable, searchable archive of ended sessions** (`turma/archive.js`): agents
