@@ -65,6 +65,17 @@ The build workflows run only post-merge; these run on `pull_request` → `main` 
 - `glasses-ci.yml` — path-filtered to `glasses/**`, typecheck + Vitest + production build in a
   throwaway `node:24-alpine` container.
 - `android-ci.yml` — path-filtered to `android/**`, JVM unit tests + `assembleDebug`.
+- `bug-fix-gate.yml` — **advisory, not blocking**, and deliberately NOT path-filtered. For every
+  test file a PR adds or changes, it runs that test against the merge-base with only the test files
+  overlaid — the fix absent — and requires it to FAIL there and pass on the head. A test that passes
+  on the base does not pin the behaviour the PR changed. It reports on every PR (a PR touching no
+  tests passes as "no proof available") so an automated merge gate can always read a conclusion
+  rather than an absent check.
+  - It is the evidence that lets a `Bug` ticket's PR merge unattended; a human merging by hand is
+    the judgement it stands in for, so a red result never blocks a person.
+  - **On android/glasses/veiller a base failure is usually a BUILD error**, not a failed assertion —
+    the test references a symbol the fix introduces. That proves the test reaches new code but not
+    that its assertion discriminates, so the summary labels those `weak (build error)`.
 
 Because the images bundle third-party binaries, keep the pinned tool versions current — that's how
 most CVEs are cleared. Non-actionable upstream base-image findings go in the root `.trivyignore` (a
