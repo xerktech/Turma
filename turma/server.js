@@ -1962,9 +1962,15 @@ function spoolRawBody(req, cap, filePath) {
         // socket: a short write is a corrupt bundle, not a smaller one.
         if (out.bytesWritten !== len)
           return fail(new Error(`spool wrote ${out.bytesWritten} of ${len} bytes`));
-        if (settled) return;
-        settled = true;
-        resolve(len);
+        // And resolve on `close`, not here: the end callback runs BEFORE the
+        // descriptor is closed (end-cb → finish → close), so a close(2) failure
+        // would land on `error` after a resolve and be swallowed — the same
+        // shape as the flush error above.
+        out.once("close", () => {
+          if (settled) return;
+          settled = true;
+          resolve(len);
+        });
       });
     });
     out.on("error", fail);
@@ -3803,7 +3809,11 @@ const server = http.createServer(async (req, res) => {
       }
       m.uploading = false;
       if (!size) {
-        fs.unlink(spool, () => {}); // never recorded on m — drop the empty file here
+        // Never recorded on m, so drop the empty file here — and drop it
+        // BEFORE answering. This is the one path that leaves the migration
+        // retriable, and a fire-and-forget unlink could land after a retry had
+        // already re-created the same path and deleted the good bundle.
+        try { fs.unlinkSync(spool); } catch {}
         return json(res, 400, { error: "empty bundle" });
       }
       m.blobPath = spool;

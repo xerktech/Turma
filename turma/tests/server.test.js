@@ -6227,8 +6227,13 @@ test("migrate: a spool that can't be written fails the move, and doesn't hang", 
   const r = await migrate("errA", "s1", { host: "errB" });
   const mid = r.body.migrationId;
   fs.mkdirSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true });
-  const up = await requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
-    { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } });
+  // Raced against a timer, so an unanswerable POST fails HERE in a second
+  // rather than by running the whole CI job out of time.
+  const up = await Promise.race([
+    requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
+      { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } }),
+    new Promise((r2) => setTimeout(() => r2({ status: "no reply — the route hung" }), 2000)),
+  ]);
   assert.equal(up.status, 500);
   // The reply must not hand the agent the hub's filesystem layout.
   assert.doesNotMatch(up.body.error, /\//);
@@ -6253,15 +6258,35 @@ test("migrate: a download racing the migration's settle is not truncated", async
   await requestRaw("POST", `/api/agents/rcA/migrations/${mid}/blob`,
     { body: blob, headers: { authorization: "Bearer agenttok" } });
   const m = migrations.get(mid);
-  const dl = requestRaw("GET", `/api/agents/rcB/migrations/${mid}/blob`,
-    { headers: { authorization: "Bearer agenttok" } });
-  await new Promise((r2) => setTimeout(r2, 1)); // let the handler open the file
-  dropMigrationBlob(m); // the settle lands mid-download
-  const got = await dl;
-  // Either outcome is correct — the drop won the race and this is a clean 404,
-  // or the read was already under way and must be COMPLETE and correctly
-  // framed. What must never happen is a 200 whose length doesn't describe it.
-  if (got.status === 404) return;
+  // The window is between `createReadStream` and its `open` event, which a
+  // sleep can only straddle by luck — timed from out here this caught a
+  // reintroduced bug once in five runs, and a drop that lands EARLY hides in a
+  // legitimate 404. So land the settle in the window by construction: patch the
+  // one call that opens it, exactly where the race would put the settle.
+  const realCreateReadStream = fs.createReadStream;
+  let dropped = false;
+  fs.createReadStream = function (p, ...rest) {
+    const s = realCreateReadStream.call(fs, p, ...rest);
+    // On `open`, and registered BEFORE the route's own open handler so it runs
+    // first: that is the production window exactly — the descriptor exists (so
+    // the unlink can't stop the read) but the response header hasn't been
+    // written yet. Dropping any earlier just races the open and 404s, which is
+    // a different, harmless outcome.
+    if (p === m.blobPath) s.once("open", () => { dropMigrationBlob(m); dropped = true; });
+    return s;
+  };
+  let got;
+  try {
+    got = await requestRaw("GET", `/api/agents/rcB/migrations/${mid}/blob`,
+      { headers: { authorization: "Bearer agenttok" } });
+  } finally {
+    fs.createReadStream = realCreateReadStream;
+  }
+  assert.ok(dropped, "the settle must land inside the window, or this proves nothing");
+  // The unlink leaves this read's fd valid, so the bytes still arrive. What
+  // must never happen is a 200 whose length disagrees with what it sends: the
+  // agent's reader believes the header and takes a `Content-Length: 0` for an
+  // empty bundle.
   assert.equal(got.status, 200);
   assert.equal(Number(got.headers["content-length"]), got.buf.length);
   assert.ok(blob.equals(got.buf), "the target must get every byte it was promised");
