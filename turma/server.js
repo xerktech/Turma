@@ -1131,6 +1131,10 @@ function startMigration(srcHost, s, targetHost) {
     // how big it is (for the target's Content-Length) — see MIGRATE_SPOOL_DIR.
     blobPath: null, blobSize: 0, uploading: false,
     importCmdId: null, targetSessionId: null,
+    // The reason an agent gave for declining its half (XERK-265), staged here by
+    // ingestSpawnFailures and turned into a terminal failure by advanceMigrations
+    // rather than applied on the spot — the handoff check must still win the tie.
+    refusal: null,
     error: null, startedAt: Date.now(), at: Date.now(),
   };
   migrations.set(id, m);
@@ -1163,6 +1167,19 @@ function advanceMigrations() {
         publishMigrations();
         continue;
       }
+    }
+    // The agent REFUSED its half of the move and said so on a beat (XERK-265):
+    // fail now, carrying its reason, instead of leaving the operator watching a
+    // move that can no longer complete for the whole MIGRATE_TIMEOUT_MS. Read
+    // after the handoff above so a success always wins the tie, and covers both
+    // halves — an export that never shipped a blob as well as a refused import.
+    if ((m.phase === "exporting" || m.phase === "importing") && m.refusal) {
+      m.phase = "failed";
+      m.error = m.refusal;
+      dropMigrationBlob(m);   // the spool file, exactly as the timeout below
+      m.at = now;
+      publishMigrations();
+      continue;
     }
     // A move that never completed: fail it so the UI stops waiting. The source
     // session was never killed, so nothing is lost — the operator retries.
@@ -1428,6 +1445,84 @@ function ingestStatusResults(agent, ticketStatusResults) {
       .sort((a, b) => a[1].at - b[1].at)
       .slice(0, over)
       .forEach(([id]) => delete agent.statusResults[id]);
+  }
+}
+
+// How long a staged session-start refusal (XERK-265) stays readable, and how
+// many one host may hold. It exists to answer a wait that is already running —
+// the Sessions page's SPAWN_FOLLOW_MS, or a migration — so minutes is generous.
+const SPAWN_FAILURE_MAX_AGE_MS = 10 * 60 * 1000;
+const SPAWN_FAILURE_MAX = 40;
+// And how long one reason / one cmdId key may be. These are NOT stylistic: this
+// cache is served with the record, so `agentRecordSize` counts it, and the
+// ceiling check runs BEFORE the ingest — an unbounded reason would land, push
+// the record past AGENT_RECORD_MAX, and then 413 every following beat from that
+// host, including the ones that would have swept it. The agent truncates too;
+// this is the boundary that makes a buggy or hostile one survivable (XERK-235).
+const SPAWN_FAILURE_ERROR_MAX = 500;
+const SPAWN_FAILURE_CMDID_MAX = 200;
+
+// Merge the agent's refusals of a session-creating command (heartbeat
+// `spawnFailures`, XERK-265) into a per-cmdId cache, and stamp any it names onto
+// the migration waiting on it.
+//
+// Every one of these used to be a line in the agent's container log: the command
+// is ACKed whether the agent ran it or refused it, so the hub could not tell a
+// refused resume from a slow one. It kept the Sessions page spinning out its
+// follow window with no reason, and left a migration in `importing` until
+// MIGRATE_TIMEOUT_MS — which XERK-256's prune/resume race made an ordinary event
+// rather than an operator error.
+//
+// Unlike `statusResults` this cache is NOT stripped from the fleet payload: the
+// point is that the client following the spawn can see it. It is small, capped
+// and short-lived, so it costs the record almost nothing. It is named apart from
+// the wire field it comes from (`spawnRefusals`, keyed by cmdId, vs the beat's
+// `spawnFailures` list) so the two shapes can't be mistaken for each other.
+// `ownCmdIds` is the set of command ids this host was actually GIVEN (its queue
+// before this beat's acks were applied). Both handles are checked against what
+// the hub knows, never taken on the agent's word: all agents share one token, so
+// an unchecked cmdId lets any host end another host's spawn wait with arbitrary
+// text, and an unchecked migrationId lets it fail a move it has no part in.
+function ingestSpawnFailures(hostKey, agent, ownCmdIds, results) {
+  const now = Date.now();
+  // A non-array here would throw mid-handler, AFTER the record was replaced and
+  // before the ack/publish/save — costing the host its commands every beat.
+  for (const r of (Array.isArray(results) ? results : [])) {
+    if (!r) continue;
+    const error = typeof r.error === "string" && r.error
+      ? r.error.slice(0, SPAWN_FAILURE_ERROR_MAX)
+      : "the agent refused it";
+    // The length and key-name checks are belt-and-braces BEHIND `ownCmdIds`:
+    // `queueCommand` mints ids from crypto.randomBytes, so the hub can never
+    // have issued one called `__proto__` or 200 chars long, and no test can
+    // fail on their removal today. They are here for the day that membership
+    // check is relaxed — `__proto__` would then invoke the prototype setter
+    // rather than store an entry, silently dropping the refusal, which is why
+    // `device` refuses the same names.
+    if (typeof r.cmdId === "string" && r.cmdId &&
+        r.cmdId.length <= SPAWN_FAILURE_CMDID_MAX &&
+        r.cmdId !== "__proto__" && r.cmdId !== "constructor" &&
+        r.cmdId !== "prototype" && ownCmdIds.has(r.cmdId)) {
+      agent.spawnRefusals[r.cmdId] = { error, at: now };
+    }
+    // A migration's own handle. The refusal can arrive for either half, so match
+    // the record by id — the export half has no importCmdId to key on. Only a
+    // host actually IN the move may fail it.
+    if (r.migrationId) {
+      const m = migrations.get(r.migrationId);
+      if (m && (m.phase === "exporting" || m.phase === "importing") &&
+          (m.srcHost === hostKey || m.targetHost === hostKey)) m.refusal = error;
+    }
+  }
+  for (const [id, e] of Object.entries(agent.spawnRefusals)) {
+    if (now - e.at > SPAWN_FAILURE_MAX_AGE_MS) delete agent.spawnRefusals[id];
+  }
+  const over = Object.keys(agent.spawnRefusals).length - SPAWN_FAILURE_MAX;
+  if (over > 0) {
+    Object.entries(agent.spawnRefusals)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.spawnRefusals[id]);
   }
 }
 
@@ -1906,6 +2001,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "sessions", "startedAt", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
+  "spawnFailures",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -4101,6 +4197,11 @@ const server = http.createServer(async (req, res) => {
       delete payload.createMetaResults;
       const createTicketResults = payload.createTicketResults;
       delete payload.createTicketResults;
+      // Session-creating commands this agent REFUSED since the last beat
+      // (XERK-265) — cached by cmdId below and applied to any migration they
+      // name, so a refusal fails the move now rather than at its timeout.
+      const spawnFailures = payload.spawnFailures;
+      delete payload.spawnFailures;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -4138,6 +4239,10 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId board-status-change outcome cache (see the /status route,
         // XERK-138); survives across beats like `jiraIssues`.
         statusResults: prev.statusResults || {},
+        // Per-cmdId refusals of a session-creating command (XERK-265). Survives
+        // across beats like the caches above, but is SERVED with the record
+        // rather than stripped — the client following that spawn is who needs it.
+        spawnRefusals: prev.spawnRefusals || {},
         // New-ticket create caches (XERK-137): the org's project/label metadata,
         // per-project issue types, and per-cmdId create outcomes. Like the other
         // on-demand caches, they survive across beats and are stripped from the
@@ -4212,6 +4317,17 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
+      // Scoped to the commands this host was actually given: `prev.commands` is
+      // the queue BEFORE this beat's acks were filtered out, and the agent
+      // stages a refusal in the same handle_commands call that acks it, so the
+      // two always ride together. A hub restart inside `scheduleSave`'s debounce
+      // forgets the queue and therefore drops that refusal — correctly: the hub
+      // can no longer tell whose command it was, and the wait simply degrades to
+      // the pre-XERK-265 timeout. Never authenticate it from the beat's own
+      // `ackedCommands` instead; that is the agent's word, which is the thing
+      // being checked.
+      ingestSpawnFailures(key, next,
+        new Set((prev.commands || []).map((c) => c && c.cmdId)), spawnFailures);
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);
@@ -4359,6 +4475,17 @@ const server = http.createServer(async (req, res) => {
         // BEFORE answering. This is the one path that leaves the migration
         // retriable, and a fire-and-forget unlink could land after a retry had
         // already re-created the same path and deleted the good bundle.
+        try { fs.unlinkSync(spool); } catch {}
+        return json(res, 404, { error: "unknown migration" });
+      }
+      // The move may have SETTLED while those bytes were being written — a
+      // refusal the source staged for this very upload (its POST timed out
+      // while the hub was still spooling, XERK-265) fails it within one beat,
+      // and the timeout can land here too. Advancing anyway would resurrect a
+      // move the operator was already told had failed, queue an importSession
+      // for it, and then kill the source when the target came up. Same careful
+      // unlink as the empty-body path: this file is now nobody's.
+      if (m.phase !== "exporting") {
         try { fs.unlinkSync(spool); } catch {}
         return json(res, 404, { error: "unknown migration" });
       }
