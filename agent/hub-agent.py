@@ -2236,17 +2236,30 @@ def pr_status(url):
 
 def _mr_url_parts(url):
     """(project_path, iid) when `url` is a merge-request URL under the
-    configured GITLAB_URL, else None. Prefix-matched against gitlab_base() so a
+    configured GITLAB_URL, else None. Matched against gitlab_base()'s host so a
     GitLab installed under a subpath still resolves its project path; an MR on
     any OTHER GitLab host stays None — this host holds no credential for it,
-    so its chip renders as a bare link, like a PR gh can't see."""
+    so its chip renders as a bare link, like a PR gh can't see.
+
+    The match is on the HOST(:port), case-insensitively, ignoring the scheme —
+    not a byte-for-byte URL prefix. Hostnames are case-insensitive and a
+    GITLAB_URL configured as `http://` (or with odd casing) still names the
+    same GitLab the MR lives on; an exact-prefix compare silently left every
+    attributed MR a bare link chip forever over such a mismatch."""
     base = gitlab_base()
     if not base or not gitlab_configured():
         return None
-    u = str(url or "")
-    if not u.startswith(base + "/"):
+    bm = re.match(r"^[a-zA-Z][\w.+-]*://([^/]+)(/.*)?$", base)
+    um = re.match(r"^https?://([^/]+)(/.+)$", str(url or ""))
+    if not bm or not um or bm.group(1).lower() != um.group(1).lower():
         return None
-    m = re.match(r"(.+?)/-/merge_requests/(\d+)$", u[len(base) + 1:])
+    tail = um.group(2)
+    bpath = (bm.group(2) or "").rstrip("/")
+    if bpath:
+        if not tail.lower().startswith(bpath.lower() + "/"):
+            return None
+        tail = tail[len(bpath):]
+    m = re.match(r"/(.+?)/-/merge_requests/(\d+)$", tail)
     if not m:
         return None
     return m.group(1), m.group(2)
@@ -2268,6 +2281,21 @@ def _mr_check_class(status):
     return None
 
 
+# How detailed_merge_status buckets into GitHub's three-value mergeability.
+# GitHub's `mergeable` answers ONE question — do the branches conflict? —
+# while GitLab's enum also reports approvals, discussions, CI and workflow
+# gates. Bucketing anything non-mergeable to UNKNOWN left every healthy MR at
+# ● forever (not_approved, ci_still_running …) where the equivalent GitHub PR
+# shows ✓. So: only the git-level can't-merge states are CONFLICTING, only the
+# still-computing states are UNKNOWN, and every OTHER known status means the
+# branches themselves merge — MERGEABLE, exactly what GitHub would say. An
+# unrecognized future status lands in MERGEABLE by that same logic (it exists
+# because the merge-check RAN); only absence stays UNKNOWN.
+_MR_CONFLICT_STATUSES = {"conflict", "broken_status", "cannot_be_merged"}
+_MR_UNVERIFIED_STATUSES = {"checking", "unchecked", "preparing",
+                           "approvals_syncing"}
+
+
 def _summarize_mr(data):
     """Condense a GitLab merge-request API payload into the SAME compact status
     dict _summarize_pr builds, so every renderer treats an MR chip exactly like
@@ -2275,10 +2303,9 @@ def _summarize_mr(data):
     (draft→DRAFT), merged→MERGED, closed→CLOSED, locked→OPEN (a transient
     in-between); the head pipeline is the whole CI rollup (GitLab exposes no
     per-check rollup on the MR itself), one entry classed by _mr_check_class;
-    mergeability comes from detailed_merge_status ("mergeable"→MERGEABLE,
-    "conflict"→CONFLICTING, anything else UNKNOWN — unproven is not proven,
-    exactly the discipline _merge_ready applies to GitHub's UNKNOWN), with the
-    older merge_status can/cannot_be_merged as the fallback vocabulary."""
+    mergeability comes from detailed_merge_status, bucketed by
+    _MR_CONFLICT_STATUSES/_MR_UNVERIFIED_STATUSES, with the older merge_status
+    can/cannot_be_merged as the fallback vocabulary."""
     raw_state = str(data.get("state") or "").lower()
     state = {"opened": "OPEN", "locked": "OPEN", "merged": "MERGED",
              "closed": "CLOSED"}.get(raw_state, raw_state.upper())
@@ -2297,9 +2324,13 @@ def _summarize_mr(data):
                   else "pending" if counts["pending"] else "passing")
     detailed = str(data.get("detailed_merge_status") or "").lower()
     legacy = str(data.get("merge_status") or "").lower()
-    if detailed == "mergeable" or (not detailed and legacy == "can_be_merged"):
+    if detailed in _MR_CONFLICT_STATUSES:
+        mergeable = "CONFLICTING"
+    elif detailed and detailed not in _MR_UNVERIFIED_STATUSES:
         mergeable = "MERGEABLE"
-    elif detailed == "conflict" or (not detailed and legacy == "cannot_be_merged"):
+    elif not detailed and legacy == "can_be_merged":
+        mergeable = "MERGEABLE"
+    elif not detailed and legacy == "cannot_be_merged":
         mergeable = "CONFLICTING"
     else:
         mergeable = "UNKNOWN"
@@ -9528,6 +9559,14 @@ class SessionManager:
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
         )
+        # glab reads its default host from GITLAB_HOST — never the agent's own
+        # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
+        # can't auth without this, falls back to a raw API call, and the MR
+        # never gets a chip (_scan_pr_line only attributes the creating
+        # command's own tool_result). Sessions already inherit GITLAB_TOKEN
+        # from the manager env; an operator-set GITLAB_HOST wins.
+        if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
+            env_prefix += f"GITLAB_HOST={shlex.quote(gitlab_base())} "
         claude_cmd = env_prefix + claude_cmd
         if local_env_file:
             # SOURCED, never inlined and never passed as `tmux -e`: both put the

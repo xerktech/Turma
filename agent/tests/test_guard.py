@@ -111,6 +111,20 @@ POLICY_BLOCKED = [
     "az repos pr update --id 12 --auto-complete true",
     "az repos pr create --title t --auto-complete",
     "az repos pr create --title t --auto-complete=true",
+    # GitLab's auto-merge push options are `glab mr merge` spelt as a push:
+    # the MR lands the moment its pipeline/checks pass, with no human in the
+    # loop. Both spellings (classic and >= 17.11), every flag form.
+    "git push -o merge_request.create -o merge_request.merge_when_pipeline_succeeds origin CE-1",
+    "git push -o merge_request.auto_merge origin CE-1",
+    "git push -omerge_request.auto_merge origin CE-1",
+    "git push --push-option merge_request.merge_when_pipeline_succeeds origin CE-1",
+    "git push --push-option=merge_request.merge_when_pipeline_succeeds origin CE-1",
+    # `=value` forms too: GitLab keeps the value as a string and Ruby treats
+    # ANY non-empty string as truthy, so even `=false` arms auto-merge — no
+    # value disarms, so no value is safe to allow.
+    "git push -o merge_request.auto_merge=true origin CE-1",
+    "git push -o merge_request.auto_merge=false origin CE-1",
+    "git push --push-option=merge_request.merge_when_pipeline_succeeds=1 origin CE-1",
 ]
 
 POLICY_OK = [
@@ -126,6 +140,11 @@ POLICY_OK = [
     "az repos pr show --id 12",
     "az repos pr update --id 12 --status abandoned",
     "az repos pr update --id 12 --auto-complete false",  # DISARMING it is fine
+    # The push-option MR creation path stays open (XERK-162) — only the
+    # auto-merge options are the policy's business.
+    "git push -o merge_request.create origin CE-1",
+    "git push -o merge_request.create -o merge_request.target=main origin CE-1",
+    "git push --push-option=merge_request.create origin CE-1",
     "git merge feature/x",  # local branch merge is fine
 ]
 

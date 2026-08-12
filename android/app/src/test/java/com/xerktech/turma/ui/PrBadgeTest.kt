@@ -14,18 +14,29 @@ class PrBadgeTest {
         assertEquals("#42", prNumberLabel(PrInfo(url = "https://github.com/o/r/pull/42")))
     }
 
-    // XERK-162: a GitLab merge request chips exactly like a PR.
+    // XERK-162: a GitLab merge request chips exactly like a PR — labelled with
+    // GitLab's own !n sigil.
     @Test fun `bare gitlab mr url falls back to the merge_requests number`() {
         assertEquals(
-            "#12",
+            "!12",
             prNumberLabel(PrInfo(url = "https://gitlab.example.com/grp/app/-/merge_requests/12")),
         )
     }
 
-    // XERK-226: and so does an Azure DevOps pull request.
+    @Test fun `gitlab mr keeps the bang sigil when the status has a number`() {
+        assertEquals(
+            "!3",
+            prNumberLabel(
+                PrInfo(url = "https://gitlab.example.com/grp/app/-/merge_requests/3", number = 3),
+            ),
+        )
+    }
+
+    // XERK-226: and so does an Azure DevOps pull request (!n too — in ADO #n
+    // addresses a WORK ITEM).
     @Test fun `bare azure devops pr url falls back to the pullrequest number`() {
         assertEquals(
-            "#12",
+            "!12",
             prNumberLabel(PrInfo(url = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12")),
         )
     }

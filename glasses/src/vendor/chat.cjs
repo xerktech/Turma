@@ -1545,7 +1545,10 @@
   function prBadge(pr) {
     const url = pr.url || "";
     const m = url.match(/\/pull\/(\d+)|\/-\/merge_requests\/(\d+)|\/pullrequest\/(\d+)/i);
-    const num = pr.number ? "#" + pr.number : (m ? "#" + (m[1] || m[2] || m[3]) : "PR");
+    // GitLab and Azure DevOps number their requests !n, not #n (in ADO #n is a
+    // WORK ITEM) — the sigil follows the URL's platform, mirroring _pr_ref.
+    const sigil = m && !m[1] ? "!" : "#";
+    const num = pr.number ? sigil + pr.number : (m ? sigil + (m[1] || m[2] || m[3]) : "PR");
     const state = String(pr.state || "").toUpperCase();
     const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
     const label = state ? state[0] + state.slice(1).toLowerCase() : "";
