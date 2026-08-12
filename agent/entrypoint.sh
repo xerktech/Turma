@@ -353,34 +353,26 @@ if [ "${TURMA_CLAUDE_AUTO_UPDATE:-1}" != "0" ] \
   # no restart. The watchdog is the structural guarantee; the per-call bounds
   # and the regular-file guards are what stop it ever firing.
   #
-  # Its deadline is DERIVED from those per-call bounds, never a hard-coded
-  # number, because a `kill` reaches the check's shell and NOT its npm
-  # grandchild. Fire it while an install is running and npm keeps replacing the
-  # package while the manager starts launching sessions into it — measured at
-  # 100 launch failures out of 100, which is the exact window this whole design
-  # exists to close. Above the sum, the watchdog can only fire when something
-  # OTHER than a bounded call is stuck, and there is then nothing to orphan.
-  # An operator value below the floor is raised, out loud: the way to shorten a
-  # boot is to lower the per-call timeouts, which are what actually take time.
-  _grace="$(_num "${TURMA_KILL_GRACE:-10}" 10)"
-  _slack="$(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60)"
-  # A slack of 0 leaves nothing for the unbounded local work between the bounded
-  # calls (mktemp, mkdir, the greps, deleting the npm cache, plain scheduling).
-  [ "$_slack" -lt 10 ] && _slack=10
-  _floor=$(( $(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30) * 2 \
-             + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
-             + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
-             + _grace * 4 + _slack ))
-  # `_num`'s default is 0 here on purpose — "not set" — and 0 can no longer come
-  # from an operator value, so the two are distinguishable.
-  _deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
-  if [ "$_deadline" -lt "$_floor" ]; then
-    [ "$_deadline" -gt 0 ] && echo "[entrypoint] claude: TURMA_CLAUDE_UPDATE_TIMEOUT=${_deadline}s is" \
-      "below the ${_floor}s floor implied by the per-call timeouts; using ${_floor}s"
-    _deadline="$_floor"
+  # Its deadline is a FIXED, deliberately generous number — not arithmetic over
+  # the per-call bounds. It only ever needed to sit above the legitimate worst
+  # case; every attempt to make it TIGHT coupled it to the exact set of calls
+  # below and produced a run of defects (a floor that overflowed on a large
+  # value, multipliers that miscounted the calls, a count taken as the wrong
+  # uid, clock arithmetic inside the budget that fed it). What must remain true
+  # is only that it cannot fire while an install is running — a `kill` reaches
+  # this shell and NOT its npm grandchild, and npm would then keep replacing the
+  # package while the manager starts launching sessions into it. So the single
+  # coupling kept is to the one bound that dominates: at least twice the install
+  # budget — one budget for the install itself and one for everything else, so the
+  # deadline cannot land inside an install however that knob is set. Interrupting
+  # a version read or a registry query orphans nothing.
+  _deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-1800}" 1800)"
+  _min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 2 ))
+  if [ "$_deadline" -lt "$_min" ]; then
+    echo "[entrypoint] claude: TURMA_CLAUDE_UPDATE_TIMEOUT=${_deadline}s could fire while an" \
+      "install is running; using ${_min}s"
+    _deadline="$_min"
   fi
-  # Reported every boot, so the shipped default is observable (and pinned by a
-  # test) rather than something only arithmetic knows.
   echo "[entrypoint] claude check bounded at ${_deadline}s"
   claude_update_check &
   _check_pid=$!

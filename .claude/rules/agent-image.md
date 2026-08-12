@@ -43,16 +43,15 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     and the call site adds a watchdog that bounds the whole block the way the native launcher's
     outer `timeout` does. Guards mean it never fires; the watchdog means a future unbounded call
     can't wedge a host.
-  - **The watchdog's deadline is DERIVED from the per-call timeouts, never hard-coded** (same on the
-    native launcher). A `kill` reaches the check's shell, not its npm grandchild: fire it during an
-    install and npm keeps replacing the package while the manager starts launching sessions into it
-    — 100 launch failures out of 100, the very window this design closes. Above the sum, it can only
-    fire when something OTHER than a bounded call is stuck, where there is nothing to orphan. An
-    operator value below the floor is raised, out loud; shorten a boot by lowering the PER-CALL
-    timeouts (`TURMA_CLAUDE_UPDATE_SLACK` is the headroom above them). Raising, rather than
-    honouring, is deliberate: scaling the inner bounds down to fit a 60s budget would GUARANTEE a
-    killed install on a slow link, which is worse than a slower boot — and the floor is a worst
-    case only reached when there is really something to install, not what a start normally costs.
+  - **The watchdog's deadline is a FIXED generous number (1800s), not arithmetic over the per-call
+    bounds.** It only ever had to sit above the legitimate worst case; deriving it TIGHTLY coupled
+    it to the exact set of calls in the check, and every miscount of that was a defect (an
+    overflowing floor, wrong multipliers, a count taken as the wrong uid). The one coupling kept is
+    to the bound that matters: at least 2x the install budget, because a `kill` reaches the check's
+    shell and not its npm grandchild — fire it during an install and npm keeps replacing the package
+    while the manager launches sessions into it (measured: 100 launch failures out of 100).
+    Interrupting a version read or a registry query orphans nothing. The effective deadline is
+    logged every boot and the default is pinned by a test.
   - **Those per-call bounds use `timeout -k`.** Without `-k`, `timeout` only SIGNALS at the deadline
     and then waits for the child to leave (measured: 30s for a `trap "" TERM` child given `timeout
     2`), so every bound would be nominal and the derived floor would be arithmetic over numbers

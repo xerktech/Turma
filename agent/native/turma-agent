@@ -260,56 +260,33 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
   mkdir -p "$HOME/.turma" 2>/dev/null || true
   echo "[turma-agent] checking Claude Code (before any session can launch)"
   if command -v timeout >/dev/null 2>&1; then
-    # The deadline is DERIVED from the updater's own per-call timeouts, never a
-    # hard-coded number. `timeout` signals its direct child only, so firing it
-    # while an `npm install -g` is running leaves npm replacing the package
-    # while the manager comes up and starts launching sessions into it — the
-    # exact window awaiting this check exists to close. Above the sum of the
-    # inner bounds it can only fire when something OTHER than a bounded call is
-    # stuck, where there is nothing to orphan. An operator value below the floor
-    # is raised, out loud; the way to shorten a boot is to lower the per-call
-    # timeouts, which are what actually take the time.
-    # A plausible whole number of seconds, or the default. An all-digit but
-    # oversized value would overflow the arithmetic below to a NEGATIVE floor —
-    # i.e. one BELOW the sum it exists to exceed — so magnitude is capped too.
+    # A plausible whole number of seconds, or the default. `timeout 0` DISABLES
+    # the bound and an oversized value overflows the arithmetic below, so both
+    # read as "use the default"; leading zeros are stripped rather than making a
+    # sane value fail the length test.
     _num() {
       case "$1" in ''|*[!0-9]*) printf '%s' "$2"; return ;; esac
-      # Leading zeros stripped (they break the length test); all-zero, and so a
-      # literal 0, reads as "use the default" — `timeout 0` DISABLES the bound,
-      # which would leave that call unbounded and subtract its whole share from
-      # the floor at the same time.
       local v="${1#"${1%%[!0]*}"}"
       [ -n "$v" ] || { printf '%s' "$2"; return; }
       if [ "${#v}" -le 6 ] && [ "$v" -le 86400 ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
     }
-    claude_grace="$(_num "${TURMA_KILL_GRACE:-10}" 10)"
-    claude_slack="$(_num "${TURMA_CLAUDE_UPDATE_SLACK:-60}" 60)"
-    # Nothing left for the unbounded local work between the bounded calls if the
-    # slack is 0.
-    [ "$claude_slack" -lt 10 ] && claude_slack=10
-    # The multipliers are the COUNTS OF BOUNDED CALLS on the updater's worst
-    # path, measured by shimming `timeout` on PATH rather than read off the
-    # source — the source is what got them wrong. Worst path is the REPAIR one
-    # (claude present, version unreadable, on a NON-ROOT host where the global
-    # npm prefix returns EACCES): 4 probes, 2 npm-metadata reads, and an install
-    # step of 2 attempts = 8 `timeout` invocations, hence 8 graces. The two
-    # attempts SHARE one install budget, so the install term stays 1x; counting
-    # them separately would be a 965s floor for the same work. The upgrade paths
-    # are strictly smaller, so including the view term keeps this an upper bound
-    # over all of them. Counts come from shimming `timeout` on PATH and counting
-    # — AS THE IDENTITY THE CODE RUNS AS, since `[ "$(id -u)" = 0 ]` hides that
-    # retry from any root-only measurement. If a call is added or removed, this
-    # arithmetic and the test pinning its result both move.
-    claude_floor=$(( $(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30) * 4 \
-                     + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
-                     + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
-                     + $(_num "${TURMA_NPM_META_TIMEOUT:-30}" 30) * 2 \
-                     + claude_grace * 8 + claude_slack ))
-    claude_deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
-    if [ "$claude_deadline" -lt "$claude_floor" ]; then
-      [ "$claude_deadline" -gt 0 ] && echo "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${claude_deadline}s is below" \
-        "the ${claude_floor}s floor implied by the per-call timeouts; using ${claude_floor}s"
-      claude_deadline="$claude_floor"
+    # A FIXED, deliberately generous deadline — not arithmetic over the
+    # updater's per-call timeouts. It only ever needed to sit above the
+    # legitimate worst case; deriving it tightly coupled this launcher to the
+    # exact call graph inside turma-agent-update, and that coupling produced a
+    # run of defects (multipliers that miscounted the calls, a count taken as
+    # the wrong uid, an overflowing floor). What must remain true is only that
+    # it cannot fire while an install is running — `timeout` signals its direct
+    # child only, so npm would keep replacing the package while the manager
+    # comes up and launches sessions into it. Hence the one coupling kept: at
+    # least twice the install budget — one budget for the install itself and one for everything else, so the
+  # deadline cannot land inside an install however that knob is set.
+    claude_deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-1800}" 1800)"
+    claude_min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 2 ))
+    if [ "$claude_deadline" -lt "$claude_min" ]; then
+      echo "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${claude_deadline}s could fire while an" \
+        "install is running; using ${claude_min}s"
+      claude_deadline="$claude_min"
     fi
     echo "[turma-agent] claude check bounded at ${claude_deadline}s"
     timeout "$claude_deadline" \

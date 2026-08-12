@@ -112,11 +112,10 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       in the config stops being "no timeout" and becomes "every claude read looks broken, every
       start attempts a futile repair, no check ever runs". `0` reads as the default too — it
       disables `timeout` outright. Shipped default deadline (585s) pinned by a test.
-    - **The floor's multipliers are measured, not read off the source** — shim `timeout` on PATH and
-      count, **as the identity the code will run as**: the EACCES retry is behind `[ "$(id -u)" = 0
-      ]`, so a root-only measurement cannot see it at all. Worst path is the REPAIR one on a
-      NON-ROOT host (4 probes, 2 npm-metadata reads, an install step of 2 attempts = 8 invocations,
-      hence 8 graces). A test pins the shipped 665s.
+    - The launcher's deadline is a **fixed generous number**, held clear of the install budget only
+      (2x it). Deriving it from this script's per-call timeouts coupled the launcher to this
+      script's call graph, and every miscount was a defect — including one that could only be seen
+      by counting as a NON-ROOT user, since the EACCES retry sits behind `[ "$(id -u)" = 0 ]`.
     - **The two install attempts SHARE one budget** (`TURMA_NPM_INSTALL_TIMEOUT`, the retry gets the
       remainder): per-attempt bounds let the step take twice the operator's number, which is
       arithmetic the floor is built on — and counting them separately instead would mean promising a

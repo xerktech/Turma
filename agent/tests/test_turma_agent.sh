@@ -414,17 +414,15 @@ if grep -q "claudecheck=done" "$WORK/manager.log"; then
 else
   fail "the manager started while claude was still being replaced — sessions launched then die on exec"
 fi
-# The SHIPPED default deadline, pinned: 4x30 probe + 45 view + 300 install +
-# 2x30 npm-metadata + 8x10 kill-grace + 60 slack. Those multipliers are the
-# bounded-call COUNTS on the updater's worst path (the repair one), measured by
-# shimming `timeout` on PATH — reading them off the source is how they were
-# wrong before, at 585s against a path that needed 630s. The tuned cases below
-# are scale-invariant and would not catch that.
+# The shipped default deadline: a FIXED generous number, deliberately not
+# arithmetic over the updater's per-call timeouts. Deriving it tightly coupled
+# this launcher to that script's exact call graph, and every miscount of it was
+# a defect; the deadline only ever needed to sit above the legitimate worst case.
 bound="$(sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' "$WORK/run5.log" | head -1)"
-if [ "$bound" = "665" ]; then
-  ok "default deadline is 665s"
+if [ "$bound" = "1800" ]; then
+  ok "default deadline is 1800s"
 else
-  fail "default deadline is ${bound:-unreported}s, not the 665s the worst path's bounds imply"
+  fail "default deadline is ${bound:-unreported}s, not the shipped 1800s"
 fi
 pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent-update" 2>/dev/null || true
@@ -436,12 +434,9 @@ pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 echo "case: a hung Claude Code check does not hold the boot"
 : > "$WORK/boot-update.log"
 rm -f "$WORK/manager.log" "$WORK/claude-done"
-# The per-call timeouts are what the deadline is derived from, so they are what a
-# test lowers — TURMA_CLAUDE_UPDATE_TIMEOUT alone is raised to the floor (see the
-# next case), precisely so it can never be set below a running install.
-TEST_CLAUDE_CHECK_SLEEP=60 TURMA_CLAUDE_UPDATE_TIMEOUT=2 \
-  TURMA_CLAUDE_PROBE_TIMEOUT=1 TURMA_NPM_VIEW_TIMEOUT=1 TURMA_NPM_INSTALL_TIMEOUT=1 \
-  TURMA_NPM_META_TIMEOUT=1 TURMA_CLAUDE_UPDATE_SLACK=10 TURMA_KILL_GRACE=1 \
+# The deadline is held clear of the INSTALL budget and nothing else, so a small
+# budget is how a test gets a small deadline without touching the property.
+TEST_CLAUDE_CHECK_SLEEP=600 TURMA_CLAUDE_UPDATE_TIMEOUT=8 TURMA_NPM_INSTALL_TIMEOUT=1 \
   PATH="$WORK/stub-bin:$PATH" \
   setsid "$PREFIX/bin/turma-agent" >"$WORK/run7.log" 2>&1 &
 if wait_longer file_has_content "$WORK/manager.log"; then
@@ -464,22 +459,28 @@ pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 # comes up and launches sessions into it — the very window awaiting the check
 # exists to close. The bound must therefore exceed the sum of the per-call
 # timeouts, and an operator value below that floor is raised, out loud.
-echo "case: an operator deadline below the floor is raised"
+echo "case: a deadline that could fire mid-install is raised"
 : > "$WORK/boot-update.log"
 rm -f "$WORK/manager.log" "$WORK/claude-done"
-TURMA_CLAUDE_UPDATE_TIMEOUT=5 PATH="$WORK/stub-bin:$PATH" setsid \
+# The ONE coupling the fixed deadline keeps: it must stay clear of the install
+# budget, because `timeout` signals its direct child only — fire it while npm is
+# replacing the package and npm carries on while the manager launches sessions
+# into it. An operator raising the install budget past the deadline is the shape
+# that matters, and it must not be honoured silently.
+TURMA_CLAUDE_UPDATE_TIMEOUT=5 TURMA_NPM_INSTALL_TIMEOUT=600 \
+  PATH="$WORK/stub-bin:$PATH" setsid \
   "$PREFIX/bin/turma-agent" >"$WORK/run8.log" 2>&1 &
 if wait_for logged "claude check bounded at" "$WORK/run8.log"; then
   bound="$(sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' "$WORK/run8.log" | head -1)"
-  if [ -n "$bound" ] && [ "$bound" -gt 300 ]; then
-    ok "raised 5s to the ${bound}s floor implied by the per-call timeouts"
+  if [ -n "$bound" ] && [ "$bound" -ge 1200 ]; then
+    ok "raised 5s clear of a 600s install budget (bounded at ${bound}s)"
   else
     fail "honoured a deadline that can fire mid-install (bounded at ${bound:-?}s)"
   fi
 else
   fail "the launcher never reported its bound: $(cat "$WORK/run8.log")"
 fi
-if grep -q "below the .*floor" "$WORK/run8.log"; then
+if grep -q "could fire while an install is running" "$WORK/run8.log"; then
   ok "and said so"
 else
   fail "raised the deadline silently"

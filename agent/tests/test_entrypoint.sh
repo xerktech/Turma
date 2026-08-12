@@ -570,25 +570,24 @@ if [ -n "$done_line" ] && [ -n "$mgr_line" ] && [ "$done_line" -lt "$mgr_line" ]
 else
   echo "  FAIL: the watchdog orphaned an install into the session-relaunch window (install=$done_line manager=$mgr_line)"; FAILED=1
 fi
-if echo "$out" | grep -q "below the .*floor implied by the per-call timeouts"; then
+if echo "$out" | grep -q "could fire while an install is running"; then
   echo "  ok: and said it was raising the deadline"
 else
-  echo "  FAIL: silently honoured a deadline below the floor"; FAILED=1
+  echo "  FAIL: silently honoured a deadline that could fire mid-install"; FAILED=1
 fi
 
 echo "== case: the SHIPPED default floor is what it is supposed to be"
-# The scale-invariant cases below tune the knobs down to stay fast, so they would
-# still pass if a future edit left the DEFAULT floor below the DEFAULT per-call
-# bounds. This pins the shipped number itself: 2x30 probe + 45 view + 300 install
-# + 4x10 kill-grace + 60 slack.
+# A FIXED generous number, deliberately not arithmetic over the per-call bounds:
+# the deadline only ever needed to sit above the legitimate worst case, and every
+# attempt to make it tight coupled it to the exact set of calls in the check.
 make_fixture "$WORK/fx19" 0 0
 out="$(run_case "$WORK/fx19" -e AGENT=claude -e STUB_MANAGER_SLEEP=2 \
   -e STUB_CLAUDE_VERSION=2.0.9 -e STUB_NPM_LATEST=2.0.9)"
 bound="$(echo "$out" | sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' | head -1)"
-if [ "$bound" = "505" ]; then
-  echo "  ok: default deadline is 505s"
+if [ "$bound" = "1800" ]; then
+  echo "  ok: default deadline is 1800s"
 else
-  echo "  FAIL: default deadline is ${bound:-unreported}s, not the 505s the per-call defaults imply"; FAILED=1
+  echo "  FAIL: default deadline is ${bound:-unreported}s, not the shipped 1800s"; FAILED=1
 fi
 
 echo "== case: a timeout of 0 does not disable a bound and shrink the floor"
