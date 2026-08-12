@@ -702,6 +702,45 @@ test("picking a session cancels a pending follow, so the spawn can't yank the st
   assert.deepEqual(opened, ["11111"], "an explicit pick wins over the pending follow");
 });
 
+test("a spawn the agent refused stops the wait and says why (XERK-265)", () => {
+  const { beat, els, opened } = loadPage({ search: "?spawn=cmd-ref" });
+  const { now, host: h } = host([]);
+  // Beat 1: nothing reported yet — the ordinary wait.
+  beat({ now, agents: [h] });
+  assert.match(els.stageEmptyBig.innerHTML, /Starting your session/);
+
+  // Beat 2: the host reports it declined that command.
+  h.spawnRefusals = { "cmd-ref": { error: "the host is at MAX_SESSIONS (4)", at: now } };
+  beat({ now, agents: [h] });
+  assert.match(els.toast.textContent, /MAX_SESSIONS/, "the reason is surfaced");
+  assert.match(els.stageEmptyBig.innerHTML, /No session attached/,
+    "and the wait ends instead of spinning out SPAWN_FOLLOW_MS");
+  assert.deepEqual(opened, []);
+});
+
+test("a refused MOVE is reported once, by the migration that owns it", () => {
+  const { beat, els } = loadPage({ search: "?spawn=cmd-imp" });
+  const { now, host: h } = host([]);
+  h.spawnRefusals = { "cmd-imp": { error: "a root session is already running", at: now } };
+  beat({
+    now, agents: [h],
+    migrations: [{ id: "m1", phase: "importing", importCmdId: "cmd-imp",
+                   srcHost: "hostA", srcSessionId: "s1" }],
+  });
+  // The migration follow words this one ("Move failed: …"); the spawn wait must
+  // not toast the same refusal a second time. (The shim only materializes an
+  // element once the page asks for it, so an absent #toast IS "never toasted".)
+  assert.equal(els.toast ? els.toast.textContent : "", "");
+});
+
+test("a hub or agent too old to report refusals waits exactly as before", () => {
+  const { beat, els } = loadPage({ search: "?spawn=cmd-old" });
+  const { now, host: h } = host([]);
+  beat({ now, agents: [h] });   // no spawnRefusals key at all
+  assert.equal(els.toast ? els.toast.textContent : "", "");
+  assert.match(els.stageEmptyBig.innerHTML, /Starting your session/);
+});
+
 test("mobile: re-selecting a session after backing out re-reveals its stage (XERK-17)", () => {
   const { beat, selectSession, backToList, opened, body } = loadPage({ narrow: true });
   const { now, host: h } = host([working("11111", "Some Task")]);

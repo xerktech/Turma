@@ -4035,7 +4035,12 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         sm.registry = [{"id": "sess1", "worktreePath": wt, "status": "running",
                         "repo": "Turma", "claudeSessionId": "transE"}]
         sent = {}
-        sm._migration_upload = lambda mid, blob: sent.update(mid=mid, blob=blob)
+
+        def upload(mid, blob):
+            sent.update(mid=mid, blob=blob)
+            return True   # the real one answers whether the POST landed
+
+        sm._migration_upload = upload
         sm.export_session("sess1", "mig123")
         self.assertEqual(sent["mid"], "mig123")
         # What it uploaded really is the packed transcript.
@@ -4200,6 +4205,123 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess.get("prUrls"), [url])
         self.assertEqual(sm.session_pr_urls[sess["id"]], [url])
         self.assertEqual(sm.pr_ledger["transP"]["urls"], [url])
+
+
+class TestSpawnFailures(ManagerMixin, unittest.TestCase):
+    """A refused session-creating command is REPORTED, not just logged
+    (XERK-265). The command is ACKed whether the agent ran it or declined it, so
+    without a staged failure the hub cannot tell a refusal from a slow spawn: a
+    migration sits in `importing` until MIGRATE_TIMEOUT_MS and the Sessions page
+    spins out its follow window, both with no reason attached."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.repo = {"name": "Turma", "path": os.path.join(ha.REPOS_ROOT, "Turma")}
+        os.makedirs(self.repo["path"], exist_ok=True)
+        p2 = mock.patch.object(ha, "scan_repos", lambda: [self.repo])
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sm.device = "hostA"
+        return sm
+
+    def test_a_refused_resume_stages_its_reason_against_the_cmd_id(self):
+        sm = self._manager()
+        with mock.patch.object(ha, "MAX_SESSIONS", 0):
+            sm._resume_at_cwd("trans1", os.path.join(ha.WORKTREES_ROOT, "Turma", "w1"),
+                              cmd_id="c1")
+        self.assertEqual(len(sm.spawn_failures), 1)
+        f = sm.spawn_failures[0]
+        self.assertEqual(f["cmdId"], "c1")
+        self.assertIsNone(f["migrationId"])
+        self.assertIn("MAX_SESSIONS", f["error"])
+        self.assertEqual(sm.registry, [])   # and no half-built session behind it
+
+    def test_a_refused_import_names_its_migration_so_the_hub_can_fail_it(self):
+        """The case the ticket is about: the target declines, and the hub needs
+        the migrationId to fail that move now instead of at its timeout."""
+        sm = self._manager()
+        sm._migration_download = lambda mid: None   # relay fetch fails
+        sm.import_session({"migrationId": "mig9", "cmdId": "c9",
+                           "transcriptId": "0" * 8 + "-0000-4000-8000-" + "0" * 12,
+                           "cwd": os.path.join(ha.WORKTREES_ROOT, "Turma", "w2"),
+                           "repo": "Turma"})
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["mig9"])
+        self.assertEqual(sm.spawn_failures[0]["cmdId"], "c9")
+
+    def test_an_import_refused_inside_resume_still_names_its_migration(self):
+        """_resume_at_cwd's own refusals are the ones the ticket found discarded
+        — they must carry the migration id through, not just the cmdId."""
+        sm = self._manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "w3")
+        with mock.patch.object(ha, "MAX_SESSIONS", 0):
+            sm._resume_at_cwd("trans3", cwd, cmd_id="c3", migration_id="mig3")
+        self.assertEqual(sm.spawn_failures[0]["migrationId"], "mig3")
+
+    def test_a_refused_export_is_reported_too(self):
+        """The SOURCE half hangs the same way — a move whose blob never ships
+        sits in `exporting` for the whole timeout."""
+        sm = self._manager()
+        sm.registry = [{"id": "s", "worktreePath": "/nope", "status": "running",
+                        "repo": "Turma", "claudeSessionId": "gone"}]
+        sm.export_session("s", "mig1")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["mig1"])
+        self.assertIn("transcript", sm.spawn_failures[0]["error"])
+
+    def test_a_failed_upload_is_reported(self):
+        sm = self._manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "sessU")
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "transU.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "cwd": wt}) + "\n")
+        sm.registry = [{"id": "sessU", "worktreePath": wt, "status": "running",
+                        "repo": "Turma", "claudeSessionId": "transU"}]
+        sm._migration_upload = lambda mid, blob: False
+        sm.export_session("sessU", "migU")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["migU"])
+
+    def test_a_resume_any_that_finds_no_transcript_is_reported(self):
+        sm = self._manager()
+        sm.resume_transcript("11111111-2222-4333-8444-555555555555",
+                             cwd_hint=None, cmd_id="c7")
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c7"])
+
+    def test_an_uncorrelatable_refusal_is_logged_only(self):
+        """Nothing to report it against: the migration id IS the handle, and a
+        malformed one is what's being rejected."""
+        sm = self._manager()
+        sm.import_session({"migrationId": "bad id!", "transcriptId": "t"})
+        self.assertEqual(sm.spawn_failures, [])
+
+    def test_staged_failures_ride_the_next_beat_and_clear_on_delivery(self):
+        sm = self._manager()
+        self.assertNotIn("spawnFailures", sm.build_payload(1))  # absent when empty
+        with mock.patch.object(ha, "MAX_SESSIONS", 0):
+            sm._resume_at_cwd("t", os.path.join(ha.WORKTREES_ROOT, "Turma", "w4"),
+                              cmd_id="c4")
+        self.assertEqual(len(sm.build_payload(1)["spawnFailures"]), 1)
+        with mock.patch.object(ha.urllib.request, "urlopen") as uo:
+            uo.return_value.__enter__.return_value.read.return_value = b"{}"
+            sm.post({"device": "hostA"})
+        self.assertEqual(sm.spawn_failures, [])
+
+    def test_the_staged_list_is_bounded(self):
+        sm = self._manager()
+        for i in range(ha.SPAWN_FAILURES_MAX + 10):
+            sm._refuse_start(f"nope {i}", cmd_id=f"c{i}")
+        self.assertEqual(len(sm.spawn_failures), ha.SPAWN_FAILURES_MAX)
+        # Oldest-first eviction: the newest refusal is always the one kept.
+        self.assertEqual(sm.spawn_failures[-1]["cmdId"],
+                         f"c{ha.SPAWN_FAILURES_MAX + 9}")
 
 
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):

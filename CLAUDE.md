@@ -186,6 +186,21 @@ One agent container per host, multiplexing sessions across every repo it scans.
 - Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
   `eligibleMoveTargets` in android `SessionsTest`.
 
+### A refused session start is REPORTED, never just logged (XERK-265)
+
+- **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only
+  `log()`s is indistinguishable from a slow spawn: the move sat in `importing` until
+  `MIGRATE_TIMEOUT_MS` and failed with no reason, and the Sessions page spun out `SPAWN_FOLLOW_MS`.
+- Every refusal in `_resume_at_cwd`, `import_session` and `export_session` therefore goes through
+  **`_refuse_start`**, staging `{cmdId, migrationId, error}` onto the beat's **`spawnFailures`** with
+  the same held-across-a-failed-POST lifecycle as `ticketStatusResults`. The `error` is
+  operator-facing — it is what the UI and the migration record show.
+- Hub-side `ingestSpawnFailures` caches it per cmdId as **`spawnRefusals`** (served with the record,
+  NOT stripped like the other caches — the client following that spawn is who needs it) and stamps
+  `m.refusal`, which `advanceMigrations` applies **after** its handoff check, so a success always
+  wins the tie. Absent = "that agent can't tell", i.e. the old timeout wait, on both halves.
+- A refusal with neither handle stays a log line: the id being rejected IS the correlation.
+
 ## Cross-cutting contracts
 
 Rules spanning more than one component, so no `paths:`-scoped file can carry them alone.

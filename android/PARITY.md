@@ -332,6 +332,12 @@ those are marked `[MODEL]`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
+- **P2 Say when a start was REFUSED (XERK-265).** Agents now report a declined resume/import on the
+  heartbeat, and the hub serves it per cmdId as `agent.spawnRefusals[cmdId] = {error, at}`. The web
+  ends its spawn-follow wait and toasts the reason ("Couldn't start session: the host is at
+  MAX_SESSIONS (4)"); Android's Resume is fire-and-forget ("resume queued") and follows no cmdId, so
+  a refusal there is still silent — the row simply never reappears. The cheapest port is to keep the
+  cmdId a resume POST answers with and surface a matching refusal as a snackbar.
 - **P1 Local-model failover control + chip (XERK-246).** The web compose bar carries a third
   selector beside agent-mode and model — "Run against: Claude subscription / <self-hosted model>" —
   which POSTs `/api/agents/<host>/sessions/<id>/model-source` and relaunches the session on the

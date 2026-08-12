@@ -6129,6 +6129,112 @@ test("migrate: a stalled move times out and frees its blob", async () => {
   assert.equal(m.blob, null);
 });
 
+// ---- refused session starts (XERK-265) --------------------------------------
+// A resume/import the agent DECLINES is ACKed like any other command, so before
+// this the hub could not tell a refusal from a slow spawn: the move sat in
+// `importing` for the whole MIGRATE_TIMEOUT_MS and failed with no reason.
+
+test("migrate: a target that refuses the import fails the move now, with its reason", async () => {
+  await migHost("rfA", "rf.atlassian.net");
+  await migHost("rfB", "rf.atlassian.net");
+  const r = await migrate("rfA", "s1", { host: "rfB" });
+  const mid = r.body.migrationId;
+  await requestRaw("POST", `/api/agents/rfA/migrations/${mid}/blob`,
+    { body: Buffer.from("BYTES"), headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "importing");
+  const impCmdId = m.importCmdId;
+
+  // The target beats in saying it refused, naming the migration.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "rfB",
+      spawnFailures: [{ cmdId: impCmdId, migrationId: mid,
+                        error: "the host is at MAX_SESSIONS (4)" }],
+    },
+    headers: agentHeaders,
+  });
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /MAX_SESSIONS/);
+  assert.equal(m.blob, null);
+  // The source is untouched — a refused import loses nothing, so no kill.
+  assert.ok(!(agents.rfA.commands || []).some((c) => c.type === "kill"));
+  // And it rides the fleet payload keyed by cmdId, for the page following it.
+  assert.equal(agents.rfB.spawnRefusals[impCmdId].error,
+    "the host is at MAX_SESSIONS (4)");
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  const served = fleet.body.agents.find((a) => a.key === "rfB");
+  assert.ok(served.spawnRefusals[impCmdId], "served, not stripped like the caches");
+});
+
+test("migrate: a source that never ships its blob fails the move too", async () => {
+  await migHost("rxA", "rx.atlassian.net");
+  await migHost("rxB", "rx.atlassian.net");
+  const r = await migrate("rxA", "s1", { host: "rxB" });
+  const mid = r.body.migrationId;
+  assert.equal(migrations.get(mid).phase, "exporting");
+  await request("POST", "/api/heartbeat", {
+    body: { device: "rxA", spawnFailures: [{ migrationId: mid, error: "packing failed: boom" }] },
+    headers: agentHeaders,
+  });
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /packing failed/);
+});
+
+test("migrate: a target reporting BOTH the session and a refusal still completes", async () => {
+  // Ordering guard: the handoff check runs first, so a refusal that raced a
+  // successful launch can never fail a move that actually landed.
+  await migHost("rcA", "rc.atlassian.net");
+  await migHost("rcB", "rc.atlassian.net");
+  const r = await migrate("rcA", "s1", { host: "rcB" });
+  const mid = r.body.migrationId;
+  await requestRaw("POST", `/api/agents/rcA/migrations/${mid}/blob`,
+    { body: Buffer.from("BYTES"), headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
+  const m = migrations.get(mid);
+  await migHost("rcB", "rc.atlassian.net", {
+    extraSessions: [{ id: "new9", status: "running", root: false, repo: "Turma",
+      transcriptId: "trans-rcA", worktreePath: "/git/.turma/worktrees/Turma/s1",
+      spawnCmdId: m.importCmdId }],
+  });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "rcB", spawnFailures: [{ migrationId: mid, error: "stale refusal" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(m.phase, "done");
+});
+
+test("migrate: a bystander host cannot fail someone else's move", async () => {
+  // Every agent shares one token, so the migration id alone must not be enough.
+  await migHost("byA", "by.atlassian.net");
+  await migHost("byB", "by.atlassian.net");
+  const r = await migrate("byA", "s1", { host: "byB" });
+  const mid = r.body.migrationId;
+  await request("POST", "/api/heartbeat", {
+    body: { device: "byC", spawnFailures: [{ migrationId: mid, error: "not mine to fail" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(migrations.get(mid).phase, "exporting");
+});
+
+test("spawn refusals are bounded and age out of a host's record", async () => {
+  const many = Array.from({ length: 60 }, (_, i) => ({ cmdId: `c${i}`, error: `no ${i}` }));
+  await request("POST", "/api/heartbeat",
+    { body: { device: "bndH", spawnFailures: many }, headers: agentHeaders });
+  const kept = Object.keys(agents.bndH.spawnRefusals);
+  assert.ok(kept.length <= 40, `bounded, got ${kept.length}`);
+  assert.ok(kept.includes("c59"), "newest kept");
+  // An entry past its max age is dropped on the next beat that carries one.
+  agents.bndH.spawnRefusals.c59.at = Date.now() - 60 * 60 * 1000;
+  await request("POST", "/api/heartbeat",
+    { body: { device: "bndH", spawnFailures: [{ cmdId: "fresh", error: "x" }] }, headers: agentHeaders });
+  assert.ok(!agents.bndH.spawnRefusals.c59, "aged out");
+  assert.ok(agents.bndH.spawnRefusals.fresh);
+  // The wire field itself never lands on the record — it's a delivery, like the
+  // other *Results.
+  assert.equal(agents.bndH.spawnFailures, undefined);
+});
+
 test("migrate: the blob relay rejects an unauthenticated caller", async () => {
   await migHost("auA", "au.atlassian.net");
   await migHost("auB", "au.atlassian.net");
