@@ -1887,6 +1887,33 @@ function normalizeRecord(a) {
   normalizeLocalModel(a);
 }
 
+/**
+ * The heartbeat's coercion step, reached through a holder so a test can force it
+ * to throw (XERK-262). Production always holds the real [normalizeRecord]; only
+ * a `TURMA_TEST` suite ever replaces `normalize`.
+ *
+ * The indirection exists because the backstop around this call cannot be
+ * reached from the heartbeat wire today, and a QA mutation pass deleted the
+ * whole try/catch with the suite green.
+ *
+ * Why it is unreachable: every `normalize*` guards its own input shape, so the
+ * only throw the path has ever had was `sanitizeLiveAgents`'s `String(...)` on a
+ * value with no primitive conversion (pure JSON can express one —
+ * `{"toString":1,"valueOf":1}`), and `sanitizeHeartbeat` walks those same rows
+ * BEFORE any record is installed. Do not read that as "the input is impossible":
+ * the same value reaches `sanitizeLiveAgents` from the `/agent/control` frame
+ * handler, where nothing catches it (XERK-278).
+ *
+ * Being unreachable is exactly why deleting this catch reads as safe. It is not:
+ * `agents[key] = next` has ALREADY run by the time the coercion is called, so
+ * without the rollback a throw leaves the RAW, uncoerced record installed and
+ * served — defeating every gate downstream, `normalizeLocalModel`'s
+ * strict-boolean `available` check included. One `normalize*` that can throw on
+ * an input `sanitizeHeartbeat` does not walk makes this load-bearing with no
+ * other warning.
+ */
+const recordCoercion = { normalize: normalizeRecord };
+
 // The per-SESSION coercions (see normalizeRecord).
 //
 // `sessions` is a KNOWN key, so sanitizeHeartbeat's unknown-field sweep never
@@ -3728,7 +3755,7 @@ const server = http.createServer(async (req, res) => {
       // strict-boolean check. The coercions are written not to throw; this is
       // the backstop that makes that not matter.
       try {
-        normalizeRecord(next);
+        recordCoercion.normalize(next);
       } catch (e) {
         console.error(`heartbeat from ${key}: coercion failed (${e.message}) — beat refused`);
         if (prev && Object.keys(prev).length) agents[key] = prev;
@@ -5367,6 +5394,10 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    // The holder the heartbeat's coercion step goes through, exported so a test
+    // can make it throw and hold the rollback that follows (XERK-262). See its
+    // declaration for why that rollback cannot be reached from the wire.
+    recordCoercion,
 
     queueCommand,
     findSession,

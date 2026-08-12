@@ -6553,7 +6553,12 @@ test("the state.json restore coerces too, not just the ingest path", () => {
     "the state.json restore must go through normalizeRecord, like the ingest path");
   const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
     src.indexOf("ingestHistory(next, historyResults)"));
-  assert.ok(/normalizeRecord\(next\)/.test(ingest),
+  // The ingest reaches it through `recordCoercion` (XERK-262) so a test can
+  // force the backstop around it to run; that holder carries `normalizeRecord`
+  // itself, which is asserted directly by "the coercion holder runs the real
+  // normalizeRecord in production". So this stays a check that the ingest and
+  // the restore share ONE function, not a list of coercions to keep in step.
+  assert.ok(/recordCoercion\.normalize\(next\)/.test(ingest),
     "the heartbeat ingest must go through the same normalizeRecord");
   // ...and BETWEEN the two size measurements. Before the raw check it could
   // shrink away the amplifier the ceiling exists to refuse (an 8 MiB string
@@ -6561,7 +6566,7 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   // EXPANDING coercion escapes the ceiling entirely (normalizeModelUsage is
   // ~3.5x, and an 8 MiB beat parked 28 MiB per host for a week).
   const iRaw = ingest.indexOf("rawSize > AGENT_RECORD_MAX");
-  const iCoerce = ingest.indexOf("normalizeRecord(next)");
+  const iCoerce = ingest.indexOf("recordCoercion.normalize(next)");
   const iStored = ingest.indexOf("recordSize > AGENT_RECORD_MAX");
   assert.ok(iRaw > -1 && iCoerce > iRaw && iStored > iCoerce,
     "the ingest must measure raw size, THEN coerce, THEN measure the stored size");
@@ -6766,3 +6771,105 @@ test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async
   assert.ok(res.body.agents.length > 1);
 });
 
+
+// ---- the coercion backstop (XERK-262) ---------------------------------------
+//
+// A QA mutation pass deleted the whole try/catch around the heartbeat's
+// coercion step and the entire node suite stayed green. It was reported as a
+// gap on dead defensive code — no input could be found that made
+// `normalizeRecord` throw. Half of that turned out to be wrong: one exists, and
+// the first test below pins it. What it does NOT do is reach the backstop,
+// because `sanitizeHeartbeat` walks the same rows first and refuses the beat
+// before any record is installed. That ordering is the reason the catch looks
+// dead, so both halves are held here — the ordering, and the rollback it hides.
+
+test("heartbeat: a live-agent field with no primitive conversion never reaches the record", async () => {
+  const host = "poison-host";
+  // Pure JSON, straight off the wire: an object whose own `toString` and
+  // `valueOf` are both non-callable has NO primitive conversion. It is the one
+  // input that reaches a throw anywhere in the coercion path — which is what
+  // makes the ordering below (sanitizeHeartbeat ahead of the record install)
+  // load-bearing rather than incidental.
+  const poison = JSON.parse('{"toString":1,"valueOf":1}');
+
+  const good = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running", repo: "r" }] },
+  });
+  assert.equal(good.status, 200);
+
+  const bad = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host,
+      sessions: [{ id: "s1", status: "running", session: { agents: [{ type: poison }] } }],
+    },
+  });
+  // A DEFINITE verdict, never a 5xx and never a hang. Deliberately not pinned to
+  // one status: this beat is refused 400 while the coercion can throw, and
+  // becomes an ordinary 200 with the row dropped once XERK-278 makes
+  // `sanitizeLiveAgents` total. Both are correct; what must never change is that
+  // the poisoned row does not survive and the hub keeps serving.
+  assert.ok(bad.status === 200 || bad.status === 400, `unexpected ${bad.status}`);
+  const live = agents[host].sessions[0].session;
+  assert.deepEqual(live ? live.agents : [], []);
+  // Still answering — the throw must not have escaped the request handler.
+  assert.equal((await request("GET", "/api/agents", { headers: userHeaders })).status, 200);
+});
+
+test("heartbeat: a coercion that throws rolls the record back rather than banking it raw", async () => {
+  const host = "coercion-throw-host";
+  const real = hub.recordCoercion.normalize;
+
+  // A first beat the host is entitled to keep.
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running", repo: "before" }] },
+  })).status, 200);
+
+  hub.recordCoercion.normalize = () => {
+    throw new TypeError("coercion blew up");
+  };
+  try {
+    const r = await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: host, sessions: [{ id: "s1", status: "running", repo: "after" }] },
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.error, "malformed heartbeat");
+  } finally {
+    hub.recordCoercion.normalize = real;
+  }
+
+  // `agents[key] = next` has ALREADY run by the time the coercion is called, so
+  // without the rollback the RAW, uncoerced record stays installed and is what
+  // every client is served — which is the whole reason the catch exists.
+  assert.equal(agents[host].sessions[0].repo, "before");
+});
+
+test("heartbeat: a coercion that throws on a host's FIRST beat leaves no record at all", async () => {
+  const host = "coercion-throw-first";
+  const real = hub.recordCoercion.normalize;
+  hub.recordCoercion.normalize = () => {
+    throw new TypeError("coercion blew up");
+  };
+  try {
+    const r = await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: host, sessions: [{ id: "s1", status: "running", repo: "r" }] },
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    hub.recordCoercion.normalize = real;
+  }
+  // No `prev` to restore, so the half-installed record must be DELETED. Leaving
+  // it would put a host on the dashboard whose payload never passed a coercion.
+  assert.ok(!(host in agents));
+});
+
+test("heartbeat: the coercion holder runs the real normalizeRecord in production", () => {
+  // The seam must not become a place a coercion can be quietly unhooked: what
+  // the holder carries by default IS the function every client's decode depends
+  // on, and the two tests above only prove the catch given that it is.
+  assert.equal(hub.recordCoercion.normalize, hub.normalizeRecord);
+});

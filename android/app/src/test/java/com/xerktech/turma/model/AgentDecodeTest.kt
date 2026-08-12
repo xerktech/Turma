@@ -139,6 +139,30 @@ class AgentDecodeTest {
         assertEquals("", resp.agents[0].sessions[0].modelSourceAt)
     }
 
+    // The @Serializable DEFAULT, held on its own (XERK-262).
+    //
+    // The two cases either side of this one send `available` explicitly, so both
+    // stayed green when a mutation pass flipped the default to `true` — and that
+    // default is the whole contract for a block that arrives PRESENT but EMPTY.
+    // Flipped, a host reporting `localModel: {}` reads fleet-wide as "can fail
+    // over": the UI offers the switch, and the hub 409s every command it sends.
+    // That is the exact inverse of the rule CLAUDE.md states — an absent flag
+    // means "that agent can't do it", never "unlimited" — so the default is
+    // load-bearing and gets a case that fails the moment it moves.
+    @Test fun `an empty localModel block is not available`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+              "localModel": {} } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val lm = resp.agents[0].localModel
+        assertEquals(false, lm?.available)
+        // The two it carries are null exactly when it is unavailable, so nothing
+        // downstream can read them as a fallback for an unconfigured host.
+        assertNull(lm?.model)
+        assertNull(lm?.contextTokens)
+    }
+
     // An agent predating the failover reports neither field. Absent must mean
     // "that host can't do it", which is what hides the control.
     @Test fun `an agent predating the failover decodes with no local model`() {
