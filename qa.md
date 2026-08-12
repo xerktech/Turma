@@ -14,17 +14,20 @@ actually run on, where several of its recipes do not apply as written.
 
 Turma runs its fleet two ways, and they are not interchangeable:
 
-| | agent container | TrueNAS native (this host) |
-|---|---|---|
-| `npm` / `npx` | on PATH | **not on PATH** — see below |
-| `java`, `gradle`, Android SDK | bundled | **absent** |
-| `apt`, writable `/usr` | yes | **no** — read-only, no sudo |
-| `ps` / `pkill` | absent | present |
-| `~/.claude`, `~/.turma` | bind mounts | the operator's real ones |
+| | agent container | TrueNAS native | WSL workstation (`MaxAI`) |
+|---|---|---|---|
+| `npm` / `npx` | on PATH | **not on PATH** — see below | on PATH |
+| `java`, `gradle`, Android SDK | bundled | **absent** | **installed** — see §2.5 |
+| emulator / `adb` | only the `:emulator` tag | absent | **a running AVD** |
+| `apt`, writable `/usr` | yes | **no** — read-only, no sudo | yes, with sudo |
+| `ps` / `pkill` | absent | present | present |
+| `~/.claude`, `~/.turma` | bind mounts | the operator's real ones | the operator's real ones |
 
-Check with `which java gradle npm` before you plan anything. Assuming the
+Check with `which java gradle npm adb` before you plan anything. Assuming the
 container's toolchain on a native host is the single most common way to waste
-a QA session.
+a QA session — and assuming the TrueNAS host's *absences* on the WSL
+workstation is the second, because it sends you into a docker pull and an
+emulator download you don't need.
 
 ### Native-host facts
 
@@ -326,7 +329,154 @@ Driving it:
 
 There is **no committed gradle wrapper** — CI generates it.
 `.github/workflows/android-ci.yml` is the reliable spec for how this is really
-built; read it before inventing your own invocation.
+built; read it before inventing your own invocation. That workflow runs
+`:app:testDebugUnitTest` + `:app:assembleDebug` and **nothing else** — no lint,
+no ktlint, no instrumented source set — so a rule living inside a `@Composable`
+or a ViewModel call site has **no gate at all**. Read the count out of
+`app/build/test-results/testDebugUnitTest/TEST-*.xml`; it moves every ticket.
+
+#### On the WSL workstation, build and drive natively — no container
+
+```bash
+export JAVA_HOME=~/tools/jdk-17.0.20+8 ANDROID_HOME=~/Android/Sdk
+export PATH=~/tools/gradle-8.11.1/bin:$JAVA_HOME/bin:~/Android/Sdk/platform-tools:$PATH
+cd android && gradle --no-daemon :app:testDebugUnitTest --rerun :app:assembleDebug
+adb -s <device> install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+`--rerun` is not optional for a mutation test: without it Gradle says
+`UP-TO-DATE`, nothing executes, and **every mutation reads as caught**. Same
+trap as the container's `FROM-CACHE`, different wording. (`assembleDebug` on its
+own is safe to trust: Gradle hashes CONTENT, so a mutated-then-reverted file
+reports `UP-TO-DATE` correctly even though its mtime moved.)
+
+**Run a throwaway probe test without editing the repo** — an init script can add
+a scratch source dir, which is how you measure "is this wire shape actually
+decode-fatal?" against the app's own `TurmaJson` and data classes:
+
+```bash
+cat > /tmp/qa-init.gradle <<'EOF'
+gradle.projectsEvaluated { gradle.rootProject.allprojects.each { p ->
+  if (p.plugins.hasPlugin('com.android.application'))
+    p.android.sourceSets.getByName('test').java.srcDir('/tmp/qa-kt') } }
+EOF
+gradle --no-daemon --init-script /tmp/qa-init.gradle \
+  :app:testDebugUnitTest --tests "qa.MyProbeTest" -i | grep PROBE
+```
+
+Measured that way: `coerceInputValues` saves a `null` and a wrong-typed
+PRIMITIVE (`modelSource: 5` and `: true` decode fine, `device: 5` too), but an
+object or an array where a `String`/`Boolean`/`Int` is declared always throws,
+as does any non-object element of a typed `List<…>`. So "it is typed" is not the
+test — "an object or array can land there" is.
+
+**Stand up your own AVD.** The shared `turma228` is used by other sessions whose
+apps steal the foreground every 30–60s and which have force-stopped
+`com.xerktech.turma` outright (`adb logcat -b events | grep am_kill`) — that
+looks exactly like your app crashing.
+
+```bash
+echo no | avdmanager create avd -n qa-<ticket> -k "system-images;android-35;google_apis;x86_64" -d pixel_6
+emulator -avd qa-<ticket> -no-window -no-audio -no-boot-anim -port 5556
+```
+
+A second instance of an AVD already running is refused unless the first was
+started `-read-only`, which is why you cannot simply reuse the shared one.
+
+- **Re-focus with `am start -f 0x20000`** (REORDER_TO_FRONT), which returns you
+  to the last SCREEN, not a tab. A plain `am start` pushes a new `MainActivity`
+  and resets the Compose nav stack to the dashboard, silently losing the screen
+  under test.
+- **Guard every tap on `dumpsys activity activities | grep topResumedActivity`.**
+  A tap resolved from one app's dump and delivered to another lands wherever
+  that app put it — one such stray tap opened a package-manager "Uninstall
+  Turma?" dialog.
+- Resolve targets from `uiautomator dump`, never screenshot pixels: the
+  compose-bar chips reflow as their labels change width. Match `content-desc`
+  where there is one, and **match exactly** — a substring `Sessions` hits
+  `RUNNING SESSIONS` first. Snackbars live ~3s, so poll at t+2s.
+  - **A dump costs ~2s normally, but can stall for tens of seconds** — it waits
+    for window idle, so a screen the ~1s fleet beat keeps repainting can hold it
+    off. Measured on emulator-5556 with a second emulator running and the fleet
+    beating: 1.94–1.97s, so do NOT plan around a fixed 30–60s budget. When one
+    screen does hang, `exec-out screencap -p` costs ~2s and never blocks: drive
+    from fixed coordinates read off one screenshot, and spend a dump only where
+    you need `content-desc`.
+  - A `content-desc` containing a `"` is emitted in SINGLE quotes, so
+    `grep 'content-desc="…'` misses it. Grep the value, not the attribute.
+  - **A row that appears/disappears reflows the buttons under it.** Hiding the
+    composer's "Run against" row moved `Spawn` up ~100px, and the stale
+    coordinate hit dead space — re-screenshot after any state change that can
+    add or drop a field.
+- `ExposedDropdownMenuBox` opens on a tap **anywhere in the field**, caret or
+  body — measured on the spawn composer's Model row (bounds `[183,1277]`–
+  `[897,1445]`, tapped at x=325, menu opened). An earlier note here said the
+  caret only; that is wrong for this build, so resolve the field's own bounds
+  and tap its centre.
+- A destructive row **arms and re-disarms**: `Kill` becomes `Confirm kill` and
+  reverts in ~2s, so the two taps must be one `adb shell "input tap …; sleep
+  0.4; input tap …"`. A dump between them loses the arm.
+- **Every list/chat screen collects the VM's `messages` into a snackbar** —
+  `SessionsListPane` (its own `SnackbarHost`, bottom of the pane; in the wide
+  two-pane layout that is inside the 360dp list column), `FleetScreen`,
+  `ChatScreen`, and `BoardScreen`/`OrgControl` as toasts. So an error-wording
+  check can be driven from any of them. Measured: a refused local spawn from the
+  session list reads `✗ host has no local model configured`, a good one
+  `✓ session queued`.
+- **XML-illegal characters in the payload make `uiautomator dump` die** —
+  a 0-byte file, and every tap resolved from it misses, while the app itself
+  renders the string fine. THREE classes do it, all measured on emulator-5556:
+  **lone surrogates**, **C0/DEL controls**, and **U+FFFE/U+FFFF** (the two
+  noncharacters XML 1.0 also excludes). Everything else survives — `U+FDD0` and
+  `U+1FFFE` dump fine, so do not blame "noncharacters" generally.
+  `normalizeLocalModel` closes ALL THREE for `localModel.model`, in both
+  directions (manufactured by its own 60-code-point cut, and arriving in a rogue
+  agent's input); every other agent-supplied string reaching the UI is unguarded
+  entirely, so re-probe per field rather than assuming the guard travels.
+  Screenshot instead when a dump goes
+  empty for no reason, suspect the payload before the tooling, and always run
+  the same screen with a benign name as the control before filing.
+- **`ChatViewModel` is scoped to the chat's nav back-stack entry**, so all of its
+  in-memory state dies when you leave that screen (backgrounding does not).
+  Anything that must survive lives in `AppContainer` — `container.drafts`,
+  `container.modelSwitches`. Check which before calling a "the value springs
+  back" report a logic bug.
+
+#### Standing a hub up for the app to talk to
+
+Run the real `turma/server.js` on scratch `STATE_FILE`/`ARCHIVE_DIR`/
+`ARCHIVE_DB`, POST synthetic `/api/heartbeat`s every ~3s to keep hosts online,
+and point the app at `http://10.0.2.2:<port>`.
+
+- **Put a logging HTTP proxy in front of it.** The heartbeat RESPONSE drains the
+  command queue, so polling `/api/agents` for `commands` misses what a tap
+  actually sent; a proxy logging method + path + body is the only reliable
+  record, and it is how you inject 409/500/socket-drop to reach the error paths.
+  It must handle `upgrade` (raw socket pipe) or the live-tail WebSocket dies,
+  and must `pipe()` responses or SSE hangs.
+- Delay the first heartbeat ~2.5s; `server.js` is not listening instantly.
+- **Kill previous passes' rigs first** (`/proc/*/cmdline` matching
+  `turma/server.js` under your worktree). Stale beat loops from an earlier pass
+  keep overwriting your hosts and quietly contaminate the evidence.
+- A host the app has decoded once stays in its `byKey` map, so **re-probing a
+  malformed payload under a name the app has already seen hides the failure** —
+  use a fresh host name for every decode probe.
+- Kill the rig by PID, not `pkill -f`, and not by grepping `/proc/*/cmdline`
+  either: BOTH match your own shell, whose command line quotes the pattern you
+  are searching for. `pkill` kills the caller (exit 144); the `/proc` version
+  kills it too, and the replacement rig then dies on `EADDRINUSE` while the OLD
+  one keeps serving — so the whole A/B runs against the unmutated code and reads
+  as "no difference". Match `argv[0] == "node"`, skip your own PID's ancestry
+  (`scratchpad/qa8/killrig.py`), and assert the port is free before restarting.
+  The tell is subtler than a dead rig: the NEW rig keeps beating happily into the
+  OLD rig's server, so any control your new rig added (an env var, a file toggle)
+  silently does nothing and the app looks like it ignored the change. `ps -eo
+  pid,lstart,args | grep "[r]ig.js"` must show exactly ONE before you believe a
+  negative result.
+- **Refuse `/api/events` at the proxy to see what a decode failure really
+  costs.** With SSE healthy a bad host loses only itself (per-agent events
+  decode in `runCatching`); poll-only, the whole fleet is replaced by the raw
+  kotlinx exception text. Test both — they look like different bugs.
 
 ---
 
@@ -593,6 +743,131 @@ act on every time.
   a session only when its LAST `/live` viewer disconnects, so one browser socket
   the page has lost track of pins the agent's ~1s transcript tail on forever.
   Count sockets opened and still-open after leaving the stage.
+- **Whether the branch still merges, and what the careless resolution costs.**
+  `git merge-tree --write-tree HEAD origin/main` finds the conflicts (it exits 1
+  on one); then run the *wrong* side of each hunk as a mutation. XERK-246
+  conflicted on a single `_state.update` line where taking `main`'s side drops
+  one field and permanently hides two controls — with the whole suite green.
+  A branch verified only at its own tip is not verified. `qa.md` is the file
+  most likely to conflict; a "take theirs" there silently deletes a pass's notes.
+- **Boundaries asserted relative to the constant they test.** A TTL check written
+  `now = at + SETTLE_MS + 1` bounds the constant from below only: raising it to
+  16.7 hours keeps the test green, which is the exact failure the constant
+  exists to prevent. Assert one side with a literal.
+- **Which heartbeat fields are actually coerced.** Read `normalizeRecord` — it is
+  the one list, and both the ingest and the `state.json` restore call it. Today:
+  `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`, `normalizeSessions`
+  (which reshapes `sessions[].session.agents` via `sanitizeLiveAgents`, and
+  coerces `modelSource`/`modelSourceAt`). Everything else is raw: every other
+  host-level block Android types (`capacity`, `github`, `models`, `jira`,
+  `claudeAuth`, `closedSessions`, …) and every other per-session field (`prs`,
+  `id`, …), where an object or array throws for the WHOLE `/api/agents` array.
+  `normalizeSessions` DROPS a non-object element and REWRITES a non-array
+  `sessions` to `[]` (both used to hide that host from the phone — and the
+  non-array one stopped the app signing in at all, see below).
+  **`normalizeRecord` runs PAST the `AGENT_RECORD_MAX` gate**, which is what
+  makes rewriting safe: placed before it, a coercion shrinks away the very
+  amplifier the gate exists to refuse (an 8 MiB string `sessions` rewritten to
+  `[]` turned a 413 into a 200) and walks an oversized record field by field
+  before throwing it out — which is how a 24 MiB model name reached a
+  per-code-point spread and OOM-killed the hub. So: **anything running before
+  the gate may only SHRINK; put a rewrite after it.** `sanitizeHeartbeat` is
+  pre-gate and is held to the shrink-only half.
+  - Measure what an uncoerced field costs before calling it acceptable. A host
+    with `sessions:"x"` does not merely vanish: the phone **cannot sign in at
+    all**, reporting `Could not reach the hub — check the URL`, because the
+    login probe decodes `/api/agents`. A/B it by dropping the bad host and
+    re-pressing Sign in. (That one is coerced as of XERK-246; the point is the
+    method — the cost of an uncoerced field is rarely the one you assume.)
+  Verify by probing, not by reading any doc: this list has been wrong in
+  `CLAUDE.md` and here more than once.
+- **Check the state.json RESTORE, not just the ingest path**, and check it
+  against the LIST above rather than against what the loader looks like it does.
+  A hub restart is when a new coercion ships and the restore is the first thing
+  it serves, so a coercion applied only at ingest is a hole straight through
+  itself — until that host's next beat, which for an OFFLINE host is never
+  (records live 7 days). The loader is a bare `for` over the parsed blob;
+  `grep -n "(a);"` the slice between `agents = JSON.parse` and
+  `first boot or no volume` and compare it to the four, one by one.
+  Repro that costs 30 seconds and needs no agent: write a state file with the
+  suspect record, boot `turma/server.js` on it with `STATE_FILE=` pointed there,
+  and `curl -u … /api/agents` — the record has no beat behind it, so whatever
+  comes back is what the restore did. Point the phone at the same hub to see
+  what the raw record costs it.
+  A `normalize*` is also a WHITELIST: a sub-key a newer agent adds is dropped
+  fleet-wide with nothing failing.
+- **The restore runs inside `try { … } catch {}`, so ANY throw in it is silent** —
+  the record loads half-coerced, no log line, every suite green. `console.log`
+  the `loaded N agents from …` line is the only tell; its ABSENCE with a
+  non-empty state file means the loop threw. Two things cause it: a module
+  `const` the restore path reads that is declared BELOW the restore (temporal
+  dead zone at module init — function declarations hoist, `const`s do not), and
+  a shape the coercions don't guard. Check the first mechanically rather than by
+  eye: BFS the call graph from `normalizeRecord`, collect the top-level
+  `const`/`let` each reached function references, and flag any declared after the
+  loader (`scratchpad/qa8/tdz_scan.py`). A line-order assert naming two constants
+  by hand does not see the third.
+- **The hub's deployed memory ceiling is `mem_limit: 256m`** (DockerOps
+  `compose/turma.yaml`), so ANY per-request allocation over ~200 MB is a
+  one-request kill of the whole fleet's control plane, not a slow page.
+  `HEARTBEAT_MAX` is 32 MiB and `AGENT_RECORD_MAX` (8 MiB) is checked AFTER
+  `normalizeRecord`, so a coercion that expands an agent-controlled string before
+  bounding it — `[...s]` spreads to one array element per code point — routes
+  straight around that guard. **Bound with `slice()` BEFORE any spread/split/
+  match over an agent string.** Reproduce at the deployed shape rather than
+  arguing about it:
+  ```bash
+  docker run -d --name qa-hub -m 256m --memory-swap 256m -p 127.0.0.1:8993:8993 \
+    -e PORT=8993 -e TURMA_USER=qa -e TURMA_PASSWORD=qa-pass -e TURMA_AGENT_TOKEN=t \
+    -e STATE_FILE=/tmp/state.json -e ARCHIVE_DIR=/tmp/a -e ARCHIVE_DB=/tmp/a.db \
+    -v "$PWD/turma:/app:ro" -w /app node:24-bookworm-slim node server.js
+  # then POST one beat with a ~24 MiB string in the field under test and read
+  docker inspect -f '{{.State.Status}} {{.State.OOMKilled}}' qa-hub
+  ```
+
+Mutation-testing mechanics, since a broken harness reads as a passing one:
+
+- Force the tests to actually run (`--rerun`, or `--rerun-tasks` in the
+  container) — an `UP-TO-DATE`/`FROM-CACHE` result makes every mutation "caught".
+- **Run a mutation the way CI runs the suite, and run it more than once.** A
+  guard asserted as a TIME or `heapUsed` budget is order-dependent: whether the
+  GC ran just before the measurement decides the number. `node --test
+  turma/tests/server.test.js` caught the un-bounded-spread mutation 5 times in 8
+  identical runs and MISSED it 3 — alone (`--test-name-pattern`) it failed every
+  time. A single green run against a mutation proves nothing; a resource budget
+  needs a margin of ~10x, not ~1.02x (measured 51ms against a 50ms limit and
+  71MB against 64MB).
+- `git checkout -- <path>` resolves relative to the `-C` root, not your cwd. A
+  silently failed revert leaves the previous mutation in the tree and the NEXT
+  one then reads as caught. Verify with `git status` after every revert, and
+  mutate a scratch copy rather than the repo.
+- On `android/`, expect roughly HALF the battery to survive, and not at random:
+  60 mutations over XERK-246 left 30 alive, all in the same three places —
+  **Composable bodies** (19: `ChatScreen.kt`, `FleetDialogs.kt`, the two
+  `SpawnDialog` call sites, and `SessionsListPane`'s snackbar collector + host,
+  no instrumented source set), **ViewModel call sites** (10: `ChatViewModel.kt`,
+  `FleetViewModel.kt`, no Robolectric or coroutine-test harness), and
+  **`@Serializable` field defaults** (1) that no fixture exercises. A pure
+  `core/` rule with a test is gated; the CALL to it is not, and neither is which
+  value a Composable passes it. Spot-checked independently: 3/3 `core/` mutations
+  caught, 9/9 VM-call-site and Composable-body mutations escaped. Judge an
+  Android change on where its rule lives, and quote the survivor count rather
+  than "a few".
+- A hub-side rule genuinely is gated by comparison. Over `turma/server.js`'s
+  coercion path a 12-mutation battery is now caught 12/12 by `server.test.js` —
+  including the TDZ one (the behavioural child-process restore test sees it) and
+  the un-bounded spread, whose guard pairs a structural assertion with a
+  resource budget precisely because the budget alone was flaky. `sessions:{a:1}`
+  (any non-iterable) used to make `normalizeUsage`'s `for…of` throw and abort the
+  whole restore into its own `catch {}` with `loaded N agents` never printing;
+  `normalizeSessions` now runs first and rewrites it. The asymmetry with Android
+  is structural, not effort: "0 escapes" on a UI layer usually means the battery
+  was too small, while on the hub it means the tests are real.
+- `gradle --no-daemon --offline :app:testDebugUnitTest --rerun` is ~13s per
+  mutation once the first compile is warm, so a 50-mutation battery is ~12
+  minutes; run it in the background and do UI work meanwhile (the emulator does
+  not see tree edits). Do NOT read a source file while it runs — you will read a
+  mutation and think it is the branch.
 - Type validation on hub routes: `!body.repo` passes an object; a non-string
   `model` coerced to `""` silently *released* a pin.
 - The two mirrors of any rule (`liveState` in `index.html` vs `sessions.html`,
@@ -659,6 +934,28 @@ are holding. Re-confirm with the same script on both before you spend time.
   Deleting the call leaves all 455 vitest tests green while a scrolled-up view
   gets yanked down by a growing live turn. The behaviour is correct on both
   `main` and HEAD — it is the coverage that is missing.
+- **One malformed host costs the phone every OTHER host, silently.** Decoding
+  `/api/agents` is atomic on Android, so an object/array in any uncoerced field
+  throws for the whole array; `FleetRepository.refresh` catches it into
+  `FleetState.error`, but `ui/FleetScreen.kt` renders that error ONLY when the
+  fleet is empty, so the app keeps painting its last good snapshot and still
+  claims "N / N online". Per-agent SSE events decode inside `runCatching{}`, so
+  while SSE is healthy a bad host loses only itself — but every full refresh
+  throws, and a cold start then shows the reduced count with no error at all.
+  Two-line repro, no app changes needed:
+  ```
+  POST /api/heartbeat {"device":"capbad","online":true,
+        "capacity":{"maxSessions":"eight","running":1.5,"queued":0,"free":0}}
+  ```
+  Hub serves it raw; the phone silently drops `capbad`. Lenient decoding absorbs
+  a number or bool in a String field, so only object/array values do it. Use a
+  host name the app has never decoded, or its `byKey` entry hides the failure.
+- **`ChatViewModel` never starts the fleet poll**, so a process-death restore
+  straight into a chat shows no session record — header "Session", chips at
+  their defaults, no PR/ticket/source chips — and never recovers until you back
+  out to a list and re-enter. `FleetRepository.start()` is called only from
+  `FleetViewModel.start()`, i.e. from a list screen. It degrades in the safe
+  direction (controls hidden, not wrongly enabled).
 - **The board drag's edge auto-scroll is dead on a phone (≤560px).** `edgeScroll`
   nudges `scrollLeft += 18` per pointermove and `scroll-snap-type: x proximity`
   snaps it back, so a card only reaches a column already on screen (a peek is
