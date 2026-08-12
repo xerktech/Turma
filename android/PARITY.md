@@ -371,6 +371,12 @@ those are marked `[MODEL]`.
 - ~~P1 Clone bar: collapse + search + multi-select + `🔒` private marker + clone-job status rows.~~
   Done (XERK-126, see Done below).
 - P1 `[MODEL]` Repo blocks: branch/dirty meta, remote link, orphan repos, prune-note, empty state.
+  - The prune-note now also covers a prune IN FLIGHT (XERK-256): the agent sweeps on a worker thread
+    and reports `prunes[].status` as `queued`/`running` with a progress summary, which the web uses
+    both for the note and to keep the Prune button spinning for the whole sweep (minutes on a big
+    repo). Android's `prune()` fires and forgets, so its button releases immediately and the
+    operator has no sign the sweep is still going. Decode `prunes[]` and mirror `repoBlock`'s rule:
+    busy while `status` is `queued` or `running`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)

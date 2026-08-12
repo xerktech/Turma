@@ -82,7 +82,7 @@ reviewed triage list, each with a reason); anything unlisted still fails.
     `ANDROID_EMULATOR_TAG`/`ANDROID_EMULATOR_ABI`) is built on demand via
     `agent-emulator-image.yml`.
 - The cloud CLIs (terraform/`az`/`aws`) sit in the `tooling` stage so **every tier carries them and
-  the CI scan covers them**. Details in `.claude/rules/agent.md`.
+  the CI scan covers them**. Details in `.claude/rules/agent-image.md`.
 
 ## Where jobs run
 

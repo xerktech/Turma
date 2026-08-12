@@ -47,6 +47,12 @@ class SubagentViewModel(app: Application) : AndroidViewModel(app) {
                         return@launch
                     }
                     is HubClient.HistoryResult.Pending -> delay(1200)
+                    // Refused, not pending (XERK-264) — retrying can't fix it,
+                    // and the hub's own words beat a generic "unavailable".
+                    is HubClient.HistoryResult.Failed -> {
+                        _state.update { it.copy(loading = false, error = r.why) }
+                        return@launch
+                    }
                     null -> { // hub unreachable — stop trying, report it
                         _state.update { it.copy(loading = false, error = "unreachable") }
                         return@launch
