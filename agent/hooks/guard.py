@@ -1037,7 +1037,8 @@ _ATTRIB_PATTERNS = (
 # text, and a description written through `glab` or `az` carries it just as far.
 _ATTRIB_CONTEXT = re.compile(
     r"\bgit\s+(commit|tag|merge|revert)\b|\bgh\s+(pr|release)\b"
-    r"|\bglab\s+mr\b|\baz\s+repos\s+pr\b|--message\b|\bcommit\b.*-m\b",
+    r"|\bglab\s+mr\b|\baz\s+repos\s+pr\b|\bado\s+pr-create\b"
+    r"|--message\b|\bcommit\b.*-m\b",
     re.IGNORECASE,
 )
 

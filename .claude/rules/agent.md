@@ -266,6 +266,11 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   (XERK-162); `az repos pr create` (XERK-226), whose JSON carries no link, so `_azdo_created_pr_url`
   builds one from `repository.webUrl` + `pullRequestId`. Call and result land in different beats, so
   pending tool_use ids carry across (capped); the scan parses whole lines.
+  - **An on-prem Azure DevOps Server host has no vendor CLI to name here** — the `azure-devops` az
+    extension refuses a self-hosted collection outright, so those hosts open PRs with a local REST
+    wrapper. `ado pr-create` is built in; **`TURMA_PR_CREATE_CMDS`** (CSV of command prefixes)
+    registers any other, so a host isn't chipless because its tool isn't a vendor's
+    (`_pr_create_pattern`, entries escaped and anchored — never a pattern).
   - Cost: a PR opened another way (subagent, MCP tool, web UI) gets no chip. **Widen only by
     teaching `_scan_pr_line` another creation event, never by scanning loose text.**
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: `pr_status`/`_pr_comment_events`
@@ -274,7 +279,7 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   BOARD's PAT and has no CI rollup, so `checks` is the **CI-bearing branch POLICY evaluations only**
   (`AZDO_CI_POLICY_IDS`) — reviewer/work-item policies would read a PR awaiting a human as "CI
   pending". `mergeable` is `mergeStatus`, conflicts alone. The image bundles `glab` and az's
-  `azure-devops` extension.
+  `azure-devops` extension (Services only — see the wrapper note above).
 - Tests: `TestPrStatus`, `TestMr*`, `TestAzdoPr*`, `TestRefreshPrStatus`, `TestPrLedger`.
 
 ### PR comment delivery (XERK-49) and conflict nudges (XERK-223)

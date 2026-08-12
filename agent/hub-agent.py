@@ -2017,9 +2017,39 @@ AZDO_PR_URL_ID_RE = re.compile(r"/pullrequest/(\d+)", re.IGNORECASE)
 # PR/MR as its own output, and that pairing — this command, this output — is
 # the only thing in a transcript that says the session opened the PR rather
 # than merely looked at one. See _scan_pr_line.
-PR_CREATE_RE = re.compile(
-    r"\bgh\s+pr\s+create\b|\bglab\s+mr\s+create\b|\bmerge_request\.create\b"
-    r"|\baz\s+repos\s+pr\s+create\b")
+#
+# An on-prem Azure DevOps Server host has NO vendor CLI to name here: the
+# `azure-devops` az extension refuses a self-hosted collection outright ("works
+# only with Azure DevOps Services"), so those hosts open their PRs through a
+# local wrapper over the REST API. `ado pr-create` is the common spelling and
+# is built in; TURMA_PR_CREATE_CMDS registers any other wrapper, so a host
+# whose PRs are opened by its own tool still gets chips.
+PR_CREATE_CMDS = os.environ.get("TURMA_PR_CREATE_CMDS", "")
+
+
+def _pr_create_pattern(extra=""):
+    """The PR_CREATE_RE source: the built-in creating commands, plus one
+    alternative per comma-separated entry in `extra`.
+
+    Each entry is a whitespace-separated command prefix (`mkpr`, `tfs pr new`),
+    matched literally — every word is escaped and the run is anchored so it can
+    only match a whole command, never a substring of a longer one. The anchor
+    excludes `-` as well as word characters, so a short entry can't match the
+    tail of `run-mkpr`, while a path-qualified `./mkpr` still does. Nothing
+    free-form reaches the regex engine, and a malformed entry widens nothing."""
+    pats = [r"\bgh\s+pr\s+create\b", r"\bglab\s+mr\s+create\b",
+            r"\bmerge_request\.create\b", r"\baz\s+repos\s+pr\s+create\b",
+            r"\bado\s+pr-create\b"]
+    for entry in (extra or "").split(","):
+        words = entry.split()
+        if not words:
+            continue
+        pats.append(r"(?<![\w-])" + r"\s+".join(re.escape(w) for w in words)
+                    + r"(?![\w-])")
+    return "|".join(pats)
+
+
+PR_CREATE_RE = re.compile(_pr_create_pattern(PR_CREATE_CMDS))
 # Unresolved `gh pr create` tool_use ids remembered per session between beats.
 # Capped: a call whose result never lands (the turn was interrupted, the pane
 # died) must not grow the set for the life of the session.
@@ -3321,7 +3351,8 @@ def _scan_pr_line(raw, state, report):
 
     Attribution is deliberately narrow: a URL counts only when it comes back in
     a PR/MR-creating call's OWN tool_result (`gh pr create`, `glab mr create`,
-    `az repos pr create`, or a `git push` carrying the `merge_request.create`
+    `az repos pr create`, `ado pr-create`, a host wrapper registered via
+    TURMA_PR_CREATE_CMDS, or a `git push` carrying the `merge_request.create`
     push option — see PR_CREATE_RE) — i.e. the session literally opened that PR. A PR link reaches a transcript a dozen other ways (`gh pr
     list`/`view`/`checks` output, a link the operator pasted, the model quoting
     a PR another session opened), and taking any of those as "this session's

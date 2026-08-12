@@ -136,6 +136,8 @@ ATTRIB_BLOCKED = [
     "gh pr create --title t --body 'Generated with Claude'",
     "glab mr create --title t --description 'Generated with Claude'",
     "az repos pr create --title t --description 'Generated with Claude'",
+    # An on-prem ADO host opens its PRs with a local wrapper, not az.
+    "ado pr-create --title t --description 'Generated with Claude Code'",
 ]
 
 ATTRIB_OK = [

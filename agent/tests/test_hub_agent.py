@@ -1098,6 +1098,64 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [])
 
+    # The real shape from an on-prem TFS host: the `azure-devops` az extension
+    # refuses a self-hosted collection, so the session opens its PR with a
+    # local REST wrapper that prints the link itself.
+    ADO_WRAPPER_OUT = (
+        "Created PR !10068: Keep the model loaded in VRAM\n"
+        "  https://tfsserver.example.com/tfs/DefaultCollection/DevOps/_git/App"
+        "/pullrequest/10068\n"
+        "  linked work item #80995")
+    ADO_WRAPPER_URL = ("https://tfsserver.example.com/tfs/DefaultCollection"
+                       "/DevOps/_git/App/pullrequest/10068")
+
+    def test_on_prem_ado_wrapper_create_is_this_sessions_pr(self):
+        """An on-prem ADO host has no vendor CLI to name, so `ado pr-create`
+        is a built-in creating command — without it that host's PRs are never
+        attributed and its cards never chip."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call("w1", cmd='ado pr-create --title "x" \\\n  --work-item 80995'),
+            self.tool_result("w1", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.ADO_WRAPPER_URL])
+
+    def test_path_qualified_wrapper_still_counts(self):
+        """The wrapper is routinely invoked by path (`~/.local/bin/ado`), and
+        after a `cd` into the worktree."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call(
+                "w2", cmd="cd /home/u/git/app && ~/.local/bin/ado pr-create --title x"),
+            self.tool_result("w2", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.ADO_WRAPPER_URL])
+
+    def test_a_wrapper_that_only_lists_prs_is_not_a_create(self):
+        """`ado pr-list` prints every open PR's link — the exact loose text the
+        narrow rule exists to keep off this session's card."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call("w3", cmd="ado pr-list --repo App"),
+            self.tool_result("w3", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [])
+
     def test_plain_push_mr_hint_is_not_a_created_mr(self):
         """A plain `git push` prints GitLab's "to create a merge request …
         visit …/merge_requests/new" hint (and, on later pushes, the existing
@@ -6650,6 +6708,50 @@ class TestAzdoPrCommentEvents(AzdoPrMixin, unittest.TestCase):
         with self._configured():
             self.assertIsNone(ha._pr_comment_events(
                 "https://dev.azure.com/other/P/_git/r/pullrequest/1", ""))
+
+
+class TestPrCreatePattern(unittest.TestCase):
+    """TURMA_PR_CREATE_CMDS: a host whose PRs are opened by its own wrapper can
+    register it, without loosening attribution for anyone else."""
+
+    def _re(self, extra=""):
+        return re.compile(ha._pr_create_pattern(extra))
+
+    def test_built_ins_need_no_configuration(self):
+        rx = self._re()
+        for cmd in ("gh pr create --fill", "glab mr create", "ado pr-create -t x",
+                    "az repos pr create", "git push -o merge_request.create"):
+            self.assertTrue(rx.search(cmd), cmd)
+
+    def test_a_registered_wrapper_matches(self):
+        rx = self._re("mkpr, tfs pr new")
+        self.assertTrue(rx.search("mkpr --title x"))
+        self.assertTrue(rx.search("tfs   pr  new --repo app"))
+
+    def test_an_unregistered_wrapper_does_not(self):
+        self.assertIsNone(self._re("mkpr").search("openpr --title x"))
+
+    def test_a_registered_word_is_not_matched_inside_a_longer_one(self):
+        """Anchoring is what keeps a short entry from matching half a command."""
+        rx = self._re("mkpr")
+        self.assertIsNone(rx.search("mkprod deploy"))
+        self.assertIsNone(rx.search("run-mkpr --title x"))
+        self.assertTrue(rx.search("./mkpr --title x"))
+
+    def test_a_built_in_is_not_matched_inside_a_longer_word(self):
+        self.assertIsNone(self._re().search("myado pr-create"))
+
+    def test_entries_are_literal_not_patterns(self):
+        """The value is host config, but it must never reach the engine as a
+        pattern — a stray `.` or `*` would silently widen attribution."""
+        rx = self._re("mk.pr")
+        self.assertTrue(rx.search("mk.pr --title x"))
+        self.assertIsNone(rx.search("mkxpr --title x"))
+
+    def test_blank_and_malformed_entries_widen_nothing(self):
+        for extra in ("", "   ", ",,", " , ,"):
+            self.assertEqual(ha._pr_create_pattern(extra),
+                             ha._pr_create_pattern(), extra)
 
 
 class TestAzdoCreatedPrUrl(unittest.TestCase):
