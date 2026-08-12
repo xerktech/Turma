@@ -1,15 +1,17 @@
 // Unit tests for the agent registry's own ceiling (XERK-272).
 //
-// `device` is attacker-chosen — every agent shares one TURMA_AGENT_TOKEN — so
-// the number of RETAINED records was unbounded: 512 beats of 0.9 MiB under 512
-// names OOM-killed a 256 MiB hub, while the same 512 beats under ONE name
-// peaked at 169 MiB. `AGENT_RECORD_MAX` bounds one record and `prune()` only
-// reclaims at seven days, so neither is the aggregate.
+// Nothing capped how many DISTINCT `device` names the registry could retain:
+// 512 beats of 0.9 MiB under 512 names OOM-killed a 256 MiB hub, while the same
+// 512 beats under ONE name peaked at 169 MiB. `AGENT_RECORD_MAX` bounds one
+// record and `prune()` only reclaims at seven days, so neither is the aggregate.
+// XERK-268 binds `device` to the credential, which changes WHO can do this
+// (a compromised or buggy host, or the `legacy` master) but bounds nothing.
 //
 // This gets its OWN process because the caps are process-wide constants read at
-// require time, and the numbers that make the behavior testable (4 hosts, 64
-// KiB) are nothing like the fleet's. server.test.js lifts `AGENTS_MAX` for the
-// opposite reason: it invents ~100 synthetic hosts and is not a fleet either.
+// require time, and the numbers that make the behavior testable are nothing
+// like the fleet's. server.test.js lifts `AGENTS_MAX` for the opposite reason:
+// it invents ~100 synthetic hosts and is not a fleet either. The DEGENERATE
+// config (a fleet cap far past the byte budget) lives in registry-restore.
 // node:test, no npm.
 
 "use strict";
@@ -27,9 +29,9 @@ process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.AGENTS_MAX = "4";
-// Chosen so the derived per-host share (total / max = 160 KiB) sits clear of
-// BOTH the 64 KiB floor and the record sizes below — the whole point of the
-// share is that a small host and a fat one land on opposite sides of it.
+// Chosen so the derived per-host share (total / max = 160 KiB) sits clear of the
+// record sizes below — the whole point of the share is that a small host and a
+// fat one land on opposite sides of it.
 process.env.AGENTS_TOTAL_MAX = String(640 << 10);
 process.env.AGENT_EVICT_IDLE_MS = String(60 * 1000);
 
@@ -391,6 +393,37 @@ test("a host name cannot forge a hub log line", async () => {
   assert.equal(lines.some((l) => l.includes("\n")), false, "a refusal log carried a raw newline");
 });
 
+test("EVERY heartbeat log naming a host is safe, not just the newest ones", async () => {
+  // The 429 paths were fixed first and the older ones left; that is the wrong
+  // way round. `refuseOversized` is ONE request with no registry pressure at
+  // all, and the unknown-field drop rides a beat that returns 200 — both are
+  // easier to reach than the throttled refusal above.
+  resetRegistry();
+  const forged = "evil\r\n2026-01-01T00:00:00Z FORGED: hub healthy[2J";
+  const lines = [];
+  const realErr = console.error;
+  const realWarn = console.warn;
+  console.error = (m) => lines.push(String(m));
+  console.warn = (m) => lines.push(String(m));
+  try {
+    // Over AGENT_RECORD_MAX -> refuseOversized's 413.
+    const fat = await beat({ device: forged, sessions: "A".repeat((8 << 20) + 1024) });
+    assert.equal(fat.status, 413);
+    // An oversized UNKNOWN field -> sanitizeHeartbeat's drop line, on a beat
+    // that is otherwise accepted.
+    await beat({ device: forged, bogusField: "B".repeat((64 << 10) + 512) });
+  } finally {
+    console.error = realErr;
+    console.warn = realWarn;
+  }
+  assert.ok(lines.length >= 2, `expected both log paths, got ${lines.length}`);
+  for (const l of lines) {
+    assert.equal(/[\u0000-\u0009\u000b-\u001f\u007f]/.test(l), false,
+      `a raw control character reached the log: ${JSON.stringify(l)}`);
+    assert.equal(l.includes("\n"), false, `a forged line break reached the log: ${JSON.stringify(l)}`);
+  }
+});
+
 test("the refusal log is throttled, and says how many it swallowed", async () => {
   // The flood this cap exists to survive is exactly the traffic that writes
   // this line — unthrottled, surviving the attack costs the host its disk.
@@ -416,6 +449,34 @@ test("the state.json ceiling is measured before the file is opened", () => {
   assert.ok(STATE_FILE_MAX >= (32 << 20), "the ceiling must clear a legitimate state file");
   const limit = containerMemoryLimit();
   if (limit) assert.ok(STATE_FILE_MAX <= limit, "and must not exceed the container itself");
+});
+
+test("the per-host share is DERIVED, so the overshoot cannot grow with AGENTS_MAX", () => {
+  // The bound is exactly AGENTS_TOTAL_MAX + AGENTS_MAX * AGENT_FAIR_SHARE. A
+  // FLOOR under the share (there was a 64 KiB one) makes the second term
+  // unbounded in AGENTS_MAX — and raising AGENTS_MAX is what an operator with a
+  // growing fleet is told to do. At AGENTS_MAX=2000 against the deployed 32 MiB
+  // budget that was 3.9x the budget and the hub was OOM-killed.
+  assert.ok(
+    AGENTS_MAX * AGENT_FAIR_SHARE <= AGENTS_TOTAL_MAX,
+    `${AGENTS_MAX} hosts x ${AGENT_FAIR_SHARE} bytes exceeds the ${AGENTS_TOTAL_MAX} budget`
+  );
+  assert.equal(AGENT_FAIR_SHARE, Math.max(1, Math.floor(AGENTS_TOTAL_MAX / AGENTS_MAX)));
+});
+
+test("an evicted host is forgotten by everything keyed on its name", async () => {
+  resetRegistry();
+  for (let i = 0; i < AGENTS_MAX; i++) await beat({ device: `sweep-${i}` });
+  agents["sweep-0"].lastSeen = Date.now() - AGENT_EVICT_IDLE_MS * 2;
+  // Populate the size-warning ledger for the host about to go, the way a beat
+  // over half the per-record ceiling would.
+  hub.recordSizeWarned.set("sweep-0", true);
+  assert.equal((await beat({ device: "replacement" })).status, 200);
+  assert.equal("sweep-0" in agents, false);
+  // A registry that admits and evicts forever must not leak a per-host entry
+  // for every name it has ever seen.
+  assert.equal(recordBytes.has("sweep-0"), false);
+  assert.equal(hub.recordSizeWarned.has("sweep-0"), false, "recordSizeWarned leaked an evicted host");
 });
 
 test("makeRegistryRoom spends no record on a request it cannot satisfy", () => {

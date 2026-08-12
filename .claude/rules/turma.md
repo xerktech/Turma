@@ -314,8 +314,18 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   host rolls it back to its previous record — `lastSeen` included — so a host refused every beat
   ages past `OFFLINE_AFTER_MS` and **reads offline while it is up**, indistinguishable from a
   network failure and invisible to the operator. A host inside its share is not why the registry is
-  full, so it never pays; the refusal lands on the host the operator needs named. The cost is a
-  bounded overshoot (~2× the budget worst case) rather than a hard total.
+  full, so it never pays; the refusal lands on the host the operator needs named. An OVER-share host
+  is still refused silently — it freezes and ages to offline, or (if new) never appears at all, with
+  only the throttled log to say why. That is the accepted cost, and the headroom is 1.7× the largest
+  measured real record.
+- **The cost of the exemption is a bounded overshoot, and the bound is an identity**: worst-case
+  retained is `AGENTS_TOTAL_MAX + AGENTS_MAX × AGENT_FAIR_SHARE`. **So the share is DERIVED and
+  never floored** — a floor makes the second term unbounded in `AGENTS_MAX`, and raising
+  `AGENTS_MAX` is exactly what an operator with a growing fleet is told to do (at 2000 hosts a
+  64 KiB floor was 3.9× the budget and OOM-killed the hub). **Raising the count means raising the
+  budget with it**; a share under `AGENT_SHARE_SANE_MIN` warns at load rather than letting the two
+  contradict silently. The flood path cannot reach the exemption at all — a new device is admitted
+  only while the registry is inside the budget, so only an already-seated host can overshoot.
 - **The state.json restore enforces the same budget** (`trimRestoredAgents`, keep-newest), and the
   file is **measured with `statSync` before it is opened** (`STATE_FILE_MAX`, container/4): the trim
   cannot protect a restore it never reaches, and `readFileSync` + `JSON.parse` of a flooded file
@@ -332,9 +342,12 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 - New env knobs go through `positiveEnv`: a silently-obeyed negative cap refuses the whole fleet on
   its first beat, so a bad value is announced and ignored. The effective budget is printed at boot
   because it is DERIVED, not configured.
-- Tests: `registry-cap.test.js` and `registry-restore.test.js`, each pinning tiny caps in its own
-  process (`server.test.js` lifts `AGENTS_MAX` because ~100 synthetic host names is not a fleet, so
-  the cap's interaction with other routes is covered only in those two files).
+- Tests: `registry-cap.test.js` (small caps) and `registry-restore.test.js` (the restore, plus the
+  DEGENERATE `AGENTS_MAX=2000` config — the overshoot bound only breaks when the derived share falls
+  below what a floor would impose, which the small-cap rig never does). Each needs its own process
+  because the caps are read at require time; `server.test.js` lifts `AGENTS_MAX` because ~100
+  synthetic host names is not a fleet, so the cap's interaction with other routes lives only in
+  those two files.
 - The hub also serves the `glasses/` client: a CORS'd `/api/*` surface for that cross-origin
   WebView; per-session `input`/`history` endpoints; `GET /api/ws-token` for short-lived WebSocket
   auth; an `/audio` STT WebSocket (G2-mic PCM to the LiteLLM instance's transcription endpoint); and

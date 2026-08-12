@@ -543,9 +543,33 @@ const AGENTS_TOTAL_MAX = positiveEnv("AGENTS_TOTAL_MAX", defaultRegistryBudget()
 // The cost is a bounded overshoot rather than a hard total: fat records are
 // still admitted only while the aggregate has slack, and every host inside its
 // share sums to at most AGENTS_TOTAL_MAX again — so worst-case retained is
-// ~2x the budget (a quarter of the container at the deployed sizing), not the
-// unbounded growth this replaces.
-const AGENT_FAIR_SHARE = Math.max(64 << 10, Math.floor(AGENTS_TOTAL_MAX / AGENTS_MAX));
+// exactly AGENTS_TOTAL_MAX + AGENTS_MAX * AGENT_FAIR_SHARE, i.e. 2x the budget
+// (a quarter of the container at the deployed sizing), not the unbounded growth
+// this replaces.
+//
+// **That identity is the whole bound, so the share is DERIVED and never
+// floored.** A floor under it (there was a 64 KiB one) makes the second term
+// `AGENTS_MAX * 64 KiB`, which is unbounded in AGENTS_MAX — and raising
+// AGENTS_MAX is exactly what an operator with a growing fleet is told to do.
+// At AGENTS_MAX=2000 against the deployed 32 MiB budget that is 3.9x, and the
+// hub is OOM-killed. Raising the count means raising the budget with it; the
+// boot check below says so rather than letting the two contradict silently.
+const AGENT_FAIR_SHARE = Math.max(1, Math.floor(AGENTS_TOTAL_MAX / AGENTS_MAX));
+// A share this small means the count cap and the byte budget disagree about how
+// big a fleet this hub is for: hosts would be refused on size long before the
+// slots ran out. The memory bound still holds — it is the CONFIGURATION that is
+// wrong, so this warns rather than adjusting either number, and it warns HERE
+// (module scope) rather than in the listen banner, so it is reachable to a test
+// and to anything that loads the module without binding a port.
+const AGENT_SHARE_SANE_MIN = 64 << 10;
+if (AGENT_FAIR_SHARE < AGENT_SHARE_SANE_MIN) {
+  console.warn(
+    `WARNING: AGENTS_MAX=${AGENTS_MAX} leaves each host only ${AGENT_FAIR_SHARE} ` +
+      `bytes of the ${AGENTS_TOTAL_MAX}-byte registry budget — hosts will be ` +
+      `refused on record size long before the slots run out. Raise ` +
+      `AGENTS_TOTAL_MAX alongside AGENTS_MAX.`
+  );
+}
 
 // The most state.json may be before the restore refuses to open it at all. Sized
 // like the registry budget and generously above it, because the saved blob
@@ -741,11 +765,16 @@ try {
   // can still be examined.
   const stateSize = fs.statSync(STATE_FILE).size;
   if (stateSize > STATE_FILE_MAX) {
+    // The rename can fail (a read-only /data), and the message has to say what
+    // actually happened: an operator sent to a `.oversized` that was never
+    // created finds nothing and concludes the hub ate their state.
     const aside = `${STATE_FILE}.oversized`;
-    try { fs.renameSync(STATE_FILE, aside); } catch { /* read-only volume */ }
+    let movedTo = null;
+    try { fs.renameSync(STATE_FILE, aside); movedTo = aside; } catch { /* read-only volume */ }
     throw new Error(
       `state file is ${stateSize} bytes, over the ${STATE_FILE_MAX} limit — ` +
-        `starting with an empty registry; the file is kept at ${aside}`
+        `starting with an empty registry; the file is ` +
+        (movedTo ? `kept at ${movedTo}` : `left in place at ${STATE_FILE} (could not move it)`)
     );
   }
   agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
@@ -2363,7 +2392,7 @@ function sanitizeHeartbeat(payload, key) {
     }
     if (size > HEARTBEAT_UNKNOWN_MAX) {
       console.error(
-        `heartbeat from ${key}: dropped unknown field ${JSON.stringify(k)} ` +
+        `heartbeat from ${logName(key)}: dropped unknown field ${JSON.stringify(k)} ` +
           `(${size} bytes, limit ${HEARTBEAT_UNKNOWN_MAX})`
       );
       delete payload[k];
@@ -4582,7 +4611,7 @@ const server = http.createServer(async (req, res) => {
         if (prev && Object.keys(prev).length) agents[key] = prev;
         else delete agents[key];
         console.error(
-          `heartbeat from ${key}: record is ${size} bytes, over the ` +
+          `heartbeat from ${logName(key)}: record is ${size} bytes, over the ` +
             `${AGENT_RECORD_MAX} limit — beat refused`
         );
         return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
@@ -4607,7 +4636,7 @@ const server = http.createServer(async (req, res) => {
       try {
         recordCoercion.normalize(next);
       } catch (e) {
-        console.error(`heartbeat from ${key}: coercion failed (${e.message}) — beat refused`);
+        console.error(`heartbeat from ${logName(key)}: coercion failed (${e.message}) — beat refused`);
         if (prev && Object.keys(prev).length) agents[key] = prev;
         else delete agents[key];
         return json(res, 400, { error: "malformed heartbeat" });
@@ -4622,7 +4651,7 @@ const server = http.createServer(async (req, res) => {
       const overHalf = recordSize > AGENT_RECORD_MAX / 2 && recordSize <= AGENT_RECORD_MAX;
       if (overHalf && !recordSizeWarned.get(key)) {
         console.warn(
-          `heartbeat from ${key}: record is ${recordSize} bytes, over half the ` +
+          `heartbeat from ${logName(key)}: record is ${recordSize} bytes, over half the ` +
             `${AGENT_RECORD_MAX} limit`
         );
       }
@@ -6425,7 +6454,7 @@ if (process.env.TURMA_TEST) {
     // the per-record ceiling stayed green while an unbounded NUMBER of records
     // OOM-killed the hub, so the aggregate has to be pinned by name too.
     AGENTS_MAX, AGENTS_TOTAL_MAX, AGENT_EVICT_IDLE_MS, AGENT_FAIR_SHARE,
-    STATE_FILE_MAX, positiveEnv, logName,
+    STATE_FILE_MAX, positiveEnv, logName, recordSizeWarned,
     registryBytes, makeRegistryRoom, trimRestoredAgents, containerMemoryLimit,
     defaultRegistryBudget, recordBytes,
     // Ingest coercion, exported for the same reason as the rest of this group:

@@ -27,6 +27,12 @@ process.env.TURMA_AGENT_TOKEN = "agenttok";
 // Wound right down so an "oversized" file is a few KiB rather than the hundreds
 // of MiB it takes to reproduce the real kill.
 process.env.STATE_FILE_MAX = "4096";
+// This process ALSO carries the degenerate registry config (a big fleet cap
+// against the default byte budget), because the overshoot bound only breaks
+// when the DERIVED per-host share falls below what a floor would have imposed —
+// at the caps registry-cap.test.js uses it never does. A hub at these numbers
+// was OOM-killed at -m 256m before the share stopped being floored.
+process.env.AGENTS_MAX = "2000";
 
 const tmp = (name) => path.join(os.tmpdir(), `turma-regrestore-${name}-${process.pid}.json`);
 process.env.DEVICES_FILE = tmp("devices");
@@ -56,10 +62,39 @@ fs.writeFileSync(
 const WROTE = fs.statSync(process.env.STATE_FILE).size;
 
 const errors = [];
+const warns = [];
 const realError = console.error;
+const realWarn = console.warn;
 console.error = (m) => { errors.push(String(m)); realError(m); };
+console.warn = (m) => { warns.push(String(m)); realWarn(m); };
 const hub = require("../server.js");
 console.error = realError;
+console.warn = realWarn;
+
+test("a big fleet cap cannot inflate the overshoot bound", () => {
+  // The retained worst case is AGENTS_TOTAL_MAX + AGENTS_MAX x AGENT_FAIR_SHARE.
+  // A FLOOR under the share makes the second term unbounded in AGENTS_MAX, and
+  // raising AGENTS_MAX is exactly what an operator with a growing fleet is told
+  // to do: at these numbers the floored share was 65536, i.e. 2000 x 64 KiB =
+  // 3.9x the budget, and the hub was OOM-killed at -m 256m. Derived, it is 2x
+  // at any AGENTS_MAX.
+  assert.equal(hub.AGENTS_MAX, 2000);
+  assert.ok(hub.AGENT_FAIR_SHARE < (64 << 10), "the rig must put the share under the old floor");
+  assert.ok(
+    hub.AGENTS_MAX * hub.AGENT_FAIR_SHARE <= hub.AGENTS_TOTAL_MAX,
+    `${hub.AGENTS_MAX} x ${hub.AGENT_FAIR_SHARE} exceeds the ${hub.AGENTS_TOTAL_MAX} budget`
+  );
+});
+
+test("and the hub says so, because the two numbers now disagree", () => {
+  // The bound holds, but the CONFIG is wrong — hosts get refused on record size
+  // long before the slots run out. Silence here is how the boot banner ends up
+  // printing two numbers whose product contradicts the third.
+  assert.ok(
+    warns.some((m) => m.includes("AGENTS_MAX=2000") && m.includes("Raise AGENTS_TOTAL_MAX")),
+    warns.join("\n")
+  );
+});
 
 test("an oversized state.json does not get parsed, and the hub still boots", () => {
   assert.ok(WROTE > Number(process.env.STATE_FILE_MAX));
@@ -67,6 +102,36 @@ test("an oversized state.json does not get parsed, and the hub still boots", () 
   // state file is a best-effort cache); not booting is not.
   assert.deepEqual(Object.keys(hub.agents), []);
   assert.equal(typeof hub.server.listen, "function");
+});
+
+test("a restore that fails PART WAY through serves nothing, not half a registry", () => {
+  // The size ceiling throws BEFORE the parse, so it cannot reach this state.
+  // What can: a file small enough to open whose CONTENT breaks the walk —
+  // `agents = JSON.parse(...)` installs the whole thing before `normalizeRecord`
+  // or `trimRestoredAgents` ever looks at it, so a throw in either used to leave
+  // the raw, uncoerced, unbounded parse installed and being served. That is the
+  // one state the restore exists to prevent, so it needs its own boot.
+  const poisoned = tmp("state-poisoned");
+  // Null records: the trim's sort reads `.lastSeen` off each and throws.
+  fs.writeFileSync(poisoned, JSON.stringify({ h1: null, h2: null, h3: null }));
+  const probe = `
+    process.env.STATE_FILE = ${JSON.stringify(poisoned)};
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    process.stdout.write(JSON.stringify({
+      keys: Object.keys(hub.agents), bytes: hub.registryBytes(),
+    }));
+  `;
+  const env = { ...process.env, STATE_FILE: poisoned };
+  const r = require("child_process").spawnSync(process.execPath, ["-e", probe], {
+    env, encoding: "utf8",
+  });
+  assert.equal(r.status, 0, `the hub must still boot:\n${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.keys, [], "a failed restore must leave an EMPTY registry, not the raw parse");
+  // And the accounting agrees, so the first beat is measured against an empty
+  // registry rather than a phantom one.
+  assert.equal(out.bytes, 0);
+  assert.ok(r.stderr.includes("state restore skipped"), r.stderr);
 });
 
 test("it says so, and keeps the file rather than deleting it", () => {
