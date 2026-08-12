@@ -3626,8 +3626,9 @@ const server = http.createServer(async (req, res) => {
     // real target `claude --resume` bytes it chose *by mis-addressing*. Binding
     // the segment to the credential — the actual fix, and the only thing that
     // stops a deliberate attacker — is XERK-268.
-    // **Every refusal answers the SAME 404** (wrong host, wrong phase, empty
-    // body, vanished source session), and that uniformity is the point, not
+    // **Every refusal answers the SAME 404** — wrong host, wrong phase, empty
+    // body, vanished source session; the 413 below is the one exception, and
+    // is discussed there — and that uniformity is the point, not
     // tidiness: any RESPONSE a non-source cannot also get names the source to a
     // prober. So do NOT restore a friendlier 409/400 at any of them, and
     // **enumerate what this route can answer rather than eyeballing the guard**
@@ -3644,8 +3645,8 @@ const server = http.createServer(async (req, res) => {
     // answers at once — 15 probes and 960 bytes to find a source, mutating
     // nothing), and the 413 (loud, and ~1 MiB per wrong-host probe since the
     // guard cuts it off early — the full >MIGRATE_BLOB_MAX only on the hit).
-    // Neither is closeable without buffering an unbounded body from an
-    // unverified caller.
+    // Neither is closeable without reading an unbounded body from an unverified
+    // caller.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
