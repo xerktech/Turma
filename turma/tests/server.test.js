@@ -6500,6 +6500,13 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
     assert.ok(norm({ available: true, model: evil }).model.isWellFormed(),
       `a lone surrogate survived: ${JSON.stringify(evil)}`);
   }
+  // The guarantee is the whole XML-ILLEGAL class, not just surrogates: a C0
+  // control kills `uiautomator dump` the same way (a 0-byte file), and closing
+  // only the case that bit us leaves the next one to be rediscovered.
+  const ctl = norm({ available: true, model: "qwen\x01ctl\x00nul\x0bvt\x7fdel" });
+  assert.equal(ctl.model, "qwenctlnulvtdel");
+  // Tab/newline/CR are legal XML and are only trimmed at the edges.
+  assert.equal(norm({ available: true, model: "  a\tb  " }).model, "a\tb");
 
   // Not an object at all -> null, which every client reads as "cannot fail over".
   assert.equal(norm("yes"), null);
@@ -6511,6 +6518,30 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
   const old = { device: "h" };
   hub.normalizeLocalModel(old);
   assert.ok(!("localModel" in old));
+});
+
+test("the state.json restore coerces too, not just the ingest path", () => {
+  // A hub restart is exactly when a new coercion ships, and the restore is the
+  // FIRST thing it serves. A record written before it — or belonging to an
+  // OFFLINE host, where no beat will ever rewrite it — would otherwise reach
+  // the phone raw and throw for the whole fleet. Held here rather than by
+  // booting a second hub: the loader is a bare `for` over the parsed blob, so
+  // what matters is that all three coercions are applied to a loaded record.
+  const restored = {
+    device: "old",
+    localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+    limits: { fiveHour: { usedPct: "lots" } },
+  };
+  hub.normalizeLocalModel(restored);
+  assert.deepEqual(restored.localModel,
+    { available: false, model: null, contextTokens: null });
+
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const loader = src.slice(src.indexOf("agents = JSON.parse"), src.indexOf("first boot or no volume"));
+  for (const fn of ["normalizeUsage", "normalizeLimits", "normalizeLocalModel"]) {
+    assert.ok(loader.includes(`${fn}(a)`),
+      `${fn} is applied at ingest but NOT on the state.json restore`);
+  }
 });
 
 test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async () => {

@@ -362,10 +362,21 @@ started `-read-only`, which is why you cannot simply reuse the shared one.
   where there is one, and **match exactly** — a substring `Sessions` hits
   `RUNNING SESSIONS` first. Snackbars live ~3s, so poll at t+2s.
 - `ExposedDropdownMenuBox` opens on its **trailing caret**, not the field body.
-- **A lone surrogate anywhere in the payload makes `uiautomator dump` return an
-  empty file** (`KXmlSerializer … Illegal character`). The hub coerces the one
-  field that could manufacture one (`normalizeLocalModel`), but not one that
-  arrives in a rogue agent's input.
+- A destructive row **arms and re-disarms**: `Kill` becomes `Confirm kill` and
+  reverts in ~2s, so the two taps must be one `adb shell "input tap …; sleep
+  0.4; input tap …"`. A dump between them loses the arm.
+- **`SessionsScreen` collects no `messages`**, so every action driven from it
+  (spawn, kill, rename) is silent whatever the hub answered; `FleetScreen`,
+  `ChatScreen` and `BoardScreen` do collect. Drive error-wording checks from the
+  Dashboard or the chat, never the session list.
+- **XML-illegal characters in the payload make `uiautomator dump` die** —
+  `rc=137`, a 0-byte file, and every tap resolved from it misses, while the app
+  itself renders the string fine. Two classes do it: **lone surrogates** and
+  **C0 controls**. `normalizeLocalModel` closes both for `localModel.model`, in
+  both directions (manufactured by its 60-char cut, and arriving in a rogue
+  agent's input) — but it is the ONLY field so guarded, so any other
+  agent-supplied string reaching the UI can still do it. Screenshot instead when
+  a dump goes empty for no reason, and suspect the payload before the tooling.
 - **`ChatViewModel` is scoped to the chat's nav back-stack entry**, so all of its
   in-memory state dies when you leave that screen (backgrounding does not).
   Anything that must survive lives in `AppContainer` — `container.drafts`,
@@ -391,6 +402,13 @@ and point the app at `http://10.0.2.2:<port>`.
 - A host the app has decoded once stays in its `byKey` map, so **re-probing a
   malformed payload under a name the app has already seen hides the failure** —
   use a fresh host name for every decode probe.
+- Kill the rig by PID, not `pkill -f`: the pattern matches your own shell's
+  command line, so `pkill` kills the caller (exit 144) before the next command
+  in the chain runs, and you carry on against a rig you think you restarted.
+- **Refuse `/api/events` at the proxy to see what a decode failure really
+  costs.** With SSE healthy a bad host loses only itself (per-agent events
+  decode in `runCatching`); poll-only, the whole fleet is replaced by the raw
+  kotlinx exception text. Test both — they look like different bugs.
 
 ---
 
@@ -668,13 +686,27 @@ act on every time.
   `now = at + SETTLE_MS + 1` bounds the constant from below only: raising it to
   16.7 hours keeps the test green, which is the exact failure the constant
   exists to prevent. Assert one side with a literal.
-- **Which heartbeat fields are actually coerced at ingest.** Only three —
-  `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`. Every other
-  host-level block Android types (`capacity`, `github`, `models`, `jira`,
-  `claudeAuth`, `closedSessions`, …) and every per-session field is raw, and an
-  object or array in any of them throws for the WHOLE `/api/agents` array.
+- **Which heartbeat fields are actually coerced at ingest.** FOUR things, not
+  three: `normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`, and
+  `sanitizeHeartbeat`'s `sanitizeLiveAgents`, which reshapes
+  `sessions[].session.agents` to `{sel:Boolean, type:String, label:String}` —
+  load-bearing, since Android types those too (`type:{}` raw throws at
+  `$.agents[N].sessions[0].session.agents[0].type`). Everything else is raw:
+  every other host-level block Android types (`capacity`, `github`, `models`,
+  `jira`, `claudeAuth`, `closedSessions`, …) and every other per-session field
+  (`prs`, `modelSource`, …), where an object or array throws for the WHOLE
+  `/api/agents` array. Verify by probing, not by reading the doc — this count
+  has been wrong in `CLAUDE.md` more than once. Two-line repro in §6.2.
+- **Check the state.json RESTORE, not just the ingest path.** A hub restart is
+  when a new coercion ships and the restore is the first thing it serves, so a
+  coercion applied only at ingest is a hole straight through itself — until that
+  host's next beat, which for an OFFLINE host is never (records live 7 days).
+  The load path applied `normalizeUsage` alone until XERK-246 added the other
+  two beside it; check that any new one is in BOTH places. Repro: write a state
+  file with `localModel:{available:"yes",model:12345}`, boot `turma/server.js`
+  on it, and read `/api/agents`.
   A `normalize*` is also a WHITELIST: a sub-key a newer agent adds is dropped
-  fleet-wide with nothing failing. Two-line repro in §6.2.
+  fleet-wide with nothing failing.
 
 Mutation-testing mechanics, since a broken harness reads as a passing one:
 

@@ -55,6 +55,27 @@ class SpawnRequestTest {
         )
     }
 
+    /**
+     * The switch's own wire contract — the ONE thing between the chip and a
+     * hub route, and the only part of it not covered by anything else. Renaming
+     * either the field or the path leaves the whole suite green while the
+     * feature is dead on the wire (a 400 "modelSource must be subscription or
+     * local", or a 404). The sibling `SpawnRequest.modelSource` is pinned above
+     * for the same reason; this closes the pair.
+     */
+    @Test fun `the model-source switch posts the field and path the hub expects`() {
+        assertEquals(
+            """{"modelSource":"local"}""",
+            TurmaJson.encodeToString(com.xerktech.turma.net.ModelSourceRequest("local")),
+        )
+        // By name, not signature: a `suspend fun` carries a trailing
+        // Continuation parameter that getMethod(...) won't match.
+        val m = com.xerktech.turma.net.HubApi::class.java.methods
+            .single { it.name == "setModelSource" }
+        assertEquals("api/agents/{host}/sessions/{id}/model-source",
+            m.getAnnotation(retrofit2.http.POST::class.java)!!.value)
+    }
+
     @Test fun `the full composer body keeps its field order and content`() {
         assertEquals(
             """{"repo":"Turma","prompt":"do the thing","label":"lbl","baseRef":"main",""" +

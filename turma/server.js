@@ -363,10 +363,20 @@ const liveClients = {};
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
   agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  // Records written before the ingest-side coercion below (and any host that is
-  // OFFLINE, so no beat will ever rewrite its record) still carry the legacy
-  // per-model usage shape — normalize what we load, not just what arrives.
-  for (const a of Object.values(agents)) normalizeUsage(a);
+  // Records written before the ingest-side coercions below (and any host that
+  // is OFFLINE, so no beat will ever rewrite its record) carry whatever shape
+  // was current when they were saved — normalize what we LOAD, not just what
+  // arrives. Every coercion the ingest path applies has to be applied here too,
+  // or the restore is a hole straight through it: the first `/api/agents` after
+  // a hub restart serves the raw record, which for a wrong-typed block means
+  // Android's atomic decode throws and the fleet vanishes from the phone. That
+  // window is one beat for a live host and up to the whole record life for an
+  // offline one — and a hub restart is exactly when a new coercion ships.
+  for (const a of Object.values(agents)) {
+    normalizeUsage(a);
+    normalizeLimits(a);
+    normalizeLocalModel(a);
+  }
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
 } catch {
   /* first boot or no volume mounted */
@@ -1103,15 +1113,20 @@ function normalizeLocalModel(payload) {
     payload.localModel = { available: false, model: null, contextTokens: null };
     return;
   }
-  // No LONE SURROGATE may leave here, from either direction. Cutting with
-  // `slice(60)` through an astral pair MANUFACTURES one, so the cut is on code
-  // points; and one already in the input is replaced rather than passed on.
-  // It is not mere mojibake — it is unencodable, and it kills Android's own
-  // uiautomator outright (`KXmlSerializer: Illegal character`), i.e. the tool a
-  // QA pass drives the app with. Only a rogue agent reaches this (a real one is
-  // bounded by LOCAL_MODEL_NAME_RE), which is this function's whole threat model.
+  // Nothing XML-ILLEGAL may leave here, from either direction — the whole class,
+  // not just the one case that bit us. A lone surrogate and a C0 control are
+  // both unencodable in XML, and both kill Android's `uiautomator dump`
+  // outright (`KXmlSerializer: Illegal character` / a 0-byte file), i.e. the
+  // tool a QA pass drives the app with. Cutting with `slice(60)` through an
+  // astral pair MANUFACTURES a lone surrogate, so the cut is on CODE POINTS and
+  // runs after the strip. Only a rogue agent reaches this — a real one is
+  // bounded by LOCAL_MODEL_NAME_RE — which is this function's whole threat model.
   const name = typeof lm.model === "string"
-    ? [...lm.model.trim().replace(/\p{Surrogate}/gu, "�")].slice(0, 60).join("")
+    ? [...lm.model
+        .replace(/\p{Surrogate}/gu, "�")     // unpaired halves -> replacement
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")  // XML-illegal controls
+        .trim()]
+      .slice(0, 60).join("")
     : "";
   const ctx = lm.contextTokens;
   payload.localModel = {

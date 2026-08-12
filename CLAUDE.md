@@ -224,14 +224,17 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
-  - **`/api/agents` decodes ATOMICALLY on Android**, so one host's wrong-typed field throws for the
-    whole array and every OTHER host vanishes from that phone — silently, since the app keeps its
-    last good snapshot and the tile still says "N / N online". **Exactly three blocks are coerced at
-    ingest today** (`normalizeUsage`, `normalizeLimits`, `normalizeLocalModel`); everything else,
-    host-level blocks included, is served raw, so this is a live hazard rather than a solved one.
-    Give a new typed block a `normalize*`, and coerce to the "can't tell you" value every client
-    already handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer
-    agent adds is dropped fleet-wide unless it is added there too.
+  - **A full `/api/agents` decode is ATOMIC on Android**, so one host's wrong-typed field throws for
+    the whole array — the poll fails while the app keeps its last snapshot and the tile still says
+    "N / N online" (per-agent SSE events decode individually, so with SSE healthy only the bad host
+    is missing; on a cold start the whole list is). **Most of the payload is served raw**, so this
+    is a live hazard, not a solved one: the coercions that exist are `normalizeUsage`,
+    `normalizeLimits`, `normalizeLocalModel` and `sanitizeHeartbeat`'s `sanitizeLiveAgents` — grep
+    for them rather than trusting a count here, which has been wrong repeatedly. Give a new typed
+    block one, apply it at ingest **and on the `state.json` restore** (a restart is when a coercion
+    ships and the restore is the first thing it serves), and coerce to the "can't tell you" value
+    every client already handles, never to a plausible default. A `normalize*` is a WHITELIST — a
+    sub-key a newer agent adds is dropped fleet-wide unless it is added there too.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 
