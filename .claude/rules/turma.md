@@ -195,9 +195,18 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   - Budget spend is the `archiveBytes` column, **re-derived from the files by `rebuildIndex`** —
     the index is disposable, so reading it from a sidecar would drift (and every pre-XERK-267
     sidecar has no such field).
-  - **The store total is WALKED off the files, never summed from the index** (`totalArchiveBytes`,
-    cached `TOTAL_CACHE_MS`). Deleting archives is the operator's way out of a full store, and it
-    works here because the bytes are simply gone — nothing has to notice a deletion.
+  - **The store total is WALKED off the files, never summed from the index** (`totalArchiveBytes`).
+    Deleting archives is the operator's way out of a full store, and it works here because the
+    bytes are simply gone — nothing has to notice a deletion.
+    - The walk is the **baseline only**; `writtenSinceWalk` adds every byte appended since, and the
+      walk zeroes it. A cached total on its own leaves ingest **unmetered between refreshes** —
+      measured 4.85 GiB written past a 4 MiB ceiling in one window. Growth is therefore exact
+      (overshoot ≤ one chunk) and only DELETION is stale, which is why `TOTAL_CACHE_MS` can be
+      minutes: waiting one window to notice an operator freeing space costs nothing.
+    - It is **synchronous on the heartbeat path** and the hub is one event loop, so the walk's cost
+      is a hub-wide stall: 14 ms at the reference ~1,300 files, ~7 µs/file warm, ~18× cold. Fine at
+      today's scale; if the store ever reaches tens of thousands of files, make it async or walk
+      only when near the ceiling rather than shortening the window.
     - **Do not "improve" this into an indexed column that reconciles against disk.** That means
       inferring "deleted" from a failed stat, which is not knowable: an unmounted volume, a renamed
       parent and a real delete all report ENOENT, while EACCES/EIO/ESTALE report neither. Guessing

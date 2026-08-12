@@ -11235,6 +11235,11 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         ]}]
         dropped = ha._shed_block_payloads(blocks)
         self.assertEqual(dropped, len("data:image/png;base64,AAAA") + len("<h1>hi</h1>"))
+        # Bytes, not code points. A base64 payload is pure ASCII, so only a
+        # non-ASCII preview can tell the two apart.
+        wide = [{"t": "tool_use", "files": [
+            {"name": "p.html", "kind": "html", "html": "中" * 200}]}]
+        self.assertEqual(ha._shed_block_payloads(wide), len(("中" * 200).encode("utf-8")))
         self.assertEqual(blocks[0]["files"], [
             # Dropped for size, and says so — never confused with a file that
             # was unreadable when the preview was taken.
@@ -11275,7 +11280,8 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         # while the other read 16 MiB. Mirrors the hub's byteCeiling case.
         for odd in ("﻿16", "\x8516", "\x1c16", "\x8516\x85", "16﻿"):
             self.assertEqual(ha._byte_ceiling(odd, 999), 999, repr(odd))
-        self.assertEqual(ha._byte_ceiling(" \t\n16\r\n ", 999), 16)  # ASCII still trims
+        # The exact ASCII set, matching the hub's regex character-for-character.
+        self.assertEqual(ha._byte_ceiling(" \t\n\r\f\v16 \t\n\r\f\v", 999), 16)
 
     def test_payload_bytes_are_utf8_bytes_not_code_points(self):
         # The budget is named in bytes and the hub spends it in bytes; counting
@@ -11367,6 +11373,28 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         self.assertGreater(len(pushed), 1)
         self.assertEqual(self._files_of(pushed[0])[0]["kind"], "image")   # before
         self.assertTrue(self._files_of(pushed[1])[0]["shed"])             # after
+
+    def test_shedding_says_so_in_the_log(self):
+        # Without it, an operator looking at an archived session full of
+        # name-only chips has nothing telling them the previews were dropped for
+        # size rather than never captured. Also the only thing making the shed
+        # byte count observable at all — it has no other consumer.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        png = self._png("a.png", 4096)
+        self._write_transcript(wt, "t1.jsonl", [
+            self._delivery("a%d" % i, png, "2026-07-01T10:0%d:00Z" % i) for i in range(4)])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        lines = []
+        with mock.patch.object(ha, "log", lines.append):
+            self._push(sm, shed_ids=["t1"])
+        shed_lines = [ln for ln in lines if "shed" in ln]
+        self.assertEqual(len(shed_lines), 1, lines)   # once per transcript per pass
+        self.assertIn("t1", shed_lines[0])
+        # A real byte count, and a plausible one: 4 base64'd 4 KiB images.
+        dropped = int(re.search(r"shed (\d+) bytes", shed_lines[0]).group(1))
+        self.assertGreater(dropped, 4 * 4096)
 
     def test_a_full_store_is_not_pushed_at_at_all(self):
         sm = self.make_manager()

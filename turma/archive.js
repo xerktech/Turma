@@ -234,20 +234,38 @@ function writeSidecar(metaPath, obj) {
 // directory was removed outright recreates it and carries on, rather than
 // latching full forever with no way back.
 //
-// Cached, because it runs on the heartbeat path: ~10 ms over the reference
-// host's 1,276 files, which is not something to pay per beat per host.
+// The walk is CACHED, because it runs on the heartbeat path and is synchronous:
+// 14 ms over the reference host's ~1,300 files (~7 us/file warm on that pool),
+// and the whole hub is one event loop, so every beat and SSE tail waits on it.
+//
+// ...but a cached total alone is NOT the ceiling's input, because a frozen
+// number means ingest is unmetered between refreshes: measured 4.85 GiB written
+// past a 4 MiB ceiling in one cache window, the exact outcome the ceiling
+// exists to prevent. So the walk is only the BASELINE, and every byte appended
+// since it is added on top (`writtenSinceWalk`). That keeps the two properties
+// that matter at once — overshoot is bounded by ONE chunk, as it would be with
+// an exactly-maintained counter, and a deletion still frees its bytes at the
+// next walk without anyone having to detect a deletion.
+//
+// Growth is therefore exact and only DELETION is stale, which is why the window
+// can be minutes rather than seconds: a deletion is an operator freeing space,
+// and waiting one window to see it costs nothing.
 let totalCache = { at: 0, bytes: 0 };
-const TOTAL_CACHE_MS = 60 * 1000;
+let writtenSinceWalk = 0;
+const TOTAL_CACHE_MS = 5 * 60 * 1000;
 function totalArchiveBytes(now) {
   now = now || Date.now();
-  if (now - totalCache.at < TOTAL_CACHE_MS) return totalCache.bytes;
+  if (now - totalCache.at < TOTAL_CACHE_MS) return totalCache.bytes + writtenSinceWalk;
   const files = [];
   walkJsonl(ARCHIVE_DIR, files);
   let bytes = 0;
   for (const f of files) {
+    // One unreadable file must not abandon the measurement and hand back a
+    // total far under the truth — skip it and keep counting.
     try { bytes += fs.statSync(f).size; } catch { /* raced with a delete */ }
   }
   totalCache = { at: now, bytes };
+  writtenSinceWalk = 0;
   return bytes;
 }
 
@@ -255,6 +273,7 @@ function totalArchiveBytes(now) {
 // TOTAL_CACHE_MS, or seed it to put the total at an exact value the filesystem
 // can't easily be coaxed into. Nothing in the serving path calls it.
 function __resetTotalCache(seed) {
+  writtenSinceWalk = 0;
   totalCache = seed === undefined ? { at: 0, bytes: 0 } : { at: Date.now(), bytes: seed };
 }
 
@@ -378,7 +397,12 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
       if (ARCHIVE_TRANSCRIPT_MAX > 0 && archiveBytes >= ARCHIVE_TRANSCRIPT_MAX) shed = true;
       insert.run(text, transcriptId, e.uuid || null, e.role || null, e.ts || null);
     }
-    if (lines) fs.appendFileSync(paths.jsonl, lines);
+    if (lines) {
+      fs.appendFileSync(paths.jsonl, lines);
+      // Charge the store total immediately rather than waiting for the next
+      // walk — that gap is what let a burst run 1,200x past the ceiling.
+      writtenSinceWalk += Buffer.byteLength(lines);
+    }
     db.prepare(`INSERT INTO sessions(
         transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
         summary, msgCount, bytesStored, archiveBytes, filePath, updatedAt)

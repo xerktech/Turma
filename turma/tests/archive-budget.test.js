@@ -274,7 +274,97 @@ test("byteCeiling: an explicit 0 disables, a typo falls back, digits win", () =>
   for (const odd of ["﻿16", "16", "16", " 16", "16﻿"]) {
     assert.equal(archive.byteCeiling(odd, 999), 999, JSON.stringify(odd));
   }
-  assert.equal(archive.byteCeiling(" \t\n16\r\n ", 999), 16);   // ASCII space still trims
+  assert.equal(archive.byteCeiling(" \t\n\r\f\v16 \t\n\r\f\v", 999), 16);  // the exact ASCII set, both sides
+});
+
+test("bytes written inside the cache window still count against the ceiling", () => {
+  // The cache is a baseline, not the total. Frozen alone it left ingest
+  // unmetered between refreshes — measured 4.85 GiB written past a 4 MiB
+  // ceiling in one window — so overshoot must stay bounded by one chunk even
+  // though no walk happens in between.
+  archive.__resetTotalCache();
+  const t0 = Date.now();
+  const base = archive.totalArchiveBytes(t0);
+  const max = Number(process.env.ARCHIVE_TOTAL_MAX_BYTES);
+  assert.ok(base < max);
+
+  // Fill past the ceiling WITHOUT ever letting the cache expire.
+  let n = 0;
+  while (archive.totalArchiveBytes(t0 + 1000) < max && n < 80) {
+    archive.ingestChunk("nas", `burst${n}`, { ...META, summary: `Burst ${n}` }, 0, 100,
+      [{ uuid: `bu${n}`, role: "user", ts: "2026-07-10T00:07:00Z", text: "w".repeat(2000) }]);
+    n++;
+  }
+  assert.ok(n < 80, "the total never moved inside the cache window");
+  // Overshoot is one chunk's worth, not a window's worth.
+  assert.ok(archive.totalArchiveBytes(t0 + 1000) < max + 4096,
+    `overshot by ${archive.totalArchiveBytes(t0 + 1000) - max} bytes`);
+  // ...and the refusal follows immediately, on the same frozen cache.
+  const r = archive.ingestChunk("nas", "past-it", { ...META, summary: "Past It" }, 0, 40,
+    [{ uuid: "pi1", role: "user", ts: "2026-07-10T00:07:30Z", text: "no" }]);
+  assert.equal(r.full, true);
+
+  for (const f of fs.readdirSync(path.join(process.env.ARCHIVE_DIR, "turma"))) {
+    if (f.startsWith("2026-07-10__burst")) {
+      fs.rmSync(path.join(process.env.ARCHIVE_DIR, "turma", f));
+    }
+  }
+  archive.__resetTotalCache();
+});
+
+test("one unreadable file does not abandon the whole measurement", (t) => {
+  // A file deleted between readdir and stat is an ordinary race. Letting it
+  // throw abandons the walk, and the caller then treats a partial (or zero)
+  // total as the truth — silently disabling the ceiling.
+  archive.__resetTotalCache();
+  const real = archive.totalArchiveBytes();
+  assert.ok(real > 0);
+
+  let first = true;
+  const realStat = fs.statSync;
+  t.mock.method(fs, "statSync", (p, ...rest) => {
+    if (first && String(p).endsWith(".jsonl")) {
+      first = false;
+      const e = new Error("ENOENT: raced with a delete");
+      e.code = "ENOENT";
+      throw e;
+    }
+    return realStat(p, ...rest);
+  });
+  archive.__resetTotalCache();
+  const measured = archive.totalArchiveBytes();
+  t.mock.restoreAll();
+  archive.__resetTotalCache();
+
+  assert.ok(measured > 0, "the walk gave up on the first bad stat");
+  assert.ok(measured < real, "the skipped file should be missing from the total");
+  assert.equal(archive.totalArchiveBytes(), real, "and it recovers on the next walk");
+});
+
+test("a walk re-baselines: bytes counted once, not twice", () => {
+  // writtenSinceWalk rides ON TOP of the last walk, so the walk that absorbs
+  // those bytes has to zero it. Left standing, every window's writes are added
+  // to a baseline that already includes them and the total runs away upward.
+  archive.__resetTotalCache();
+  const t0 = Date.now();
+  archive.totalArchiveBytes(t0);
+  archive.ingestChunk("nas", "rebase", { ...META, summary: "Rebase" }, 0, 60,
+    [{ uuid: "rb1", role: "user", ts: "2026-07-10T00:08:00Z", text: "q".repeat(300) }]);
+  // Force the next walk, then read again from the cache it just wrote — the
+  // walk's own return value looks right either way; the double-count only shows
+  // once writtenSinceWalk is added back on top of a baseline containing it.
+  archive.totalArchiveBytes(t0 + 6 * 60_000);
+  const walked = archive.totalArchiveBytes(t0 + 6 * 60_000 + 1000);
+  let real = 0;
+  const stack = [path.join(process.env.ARCHIVE_DIR)];
+  while (stack.length) {
+    for (const d of fs.readdirSync(stack.pop(), { withFileTypes: true })) {
+      const full = path.join(d.parentPath || d.path, d.name);
+      if (d.isDirectory()) stack.push(full);
+      else if (d.isFile() && d.name.endsWith(".jsonl")) real += fs.statSync(full).size;
+    }
+  }
+  assert.equal(walked, real, "the walk double-counted the window's writes");
 });
 
 test("the store total is cached, and the cache does expire", () => {
@@ -285,7 +375,7 @@ test("the store total is cached, and the cache does expire", () => {
   const first = archive.totalArchiveBytes(t0);
   fs.writeFileSync(path.join(process.env.ARCHIVE_DIR, "turma", "cache-probe.jsonl"), "x".repeat(500));
   assert.equal(archive.totalArchiveBytes(t0 + 1000), first, "not cached");
-  assert.equal(archive.totalArchiveBytes(t0 + 61_000), first + 500, "cache never expires");
+  assert.equal(archive.totalArchiveBytes(t0 + 6 * 60_000), first + 500, "cache never expires");
   fs.rmSync(path.join(process.env.ARCHIVE_DIR, "turma", "cache-probe.jsonl"));
   archive.__resetTotalCache();
 });
