@@ -6919,17 +6919,39 @@ test("limits' two epoch fields are INTEGER-bounded, not merely finite", () => {
   assert.equal(q.limits, null);
 });
 
-test("turma/Dockerfile copies every local module server.js requires", () => {
+test("turma/Dockerfile copies every local module the hub requires", () => {
   // The COPY list is hand-maintained, and a module missing from it is a
   // container that boots to a MODULE_NOT_FOUND — invisible until deploy, since
   // every test here requires straight off the working tree.
-  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  const dockerfile = fs.readFileSync(path.join(__dirname, "..", "Dockerfile"), "utf8");
-  const required = [...src.matchAll(/require\("\.\/([\w.-]+)"\)/g)].map((m) => m[1]);
-  assert.ok(required.length >= 3, "no local requires found — did the pattern rot?");
-  for (const f of new Set(required)) {
-    assert.match(dockerfile, new RegExp(`COPY[^\\n]*\\b${f.replace(".", "\\.")}\\b`),
-      `${f} is required by server.js but never COPYed into the image`);
+  //
+  // The whole require GRAPH, not just server.js's own line: a module two hops
+  // out is just as absent from the image, and the crash reads the same. Both
+  // quote styles and a nested path count, because a pattern that only matches
+  // today's three requires is a test that passes on the shape it was written
+  // against rather than the one that breaks.
+  const dir = path.join(__dirname, "..");
+  const dockerfile = fs.readFileSync(path.join(dir, "Dockerfile"), "utf8")
+    .replace(/^\s*#[^\n]*/gm, "");             // a name in a COMMENT copies nothing
+  const local = /require\(\s*['"]\.\/([\w./-]+)['"]\s*\)/g;
+  const seen = new Set(["server.js"]);
+  const queue = ["server.js"];
+  const required = new Set();
+  while (queue.length) {
+    const file = queue.pop();
+    const full = path.join(dir, file);
+    assert.ok(fs.existsSync(full), `${file} is required but does not exist`);
+    for (const m of fs.readFileSync(full, "utf8").matchAll(local)) {
+      required.add(m[1]);
+      if (!seen.has(m[1])) { seen.add(m[1]); queue.push(m[1]); }
+    }
+  }
+  assert.ok(required.size >= 3, "no local requires found — did the pattern rot?");
+  for (const f of required) {
+    // A module in a subdirectory is copied by copying that directory (the
+    // `COPY public ./public` idiom), so the first segment is what must appear.
+    const want = f.includes("/") ? f.split("/")[0] : f;
+    assert.match(dockerfile, new RegExp(`COPY[^\\n]*(^|[\\s/])${want.replace(/\./g, "\\.")}([\\s/]|$)`, "m"),
+      `${f} is required by the hub but never COPYed into the image`);
   }
 });
 
@@ -6978,7 +7000,10 @@ test("every field Android types on the fleet payload is in the shape table", () 
   //     pattern keyed on `=` skips exactly those.
   const classes = {};
   const subclassesOfBlock = [];
-  for (const m of src.matchAll(/data class (\w+)\(/g)) {
+  // `\s*` around the paren: `data class X` with its `(` on the next line is a
+  // legal declaration, and a class this misses is one whose sub-shape then goes
+  // unchecked — the guard's reach must not ride on brace style.
+  for (const m of src.matchAll(/data class\s+(\w+)\s*\(/g)) {
     let depth = 1, i = m.index + m[0].length;
     for (; i < src.length && depth; i++) {
       if (src[i] === "(") depth++;
@@ -7001,13 +7026,24 @@ test("every field Android types on the fleet payload is in the shape table", () 
       .map((p) => /\bval (\w+)\s*:\s*([\w<>, ?]+?)\s*(?:=|$)/.exec(p))
       .filter(Boolean)
       .map((f) => ({ name: f[1], type: f[2].trim() }));
+    // EVERY declared field must have survived the split. The splitter counts
+    // bracket depth and does not know string literals, so a default containing a
+    // bare `>`/`(`/`[` (`= ">".length`) desynchronises it and silently folds the
+    // rest of the constructor into one param. Counting `val`s in the same
+    // comment-stripped body is the check that cannot itself drift: a field-count
+    // FLOOR would let this pass the moment the class grew past the floor, which
+    // is the state a growing class reaches on its own.
+    const declared = (body.match(/\bval\s+\w+\s*:/g) || []).length;
+    assert.equal(classes[m[1]].length, declared,
+      `parsed ${classes[m[1]].length} of ${declared} fields in ${m[1]} — the parser ` +
+      `lost some, so this test is not checking what it claims to`);
     if (/^\s*:\s*Block\(\)/.test(src.slice(i))) subclassesOfBlock.push(m[1]);
   }
-  // Guards against a parse that "succeeds" while seeing almost nothing — the
-  // counts are the ones a mis-parse drops first (AgentInfo is multi-line with
-  // comments between params, TextBlock is a one-liner, CreateTicketRequest's
-  // first three fields carry no default).
-  assert.ok(classes.AgentInfo?.length >= 26 && subclassesOfBlock.length >= 5 &&
+  // ...and the classes themselves are all there. Not a floor on any one class
+  // (see above) — these are the exact shapes a mis-parse drops first: AgentInfo
+  // is multi-line with comments between params, TextBlock is a one-liner, and
+  // CreateTicketRequest's first three fields carry no default.
+  assert.ok(classes.AgentInfo?.length && subclassesOfBlock.length >= 5 &&
     classes.TextBlock?.length === 2 && classes.CreateTicketRequest?.length === 5,
     "Models.kt did not parse — this test is only as good as the field list it built");
   // A transcript block is polymorphic: the table carries the UNION of every
