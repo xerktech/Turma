@@ -54,9 +54,14 @@ jobs:
       # the toolchain steps below install only what this PR actually exercises.
       - name: Detect changed test files
         id: detect
+        # Every `${{ }}` reaches these scripts through `env:`, never spliced into
+        # the script text — that is `run-shell-injection`, which code-scan runs
+        # over every workflow in this repo.
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          BASE="$(git merge-base origin/${{ github.base_ref }} HEAD)"
+          BASE="$(git merge-base "origin/$BASE_REF" HEAD)"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           # Added/copied/modified/renamed only — a deleted test cannot be proven.
           CHANGED="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)"
@@ -101,6 +106,7 @@ jobs:
       - name: Build the base-with-tests tree
         if: steps.detect.outputs.any == 'true'
         env:
+          BASE: ${{ steps.detect.outputs.base }}
           # ONLY the detected test files. Overlaying every changed file would
           # carry the fix across too and the "fails on base" run would prove
           # nothing — that is the whole point of this tree.
@@ -113,7 +119,7 @@ jobs:
             ${{ steps.detect.outputs.android }}
         run: |
           set -euo pipefail
-          git worktree add --detach /tmp/base "${{ steps.detect.outputs.base }}"
+          git worktree add --detach /tmp/base "$BASE"
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             mkdir -p "/tmp/base/$(dirname "$f")"
