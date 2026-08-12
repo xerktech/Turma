@@ -7243,3 +7243,113 @@ test("heartbeat: the coercion holder runs the real normalizeRecord in production
   // on, and the two tests above only prove the catch given that it is.
   assert.equal(hub.recordCoercion.normalize, hub.normalizeRecord);
 });
+
+// ---- XERK-278: an unstringifiable value must never kill the process ---------
+//
+// `String(x)` throws `TypeError: Cannot convert object to primitive value` for a
+// value with no usable primitive conversion, and pure JSON can express one:
+// `{"toString":1,"valueOf":1}` has both hooks as own, NON-CALLABLE properties.
+//
+// `sanitizeLiveAgents` took that straight off an `/agent/control` WebSocket
+// frame, inside a `socket.on("data")` listener with no try/catch above it and no
+// process-level `uncaughtException` handler — so ONE frame exited node, and
+// DockerOps' `restart: unless-stopped` turned that into an outage loop of the
+// whole control plane. The socket only needs the ordinary single-user web login
+// (`agentWsAuthorized` falls back to `agentAuthorized` falls back to
+// `userAuthorized`), which is reachable through the public tunnel.
+//
+// These run in the SAME process as the rest of the suite, so a regression does
+// not fail one assertion — it takes the entire test run down with it. That is
+// the intended signal.
+
+const UNSTRINGIFIABLE = JSON.parse('{"toString":1,"valueOf":1}');
+
+test("sanitizeLiveAgents: an unstringifiable field is dropped, never thrown on", () => {
+  // The `type` decides whether the row survives at all, so an unconvertible one
+  // reads as absent and the row goes — exactly what a blank type already gets.
+  assert.deepEqual(sanitizeLiveAgents([{ type: UNSTRINGIFIABLE }]), []);
+  // A `label` is display-only, so the row survives with a blank label rather
+  // than being dropped: losing the row would lose the "an agent is running"
+  // signal that `hasLiveAgents` reads.
+  assert.deepEqual(
+    sanitizeLiveAgents([{ type: "qa", label: UNSTRINGIFIABLE }]),
+    [{ sel: false, type: "qa", label: "" }]
+  );
+  // Good rows beside a poisoned one still come through.
+  assert.deepEqual(
+    sanitizeLiveAgents([{ type: UNSTRINGIFIABLE }, { type: "Explore", label: "look" }]),
+    [{ sel: false, type: "Explore", label: "look" }]
+  );
+  // The ordinary coercions are unchanged.
+  assert.deepEqual(sanitizeLiveAgents([{ type: 42 }]), [{ sel: false, type: "42", label: "" }]);
+});
+
+test("control WS: a poisoned agent row does not kill the hub", async () => {
+  const host = "poison-ctrl";
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
+    turn: "s1", text: "hi", agents: [{ type: UNSTRINGIFIABLE }],
+  }))));
+
+  // The proof is that anything at all still answers afterwards. Before the fix
+  // the process was gone by this point and no assertion ran.
+  await waitFor(() => true, 200);
+  const alive = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(alive.status, 200);
+  ctrl.socket.destroy();
+});
+
+test("control WS: a non-string session id is refused, not used as a property key", async () => {
+  // `liveFanout` does `liveClients[host]?.[sessionId]`, and coercing an object
+  // to a property key runs the same ToPrimitive. It only bites once a viewer
+  // socket exists for the host (the optional chain short-circuits otherwise), so
+  // this test opens one first — which is why the frame handler now type-checks
+  // the id rather than relying on `safeString` alone.
+  const host = "poison-key";
+  agents[host] = {
+    device: host, online: true, lastSeen: Date.now(),
+    sessions: [{ id: "pk1", status: "running", repo: "r", worktreePath: "/w",
+      transcriptId: "conv-pk1", session: { tail: [] } }],
+  };
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  const token = await issueToken();
+  const live = await wsConnect(`/live/${host}/pk1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+
+  for (const frame of [
+    { turn: UNSTRINGIFIABLE, text: "hi" },
+    { tail: UNSTRINGIFIABLE, entries: [] },
+  ]) {
+    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(frame))));
+  }
+
+  await waitFor(() => true, 200);
+  const alive = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(alive.status, 200);
+  live.socket.destroy();
+  ctrl.socket.destroy();
+  delete agents[host];
+});
+
+test("heartbeat: the same poison on the ingest path is dropped, not crashed on", async () => {
+  // The third caller. It was never the crash — the request handler's catch
+  // turned the throw into a 400 — so the fix CHANGES its answer: the coercion no
+  // longer throws, so the beat is now an ordinary 200 with the poisoned row
+  // dropped. The pre-existing XERK-262 case above deliberately accepts either
+  // status and asserts only the invariant (no poisoned row survives, the hub
+  // keeps serving); this one pins the post-fix contract exactly, so a future
+  // change back to refusing the whole beat has to be deliberate.
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: "poison-ingest",
+      sessions: [{ id: "s1", status: "running", session: { agents: [{ type: UNSTRINGIFIABLE }] } }],
+    },
+  });
+  assert.equal(r.status, 200);
+  // The poisoned row is dropped; the beat is otherwise honoured.
+  assert.deepEqual(agents["poison-ingest"].sessions[0].session.agents, []);
+});
