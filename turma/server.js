@@ -1985,9 +1985,19 @@ function readBody(req, cap = BODY_MAX) {
     // Armed only while this read holds budget, and reset by every chunk: a slow
     // client keeps sending and is never touched; an abandoned one is.
     let idleTimer = null;
+    // Where `len` stood when the window opened, and how much further it must get
+    // before the window may be reopened. Without these the window resets on any
+    // byte and a dribble holds its charge for as long as it likes.
+    let progressMark = 0;
+    let progressNeeded = 0;
     const disarmIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
     const armIdle = () => {
       disarmIdle();
+      progressMark = len;
+      // Never ask for more than the body has left to give, so a nearly-finished
+      // upload is not reclaimed over its last few bytes.
+      const left = Number.isFinite(declared) && declared > len ? declared - len : Infinity;
+      progressNeeded = Math.max(1, Math.min(BODY_MIN_PROGRESS_BYTES, left));
       idleTimer = setTimeout(() => {
         if (over) return;
         over = true;
@@ -2072,7 +2082,7 @@ function readBody(req, cap = BODY_MAX) {
         lane = next;
         chargeBody(want - held, lane);
         held = want;
-        armIdle();
+        if (!progressNeeded || len - progressMark >= progressNeeded) armIdle();
       }
       data += c;
     });
@@ -2125,6 +2135,24 @@ const BUDGET_DRAIN_SLACK = 64 << 10; // 64 KiB
 // window is generous for that reason: this is not a throughput floor.
 const BODY_IDLE_TIMEOUT_MS = Number(process.env.BODY_IDLE_TIMEOUT_MS) || 20 * 1000;
 
+// ...and how much must ARRIVE in that window for the body to count as making
+// progress. This is the half that matters.
+//
+// A window reset by ANY byte is not a liveness check, it is a heartbeat an
+// attacker can forge: one byte every 15s is neither silence nor slowness, and it
+// held the big lane — refusing every POST on the hub, operator login included —
+// indefinitely, for about 0.5 bit/s after a one-time 22 MiB warmup. Renewing
+// cost nothing because it never had to re-stream.
+//
+// So the rule is a minimum RATE, not a minimum sign of life: roughly 3 KiB/s at
+// the defaults. That is far below anything the fleet does — agents reach the hub
+// over a LAN or the tunnel — and far above what a dribble can fake. The floor
+// gives way to what is actually left of the body, so a nearly-complete upload is
+// never reclaimed for the sake of a few last bytes; an attacker cannot use that,
+// since holding a big charge requires a large body with a large remainder.
+const BODY_MIN_PROGRESS_BYTES =
+  Number(process.env.BODY_MIN_PROGRESS_BYTES) || 64 << 10; // 64 KiB per window
+
 // Thrown when a body holding budget stops arriving. Its socket is destroyed —
 // a caller that stopped mid-body is not waiting to read a status, and by this
 // point it is holding room the rest of the fleet needs.
@@ -2156,9 +2184,19 @@ function readRawBody(req, cap) {
     // Armed only while this read holds budget, and reset by every chunk: a slow
     // client keeps sending and is never touched; an abandoned one is.
     let idleTimer = null;
+    // Where `len` stood when the window opened, and how much further it must get
+    // before the window may be reopened. Without these the window resets on any
+    // byte and a dribble holds its charge for as long as it likes.
+    let progressMark = 0;
+    let progressNeeded = 0;
     const disarmIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
     const armIdle = () => {
       disarmIdle();
+      progressMark = len;
+      // Never ask for more than the body has left to give, so a nearly-finished
+      // upload is not reclaimed over its last few bytes.
+      const left = Number.isFinite(declared) && declared > len ? declared - len : Infinity;
+      progressNeeded = Math.max(1, Math.min(BODY_MIN_PROGRESS_BYTES, left));
       idleTimer = setTimeout(() => {
         if (over) return;
         over = true;
@@ -2218,7 +2256,7 @@ function readRawBody(req, cap) {
         lane = next;
         chargeBody(len - held, lane);
         held = len;
-        armIdle();
+        if (!progressNeeded || len - progressMark >= progressNeeded) armIdle();
       }
       chunks.push(c);
     });
@@ -5675,7 +5713,7 @@ if (process.env.TURMA_TEST) {
     // "idle hub admits anything, a busy one does not" rule can be held directly.
     MEMORY_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
     bodyLaneFor, chargeBody, releaseBody, bodyInflightHeld, BODY_PARSE_COST,
-    DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS,
+    DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,

@@ -282,12 +282,15 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - **A refused body must be closed, not merely paused.** Node DUMPS an unread body when the
     response finishes, to keep the connection alive — it resumes the paused stream and reads the
     whole thing. Discarded bytes are still read into memory.
-  - **A body holding budget that goes SILENT is taken back** (`BODY_IDLE_TIMEOUT_MS`). The budget
-    bounds how much may be held; only this bounds how long. One socket that streamed 22 MiB and
-    stopped held the big lane until `requestTimeout` (300s), refusing every body on the hub —
-    including the operator's login — for ~0.6 kbit/s. Armed only while a charge is held and reset by
-    every chunk, so a genuinely slow client is untouched; it is silence, not slowness, that is
-    reclaimed.
+  - **A body holding budget must keep making PROGRESS or it is taken back** — `BODY_MIN_PROGRESS_
+    BYTES` per `BODY_IDLE_TIMEOUT_MS`, i.e. a minimum RATE (~3 KiB/s at the defaults), armed only
+    while a charge is held. The budget bounds how much may be held; only this bounds how long.
+    - A window reset by ANY byte is not a liveness check, it is one an attacker forges: one byte
+      every 15s held the big lane indefinitely — refusing every POST including the operator's login
+      — for ~0.5 bit/s, since renewing never had to re-stream. Reclaiming only silence is not
+      enough; a dribble is neither silent nor slow.
+    - The floor gives way to what the body has LEFT, so a nearly-complete upload is never reclaimed
+      over its last bytes. That is not exploitable: holding a big charge needs a large remainder.
   - **Known gap: CHUNKED bodies bypass the declared-length pre-check** and can still OOM the hub at
     256m (XERK-287). Fixing it means capping undeclared-body concurrency, which is only safe once
     it's known whether the Cloudflare tunnel preserves agent framing — measure before capping.

@@ -6791,3 +6791,67 @@ test("budget: a body that goes silent while holding budget is taken back", async
     sock.destroy();
   }
 });
+
+test("budget: a DRIBBLE cannot hold budget open forever", async () => {
+  // The idle window alone was not enough. Reset by any byte, it is a liveness
+  // check an attacker can forge: one byte per window is neither silence nor
+  // slowness, and it held the big lane -- refusing every POST on the hub,
+  // operator login included -- indefinitely, for ~0.5 bit/s after a one-time
+  // warmup, without ever having to re-stream. The window must therefore reopen
+  // on real PROGRESS, not on a sign of life.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  let dribbler = null;
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        `{"device":"dribbler","pad":"${"d".repeat(256 * 1024)}`
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    assert.ok(hub.bodyInflightHeld() > 0, "the warmup is charged");
+
+    // One byte per window -- comfortably under BODY_MIN_PROGRESS_BYTES, and
+    // often enough that a reset-on-any-byte rule would never expire.
+    dribbler = setInterval(() => { try { sock.write("d"); } catch {} },
+      Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 3)));
+
+    const deadline = Date.now() + hub.BODY_IDLE_TIMEOUT_MS * 4 + 2000;
+    while (hub.bodyInflightHeld() > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(hub.bodyInflightHeld(), 0, "dribbling must not renew the hold");
+    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), "big",
+      "and the lane must come back");
+  } finally {
+    if (dribbler) clearInterval(dribbler);
+    sock.destroy();
+  }
+});
+
+test("budget: a body making REAL progress is never reclaimed", async () => {
+  // The other half: the rule is a minimum RATE, and anything clearing it must be
+  // left alone however long it takes. A real slow migration lives here.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const chunk = Math.max(hub.BODY_MIN_PROGRESS_BYTES * 2, 128 * 1024);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  let pump = null;
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        '{"device":"steady","pad":"'
+    );
+    pump = setInterval(() => { try { sock.write("s".repeat(chunk)); } catch {} },
+      Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 2)));
+    // Outlast several windows; a body clearing the floor must still be alive.
+    await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
+    assert.ok(hub.bodyInflightHeld() > 0,
+      "a body meeting the progress floor must not be reclaimed");
+  } finally {
+    if (pump) clearInterval(pump);
+    sock.destroy();
+  }
+});
