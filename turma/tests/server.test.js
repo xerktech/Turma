@@ -6925,10 +6925,41 @@ test("limits' two epoch fields are INTEGER-bounded, not merely finite", () => {
 // needs its strings intact, the Kotlin parser must not read a default's
 // contents as syntax). Both guards below got this wrong in opposite directions:
 // one read a `//` inside a string as a comment, the other read `"/*"` as one.
-function blankNonCode(src, blankStrings) {
+function blankNonCode(src, { blankStrings = false, regexLiterals = false } = {}) {
   let out = "";
   const pad = (s) => s.replace(/[^\n]/g, " ");   // keep line numbering intact
+  // Whether a `/` here opens a REGEX or is a division, by the previous
+  // significant token — the standard JS lexer rule. `regexLiterals` is off for
+  // Kotlin, which has no such literal and where `a / b / c` would otherwise read
+  // as one.
+  const opensRegex = () => {
+    const before = out.replace(/\s+$/, "");
+    if (!before) return true;
+    const last = before[before.length - 1];
+    if ("(,=:[!&|?{};+-*%~^<>".includes(last)) return true;
+    return /\b(return|typeof|case|in|of|do|else|yield|await|delete|void|new)$/.test(before);
+  };
   for (let i = 0; i < src.length; ) {
+    if (regexLiterals && src[i] === "/" && src[i + 1] !== "/" && src[i + 1] !== "*" &&
+        opensRegex()) {
+      // A regex literal cannot span a line, so scan to the closing unescaped `/`
+      // on this one, stepping over a `[...]` class. Consuming it is the point: a
+      // quote or BACKTICK inside a character class (`` /`([^`]+)`/g ``, which
+      // glasses and veiller both contain verbatim) otherwise opens a phantom
+      // literal that runs to the next matching one — swallowing every comment in
+      // between and un-blanking them, which is the false positive this whole
+      // helper exists to prevent.
+      let j = i + 1, inClass = false, closed = false;
+      for (; j < src.length; j++) {
+        const c = src[j];
+        if (c === "\\") { j++; continue; }
+        if (c === "\n") break;                   // unterminated: not a regex
+        if (inClass) { if (c === "]") inClass = false; continue; }
+        if (c === "[") { inClass = true; continue; }
+        if (c === "/") { j++; closed = true; break; }
+      }
+      if (closed) { out += pad(src.slice(i, j)); i = j; continue; }
+    }
     if (src.startsWith('"""', i)) {              // Kotlin raw string
       let stop = src.length;
       const end = src.indexOf('"""', i + 3);
@@ -6955,9 +6986,10 @@ function blankNonCode(src, blankStrings) {
       const quote = src[i];
       let j = i + 1;
       let quoteIsCode = false;
+      let closed = false;
       for (; j < src.length; j++) {
         if (src[j] === "\\") { j++; continue; }  // an escaped quote does not close
-        if (src[j] === quote) { j++; break; }
+        if (src[j] === quote) { j++; closed = true; break; }
         // Neither language lets a `'`/`"` literal span a line, so one that does
         // was never a string — overwhelmingly a quote inside a JS REGEX class
         // (`/[.,;:!?'"]+$/`, which this repo really contains). Reading it as a
@@ -6966,12 +6998,15 @@ function blankNonCode(src, blankStrings) {
         // one-character edit to any character class.
         if (src[j] === "\n" && quote !== "`") { quoteIsCode = true; break; }
       }
-      if (quoteIsCode) { out += quote; i++; continue; }
+      // A literal that never closes was never a literal. That covers the
+      // newline rule's blind spot, the BACKTICK — exempt from it because a
+      // template literal may legitimately span lines, so a regex holding an odd
+      // number of them (`` /`([^`]+)`/g ``, which glasses and veiller both
+      // contain) would otherwise open a phantom literal that ran to EOF and
+      // stopped comment-blanking for the rest of the file.
+      if (quoteIsCode || !closed) { out += quote; i++; continue; }
       const lit = src.slice(i, j);
-      const closed = lit.length >= 2 && lit.endsWith(quote);
-      out += blankStrings
-        ? quote + pad(lit.slice(1, closed ? -1 : undefined)) + (closed ? quote : "")
-        : lit;
+      out += blankStrings ? quote + pad(lit.slice(1, -1)) + quote : lit;
       i = j;
     } else {
       out += src[i];
@@ -7013,7 +7048,7 @@ test("turma/Dockerfile copies every local module the hub requires", () => {
     // long before this test runs, so an assert here could only ever fire on a
     // false positive.
     if (!fs.existsSync(full)) continue;
-    const code = blankNonCode(fs.readFileSync(full, "utf8"), false);
+    const code = blankNonCode(fs.readFileSync(full, "utf8"), { regexLiterals: true });
     for (const m of code.matchAll(local)) {
       required.add(m[1]);
       if (!seen.has(m[1])) { seen.add(m[1]); queue.push(m[1]); }
@@ -7064,7 +7099,7 @@ test("every field Android types on the fleet payload is in the shape table", () 
   // breaking the parser. Length-preserving, so the offsets below stay valid.
   const src = blankNonCode(fs.readFileSync(path.join(__dirname, "..", "..", "android",
     "app", "src", "main", "java", "com", "xerktech", "turma", "model", "Models.kt"),
-    "utf8"), true);
+    "utf8"), { blankStrings: true });
   // One entry per `data class X(...)`: its fields as {name, type}.
   //
   // Parsed by matching parens and then splitting the constructor on TOP-LEVEL
