@@ -316,9 +316,12 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     indistinguishable from a legitimate slow migration at the same rate, so no rate threshold
     separates them. This is the orthogonal bound — not "are you progressing" but "you have had it
     long enough" — sized well above a 65 MiB bundle at any sane rate.
-  - **Known gap: CHUNKED bodies bypass the declared-length pre-check** and can still OOM the hub at
-    256m (XERK-287). Fixing it means capping undeclared-body concurrency, which is only safe once
-    it's known whether the Cloudflare tunnel preserves agent framing — measure before capping.
+  - **Known gap (XERK-287): held UPLOADS are still a budget of their own, outside that ceiling**, so
+    the true worst case is `in-flight + uploads` — 192 MiB of a 256 MiB container — and the flood
+    row OOMs once attachments are staged beside it. The rule above applies to itself here; closing
+    it is a sizing decision with user-visible cost, not a code fix. Chunked bodies also bypass the
+    declared-length pre-check, and capping undeclared concurrency is only safe once it's known
+    whether the Cloudflare tunnel preserves agent framing — measure before capping.
   - `server.maxConnections` bounds the socket count, which no byte budget can: each socket costs a
     read buffer, parser and req/res objects before a body byte arrives. It counts the upgraded
     WebSockets too, so the number must clear steady-state SSE/tunnel/terminal use with room spare —
