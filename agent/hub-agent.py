@@ -252,7 +252,11 @@ def _byte_ceiling(raw, fallback):
     at 2**53-1 for the same reason — past that the hub's Number.isSafeInteger
     rejects and this would not."""
     try:
-        s = str(raw if raw is not None else "").strip()
+        # An EXPLICIT whitespace set, not .strip(): str.strip() and JS's
+        # String.trim() disagree at the edges (JS strips U+FEFF, Python doesn't;
+        # Python strips U+0085 and U+001C-1F, JS doesn't), so a BOM pasted in
+        # front of the value made the two read different ceilings.
+        s = str(raw if raw is not None else "").strip(" \t\n\r\f\v")
         if not (s.isascii() and s.isdigit()):
             return fallback
         n = int(s)
@@ -12224,6 +12228,7 @@ class SessionManager:
             # flicker between full previews and chips chunk to chunk.
             shed = tid in shed_set
             payload_sent = 0
+            shed_bytes = 0
             while have < size and budget > 0:
                 try:
                     with open(path, "rb") as f:
@@ -12261,7 +12266,7 @@ class SessionManager:
                     # ...except the SendUserFile payloads, once this transcript
                     # has spent its archive budget on them (XERK-267).
                     if shed:
-                        _shed_block_payloads(blocks)
+                        shed_bytes += _shed_block_payloads(blocks)
                     elif ARCHIVE_PAYLOAD_MAX > 0:   # 0 = ceiling disabled
                         payload_sent += _block_payload_bytes(blocks)
                         if payload_sent >= ARCHIVE_PAYLOAD_MAX:
@@ -12296,6 +12301,12 @@ class SessionManager:
                 if new_have <= have:
                     break  # no forward progress (offset realign / hub cursor) — stop
                 have = new_have
+            if shed_bytes:
+                # Once per transcript per pass. Without it an operator seeing
+                # name-only chips in an archived session has nothing saying the
+                # previews were dropped for size rather than never captured.
+                log(f"archive: shed {shed_bytes} bytes of inline file previews "
+                    f"from {tid} (over ARCHIVE_TRANSCRIPT_MAX_BYTES)")
 
     def _post_archive_chunk(self, transcript_id, body):
         """POST one archive delta to the hub. Returns the parsed reply

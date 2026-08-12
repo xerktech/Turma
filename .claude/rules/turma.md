@@ -195,21 +195,20 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   - Budget spend is the `archiveBytes` column, **re-derived from the files by `rebuildIndex`** —
     the index is disposable, so reading it from a sidecar would drift (and every pre-XERK-267
     sidecar has no such field).
-  - **Deleting archives is the way out of a full store, so the spend must give those bytes back**
-    (`forgetMissingTranscript` / `reconcileMissingFiles`): a column that only grows leaves the
-    ceiling measured against files that no longer exist, with no exit short of deleting
-    `index.db`. It runs on **both** full paths — `ingestChunk` AND `archiveLimits` — because a
-    `full` verdict stops the agent pushing, so ingest alone would never run again to notice.
-  - Dropping that row also **repairs the cursor**: a deleted file with its row kept made the next
-    delta append onto a hole, leaving a truncated conversation behind a `msgCount` that claimed
-    otherwise. `ingestChunk` re-checks the file on every chunk, so the transcript simply
-    re-archives from the start.
-  - **Only a genuine deletion counts, and `fileIsGone` is deliberately paranoid about it**
-    (never `fs.existsSync`, which collapses every errno to false). A false "gone" resets the cursor
-    and ingest APPENDS, so the re-push writes a SECOND copy of the conversation into a file that
-    was there all along — durable corruption of the store's own source of truth. So: only ENOENT,
-    and only when `ARCHIVE_DIR` itself still stats, since a missing parent reports ENOENT for
-    every row at once and one bad moment on the archive mount would otherwise empty the index.
+  - **The store total is WALKED off the files, never summed from the index** (`totalArchiveBytes`,
+    cached `TOTAL_CACHE_MS`). Deleting archives is the operator's way out of a full store, and it
+    works here because the bytes are simply gone — nothing has to notice a deletion.
+    - **Do not "improve" this into an indexed column that reconciles against disk.** That means
+      inferring "deleted" from a failed stat, which is not knowable: an unmounted volume, a renamed
+      parent and a real delete all report ENOENT, while EACCES/EIO/ESTALE report neither. Guessing
+      "deleted" drops the row and resets the cursor, and since ingest APPENDS, the re-push writes a
+      SECOND copy of the conversation into a file that was there all along; guessing "present"
+      latches the ceiling shut with no exit. Both were built and both were reproduced.
+    - An unreadable `ARCHIVE_DIR` therefore measures **0, i.e. not full** — a store whose directory
+      was removed recreates it and carries on, rather than refusing fleet-wide forever.
+  - **A deleted `.jsonl` whose index row survives leaves the cursor alone** and the next delta
+    appends onto the gap — pre-existing, tracked as XERK-280. Repairing it needs a reliable answer
+    to "was this deleted", which is the thing above that cannot be had cheaply.
 - Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.
 
 ## `POST /api/trigger` — external automation

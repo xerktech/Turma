@@ -49,8 +49,14 @@ const MAX_TRANSCRIPT_BYTES = 1024 ** 4;
 // Anything else falls back to the default. Mirrored by _byte_ceiling in
 // hub-agent.py, which must agree on both rules (XERK-267).
 function byteCeiling(raw, fallback) {
-  const s = String(raw == null ? "" : raw).trim();
-  if (!/^\d+$/.test(s)) return fallback;
+  // An EXPLICIT whitespace set, not .trim(): String.trim() and Python's
+  // str.strip() disagree about the edges — JS strips U+FEFF and Python doesn't,
+  // Python strips U+0085 and U+001C-1F and JS doesn't. A BOM in front of the
+  // value is an ordinary copy-paste accident, and under .trim() it gave the hub
+  // 16 where the agent read 16 MiB (or the reverse), which is the fleet-wide
+  // preview strip the digits-only rule exists to prevent.
+  const s = String(raw == null ? "" : raw).replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
+  if (!/^[0-9]+$/.test(s)) return fallback;
   const n = Number(s);
   return Number.isSafeInteger(n) ? n : fallback;
 }
@@ -209,82 +215,47 @@ function writeSidecar(metaPath, obj) {
   fs.renameSync(tmp, metaPath);
 }
 
-// Bytes of .jsonl the whole store holds, summed over the index.
-function totalArchiveBytes() {
-  const r = db.prepare("SELECT SUM(archiveBytes) AS n FROM sessions").get();
-  return (r && r.n) || 0;
+// Bytes the whole store holds, measured by WALKING THE FILES — never summed
+// from the index.
+//
+// The ceiling this feeds exists to stop the archive filling the volume the
+// hub's own state.json lives on, so the honest input is what is actually on
+// that volume. An indexed total has to be kept in step with the disk, and every
+// way of doing that means inferring "the operator deleted this" from a failed
+// stat — which is not reliably knowable: an unmounted volume, a renamed parent
+// and a real deletion all report ENOENT, while EACCES/EIO/ESTALE report neither.
+// Guessing wrong in one direction wedges the ceiling shut; in the other it
+// drops a live transcript's row, and since ingest APPENDS, the re-push writes a
+// SECOND copy of the conversation into a file that was there all along. Walking
+// the files needs no such guess: deleting archives frees bytes because the
+// bytes are gone, and nothing has to notice.
+//
+// An unreadable ARCHIVE_DIR measures 0, i.e. "not full" — so a store whose
+// directory was removed outright recreates it and carries on, rather than
+// latching full forever with no way back.
+//
+// Cached, because it runs on the heartbeat path: ~10 ms over the reference
+// host's 1,276 files, which is not something to pay per beat per host.
+let totalCache = { at: 0, bytes: 0 };
+const TOTAL_CACHE_MS = 60 * 1000;
+function totalArchiveBytes(now) {
+  now = now || Date.now();
+  if (now - totalCache.at < TOTAL_CACHE_MS) return totalCache.bytes;
+  const files = [];
+  walkJsonl(ARCHIVE_DIR, files);
+  let bytes = 0;
+  for (const f of files) {
+    try { bytes += fs.statSync(f).size; } catch { /* raced with a delete */ }
+  }
+  totalCache = { at: now, bytes };
+  return bytes;
 }
 
-// Has this transcript's file actually been DELETED — as opposed to being
-// momentarily unreachable? The difference is not academic: a false "gone" drops
-// the row and resets the cursor, and since ingest APPENDS, the re-push from
-// offset 0 writes a second copy of the conversation into a file that was there
-// all along. That is durable corruption of the store's own source of truth, so
-// this errs hard toward "still there".
-//
-//   - Only ENOENT counts. `fs.existsSync` collapses EVERY error to false, so an
-//     EACCES/EIO/ESTALE blip on the archive volume read as a deletion.
-//   - A missing PARENT also reports ENOENT, so an archive mount that drops for
-//     one syscall would make every row look deleted at once — hence the second
-//     check. If ARCHIVE_DIR itself isn't there, nothing was deleted; the volume
-//     is gone, and the right response is to touch nothing.
-function fileIsGone(relPath) {
-  const paths = filePaths(relPath);
-  try {
-    fs.statSync(paths.jsonl);
-    return false;                       // still there
-  } catch (e) {
-    if (e.code !== "ENOENT") return false;   // unreachable != deleted
-  }
-  try {
-    fs.statSync(ARCHIVE_DIR);
-  } catch {
-    return false;                       // the whole store is unreachable
-  }
-  return true;
-}
-
-// Forget a transcript whose organized file is no longer on disk: its row, its
-// budget spend and its FTS entries. Returns true if anything was dropped.
-//
-// The FILES are the source of truth here, not the index — so deleting one has
-// to actually give its bytes back. Without this, `archiveBytes` only ever grows
-// and the operator's obvious remedy for a full store (delete some archives)
-// changes nothing, leaving the ceiling measured against bytes that no longer
-// exist and no way out short of deleting index.db.
-//
-// It also repairs the cursor: an agent still holding that transcript re-offers
-// it, sees have=0, and re-pushes from the start — where a kept cursor made the
-// hub accept the NEXT delta as if the earlier ones were still stored, silently
-// leaving a truncated conversation behind a msgCount that claimed otherwise.
-function forgetMissingTranscript(transcriptId, relPath) {
-  if (!relPath || !fileIsGone(relPath)) return false;
-  tx(() => {
-    db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(transcriptId);
-    db.prepare("DELETE FROM sessions WHERE transcriptId=?").run(transcriptId);
-  });
-  console.error(`archive: ${transcriptId}'s file is gone (${relPath}); ` +
-    `dropped its index row, so it re-archives from the start`);
-  return true;
-}
-
-// Sweep every indexed transcript for a file that has since been deleted. Only
-// worth its cost on the full-store path, where it is the difference between a
-// recoverable ceiling and a wedged one — so it is rate-limited rather than run
-// per chunk.
-let lastReconcileAt = 0;
-// Test seam: reach past the rate limit the way a later beat would, rather than
-// making a unit test sleep a minute to observe a recovery.
-function __resetReconcileClock() { lastReconcileAt = 0; }
-function reconcileMissingFiles() {
-  const now = Date.now();
-  if (now - lastReconcileAt < 60 * 1000) return 0;
-  lastReconcileAt = now;
-  let dropped = 0;
-  for (const row of db.prepare("SELECT transcriptId, filePath FROM sessions").all()) {
-    if (forgetMissingTranscript(row.transcriptId, row.filePath)) dropped++;
-  }
-  return dropped;
+// Test seam: drop the cache so a test observes a recovery without waiting out
+// TOTAL_CACHE_MS, or seed it to put the total at an exact value the filesystem
+// can't easily be coaxed into. Nothing in the serving path calls it.
+function __resetTotalCache(seed) {
+  totalCache = seed === undefined ? { at: 0, bytes: 0 } : { at: Date.now(), bytes: seed };
 }
 
 // Drop the SendUserFile payloads embedded on an entry's blocks — the base64
@@ -335,28 +306,18 @@ function warnArchiveFull(total) {
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
   openDb();
   meta = meta || {};
-  let row = db.prepare(
+  const row = db.prepare(
     "SELECT bytesStored, archiveBytes, filePath FROM sessions WHERE transcriptId=?"
   ).get(transcriptId);
-  // Someone deleted this transcript's file out from under the index. Forget it
-  // and take the push as a fresh one rather than appending onto a hole.
-  if (row && row.bytesStored > 0 && forgetMissingTranscript(transcriptId, row.filePath)) {
-    row = undefined;
-  }
   const have = row ? row.bytesStored : 0;
   // Store full: hand back the cursor we already hold and store nothing. Not an
   // error status — the agent must read this as "no progress" and move on, never
-  // as a chunk to retry (XERK-267).
-  if (ARCHIVE_TOTAL_MAX && totalArchiveBytes() >= ARCHIVE_TOTAL_MAX) {
-    // Deleted archives are the way out of a full store, so give them back
-    // before refusing — else the ceiling is measured against bytes that are no
-    // longer there and no amount of deleting reopens it.
-    reconcileMissingFiles();
-    const total = totalArchiveBytes();
-    if (total >= ARCHIVE_TOTAL_MAX) {
-      warnArchiveFull(total);
-      return { bytesStored: have, full: true };
-    }
+  // as a chunk to retry (XERK-267). Deleting archives is what reopens it, and
+  // needs nothing from us: the total is measured off the files themselves.
+  const total = totalArchiveBytes();
+  if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) {
+    warnArchiveFull(total);
+    return { bytesStored: have, full: true };
   }
   if (Number(startOffset) !== have) return { bytesStored: have };
   // The cursor only ever moves forward. Without this an endOffset BELOW
@@ -509,16 +470,7 @@ function archiveLimits(ids) {
     ).all(ARCHIVE_TRANSCRIPT_MAX).map((r) => r.transcriptId));
     for (const id of list) if (over.has(id)) shed.push(id);
   }
-  let full = !!(ARCHIVE_TOTAL_MAX && totalArchiveBytes() >= ARCHIVE_TOTAL_MAX);
-  if (full) {
-    // Reconcile HERE too, not only in ingestChunk: a `full` verdict makes the
-    // agent skip the push entirely, so ingest would never run again to notice
-    // that the operator has since deleted archives — the store would stay full
-    // forever on the strength of files that no longer exist.
-    reconcileMissingFiles();
-    full = totalArchiveBytes() >= ARCHIVE_TOTAL_MAX;
-  }
-  return { shed, full };
+  return { shed, full: !!(ARCHIVE_TOTAL_MAX && totalArchiveBytes() >= ARCHIVE_TOTAL_MAX) };
 }
 
 // ---- query ------------------------------------------------------------------
@@ -689,6 +641,6 @@ module.exports = {
   slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits,
-  reconcileMissingFiles, __resetReconcileClock,
+  totalArchiveBytes, __resetTotalCache,
   searchArchive, listArchive, getTranscript,
 };

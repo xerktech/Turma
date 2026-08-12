@@ -148,140 +148,103 @@ test("rebuildIndex re-derives archiveBytes from the files, so a lost DB keeps th
   assert.deepEqual(archive.archiveLimits(["big"]).shed, ["big"]);
 });
 
-test("a file that is merely UNREACHABLE is not treated as deleted", () => {
-  // The dangerous direction. Dropping the row resets the cursor to 0, and ingest
-  // APPENDS — so a false "gone" makes the re-push write a second copy of the
-  // conversation into a file that was there all along. An EACCES/EIO blip, or an
-  // archive mount that drops for one syscall, must change nothing.
-  const rel = "turma/2026-07-10__small__nas__small.jsonl";
-  const abs = path.join(process.env.ARCHIVE_DIR, rel);
-  const linesBefore = fs.readFileSync(abs, "utf8").split("\n").length;
-
-  // The whole store momentarily not at its path — every row would look deleted.
-  const moved = process.env.ARCHIVE_DIR + ".away";
-  fs.renameSync(process.env.ARCHIVE_DIR, moved);
-  let sweptWhileGone;
-  try {
-    sweptWhileGone = archive.reconcileMissingFiles();
-  } finally {
-    fs.renameSync(moved, process.env.ARCHIVE_DIR);
-  }
-  assert.equal(sweptWhileGone, 0, "an unreachable store must not empty the index");
-
-  // ...and the transcript still ingests onto its real cursor, not from 0.
-  const t = archive.getTranscript("small");
-  assert.ok(t, "the row must survive");
-  assert.equal(fs.readFileSync(abs, "utf8").split("\n").length, linesBefore);
-
-  // The other shape: the STORE is fine and this one file errors for a reason
-  // that isn't deletion. fs.existsSync collapses every errno to false, which is
-  // what made an EACCES/EIO blip read as "the operator deleted it".
-  archive.ingestChunk("nas", "enotdir", { ...META, repo: "sub", summary: "Enotdir" }, 0, 60,
-    [{ uuid: "e1", role: "user", ts: "2026-07-10T00:00:00Z", text: "still here" }]);
-  const subdir = path.join(process.env.ARCHIVE_DIR, "sub");
-  const stash = subdir + ".stash";
-  fs.renameSync(subdir, stash);
-  fs.writeFileSync(subdir, "not a directory");   // stat now fails ENOTDIR, not ENOENT
-  let sweptOnEnotdir;
-  try {
-    archive.__resetReconcileClock();
-    sweptOnEnotdir = archive.reconcileMissingFiles();
-  } finally {
-    fs.rmSync(subdir);
-    fs.renameSync(stash, subdir);
-  }
-  assert.equal(sweptOnEnotdir, 0, "a non-ENOENT stat error is not a deletion");
-  assert.ok(archive.getTranscript("enotdir"), "the row must survive an unreadable path");
-});
-
-test("deleting an archived file gives its bytes back and re-arms the transcript", () => {
-  // The operator's remedy for a full store. Without this the spend is counted
-  // forever against a file that no longer exists, and the next delta appends
-  // onto a hole while msgCount still claims the earlier messages.
+test("the store total is measured off the FILES, so deleting archives frees bytes", () => {
+  // The whole reason the total is not an indexed column. Deleting archives is
+  // the operator's remedy for a full store, and it works because the bytes are
+  // actually gone — nothing has to notice a deletion, which is a thing the
+  // filesystem cannot reliably be asked (an unmounted volume, a renamed parent
+  // and a real delete all report ENOENT; EACCES/EIO report neither).
   const rel = "turma/2026-07-10__runaway__nas__runaway.jsonl";
   const abs = path.join(process.env.ARCHIVE_DIR, rel);
   const freed = fs.statSync(abs).size;
-  const before = archive.listArchive({ limit: 500 }).sessions.length;
-  fs.rmSync(abs);
-
-  // The next delta for it is taken as a fresh archive from offset 0...
-  const stale = archive.ingestChunk("nas", "runaway", { ...META, summary: "Runaway" }, 5000, 5100,
-    [{ uuid: "r-new", role: "user", ts: "2026-07-10T00:02:00Z", text: "after the delete" }]);
-  assert.equal(stale.bytesStored, 0, "the cursor must reset, not append onto a hole");
-  assert.equal(archive.listArchive({ limit: 500 }).sessions.length, before - 1);
   assert.ok(freed > 0);
-  // The FTS entries have to go with the row. Asserted against the FTS table
-  // itself, not through searchArchive: that joins onto `sessions`, so a dropped
-  // row HIDES orphaned entries rather than removing them, and the leak would sit
-  // there growing the index until a rebuild.
-  const probe = new DatabaseSync(process.env.ARCHIVE_DB);
-  try {
-    const left = probe.prepare(
-      "SELECT COUNT(*) AS n FROM entries_fts WHERE transcriptId=?").get("runaway");
-    assert.equal(left.n, 0, "FTS entries outlived their session row");
-  } finally {
-    probe.close();
-  }
-  assert.deepEqual(archive.searchArchive("runaway").groups, []);
+
+  archive.__resetTotalCache();
+  const before = archive.totalArchiveBytes();
+  fs.rmSync(abs);
+  archive.__resetTotalCache();
+  assert.equal(archive.totalArchiveBytes(), before - freed);
 });
 
-test("a full store recovers on the HEARTBEAT path too, not only through ingest", () => {
-  // The deadlock this pair of call sites exists to break: a `full` verdict stops
-  // the agent pushing, so if only ingestChunk reconciled, ingest would never run
-  // again to notice the operator's deletions and the store would stay full on
-  // the strength of files that are gone.
+test("an unreachable store reads as empty, never as full — a wedge has no exit", () => {
+  // The direction that cannot be recovered from in production: latching `full`
+  // on a store that is merely unreachable stops every agent on the fleet
+  // archiving, and no amount of deleting reopens it. Measuring the files means
+  // "can't see it" reads as 0 bytes, so ingest recreates the directory and
+  // carries on.
+  const moved = process.env.ARCHIVE_DIR + ".away";
+  fs.renameSync(process.env.ARCHIVE_DIR, moved);
+  let whileGone;
+  try {
+    archive.__resetTotalCache();
+    whileGone = archive.totalArchiveBytes();
+  } finally {
+    fs.renameSync(moved, process.env.ARCHIVE_DIR);
+    archive.__resetTotalCache();
+  }
+  assert.equal(whileGone, 0);
+});
+
+test("a deleted archive does not disturb the cursor or the stored file", () => {
+  // The counterpart. This deliberately does NOT try to detect the deletion and
+  // reset the transcript: inferring "deleted" from a failed stat is what made a
+  // momentarily-unreachable file drop its row, reset the cursor to 0, and — since
+  // ingest APPENDS — write a SECOND copy of the conversation into a file that was
+  // there all along. The append-only cursor is left exactly as it was (XERK-280).
+  const rel = "turma/2026-07-10__small__nas__small.jsonl";
+  const abs = path.join(process.env.ARCHIVE_DIR, rel);
+  const before = fs.readFileSync(abs, "utf8");
+
+  const moved = process.env.ARCHIVE_DIR + ".away";
+  fs.renameSync(process.env.ARCHIVE_DIR, moved);
+  fs.renameSync(moved, process.env.ARCHIVE_DIR);
+  archive.__resetTotalCache();
+
+  assert.ok(archive.getTranscript("small"), "the row must survive an unreachable moment");
+  assert.equal(fs.readFileSync(abs, "utf8"), before, "and the file must be untouched");
+});
+
+test("a full store stays refusable and recovers by deletion, on both paths", () => {
   const fillDir = path.join(process.env.ARCHIVE_DIR, "turma");
   let n = 0;
+  archive.__resetTotalCache();
   while (!archive.archiveLimits([]).full && n < 60) {
     archive.ingestChunk("nas", `heart${n}`, { ...META, summary: `Heart ${n}` }, 0, 100,
       [{ uuid: `h${n}`, role: "user", ts: "2026-07-10T00:00:00Z", text: "y".repeat(2000) }]);
+    archive.__resetTotalCache();
     n++;
   }
   assert.ok(archive.archiveLimits([]).full, "the store ceiling never engaged");
+  // Ingest refuses without erroring — the agent reads it as no progress.
+  const refused = archive.ingestChunk("nas", "blocked", { ...META, summary: "Blocked" }, 0, 40,
+    [{ uuid: "bl1", role: "user", ts: "2026-07-10T00:05:00Z", text: "nope" }]);
+  assert.equal(refused.full, true);
+  assert.equal(refused.bytesStored, 0);
 
-  // Delete what we just wrote — WITHOUT going through ingest at all.
+  // Delete, WITHOUT going through ingest: the heartbeat path must reopen too,
+  // since a `full` verdict is exactly what stops the agent pushing at all.
   for (const f of fs.readdirSync(fillDir)) {
     if (f.startsWith("2026-07-10__heart")) fs.rmSync(path.join(fillDir, f));
   }
-  // The rate limit is the only thing between here and recovery, so reach past it
-  // the way a later beat would rather than sleeping a minute in a unit test.
-  archive.__resetReconcileClock();
+  archive.__resetTotalCache();
   assert.equal(archive.archiveLimits([]).full, false,
-    "deleting archives must reopen the store from the heartbeat path");
-
-  // ...and immediately again is a no-op EVEN WITH work to do, so the sweep
-  // can't run on every beat of every host: it walks every row and stats every
-  // file. A throwaway of its own, so this can't delete a transcript a later
-  // test is asserting on.
-  archive.ingestChunk("nas", "victim", { ...META, summary: "Victim" }, 0, 30,
-    [{ uuid: "v1", role: "user", ts: "2026-07-10T00:04:00Z", text: "delete me" }]);
-  fs.rmSync(path.join(fillDir, "2026-07-10__victim__nas__victim.jsonl"));
-  assert.equal(archive.reconcileMissingFiles(), 0, "the sweep is not rate-limited");
-  archive.__resetReconcileClock();
-  assert.equal(archive.reconcileMissingFiles(), 1, "...but a later beat does see it");
+    "deleting archives must reopen the store on the heartbeat path");
+  const after = archive.ingestChunk("nas", "unblocked", { ...META, summary: "Unblocked" }, 0, 40,
+    [{ uuid: "ub1", role: "user", ts: "2026-07-10T00:06:00Z", text: "stored again" }]);
+  assert.equal(after.full, undefined);
+  assert.equal(after.bytesStored, 40);
 });
 
-test("a full store recovers through INGEST too, without a heartbeat in between", () => {
-  // The other half of the pair. An agent that never reads archiveFull (an older
-  // one) only ever learns the store reopened by pushing at it, so ingest has to
-  // reconcile on its own rather than leaning on archiveLimits having run.
-  const fillDir = path.join(process.env.ARCHIVE_DIR, "turma");
-  let n = 0;
-  while (!archive.archiveLimits([]).full && n < 60) {
-    archive.ingestChunk("nas", `ing${n}`, { ...META, summary: `Ing ${n}` }, 0, 100,
-      [{ uuid: `i${n}`, role: "user", ts: "2026-07-10T00:00:00Z", text: "z".repeat(2000) }]);
-    n++;
-  }
-  assert.ok(archive.archiveLimits([]).full);
-  for (const f of fs.readdirSync(fillDir)) {
-    if (f.startsWith("2026-07-10__ing")) fs.rmSync(path.join(fillDir, f));
-  }
-  archive.__resetReconcileClock();
-  // Straight to ingest — no archiveLimits call to do the reconciling for it.
-  const r = archive.ingestChunk("nas", "post-full", { ...META, summary: "Post Full" }, 0, 40,
-    [{ uuid: "pf1", role: "user", ts: "2026-07-10T00:03:00Z", text: "stored again" }]);
-  assert.equal(r.full, undefined, "ingest must reconcile before refusing");
-  assert.equal(r.bytesStored, 40);
+test("the ceiling engages AT the limit, not one byte past it", () => {
+  // Seeded rather than filled: landing the store on exactly ARCHIVE_TOTAL_MAX
+  // by writing files is not something a test can do reliably, and `>` in place
+  // of `>=` is otherwise invisible.
+  const max = Number(process.env.ARCHIVE_TOTAL_MAX_BYTES);
+  archive.__resetTotalCache(max - 1);
+  assert.equal(archive.archiveLimits([]).full, false);
+  archive.__resetTotalCache(max);
+  assert.equal(archive.archiveLimits([]).full, true);
+  archive.__resetTotalCache();
 });
 
 test("the shed accounting is in BYTES, not UTF-16 units", () => {
@@ -302,6 +265,29 @@ test("byteCeiling: an explicit 0 disables, a typo falls back, digits win", () =>
   assert.equal(archive.byteCeiling("", 999), 999);
   assert.equal(archive.byteCeiling(undefined, 999), 999);
   assert.equal(archive.byteCeiling("1048576", 999), 1048576);
+  // The two parsers read the SAME env var, so they must trim the same set.
+  // String.trim() strips U+FEFF and str.strip() doesn't; str.strip() strips
+  // U+0085 and U+001C-1F and String.trim() doesn't. A BOM in front of the value
+  // is an ordinary copy-paste accident, and under either default one side got a
+  // 16-BYTE ceiling while the other read 16 MiB. Both must reject both classes;
+  // the agent asserts the mirror of this in test_byte_ceiling_agrees_with_the_hub.
+  for (const odd of ["﻿16", "16", "16", " 16", "16﻿"]) {
+    assert.equal(archive.byteCeiling(odd, 999), 999, JSON.stringify(odd));
+  }
+  assert.equal(archive.byteCeiling(" \t\n16\r\n ", 999), 16);   // ASCII space still trims
+});
+
+test("the store total is cached, and the cache does expire", () => {
+  // It runs on the heartbeat path and walks every file, so it must not be paid
+  // per beat — and must not be permanent either, or a deletion never registers.
+  archive.__resetTotalCache();
+  const t0 = Date.now();
+  const first = archive.totalArchiveBytes(t0);
+  fs.writeFileSync(path.join(process.env.ARCHIVE_DIR, "turma", "cache-probe.jsonl"), "x".repeat(500));
+  assert.equal(archive.totalArchiveBytes(t0 + 1000), first, "not cached");
+  assert.equal(archive.totalArchiveBytes(t0 + 61_000), first + 500, "cache never expires");
+  fs.rmSync(path.join(process.env.ARCHIVE_DIR, "turma", "cache-probe.jsonl"));
+  archive.__resetTotalCache();
 });
 
 test("archiveLimits is what the heartbeat reply is built from, present AND absent", () => {
@@ -313,23 +299,19 @@ test("archiveLimits is what the heartbeat reply is built from, present AND absen
   assert.deepEqual(archive.archiveLimits([]).shed, []);
 });
 
-test("a full store stops storing, and says so instead of erroring", () => {
-  // Fill past the 40000-byte ceiling with ordinary prose (nothing sheddable).
-  let n = 0;
-  while (!archive.archiveLimits([]).full && n < 50) {
-    archive.ingestChunk("nas", `fill${n}`, { ...META, summary: `Fill ${n}` }, 0, 100,
-      [{ uuid: `f${n}`, role: "user", ts: "2026-07-10T00:00:00Z", text: "x".repeat(2000) }]);
-    n++;
-  }
-  assert.ok(n < 50, "the store ceiling never engaged");
-
+test("a refusal preserves the transcript's real cursor, so the agent realigns", () => {
+  // The refusal must hand back what we actually hold for THAT transcript, not a
+  // zero: the agent's stop condition is "no forward progress", and a bogus
+  // cursor would make it re-push from the wrong offset once the store reopens.
   const before = archive.getTranscript("small").entries.length;
-  const r = archive.ingestChunk("nas", "small", { ...META, summary: "Small" }, 50, 90,
+  const have = 50;   // where the first test in this file left "small"
+  archive.__resetTotalCache(Number(process.env.ARCHIVE_TOTAL_MAX_BYTES));
+  const r = archive.ingestChunk("nas", "small", { ...META, summary: "Small" }, have, have + 40,
     [{ uuid: "s2", role: "user", ts: "2026-07-10T00:00:00Z", text: "after the ceiling" }]);
-  // Reported as no forward progress (the agent's own stop condition) plus an
-  // explicit flag — never a rejection it would retry forever, which is the
-  // failure mode XERK-255 documented.
-  assert.equal(r.bytesStored, 50);
+  archive.__resetTotalCache();
+  // Never a rejection it would retry forever, which is the failure mode
+  // XERK-255 documented.
+  assert.equal(r.bytesStored, have);
   assert.equal(r.full, true);
   assert.equal(archive.getTranscript("small").entries.length, before);
 });

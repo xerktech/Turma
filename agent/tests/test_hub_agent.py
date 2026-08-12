@@ -11268,6 +11268,14 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         # Past 2**53-1 the hub's Number.isSafeInteger refuses; agree with it.
         self.assertEqual(ha._byte_ceiling(str((1 << 53) - 1), 999), (1 << 53) - 1)
         self.assertEqual(ha._byte_ceiling(str(1 << 53), 999), 999)
+        # The two parsers read the SAME env var, so they must trim the same set.
+        # str.strip() strips U+0085 and U+001C-1F where JS's String.trim() does
+        # not, and String.trim() strips U+FEFF where str.strip() does not — so
+        # under either default a BOM'd value gave one side a 16-BYTE ceiling
+        # while the other read 16 MiB. Mirrors the hub's byteCeiling case.
+        for odd in ("﻿16", "\x8516", "\x1c16", "\x8516\x85", "16﻿"):
+            self.assertEqual(ha._byte_ceiling(odd, 999), 999, repr(odd))
+        self.assertEqual(ha._byte_ceiling(" \t\n16\r\n ", 999), 16)  # ASCII still trims
 
     def test_payload_bytes_are_utf8_bytes_not_code_points(self):
         # The budget is named in bytes and the hub spends it in bytes; counting
