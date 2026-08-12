@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -67,6 +68,13 @@ fun SpawnDialog(
     var mode by remember { mutableStateOf("auto") }
     var modelSource by remember { mutableStateOf(ModelSource.SUBSCRIPTION) }
     val sourceOpts = remember(localModel) { ModelSource.options(localModel) }
+    // Never keep a choice the operator can no longer see. If the host stops
+    // reporting a local model while the composer is open, the "Run against" row
+    // disappears — and a `local` left behind in state would spawn into a
+    // guaranteed 409 with nothing on screen explaining it or able to change it.
+    LaunchedEffect(localModel?.available) {
+        if (!ModelSource.composerOffers(localModel)) modelSource = ModelSource.SUBSCRIPTION
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,

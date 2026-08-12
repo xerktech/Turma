@@ -383,14 +383,28 @@ started `-read-only`, which is why you cannot simply reuse the shared one.
   compose-bar chips reflow as their labels change width. Match `content-desc`
   where there is one, and **match exactly** — a substring `Sessions` hits
   `RUNNING SESSIONS` first. Snackbars live ~3s, so poll at t+2s.
+  - **But budget 30–60s per dump when a second emulator is running** — it waits
+    for window idle and the ~1s fleet beat keeps repainting, so a scripted walk
+    of six screens can take 20 minutes and looks hung. `exec-out screencap -p`
+    costs ~2s and never blocks: drive from fixed coordinates read off one
+    screenshot, and spend a dump only where you need `content-desc`.
+  - A `content-desc` containing a `"` is emitted in SINGLE quotes, so
+    `grep 'content-desc="…'` misses it. Grep the value, not the attribute.
+  - **A row that appears/disappears reflows the buttons under it.** Hiding the
+    composer's "Run against" row moved `Spawn` up ~100px, and the stale
+    coordinate hit dead space — re-screenshot after any state change that can
+    add or drop a field.
 - `ExposedDropdownMenuBox` opens on its **trailing caret**, not the field body.
 - A destructive row **arms and re-disarms**: `Kill` becomes `Confirm kill` and
   reverts in ~2s, so the two taps must be one `adb shell "input tap …; sleep
   0.4; input tap …"`. A dump between them loses the arm.
-- **`SessionsScreen` collects no `messages`**, so every action driven from it
-  (spawn, kill, rename) is silent whatever the hub answered; `FleetScreen`,
-  `ChatScreen` and `BoardScreen` do collect. Drive error-wording checks from the
-  Dashboard or the chat, never the session list.
+- **Every list/chat screen collects the VM's `messages` into a snackbar** —
+  `SessionsListPane` (its own `SnackbarHost`, bottom of the pane; in the wide
+  two-pane layout that is inside the 360dp list column), `FleetScreen`,
+  `ChatScreen`, and `BoardScreen`/`OrgControl` as toasts. So an error-wording
+  check can be driven from any of them. Measured: a refused local spawn from the
+  session list reads `✗ host has no local model configured`, a good one
+  `✓ session queued`.
 - **XML-illegal characters in the payload make `uiautomator dump` die** —
   a 0-byte file, and every tap resolved from it misses, while the app itself
   renders the string fine. THREE classes do it, all measured on emulator-5556:
@@ -436,6 +450,11 @@ and point the app at `http://10.0.2.2:<port>`.
   one keeps serving — so the whole A/B runs against the unmutated code and reads
   as "no difference". Match `argv[0] == "node"`, skip your own PID's ancestry
   (`scratchpad/qa8/killrig.py`), and assert the port is free before restarting.
+  The tell is subtler than a dead rig: the NEW rig keeps beating happily into the
+  OLD rig's server, so any control your new rig added (an env var, a file toggle)
+  silently does nothing and the app looks like it ignored the change. `ps -eo
+  pid,lstart,args | grep "[r]ig.js"` must show exactly ONE before you believe a
+  negative result.
 - **Refuse `/api/events` at the proxy to see what a decode failure really
   costs.** With SSE healthy a bad host loses only itself (per-agent events
   decode in `runCatching`); poll-only, the whole fleet is replaced by the raw
@@ -725,13 +744,25 @@ act on every time.
   host-level block Android types (`capacity`, `github`, `models`, `jira`,
   `claudeAuth`, `closedSessions`, …) and every other per-session field (`prs`,
   `id`, …), where an object or array throws for the WHOLE `/api/agents` array.
-  `normalizeSessions` DROPS a non-object element (`sessions:[null]` used to hide
-  that host from the phone, and the whole SCREEN with SSE also down), but a
-  non-array `sessions` is deliberately left alone: this runs BEFORE the
-  `AGENT_RECORD_MAX` check, so rewriting it would erase the amplifier that check
-  exists to refuse. **A coercion here may only ever SHRINK a record** — that is
-  the rule to hold a new one against. Verify by probing, not by reading any doc:
-  this list has been wrong in `CLAUDE.md` and here more than once.
+  `normalizeSessions` DROPS a non-object element and REWRITES a non-array
+  `sessions` to `[]` (both used to hide that host from the phone — and the
+  non-array one stopped the app signing in at all, see below).
+  **`normalizeRecord` runs PAST the `AGENT_RECORD_MAX` gate**, which is what
+  makes rewriting safe: placed before it, a coercion shrinks away the very
+  amplifier the gate exists to refuse (an 8 MiB string `sessions` rewritten to
+  `[]` turned a 413 into a 200) and walks an oversized record field by field
+  before throwing it out — which is how a 24 MiB model name reached a
+  per-code-point spread and OOM-killed the hub. So: **anything running before
+  the gate may only SHRINK; put a rewrite after it.** `sanitizeHeartbeat` is
+  pre-gate and is held to the shrink-only half.
+  - Measure what an uncoerced field costs before calling it acceptable. A host
+    with `sessions:"x"` does not merely vanish: the phone **cannot sign in at
+    all**, reporting `Could not reach the hub — check the URL`, because the
+    login probe decodes `/api/agents`. A/B it by dropping the bad host and
+    re-pressing Sign in. (That one is coerced as of XERK-246; the point is the
+    method — the cost of an uncoerced field is rarely the one you assume.)
+  Verify by probing, not by reading any doc: this list has been wrong in
+  `CLAUDE.md` and here more than once.
 - **Check the state.json RESTORE, not just the ingest path**, and check it
   against the LIST above rather than against what the loader looks like it does.
   A hub restart is when a new coercion ships and the restore is the first thing
@@ -780,25 +811,40 @@ Mutation-testing mechanics, since a broken harness reads as a passing one:
 
 - Force the tests to actually run (`--rerun`, or `--rerun-tasks` in the
   container) — an `UP-TO-DATE`/`FROM-CACHE` result makes every mutation "caught".
+- **Run a mutation the way CI runs the suite, and run it more than once.** A
+  guard asserted as a TIME or `heapUsed` budget is order-dependent: whether the
+  GC ran just before the measurement decides the number. `node --test
+  turma/tests/server.test.js` caught the un-bounded-spread mutation 5 times in 8
+  identical runs and MISSED it 3 — alone (`--test-name-pattern`) it failed every
+  time. A single green run against a mutation proves nothing; a resource budget
+  needs a margin of ~10x, not ~1.02x (measured 51ms against a 50ms limit and
+  71MB against 64MB).
 - `git checkout -- <path>` resolves relative to the `-C` root, not your cwd. A
   silently failed revert leaves the previous mutation in the tree and the NEXT
   one then reads as caught. Verify with `git status` after every revert, and
   mutate a scratch copy rather than the repo.
 - On `android/`, expect roughly HALF the battery to survive, and not at random:
-  58 mutations over XERK-246 left 28 alive, all in the same three places —
-  **Composable bodies** (17: `ChatScreen.kt`, `FleetDialogs.kt` and the two
-  `SpawnDialog` call sites, no instrumented source set), **ViewModel call sites**
-  (10: `ChatViewModel.kt`, `FleetViewModel.kt`, no Robolectric or coroutine-test
-  harness), and **`@Serializable` field defaults** (1) that no fixture exercises.
-  A pure `core/` rule with a test is gated; the CALL to it is not, and neither is
-  which value a Composable passes it. Judge an Android change on where its rule
-  lives, and quote the survivor count rather than "a few".
-- A hub-side rule genuinely is gated by comparison, but not completely: 24
-  mutations over `turma/server.js`'s coercion path left **3** alive — an
-  `Array.isArray` guard nothing feeds a non-array to, a NEW late-declared `const`
-  on the restore path (the TDZ class again, which the hand-written line-order
-  assert cannot see), and the restore body simply throwing. The asymmetry with
-  Android is real; "0 escapes" usually means the battery was too small.
+  60 mutations over XERK-246 left 30 alive, all in the same three places —
+  **Composable bodies** (19: `ChatScreen.kt`, `FleetDialogs.kt`, the two
+  `SpawnDialog` call sites, and `SessionsListPane`'s snackbar collector + host,
+  no instrumented source set), **ViewModel call sites** (10: `ChatViewModel.kt`,
+  `FleetViewModel.kt`, no Robolectric or coroutine-test harness), and
+  **`@Serializable` field defaults** (1) that no fixture exercises. A pure
+  `core/` rule with a test is gated; the CALL to it is not, and neither is which
+  value a Composable passes it. Spot-checked independently: 3/3 `core/` mutations
+  caught, 9/9 VM-call-site and Composable-body mutations escaped. Judge an
+  Android change on where its rule lives, and quote the survivor count rather
+  than "a few".
+- A hub-side rule genuinely is gated by comparison. Over `turma/server.js`'s
+  coercion path a 12-mutation battery is now caught 12/12 by `server.test.js` —
+  including the TDZ one (the behavioural child-process restore test sees it) and
+  the un-bounded spread, whose guard pairs a structural assertion with a
+  resource budget precisely because the budget alone was flaky. `sessions:{a:1}`
+  (any non-iterable) used to make `normalizeUsage`'s `for…of` throw and abort the
+  whole restore into its own `catch {}` with `loaded N agents` never printing;
+  `normalizeSessions` now runs first and rewrites it. The asymmetry with Android
+  is structural, not effort: "0 escapes" on a UI layer usually means the battery
+  was too small, while on the hub it means the tests are real.
 - `gradle --no-daemon --offline :app:testDebugUnitTest --rerun` is ~13s per
   mutation once the first compile is warm, so a 50-mutation battery is ~12
   minutes; run it in the background and do UI work meanwhile (the emulator does

@@ -6551,9 +6551,16 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   const loader = src.slice(src.indexOf("agents = JSON.parse"), src.indexOf("first boot or no volume"));
   assert.ok(/normalizeRecord\(a\)/.test(loader),
     "the state.json restore must go through normalizeRecord, like the ingest path");
-  const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'), src.indexOf("const key = payload.device"));
-  assert.ok(/normalizeRecord\(payload\)/.test(ingest),
+  const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
+    src.indexOf("ingestHistory(next, historyResults)"));
+  assert.ok(/normalizeRecord\(next\)/.test(ingest),
     "the heartbeat ingest must go through the same normalizeRecord");
+  // ...and AFTER the ceiling, never before: coercing first shrinks away the
+  // amplifier the ceiling exists to refuse (an 8 MiB string `sessions` became
+  // `[]` and the beat 200'd), and walks an oversized record field by field
+  // before throwing it out — which is how a 24 MiB name reached a spread.
+  assert.ok(ingest.indexOf("recordSize > AGENT_RECORD_MAX") < ingest.indexOf("normalizeRecord(next)"),
+    "normalizeRecord must run past the AGENT_RECORD_MAX gate, not before it");
 });
 
 test("the restore actually RUNS — it must not throw into its own catch", () => {
@@ -6609,20 +6616,28 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
 });
 
 test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
-  // `[...s]` allocates per code point over the WHOLE string, and this runs
-  // before the AGENT_RECORD_MAX check — so an unbounded spread let one
-  // agent-authed heartbeat with a 24 MiB name OOM-kill the hub at its deployed
-  // `mem_limit: 256m`, on repeat. Held as a time+memory budget rather than by
-  // reading the source, so any rewrite that reintroduces the spread fails.
-  const huge = { device: "h", localModel: { available: true, model: "x".repeat(8 << 20) } };
-  const before = process.memoryUsage().heapUsed;
+  // `[...s]` allocates per code point over the WHOLE string, so an unbounded
+  // spread let one agent-authed heartbeat with a 24 MiB name OOM-kill the hub
+  // at its deployed `mem_limit: 256m`, on repeat.
+  //
+  // Two assertions, because neither is sufficient alone. A RESOURCE BUDGET is
+  // the honest behavioural check but is nondeterministic at close margins — an
+  // earlier version used 8 MiB against 50ms/64MB and caught the reintroduced
+  // bug only 5 runs in 8, decided by whether a GC landed between the samples.
+  // So the budget runs at 32 MiB (`HEARTBEAT_MAX`, the largest a beat can carry)
+  // with ~10x headroom, and a STRUCTURAL assertion holds the ordering exactly.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const spread = src.slice(src.indexOf("const name = typeof lm.model"), src.indexOf(".slice(0, 60)"));
+  assert.match(spread, /\[\.\.\.lm\.model\.slice\(/,
+    "the model name must be bounded BEFORE the per-code-point spread");
+
+  const huge = { device: "h", localModel: { available: true, model: "x".repeat(32 << 20) } };
   const t0 = process.hrtime.bigint();
   hub.normalizeRecord(huge);
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-  const grewMb = (process.memoryUsage().heapUsed - before) / (1 << 20);
   assert.equal(huge.localModel.model, "x".repeat(60));
-  assert.ok(ms < 50, `coercing an 8 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
-  assert.ok(grewMb < 64, `coercing an 8 MiB name grew the heap ${grewMb.toFixed(0)}MB`);
+  // Bounded: ~0.1ms. Unbounded at this size: several hundred ms and ~600 MB.
+  assert.ok(ms < 60, `coercing a 32 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
 });
 
 test("normalizeSessions coerces the per-session fields Android types", () => {

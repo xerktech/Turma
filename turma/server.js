@@ -1811,7 +1811,19 @@ function sanitizeHeartbeat(payload, key) {
   // session's live agent rows come from a pane scrape and are re-shaped and
   // bounded here for the same reason the `turn` frame's are — the clients turn
   // this list into a count and a label, and nothing else bounds it.
-  normalizeSessions(payload);
+  // Pre-ceiling, so this may only ever SHRINK (see normalizeRecord, which runs
+  // past the gate and is free to rewrite). Live agent rows come from a pane
+  // scrape and are re-shaped and bounded here for the same reason the `turn`
+  // frame's are — clients turn this list into a count and a label, and nothing
+  // else bounds it.
+  if (Array.isArray(payload.sessions)) {
+    for (const s of payload.sessions) {
+      const live = s && typeof s === "object" ? s.session : null;
+      if (live && typeof live === "object" && "agents" in live) {
+        live.agents = sanitizeLiveAgents(live.agents) || [];
+      }
+    }
+  }
   return payload;
 }
 
@@ -1829,10 +1841,13 @@ function sanitizeHeartbeat(payload, key) {
  * host silently disappears from that phone.
  */
 function normalizeRecord(a) {
+  // Sessions FIRST: normalizeUsage iterates `payload.sessions || []`, so a
+  // non-iterable `sessions` throws there — and on the restore path that throw
+  // lands in a silent `catch {}` and abandons the whole record half-coerced.
+  normalizeSessions(a);
   normalizeUsage(a);
   normalizeLimits(a);
   normalizeLocalModel(a);
-  normalizeSessions(a);
 }
 
 // The per-SESSION coercions (see normalizeRecord).
@@ -1845,13 +1860,17 @@ function normalizeRecord(a) {
 // which is why `modelSource`/`modelSourceAt` are here from the commit that
 // declared them on `SessionInfo`.
 function normalizeSessions(payload) {
-  // A non-array `sessions` is left ALONE, deliberately. It is decode-fatal on
-  // Android, but rewriting it here would erase the amplifier that
-  // AGENT_RECORD_MAX exists to refuse — this runs before that check, so a
-  // `sessions` of 8 MiB of "A" would be quietly turned into `[]` and the beat
-  // would 200 instead of 413 (XERK-235's guard, caught by "an oversized record
-  // is refused"). Coercions here may only ever SHRINK a record.
-  if (!Array.isArray(payload?.sessions)) return;
+  if (!payload || typeof payload !== "object") return;
+  // A non-array `sessions` is REWRITTEN, not skipped. It is decode-fatal on
+  // Android — measured as the app failing to sign in at all, reporting "Could
+  // not reach the hub" — and on the restore path it also throws out of
+  // normalizeUsage's `for … of`, silently abandoning the record. Rewriting is
+  // safe only because this now runs PAST the AGENT_RECORD_MAX gate: doing it
+  // before would have erased the amplifier that gate exists to refuse.
+  if (!Array.isArray(payload.sessions)) {
+    if ("sessions" in payload) payload.sessions = [];
+    return;
+  }
   // DROP a non-object element, never skip past it: `sessions` is typed
   // `List<SessionInfo>` on Android, so a `null` or a bare string in the array is
   // as fatal as a wrong-typed field inside one — measured as a host silently
@@ -3538,11 +3557,6 @@ const server = http.createServer(async (req, res) => {
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
-      // One shared coercion, also applied on the state.json restore — see
-      // normalizeRecord. sanitizeHeartbeat above has already run the per-session
-      // half; running it again is idempotent and keeps this one call the answer
-      // to "what does a record get coerced by".
-      normalizeRecord(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.
@@ -3662,6 +3676,15 @@ const server = http.createServer(async (req, res) => {
         );
         return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
       }
+      // Coerce AFTER the ceiling, never before. Coercing first let the
+      // amplifier the ceiling exists to refuse be quietly shrunk away — an
+      // 8 MiB string `sessions` rewritten to `[]` turned a 413 into a 200 — and
+      // it also meant an oversized beat was walked field-by-field before being
+      // thrown out, which is how a 24 MiB model name reached a per-code-point
+      // spread and OOM-killed the hub. Past the gate the record is bounded, so
+      // a coercion here is free to REWRITE rather than only shrink. Same
+      // function the state.json restore calls (normalizeRecord).
+      normalizeRecord(next);
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
