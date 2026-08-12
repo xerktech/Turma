@@ -1849,6 +1849,10 @@ let bodyInflightBytes = 0;
 // Whether the big-body lane below is occupied. At most one body at a time may
 // exceed the shared budget.
 let bigLaneTaken = false;
+// Charged to the big lane, kept OUT of `bodyInflightBytes` on purpose — see
+// chargeBody. Tracked for reporting; the lane's real bound is the per-request
+// cap plus the fact that only one body may hold it.
+let bigLaneBytes = 0;
 
 /**
  * Which lane a body of `n` budget units may use right now, or null to refuse.
@@ -1882,8 +1886,12 @@ function bodyLaneFor(n) {
  * more than half spent — the two states in which one body holding on actually
  * costs another body its turn.
  */
-function budgetUnderPressure() {
-  return bigLaneTaken || bodyInflightBytes * 2 > BODY_INFLIGHT_TOTAL_MAX;
+function budgetUnderPressure(lane) {
+  // The big lane is EXCLUSIVE, so a body sitting in it blocks the next large
+  // body however much room the shared budget has. A stall there is contention
+  // by definition.
+  if (lane === "big") return true;
+  return bodyInflightBytes * 2 > BODY_INFLIGHT_TOTAL_MAX;
 }
 
 /**
@@ -1928,7 +1936,22 @@ function laneForCharge(lane, delta) {
  * charge the moment it passed the shared budget.
  */
 function chargeBody(n, lane) {
-  if (lane === "big") bigLaneTaken = true;
+  // **The lanes are accounted SEPARATELY, and that is the whole point of having
+  // lanes.** Billing the big body to the shared budget made merely OCCUPYING
+  // the lane a total outage: its own charge exceeds the budget, so every other
+  // body — a 200-byte heartbeat, the operator's own login — was refused 503
+  // behind it, and one authenticated socket could hold the fleet's control
+  // plane offline for about 29 kbit/s.
+  //
+  // Kept apart, a big body costs the shared lane nothing: occupying the lane
+  // delays other LARGE bodies, which is what an exclusive lane means, and
+  // ordinary traffic never notices. The hub's ceiling is unchanged either way —
+  // one max-size body plus the shared budget, which is what it is sized for.
+  if (lane === "big") {
+    bigLaneTaken = true;
+    bigLaneBytes += n;
+    return;
+  }
   bodyInflightBytes += n;
 }
 
@@ -1956,15 +1979,21 @@ const BODY_PARSE_COST = 3;
  * hub down just as surely as the OOM this replaced, only more quietly.
  */
 function releaseBody(n, lane) {
+  // Freeing the lane is the half that must never be missed — leaked, the hub
+  // refuses every large body for the rest of its life.
+  if (lane === "big") {
+    bigLaneBytes -= n;
+    if (bigLaneBytes < 0) bigLaneBytes = 0;
+    bigLaneTaken = false;
+    return;
+  }
   bodyInflightBytes -= n;
   // Belt and braces: a double release would drive this negative, which would
   // hand the shared lane more room than the container has.
   if (bodyInflightBytes < 0) bodyInflightBytes = 0;
-  // Freeing the big lane is the half that must never be missed — leaked, the
-  // hub refuses every large body for the rest of its life.
-  if (lane === "big") bigLaneTaken = false;
 }
-const bodyInflightHeld = () => bodyInflightBytes;
+// Everything held right now, BOTH lanes — what a test or a log wants to see.
+const bodyInflightHeld = () => bodyInflightBytes + bigLaneBytes;
 
 // Collect a request body as a string. Past `cap` it keeps DRAINING for a while
 // rather than destroying the socket: draining is what lets the route write a
@@ -1981,6 +2010,7 @@ function readBody(req, cap = BODY_MAX) {
     // a charge that outlives its buffer would ratchet the budget shut.
     let held = 0;
     let lane = null; // decided on the first charge, held for the whole read
+    let bigLaneSince = 0; // when this read took the exclusive lane, if it has
     let draining = false; // holds one of the DRAIN_CONCURRENCY_MAX slots
     const costOf = (bytes) => bytes * BODY_PARSE_COST;
     // How far past the refusal point we keep draining before cutting the socket.
@@ -2016,7 +2046,7 @@ function readBody(req, cap = BODY_MAX) {
         // bad link holds a few hundred KB of a 64 MiB budget and monopolizes
         // nothing. Under pressure the non-progressing reads are exactly the
         // ones that should give way.
-        if (!budgetUnderPressure()) return armIdle();
+        if (!budgetUnderPressure(lane)) return armIdle();
         over = true;
         release();
         reject(new BodyStalled());
@@ -2096,9 +2126,14 @@ function readBody(req, cap = BODY_MAX) {
       if (want > held) {
         const next = laneForCharge(lane, want - held);
         if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        if (lane !== "big" && next === "big") bigLaneSince = Date.now();
         lane = next;
         chargeBody(want - held, lane);
         held = want;
+        // Held the exclusive lane too long, however well-behaved: see
+        // BIG_LANE_MAX_HOLD_MS for why progress alone cannot bound this.
+        if (lane === "big" && Date.now() - bigLaneSince > BIG_LANE_MAX_HOLD_MS)
+          return refuse(new BodyStalled(), len);
         if (!progressNeeded || len - progressMark >= progressNeeded) armIdle();
       }
       data += c;
@@ -2170,6 +2205,20 @@ const BODY_IDLE_TIMEOUT_MS = Number(process.env.BODY_IDLE_TIMEOUT_MS) || 20 * 10
 const BODY_MIN_PROGRESS_BYTES =
   Number(process.env.BODY_MIN_PROGRESS_BYTES) || 64 << 10; // 64 KiB per window
 
+// The longest any ONE body may occupy the exclusive big lane, however well it
+// behaves. The progress floor cannot close this on its own: a body dribbling AT
+// the floor is byte-for-byte indistinguishable from a legitimate slow migration
+// at the same rate, so no rate threshold separates them and raising the floor
+// only moves the price. This is the orthogonal bound — not "are you making
+// progress" but "you have had the lane long enough".
+//
+// Generous on purpose: a 65 MiB migration bundle (MIGRATE_BLOB_MAX, the largest
+// legitimate body) clears this at ~110 KiB/s, far below what a LAN or the tunnel
+// does, and the agent retries a reset anyway. What it denies is the indefinite
+// hold — an attacker must re-establish rather than sit there forever.
+const BIG_LANE_MAX_HOLD_MS =
+  Number(process.env.BIG_LANE_MAX_HOLD_MS) || 10 * 60 * 1000;
+
 // Thrown when a body holding budget stops arriving. Its socket is destroyed —
 // a caller that stopped mid-body is not waiting to read a status, and by this
 // point it is holding room the rest of the fleet needs.
@@ -2194,6 +2243,7 @@ function readRawBody(req, cap) {
     // in step, or the budget bounds only half of what the hub buffers.
     let held = 0;
     let lane = null;
+    let bigLaneSince = 0;
     let draining = false;
     let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
     const release = () => { releaseBody(held, lane); held = 0; lane = null; };
@@ -2222,7 +2272,7 @@ function readRawBody(req, cap) {
         // bad link holds a few hundred KB of a 64 MiB budget and monopolizes
         // nothing. Under pressure the non-progressing reads are exactly the
         // ones that should give way.
-        if (!budgetUnderPressure()) return armIdle();
+        if (!budgetUnderPressure(lane)) return armIdle();
         over = true;
         release();
         reject(new BodyStalled());
@@ -2277,9 +2327,14 @@ function readRawBody(req, cap) {
       if (len > held) {
         const next = laneForCharge(lane, len - held);
         if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        if (lane !== "big" && next === "big") bigLaneSince = Date.now();
         lane = next;
         chargeBody(len - held, lane);
         held = len;
+        // Held the exclusive lane too long, however well-behaved: see
+        // BIG_LANE_MAX_HOLD_MS for why progress alone cannot bound this.
+        if (lane === "big" && Date.now() - bigLaneSince > BIG_LANE_MAX_HOLD_MS)
+          return refuse(new BodyStalled(), len);
         if (!progressNeeded || len - progressMark >= progressNeeded) armIdle();
       }
       chunks.push(c);
@@ -5738,6 +5793,7 @@ if (process.env.TURMA_TEST) {
     MEMORY_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
     bodyLaneFor, chargeBody, releaseBody, bodyInflightHeld, BODY_PARSE_COST,
     DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
+    BIG_LANE_MAX_HOLD_MS, budgetUnderPressure,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,

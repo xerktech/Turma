@@ -39,6 +39,8 @@ process.env.CREATE_INFLIGHT_TTL_MS = "300";
 // Same trick for the stalled-body reclaim (XERK-258): the fleet gives a body
 // holding budget 20s of silence, which is only testable wound down.
 process.env.BODY_IDLE_TIMEOUT_MS = "400";
+// And the exclusive-lane occupancy ceiling, which the fleet gives 10 minutes.
+process.env.BIG_LANE_MAX_HOLD_MS = "3000";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
@@ -6551,12 +6553,19 @@ test("budget: one big body may exceed the budget, and exactly one", async () => 
 
     // ...but only one at a time, and the shared lane is now full too.
     assert.equal(hub.bodyLaneFor(total * 2), null, "a second big body must be refused");
-    assert.equal(hub.bodyLaneFor(1), null, "the shared lane is over budget as well");
+    // ...and the SHARED lane is untouched by it. The lanes are accounted
+    // separately, which is what stopped one big body from refusing every tiny
+    // one: billed to the shared budget, merely holding the lane refused a
+    // 200-byte heartbeat and the operator's own login, a total outage for
+    // ~29 kbit/s.
+    assert.equal(hub.bodyLaneFor(1), "shared", "ordinary traffic must flow past it");
 
     hub.releaseBody(total * 2, "big");
     assert.equal(hub.bodyLaneFor(total * 2), "big", "the lane frees for the next one");
   } finally {
-    hub.releaseBody(hub.bodyInflightHeld(), "big");
+    // Each lane is given back on its own; bodyInflightHeld() sums both, so it
+    // cannot be handed to a single release.
+    hub.releaseBody(4096, "shared");
   }
   assert.equal(hub.bodyInflightHeld(), 0, "every charge must be given back");
 });
@@ -6573,7 +6582,7 @@ test("budget: ordinary bodies share the budget until it is full", async () => {
     assert.equal(hub.bodyLaneFor(total), "big");
     assert.ok(hub.bodyInflightHeld() <= total, "the shared lane never exceeds the budget");
   } finally {
-    hub.releaseBody(hub.bodyInflightHeld(), null);
+    hub.releaseBody(hub.bodyInflightHeld(), "shared");
   }
   assert.equal(hub.bodyInflightHeld(), 0);
 });
@@ -6591,7 +6600,7 @@ test("budget: a leaked big lane would refuse every large body forever", async ()
 test("budget: a release can never drive the held total negative", async () => {
   // A double release would read as "idle" and silently disable the budget --
   // the same OOM again, only with the guard apparently in place.
-  hub.releaseBody(1 << 30, null);
+  hub.releaseBody(1 << 30, "shared");
   assert.equal(hub.bodyInflightHeld(), 0);
 });
 
@@ -6613,7 +6622,8 @@ test("http: a request over the budget is refused 503, not 413", async () => {
     assert.match(res.body.error, /busy/i);
     assert.equal(res.body.limit, hub.BODY_INFLIGHT_TOTAL_MAX);
   } finally {
-    hub.releaseBody(hub.bodyInflightHeld(), "big");
+    hub.releaseBody(hub.BODY_INFLIGHT_TOTAL_MAX, "shared");
+    hub.releaseBody(1, "big");
   }
   // And with the budget clear again the very same beat succeeds -- the refusal
   // was transient, which is exactly what the 503 promised.
@@ -6718,7 +6728,7 @@ test("http: a large LEGAL body is admitted while other traffic is in flight", as
     });
     assert.equal(res.status, 200, "a body within HEARTBEAT_MAX must not be refused");
   } finally {
-    hub.releaseBody(hub.bodyInflightHeld(), null);
+    hub.releaseBody(hub.bodyInflightHeld(), "shared");
   }
   assert.equal(hub.bodyInflightHeld(), 0);
 });
@@ -6766,10 +6776,13 @@ test("drain: only so many refused bodies may drain at once", async () => {
 // here they are host-RAM-sized, so pressure has to be staged rather than assumed.
 function withBudgetPressure(fn) {
   return async () => {
-    // Occupy the LANE, not the budget: pressure must still leave room for the
-    // body under test to be admitted, or it is refused 503 and never charged.
-    hub.chargeBody(1, "big");
-    try { await fn(); } finally { hub.releaseBody(hub.bodyInflightHeld(), "big"); }
+    // Contend the SHARED budget, since the lanes are accounted separately now:
+    // occupying the big lane no longer pressures shared-lane reads (that
+    // separation is what stopped one big body from refusing every tiny one).
+    // Just over half, so the body under test is still admitted.
+    const stage = Math.floor(hub.BODY_INFLIGHT_TOTAL_MAX / 2) + 1;
+    hub.chargeBody(stage, "shared");
+    try { await fn(); } finally { hub.releaseBody(stage, "shared"); }
   };
 }
 
@@ -6870,6 +6883,11 @@ test("budget: with room to spare, a slow body is NOT reclaimed", async () => {
   // a bad link holds a few hundred KB of a 64 MiB budget -- it monopolizes
   // nothing, and dropping it would break a legitimate call to protect capacity
   // that was never scarce. Reclaiming is for contention, not for slowness.
+  // The previous test's socket teardown is asynchronous, so settle first —
+  // this case is specifically about an idle hub and must actually start on one.
+  for (let i = 0; i < 50 && hub.bodyInflightHeld() > 0; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
   assert.equal(hub.bodyInflightHeld(), 0, "this one runs on an UNcontended hub");
   const sock = net.connect(server.address().port, "127.0.0.1");
   try {
@@ -6891,4 +6909,68 @@ test("budget: with room to spare, a slow body is NOT reclaimed", async () => {
   }
   await new Promise((r) => setTimeout(r, 150));
   assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("budget: holding the big lane does not starve ordinary traffic", async () => {
+  // Billed to the shared budget, merely OCCUPYING the exclusive lane was a total
+  // outage: the big body's own charge exceeds the budget, so a 200-byte
+  // heartbeat and the operator's own login were refused 503 behind it -- one
+  // authenticated socket holding the fleet's control plane down for ~29 kbit/s.
+  // Accounted separately, it delays only other LARGE bodies.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  try {
+    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX * 2, "big");
+    assert.equal(hub.bodyLaneFor(1), "shared", "a tiny body still has its lane");
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "unstarved" }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200, "ordinary traffic must flow past a held big lane");
+    // Another LARGE body is what legitimately waits.
+    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), null);
+  } finally {
+    hub.releaseBody(hub.BODY_INFLIGHT_TOTAL_MAX * 2, "big");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("budget: the big lane cannot be held past its occupancy ceiling", async () => {
+  // The progress floor cannot close this on its own: a body dribbling AT the
+  // floor is byte-for-byte indistinguishable from a legitimate slow migration at
+  // the same rate, so no rate threshold separates them. This is the orthogonal
+  // bound -- not "are you making progress" but "you have had the lane long
+  // enough" -- and it is what stops an indefinite hold.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  let pump = null;
+  // Fill the shared lane so a modest body is pushed into the big one. The suite
+  // does not run in a container, where the budget is container-sized; here it is
+  // host-RAM-sized and nothing reasonable would reach the lane on its own.
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - (1 << 20);
+  hub.chargeBody(stage, "shared");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    const warm = 512 * 1024; // costs 1.5 MiB — past the 1 MiB left in shared
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        `{"device":"lanehog","pad":"${"h".repeat(warm)}`
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), null,
+      "it is holding the lane");
+    pump = setInterval(() => {
+      try { sock.write("h".repeat(hub.BODY_MIN_PROGRESS_BYTES * 2)); } catch {}
+    }, Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 2)));
+
+    const deadline = Date.now() + hub.BIG_LANE_MAX_HOLD_MS + 4000;
+    while (hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2) === null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), "big",
+      "paying the floor rate must not buy the lane forever");
+  } finally {
+    if (pump) clearInterval(pump);
+    sock.destroy();
+    hub.releaseBody(stage, "shared");
+  }
 });

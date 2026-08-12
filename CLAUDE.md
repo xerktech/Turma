@@ -291,10 +291,19 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
       enough; a dribble is neither silent nor slow.
     - The floor gives way to what the body has LEFT, so a nearly-complete upload is never reclaimed
       over its last bytes. That is not exploitable: holding a big charge needs a large remainder.
-    - **Reclaim fires only under CONTENTION** (`budgetUnderPressure`: the big lane taken, or the
-      shared budget over half spent). It relieves scarcity, so with room to spare a slow caller is
-      left alone — a small request over a bad link holds a few hundred KB of a 64 MiB budget and
-      monopolizes nothing, and dropping it would be a pure false positive.
+    - **Reclaim fires only under CONTENTION** (`budgetUnderPressure`), judged PER LANE: the shared
+      budget over half spent, or — for a big-lane body — always, since that lane is exclusive. With
+      room to spare a slow caller is left alone; dropping it would be a pure false positive.
+  - **The two lanes are accounted SEPARATELY**, and that is the point of having lanes. Billed to the
+    shared budget, merely OCCUPYING the big lane was a TOTAL outage — the big body's own charge
+    exceeds the budget, so a 200-byte heartbeat and the operator's own login were refused behind it,
+    one authenticated socket holding the control plane down for ~29 kbit/s. Kept apart, a big body
+    delays only other LARGE bodies.
+  - **`BIG_LANE_MAX_HOLD_MS` bounds how long one body may occupy the lane, however well it
+    behaves.** The progress floor cannot close this: a body dribbling AT the floor is byte-for-byte
+    indistinguishable from a legitimate slow migration at the same rate, so no rate threshold
+    separates them. This is the orthogonal bound — not "are you progressing" but "you have had it
+    long enough" — sized well above a 65 MiB bundle at any sane rate.
   - **Known gap: CHUNKED bodies bypass the declared-length pre-check** and can still OOM the hub at
     256m (XERK-287). Fixing it means capping undeclared-body concurrency, which is only safe once
     it's known whether the Cloudflare tunnel preserves agent framing — measure before capping.
