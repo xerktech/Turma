@@ -252,8 +252,8 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 - UI, API, and the click-to-attach live terminal (`/term/<sessionId>/`, reverse-tunneled to that
   session's ttyd by port) sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`).
   Agents authenticate heartbeats, tunnel WebSockets, and ttyd with a **per-host** token —
-  `TURMA_TOKEN` in the agent's env, `hostAgentToken()` = `HMAC(TURMA_AGENT_TOKEN, <device>)` on the
-  hub. See `CLAUDE.md`'s cross-cutting contracts for the rule; the mechanics:
+  `TURMA_TOKEN` in the agent's env, `hostAgentToken()` = `<base64url(device)>.<HMAC(master, device)>`
+  on the hub. See `CLAUDE.md`'s cross-cutting contracts for the rule; the mechanics:
   - The hub keeps only the master and **re-derives** the expected value for whatever host a request
     names, so adding a host needs no hub-side list and no restart. Print one with `node
     turma/server.js --agent-token <device>`. The name is IN the token, so a **host rename
@@ -264,8 +264,17 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
     the response. **Never settle for `agentAuthorized` where a host is in hand**: it answers "an
     agent", not "which".
   - The heartbeat is the one surface bound in its HANDLER, not at the route gate, since `device` is
-    in the body. The gate's `agentPresented` only refuses a credential-less caller before the body
-    is read; it cannot tell a derived token from a wrong one without a host to check against.
+    in the body. `agentPresented` is the gate: it says the credential is one the hub ISSUED, without
+    saying which host, and **must keep refusing an unknown bearer** — it stands in front of a 32 MiB
+    `readBody`, so admitting any `Bearer <anything>` is an unauthenticated remote OOM of the hub,
+    and with it the whole fleet's control plane.
+  - **A wrong-host token answers 403 naming both hosts, not a bare 401.** The overwhelmingly likely
+    cause is a host RENAME (the name is inside the token, so the credential silently stops matching);
+    it leaks nothing, since the token names its own host on its face. `hub-agent.py` logs the hub's
+    `{error}` body via `_http_error_detail` — the status line alone cannot say any of this.
+  - `controlChannels`/`pendingChannels` are **null-prototype**: their keys come off the wire, and on
+    a plain object a `ch` of `__proto__` read back as `Object.prototype` — truthy, so it passed the
+    "is there a pending channel" check and killed the hub on the next property access.
   - `ttydAuth(host)` sends the token that host's ttyd is actually running (`tokenBound` on the
     record, from how its own heartbeat authenticated), so a half-rolled fleet keeps every terminal
     working. It is hub-derived and **stripped from the fleet payload** — putting it on the wire

@@ -5792,8 +5792,11 @@ def _http_error_detail(err):
         parsed = json.loads(body) if body.strip() else None
         if isinstance(parsed, dict):
             # Azure DevOps says {"message": ...}; Jira says {"errorMessages":
-            # [...]} and/or a per-field {"errors": {field: why}}.
-            msg = str(parsed.get("message") or "").strip()
+            # [...]} and/or a per-field {"errors": {field: why}}. The TURMA HUB
+            # says {"error": ...} — same need, same function: its refusals name
+            # the host a credential is for and whether TURMA_AGENT_STRICT is on
+            # (XERK-268), and the status line alone cannot say either.
+            msg = str(parsed.get("message") or parsed.get("error") or "").strip()
             if not msg:
                 msg = "; ".join(str(m) for m in (parsed.get("errorMessages") or []))
             errors = parsed.get("errors")
@@ -14602,6 +14605,14 @@ class SessionManager:
             self.create_meta_results.clear()  # delivered — same lifecycle
             self.create_ticket_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
+        except urllib.error.HTTPError as e:
+            # urllib stringifies an HTTPError to just its status line and throws
+            # the body away — and for a REFUSED beat that body is the only thing
+            # that says why (XERK-268: whose token this is, whether the hub is
+            # strict). A rollover that goes wrong otherwise reads as a bare
+            # "HTTP Error 403: Forbidden" and a host that silently vanishes.
+            log(f"heartbeat failed: {_http_error_detail(e)}")
+            return None
         except Exception as e:
             log(f"heartbeat failed: {e}")
             return None
@@ -14644,6 +14655,8 @@ class SessionManager:
                 resp.read()
             log(f"announced updating to hub (reason={reason or 'restart'}"
                 f"{', v' + version if version else ''})")
+        except urllib.error.HTTPError as e:
+            log(f"updating announce failed (continuing shutdown): {_http_error_detail(e)}")
         except Exception as e:
             log(f"updating announce failed (continuing shutdown): {e}")
 

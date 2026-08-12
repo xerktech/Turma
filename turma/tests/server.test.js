@@ -116,7 +116,7 @@ const {
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
-  userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
+  userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
   agentBearerKind, agentHostRefusal, hostAgentToken, ttydAuth,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -344,14 +344,26 @@ test("userAuthorized: accepts a valid session cookie", () => {
   assert.equal(userAuthorized({ headers: { cookie: "other=1; hub_session=" + tok } }), true);
 });
 
-test("agentAuthorized: bearer token, with user-credential fallback", () => {
+test("agentPresented: a valid agent credential, whatever host it is for", () => {
   const req = (h) => ({ headers: h });
-  assert.equal(agentAuthorized(req({ authorization: "Bearer agenttok" })), true);
-  assert.equal(agentAuthorized(req({ authorization: "Bearer nope" })), false);
-  assert.equal(agentAuthorized(req({})), false);
+  assert.equal(agentPresented(req({ authorization: "Bearer agenttok" })), true);
+  assert.equal(agentPresented(req({ authorization: "Bearer nope" })), false);
+  assert.equal(agentPresented(req({})), false);
   // The single-user basic login may also exercise the heartbeat endpoint.
-  assert.equal(agentAuthorized(req({ authorization: basic("hubuser", "hubpass") })), true);
-  assert.equal(agentAuthorized(req({ authorization: basic("hubuser", "WRONG") })), false);
+  assert.equal(agentPresented(req({ authorization: basic("hubuser", "hubpass") })), true);
+  assert.equal(agentPresented(req({ authorization: basic("hubuser", "WRONG") })), false);
+  // Any host's own token passes — this gate cannot say WHICH host, only that the
+  // credential is one the hub issued. It is what keeps an unknown bearer off the
+  // heartbeat's 32 MiB body read, so it must refuse a made-up one (XERK-268).
+  assert.equal(agentPresented(req({ authorization: `Bearer ${hostAgentToken("anyhost")}` })), true);
+  const [name, mac] = hostAgentToken("anyhost").split(".");
+  // Neither half alone, and not a name swapped onto someone else's HMAC.
+  assert.equal(agentPresented(req({ authorization: `Bearer ${mac}` })), false);
+  assert.equal(agentPresented(req({ authorization: `Bearer ${name}.` })), false);
+  assert.equal(
+    agentPresented(req({ authorization: `Bearer ${Buffer.from("otherhost").toString("base64url")}.${mac}` })),
+    false
+  );
 });
 
 test("agentWsAuthorized: query token first, header fallback", () => {
@@ -6169,14 +6181,30 @@ const asHost = (host) => ({ authorization: `Bearer ${hostAgentToken(host)}` });
 const beatAs = (device, headers) =>
   request("POST", "/api/heartbeat", { body: { device }, headers: { ...headers, "content-type": "application/json" } });
 
-test("XERK-268: a host's token is derived from the master and its own name", () => {
+test("XERK-268: a host's token names its host and proves that name", () => {
   // Stable (the hub re-derives it per request rather than storing a map),
   // distinct per host, and nothing without a master to derive from.
   assert.equal(hostAgentToken("nas01"), hostAgentToken("nas01"));
   assert.notEqual(hostAgentToken("nas01"), hostAgentToken("nas02"));
-  assert.match(hostAgentToken("nas01"), /^[0-9a-f]{64}$/);
+  assert.match(hostAgentToken("nas01"), /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/);
   // Never the master itself — handing an agent the master back would defeat it.
   assert.notEqual(hostAgentToken("nas01"), "agenttok");
+  // It carries its host on its face, which is what lets the heartbeat gate
+  // identify a caller before reading a body. The name half is not a secret; the
+  // HMAC half is what makes it unforgeable, so editing the name breaks it.
+  const [name, mac] = hostAgentToken("nas01").split(".");
+  assert.equal(Buffer.from(name, "base64url").toString(), "nas01");
+  assert.equal(hostAgentToken("nas01").split(".")[1], mac);
+  // A host name with dots/unicode round-trips (the name is base64url, so the
+  // separator can never appear inside it).
+  for (const h of ["a.b.c", "héllo-01", "日本-01", "x".repeat(200)]) {
+    assert.equal(Buffer.from(hostAgentToken(h).split(".")[0], "base64url").toString(), h);
+  }
+  // Non-strings and the empty name get NO token: String() coercion would mint a
+  // real credential for an array or a toString()-carrying object.
+  for (const bad of [["nas01"], { toString: () => "nas01" }, 5, null, undefined, ""]) {
+    assert.equal(hostAgentToken(bad), "");
+  }
 });
 
 test("XERK-268: a bearer proves at most the ONE host it derives to", () => {
@@ -6194,6 +6222,28 @@ test("XERK-268: a bearer proves at most the ONE host it derives to", () => {
   assert.equal(agentBearerKind({ headers: { authorization: basic("hubuser", "hubpass") } }, "hA"), "operator");
   assert.equal(agentBearerKind({ headers: {} }, "hA"), null);
   assert.equal(agentBearerKind(bearer("garbage"), "hA"), null);
+  // A host token that is for someone else is NEVER downgraded to `legacy` —
+  // that would hand it the fleet-wide rights its own binding just refused.
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hB")), null), null);
+  // A non-string host cannot be coerced into one that "matches".
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hA")), ["hA"]), null);
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hA")), { toString: () => "hA" }), null);
+});
+
+test("XERK-268: a wrong-host token says so, so a RENAME is diagnosable", () => {
+  // The host name is inside the token, so renaming a host silently invalidates
+  // its credential. A bare "unauthorized" sends the operator hunting for a wrong
+  // secret instead of a changed name; this tells them nothing the caller does
+  // not already hold, since the token names its own host on its face.
+  const refusal = agentHostRefusal(
+    { headers: { authorization: `Bearer ${hostAgentToken("oldname")}` } }, "newname");
+  assert.equal(refusal.status, 403);
+  assert.match(refusal.error, /oldname's, not newname's/);
+  assert.match(refusal.error, /re-derive it if the host was renamed/);
+  // A token that is not a host token at all stays a flat 401 — there is nothing
+  // to say about it, and saying more would be an oracle.
+  assert.deepEqual(agentHostRefusal({ headers: { authorization: "Bearer garbage" } }, "hA"),
+    { status: 401, error: "unauthorized" });
 });
 
 test("migrate: the blob relay is scoped to the migration's own two hosts", async () => {
@@ -6216,6 +6266,19 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
   // the real target.
   assert.equal(migrations.get(mid).phase, "exporting");
   assert.ok(!(agents.scB.commands || []).some((c) => c.type === "importSession"));
+
+  // The GET half is scoped to the TARGET specifically, not merely to "one of the
+  // two". Once a bundle exists, even the migration's own SOURCE cannot pull it
+  // back — it is the raw transcript, and only the host resuming it needs it.
+  const up = await requestRaw("POST", `/api/agents/scA/migrations/${mid}/blob`,
+    { body: Buffer.from("SOURCE-BUNDLE"), headers: asHost("scA") });
+  assert.equal(up.status, 200);
+  const bySrc = await requestRaw("GET", `/api/agents/scA/migrations/${mid}/blob`,
+    { headers: asHost("scA") });
+  assert.equal(bySrc.status, 404);
+  const byTgt = await requestRaw("GET", `/api/agents/scB/migrations/${mid}/blob`,
+    { headers: asHost("scB") });
+  assert.equal(byTgt.status, 200);
 });
 
 test("migrate: a third host cannot relay by naming the victim's host", async () => {
@@ -6228,7 +6291,8 @@ test("migrate: a third host cannot relay by naming the victim's host", async () 
   // before the migration is ever looked up.
   const spoofPost = await requestRaw("POST", `/api/agents/vcA/migrations/${mid}/blob`,
     { body: Buffer.from("ATTACKER-BYTES-FORGED"), headers: asHost("vcC") });
-  assert.equal(spoofPost.status, 401);
+  assert.equal(spoofPost.status, 403);
+  assert.match(spoofPost.body.error, /is vcC's, not vcA's/);
   assert.equal(migrations.get(mid).phase, "exporting");
   assert.ok(!(agents.vcB.commands || []).some((c) => c.type === "importSession"));
 
@@ -6242,7 +6306,7 @@ test("migrate: a third host cannot relay by naming the victim's host", async () 
   // the real target gets its bytes.
   const spoofGet = await requestRaw("GET", `/api/agents/vcB/migrations/${mid}/blob`,
     { headers: asHost("vcC") });
-  assert.equal(spoofGet.status, 401);
+  assert.equal(spoofGet.status, 403);
   const realGet = await requestRaw("GET", `/api/agents/vcB/migrations/${mid}/blob`,
     { headers: asHost("vcB") });
   assert.equal(realGet.status, 200);
@@ -6255,7 +6319,7 @@ test("XERK-268: an agent can only collect an attachment staged for its own host"
   // Naming the victim's host with another host's credential — the case
   // `u.host !== host` alone could not catch.
   const spoof = await requestRaw("GET", `/api/agents/atA/uploads/${id}/blob`, { headers: asHost("atB") });
-  assert.equal(spoof.status, 401);
+  assert.equal(spoof.status, 403);
   const own = await requestRaw("GET", `/api/agents/atA/uploads/${id}/blob`, { headers: asHost("atA") });
   assert.equal(own.status, 200);
   assert.equal(own.buf.toString(), "SECRET");
@@ -6273,7 +6337,8 @@ test("XERK-268: a heartbeat's `device` is bound to the credential too", async ()
   // hbC's own token cannot beat as hbA, so the exportSession command carrying
   // the id stays with hbA.
   const spoof = await beatAs("hbA", asHost("hbC"));
-  assert.equal(spoof.status, 401);
+  assert.equal(spoof.status, 403);
+  assert.match(spoof.body.error, /is hbC's, not hbA's/);
 
   const real = await beatAs("hbA", asHost("hbA"));
   assert.equal(real.status, 200);
@@ -6310,6 +6375,58 @@ test("XERK-268: the tunnel control channel can only register its own host", asyn
   const ok = await wsConnect(`/agent/control?name=tunA&token=${hostAgentToken("tunA")}`, 1500);
   assert.match(ok.statusLine, /101/);
   ok.socket.destroy();
+});
+
+test("XERK-268: a data channel can only be answered by the host it was opened for", async () => {
+  // `ch` is unguessable, but it identifies the CHANNEL and proves nothing about
+  // who dialled back — the duplex becomes that host's terminal stream.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "dchA",
+      sessions: [{ id: "dch1", repo: "Turma", status: "running", ttydPort: 7777,
+        worktreePath: "/git/.turma/worktrees/Turma/dch1", transcriptId: "t-dch" }],
+    },
+    headers: agentHeaders,
+  });
+  const ctrl = await wsConnect(`/agent/control?name=dchA&token=${hostAgentToken("dchA")}`);
+  const frames = collectFrames(ctrl.socket, ctrl.leftover);
+  try {
+    // Ask for a terminal: the hub sends {open:<ch>} down the control channel.
+    request("GET", "/term/dch1/", { headers: userHeaders }).catch(() => {});
+    await waitFor(() => frames.some((f) => {
+      try { return JSON.parse(f.payload).open; } catch { return false; }
+    }));
+    const ch = frames.map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
+      .find(Boolean);
+    assert.ok(ch);
+
+    // Another host answering it is destroyed; the channel stays pending.
+    await assert.rejects(
+      () => wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken("dchB")}`, 1500),
+      /closed before headers|timed out/
+    );
+    const ok = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken("dchA")}`, 1500);
+    assert.match(ok.statusLine, /101/);
+    ok.socket.destroy();
+  } finally {
+    ctrl.socket.destroy();
+  }
+});
+
+test("XERK-268: a `ch` of __proto__ is not a pending channel", async () => {
+  // On a plain object it read back as Object.prototype — truthy, so it sailed
+  // past the "is there a pending channel" check and died on `.resolve is not a
+  // function`, out of an async upgrade handler: an instant hub exit.
+  await assert.rejects(
+    () => wsConnect("/agent/data?ch=__proto__&token=agenttok", 1500),
+    /closed before headers|timed out/
+  );
+  await assert.rejects(
+    () => wsConnect("/agent/data?ch=constructor&token=agenttok", 1500),
+    /closed before headers|timed out/
+  );
+  // Still serving: the point of the test is that the hub is alive to answer.
+  assert.equal((await request("GET", "/healthz")).status, 200);
 });
 
 test("XERK-268: ttyd is proxied with the token that host actually runs", async () => {

@@ -241,8 +241,11 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
 - **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
   agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
-  the tunnel's `?name=` — and each agent runs on its OWN token, `HMAC(TURMA_AGENT_TOKEN, <device>)`,
-  which the hub re-derives against the host that was named.
+  the tunnel's `?name=` — and each agent runs on its OWN token,
+  `<base64url(device)>.<HMAC(TURMA_AGENT_TOKEN, device)>`, which the hub re-derives against the host
+  that was named. **The token NAMES its host on purpose**: an HMAC can't be inverted, so a bare
+  digest could only be checked once the host was known, and `/api/heartbeat` — whose host is buried
+  in a 32 MiB body — would have had to admit any bearer before reading it.
   - **Scoping a route to a host is not a security check on its own.** Under one fleet-shared token
     `<host>` was self-asserted, so `m.srcHost !== host` refused a caller naming ITSELF and passed one
     naming the victim; `device` was the same, so any token-holder could beat as another host and be

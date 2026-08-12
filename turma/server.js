@@ -282,12 +282,46 @@ const TURMA_AGENT_TOKEN = process.env.TURMA_AGENT_TOKEN || "";
 // A per-relay one-time secret was the other candidate and does not work: it
 // would ride on exactly the commands an impersonated heartbeat hands out.
 const TURMA_AGENT_STRICT = /^(1|true|yes|on)$/i.test(process.env.TURMA_AGENT_STRICT || "");
-// A host's own agent token. Keyed on the host name the agent reports as
-// `device`, so a host RENAME invalidates its token by design — the hub cannot
-// tell a rename from an impersonation, and guessing would be the bug.
+// A host's own agent token: `<base64url(host)>.<HMAC(master, host)>`.
+//
+// It NAMES the host it is for, and the HMAC is what makes that name unforgeable
+// — so the hub can identify a caller from the token ALONE, before it has read a
+// body or looked at a path. That is what lets `/api/heartbeat`, whose host is
+// buried in its payload, refuse an unknown credential BEFORE reading 32 MiB
+// (an HMAC cannot be inverted, so a bare digest could not be placed without
+// already knowing the host, and the gate would have had to let anything
+// through). The name half is not a secret: whoever holds the token is that
+// host, and host names travel in the URL anyway.
+//
+// Keyed on the host name the agent reports as `device`, so a host RENAME
+// invalidates its token by design — the hub cannot tell a rename from an
+// impersonation, and guessing would be the bug.
 function hostAgentToken(host) {
-  if (!TURMA_AGENT_TOKEN) return "";
-  return crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(String(host)).digest("hex");
+  // Non-strings never get a token: `String(host)` would coerce an array or a
+  // toString()-carrying object into a host name and mint a REAL credential for
+  // it. No caller passes one today; this is so none can start.
+  if (!TURMA_AGENT_TOKEN || typeof host !== "string" || !host) return "";
+  return Buffer.from(host).toString("base64url") + "." +
+    crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
+}
+
+// The host a bearer token proves it is, or null if it proves nothing. Reads the
+// name off the token and re-derives to check it, so an attacker editing the name
+// half invalidates the HMAC half.
+function tokenHost(token) {
+  if (!TURMA_AGENT_TOKEN || typeof token !== "string") return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0) return null;
+  let host;
+  try {
+    host = Buffer.from(token.slice(0, dot), "base64url").toString();
+  } catch {
+    return null;
+  }
+  // Compare the WHOLE token, so a name that doesn't round-trip through base64url
+  // (padding games, a different encoding of the same bytes) fails here rather
+  // than resolving to a host it isn't the token for.
+  return host && safeEqual(token, hostAgentToken(host)) ? host : null;
 }
 // A dedicated bearer token for the programmatic session-trigger endpoint
 // (POST /api/trigger), so external automation (CI, webhooks, cron) can start a
@@ -382,10 +416,17 @@ const PR_ALERT_MAX_TRACKED = 20;
 let agents = {};
 
 // Reverse-tunnel state. controlChannels[name] = the live control connection for
-// that container's tunnel-agent; pendingChannels[ch] = resolver awaiting the
+// that container's tunnel-agent; pendingChannels[ch] = the record awaiting the
 // agent's data-WS dial-back for channel `ch`.
-const controlChannels = {};
-const pendingChannels = {};
+//
+// Both are NULL-PROTOTYPE: the keys are attacker-influenced (a `?name=`/`?ch=`
+// off the wire), and on a plain object `__proto__` is not a key. It read back as
+// Object.prototype — truthy, so a `ch` of `__proto__` sailed past the "is there
+// a pending channel" check and died on `.resolve is not a function`, out of an
+// async upgrade handler with no unhandledRejection hook: an instant hub exit.
+// Assignment was worse, silently re-parenting the map.
+const controlChannels = Object.create(null);
+const pendingChannels = Object.create(null);
 // Live transcript subscribers: liveClients[host][sessionId] = Set of glasses
 // WebSocket sockets watching that session's transcript in near-real-time (see
 // the /live upgrade handler). The hub asks the host's tunnel-agent to tail a
@@ -1975,20 +2016,18 @@ function userAuthorized(req) {
   return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1));
 }
 
-// Agent auth (heartbeats). The user credentials also work here, so a curl
-// with the basic-auth login can exercise the endpoint.
-function agentAuthorized(req) {
-  return !!agentBearerKind(req, null);
-}
-
-// Did this request carry an agent credential of ANY kind? Deliberately weaker
-// than agentBearerKind: it cannot tell a host's derived token from a wrong one,
-// because that judgement needs the host being claimed (XERK-268). The one
-// caller is the heartbeat's pre-body gate, which has no host yet — everywhere
-// else has one and must bind to it.
+// Did this request carry a VALID agent credential, whatever host it is for?
+// Weaker than agentBearerKind only in that it doesn't say which host — it still
+// refuses an unknown token outright, which is what keeps an anonymous caller off
+// the heartbeat's 32 MiB body read (XERK-268). The one caller is that pre-body
+// gate; everywhere else has a host in hand and must bind to it.
 function agentPresented(req) {
   if (!TURMA_AGENT_TOKEN) return true;
-  if ((req.headers.authorization || "").startsWith("Bearer ")) return true;
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) {
+    const token = header.slice(7);
+    return !!tokenHost(token) || safeEqual(token, TURMA_AGENT_TOKEN);
+  }
   return userAuthorized(req) && !!TURMA_PASSWORD;
 }
 
@@ -2018,10 +2057,11 @@ function agentBearerKind(req, host) {
   const header = req.headers.authorization || "";
   if (header.startsWith("Bearer ")) {
     const token = header.slice(7);
-    if (host != null && safeEqual(token, hostAgentToken(host))) return "proved";
+    const bound = tokenHost(token);
+    // A host token proves exactly one host. Naming any other is the
+    // impersonation this exists to refuse — not a fallback to `legacy`.
+    if (bound) return host != null && bound === host ? "proved" : null;
     if (safeEqual(token, TURMA_AGENT_TOKEN)) return "legacy";
-    // A well-formed bearer that is neither: it may still be some OTHER host's
-    // derived token, which is exactly the impersonation this exists to refuse.
     return null;
   }
   return userAuthorized(req) && !!TURMA_PASSWORD ? "operator" : null;
@@ -2034,7 +2074,22 @@ function agentBearerKind(req, host) {
 // meeting a host still on the master, must not read as a generic 401.
 function agentHostRefusal(req, host) {
   const kind = agentBearerKind(req, host);
-  if (!kind) return { status: 401, error: "unauthorized" };
+  if (!kind) {
+    // A token that IS a host token, for a different host, gets said out loud.
+    // The commonest cause by far is not an attack but a host RENAME — the name
+    // is inside the token, so the agent's credential silently stops matching —
+    // and "unauthorized" sends the operator hunting for a wrong secret instead
+    // of a changed name. It tells the caller nothing it doesn't already hold:
+    // the token names its own host on its face.
+    const bound = tokenHost((req.headers.authorization || "").slice(7));
+    if (bound) {
+      return {
+        status: 403,
+        error: `this agent token is ${bound}'s, not ${host}'s — a host's token is derived from its name, so re-derive it if the host was renamed`,
+      };
+    }
+    return { status: 401, error: "unauthorized" };
+  }
   if (kind === "legacy" && TURMA_AGENT_STRICT && TURMA_AGENT_TOKEN) {
     return {
       status: 403,
@@ -5327,7 +5382,7 @@ if (process.env.TURMA_TEST) {
     uploads,
     UPLOAD_MAX_PER_MESSAGE,
     userAuthorized,
-    agentAuthorized,
+    agentPresented,
     agentBearerKind,
     agentHostRefusal,
     agentWsAuthorized,
