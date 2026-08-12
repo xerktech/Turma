@@ -30,13 +30,14 @@
 
 ## glasses/
 
-- `glasses/src/vendor/chat.cjs` and `board.cjs` are COMMITTED byte-for-byte copies of
-  `turma/public/chat.js`/`board.js`, enforced by `glasses/src/vendor/vendor.test.ts`.
-  TRAP: a PR editing chat.js/board.js without re-copying merges green (glasses-ci.yml is
-  path-filtered to `glasses/**`) and breaks the NEXT glasses PR. Check with
-  `cmp turma/public/chat.js glasses/src/vendor/chat.cjs`.
-- `glasses/src/phone/render.ts` has its own hand-ported `prBadgeHtml` — a fourth chip
-  renderer beside web ×3 + android; check it whenever the chip changes.
+- `glasses/src/vendor/chat.cjs`+`board.cjs` AND `veiller/src/ui/vendor/chat.cjs`+`board.cjs`
+  are COMMITTED byte-for-byte copies of `turma/public/chat.js`/`board.js`, each enforced by
+  its own `vendor.test.ts`. TRAP: a PR editing chat.js/board.js without re-copying BOTH
+  merges green when the path filters don't fire and breaks the NEXT glasses/veiller PR.
+  Sweep with `find . -name chat.cjs` + `cmp` against the source.
+- `glasses/src/phone/render.ts` AND `veiller/src/ui/phone/render.ts` each carry a
+  hand-ported `prBadgeHtml` — chip renderers beside web ×3 + android; check both whenever
+  the chip changes.
 - Vitest needs npm install; not runnable on the TrueNAS host — rely on glasses-ci.yml.
 
 ## android/
