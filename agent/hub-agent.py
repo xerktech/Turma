@@ -14422,25 +14422,51 @@ class SessionManager:
         cap = self.heartbeat_max_bytes
         if not cap or len(body) <= cap:
             return body
+        # Would shedding even help? If the payload is over the cap with EVERY staged
+        # result removed, then dropping them costs the operator their results and
+        # buys nothing — so keep them and send. Shedding for no size gain is the
+        # same mistake as shedding what was never sent.
+        keys = [key for tier in self.SHED_TIERS for _, key in tier]
+        floor = len(json.dumps({k: v for k, v in payload.items() if k not in keys}).encode())
+        if floor > cap:
+            # The base payload alone is over the cap. It still goes out: the hub
+            # must hear from this host or the host reads as offline. Deliberately
+            # NOT promising the hub will explain itself — an over-cap body is
+            # refused mid-upload and reaches us as a broken pipe, so this beat is
+            # simply lost, and so is the next, until the payload itself shrinks.
+            log(f"heartbeat is {len(body)} bytes, over the hub's {cap} cap, and is still "
+                f"{floor} bytes with every staged result dropped — sending it anyway, but "
+                f"expect it to be refused")
+            return body
         while len(body) > cap:
             # Sheds ONE tier, from the payload and the staging list together — see
             # _shed_staged_results for why splitting those two costs the operator
             # half an hour of refused board writes.
             shed = self._shed_staged_results(payload)
             if not shed:
-                # The base payload alone is over the cap, so there is nothing left
-                # to trade away. It still goes out: the hub must hear from this host
-                # or the host reads as offline. Deliberately NOT promising that the
-                # hub will explain itself — an over-cap body is refused mid-upload
-                # and reaches us as a broken pipe, so this beat is simply lost and
-                # the next one will be too until the payload itself shrinks.
-                log(f"heartbeat is {len(body)} bytes, over the hub's {cap} cap, with nothing "
-                    f"left to shed — sending it anyway, but expect it to be refused")
-                return body
+                return body  # unreachable: `floor <= cap` guarantees one helps
             log(f"heartbeat would be {len(body)} bytes, over the hub's {cap} cap — "
                 f"dropped staged {shed} before sending; re-open the view to fetch them again")
             body = json.dumps(payload).encode()
         return body
+
+    def _refusal_kind(self, err):
+        """`(kind, detail)` off a refusal's JSON body — "body" or "record" — or
+        (None, None) when it cannot be read. The body is only readable when the hub
+        answered a request it had FULLY received; a mid-upload refusal reaches us as
+        a broken pipe with nothing to parse, which is exactly why the cap is
+        advertised on every beat reply instead."""
+        try:
+            raw = err.read(4096)
+            d = json.loads(raw.decode("utf-8", "replace") or "{}")
+            if not isinstance(d, dict):
+                return None, None
+            kind = d.get("kind")
+            detail = d.get("error")
+            return (kind if isinstance(kind, str) else None,
+                    detail if isinstance(detail, str) else None)
+        except Exception:
+            return None, None
 
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
@@ -14475,12 +14501,14 @@ class SessionManager:
                         and 0 < cap <= HEARTBEAT_CAP_SANE_MAX):
                     self.heartbeat_max_bytes = cap
             self._clear_pending_prs()  # delivered
-            self.history_results.clear()  # delivered — same lifecycle
-            self.subagent_history_results.clear()  # delivered — same lifecycle
-            self.jira_issue_results.clear()  # delivered — same lifecycle
-            self.ticket_status_results.clear()  # delivered — same lifecycle
-            self.create_meta_results.clear()  # delivered — same lifecycle
-            self.create_ticket_results.clear()  # delivered — same lifecycle
+            # Clear ONLY what this body actually carried. Clearing every staging
+            # list on any 200 destroys a result staged after the payload was built,
+            # or one a pre-flight shed removed — and the hub reads a missing result
+            # as a missing capability (see _shed_staged_results).
+            for tier in self.SHED_TIERS:
+                for attr, key in tier:
+                    if key in payload:
+                        getattr(self, attr).clear()
             return reply if isinstance(reply, dict) else {}
         except urllib.error.HTTPError as e:
             # 413 and 503 mean OPPOSITE things and must not be handled alike
@@ -14493,13 +14521,28 @@ class SessionManager:
             #         oversized beat every interval — the exact XERK-235 symptom
             #         the 413 was introduced to replace. So shed what made it big.
             if e.code == 413:
-                shed = self._shed_staged_results()
-                if shed:
-                    log(f"heartbeat refused as too large (413) — dropped staged {shed}; "
-                        f"re-open the view to fetch them again")
+                # WHICH 413. The hub measures its record ceiling AFTER stripping the
+                # on-demand results from the payload, so shedding them can never
+                # satisfy that one — and shedding anyway destroyed a delivery per
+                # beat, forever, while the host stayed offline for an unrelated
+                # reason. `kind` tells them apart; an older hub sends none, and the
+                # body-size reading is the safe default there (it is the refusal the
+                # advertised cap already prevents).
+                kind, detail = self._refusal_kind(e)
+                if kind == "record":
+                    log(f"heartbeat refused: this host's RECORD is too large for the hub "
+                        f"({detail or 'no detail'}) — staged results are not counted in it, so "
+                        f"nothing is dropped; reduce what this host reports (sessions/repos)")
                 else:
-                    log("heartbeat refused as too large (413) with nothing staged to drop — "
-                        "the base payload itself is over the hub's cap")
+                    # No payload to keep in step here: this one has already gone out
+                    # and is discarded, so clearing the staging lists alone is right.
+                    shed = self._shed_staged_results()
+                    if shed:
+                        log(f"heartbeat refused as too large (413) — dropped staged {shed}; "
+                            f"re-open the view to fetch them again")
+                    else:
+                        log("heartbeat refused as too large (413) with nothing staged to drop — "
+                            "the base payload itself is over the hub's cap")
             else:
                 log(f"heartbeat failed: {e}")
             return None

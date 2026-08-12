@@ -38,6 +38,18 @@ from unittest import mock
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULE_PATH = os.path.join(AGENT_DIR, "hub-agent.py")
 
+# The tracker credentials are cleared BEFORE the module is imported, because it
+# reads them into module-level constants at import and `build_payload()` then
+# polls the REAL tracker on any host that has them set. That made the suite
+# non-hermetic in two ways: several seconds of live network per test, against the
+# operator's own production board, and payload sizes that depend on how many
+# tickets happen to be assigned to them today — which failed a size assertion
+# locally while CI, whose runners have no credentials, stayed green. A unit suite
+# must not be able to tell the difference (XERK-258).
+for _cred in ("JIRA_SITE", "JIRA_EMAIL", "JIRA_TOKEN",
+              "AZDO_URL", "AZDO_TOKEN", "AZDO_PROJECT", "AZDO_USER"):
+    os.environ.pop(_cred, None)
+
 spec = importlib.util.spec_from_file_location("hub_agent", MODULE_PATH)
 ha = importlib.util.module_from_spec(spec)
 sys.modules["hub_agent"] = ha
@@ -9277,6 +9289,68 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
                  if "/api/heartbeat" in r.full_url]
         self.assertEqual(len(beats), 1, "the oversized beat still goes out")
 
+    def test_a_record_size_413_sheds_NOTHING(self):
+        # The hub measures its record ceiling AFTER stripping the on-demand results
+        # from the payload, so shedding them can never satisfy it. Shedding anyway
+        # destroyed one delivery per beat, forever, while the host stayed offline for
+        # an entirely unrelated reason (too many sessions/repos to report).
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x"}]})
+        sm.create_ticket_results.append({"cmdId": "c1", "key": "ENG-1"})
+        err = ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", 413, "too large", {},
+            io.BytesIO(json.dumps(
+                {"error": "agent record too large", "limit": 8388608, "kind": "record"}
+            ).encode()))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+            self.assertIsNone(sm.post(sm.build_payload(0)))
+        self.assertEqual(len(sm.history_results), 1, "nothing may be shed for a record refusal")
+        self.assertEqual(len(sm.create_ticket_results), 1)
+
+    def test_a_body_size_413_still_sheds(self):
+        # The other 413 — the one shedding CAN fix. An older hub sends no `kind`, and
+        # that must read as the body case: it is the refusal the advertised cap
+        # already prevents, so defaulting there costs nothing.
+        for body in (json.dumps({"error": "body too large", "limit": 99, "kind": "body"}).encode(),
+                     json.dumps({"error": "body too large", "limit": 99}).encode(),
+                     b"not json at all"):
+            sm = self.make_manager()
+            sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x"}]})
+            err = ha.urllib.error.HTTPError(
+                "http://hub/api/heartbeat", 413, "too large", {}, io.BytesIO(body))
+            with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+                self.assertIsNone(sm.post(sm.build_payload(0)))
+            self.assertEqual(sm.history_results, [], f"{body[:20]!r} must shed")
+
+    def test_pre_flight_sheds_nothing_when_shedding_cannot_help(self):
+        # If the payload is over the cap with EVERY staged result removed, dropping
+        # them costs the operator their results and buys nothing. Shedding for no
+        # size gain is the same mistake as shedding what was never sent.
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 4000}]})
+        sm.create_ticket_results.append({"cmdId": "c1", "key": "ENG-1"})
+        sm.heartbeat_max_bytes = 8  # nothing can get under this
+        sent = self._record_posts(sm, sm.build_payload(0))
+        beats = [r for r in sent if "/api/heartbeat" in r.full_url]
+        self.assertEqual(len(beats), 1, "it still goes out")
+        # The results are still ON THE WIRE — not dropped for a size gain that was
+        # never available. (They are then cleared as delivered, which is correct:
+        # this beat carried them.)
+        wire = json.loads(beats[0].data)
+        self.assertIn("historyResults", wire)
+        self.assertIn("createTicketResults", wire)
+
+    def test_a_200_clears_only_what_the_body_carried(self):
+        # Clearing every staging list on any 200 destroys a result staged after the
+        # payload was built, or one a pre-flight shed removed — and the hub reads a
+        # missing result as a missing capability.
+        sm = self.make_manager()
+        payload = sm.build_payload(0)  # carries no results
+        sm.history_results.append({"sessionId": "late", "entries": []})
+        self._record_posts(sm, payload)
+        self.assertEqual(len(sm.history_results), 1,
+                          "a result staged after the payload was built survives the beat")
+
     def test_413_shed_never_destroys_a_result_it_did_not_send(self):
         # The pre-flight shed used to drop ONE tier from the staging lists while
         # popping ALL SIX result keys from the payload, and post() then cleared every
@@ -9286,12 +9360,16 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         # "your agent is too old" for half an hour. Earned by a beat that was
         # merely too big.
         sm = self.make_manager()
-        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 20000}]})
         sm.jira_issue_results.append({"key": "ENG-1", "fields": {}})
         sm.create_ticket_results.append({"cmdId": "c1", "key": "ENG-2"})
-        sm.heartbeat_max_bytes = 4096
+        # Derive the cap from the payload WITHOUT tier one, so the test asserts the
+        # tier boundary and not the base payload's size. Hard-coding a cap made this
+        # fail on any host whose base payload happened to be bigger.
+        tier2_only = len(json.dumps(sm.build_payload(0)).encode())
+        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 20000}]})
+        sm.heartbeat_max_bytes = tier2_only + 512
 
-        payload = sm.build_payload(0)
+        payload = sm.build_payload(1)
         sent = self._record_posts(sm, payload)
         wire = json.loads([r for r in sent if "/api/heartbeat" in r.full_url][0].data)
 

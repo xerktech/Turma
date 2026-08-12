@@ -217,11 +217,17 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
     PARSE**, a sixteenth of the limit (16 MiB at the deployed 256m). A body costs ~5x its size to
     hold and V8 sizes its heap from the cgroup, so it grows into the container and lets the kernel
     decide: eight sequential 25 MiB deliveries, each legal under `HEARTBEAT_MAX` and each answered
-    200, pegged a 256 MiB container at its ceiling. Refused on the headers instead, the same
-    sequence peaks at 77 MiB. Never restore a flat constant here.
-  - **A 413 raised AFTER a complete read is still delivered normally** (`AGENT_RECORD_MAX` — the body
-    finished, so `json()` answers on a healthy socket). That is the 413 the agent's shed most relies
-    on, and it must stay that way.
+    200, pegged a 256 MiB container at its ceiling (254 of 256 MiB). Refused on the headers instead,
+    the same sequence peaks in the low tens of MiB. **The floor is `BODY_MAX`, not something
+    roomier** — an 8 MiB floor overrode the derivation at `-m 64m`, where the hub then advertised
+    8 MiB, accepted one beat that size and was killed by the next. Never restore a flat constant.
+  - **There are TWO 413s and they are not interchangeable**, so each carries a `kind`. `kind:"body"`
+    is the transport cap — shedding staged results fixes it, and it is the one a mid-upload refusal
+    may fail to deliver. `kind:"record"` is `AGENT_RECORD_MAX`, measured with the on-demand results
+    already STRIPPED from the payload, so **shedding can never satisfy it**; the agent must log and
+    keep them, or it destroys one delivery per beat forever while the host is offline for an
+    unrelated reason (too much to report). This one is delivered reliably — the body finished, so
+    `json()` answers on a healthy socket — which is what makes reading `kind` worthwhile.
 - **`release()` must run on every exit path**, which is why it is idempotent and guarded on `close`
   as well as `error`/`end`: a leaked reservation is never recovered, and enough of them refuse every
   large body for the life of the process.
@@ -232,7 +238,11 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   the deployed limit. **`readRawBody` deliberately does NOT preallocate from `Content-Length`** — that
   would size an allocation from a claim, one byte behind a 65 MiB header.
 - **The on-demand history caches are bounded in BYTES too** (`sweepHistoryBytes`,
-  `HISTORY_TOTAL_MAX_BYTES`, fleet-wide, oldest delivery evicted first). `HISTORY_MAX_SESSIONS`
+  `HISTORY_TOTAL_MAX_BYTES`, fleet-wide, oldest delivery evicted first). Two consequences worth
+  knowing: the budget is **shared across hosts**, so an operator's open history view can go stale
+  because a DIFFERENT host delivered (re-opening re-fetches it); and the delivery that just landed is
+  **never swept**, or one larger than the whole ceiling would be evicted on arrival, leaving the view
+  permanently unloadable and re-queueing a `history` command on every open. `HISTORY_MAX_SESSIONS`
   cannot see size, `AGENT_CACHE_KEYS` strips these caches before `AGENT_RECORD_MAX` measures a
   record, and `retainedBytes` deliberately leaves them out — so they were invisible to every ceiling
   and seven sequential 25 MiB deliveries from ONE authorized host OOM-killed the hub.

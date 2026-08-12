@@ -163,9 +163,11 @@ const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted 
 // OOM-killed the hub with each individual limit respected. Derived from the
 // container like the other ceilings, because a flat number here is the same
 // mistake in a different constant (XERK-258).
-const HISTORY_TOTAL_MAX_BYTES =
-  Number(process.env.HISTORY_TOTAL_MAX_BYTES) ||
-  (HUB_MEM_LIMIT ? Math.floor(HUB_MEM_LIMIT / 8) : 64 << 20);
+const HISTORY_TOTAL_MAX_BYTES = (() => {
+  const explicit = Number(process.env.HISTORY_TOTAL_MAX_BYTES);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  return HUB_MEM_LIMIT ? Math.floor(HUB_MEM_LIMIT / 8) : 64 << 20;
+})();
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -1180,11 +1182,13 @@ function normalizeLimits(payload) {
 // results, so the sweep still bounds memory on quiet hosts.
 function ingestHistory(agent, historyResults) {
   const now = Date.now();
+  let newest = null; // the delivery that just landed; never swept (see below)
   for (const r of historyResults || []) {
     if (!r || !r.sessionId) continue;
     agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated,
       queued: Array.isArray(r.queued) ? r.queued : [], fetchedAt: now,
       bytes: cacheEntryBytes(r.entries) };
+    newest = { cache: agent.history, key: r.sessionId };
   }
   for (const [sessionId, h] of Object.entries(agent.history)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.history[sessionId];
@@ -1196,7 +1200,7 @@ function ingestHistory(agent, historyResults) {
       .slice(0, over)
       .forEach(([sessionId]) => delete agent.history[sessionId]);
   }
-  sweepHistoryBytes();
+  sweepHistoryBytes(newest);
 }
 
 // The serialized size of one cached delivery, measured ONCE at ingest so the
@@ -1219,19 +1223,23 @@ function cacheEntryBytes(entries) {
 // at the deployed limit. Bounded here in BYTES, fleet-wide, oldest first: the
 // count and age caps above cannot see size, and 8 sessions x tens of MiB is over
 // any container this runs in (XERK-258).
-function sweepHistoryBytes() {
+function sweepHistoryBytes(keep) {
   const held = [];
   let total = 0;
   for (const a of Object.values(agents)) {
     for (const [key, h] of Object.entries(a.history || {})) {
       const bytes = Number(h.bytes) || 0;
       total += bytes;
-      held.push({ cache: a.history, key, bytes, at: h.fetchedAt || 0 });
+      if (!(keep && keep.cache === a.history && keep.key === key)) {
+        held.push({ cache: a.history, key, bytes, at: h.fetchedAt || 0 });
+      }
     }
     for (const [key, h] of Object.entries(a.subagentHistory || {})) {
       const bytes = Number(h.bytes) || 0;
       total += bytes;
-      held.push({ cache: a.subagentHistory, key, bytes, at: h.fetchedAt || 0 });
+      if (!(keep && keep.cache === a.subagentHistory && keep.key === key)) {
+        held.push({ cache: a.subagentHistory, key, bytes, at: h.fetchedAt || 0 });
+      }
     }
   }
   if (total <= HISTORY_TOTAL_MAX_BYTES) return;
@@ -1241,6 +1249,11 @@ function sweepHistoryBytes() {
     delete h.cache[h.key];
     total -= h.bytes;
   }
+  // `keep` — the delivery that just landed — is excluded from the sweep above, so
+  // a single delivery larger than the whole ceiling is not evicted the instant it
+  // arrives. Evicting it made the view unloadable AND unbounded: every open
+  // re-queued a `history` command, costing the victim host a transcript read per
+  // turn, forever.
 }
 
 // The cache key for one background agent's transcript (see the {type:
@@ -1255,11 +1268,14 @@ function subagentKey(sessionId, type, label) {
 // agent's `subagentHistoryResults`, then evicts by age and caps the cache.
 function ingestSubagentHistory(agent, results) {
   const now = Date.now();
+  let newest = null;
   for (const r of results || []) {
     if (!r || !r.sessionId) continue;
     agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label)] =
       { entries: r.entries, truncated: r.truncated, fetchedAt: now,
         bytes: cacheEntryBytes(r.entries) };
+    newest = { cache: agent.subagentHistory,
+               key: subagentKey(r.sessionId, r.type, r.label) };
   }
   for (const [k, h] of Object.entries(agent.subagentHistory)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.subagentHistory[k];
@@ -1271,7 +1287,7 @@ function ingestSubagentHistory(agent, results) {
       .slice(0, over)
       .forEach(([k]) => delete agent.subagentHistory[k]);
   }
-  sweepHistoryBytes(); // the byte bound is fleet-wide — see ingestHistory
+  sweepHistoryBytes(newest); // the byte bound is fleet-wide — see ingestHistory
 }
 
 // Merge the agent's on-demand Jira issue deliveries (heartbeat
@@ -1789,8 +1805,14 @@ const HEARTBEAT_MAX = 32 << 20; // 32 MiB
 // each answered 200, pegged a 256 MiB container at its ceiling; at a sixteenth
 // they are refused before a byte is parsed, and the agent sheds to fit instead
 // (XERK-258). Never widen this back to a flat constant.
+//
+// The floor is BODY_MAX, deliberately not something roomier: an 8 MiB floor
+// OVERRODE the derivation on a small container and put the original OOM straight
+// back — at `-m 64m` the hub advertised 8 MiB, accepted one beat of exactly that
+// size and was killed by the second. A floor here must be small enough that the
+// container can still parse it, and only the derivation knows that.
 const HEARTBEAT_ACCEPT_MAX_RAW = HUB_MEM_LIMIT
-  ? Math.min(HEARTBEAT_MAX, Math.max(8 << 20, Math.floor(HUB_MEM_LIMIT / 16)))
+  ? Math.min(HEARTBEAT_MAX, Math.max(BODY_MAX, Math.floor(HUB_MEM_LIMIT / 16)))
   : HEARTBEAT_MAX;
 
 // ---- the fleet-wide in-flight body budget (XERK-258) ------------------------
@@ -4058,7 +4080,8 @@ const server = http.createServer(async (req, res) => {
           `heartbeat from ${key}: record is ${recordSize} bytes, over the ` +
             `${AGENT_RECORD_MAX} limit — beat refused`
         );
-        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX,
+                              kind: "record" }); // see the "body" 413 for why
       }
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
@@ -5326,7 +5349,10 @@ const server = http.createServer(async (req, res) => {
     // The socket is still open here precisely because readBody drained instead
     // of destroying it (XERK-235).
     if (err && err.tooLarge) {
-      refuse(res, 413, { error: "body too large", limit: err.cap });
+      // `kind` is what lets the agent tell this from the record-size 413 below:
+      // shedding staged results shrinks a BODY, and can never satisfy a record
+      // ceiling that is measured with those results already stripped out.
+      refuse(res, 413, { error: "body too large", limit: err.cap, kind: "body" });
       return;
     }
     // Not too big — badly timed. 503 + Retry-After is what tells an agent to

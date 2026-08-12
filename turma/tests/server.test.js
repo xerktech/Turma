@@ -1766,6 +1766,78 @@ test("the history caches are bounded in BYTES, fleet-wide (XERK-258)", () => {
   }
 });
 
+test("the heartbeat cap is a SIXTEENTH of the container, floored at BODY_MAX (XERK-258)", () => {
+  // HEARTBEAT_MAX is the documented ceiling for a legitimate delivery; this is what
+  // the container can afford to PARSE (~5x the body, and V8 sizes its heap from the
+  // cgroup, so it grows into the container and lets the kernel decide). Deleting the
+  // derivation left the suite green while eight 25 MiB beats pegged a 256 MiB
+  // container one beat from death — so it is pinned here.
+  const at = (bytes) => freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(bytes);
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+    delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
+  });
+  const m256 = at(256 << 20);
+  assert.equal(m256.heartbeatAcceptMax(), 16 << 20, "a sixteenth at the deployed limit");
+  assert.ok(m256.heartbeatAcceptMax() < m256.HEARTBEAT_MAX, "below the documented ceiling");
+  // A ROOMY floor is what re-created the OOM: at -m 64m an 8 MiB floor overrode the
+  // derivation, the hub advertised 8 MiB, took one beat that size and died on the
+  // next. The floor must be small enough that the container can still parse it.
+  const m64 = at(64 << 20);
+  assert.ok(m64.heartbeatAcceptMax() <= (64 << 20) / 16,
+            `64m must not advertise more than a sixteenth (got ${m64.heartbeatAcceptMax()})`);
+  assert.ok(m64.heartbeatAcceptMax() >= m64.BODY_INFLIGHT_FREE, "but at least one free floor");
+  // A big container keeps the documented ceiling rather than scaling past it.
+  assert.equal(at(4096 << 20).heartbeatAcceptMax(), m256.HEARTBEAT_MAX);
+});
+
+test("http: a body declaring more than the ROUTE CAP is refused on its headers (XERK-258)", async () => {
+  // Distinct from the budget's header refusal: this one is the permanent case, and
+  // answering it before the body streams is what keeps a flood of oversized declared
+  // bodies from costing anything. Removing it left the suite green.
+  const sock = net.connect(new URL(baseUrl).port, "127.0.0.1");
+  try {
+    await new Promise((r, rej) => { sock.once("connect", r); sock.once("error", rej); });
+    let reply = "";
+    sock.on("data", (c) => (reply += c));
+    sock.on("error", () => {});
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\n" +
+        "Authorization: Bearer agenttok\r\nContent-Type: application/json\r\n" +
+        `Content-Length: ${hub.heartbeatAcceptMax() + (1 << 20)}\r\n\r\n`
+    );
+    await waitUntil(() => reply.includes("\r\n\r\n"), "a 413 on the headers alone");
+    assert.match(reply, /^HTTP\/1\.1 413/, "refused without reading a byte of the body");
+    assert.match(reply, /"kind":"body"/, "and labelled, so the agent knows shedding helps");
+  } finally {
+    sock.destroy();
+  }
+});
+
+test("http: an answer sent over an UNREAD body asks for the connection to close", async () => {
+  // Node destroys such a socket once the reply is out, so a keep-alive header hands
+  // the client a doomed pooled socket and its next request dies with ECONNRESET.
+  const sock = net.connect(new URL(baseUrl).port, "127.0.0.1");
+  try {
+    await new Promise((r, rej) => { sock.once("connect", r); sock.once("error", rej); });
+    let reply = "";
+    sock.on("data", (c) => (reply += c));
+    sock.on("error", () => {});
+    // A route that answers BEFORE reading the body: an unknown host's kill route.
+    sock.write(
+      "POST /api/agents/nope/sessions/x/kill HTTP/1.1\r\nHost: x\r\n" +
+        `Authorization: ${basic("hubuser", "hubpass")}\r\n` +
+        "Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n"
+    );
+    await waitUntil(() => reply.includes("\r\n\r\n"), "the early answer");
+    assert.match(reply, /^HTTP\/1\.1 404/);
+    assert.match(reply, /[Cc]onnection: close/, "an unread body must not leave keep-alive on");
+  } finally {
+    sock.destroy();
+  }
+});
+
 test("http: the advertised cap is the cap the hub can actually accept (XERK-258)", () => {
   // A lone body escapes the ceilings only while it fits BODY_INFLIGHT_ESCAPE_MAX,
   // so on a small container a route whose cap exceeds that would advertise — and
