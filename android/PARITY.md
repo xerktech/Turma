@@ -102,7 +102,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   mirrors the web target filter (tested in `SessionsTest`). One deliberate difference: the web stage
   auto-follows the moved session onto its new host (`advanceMigrationFollow`); Android just lets it
   reappear in the session list on its new host (no stage to follow on a phone), so the "Moving…" card
-  hint and the follow are web-only.
+  hint and the follow are web-only. Its refusals — including the 503 when too many moves are in
+  flight (XERK-263) — reach the operator in the hub's own words through `hubErrorMessage`, like
+  every other command (XERK-264).
 - **One Sessions search box, doing both halves (XERK-243).** The web sidebar's single box searches the
   archive only, hiding the live lists while a query is up. Android's box filters the live/queued/ended
   lists as you type AND, past two characters, appends an "In history" section of archive full-text

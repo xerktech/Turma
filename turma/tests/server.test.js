@@ -60,6 +60,11 @@ process.env.ORG_COLORS_FILE = path.join(
   os.tmpdir(),
   `turma-test-org-colors-${process.pid}.json`
 );
+// The migration relay spools transcript bundles to disk (XERK-263) and sweeps
+// its whole directory at boot, so it gets a throwaway one of its own — sharing
+// /data/migrations, or one dir across test files, would have each sweep delete
+// the others' spools.
+process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-migrations-"));
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -123,7 +128,8 @@ const {
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
   orgColors, setOrgColor,
-  migrations, advanceMigrations,
+  migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
+  dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
 } = hub;
 
@@ -5992,19 +5998,33 @@ const migHost = (device, site, {
   });
 
 // A raw-body request (the JSON `request` helper can't carry an octet-stream).
-function requestRaw(method, pathName, { body, headers } = {}) {
+//
+// It TIMES OUT rather than waiting forever. A route that stops answering — the
+// spool relay has two failure paths that could, and both were live bugs — would
+// otherwise hang whichever test reached it and take the CI job's whole budget
+// with it, reported as a timeout with no failing assertion to read. The
+// sentinel status makes the assertion that was going to run fail instead.
+const RAW_REQUEST_TIMEOUT_MS = 10_000;
+function requestRaw(method, pathName, { body, headers, timeoutMs = RAW_REQUEST_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      req.destroy();
+      resolve({ status: `no reply in ${timeoutMs}ms — the route hung`, body: null,
+        buf: Buffer.alloc(0), headers: {} });
+    }, timeoutMs);
+    timer.unref?.(); // never hold the loop open on its own
     const req = http.request(baseUrl + pathName, { method, headers }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
+        clearTimeout(timer);
         const buf = Buffer.concat(chunks);
         let parsed = null;
         try { parsed = JSON.parse(buf.toString()); } catch {}
         resolve({ status: res.statusCode, body: parsed, buf, headers: res.headers });
       });
     });
-    req.on("error", reject);
+    req.on("error", (e) => { clearTimeout(timer); reject(e); });
     if (body) req.write(body);
     req.end();
   });
@@ -6069,6 +6089,12 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(up.status, 200);
   const m = migrations.get(mid);
   assert.equal(m.phase, "importing");
+  // It landed on DISK, not in the record — that is the whole point of XERK-263.
+  assert.equal(m.blob, undefined);
+  const spoolFile = m.blobPath;
+  assert.equal(spoolFile, path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`));
+  assert.equal(m.blobSize, blob.length);
+  assert.ok(blob.equals(fs.readFileSync(spoolFile)));
   const imp = agents.mgB.commands.find((c) => c.type === "importSession");
   assert.ok(imp);
   assert.equal(imp.migrationId, mid);
@@ -6103,8 +6129,11 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(after.targetSessionId, "new1");
   assert.ok(agents.mgA.commands.some((c) => c.type === "kill" && c.sessionId === "s1"),
     "source session should be killed once the target is up");
-  // The blob is freed on handoff.
-  assert.equal(after.blob, null);
+  // The bundle is freed on handoff — the record's pointer AND the spool file
+  // (XERK-263): a leaked file is 65 MiB of disk nothing comes back for.
+  assert.equal(after.blobPath, null);
+  assert.equal(fs.existsSync(spoolFile), false,
+    "the spool file should be unlinked once the migration is done");
 });
 
 test("migrate: a second move of the same session is single-flighted", async () => {
@@ -6121,12 +6150,237 @@ test("migrate: a stalled move times out and frees its blob", async () => {
   await migHost("toA", "to.atlassian.net");
   await migHost("toB", "to.atlassian.net");
   const r = await migrate("toA", "s1", { host: "toB" });
-  const m = migrations.get(r.body.migrationId);
+  const mid = r.body.migrationId;
+  const m = migrations.get(mid);
+  const up = await requestRaw("POST", `/api/agents/toA/migrations/${mid}/blob`,
+    { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } });
+  assert.equal(up.status, 200);
+  const spoolFile = m.blobPath;
+  assert.ok(fs.existsSync(spoolFile));
   m.startedAt = Date.now() - 10 * 60 * 1000; // well past MIGRATE_TIMEOUT_MS
   advanceMigrations();
   assert.equal(m.phase, "failed");
   assert.match(m.error, /timed out/);
-  assert.equal(m.blob, null);
+  assert.equal(m.blobPath, null);
+  await new Promise((r2) => setTimeout(r2, 30)); // the unlink is async
+  assert.equal(fs.existsSync(spoolFile), false,
+    "a timed-out move must not leave its spool file behind");
+});
+
+test("migrate: an empty bundle is refused and leaves no spool file", async () => {
+  await migHost("emA", "em.atlassian.net");
+  await migHost("emB", "em.atlassian.net");
+  const r = await migrate("emA", "s1", { host: "emB" });
+  const mid = r.body.migrationId;
+  const up = await requestRaw("POST", `/api/agents/emA/migrations/${mid}/blob`,
+    { headers: { authorization: "Bearer agenttok", "content-length": "0" } });
+  // The uniform 404 every other POST refusal answers (XERK-266) — the point is
+  // that this one is indistinguishable from a stranger's probe.
+  assert.equal(up.status, 404);
+  assert.match(up.body.error, /unknown migration/);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "exporting"); // still awaiting a real bundle
+  assert.equal(m.blobPath, null);
+  await new Promise((r2) => setTimeout(r2, 30));
+  assert.equal(fs.existsSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`)), false);
+});
+
+test("migrate: a bundle past the cap is refused 413 and spools nothing", async () => {
+  await migHost("bigA", "big.atlassian.net");
+  await migHost("bigB", "big.atlassian.net");
+  const r = await migrate("bigA", "s1", { host: "bigB" });
+  const mid = r.body.migrationId;
+  // Past MIGRATE_BLOB_MAX (65 MiB), but WELL inside RAW_BODY_DRAIN_SLACK — the
+  // 413 only holds while the route is still draining, and a body sized to the
+  // exact slack boundary would make this test one byte from flaking. The route
+  // must answer on the same connection rather than hanging the socket up on the
+  // agent, and must not leave the partial spool behind.
+  const over = Buffer.alloc((1 << 26) + (1 << 20) + 4096, 0x41);
+  const up = await requestRaw("POST", `/api/agents/bigA/migrations/${mid}/blob`,
+    { body: over, headers: { authorization: "Bearer agenttok" } });
+  assert.equal(up.status, 413);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /too large/);
+  assert.equal(m.blobPath, null);
+  await new Promise((r2) => setTimeout(r2, 50));
+  assert.equal(fs.existsSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`)), false,
+    "a rejected upload must not leave a partial spool file");
+});
+
+test("migrate: a second upload for one migration can't interleave into the spool", async () => {
+  // The phase only flips to `importing` once the first upload finishes writing,
+  // so without the `uploading` guard two concurrent POSTs would both pass the
+  // phase check and write into the SAME file, producing a corrupt bundle.
+  await migHost("dupA", "dup.atlassian.net");
+  await migHost("dupB", "dup.atlassian.net");
+  const r = await migrate("dupA", "s1", { host: "dupB" });
+  const mid = r.body.migrationId;
+  const hdr = { authorization: "Bearer agenttok" };
+  const [a, b] = await Promise.all([
+    requestRaw("POST", `/api/agents/dupA/migrations/${mid}/blob`,
+      { body: Buffer.alloc(1 << 20, 0x41), headers: hdr }),
+    requestRaw("POST", `/api/agents/dupA/migrations/${mid}/blob`,
+      { body: Buffer.alloc(1 << 20, 0x42), headers: hdr }),
+  ]);
+  const codes = [a.status, b.status].sort();
+  assert.deepEqual(codes, [200, 404]);
+  const loser = a.status === 404 ? a : b;
+  // The loser is REFUSED, not hung up on: it must read a real reply — and it is
+  // the same 404 as every other POST refusal (XERK-266), not a distinct status
+  // that would name the source to anyone holding the id.
+  assert.match(loser.body.error, /unknown migration/);
+  const spooled = fs.readFileSync(migrations.get(mid).blobPath);
+  assert.equal(spooled.length, 1 << 20);
+  assert.equal(new Set(spooled).size, 1, "the spool must hold ONE upload's bytes, not two interleaved");
+});
+
+test("migrate: a spool that can't be written fails the move, and doesn't hang", async () => {
+  // Stand in for the disk saying no (ENOSPC/EACCES/EDQUOT): a DIRECTORY where
+  // the spool file goes makes the write stream error. The route must answer —
+  // an unanswerable POST would leave the source agent, which never retries,
+  // waiting out the whole migration timeout.
+  await migHost("errA", "err.atlassian.net");
+  await migHost("errB", "err.atlassian.net");
+  const r = await migrate("errA", "s1", { host: "errB" });
+  const mid = r.body.migrationId;
+  fs.mkdirSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true });
+  // requestRaw times out on its own, so an unanswerable POST fails on this
+  // assertion rather than by running the whole CI job out of time.
+  const up = await requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
+    { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" }, timeoutMs: 2000 });
+  // Uniform with every other POST refusal (XERK-266) — a status of its own
+  // would name the source the moment the hub's disk misbehaved. It also can't
+  // hand the agent the hub's filesystem layout; that detail goes to the log.
+  assert.equal(up.status, 404);
+  assert.match(up.body.error, /unknown migration/);
+  assert.doesNotMatch(up.body.error, /\//);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.equal(m.blobPath, null);
+  assert.equal(agents.errB.commands.some((c) => c.type === "importSession"), false,
+    "a bundle that never landed must not queue an import");
+  fs.rmSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true, force: true });
+});
+
+test("migrate: a download racing the migration's settle is not truncated", async () => {
+  // dropMigrationBlob zeroes blobPath/blobSize, and the unlink leaves an open
+  // read valid — so a GET that read the size AFTER its first async hop served
+  // the whole body under `Content-Length: 0`, which the agent's reader takes
+  // for an empty bundle. The response must describe what it actually sends.
+  await migHost("rcA", "rc.atlassian.net");
+  await migHost("rcB", "rc.atlassian.net");
+  const r = await migrate("rcA", "s1", { host: "rcB" });
+  const mid = r.body.migrationId;
+  const blob = Buffer.alloc(1 << 19, 0x5a);
+  await requestRaw("POST", `/api/agents/rcA/migrations/${mid}/blob`,
+    { body: blob, headers: { authorization: "Bearer agenttok" } });
+  const m = migrations.get(mid);
+  // The window is between `createReadStream` and its `open` event, which a
+  // sleep can only straddle by luck — timed from out here this caught a
+  // reintroduced bug once in five runs, and a drop that lands EARLY hides in a
+  // legitimate 404. So land the settle in the window by construction: patch the
+  // one call that opens it, exactly where the race would put the settle.
+  const realCreateReadStream = fs.createReadStream;
+  let dropped = false;
+  fs.createReadStream = function (p, ...rest) {
+    const s = realCreateReadStream.call(fs, p, ...rest);
+    // On `open`, and registered BEFORE the route's own open handler so it runs
+    // first: that is the production window exactly — the descriptor exists (so
+    // the unlink can't stop the read) but the response header hasn't been
+    // written yet. Dropping any earlier just races the open and 404s, which is
+    // a different, harmless outcome.
+    if (p === m.blobPath) s.once("open", () => { dropMigrationBlob(m); dropped = true; });
+    return s;
+  };
+  let got;
+  try {
+    got = await requestRaw("GET", `/api/agents/rcB/migrations/${mid}/blob`,
+      { headers: { authorization: "Bearer agenttok" } });
+  } finally {
+    fs.createReadStream = realCreateReadStream;
+  }
+  assert.ok(dropped, "the settle must land inside the window, or this proves nothing");
+  // The unlink leaves this read's fd valid, so the bytes still arrive. What
+  // must never happen is a 200 whose length disagrees with what it sends: the
+  // agent's reader believes the header and takes a `Content-Length: 0` for an
+  // empty bundle.
+  assert.equal(got.status, 200);
+  assert.equal(Number(got.headers["content-length"]), got.buf.length);
+  assert.ok(blob.equals(got.buf), "the target must get every byte it was promised");
+});
+
+test("migrate: the spool path can only ever be a hub-minted id", async () => {
+  // The comment says the filename comes from the hub-minted id and not from the
+  // agent's path segment; this is what makes that true rather than a promise
+  // about today's one caller. Nothing here should be reachable from a route —
+  // that is the point of asserting it directly.
+  assert.equal(migrationSpoolPath("0123456789abcdef"),
+    path.join(MIGRATE_SPOOL_DIR, "0123456789abcdef.bin"));
+  for (const bad of ["../../etc/passwd", "0123456789abcde/", "0123456789ABCDEF",
+                     "0123456789abcdefff", "..", "", null, undefined]) {
+    assert.throws(() => migrationSpoolPath(bad), /did not mint/, `should refuse ${bad}`);
+  }
+});
+
+test("migrate: the boot sweep deletes only spool files, never a neighbour", async () => {
+  // MIGRATE_SPOOL_DIR is deployment config. Pointed at /data by a compose slip,
+  // an unfiltered sweep would delete state.json and devices.json on boot.
+  const mine = path.join(MIGRATE_SPOOL_DIR, "0123456789abcdef.bin");
+  const theirs = path.join(MIGRATE_SPOOL_DIR, "state.json");
+  fs.writeFileSync(mine, "bundle");
+  fs.writeFileSync(theirs, "{}");
+  sweepMigrationSpool();
+  assert.equal(fs.existsSync(mine), false);
+  assert.equal(fs.existsSync(theirs), true, "the sweep must not touch a name it didn't write");
+  fs.unlinkSync(theirs);
+});
+
+test("migrate: too many moves in flight is refused, not spooled", async () => {
+  // Each in-flight move can hold a 65 MiB bundle on /data, so the hub caps how
+  // many can be doing that at once (XERK-263). The refusal lands on the
+  // OPERATOR's click, where it can be shown, never on the agent's upload.
+  await migHost("cpA", "cp.atlassian.net", {
+    extraSessions: ["s2", "s3", "s4", "s5"].map((id) => ({
+      id, status: "running", root: false, repo: "Turma", transcriptId: "trans-" + id,
+      worktreePath: `/git/.turma/worktrees/Turma/${id}`,
+    })),
+  });
+  await migHost("cpB", "cp.atlassian.net");
+  // The cap is fleet-wide (so is /data), so settle what earlier cases left in
+  // flight rather than counting on an empty map — and settle this case's own
+  // moves on the way out, or it hands every later test a fleet already at the
+  // cap and their migrate() calls come back 503.
+  const settleInFlight = () => {
+    for (const m of migrations.values()) {
+      if (m.phase === "exporting" || m.phase === "importing") m.phase = "failed";
+    }
+  };
+  settleInFlight();
+  try {
+  for (const id of ["s1", "s2", "s3", "s4"]) {
+    assert.equal((await migrate("cpA", id, { host: "cpB" })).status, 200, id);
+  }
+  const over = await migrate("cpA", "s5", { host: "cpB" });
+  assert.equal(over.status, 503);
+  assert.match(over.body.error, /too many moves in flight/);
+  // Settling one frees the slot again.
+  const first = [...migrations.values()].find(
+    (m) => m.srcHost === "cpA" && m.srcSessionId === "s1");
+  first.phase = "failed";
+  assert.equal((await migrate("cpA", "s5", { host: "cpB" })).status, 200);
+  } finally {
+    settleInFlight();
+  }
+});
+
+test("migrate: the boot sweep clears spool files a restart orphaned", async () => {
+  // The records live in memory, so a restart abandons every in-flight move; the
+  // files it was relaying belong to nobody and must not survive.
+  const orphan = path.join(MIGRATE_SPOOL_DIR, "deadbeefdeadbeef.bin");
+  fs.writeFileSync(orphan, "orphaned bundle");
+  sweepMigrationSpool();
+  assert.equal(fs.existsSync(orphan), false);
 });
 
 test("migrate: the blob relay rejects an unauthenticated caller", async () => {
@@ -6161,7 +6415,7 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
     { body: Buffer.from("ATTACKER-BYTES"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
   assert.equal(inject.status, 404);
   assert.equal(migrations.get(mid).phase, "exporting");
-  assert.equal(migrations.get(mid).blob, null);
+  assert.equal(migrations.get(mid).blobPath, null);
   assert.ok(!agents.hsB.commands.some((c) => c.type === "importSession"));
 
   // The POST compare is EXACT, and this has to be asked while the migration is
@@ -6206,7 +6460,8 @@ test("migrate: every POST refusal is the same 404, so the responses name no host
   // `<host>` is self-asserted (XERK-268), so any refusal a NON-source can't
   // also get names the source to anyone holding the id — and then the injection
   // above is a matter of re-addressing. The refusals are therefore uniform: a
-  // wrong host, a wrong phase and an empty body must be indistinguishable.
+  // wrong host, a wrong phase, an empty body and a spool that could not be
+  // written must be indistinguishable.
   // This pins the RESPONSES only. The route still leaks the source through the
   // timing of an accepted vs rejected POST, which no test here can close —
   // see the route's comment; that one needs XERK-268.
@@ -6240,7 +6495,7 @@ test("migrate: every POST refusal is the same 404, so the responses name no host
   assert.deepEqual(unknown.body, rePost.body);
   // The re-POST didn't disturb the move it was refused from.
   assert.equal(migrations.get(mid).phase, "importing");
-  assert.ok(migrations.get(mid).blob.equals(Buffer.from("REAL")));
+  assert.ok(fs.readFileSync(migrations.get(mid).blobPath).equals(Buffer.from("REAL")));
 
   // The refusal AFTER the body read counts too: only the real source can reach
   // "source session gone", so a status of its own would name it. The reply is
