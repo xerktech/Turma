@@ -246,6 +246,44 @@ test("http: a host INSIDE its share is not refused for someone else's bulk", asy
   assert.ok(registryBytes() <= AGENTS_TOTAL_MAX + AGENTS_MAX * AGENT_FAIR_SHARE);
 });
 
+test("http: the share exemption's overshoot is bounded at 2x the budget", async () => {
+  // The exemption admits an at-or-under-share host REGARDLESS of the budget, so
+  // the aggregate is a soft total. Drive the worst case and hold the bound:
+  //   * a fat beat is accepted only while the whole registry fits, so the fat
+  //     records sum to at most the budget;
+  //   * every exempt host is inside its share and there are at most AGENTS_MAX
+  //     of them, so they sum to at most AGENTS_MAX x share = the budget again.
+  // Hence 2x, and never the container.
+  resetRegistry();
+  // Only a GROWING host can overshoot. A new device is admitted only while the
+  // registry is inside the budget (`makeRegistryRoom(0, 1)`), so the flood path
+  // cannot reach past it — the exemption is reachable only by hosts that were
+  // already seated. Seat the worst case first: one host holding most of the
+  // budget, and the rest of the slots.
+  assert.equal((await beat(chunky("fat-1", 560))).status, 200);
+  for (let i = 0; i < AGENTS_MAX - 1; i++) {
+    assert.equal((await beat({ device: `snug-${i}` })).status, 200);
+  }
+  assert.equal(Object.keys(agents).length, AGENTS_MAX);
+  // A further fat beat is capped by the budget, which is what bounds the fat
+  // half at one budget's worth.
+  assert.equal((await beat(chunky("fat-1", 900))).status, 429);
+
+  // Now grow every seated host to just inside its share. Each is exempt, so all
+  // of them land — this is the overshoot, and it is the whole of it.
+  const snugKiB = Math.floor((AGENT_FAIR_SHARE - 4096) / 1024);
+  for (let i = 0; i < AGENTS_MAX - 1; i++) {
+    assert.equal((await beat(chunky(`snug-${i}`, snugKiB))).status, 200, `snug-${i}`);
+  }
+  assert.ok(registryBytes() > AGENTS_TOTAL_MAX, "the rig must actually be overshooting");
+  assert.ok(
+    registryBytes() <= 2 * AGENTS_TOTAL_MAX,
+    `overshoot ${registryBytes()} exceeded 2x the ${AGENTS_TOTAL_MAX} budget`
+  );
+  // And no new host can be seated while it overshoots, so it cannot compound.
+  assert.equal((await beat({ device: "latecomer" })).status, 429);
+});
+
 test("http: an over-share refusal leaves the host's PREVIOUS record intact", async () => {
   resetRegistry();
   assert.equal((await beat({ device: "grower", repos: [{ name: "r1" }] })).status, 200);
