@@ -103,6 +103,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   auto-follows the moved session onto its new host (`advanceMigrationFollow`); Android just lets it
   reappear in the session list on its new host (no stage to follow on a phone), so the "Moving…" card
   hint and the follow are web-only.
+  - **P1 gap, `FleetViewModel.run` (XERK-263):** Retrofit throws on any non-2xx, so every refusal the
+    hub words for the operator — the `/migrate` 409s, and now its 503 when too many moves are in
+    flight — reaches the phone as "✗ hub unreachable". The web toasts `out.error` verbatim. Not
+    Move-specific: `run()` is every session/board action, so the fix is to read the error body off
+    `HttpException` there once. Tracked in XERK-271.
 - **One Sessions search box, doing both halves (XERK-243).** The web sidebar's single box searches the
   archive only, hiding the live lists while a query is up. Android's box filters the live/queued/ended
   lists as you type AND, past two characters, appends an "In history" section of archive full-text

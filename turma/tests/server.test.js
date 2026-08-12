@@ -129,6 +129,7 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   orgColors, setOrgColor,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
+  dropMigrationBlob,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
 } = hub;
 
@@ -6173,10 +6174,12 @@ test("migrate: a bundle past the cap is refused 413 and spools nothing", async (
   await migHost("bigB", "big.atlassian.net");
   const r = await migrate("bigA", "s1", { host: "bigB" });
   const mid = r.body.migrationId;
-  // 66 MiB — past MIGRATE_BLOB_MAX (65 MiB). The route must answer on the same
-  // connection rather than hanging the socket up on the agent, and must not
-  // leave the partial spool behind.
-  const over = Buffer.alloc((1 << 26) + (2 << 20), 0x41);
+  // Past MIGRATE_BLOB_MAX (65 MiB), but WELL inside RAW_BODY_DRAIN_SLACK — the
+  // 413 only holds while the route is still draining, and a body sized to the
+  // exact slack boundary would make this test one byte from flaking. The route
+  // must answer on the same connection rather than hanging the socket up on the
+  // agent, and must not leave the partial spool behind.
+  const over = Buffer.alloc((1 << 26) + (1 << 20) + 4096, 0x41);
   const up = await requestRaw("POST", `/api/agents/bigA/migrations/${mid}/blob`,
     { body: over, headers: { authorization: "Bearer agenttok" } });
   assert.equal(up.status, 413);
@@ -6187,6 +6190,94 @@ test("migrate: a bundle past the cap is refused 413 and spools nothing", async (
   await new Promise((r2) => setTimeout(r2, 50));
   assert.equal(fs.existsSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`)), false,
     "a rejected upload must not leave a partial spool file");
+});
+
+test("migrate: a second upload for one migration can't interleave into the spool", async () => {
+  // The phase only flips to `importing` once the first upload finishes writing,
+  // so without the `uploading` guard two concurrent POSTs would both pass the
+  // phase check and write into the SAME file, producing a corrupt bundle.
+  await migHost("dupA", "dup.atlassian.net");
+  await migHost("dupB", "dup.atlassian.net");
+  const r = await migrate("dupA", "s1", { host: "dupB" });
+  const mid = r.body.migrationId;
+  const hdr = { authorization: "Bearer agenttok" };
+  const [a, b] = await Promise.all([
+    requestRaw("POST", `/api/agents/dupA/migrations/${mid}/blob`,
+      { body: Buffer.alloc(1 << 20, 0x41), headers: hdr }),
+    requestRaw("POST", `/api/agents/dupA/migrations/${mid}/blob`,
+      { body: Buffer.alloc(1 << 20, 0x42), headers: hdr }),
+  ]);
+  const codes = [a.status, b.status].sort();
+  assert.deepEqual(codes, [200, 409]);
+  const loser = a.status === 409 ? a : b;
+  // The loser is REFUSED, not hung up on: it must read a real reply.
+  assert.match(loser.body.error, /already uploading|not awaiting a bundle/);
+  const spooled = fs.readFileSync(migrations.get(mid).blobPath);
+  assert.equal(spooled.length, 1 << 20);
+  assert.equal(new Set(spooled).size, 1, "the spool must hold ONE upload's bytes, not two interleaved");
+});
+
+test("migrate: a spool that can't be written fails the move, and doesn't hang", async () => {
+  // Stand in for the disk saying no (ENOSPC/EACCES/EDQUOT): a DIRECTORY where
+  // the spool file goes makes the write stream error. The route must answer —
+  // an unanswerable POST would leave the source agent, which never retries,
+  // waiting out the whole migration timeout.
+  await migHost("errA", "err.atlassian.net");
+  await migHost("errB", "err.atlassian.net");
+  const r = await migrate("errA", "s1", { host: "errB" });
+  const mid = r.body.migrationId;
+  fs.mkdirSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true });
+  const up = await requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
+    { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } });
+  assert.equal(up.status, 500);
+  // The reply must not hand the agent the hub's filesystem layout.
+  assert.doesNotMatch(up.body.error, /\//);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.equal(m.blobPath, null);
+  assert.equal(agents.errB.commands.some((c) => c.type === "importSession"), false,
+    "a bundle that never landed must not queue an import");
+  fs.rmSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true, force: true });
+});
+
+test("migrate: a download racing the migration's settle is not truncated", async () => {
+  // dropMigrationBlob zeroes blobPath/blobSize, and the unlink leaves an open
+  // read valid — so a GET that read the size AFTER its first async hop served
+  // the whole body under `Content-Length: 0`, which the agent's reader takes
+  // for an empty bundle. The response must describe what it actually sends.
+  await migHost("rcA", "rc.atlassian.net");
+  await migHost("rcB", "rc.atlassian.net");
+  const r = await migrate("rcA", "s1", { host: "rcB" });
+  const mid = r.body.migrationId;
+  const blob = Buffer.alloc(1 << 19, 0x5a);
+  await requestRaw("POST", `/api/agents/rcA/migrations/${mid}/blob`,
+    { body: blob, headers: { authorization: "Bearer agenttok" } });
+  const m = migrations.get(mid);
+  const dl = requestRaw("GET", `/api/agents/rcB/migrations/${mid}/blob`,
+    { headers: { authorization: "Bearer agenttok" } });
+  await new Promise((r2) => setTimeout(r2, 1)); // let the handler open the file
+  dropMigrationBlob(m); // the settle lands mid-download
+  const got = await dl;
+  // Either outcome is correct — the drop won the race and this is a clean 404,
+  // or the read was already under way and must be COMPLETE and correctly
+  // framed. What must never happen is a 200 whose length doesn't describe it.
+  if (got.status === 404) return;
+  assert.equal(got.status, 200);
+  assert.equal(Number(got.headers["content-length"]), got.buf.length);
+  assert.ok(blob.equals(got.buf), "the target must get every byte it was promised");
+});
+
+test("migrate: the boot sweep deletes only spool files, never a neighbour", async () => {
+  // MIGRATE_SPOOL_DIR is deployment config. Pointed at /data by a compose slip,
+  // an unfiltered sweep would delete state.json and devices.json on boot.
+  const mine = path.join(MIGRATE_SPOOL_DIR, "0123456789abcdef.bin");
+  const theirs = path.join(MIGRATE_SPOOL_DIR, "state.json");
+  fs.writeFileSync(mine, "bundle");
+  fs.writeFileSync(theirs, "{}");
+  sweepMigrationSpool();
+  assert.equal(fs.existsSync(mine), false);
+  assert.equal(fs.existsSync(theirs), true, "the sweep must not touch a name it didn't write");
+  fs.unlinkSync(theirs);
 });
 
 test("migrate: too many moves in flight is refused, not spooled", async () => {
