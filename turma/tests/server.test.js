@@ -6501,10 +6501,16 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
       `a lone surrogate survived: ${JSON.stringify(evil)}`);
   }
   // The guarantee is the whole XML-ILLEGAL class, not just surrogates: a C0
-  // control kills `uiautomator dump` the same way (a 0-byte file), and closing
-  // only the case that bit us leaves the next one to be rediscovered.
+  // control and the noncharacters U+FFFE/U+FFFF each kill `uiautomator dump`
+  // the same way (a 0-byte file), and closing only the case that bit us leaves
+  // the next one to be rediscovered — which is how the second and third of
+  // these were found, one pass apart.
   const ctl = norm({ available: true, model: "qwen\x01ctl\x00nul\x0bvt\x7fdel" });
   assert.equal(ctl.model, "qwenctlnulvtdel");
+  assert.equal(norm({ available: true, model: "qwen\uffffbad\ufffemore" }).model, "qwenbadmore");
+  // ...but U+FDD0 and U+1FFFE are LEGAL XML and must survive: over-stripping
+  // would mangle a name for no reason.
+  assert.equal(norm({ available: true, model: "a\ufdd0b\u{1FFFE}c" }).model, "a\ufdd0b\u{1FFFE}c");
   // Tab/newline/CR are legal XML and are only trimmed at the edges.
   assert.equal(norm({ available: true, model: "  a\tb  " }).model, "a\tb");
 
@@ -6536,12 +6542,62 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   assert.deepEqual(restored.localModel,
     { available: false, model: null, contextTokens: null });
 
+  // The durable form of "the restore can't fall behind the ingest": both go
+  // through ONE function, so there is no list here to keep in step. A previous
+  // version of this test named three coercions and therefore could not notice
+  // the fourth (`sanitizeLiveAgents`) missing from the restore — enumerating is
+  // exactly the shape that let the hole exist.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const loader = src.slice(src.indexOf("agents = JSON.parse"), src.indexOf("first boot or no volume"));
-  for (const fn of ["normalizeUsage", "normalizeLimits", "normalizeLocalModel"]) {
-    assert.ok(loader.includes(`${fn}(a)`),
-      `${fn} is applied at ingest but NOT on the state.json restore`);
+  assert.ok(/normalizeRecord\(a\)/.test(loader),
+    "the state.json restore must go through normalizeRecord, like the ingest path");
+  const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'), src.indexOf("const key = payload.device"));
+  assert.ok(/normalizeRecord\(payload\)/.test(ingest),
+    "the heartbeat ingest must go through the same normalizeRecord");
+});
+
+test("the restore actually RUNS — it must not throw into its own catch", () => {
+  // The restore sits at module init inside `try { … } catch {}`, so anything it
+  // throws is swallowed and the record loads HALF-coerced with no log line and
+  // no error. That is not hypothetical: `sanitizeLiveAgents` reads two module
+  // `const`s that were declared 1700 lines BELOW the restore, i.e. in their
+  // temporal dead zone at that moment — the localModel half was applied, the
+  // session half silently was not, and every suite stayed green.
+  //
+  // Held structurally: every identifier the restore path reaches must be
+  // declared above it.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const lineOf = (needle) => src.slice(0, src.indexOf(needle)).split("\n").length;
+  const restoreLine = lineOf("for (const a of Object.values(agents)) normalizeRecord(a)");
+  for (const c of ["LIVE_AGENTS_MAX", "LIVE_AGENT_FIELD_MAX"]) {
+    assert.ok(lineOf(`const ${c} =`) < restoreLine,
+      `${c} is declared below the state.json restore, so reading it there throws`);
   }
+});
+
+test("normalizeSessions coerces the per-session fields Android types", () => {
+  // Typing a field on `SessionInfo` is what makes it decode-fatal: before that
+  // `ignoreUnknownKeys` skipped it and any value was harmless. `modelSource`
+  // and `modelSourceAt` were typed by XERK-246, so they are coerced from it.
+  const payload = {
+    device: "h",
+    sessions: [
+      { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"] },
+      { id: "s2", modelSource: "local", modelSourceAt: "2026-08-11T00:00:00Z" },
+      { id: "s3", session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+      null,
+    ],
+  };
+  hub.normalizeRecord(payload);
+  assert.equal(payload.sessions[0].modelSource, "");
+  assert.equal(payload.sessions[0].modelSourceAt, "");
+  assert.equal(payload.sessions[1].modelSource, "local");        // good values untouched
+  assert.equal(payload.sessions[1].modelSourceAt, "2026-08-11T00:00:00Z");
+  assert.deepEqual(payload.sessions[2].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+  // A session that never carried the keys must not gain them — an older agent's
+  // payload has to stay byte-identical.
+  hub.normalizeRecord({ device: "h", sessions: [{ id: "s4" }] });
 });
 
 test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async () => {

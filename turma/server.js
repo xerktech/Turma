@@ -90,6 +90,15 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// Bounds for a session's live agent rows (sanitizeLiveAgents, far below). They
+// live UP HERE, away from their function, because the state.json restore runs
+// at module init and calls that function: a `const` declared later is in its
+// temporal dead zone then, so reading one throws a ReferenceError that the
+// restore's own `catch {}` swallows — the record loads half-coerced and says
+// nothing. Any constant a restore-path function reads has to be declared above
+// the restore.
+const LIVE_AGENTS_MAX = 32;
+const LIVE_AGENT_FIELD_MAX = 400;
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -363,20 +372,14 @@ const liveClients = {};
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
   agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  // Records written before the ingest-side coercions below (and any host that
-  // is OFFLINE, so no beat will ever rewrite its record) carry whatever shape
-  // was current when they were saved — normalize what we LOAD, not just what
-  // arrives. Every coercion the ingest path applies has to be applied here too,
-  // or the restore is a hole straight through it: the first `/api/agents` after
-  // a hub restart serves the raw record, which for a wrong-typed block means
-  // Android's atomic decode throws and the fleet vanishes from the phone. That
-  // window is one beat for a live host and up to the whole record life for an
-  // offline one — and a hub restart is exactly when a new coercion ships.
-  for (const a of Object.values(agents)) {
-    normalizeUsage(a);
-    normalizeLimits(a);
-    normalizeLocalModel(a);
-  }
+  // Records written before a coercion existed — and any host that is OFFLINE,
+  // so no beat will ever rewrite its record — carry whatever shape was current
+  // when they were saved. Normalize what we LOAD, not just what arrives: the
+  // first `/api/agents` after a restart serves the raw record, and a hub
+  // restart is exactly when a new coercion ships. `normalizeRecord` is shared
+  // with the ingest path so the two cannot drift; adding a coercion in one
+  // place covers both. Tests: `the state.json restore coerces too`.
+  for (const a of Object.values(agents)) normalizeRecord(a);
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
 } catch {
   /* first boot or no volume mounted */
@@ -1124,7 +1127,7 @@ function normalizeLocalModel(payload) {
   const name = typeof lm.model === "string"
     ? [...lm.model
         .replace(/\p{Surrogate}/gu, "�")     // unpaired halves -> replacement
-        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")  // XML-illegal controls
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]/g, "")  // XML-illegal
         .trim()]
       .slice(0, 60).join("")
     : "";
@@ -1797,15 +1800,54 @@ function sanitizeHeartbeat(payload, key) {
   // session's live agent rows come from a pane scrape and are re-shaped and
   // bounded here for the same reason the `turn` frame's are — the clients turn
   // this list into a count and a label, and nothing else bounds it.
-  if (Array.isArray(payload.sessions)) {
-    for (const s of payload.sessions) {
-      const live = s && typeof s === "object" ? s.session : null;
-      if (live && typeof live === "object" && "agents" in live) {
-        live.agents = sanitizeLiveAgents(live.agents) || [];
-      }
+  normalizeSessions(payload);
+  return payload;
+}
+
+/**
+ * Every coercion an agent record needs before a client sees it, in ONE place.
+ *
+ * Called from the heartbeat ingest and from the `state.json` restore, because a
+ * coercion applied at only one of those is a hole straight through itself: the
+ * restore serves whatever was persisted, for one beat on a live host and up to
+ * the record's whole life on an offline one. Add a new `normalize*` HERE and
+ * both paths get it.
+ *
+ * The stakes are Android's: `/api/agents` decodes atomically into typed fields,
+ * so one host's wrong-typed value throws for the whole array and every OTHER
+ * host silently disappears from that phone.
+ */
+function normalizeRecord(a) {
+  normalizeUsage(a);
+  normalizeLimits(a);
+  normalizeLocalModel(a);
+  normalizeSessions(a);
+}
+
+// The per-SESSION coercions (see normalizeRecord).
+//
+// `sessions` is a KNOWN key, so sanitizeHeartbeat's unknown-field sweep never
+// looks inside it — everything typed under a session has to be handled here.
+// Android decodes /api/agents into typed fields, so an object or array where it
+// expects a String throws for the WHOLE array and every other host disappears
+// from that phone; a field only becomes this dangerous once a client TYPES it,
+// which is why `modelSource`/`modelSourceAt` are here from the commit that
+// declared them on `SessionInfo`.
+function normalizeSessions(payload) {
+  if (!Array.isArray(payload?.sessions)) return;
+  for (const s of payload.sessions) {
+    if (!s || typeof s !== "object") continue;
+    // Live agent rows come from a pane scrape: re-shaped and bounded for the
+    // same reason the `turn` frame's are — clients turn this into a count and
+    // a label, and nothing else bounds it.
+    const live = s.session;
+    if (live && typeof live === "object" && "agents" in live) {
+      live.agents = sanitizeLiveAgents(live.agents) || [];
+    }
+    for (const k of ["modelSource", "modelSourceAt"]) {
+      if (k in s && typeof s[k] !== "string") s[k] = "";
     }
   }
-  return payload;
 }
 
 // Thrown past the cap so a route can answer 413 instead of leaking a generic
@@ -2115,8 +2157,6 @@ function fmtDur(ms) {
 // and cost that repaint; the cap matches the agent's own PANE_AGENTS_MAX.
 // `null` (not `[]`) for a frame with no `agents` key at all, so the chat can
 // tell "this agent can't report them" from "no agents are running".
-const LIVE_AGENTS_MAX = 32;
-const LIVE_AGENT_FIELD_MAX = 400;
 function sanitizeLiveAgents(raw) {
   if (!Array.isArray(raw)) return null;
   const out = [];
@@ -3476,9 +3516,11 @@ const server = http.createServer(async (req, res) => {
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
-      normalizeUsage(payload);
-      normalizeLimits(payload);
-      normalizeLocalModel(payload);
+      // One shared coercion, also applied on the state.json restore — see
+      // normalizeRecord. sanitizeHeartbeat above has already run the per-session
+      // half; running it again is idempotent and keeps this one call the answer
+      // to "what does a record get coerced by".
+      normalizeRecord(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.
@@ -5208,9 +5250,11 @@ if (process.env.TURMA_TEST) {
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
     HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
-    // Ingest coercion for the local-model block. Exported for the same reason
-    // as the rest of this group: Android decodes /api/agents atomically, so one
-    // host's wrong-typed field hides the WHOLE fleet from that phone (XERK-246).
+    // Ingest coercion, exported for the same reason as the rest of this group:
+    // Android decodes /api/agents atomically, so one host's wrong-typed field
+    // hides the WHOLE fleet from that phone (XERK-246). `normalizeRecord` is
+    // the one both the ingest path and the state.json restore call.
+    normalizeRecord,
     normalizeLocalModel,
 
     queueCommand,

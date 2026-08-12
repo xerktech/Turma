@@ -370,13 +370,17 @@ started `-read-only`, which is why you cannot simply reuse the shared one.
   `ChatScreen` and `BoardScreen` do collect. Drive error-wording checks from the
   Dashboard or the chat, never the session list.
 - **XML-illegal characters in the payload make `uiautomator dump` die** —
-  `rc=137`, a 0-byte file, and every tap resolved from it misses, while the app
-  itself renders the string fine. Two classes do it: **lone surrogates** and
-  **C0 controls**. `normalizeLocalModel` closes both for `localModel.model`, in
-  both directions (manufactured by its 60-char cut, and arriving in a rogue
-  agent's input) — but it is the ONLY field so guarded, so any other
-  agent-supplied string reaching the UI can still do it. Screenshot instead when
-  a dump goes empty for no reason, and suspect the payload before the tooling.
+  a 0-byte file, and every tap resolved from it misses, while the app itself
+  renders the string fine. THREE classes do it, all measured on emulator-5556:
+  **lone surrogates**, **C0/DEL controls**, and **U+FFFE/U+FFFF** (the two
+  noncharacters XML 1.0 also excludes). Everything else survives — `U+FDD0` and
+  `U+1FFFE` dump fine, so do not blame "noncharacters" generally.
+  `normalizeLocalModel` closes the first two for `localModel.model` in both
+  directions (manufactured by its 60-code-point cut, and arriving in a rogue
+  agent's input) and **misses the third**; every other agent-supplied string
+  reaching the UI is unguarded entirely. Screenshot instead when a dump goes
+  empty for no reason, suspect the payload before the tooling, and always run
+  the same screen with a benign name as the control before filing.
 - **`ChatViewModel` is scoped to the chat's nav back-stack entry**, so all of its
   in-memory state dies when you leave that screen (backgrounding does not).
   Anything that must survive lives in `AppContainer` — `container.drafts`,
@@ -697,14 +701,19 @@ act on every time.
   (`prs`, `modelSource`, …), where an object or array throws for the WHOLE
   `/api/agents` array. Verify by probing, not by reading the doc — this count
   has been wrong in `CLAUDE.md` more than once. Two-line repro in §6.2.
-- **Check the state.json RESTORE, not just the ingest path.** A hub restart is
-  when a new coercion ships and the restore is the first thing it serves, so a
-  coercion applied only at ingest is a hole straight through itself — until that
-  host's next beat, which for an OFFLINE host is never (records live 7 days).
-  The load path applied `normalizeUsage` alone until XERK-246 added the other
-  two beside it; check that any new one is in BOTH places. Repro: write a state
-  file with `localModel:{available:"yes",model:12345}`, boot `turma/server.js`
-  on it, and read `/api/agents`.
+- **Check the state.json RESTORE, not just the ingest path**, and check it
+  against the LIST above rather than against what the loader looks like it does.
+  A hub restart is when a new coercion ships and the restore is the first thing
+  it serves, so a coercion applied only at ingest is a hole straight through
+  itself — until that host's next beat, which for an OFFLINE host is never
+  (records live 7 days). The loader is a bare `for` over the parsed blob;
+  `grep -n "(a);"` the slice between `agents = JSON.parse` and
+  `first boot or no volume` and compare it to the four, one by one.
+  Repro that costs 30 seconds and needs no agent: write a state file with the
+  suspect record, boot `turma/server.js` on it with `STATE_FILE=` pointed there,
+  and `curl -u … /api/agents` — the record has no beat behind it, so whatever
+  comes back is what the restore did. Point the phone at the same hub to see
+  what the raw record costs it.
   A `normalize*` is also a WHITELIST: a sub-key a newer agent adds is dropped
   fleet-wide with nothing failing.
 
@@ -716,10 +725,22 @@ Mutation-testing mechanics, since a broken harness reads as a passing one:
   silently failed revert leaves the previous mutation in the tree and the NEXT
   one then reads as caught. Verify with `git status` after every revert, and
   mutate a scratch copy rather than the repo.
-- On `android/`, survivors cluster in exactly two places and neither is a
-  surprise: **Composable bodies** (no instrumented source set) and **ViewModel
-  call sites** (no Robolectric, no coroutine-test harness). A pure `core/` rule
-  with a test is gated; the CALL to it is not.
+- On `android/`, expect roughly HALF the battery to survive, and not at random:
+  58 mutations over XERK-246 left 28 alive, all in the same three places —
+  **Composable bodies** (17: `ChatScreen.kt`, `FleetDialogs.kt` and the two
+  `SpawnDialog` call sites, no instrumented source set), **ViewModel call sites**
+  (10: `ChatViewModel.kt`, `FleetViewModel.kt`, no Robolectric or coroutine-test
+  harness), and **`@Serializable` field defaults** (1) that no fixture exercises.
+  A pure `core/` rule with a test is gated; the CALL to it is not, and neither is
+  which value a Composable passes it. Judge an Android change on where its rule
+  lives, and quote the survivor count rather than "a few".
+- The same battery over `turma/server.js` left **0 of 12** alive, so a hub-side
+  rule genuinely is gated — the asymmetry is the Android gap, not the method.
+- `gradle --no-daemon --offline :app:testDebugUnitTest --rerun` is ~13s per
+  mutation once the first compile is warm, so a 50-mutation battery is ~12
+  minutes; run it in the background and do UI work meanwhile (the emulator does
+  not see tree edits). Do NOT read a source file while it runs — you will read a
+  mutation and think it is the branch.
 - Type validation on hub routes: `!body.repo` passes an object; a non-string
   `model` coerced to `""` silently *released* a pin.
 - The two mirrors of any rule (`liveState` in `index.html` vs `sessions.html`,

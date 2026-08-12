@@ -1,8 +1,10 @@
 # qa-findings.md — the defects a QA pass actually found
 
-The case-study half of `qa.md` §5, split out to keep that file readable and
-under the 40,000-character ceiling this repo holds its instruction files to.
-`qa.md` is the method; this is the evidence. Ranked by what each would have
+The case-study half of `qa.md` §5, split out to keep that file readable.
+Neither file is auto-loaded into a session, so the 40,000-character ceiling that
+governs `CLAUDE.md` and `.claude/rules/**` does not apply to them and CI does not
+gate them — `qa.md` has since grown past it, and that is a readability question
+rather than a context-budget one. `qa.md` is the method; this is the evidence. Ranked by what each would have
 cost in the field, and every one was found by RUNNING the thing, not reading
 it. Use them as a hunting guide, not a checklist — the shapes repeat.
 
