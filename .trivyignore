@@ -126,13 +126,14 @@ CVE-2026-69247 exp:2026-10-25
 CVE-2026-69249 exp:2026-10-25
 
 # CVE-2026-46600 — HIGH DoS in golang.org/x/net's dns/dnsmessage parser:
-# unbounded work on an invalid DNS record (fixed in x/net 0.56.0). Present only
-# in the bundled terraform (TERRAFORM_VERSION 1.15.8), where x/net v0.55.0 is
-# compiled in — not independently patchable. Checked 2026-08-12: 1.15.8 is
-# still the newest STABLE terraform (1.16.0 is at rc1), so TERRAFORM_VERSION has
-# nothing to bump to short of shipping a pre-release into a production image.
-# Same story as the terraform entries above. Not first-party, and the vulnerable
-# path is a DNS-message parser terraform never points at attacker-chosen records
-# here. Revisit on the expiry: terraform 1.16.0 stable, or any release built
-# against x/net 0.56+, clears it with a pin bump.
+# invalid DNS record parsing (fixed in x/net 0.56.0). The scan reports exactly
+# one carrier, /usr/local/bin/terraform (TERRAFORM_VERSION 1.15.8, x/net
+# v0.55.0), where x/net is compiled in and not independently patchable. Checked
+# 2026-08-12 against HashiCorp's release index: 1.15.8 (2026-07-08) is still the
+# newest STABLE terraform — everything after it is 1.16.0-rc/alpha — so
+# TERRAFORM_VERSION has nothing to bump to, the same story as the terraform
+# entries above. Not first-party, and a DoS against a CLI a session runs by
+# hand: nothing here parses DNS responses from a resolver the operator didn't
+# already choose. The expiry forces the revisit: bump TERRAFORM_VERSION once
+# HashiCorp ships a stable release built against x/net 0.56+.
 CVE-2026-46600 exp:2026-10-25
