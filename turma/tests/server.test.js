@@ -6217,22 +6217,113 @@ test("migrate: a bystander host cannot fail someone else's move", async () => {
   assert.equal(migrations.get(mid).phase, "exporting");
 });
 
+// Queue `n` real commands on `device` and answer the beat that collects them,
+// so their cmdIds are ones the hub actually gave that host — the only ones it
+// will accept a refusal for.
+async function issuedCmds(device, n) {
+  await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+  const ids = [];
+  for (let i = 0; i < n; i++) {
+    ids.push(queueCommand(device, { type: "resumeTranscript", transcriptId: `t${i}` }));
+  }
+  return ids;
+}
+
 test("spawn refusals are bounded and age out of a host's record", async () => {
-  const many = Array.from({ length: 60 }, (_, i) => ({ cmdId: `c${i}`, error: `no ${i}` }));
-  await request("POST", "/api/heartbeat",
-    { body: { device: "bndH", spawnFailures: many }, headers: agentHeaders });
+  const ids = await issuedCmds("bndH", 60);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "bndH", spawnFailures: ids.map((c, i) => ({ cmdId: c, error: `no ${i}` })) },
+    headers: agentHeaders,
+  });
   const kept = Object.keys(agents.bndH.spawnRefusals);
   assert.ok(kept.length <= 40, `bounded, got ${kept.length}`);
-  assert.ok(kept.includes("c59"), "newest kept");
-  // An entry past its max age is dropped on the next beat that carries one.
-  agents.bndH.spawnRefusals.c59.at = Date.now() - 60 * 60 * 1000;
-  await request("POST", "/api/heartbeat",
-    { body: { device: "bndH", spawnFailures: [{ cmdId: "fresh", error: "x" }] }, headers: agentHeaders });
-  assert.ok(!agents.bndH.spawnRefusals.c59, "aged out");
-  assert.ok(agents.bndH.spawnRefusals.fresh);
+  assert.ok(kept.includes(ids[59]), "newest kept — the trim is oldest-first");
   // The wire field itself never lands on the record — it's a delivery, like the
   // other *Results.
   assert.equal(agents.bndH.spawnFailures, undefined);
+});
+
+test("a spawn refusal ages out on its own, well under the count cap", async () => {
+  // Deliberately far from SPAWN_FAILURE_MAX, so the count trim cannot retire
+  // this entry and pass the test for the wrong reason.
+  const ids = await issuedCmds("ageH", 3);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ageH", spawnFailures: ids.map((c, i) => ({ cmdId: c, error: `no ${i}` })) },
+    headers: agentHeaders,
+  });
+  assert.equal(Object.keys(agents.ageH.spawnRefusals).length, 3);
+  agents.ageH.spawnRefusals[ids[1]].at = Date.now() - 60 * 60 * 1000;
+  const [fresh] = await issuedCmds("ageH", 1);
+  await request("POST", "/api/heartbeat",
+    { body: { device: "ageH", spawnFailures: [{ cmdId: fresh, error: "x" }] }, headers: agentHeaders });
+  assert.ok(!agents.ageH.spawnRefusals[ids[1]], "the stale one is gone");
+  assert.ok(agents.ageH.spawnRefusals[ids[0]], "its same-age neighbours stay");
+  assert.ok(agents.ageH.spawnRefusals[ids[2]]);
+  assert.ok(agents.ageH.spawnRefusals[fresh]);
+});
+
+test("a refusal cannot grow a host's record past the ceiling and wedge it", async () => {
+  // The cache is SERVED, so agentRecordSize counts it — and the ceiling check
+  // runs before the ingest. An unbounded reason would land, push the record over
+  // AGENT_RECORD_MAX, and 413 every later beat including the ones that sweep it.
+  const ids = await issuedCmds("bigH", 3);
+  const r = await request("POST", "/api/heartbeat", {
+    body: {
+      device: "bigH",
+      spawnFailures: ids.map((c) => ({ cmdId: c, error: "x".repeat(4 << 20) })),
+    },
+    headers: agentHeaders,
+  });
+  assert.equal(r.status, 200);
+  for (const c of ids) assert.ok(agents.bigH.spawnRefusals[c].error.length <= 500);
+  // The host keeps beating, and the fleet payload stays small.
+  assert.equal((await request("POST", "/api/heartbeat",
+    { body: { device: "bigH" }, headers: agentHeaders })).status, 200);
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  const served = fleet.body.agents.find((a) => a.key === "bigH");
+  assert.ok(JSON.stringify(served).length < 64 * 1024, "record stays small");
+});
+
+test("a refusal for a command this host was never given is ignored", async () => {
+  // Every agent shares one token, and the page scans the WHOLE fleet for a
+  // followed cmdId — so an unchecked one lets any host end another host's wait.
+  const [mine] = await issuedCmds("ownA", 1);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ownB", spawnFailures: [{ cmdId: mine, error: "not mine to refuse" }] },
+    headers: agentHeaders,
+  });
+  assert.deepEqual(agents.ownB.spawnRefusals, {});
+  // The host it WAS issued to is believed.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ownA", ackedCommands: [mine],
+            spawnFailures: [{ cmdId: mine, error: "at MAX_SESSIONS" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(agents.ownA.spawnRefusals[mine].error, "at MAX_SESSIONS");
+});
+
+test("a malformed refusal can't poison the cache or break the beat", async () => {
+  const [id] = await issuedCmds("malH", 1);
+  const r = await request("POST", "/api/heartbeat", {
+    body: {
+      device: "malH",
+      spawnFailures: [
+        { cmdId: "__proto__", error: "prototype setter, not an entry" },
+        { cmdId: id, error: { not: "a string" } },
+      ],
+    },
+    headers: agentHeaders,
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(Object.keys(agents.malH.spawnRefusals), [id]);
+  assert.equal(typeof agents.malH.spawnRefusals[id].error, "string");
+  assert.equal(agents.malH.spawnRefusals[id].error, "the agent refused it");
+  assert.equal(({}).error, undefined, "no prototype was re-pointed");
+  // A non-array must not throw mid-handler: the record is already replaced by
+  // then, so the host would lose its commands (and its ack) every beat.
+  const bad = await request("POST", "/api/heartbeat",
+    { body: { device: "malH", spawnFailures: 42 }, headers: agentHeaders });
+  assert.equal(bad.status, 200);
 });
 
 test("migrate: the blob relay rejects an unauthenticated caller", async () => {

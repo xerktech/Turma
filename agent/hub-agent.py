@@ -240,10 +240,15 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # large sessions; the guard is a backstop, not an expected limit (XERK-101).
 MIGRATION_BLOB_MAX = int(os.environ.get("TURMA_MIGRATION_BLOB_MAX", str(1 << 26)))  # 64 MiB
 
-# How many staged session-start refusals (XERK-265) a beat may carry. Each is a
-# few hundred bytes and one only exists where a command was refused, so this is
-# a backstop against a hub that stopped accepting beats, never a normal cap.
+# How many staged session-start refusals (XERK-265) a beat may carry, and how
+# long one reason may be. Neither is a normal limit — a refusal only exists where
+# a command was declined, and the reasons are one line. They are here because the
+# reason can interpolate an exception (`the session failed to launch: {e}`) whose
+# text is unbounded, and it lands in a hub cache that COUNTS against the record
+# ceiling: an 8 MiB beat would wedge this host's control plane. Matches the 500
+# `_set_error` already truncates a session's errorMsg to.
 SPAWN_FAILURES_MAX = 40
+SPAWN_FAILURE_REASON_MAX = 500
 
 
 def _project_slug(path):
@@ -10355,7 +10360,10 @@ class SessionManager:
         self.spawn_failures.append({
             "cmdId": cmd_id,
             "migrationId": migration_id,
-            "error": reason,
+            # Truncated for the same reason _set_error truncates errorMsg: a
+            # reason can carry an exception's text, and this one rides the beat
+            # into a hub cache that counts against the record ceiling.
+            "error": reason[:SPAWN_FAILURE_REASON_MAX],
             "at": now_iso(),
         })
         del self.spawn_failures[:-SPAWN_FAILURES_MAX]

@@ -2235,20 +2235,23 @@ function tryPendingSelect() {
   if (pendingSpawn) {
     if (Date.now() - pendingSpawnAt > SPAWN_FOLLOW_MS) pendingSpawn = null;
     else {
-      // The agent said it REFUSED this one (XERK-265). Stop waiting and say why
-      // — otherwise the wait below spins out the whole SPAWN_FOLLOW_MS and then
-      // drops back to the idle stage as if nothing had been asked for.
+      // A reported session ALWAYS wins, exactly as it does in the hub's
+      // advanceMigrations — so the lookup runs FIRST and clears `pendingSpawn`.
+      // A refusal stays served for ten minutes, so reading it ahead of this
+      // would let a stale one abandon a spawn that has since landed.
+      for (const a of (cache.agents || [])) {
+        const s = (a.sessions || []).find(x => x.spawnCmdId === pendingSpawn);
+        if (s) { pendingSpawn = null; pendingSelect = s.id; break; }
+      }
+      // Else: the agent said it REFUSED this one (XERK-265). Stop waiting and
+      // say why — otherwise the wait below spins out the whole SPAWN_FOLLOW_MS
+      // and then drops back to the idle stage as if nothing had been asked for.
       const ref = spawnRefusal(pendingSpawn);
       if (ref) {
         pendingSpawn = null;
         // A refused MIGRATION import already toasts through advanceMigrationFollow
         // (which words it as a failed move); don't say it twice.
         if (!ref.migration) toast("Couldn't start session: " + ref.error);
-      } else {
-        for (const a of (cache.agents || [])) {
-          const s = (a.sessions || []).find(x => x.spawnCmdId === pendingSpawn);
-          if (s) { pendingSpawn = null; pendingSelect = s.id; break; }
-        }
       }
     }
   }
@@ -2998,6 +3001,20 @@ function connectSSE() {
   es.addEventListener("removed", (e) => {
     try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
     catch { return; }
+    render(cache);
+  });
+  // In-flight session moves (XERK-101). Without this the page's `cache.migrations`
+  // is whatever the ONE poll at load fetched: `fastPoll` returns early while SSE
+  // is healthy and the fallback interval only runs when it isn't, which is the
+  // normal operating state. So a move's phase never advanced in the browser —
+  // `advanceMigrationFollow` never saw `importCmdId`, never followed the target
+  // session, and never surfaced a failure. Every reason the hub attaches to a
+  // failed move (XERK-265) reaches the operator through here.
+  es.addEventListener("migrations", (e) => {
+    let ms;
+    try { ms = JSON.parse(e.data); } catch { return; }
+    if (!cache) return;
+    cache.migrations = ms;
     render(cache);
   });
   // An org's color pin changed (XERK-145): org.js owns the live map; patching

@@ -79,6 +79,15 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   // Window-level listeners the page registers (e.g. popstate), so a test can
   // drive the mobile back-button flow that `history.back()` triggers.
   const winListeners = {};
+  // The EventSource(s) the page opens, plus `emit` to deliver one hub event to
+  // every listener registered for it.
+  const sse = {
+    streams: [],
+    emit(name, data) {
+      const payload = { data: JSON.stringify(data) };
+      for (const s of sse.streams) for (const fn of (s._ls[name] || [])) fn(payload);
+    },
+  };
   const document = {
     getElementById(id) { return (els[id] ||= makeEl(id)); },
     querySelector(sel) { return sel === ".sidebar" ? sidebar : null; },
@@ -104,7 +113,15 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       }
       return new Promise(() => {});
     },
-    EventSource: class { addEventListener() {} close() {} static get CLOSED() { return 2; } },
+    // Records the page's SSE listeners so a test can deliver a real hub event
+    // (the fleet payload is only polled ONCE at load while the stream is
+    // healthy, so an event is the only way some state ever moves).
+    EventSource: class {
+      constructor() { this._ls = {}; sse.streams.push(this); }
+      addEventListener(name, fn) { (this._ls[name] ||= []).push(fn); }
+      close() {}
+      static get CLOSED() { return 2; }
+    },
     setInterval: () => 0, clearInterval: noop, setTimeout: () => 0, clearTimeout: noop,
     requestAnimationFrame: () => 0, cancelAnimationFrame: noop,
     // pushState/back mirror the browser closely enough to test the mobile stage:
@@ -155,7 +172,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts, chat, body: document.body,
+  return { ...api, els, opened, posts, chat, sse, body: document.body,
     // `setOrg` narrows the header's org filter, the way picking an org in the
     // menu does — the sidebar lists only that org's hosts afterwards.
     setOrg: (k) => { stubs.TurmaOrg._k = k; } };
@@ -716,6 +733,37 @@ test("a spawn the agent refused stops the wait and says why (XERK-265)", () => {
   assert.match(els.stageEmptyBig.innerHTML, /No session attached/,
     "and the wait ends instead of spinning out SPAWN_FOLLOW_MS");
   assert.deepEqual(opened, []);
+});
+
+test("a followed move advances on its SSE event, not just on a page reload", async () => {
+  // The fleet payload is polled ONCE at load while SSE is healthy (fastPoll
+  // returns early, the fallback interval only runs when it isn't), so without a
+  // `migrations` listener a move's phase never moved in the browser: the follow
+  // never saw importCmdId and never surfaced a failure (XERK-101/XERK-265).
+  const { beat, els, sse, moveTo } = loadPage({ postReply: { ok: true, migrationId: "m8" } });
+  const { now, host: h } = host([{ ...working("s1", "Moving Me") }]);
+  beat({ now, agents: [h], migrations: [] });
+  await moveTo(click, "hostA", "s1", "hostB");   // arms pendingMigration from the reply
+
+  sse.emit("migrations", [{ id: "m8", phase: "importing", importCmdId: "cmd-i8",
+                            srcHost: "hostA", srcSessionId: "s1" }]);
+  sse.emit("migrations", [{ id: "m8", phase: "failed", importCmdId: "cmd-i8", srcHost: "hostA",
+                            srcSessionId: "s1", error: "a root session is already running" }]);
+  // Only reachable because the event moved the page's copy of the migration:
+  // with the poll alone it would still read `exporting` from the load.
+  assert.match(els.toast.textContent, /Move failed: a root session is already running/);
+});
+
+test("a session that DID come up beats a cached refusal for the same command", () => {
+  // Mirrors the hub's own tie-break in advanceMigrations. A refusal stays
+  // served for ten minutes, so reading it before the session list would let a
+  // stale one abandon a spawn that has since landed.
+  const { beat, els, opened } = loadPage({ search: "?spawn=cmd-both" });
+  const { now, host: h } = host([{ ...working("55555", "Landed"), spawnCmdId: "cmd-both" }]);
+  h.spawnRefusals = { "cmd-both": { error: "a stale refusal", at: now } };
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["55555"], "the reported session wins");
+  assert.equal(els.toast ? els.toast.textContent : "", "", "and nothing is said");
 });
 
 test("a refused MOVE is reported once, by the migration that owns it", () => {

@@ -1206,6 +1206,14 @@ function ingestStatusResults(agent, ticketStatusResults) {
 // the Sessions page's SPAWN_FOLLOW_MS, or a migration — so minutes is generous.
 const SPAWN_FAILURE_MAX_AGE_MS = 10 * 60 * 1000;
 const SPAWN_FAILURE_MAX = 40;
+// And how long one reason / one cmdId key may be. These are NOT stylistic: this
+// cache is served with the record, so `agentRecordSize` counts it, and the
+// ceiling check runs BEFORE the ingest — an unbounded reason would land, push
+// the record past AGENT_RECORD_MAX, and then 413 every following beat from that
+// host, including the ones that would have swept it. The agent truncates too;
+// this is the boundary that makes a buggy or hostile one survivable (XERK-235).
+const SPAWN_FAILURE_ERROR_MAX = 500;
+const SPAWN_FAILURE_CMDID_MAX = 200;
 
 // Merge the agent's refusals of a session-creating command (heartbeat
 // `spawnFailures`, XERK-265) into a per-cmdId cache, and stamp any it names onto
@@ -1223,16 +1231,32 @@ const SPAWN_FAILURE_MAX = 40;
 // and short-lived, so it costs the record almost nothing. It is named apart from
 // the wire field it comes from (`spawnRefusals`, keyed by cmdId, vs the beat's
 // `spawnFailures` list) so the two shapes can't be mistaken for each other.
-function ingestSpawnFailures(hostKey, agent, results) {
+// `ownCmdIds` is the set of command ids this host was actually GIVEN (its queue
+// before this beat's acks were applied). Both handles are checked against what
+// the hub knows, never taken on the agent's word: all agents share one token, so
+// an unchecked cmdId lets any host end another host's spawn wait with arbitrary
+// text, and an unchecked migrationId lets it fail a move it has no part in.
+function ingestSpawnFailures(hostKey, agent, ownCmdIds, results) {
   const now = Date.now();
-  for (const r of results || []) {
+  // A non-array here would throw mid-handler, AFTER the record was replaced and
+  // before the ack/publish/save — costing the host its commands every beat.
+  for (const r of (Array.isArray(results) ? results : [])) {
     if (!r) continue;
-    const error = typeof r.error === "string" && r.error ? r.error : "the agent refused it";
-    if (r.cmdId) agent.spawnRefusals[r.cmdId] = { error, at: now };
+    const error = typeof r.error === "string" && r.error
+      ? r.error.slice(0, SPAWN_FAILURE_ERROR_MAX)
+      : "the agent refused it";
+    // `__proto__` as a key would invoke the prototype setter rather than store
+    // an entry — silently dropping the refusal and re-pointing the cache's
+    // prototype. Refused for the same reason `device` refuses these names.
+    if (typeof r.cmdId === "string" && r.cmdId &&
+        r.cmdId.length <= SPAWN_FAILURE_CMDID_MAX &&
+        r.cmdId !== "__proto__" && r.cmdId !== "constructor" &&
+        r.cmdId !== "prototype" && ownCmdIds.has(r.cmdId)) {
+      agent.spawnRefusals[r.cmdId] = { error, at: now };
+    }
     // A migration's own handle. The refusal can arrive for either half, so match
     // the record by id — the export half has no importCmdId to key on. Only a
-    // host actually IN the move may fail it: every agent shares one token, so
-    // without this any host could kill any other host's migration.
+    // host actually IN the move may fail it.
     if (r.migrationId) {
       const m = migrations.get(r.migrationId);
       if (m && (m.phase === "exporting" || m.phase === "importing") &&
@@ -3619,7 +3643,12 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
-      ingestSpawnFailures(key, next, spawnFailures);
+      // Scoped to the commands this host was actually given: `prev.commands` is
+      // the queue BEFORE this beat's acks were filtered out, and the agent
+      // stages a refusal in the same handle_commands call that acks it, so the
+      // two always ride together.
+      ingestSpawnFailures(key, next,
+        new Set((prev.commands || []).map((c) => c && c.cmdId)), spawnFailures);
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);

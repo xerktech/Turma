@@ -198,7 +198,17 @@ One agent container per host, multiplexing sessions across every repo it scans.
 - Hub-side `ingestSpawnFailures` caches it per cmdId as **`spawnRefusals`** (served with the record,
   NOT stripped like the other caches — the client following that spawn is who needs it) and stamps
   `m.refusal`, which `advanceMigrations` applies **after** its handoff check, so a success always
-  wins the tie. Absent = "that agent can't tell", i.e. the old timeout wait, on both halves.
+  wins the tie. Absent = "that agent can't tell", i.e. the old timeout wait, on both halves. The
+  Sessions page mirrors that order: the session lookup runs first and clears `pendingSpawn`.
+- **Both handles are checked against what the HUB knows, never taken on the agent's word** — the
+  migrationId against that move's own src/target, the cmdId against the queue that host was actually
+  given. All agents share one token, so unchecked either one lets any host fail another host's move
+  or end its spawn wait with arbitrary text.
+- **The reason is length-capped at both ends** (agent `SPAWN_FAILURE_REASON_MAX`, hub
+  `SPAWN_FAILURE_ERROR_MAX`). It interpolates exception text, and `spawnRefusals` is the first
+  served cache that `agentRecordSize` COUNTS while the ceiling check runs BEFORE the ingest: one
+  unbounded reason lands, pushes the record past `AGENT_RECORD_MAX`, and then 413s every later beat
+  from that host — including the ones that would have swept it (XERK-235's failure class).
 - A refusal with neither handle stays a log line: the id being rejected IS the correlation.
 
 ## Cross-cutting contracts

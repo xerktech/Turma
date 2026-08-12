@@ -4314,6 +4314,31 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
             sm.post({"device": "hostA"})
         self.assertEqual(sm.spawn_failures, [])
 
+    def test_a_launch_that_throws_is_reported_like_a_refusal(self):
+        """The record survives as `status:"error"`, and the hub's migration
+        handoff waits for a RUNNING session — so without this the move waits out
+        its timeout exactly as a refusal used to."""
+        sm = self._manager()
+        sm._launch_tmux = mock.Mock(side_effect=RuntimeError("tmux is gone"))
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "wE")
+        os.makedirs(cwd, exist_ok=True)
+        sm._resume_at_cwd("tE", cwd, cmd_id="cE", migration_id="migE")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["migE"])
+        self.assertIn("tmux is gone", sm.spawn_failures[0]["error"])
+        # The record is left carrying the error, as _set_error intends — the
+        # refusal is what tells the hub, since an `error` record never satisfies
+        # its wait for a running one.
+        self.assertEqual(sm.registry[0]["status"], "error")
+
+    def test_a_reason_carrying_an_exception_is_truncated(self):
+        """A reason interpolates `{e}`, whose text is unbounded, and it lands in
+        a hub cache that counts against that host's record ceiling — an 8 MiB
+        one would wedge the host's control plane."""
+        sm = self._manager()
+        sm._refuse_start("x" * 100000, cmd_id="c1")
+        self.assertEqual(len(sm.spawn_failures[0]["error"]),
+                         ha.SPAWN_FAILURE_REASON_MAX)
+
     def test_the_staged_list_is_bounded(self):
         sm = self._manager()
         for i in range(ha.SPAWN_FAILURES_MAX + 10):
