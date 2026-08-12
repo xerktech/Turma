@@ -243,6 +243,9 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
       whitelist: a sub-key a newer agent adds rides through untouched, where rebuilding an object
       drops it fleet-wide until the table catches up (`normalizeLimits`/`normalizeLocalModel` DO
       rebuild, so a new sub-key of theirs must be added to them).
+    - **A block those two rebuild is in the table anyway** — a rebuild is only as good as its own
+      gates, and `limits` shipped one gating its epoch fields on `Number.isFinite`, so a fractional
+      `resetsAt` (Kotlin `Long` takes no fraction) went out raw. Nothing agent-authored is exempt.
     - Its own module because the restore runs at `server.js` module init: a `const` declared below
       that point is in its temporal dead zone, and the ReferenceError dies in the restore's own
       `catch {}`, leaving records half-coerced with nothing logged.

@@ -6897,6 +6897,42 @@ test("the sweep runs AFTER normalizeModelUsage, so a legacy model list survives"
   assert.deepEqual(p.repoUsage[0].usage.models, [{ model: "haiku" }]);
 });
 
+test("limits' two epoch fields are INTEGER-bounded, not merely finite", () => {
+  // `resetsAt`/`capturedAt` are `Long` on Android and a Long cannot take a
+  // fractional literal, so `Number.isFinite` was never the right gate: a
+  // `resetsAt: 1.5` from one host passed it, was served raw, and threw for the
+  // whole fleet payload — the exact failure normalizeLimits exists to prevent,
+  // inside normalizeLimits. `usedPct` is a Double and stays loosely checked.
+  const p = { device: "h", limits: { fiveHour: { usedPct: 50.5, resetsAt: 1.5 },
+                                     sevenDay: { usedPct: 10, resetsAt: 1e21 },
+                                     capturedAt: 1700000000 } };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.limits, {
+    fiveHour: { usedPct: 50.5 },      // the window survives; the bad stamp is dropped
+    sevenDay: { usedPct: 10 },
+    capturedAt: 1700000000,
+  });
+  // A snapshot with no usable capturedAt is the whole block's own "can't tell
+  // you" — every reader ages the snapshot against that stamp.
+  const q = { device: "h", limits: { fiveHour: { usedPct: 50 }, capturedAt: 2.5 } };
+  hub.normalizeRecord(q);
+  assert.equal(q.limits, null);
+});
+
+test("turma/Dockerfile copies every local module server.js requires", () => {
+  // The COPY list is hand-maintained, and a module missing from it is a
+  // container that boots to a MODULE_NOT_FOUND — invisible until deploy, since
+  // every test here requires straight off the working tree.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const dockerfile = fs.readFileSync(path.join(__dirname, "..", "Dockerfile"), "utf8");
+  const required = [...src.matchAll(/require\("\.\/([\w.-]+)"\)/g)].map((m) => m[1]);
+  assert.ok(required.length >= 3, "no local requires found — did the pattern rot?");
+  for (const f of new Set(required)) {
+    assert.match(dockerfile, new RegExp(`COPY[^\\n]*\\b${f.replace(".", "\\.")}\\b`),
+      `${f} is required by server.js but never COPYed into the image`);
+  }
+});
+
 test("the shape table only uses tags the walker knows", () => {
   // The walker passes an unrecognised tag THROUGH rather than throwing (a throw
   // on ingest refuses the beat; on the restore path it abandons every record
@@ -6924,14 +6960,22 @@ test("every field Android types on the fleet payload is in the shape table", () 
   // The durable form of "typing a field on a client and coercing it hub-side are
   // ONE change": this reads `Models.kt` and walks it, so a field typed there
   // without an entry here fails the hub's own suite rather than waiting for a
-  // phone to stop signing in. Two blocks are deliberately absent — `limits` and
-  // `localModel` are rebuilt wholesale by their own normalize*.
+  // phone to stop signing in.
   const src = fs.readFileSync(path.join(__dirname, "..", "..", "android", "app", "src",
     "main", "java", "com", "xerktech", "turma", "model", "Models.kt"), "utf8");
-  // One entry per `data class X(...)`: its fields as {name, type}. Scanned by
-  // matching parens rather than by regex — a constructor body carries its own
-  // `()` (`= UsageBucket()`) and the block classes are written on one line, so
-  // a "up to the next `\n)`" pattern silently mis-parses both.
+  // One entry per `data class X(...)`: its fields as {name, type}.
+  //
+  // Parsed by matching parens and then splitting the constructor on TOP-LEVEL
+  // commas, not by a per-line regex. Both departures are load-bearing, and a
+  // parser that quietly sees fewer fields than exist is the one failure mode
+  // this test cannot survive:
+  //   - a constructor body carries its own `()`/`<>` (`= UsageBucket()`,
+  //     `Map<String, UsageBucket>`), so "up to the next `\n)`" mis-parses;
+  //   - the block classes are written on ONE line, so an `^`-anchored field
+  //     pattern sees only the first field of each;
+  //   - a field with NO default (`val x: String,`) is the DANGEROUS kind — it is
+  //     required on the wire, so every host omitting it kills the decode — and a
+  //     pattern keyed on `=` skips exactly those.
   const classes = {};
   const subclassesOfBlock = [];
   for (const m of src.matchAll(/data class (\w+)\(/g)) {
@@ -6940,20 +6984,42 @@ test("every field Android types on the fleet payload is in the shape table", () 
       if (src[i] === "(") depth++;
       else if (src[i] === ")") depth--;
     }
-    const body = src.slice(m.index + m[0].length, i - 1);
-    classes[m[1]] = [...body.matchAll(/^[ \t]*val (\w+): ([\w<>, ?]+?)\s*=/gm)]
+    const body = src.slice(m.index + m[0].length, i - 1)
+      .replace(/\/\*[\s\S]*?\*\//g, " ")      // KDoc between params
+      .replace(/\/\/[^\n]*/g, " ");           // and line comments
+    const params = [];
+    for (let d = 0, start = 0, j = 0; j <= body.length; j++) {
+      const ch = body[j];
+      if (ch === "(" || ch === "<" || ch === "[") d++;
+      else if (ch === ")" || ch === ">" || ch === "]") d--;
+      else if ((ch === "," && !d) || j === body.length) {
+        params.push(body.slice(start, j));
+        start = j + 1;
+      }
+    }
+    classes[m[1]] = params
+      .map((p) => /\bval (\w+)\s*:\s*([\w<>, ?]+?)\s*(?:=|$)/.exec(p))
+      .filter(Boolean)
       .map((f) => ({ name: f[1], type: f[2].trim() }));
     if (/^\s*:\s*Block\(\)/.test(src.slice(i))) subclassesOfBlock.push(m[1]);
   }
-  assert.ok(classes.AgentInfo && subclassesOfBlock.length >= 5, "Models.kt did not parse");
+  // Guards against a parse that "succeeds" while seeing almost nothing — the
+  // counts are the ones a mis-parse drops first (AgentInfo is multi-line with
+  // comments between params, TextBlock is a one-liner, CreateTicketRequest's
+  // first three fields carry no default).
+  assert.ok(classes.AgentInfo?.length >= 26 && subclassesOfBlock.length >= 5 &&
+    classes.TextBlock?.length === 2 && classes.CreateTicketRequest?.length === 5,
+    "Models.kt did not parse — this test is only as good as the field list it built");
   // A transcript block is polymorphic: the table carries the UNION of every
   // subclass's fields under one object spec.
   classes.__Block = [{ name: "t", type: "String" },
     ...subclassesOfBlock.flatMap((c) => classes[c])];
 
+  // Nothing agent-authored is exempt. `limits` and `localModel` are rebuilt
+  // wholesale by their own normalize*, and are in the table anyway — a rebuild
+  // is only as good as its own gates, and `limits` shipped one that let a
+  // fractional `resetsAt` through.
   const SKIP = new Set([
-    "AgentInfo.limits",      // normalizeLimits rebuilds it
-    "AgentInfo.localModel",  // normalizeLocalModel rebuilds it
     "AgentInfo.key", "AgentInfo.online", "AgentInfo.terminalOnline",
     "AgentInfo.lastSeen",    // hub-authored in serializeAgent, never off the wire
     "__Block.input",         // typed JsonElement? — any shape is legal

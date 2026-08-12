@@ -12,8 +12,10 @@
 
 "use strict";
 
-// `server.js`'s own `normalize*` passes coerce three blocks by hand. This one
-// covers the REST of the agent record, because "which blocks happen to have a normalize* yet" was never
+// `server.js`'s own `normalize*` passes coerce three blocks by hand, each with
+// its own semantics (dropping a window with no percentage, forcing
+// `available:false`). This one runs after them and covers the WHOLE record,
+// because "which blocks happen to have a normalize* yet" was never
 // the boundary that matters: a field is decode-fatal the moment a client TYPES
 // it, and Android types nearly all of `AgentInfo`. `repoUsage:[null]` — four
 // bytes from one host — made the app refuse to sign in at all, reporting "Could
@@ -147,6 +149,19 @@ const AGENT_WIRE_SHAPE = {
   capacity: objOf({ maxSessions: "i", running: "i", queued: "i", free: "i",
                     rootRunning: "b" }),
   uploadMaxBytes: "l",
+  // `normalizeLimits`/`normalizeLocalModel` rebuild these two wholesale, which
+  // is not a reason to leave them out — a rebuild is only as good as its own
+  // gates, and `limits` shipped for a release gating its two epoch fields on
+  // `Number.isFinite`, so `resetsAt: 1.5` (a Long cannot take a fractional
+  // literal) went out raw and killed the whole payload. Listed here they get the
+  // same backstop as everything else AND the Models.kt drift test, which is the
+  // part that keeps the next such gap from lasting a release.
+  limits: objOf({
+    fiveHour: objOf({ usedPct: "d?", resetsAt: "l?" }),
+    sevenDay: objOf({ usedPct: "d?", resetsAt: "l?" }),
+    capturedAt: "l", source: "s",
+  }),
+  localModel: objOf({ available: "b", model: "s?", contextTokens: "i?" }),
 };
 
 // Sentinel for "this value cannot be made decodable" — a list element or map

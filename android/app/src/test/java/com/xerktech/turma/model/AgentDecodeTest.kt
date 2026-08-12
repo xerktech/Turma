@@ -363,4 +363,20 @@ class AgentDecodeTest {
         assertEquals("good", resp.agents[1].repoUsage[1].repo)
         assertNull(resp.agents[1].sessions[0].work!!.pushed)
     }
+
+    @Test fun `the limits block's epoch fields are Longs, and a fraction is fatal`() {
+        val h = """"key":"h","device":"h""""
+        // Both are `Long` on this class, and a Long cannot take a fractional
+        // literal — so the hub gating them on "is a finite number" served this
+        // straight through and hid the whole fleet. Pinned here because that
+        // block is rebuilt hub-side by its own function, where the shape is
+        // easy to assume rather than check.
+        assertFalse(decodes(
+            """{$h,"limits":{"fiveHour":{"usedPct":50,"resetsAt":1.5},"capturedAt":1}}"""))
+        assertFalse(decodes(
+            """{$h,"limits":{"fiveHour":{"usedPct":50,"resetsAt":1e21},"capturedAt":1}}"""))
+        // A fractional PERCENTAGE is fine — that one is a Double.
+        assertTrue(decodes(
+            """{$h,"limits":{"fiveHour":{"usedPct":50.5},"capturedAt":1700000000}}"""))
+    }
 }
