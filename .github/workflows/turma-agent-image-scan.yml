@@ -29,9 +29,6 @@ permissions:
 
 jobs:
   scan:
-    # See the sibling note in turma-image-scan.yml: both workflows name their job
-    # `scan`, so each needs an explicit, distinct status-check context.
-    name: Turma agent image scan
     # Hosted. This is the job with the strongest claim on the self-hosted box, so
     # it's worth being explicit about why it survives the move:
     #   - the layer cache it builds from is `type=gha` (below), which is
