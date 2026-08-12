@@ -3357,8 +3357,14 @@ const server = http.createServer(async (req, res) => {
       if (!agentPresented(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isArchiveIngest || isUpdatingSignal || isMigrationBlob || isUploadBlob) {
       // These all carry the host they act as in `<host>`, so the credential is
-      // checked AGAINST it rather than merely being a valid agent token.
-      const refusal = agentHostRefusal(req, decodeURIComponent(parts[2]));
+      // checked AGAINST it rather than merely being a valid agent token. The
+      // decode is the same expression each route runs on the same segment, so
+      // the host checked here and the host compared there cannot diverge; a
+      // segment that does not decode is matched raw so an anonymous caller
+      // still gets 401 here rather than the route's 400 before any auth ran.
+      let claimed;
+      try { claimed = decodeURIComponent(parts[2]); } catch { claimed = parts[2]; }
+      const refusal = agentHostRefusal(req, claimed);
       if (refusal) return json(res, refusal.status, { error: refusal.error });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
