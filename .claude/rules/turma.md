@@ -334,8 +334,18 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   is not.
 - **Every log line naming a host goes through `logName`** — `device` is agent-supplied and validated
   only for length and prototype keys, so a newline in it forged a line reading exactly like the
-  hub's own. Refusal logs are throttled to one a minute with the suppressed count, because the flood
-  the cap exists to survive is precisely the traffic that writes them.
+  hub's own. It strips C0, DEL **and C1** (`JSON.stringify` escapes none of the C1 block). All FIVE
+  sites go through it: converting only the new ones left the two cheapest to reach — the 413, which
+  is one request needing no registry pressure, and the unknown-field drop, which rides a 200.
+  Refusal logs are throttled to one a minute with the suppressed count, because the flood the cap
+  exists to survive is precisely the traffic that writes them.
+- **A host is warned on the crossing into half its share** (`shareWarned`, the `recordSizeWarned`
+  pattern). Without it the first signal is the host vanishing: the per-record ceiling's warning is at
+  4 MiB and a share is 512 KiB, so a record drifts past its share — and starts being refused — with
+  that warning still eight times away. This is what makes the eighth-of-the-container default safe;
+  a record grows over weeks, which is ample notice provided somebody is told. If real records ever
+  approach the share, raise `AGENTS_TOTAL_MAX` in the DockerOps compose beside `mem_limit` rather
+  than moving the derived default for every deployment at once.
 - Byte accounting is a side map (`recordBytes`), never a field on the record — anything on a record
   is served to every client — and `registryBytes()` re-measures unknown keys and forgets dead ones,
   so the many places that `delete agents[key]` need not remember it.

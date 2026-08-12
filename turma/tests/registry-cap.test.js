@@ -397,9 +397,10 @@ test("EVERY heartbeat log naming a host is safe, not just the newest ones", asyn
   // The 429 paths were fixed first and the older ones left; that is the wrong
   // way round. `refuseOversized` is ONE request with no registry pressure at
   // all, and the unknown-field drop rides a beat that returns 200 — both are
-  // easier to reach than the throttled refusal above.
+  // easier to reach than the throttled refusal above. All four sites that name
+  // a host are driven here, so none of them can quietly revert.
   resetRegistry();
-  const forged = "evil\r\n2026-01-01T00:00:00Z FORGED: hub healthy[2J";
+  const forged = "evil\r\n2026-01-01T00:00:00Z FORGED: hub healthy\u001b[2J\u0085NEL";
   const lines = [];
   const realErr = console.error;
   const realWarn = console.warn;
@@ -407,18 +408,37 @@ test("EVERY heartbeat log naming a host is safe, not just the newest ones", asyn
   console.warn = (m) => lines.push(String(m));
   try {
     // Over AGENT_RECORD_MAX -> refuseOversized's 413.
-    const fat = await beat({ device: forged, sessions: "A".repeat((8 << 20) + 1024) });
-    assert.equal(fat.status, 413);
+    assert.equal(
+      (await beat({ device: forged, sessions: "A".repeat((8 << 20) + 1024) })).status, 413);
     // An oversized UNKNOWN field -> sanitizeHeartbeat's drop line, on a beat
-    // that is otherwise accepted.
+    // that is otherwise ACCEPTED.
     await beat({ device: forged, bogusField: "B".repeat((64 << 10) + 512) });
+    // Between half and all of AGENT_RECORD_MAX -> the over-half warn (and the
+    // over-half-SHARE warn, which this rig crosses far earlier).
+    await beat(chunky(forged, (8 << 20) / 2 / 1024 + 64));
+    // And the coercion-failure line, which no wire input can reach.
+    const realNormalize = hub.recordCoercion.normalize;
+    hub.recordCoercion.normalize = () => { throw new Error("coercion blew up"); };
+    try {
+      assert.equal((await beat({ device: forged })).status, 400);
+    } finally {
+      hub.recordCoercion.normalize = realNormalize;
+    }
   } finally {
     console.error = realErr;
     console.warn = realWarn;
   }
-  assert.ok(lines.length >= 2, `expected both log paths, got ${lines.length}`);
+  // 413, the drop line, over-half, over-half-share, coercion failure.
+  assert.ok(lines.length >= 5, `only ${lines.length} of the log paths were driven`);
+  assert.ok(lines.some((l) => l.includes("over the")), "the 413 line");
+  assert.ok(lines.some((l) => l.includes("dropped unknown field")), "the drop line");
+  assert.ok(lines.some((l) => l.includes("over half the")), "the over-half warn");
+  assert.ok(lines.some((l) => l.includes("share of the registry budget")), "the share warn");
+  assert.ok(lines.some((l) => l.includes("coercion failed")), "the coercion-failure line");
   for (const l of lines) {
-    assert.equal(/[\u0000-\u0009\u000b-\u001f\u007f]/.test(l), false,
+    // C0, DEL and C1 — JSON.stringify escapes none of the C1 block, and NEL
+    // (U+0085) reads as a line break to some log viewers.
+    assert.equal(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/.test(l), false,
       `a raw control character reached the log: ${JSON.stringify(l)}`);
     assert.equal(l.includes("\n"), false, `a forged line break reached the log: ${JSON.stringify(l)}`);
   }
@@ -449,6 +469,43 @@ test("the state.json ceiling is measured before the file is opened", () => {
   assert.ok(STATE_FILE_MAX >= (32 << 20), "the ceiling must clear a legitimate state file");
   const limit = containerMemoryLimit();
   if (limit) assert.ok(STATE_FILE_MAX <= limit, "and must not exceed the container itself");
+});
+
+test("fairShare never returns zero, however absurd the caps are", () => {
+  // A share of 0 makes `recordSize > share` true for everyone, so the exemption
+  // never applies and every host is refused the moment the registry is full —
+  // the silent-offline regression, arrived at from a config `positiveEnv`
+  // accepts. Held on the function so the extremes are reachable without a whole
+  // process pinned to a degenerate config.
+  assert.equal(hub.fairShare(1 << 20, 4), (1 << 20) / 4);
+  assert.equal(hub.fairShare(100, 100), 1);
+  assert.equal(hub.fairShare(100, 1000), 1, "a count past the budget in BYTES must still leave 1");
+  assert.equal(hub.fairShare(1, 1 << 30), 1);
+  assert.equal(hub.fairShare(1 << 20, 1), 1 << 20);
+  // Floor, not round or ceil: AGENTS_MAX x share must never exceed the budget.
+  assert.equal(hub.fairShare(10, 3), 3);
+});
+
+test("a host is warned BEFORE its share starts refusing it, once per crossing", async () => {
+  // The per-record ceiling's warning is at 4 MiB and a share is 512 KiB, so a
+  // host drifts past its share with the older warning still eight times away —
+  // and the first thing the operator sees is the host vanishing.
+  resetRegistry();
+  const warns = [];
+  const realWarn = console.warn;
+  console.warn = (m) => warns.push(String(m));
+  try {
+    const halfShareKiB = Math.ceil(AGENT_FAIR_SHARE / 2 / 1024) + 2;
+    assert.equal((await beat(chunky("drifter", halfShareKiB))).status, 200);
+    assert.equal((await beat(chunky("drifter", halfShareKiB))).status, 200);
+    assert.equal((await beat(chunky("drifter", halfShareKiB))).status, 200);
+  } finally {
+    console.warn = realWarn;
+  }
+  const share = warns.filter((m) => m.includes("over half") && m.includes("share"));
+  assert.equal(share.length, 1, `warned ${share.length} times, want exactly one crossing`);
+  assert.ok(share[0].includes("drifter"));
+  assert.ok(hub.shareWarned.get("drifter"), "the crossing must be remembered, not re-warned");
 });
 
 test("the per-host share is DERIVED, so the overshoot cannot grow with AGENTS_MAX", () => {

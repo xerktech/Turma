@@ -487,7 +487,10 @@ function logName(key) {
   // JSON.stringify does the line-forging half (a newline becomes the two
   // characters \ and n, so it can never start a line); the sweep after it
   // covers the control characters JSON leaves intact, which a terminal acts on.
-  return JSON.stringify(String(key).slice(0, 200)).replace(/[\u0000-\u001f\u007f]/g, "?");
+  // C0, DEL **and C1** — JSON.stringify escapes none of the C1 block, and NEL
+  // (U+0085) is a line break to some readers.
+  return JSON.stringify(String(key).slice(0, 200))
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
 }
 
 const AGENTS_MAX = positiveEnv("AGENTS_MAX", 64);
@@ -554,7 +557,15 @@ const AGENTS_TOTAL_MAX = positiveEnv("AGENTS_TOTAL_MAX", defaultRegistryBudget()
 // At AGENTS_MAX=2000 against the deployed 32 MiB budget that is 3.9x, and the
 // hub is OOM-killed. Raising the count means raising the budget with it; the
 // boot check below says so rather than letting the two contradict silently.
-const AGENT_FAIR_SHARE = Math.max(1, Math.floor(AGENTS_TOTAL_MAX / AGENTS_MAX));
+//
+// A function, not an expression, so the extremes are reachable to a test
+// without a whole process pinned to a degenerate config: the interesting cases
+// (a count past the budget in BYTES, a count of one) are exactly the ones a
+// realistic rig never reaches.
+function fairShare(total, max) {
+  return Math.max(1, Math.floor(total / max));
+}
+const AGENT_FAIR_SHARE = fairShare(AGENTS_TOTAL_MAX, AGENTS_MAX);
 // A share this small means the count cap and the byte budget disagree about how
 // big a fleet this hub is for: hosts would be refused on size long before the
 // slots ran out. The memory bound still holds — it is the CONFIGURATION that is
@@ -611,6 +622,10 @@ function agentRecordSize(record) {
 // than re-serializing the whole registry on every beat. A side map, not a field
 // on the record: anything stored on the record is served to every client.
 const recordBytes = new Map();
+
+// Which hosts are already over half their share, so that warning fires on the
+// crossing rather than on every beat — same discipline as recordSizeWarned.
+const shareWarned = new Map();
 
 // The aggregate `agentRecordSize` of the whole registry. Measures lazily for a
 // key it has not seen (the state.json restore, and the tests, install records
@@ -690,6 +705,7 @@ function makeRegistryRoom(addBytes, addSlots) {
     // Everything else keyed by host name has to let go too, or a registry that
     // admits and evicts forever leaks a per-host entry per name it ever saw.
     recordSizeWarned.delete(key);
+    shareWarned.delete(key);
     invalidateAgentsCache();
     sseBroadcast("removed", { key });
   }
@@ -4656,6 +4672,21 @@ const server = http.createServer(async (req, res) => {
         );
       }
       recordSizeWarned.set(key, overHalf);
+      // The same crossing-edge warning against the host's SHARE, which is the
+      // line that actually bites: the ceiling above is 8 MiB and a share is
+      // 512 KiB, so a host drifts past its share — and starts being refused
+      // once the registry is also full — with the ceiling's warning still
+      // eight times away. A record grows over weeks, which is plenty of notice
+      // if anyone is told; without this the first signal is the host vanishing.
+      const overHalfShare = recordSize > AGENT_FAIR_SHARE / 2;
+      if (overHalfShare && !shareWarned.get(key)) {
+        console.warn(
+          `heartbeat from ${logName(key)}: record is ${recordSize} bytes, over half ` +
+            `its ${AGENT_FAIR_SHARE}-byte share of the registry budget — past the ` +
+            `whole share it is refused whenever the registry is full`
+        );
+      }
+      shareWarned.set(key, overHalfShare);
       if (recordSize > AGENT_RECORD_MAX) return refuseOversized(recordSize);
       // The AGGREGATE budget (XERK-272). One record under the per-record ceiling
       // is not the bound: AGENTS_MAX records AT that ceiling is 512 MiB on a
@@ -6454,7 +6485,7 @@ if (process.env.TURMA_TEST) {
     // the per-record ceiling stayed green while an unbounded NUMBER of records
     // OOM-killed the hub, so the aggregate has to be pinned by name too.
     AGENTS_MAX, AGENTS_TOTAL_MAX, AGENT_EVICT_IDLE_MS, AGENT_FAIR_SHARE,
-    STATE_FILE_MAX, positiveEnv, logName, recordSizeWarned,
+    STATE_FILE_MAX, positiveEnv, logName, recordSizeWarned, shareWarned, fairShare,
     registryBytes, makeRegistryRoom, trimRestoredAgents, containerMemoryLimit,
     defaultRegistryBudget, recordBytes,
     // Ingest coercion, exported for the same reason as the rest of this group:

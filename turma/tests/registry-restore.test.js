@@ -134,6 +134,31 @@ test("a restore that fails PART WAY through serves nothing, not half a registry"
   assert.ok(r.stderr.includes("state restore skipped"), r.stderr);
 });
 
+test("when it CANNOT move the file, it says that instead of naming one that isn't there", () => {
+  // The message is the operator's only lead. On a read-only /data the rename
+  // fails, and pointing them at a `.oversized` that was never created sends
+  // them looking for a file the hub did not write — reading as "the hub ate my
+  // state".
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "turma-regrestore-ro-"));
+  const locked = path.join(dir, "state.json");
+  fs.writeFileSync(locked, JSON.stringify({ h: { device: "h", lastSeen: 1, pad: "x".repeat(8000) } }));
+  fs.chmodSync(dir, 0o555); // read-only DIRECTORY: the file is readable, unrenamable
+  try {
+    const probe = `require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});`;
+    const r = require("child_process").spawnSync(process.execPath, ["-e", probe], {
+      env: { ...process.env, STATE_FILE: locked }, encoding: "utf8",
+    });
+    assert.equal(r.status, 0, `the hub must still boot on a read-only volume:\n${r.stderr}`);
+    assert.ok(r.stderr.includes("could not move it"), r.stderr);
+    assert.equal(r.stderr.includes(".oversized"), false,
+      "it must not name a file it failed to create");
+    assert.ok(fs.existsSync(locked), "and the original must still be there");
+  } finally {
+    fs.chmodSync(dir, 0o755);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("it says so, and keeps the file rather than deleting it", () => {
   // Silence here is the whole failure mode being fixed: the old behaviour was a
   // crash loop that logged nothing at all.
