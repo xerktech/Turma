@@ -3619,11 +3619,17 @@ const server = http.createServer(async (req, res) => {
     // a migrated session's raw transcript bundle. Agent-authed above. Body is
     // the raw gzipped tar; storing it advances the migration to `importing` and
     // queues importSession on the target (XERK-101).
+    // Scoped to the migration's OWN source host (XERK-266), like the uploads
+    // route below: every agent shares one token, so without this any host could
+    // inject a bundle into someone else's move and have the real target
+    // `claude --resume` those bytes. 404, not 403 — a host with no business
+    // asking is not told the id exists.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m) return json(res, 404, { error: "unknown migration" });
+      if (!m || m.srcHost !== host) return json(res, 404, { error: "unknown migration" });
       if (m.phase !== "exporting")
         return json(res, 409, { error: "migration not awaiting a bundle" });
       let blob;
@@ -3670,12 +3676,16 @@ const server = http.createServer(async (req, res) => {
     }
 
     // GET /api/agents/<host>/migrations/<id>/blob — the TARGET agent pulling the
-    // bundle to unpack + resume. Agent-authed above.
+    // bundle to unpack + resume. Agent-authed above, and scoped to the
+    // migration's OWN target host (XERK-266): the bundle is the raw transcript
+    // of another host's conversation, and the migration id rides the fleet
+    // payload, so the shared agent token alone must not be enough to read it.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m || !m.blob) return json(res, 404, { error: "no bundle" });
+      if (!m || m.targetHost !== host || !m.blob) return json(res, 404, { error: "no bundle" });
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
         "Content-Length": m.blob.length,

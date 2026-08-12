@@ -6144,6 +6144,46 @@ test("migrate: the blob relay rejects an unauthenticated caller", async () => {
   assert.equal(badTok.status, 401);
 });
 
+test("migrate: the blob relay is scoped to the migration's own two hosts", async () => {
+  // Every agent in the fleet shares one token, so agent-auth alone must not let
+  // a third host act as either half of someone else's move (XERK-266).
+  await migHost("hsA", "hs.atlassian.net");
+  await migHost("hsB", "hs.atlassian.net");
+  await migHost("hsC", "hs.atlassian.net"); // same org, no part of the move
+  const mid = (await migrate("hsA", "s1", { host: "hsB" })).body.migrationId;
+  const agentTok = { authorization: "Bearer agenttok" };
+
+  // A host that is not the SOURCE can't inject a bundle: 404 (not 403 — the
+  // relay doesn't confirm the id exists), and the move stays exporting.
+  const inject = await requestRaw("POST", `/api/agents/hsC/migrations/${mid}/blob`,
+    { body: Buffer.from("ATTACKER-BYTES"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(inject.status, 404);
+  assert.equal(migrations.get(mid).phase, "exporting");
+  assert.equal(migrations.get(mid).blob, null);
+  assert.ok(!agents.hsB.commands.some((c) => c.type === "importSession"));
+
+  // The real source's upload still works.
+  const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
+  const up = await requestRaw("POST", `/api/agents/hsA/migrations/${mid}/blob`,
+    { body: blob, headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(up.status, 200);
+
+  // A host that is not the TARGET can't read the bundle — it is the raw
+  // transcript of another host's conversation.
+  const steal = await requestRaw("GET", `/api/agents/hsC/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(steal.status, 404);
+  // The source can't read it back either — only the target has business with it.
+  const backAtSrc = await requestRaw("GET", `/api/agents/hsA/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(backAtSrc.status, 404);
+  // The real target still gets the bytes.
+  const dl = await requestRaw("GET", `/api/agents/hsB/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(dl.status, 200);
+  assert.ok(blob.equals(dl.buf));
+});
+
 // ---- file attachments (XERK-234) -------------------------------------------
 // The hub is the RELAY, not the store: a client POSTs the bytes, they sit in
 // memory under an id, and the agent GETs them when it picks up the input command
