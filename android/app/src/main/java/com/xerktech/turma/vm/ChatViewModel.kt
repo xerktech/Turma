@@ -236,6 +236,13 @@ class ChatViewModel(
                     if (attempt < 20) { delay(3000); loadHistory(attempt + 1) }
                     else _state.update { it.copy(loadingHistory = false) }
                 }
+                // A refusal is not "not yet" (XERK-264): polling it for the full
+                // 20×3s and then giving up in silence told the operator nothing
+                // and cost them a minute. Say what the hub said, and stop.
+                is HubClient.HistoryResult.Failed -> {
+                    _messages.tryEmit("✗ " + r.why)
+                    _state.update { it.copy(loadingHistory = false) }
+                }
                 null -> _state.update { it.copy(loadingHistory = false) }
             }
         }
@@ -432,24 +439,41 @@ class ChatViewModel(
      */
     fun kill() {
         viewModelScope.launch {
-            runCatching { client.api.sessionAction(host, sessionId, "kill") }
-            _messages.tryEmit("✓ kill queued")
+            report("kill queued") { client.api.sessionAction(host, sessionId, "kill") }
             container.fleet.nudge()
         }
+    }
+
+    /**
+     * Run one command and say what actually happened. A refusal the hub
+     * explained — an unknown session, an offline host, a command queue too full
+     * to take another — used to be swallowed by a bare `runCatching` under an
+     * unconditional "✓ queued" (XERK-264), so a command that never ran read as
+     * one that did. Retrofit throws a non-2xx as an HttpException carrying the
+     * body, which [hubErrorMessage] reads; only a transport failure is generic.
+     */
+    private suspend fun report(ok: String, block: suspend () -> Unit) {
+        val r = runCatching { block() }
+        if (r.isSuccess) _messages.tryEmit("✓ $ok")
+        else _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
     }
 
     /** Interrupt the in-flight turn (web "◼ Stop" — POST .../interrupt). */
     fun stop() {
         viewModelScope.launch {
-            runCatching { client.api.interruptSession(host, sessionId) }
-            _messages.tryEmit("◼ stop sent")
+            val r = runCatching { client.api.interruptSession(host, sessionId) }
+            if (r.isSuccess) _messages.tryEmit("◼ stop sent")
+            else _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             container.fleet.nudge()
         }
     }
 
     fun answerOption(index: Int) {
         viewModelScope.launch {
-            runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = index)) }
+            // Only the failure is worth a message here: the answer landing is
+            // its own visible feedback (the question box goes).
+            val r = runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = index)) }
+            if (r.isFailure) _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             container.fleet.nudge()
         }
     }
@@ -458,19 +482,18 @@ class ChatViewModel(
     fun answerMulti(picks: List<Int>) {
         if (picks.isEmpty()) return
         viewModelScope.launch {
-            runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, optionIndices = picks)) }
+            val r = runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, optionIndices = picks)) }
+            if (r.isFailure) _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             container.fleet.nudge()
         }
     }
 
     fun setModel(model: String) = viewModelScope.launch {
-        runCatching { client.api.setModel(host, sessionId, ModelRequest(model)) }
-        _messages.tryEmit("✓ model queued")
+        report("model queued") { client.api.setModel(host, sessionId, ModelRequest(model)) }
     }
 
     fun setMode(mode: String) = viewModelScope.launch {
-        runCatching { client.api.setMode(host, sessionId, ModeRequest(mode)) }
-        _messages.tryEmit("✓ mode queued")
+        report("mode queued") { client.api.setMode(host, sessionId, ModeRequest(mode)) }
     }
 
     // ---- voice dictation into the draft --------------------------------------

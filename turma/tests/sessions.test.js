@@ -23,6 +23,9 @@ const TurmaBoard = require("../public/board.js");
 // The terminal compose bar words a failed send through the chat engine, so the
 // two bars can't disagree (XERK-227) — use the real functions, not a stub.
 const TurmaChatCore = require("../public/chat.js");
+// The chrome's toast + refusal wording (XERK-264) is shared with the dashboard,
+// so the page is driven against the real module rather than a re-typed copy.
+const TurmaNavCore = require("../public/nav.js");
 
 // --- minimal DOM shim --------------------------------------------------------
 function makeEl(id) {
@@ -75,6 +78,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const els = {};
   const opened = [];
   const posts = [];
+  const toasts = [];
   const chat = { busy: false, stopped: 0, failed: null, closed: 0, reconnected: 0 };
   // Window-level listeners the page registers (e.g. popstate), so a test can
   // drive the mobile back-button flow that `history.back()` triggers.
@@ -154,6 +158,11 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     // The header's New-ticket control (newticket.js), fed the beat like the org
     // filter; stubbed inert here — the page just hands it the fleet.
     TurmaNewTicket: { update: noop },
+    // The chrome's shared failure toast (nav.js, XERK-264) — the one surface a
+    // refused command reaches the operator through, so `toasts` is how a test
+    // observes that a refusal was reported at all. The real refusalText is
+    // used, not a stand-in, so the wording under test is the shipped one.
+    TurmaNav: { toast: (m) => toasts.push(m), refusalText: TurmaNavCore.refusalText },
     TurmaBoard,
     scrollTo: noop, innerWidth: 1200, innerHeight: 800,
   };
@@ -172,7 +181,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts, chat, sse, body: document.body,
+  return { ...api, els, opened, posts, toasts, chat, sse, body: document.body,
     // `setOrg` narrows the header's org filter, the way picking an org in the
     // menu does — the sidebar lists only that org's hosts afterwards.
     setOrg: (k) => { stubs.TurmaOrg._k = k; } };
@@ -639,6 +648,104 @@ test("an empty rename clears the name back to the label/worktree fallback", () =
   assert.ok(!els.active.innerHTML.includes("Auto Name"));
 });
 
+// --- refused commands are visible (XERK-264) ---------------------------------
+// The hub refuses commands with a status and a JSON {error} body — an org
+// mismatch, an agent too old, an offline host, a full command queue. post()
+// ignored res.status entirely, so every one of those read to the operator as a
+// command that worked: the menu closed, the name repainted, the spinner span,
+// and nothing had happened. These pin the two halves of the fix — the hub's own
+// words reach the operator, and anything painted optimistically is taken back.
+
+// post() → fetch → res.json() → the caller's .then is four microtask turns; the
+// shim's setTimeout never fires, so drain the queue by hand.
+const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+
+test("a refused kill says why instead of passing for one that worked", async () => {
+  const { beat, cardKill, posts, toasts } = loadPage({
+    postReply: { error: "the host's command queue is full", limit: 200 }, postStatus: 429,
+  });
+  const { now, host: h } = host([working("11111", "Busy One")]);
+  beat({ now, agents: [h] });
+
+  cardKill(click, "hostA", "11111");   // arms
+  cardKill(click, "hostA", "11111");   // confirms
+  await flush();
+  assert.equal(posts.length, 1, "the kill was sent");
+  // 429 is the worst case to swallow: the reason it didn't run is a backlog
+  // that won't clear on its own, so an operator who saw nothing would retry and
+  // make it worse.
+  assert.deepEqual(toasts, ["Kill failed — the host's command queue is full"]);
+});
+
+test("a refused rename takes the optimistically painted name back", async () => {
+  const { beat, startRename, submitRename, setDraft, els, toasts } = loadPage({
+    postReply: { error: "unknown session" }, postStatus: 404,
+  });
+  const { now, host: h } = host([working("11111", "Auto Name")]);
+  beat({ now, agents: [h] });
+
+  startRename(click, "11111");
+  setDraft("My Own Name");
+  submitRename("hostA", "11111");
+  assert.ok(els.active.innerHTML.includes("My Own Name"), "painted while in flight");
+
+  await flush();
+  assert.deepEqual(toasts, ["Rename failed — unknown session"]);
+  assert.ok(els.active.innerHTML.includes("Auto Name"),
+    "the name the session actually has is back");
+  assert.ok(!els.active.innerHTML.includes("My Own Name"));
+});
+
+test("a refused spawn drops the repo's 'Starting…' spinner", async () => {
+  const page = loadPage({
+    postReply: { error: "the agent is offline" }, postStatus: 503,
+  });
+  const now = Date.now();
+  const h = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
+  };
+  page.setCache({ now, agents: [h] });
+  page.render({ now, agents: [h] });
+  page.toggleComposer("hostA::repoX", "repoX");
+  page.startSession("hostA", "repoX");
+  assert.ok(page.els.spawn.innerHTML.includes("Starting…"), "optimistic while in flight");
+
+  await flush();
+  assert.deepEqual(page.toasts, ["Start failed — the agent is offline"]);
+  // Left up, the disabled spinner sits on the repo for the whole PENDING_TTL_MS
+  // and reads as a session on its way.
+  assert.ok(!page.els.spawn.innerHTML.includes("Starting…"));
+});
+
+test("a refusal with no error body still names the status", async () => {
+  const { beat, cardKill, toasts } = loadPage({ postReply: {}, postStatus: 502 });
+  const { now, host: h } = host([working("11111", "Busy One")]);
+  beat({ now, agents: [h] });
+  cardKill(click, "hostA", "11111");
+  cardKill(click, "hostA", "11111");
+  await flush();
+  assert.deepEqual(toasts, ["Kill failed — the hub answered HTTP 502"]);
+});
+
+test("terminal compose: a refusal the button can't word goes to the toast", async () => {
+  const { beat, selectSession, sendTermInput, els, chat, toasts } = loadPage({
+    postReply: { error: "the host's command queue is full" }, postStatus: 429,
+  });
+  const { now, host: h } = host([idle("11111", "Waiting")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  els.termInput = makeEl("termInput");
+  els.termInput.value = "ship it";
+  await sendTermInput();
+  // The compose button has room for a label, not a sentence — it used to render
+  // the bare status number — so the hub's reason rides the toast instead.
+  assert.equal(chat.failed, "Send failed");
+  assert.deepEqual(toasts, ["Send failed — the host's command queue is full"]);
+  assert.equal(els.termInput.value, "ship it", "and the message is still there");
+});
+
 test("cancelling a rename restores the card untouched", () => {
   const { beat, startRename, cancelRename, setDraft, els, posts } = loadPage();
   const { now, host: h } = host([working("11111", "Auto Name")]);
@@ -720,7 +827,7 @@ test("picking a session cancels a pending follow, so the spawn can't yank the st
 });
 
 test("a spawn the agent refused stops the wait and says why (XERK-265)", () => {
-  const { beat, els, opened } = loadPage({ search: "?spawn=cmd-ref" });
+  const { beat, els, opened, toasts } = loadPage({ search: "?spawn=cmd-ref" });
   const { now, host: h } = host([]);
   // Beat 1: nothing reported yet — the ordinary wait.
   beat({ now, agents: [h] });
@@ -729,7 +836,7 @@ test("a spawn the agent refused stops the wait and says why (XERK-265)", () => {
   // Beat 2: the host reports it declined that command.
   h.spawnRefusals = { "cmd-ref": { error: "the host is at MAX_SESSIONS (4)", at: now } };
   beat({ now, agents: [h] });
-  assert.match(els.toast.textContent, /MAX_SESSIONS/, "the reason is surfaced");
+  assert.deepEqual(toasts, ["Couldn't start session: the host is at MAX_SESSIONS (4)"]);
   assert.match(els.stageEmptyBig.innerHTML, /No session attached/,
     "and the wait ends instead of spinning out SPAWN_FOLLOW_MS");
   assert.deepEqual(opened, []);
@@ -740,7 +847,7 @@ test("a followed move advances on its SSE event, not just on a page reload", asy
   // returns early, the fallback interval only runs when it isn't), so without a
   // `migrations` listener a move's phase never moved in the browser: the follow
   // never saw importCmdId and never surfaced a failure (XERK-101/XERK-265).
-  const { beat, els, sse, moveTo } = loadPage({ postReply: { ok: true, migrationId: "m8" } });
+  const { beat, sse, moveTo, toasts } = loadPage({ postReply: { ok: true, migrationId: "m8" } });
   const { now, host: h } = host([{ ...working("s1", "Moving Me") }]);
   beat({ now, agents: [h], migrations: [] });
   await moveTo(click, "hostA", "s1", "hostB");   // arms pendingMigration from the reply
@@ -751,23 +858,23 @@ test("a followed move advances on its SSE event, not just on a page reload", asy
                             srcSessionId: "s1", error: "a root session is already running" }]);
   // Only reachable because the event moved the page's copy of the migration:
   // with the poll alone it would still read `exporting` from the load.
-  assert.match(els.toast.textContent, /Move failed: a root session is already running/);
+  assert.deepEqual(toasts, ["Move failed: a root session is already running"]);
 });
 
 test("a session that DID come up beats a cached refusal for the same command", () => {
   // Mirrors the hub's own tie-break in advanceMigrations. A refusal stays
   // served for ten minutes, so reading it before the session list would let a
   // stale one abandon a spawn that has since landed.
-  const { beat, els, opened } = loadPage({ search: "?spawn=cmd-both" });
+  const { beat, opened, toasts } = loadPage({ search: "?spawn=cmd-both" });
   const { now, host: h } = host([{ ...working("55555", "Landed"), spawnCmdId: "cmd-both" }]);
   h.spawnRefusals = { "cmd-both": { error: "a stale refusal", at: now } };
   beat({ now, agents: [h] });
   assert.deepEqual(opened, ["55555"], "the reported session wins");
-  assert.equal(els.toast ? els.toast.textContent : "", "", "and nothing is said");
+  assert.deepEqual(toasts, [], "and nothing is said");
 });
 
 test("a refused MOVE is reported once, by the migration that owns it", () => {
-  const { beat, els } = loadPage({ search: "?spawn=cmd-imp" });
+  const { beat, toasts } = loadPage({ search: "?spawn=cmd-imp" });
   const { now, host: h } = host([]);
   h.spawnRefusals = { "cmd-imp": { error: "a root session is already running", at: now } };
   beat({
@@ -776,16 +883,15 @@ test("a refused MOVE is reported once, by the migration that owns it", () => {
                    srcHost: "hostA", srcSessionId: "s1" }],
   });
   // The migration follow words this one ("Move failed: …"); the spawn wait must
-  // not toast the same refusal a second time. (The shim only materializes an
-  // element once the page asks for it, so an absent #toast IS "never toasted".)
-  assert.equal(els.toast ? els.toast.textContent : "", "");
+  // not toast the same refusal a second time.
+  assert.deepEqual(toasts, []);
 });
 
 test("a hub or agent too old to report refusals waits exactly as before", () => {
-  const { beat, els } = loadPage({ search: "?spawn=cmd-old" });
+  const { beat, els, toasts } = loadPage({ search: "?spawn=cmd-old" });
   const { now, host: h } = host([]);
   beat({ now, agents: [h] });   // no spawnRefusals key at all
-  assert.equal(els.toast ? els.toast.textContent : "", "");
+  assert.deepEqual(toasts, []);
   assert.match(els.stageEmptyBig.innerHTML, /Starting your session/);
 });
 
