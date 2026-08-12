@@ -193,6 +193,34 @@ One agent container per host, multiplexing sessions across every repo it scans.
 - Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
   `eligibleMoveTargets` in android `SessionsTest`.
 
+### A refused session start is REPORTED, never just logged (XERK-265)
+
+- **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only
+  `log()`s is indistinguishable from a slow spawn: the move sat in `importing` until
+  `MIGRATE_TIMEOUT_MS` and failed with no reason, and the Sessions page spun out `SPAWN_FOLLOW_MS`.
+- Every refusal in `_resume_at_cwd`, `import_session` and `export_session` therefore goes through
+  **`_refuse_start`**, staging `{cmdId, migrationId, error}` onto the beat's **`spawnFailures`** with
+  the same held-across-a-failed-POST lifecycle as `ticketStatusResults`. The `error` is
+  operator-facing — it is what the UI and the migration record show.
+- Hub-side `ingestSpawnFailures` caches it per cmdId as **`spawnRefusals`** (served with the record,
+  NOT stripped like the other caches — the client following that spawn is who needs it) and stamps
+  `m.refusal`, which `advanceMigrations` applies **after** its handoff check, so a success always
+  wins the tie. Absent = "that agent can't tell", i.e. the old timeout wait, on both halves. The
+  Sessions page mirrors that order: the session lookup runs first and clears `pendingSpawn`.
+- **Both handles are checked against what the HUB knows, never taken on the agent's word** — the
+  migrationId against that move's own src/target, the cmdId against the queue that host was actually
+  given. All agents share one token, so unchecked either one lets any host fail another host's move
+  or end its spawn wait with arbitrary text.
+- **The reason is length-capped at both ends** (agent `SPAWN_FAILURE_REASON_MAX`, hub
+  `SPAWN_FAILURE_ERROR_MAX`). It interpolates exception text, and `spawnRefusals` is the first
+  served cache that `agentRecordSize` COUNTS while the ceiling check runs BEFORE the ingest: one
+  unbounded reason lands, pushes the record past `AGENT_RECORD_MAX`, and then 413s every later beat
+  from that host — including the ones that would have swept it (XERK-235's failure class).
+- A refusal with neither handle stays a log line: the id being rejected IS the correlation.
+- **Every refusal on a session-creating path is expected to go through it**, including `resume()`'s
+  — the prune handshake (`_claim_worktree`, XERK-256) is the one this exists for, and it is ordinary
+  timing rather than operator error. A new refusal that only `log()`s re-opens the bug.
+
 ## Cross-cutting contracts
 
 Rules spanning more than one component, so no `paths:`-scoped file can carry them alone.
@@ -265,6 +293,24 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
     a refusal, and folding them together burned 60s and then said nothing.
   - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+- **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
+  agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
+  the tunnel's `?name=` — and each agent runs on its OWN token,
+  `<base64url(device)>.<HMAC(TURMA_AGENT_TOKEN, device)>`, which the hub re-derives against the host
+  that was named. **The token NAMES its host on purpose**: an HMAC can't be inverted, so a bare
+  digest could only be checked once the host was known, and `/api/heartbeat` — whose host is buried
+  in a 32 MiB body — would have had to admit any bearer before reading it.
+  - **Scoping a route to a host is not a security check on its own.** Under one fleet-shared token
+    `<host>` was self-asserted, so `m.srcHost !== host` refused a caller naming ITSELF and passed one
+    naming the victim; `device` was the same, so any token-holder could beat as another host and be
+    handed the commands queued for it. Both halves — the scope AND the binding — or neither is worth
+    stating. Never write a comment claiming a `<host>` compare keeps one agent out of another's data
+    without checking the credential is bound.
+  - That is also why a **per-relay one-time secret is not the fix** and must not be re-proposed: it
+    would ride on exactly the commands an impersonated heartbeat hands out.
+  - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
+    **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
+    `.claude/rules/turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 
@@ -369,8 +415,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 ## Deployment (DockerOps, not here)
 
 - `compose/turma-truenas.yaml` defines the `turma` service and a single per-host `agent-host`
-  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, the shared
-  `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
+  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, that host's OWN
+  `TURMA_TOKEN` (`node turma/server.js --agent-token <device>` against the hub's master
+  `TURMA_AGENT_TOKEN`; `TURMA_AGENT_STRICT` on the hub once every host has one — see XERK-268 in the
+  contracts above), the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
   basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
   env — usage is counted in tokens per model, so there is no rate table.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land
