@@ -2056,15 +2056,49 @@ function fmtDur(ms) {
 // tell "this agent can't report them" from "no agents are running".
 const LIVE_AGENTS_MAX = 32;
 const LIVE_AGENT_FIELD_MAX = 400;
+/**
+ * `String(x)` for a value that came off the wire — it CANNOT throw (XERK-278).
+ *
+ * Plain `String(x)` throws `TypeError: Cannot convert object to primitive value`
+ * when a value has no usable primitive conversion, and **pure JSON can express
+ * one**: `{"toString":1,"valueOf":1}` gives both hooks as own, non-callable
+ * properties, so neither ToPrimitive path works. `JSON.parse` of an
+ * attacker-controlled body produces exactly that object.
+ *
+ * That was a one-packet remote kill of the whole hub. `sanitizeLiveAgents` has
+ * three callers; two are on the heartbeat path, where the request handler's
+ * catch turns the throw into a 400. The third is the `/agent/control` WebSocket
+ * frame handler, which runs inside a `socket.on("data")` listener with no
+ * try/catch above it — and this process installs no `uncaughtException` handler,
+ * so the throw exited node. Under DockerOps' `restart: unless-stopped` that is a
+ * repeatable outage loop of the fleet's entire control plane, and the ordinary
+ * single-user web login is enough to open the socket.
+ *
+ * Fixed HERE rather than by wrapping the caller: a coercion that throws on
+ * untrusted input is the bug, and a caller-side guard is one that the next
+ * caller gets added without.
+ */
+function safeString(v) {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
+  try {
+    return String(v);
+  } catch {
+    // Unconvertible. Treated as absent, which is what every field here already
+    // does with a missing value — nothing downstream could render it anyway.
+    return "";
+  }
+}
+
 function sanitizeLiveAgents(raw) {
   if (!Array.isArray(raw)) return null;
   const out = [];
   for (const a of raw) {
     if (!a || typeof a !== "object") continue;
-    const type = String(a.type == null ? "" : a.type).slice(0, LIVE_AGENT_FIELD_MAX);
+    const type = safeString(a.type).slice(0, LIVE_AGENT_FIELD_MAX);
     if (!type) continue;
     out.push({ sel: !!a.sel, type,
-      label: String(a.label == null ? "" : a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
+      label: safeString(a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
     if (out.length >= LIVE_AGENTS_MAX) break;
   }
   return out;
@@ -4919,12 +4953,18 @@ server.on("upgrade", async (req, socket, head) => {
       if (op !== 0x1) return;
       let msg;
       try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
-      if (msg && msg.tail && Array.isArray(msg.entries)) {
+      // The session id must be a STRING, not merely truthy (XERK-278). It is
+      // used as a property key in `liveFanout`, and coercing an object to a key
+      // runs the same ToPrimitive that `safeString` exists to survive — so an
+      // object id here threw out of this listener and killed the process, the
+      // moment any viewer socket was open on that host. Every real id is a
+      // string, so this only ever refuses a malformed frame.
+      if (msg && typeof msg.tail === "string" && msg.tail && Array.isArray(msg.entries)) {
         // `queued` = still-queued prompts typed mid-turn (foldQueueOp in
         // tunnel-agent.js); absent from agents predating it.
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
           queued: Array.isArray(msg.queued) ? msg.queued : [] });
-      } else if (msg && msg.turn && typeof msg.text === "string") {
+      } else if (msg && typeof msg.turn === "string" && msg.turn && typeof msg.text === "string") {
         // `agents` = the session's live agent list, which outlives the turn
         // (a background agent keeps running after the main one stops), so it
         // rides beside `status` rather than inside it; absent from agents
