@@ -6145,8 +6145,10 @@ test("migrate: the blob relay rejects an unauthenticated caller", async () => {
 });
 
 test("migrate: the blob relay is scoped to the migration's own two hosts", async () => {
-  // Every agent in the fleet shares one token, so agent-auth alone must not let
-  // a third host act as either half of someone else's move (XERK-266).
+  // The <host> segment is checked against the migration's own halves (XERK-266),
+  // so agent-auth plus the id is not on its own enough to act as someone else's
+  // move. It is defense in depth, not identity: the segment is self-asserted,
+  // and a caller that names the real source/target still passes (XERK-268).
   await migHost("hsA", "hs.atlassian.net");
   await migHost("hsB", "hs.atlassian.net");
   await migHost("hsC", "hs.atlassian.net"); // same org, no part of the move
@@ -6182,6 +6184,16 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
     { headers: agentTok });
   assert.equal(dl.status, 200);
   assert.ok(blob.equals(dl.buf));
+
+  // The compare is EXACT, on the same string the hub keys agents by. A host
+  // name that merely resembles a participant's is a different host, and a
+  // lenient compare here would hand it the bundle.
+  const nearMiss = await requestRaw("GET", `/api/agents/HSB/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(nearMiss.status, 404);
+  const nearMissUp = await requestRaw("POST", `/api/agents/HSA/migrations/${mid}/blob`,
+    { body: Buffer.from("x"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(nearMissUp.status, 404);
 });
 
 // ---- file attachments (XERK-234) -------------------------------------------

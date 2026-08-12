@@ -3620,10 +3620,16 @@ const server = http.createServer(async (req, res) => {
     // the raw gzipped tar; storing it advances the migration to `importing` and
     // queues importSession on the target (XERK-101).
     // Scoped to the migration's OWN source host (XERK-266), like the uploads
-    // route below: every agent shares one token, so without this any host could
-    // inject a bundle into someone else's move and have the real target
-    // `claude --resume` those bytes. 404, not 403 — a host with no business
-    // asking is not told the id exists.
+    // route below. **Defense in depth, NOT an identity check**: every agent
+    // shares one token, so `<host>` is the CALLER's to pick and one naming the
+    // real source still passes. What it buys is that an attacker must also know
+    // which two hosts the move is between, on top of the migration id
+    // (`crypto.randomBytes(8)`, handed only to the two participants) — without
+    // it the id alone lets any token-holder make the real target
+    // `claude --resume` bytes it chose. Binding the segment to the credential
+    // is XERK-268. 404 rather than 403 so a caller naming the wrong host isn't
+    // told the id exists (a caller naming the RIGHT one still learns it, from
+    // the 409 below — that much the 404 does not hide).
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
@@ -3677,9 +3683,10 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/agents/<host>/migrations/<id>/blob — the TARGET agent pulling the
     // bundle to unpack + resume. Agent-authed above, and scoped to the
-    // migration's OWN target host (XERK-266): the bundle is the raw transcript
-    // of another host's conversation, and the migration id rides the fleet
-    // payload, so the shared agent token alone must not be enough to read it.
+    // migration's OWN target host (XERK-266) on the same defense-in-depth
+    // terms as the POST above — the bundle is the raw transcript of another
+    // host's conversation, so the id alone should not be enough to read it,
+    // but a caller naming the real target still passes (XERK-268).
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
@@ -3696,8 +3703,10 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
     // operator attached to a message (XERK-234). Agent-authed above. Scoped to
-    // the host the upload was staged for, so one host's agent token can't pull
-    // another host's pending attachment. The blob is NOT dropped on read: the
+    // the host the upload was staged for — like the migration routes above and
+    // with the same limit: `<host>` is self-asserted, so this raises the bar
+    // (the id AND the host) rather than binding the caller (XERK-268). The
+    // blob is NOT dropped on read: the
     // agent may be re-issued the command (at-least-once delivery), and letting it
     // expire on the TTL costs nothing a re-download doesn't.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
