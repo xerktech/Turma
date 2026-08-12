@@ -23,6 +23,7 @@
 
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { Duplex } = require("stream");
@@ -35,6 +36,53 @@ const archive = require("./archive.js");
 const push = require("./push.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
+
+/**
+ * The memory ceiling this process actually runs under — the cgroup limit when
+ * containerised (which is how it is deployed), else the host's RAM.
+ *
+ * Every memory ceiling in this file is a fraction of this rather than a fixed
+ * number (XERK-258), so raising the container's `mem_limit` widens them all with
+ * no code change, and a hub given LESS memory tightens itself instead of dying.
+ * Defined here, at the top, because those ceilings are declared beside the
+ * features they bound and so are spread through the whole file.
+ *
+ * cgroup v2 spells "no limit" as the literal `max` and v1 as a sentinel near
+ * 2^63; both must read as unbounded, or the derived ceilings come out absurd. A
+ * limit above real RAM is treated the same way — it cannot be the binding
+ * constraint.
+ */
+function containerMemoryLimit() {
+  for (const p of ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
+    try {
+      const raw = fs.readFileSync(p, "utf8").trim();
+      if (raw === "max") continue;
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0 && n <= os.totalmem()) return n;
+    } catch {}
+  }
+  return os.totalmem();
+}
+const MEMORY_LIMIT = Number(process.env.MEMORY_LIMIT_BYTES) || containerMemoryLimit();
+// One request may hold an eighth of the container; everything being read at once
+// may hold a quarter. The gap between them is deliberate — it leaves room for the
+// response, the parsed object (a JSON body costs several times its wire size once
+// parsed) and the rest of the hub's working set. See chargeBody for how they are
+// enforced and why a body arriving into an idle hub is admitted regardless.
+//
+// The PER-REQUEST ceiling only ever tightens: it is `min(what one request can
+// legitimately need, what the container can hold)`. Deriving it purely from the
+// limit would hand a hub on a 64 GB host an 8 GB single-body ceiling, which is
+// not generosity — no caller has any business sending that, and the fixed
+// number is the sanity bound. The TOTAL budget is the one that genuinely wants
+// to widen with mem_limit, because that buys CONCURRENCY.
+const BODY_INFLIGHT_ABSOLUTE_MAX = 32 << 20; // 32 MiB — the largest one body may be
+const BODY_INFLIGHT_MAX =
+  Number(process.env.BODY_INFLIGHT_MAX) ||
+  Math.min(BODY_INFLIGHT_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 8));
+const BODY_INFLIGHT_TOTAL_MAX =
+  Number(process.env.BODY_INFLIGHT_TOTAL_MAX) || Math.floor(MEMORY_LIMIT / 4);
+
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 // Ticket -> agent pins (XERK-38): which HOST a ticket's sessions spawn on,
@@ -157,7 +205,18 @@ const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES) || (1 << 25); // 3
 // The whole relay's memory ceiling. Held blobs are RAM, so this is the number
 // that keeps a hub with a fat pipe and a slow agent from being OOM'd; a POST
 // arriving over it is refused rather than evicting someone else's pending file.
-const UPLOAD_TOTAL_MAX_BYTES = Number(process.env.UPLOAD_TOTAL_MAX_BYTES) || (1 << 27); // 128 MiB
+//
+// A FRACTION OF THE CONTAINER LIMIT, like the in-flight body ceilings (XERK-258)
+// — the flat 128 MiB this replaced was double the whole 256m the hub is deployed
+// with, so the refusal could never fire before the OOM killer did. It tightens
+// only: 128 MiB stays 128 MiB on a big host, and comes down to a quarter of the
+// container on a small one.
+//
+// A SEPARATE budget from the in-flight quarter, deliberately: these blobs are
+// held for MINUTES (UPLOAD_TTL_MS), not for the length of one request.
+const UPLOAD_TOTAL_MAX_BYTES =
+  Number(process.env.UPLOAD_TOTAL_MAX_BYTES) ||
+  Math.min(1 << 27, Math.floor(MEMORY_LIMIT / 4));
 // How long a staged blob waits to be collected. Generous, because the operator
 // attaches files and then keeps typing before pressing Send — the clock starts
 // at the upload, not at the message.
@@ -1638,7 +1697,12 @@ const BODY_MAX = 1 << 20; // 1 MiB
 // and — because it holds staged results until a POST succeeds — re-sent the
 // same oversized body every beat, so the host stayed offline forever with
 // nothing logged (XERK-235).
-const HEARTBEAT_MAX = 32 << 20; // 32 MiB
+// Now the SHARED per-request ceiling rather than a fixed 32 MiB (XERK-258): the
+// fixed number happened to equal an eighth of the deployed 256m, so this is the
+// same value today, but a hub given more or less memory must move with it. It
+// stays a named constant because the reason a HEARTBEAT needs the biggest body
+// the hub allows is the paragraph above, not the arithmetic.
+const HEARTBEAT_MAX = BODY_INFLIGHT_MAX;
 
 // Longest prompt/label/baseRef a queued spawn may carry. A queued command is
 // re-serialized into every /api/agents response, every SSE broadcast and
@@ -1757,6 +1821,82 @@ class BodyTooLarge extends Error {
   }
 }
 
+// ---- in-flight body budget (XERK-258) ---------------------------------------
+// A per-request ceiling bounds ONE body. Nothing bounded the SUM of the bodies
+// being read at the same moment, so two requests each comfortably under
+// HEARTBEAT_MAX together exceeded the container's whole memory limit: measured
+// at the deployed 256m, two concurrent 30 MiB heartbeats OOM-kill the hub, and
+// all agents share one TURMA_AGENT_TOKEN, so any one host can take down the
+// fleet's entire control plane — which `restart: unless-stopped` then loops.
+//
+// The ceilings are FRACTIONS OF THE CONTAINER LIMIT, not fixed numbers, so
+// raising mem_limit widens them with no code change and a hub given LESS memory
+// tightens itself instead of dying. Both are logged at boot.
+
+// Thrown when admitting a body would put the hub over the budget. A 503 (not a
+// 413): the request is not too big, the hub is momentarily too busy, and the
+// caller should retry rather than shrink anything.
+class BodyBudgetExceeded extends Error {
+  constructor(held) {
+    super("hub busy: too many large requests in flight");
+    this.budgetExceeded = true;
+    this.held = held;
+    this.limit = BODY_INFLIGHT_TOTAL_MAX;
+  }
+}
+
+let bodyInflightBytes = 0;
+
+/**
+ * Charge `n` bytes to the global budget, or refuse.
+ *
+ * **A body arriving into an idle hub is always admitted**, up to its own
+ * per-request cap — that is what keeps a single legitimate 65 MiB migration
+ * bundle (MIGRATE_BLOB_MAX, larger than the whole budget at 256m) working, and
+ * it is safe precisely because nothing else is being held beside it. Every body
+ * after that one is admitted only while the running sum stays under budget.
+ *
+ * Refusing on arrival rather than mid-read is the point: almost nothing is
+ * buffered for a request that is turned away, so a flood of large bodies costs
+ * the hub far less than a flood of small ones.
+ */
+function chargeBody(n) {
+  if (bodyInflightBytes > 0 && bodyInflightBytes + n > BODY_INFLIGHT_TOTAL_MAX) return false;
+  bodyInflightBytes += n;
+  return true;
+}
+
+/**
+ * What a body of `n` wire bytes really costs the hub, which is NOT `n`.
+ *
+ * A budget that charged wire bytes did not save the hub: two concurrent 30 MiB
+ * heartbeats summed to 60 MiB against a 64 MiB budget, were both admitted, and
+ * OOM-killed it anyway. The wire size is the smallest part of the bill — the
+ * body is also held as a JS string, and then `JSON.parse` builds an object graph
+ * beside it that outweighs both. So a JSON body is charged a MULTIPLE of what it
+ * declares, and the budget bounds the hub's real footprint rather than its
+ * traffic.
+ *
+ * Raw (Buffer) bodies keep their 1x: the migration relay and the attachment
+ * uploads never decode or parse what they hold, so for them the wire size IS the
+ * cost, and inflating it would refuse legitimate bundles that fit comfortably.
+ */
+const BODY_PARSE_COST = 3;
+
+/**
+ * Give `n` bytes back. Both readers call this the moment the body stops being
+ * held — on end, on error, and on either refusal — because a charge that
+ * outlives its buffer ratchets the budget permanently shut, which would take the
+ * hub down just as surely as the OOM this replaced, only more quietly.
+ */
+function releaseBody(n) {
+  bodyInflightBytes -= n;
+  // Belt and braces: a double release would drive this negative, which reads as
+  // "idle" and disables the budget outright.
+  if (bodyInflightBytes < 0) bodyInflightBytes = 0;
+}
+const bodyInflightHeld = () => bodyInflightBytes;
+
 // Collect a request body as a string. Past `cap` it keeps DRAINING for a while
 // rather than destroying the socket: draining is what lets the route write a
 // 413 on the same connection, where a mid-body destroy reaches the client as a
@@ -1766,22 +1906,60 @@ function readBody(req, cap = BODY_MAX) {
     let data = "";
     let len = 0;
     let over = false;
+    // Budget units this read has charged — the body's wire bytes times
+    // BODY_PARSE_COST, not the wire bytes themselves. Released the moment the
+    // body stops being held — on end, on error, and on either refusal — because
+    // a charge that outlives its buffer would ratchet the budget shut.
+    let held = 0;
+    const costOf = (bytes) => bytes * BODY_PARSE_COST;
+    // How far past the refusal point we keep draining before cutting the socket.
+    // Draining is what lets the route answer on the same connection; a mid-body
+    // destroy reaches the client as a hang-up with no status to branch on. A
+    // body refused on BUDGET may be tiny, so it drains from where it stopped
+    // rather than all the way to `cap` — otherwise a flood of refusals would
+    // cost the hub the very read time the budget exists to avoid spending.
+    let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
+    const release = () => { releaseBody(held); held = 0; };
+    const refuse = (err, from = cap) => {
+      over = true;
+      data = ""; // release it — it is not going to be used
+      drainLimit = from + RAW_BODY_DRAIN_SLACK;
+      release();
+      reject(err);
+    };
+
+    // Refuse on the DECLARED length, before a byte is buffered, whenever the
+    // client tells us one. A chunked body has no Content-Length and is caught
+    // incrementally below instead.
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > 0) {
+      if (declared > cap) return refuse(new BodyTooLarge(cap));
+      if (!chargeBody(costOf(declared)))
+        return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+      held = costOf(declared);
+    }
+
     req.on("data", (c) => {
       len += c.length;
       if (over) {
-        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        if (len > drainLimit) req.destroy();
         return;
       }
-      if (len > cap) {
-        over = true;
-        data = ""; // release it — it is not going to be used
-        reject(new BodyTooLarge(cap));
-        return;
+      if (len > cap) return refuse(new BodyTooLarge(cap));
+      // Undeclared (or under-declared) length: top the charge up to what has
+      // actually arrived. Compared in BUDGET UNITS, not wire bytes — against
+      // `len` this would stop topping up after the first chunk and a chunked
+      // body would ride most of the way in uncharged.
+      const want = costOf(len);
+      if (want > held) {
+        if (!chargeBody(want - held))
+          return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        held = want;
       }
       data += c;
     });
-    req.on("end", () => { if (!over) resolve(data); });
-    req.on("error", reject);
+    req.on("end", () => { if (!over) { release(); resolve(data); } });
+    req.on("error", (e) => { release(); reject(e); });
   });
 }
 
@@ -1802,24 +1980,44 @@ function readRawBody(req, cap) {
     let chunks = [];
     let len = 0;
     let over = false;
+    // Charged and released exactly as readBody does — the two readers must stay
+    // in step, or the budget bounds only half of what the hub buffers.
+    let held = 0;
+    let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
+    const release = () => { releaseBody(held); held = 0; };
+    const refuse = (err, from = cap) => {
+      over = true;
+      chunks = []; // release what we'd buffered — it is not going to be used
+      drainLimit = from + RAW_BODY_DRAIN_SLACK;
+      release();
+      reject(err);
+    };
+
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > 0) {
+      if (declared > cap) return refuse(new Error("body too large"));
+      if (!chargeBody(declared)) return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+      held = declared;
+    }
+
     req.on("data", (c) => {
       len += c.length;
       if (over) {
         // Still coming after we've said no: read and throw it away up to a
         // point, then stop paying for a client that won't.
-        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        if (len > drainLimit) req.destroy();
         return;
       }
-      if (len > cap) {
-        over = true;
-        chunks = []; // release what we'd buffered — it is not going to be used
-        reject(new Error("body too large"));
-        return;
+      if (len > cap) return refuse(new Error("body too large"));
+      if (len > held) {
+        const extra = len - held;
+        if (!chargeBody(extra)) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        held += extra;
       }
       chunks.push(c);
     });
-    req.on("end", () => { if (!over) resolve(Buffer.concat(chunks)); });
-    req.on("error", reject);
+    req.on("end", () => { if (!over) { release(); resolve(Buffer.concat(chunks)); } });
+    req.on("error", (e) => { release(); reject(e); });
   });
 }
 
@@ -3152,6 +3350,41 @@ async function proxyTerm(req, res, name, port) {
   req.pipe(up);
 }
 
+// ---- connection cap (XERK-273) ----------------------------------------------
+// Nothing else bounds concurrent SOCKETS. Every accepted connection costs a read
+// buffer, an HTTP parser and request/response objects before a single body byte
+// is read — a cost the in-flight byte budget above cannot see, because it is not
+// made of body bytes.
+//
+// Measured at `-m 256m` (the deployed limit), that cost is ~28 KiB per socket:
+// 1024 idle-bodied connections peak at 49 MiB and 4096 at 135 MiB, where the hub
+// survives the OOM killer but stops answering. So sockets alone turn fatal
+// somewhere past ~8000, NOT at the ~1024 the ticket first attributed to them —
+// there the bill was overwhelmingly the 0.9 MiB bodies, which is the budget's
+// job, not this one's. Both bounds are needed and neither substitutes for the
+// other: the cap cannot bound bytes (a cap safe against a worst-case body would
+// have to be ~4) and the budget cannot bound sockets.
+//
+// The number is sized against real use, not against what survives. A dashboard
+// viewer holds an SSE stream, up to ~6 HTTP/1.1 sockets and a terminal socket;
+// every agent holds a control channel plus a data channel per open terminal.
+// A plausible fleet is well under 100 sockets, so 256 is ~3.5x headroom and
+// still far below the lethal count. Raise it via the env if a bigger fleet ever
+// needs it — set it too LOW and the UI breaks looking like a network fault,
+// which is exactly why the refusal is logged rather than silent.
+//
+// A refused connection is DESTROYED by Node before any HTTP parsing, so there is
+// no way to answer it with a 503 — the client sees a reset. That is the accepted
+// cost, and the reason the `drop` log below is the only diagnosable trace.
+const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS) || 256;
+// Refusals are logged rate-limited: a flood is thousands of drops per second and
+// a line each would make the log its own resource problem. The FIRST drop of a
+// burst prints immediately (that edge is the diagnosis), then at most one
+// summary line per window for as long as it lasts.
+const DROP_LOG_EVERY_MS = 60 * 1000;
+let dropsSinceLog = 0;
+let dropLoggedAt = 0;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/sessions
@@ -3630,6 +3863,16 @@ const server = http.createServer(async (req, res) => {
       try {
         blob = await readRawBody(req, MIGRATE_BLOB_MAX);
       } catch (e) {
+        // A BUDGET refusal is transient and says nothing about this bundle, so
+        // the migration stays in `exporting` and the source re-POSTs it
+        // (`_migration_upload` retries a 5xx). Failing it here would strand a
+        // perfectly valid move on a momentarily busy hub — and since a bundle is
+        // the largest body an agent ever sends, it is the one most likely to be
+        // refused, so this is the case that would break most often.
+        if (e && e.budgetExceeded) {
+          res.setHeader("Retry-After", "1");
+          return json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+        }
         m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
         publishMigrations();
         return json(res, 413, { error: e.message });
@@ -3998,7 +4241,14 @@ const server = http.createServer(async (req, res) => {
         let bytes;
         try {
           bytes = await readRawBody(req, cap);
-        } catch {
+        } catch (e) {
+          // Same distinction the migration relay draws: "too big" is about the
+          // file and tells the operator to pick a smaller one; "busy" is about
+          // the hub and tells them to press send again.
+          if (e && e.budgetExceeded) {
+            res.setHeader("Retry-After", "1");
+            return json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+          }
           return json(res, 413, {
             error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
             limit: cap,
@@ -4779,8 +5029,39 @@ const server = http.createServer(async (req, res) => {
       if (!res.writableEnded) json(res, 413, { error: "body too large", limit: err.cap });
       return;
     }
+    // Not "your request is too big" — "the hub is momentarily holding as much as
+    // it safely can". A 503 so the caller retries instead of shrinking anything;
+    // the {error} body is what every client already toasts (XERK-264).
+    if (err && err.budgetExceeded) {
+      if (!res.writableEnded) {
+        res.setHeader("Retry-After", "1");
+        json(res, 503, { error: err.message, held: err.held, limit: err.limit });
+      }
+      return;
+    }
     json(res, 400, { error: err.message });
   }
+});
+
+// The cap counts every open socket, INCLUDING the upgraded WebSockets below —
+// they are the long-lived, most expensive ones, so leaving them out would let
+// the very connections this protects against accumulate uncounted. That is also
+// why the number has to clear steady-state WebSocket use with room to spare.
+server.maxConnections = MAX_CONNECTIONS;
+
+// Node destroys a connection over the cap before emitting `request`, so this is
+// the only place a refusal is observable. See MAX_CONNECTIONS for why it is
+// rate-limited rather than one line per drop.
+server.on("drop", () => {
+  dropsSinceLog++;
+  const now = Date.now();
+  if (now - dropLoggedAt < DROP_LOG_EVERY_MS) return;
+  console.warn(
+    `WARNING: connection cap reached (MAX_CONNECTIONS=${MAX_CONNECTIONS}) — ` +
+      `refused ${dropsSinceLog} connection(s); clients see a reset, not an HTTP error`
+  );
+  dropLoggedAt = now;
+  dropsSinceLog = 0;
 });
 
 // ---- WebSocket upgrades -----------------------------------------------------
@@ -5142,6 +5423,13 @@ if (process.env.TURMA_TEST) {
     HEARTBEAT_KNOWN_KEYS,
     invalidateAgentsCache,
     serializeAgentsForSave,
+    // The in-flight body budget (XERK-258). Exported because the admission rule
+    // is the whole fix and is otherwise only reachable by actually flooding a
+    // memory-limited container: the ceilings so a test can hold the arithmetic
+    // that derives them from the container limit, and charge/release so the
+    // "idle hub admits anything, a busy one does not" rule can be held directly.
+    MEMORY_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
+    chargeBody, releaseBody, bodyInflightHeld,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
@@ -5206,7 +5494,16 @@ if (process.env.TURMA_TEST) {
   if (!TURMA_AGENT_TOKEN) console.warn("WARNING: TURMA_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
   server.listen(PORT, () => {
-    console.log(`turma listening on :${PORT}`);
+    console.log(`turma listening on :${PORT} (max ${MAX_CONNECTIONS} concurrent connections)`);
+    // Every one of these is derived from the container limit, so print what they
+    // came out as: it is the only way to tell a hub that is correctly sized from
+    // one whose mem_limit moved under it, and it turns "why did that 503?" into
+    // one `docker logs` (XERK-258, XERK-273).
+    const mib = (n) => `${Math.round(n / (1 << 20))} MiB`;
+    console.log(
+      `memory limit ${mib(MEMORY_LIMIT)} -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
+        `${mib(BODY_INFLIGHT_TOTAL_MAX)} total; uploads held ${mib(UPLOAD_TOTAL_MAX_BYTES)}`
+    );
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile
     // notifications (every notify() is a no-op), and that has silently bitten us

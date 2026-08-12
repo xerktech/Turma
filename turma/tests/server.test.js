@@ -6455,3 +6455,155 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
 });
 
+
+// ---- XERK-273: the concurrent-connection cap ---------------------------------
+
+test("connections: the cap is applied to the listening server", async () => {
+  // Unset, `maxConnections` is Infinity and nothing bounds concurrent sockets —
+  // which is the whole bug: 1024 overlapping heartbeats OOM-kill the hub at the
+  // deployed 256m regardless of how small each body is, because the cost is per
+  // CONNECTION. A regression here is silent (every test still passes, the hub
+  // just dies under load), so the value is pinned rather than merely non-zero.
+  assert.equal(server.maxConnections, 256);
+});
+
+test("connections: a connection over the cap is refused, and says so", async () => {
+  const open = [];
+  const connections = () =>
+    new Promise((res, rej) =>
+      server.getConnections((e, n) => (e ? rej(e) : res(n)))
+    );
+  const connect = () =>
+    new Promise((res, rej) => {
+      const s = net.connect(server.address().port, "127.0.0.1");
+      s.once("connect", () => res(s));
+      s.once("error", rej);
+      open.push(s);
+    });
+
+  const before = server.maxConnections;
+  try {
+    // Relative to what is already open: earlier tests leave keep-alive sockets
+    // behind, so an absolute cap here would refuse the probe's own two sockets.
+    const base = await connections();
+    server.maxConnections = base + 2;
+    await connect();
+    await connect();
+    while ((await connections()) < base + 2) await new Promise((r) => setImmediate(r));
+
+    // The refusal is observable ONLY as the `drop` event: Node destroys the
+    // socket before parsing, so there is no request to answer with a 503 and
+    // nothing but this event (and the log it drives) to diagnose it by.
+    const dropped = new Promise((res) => server.once("drop", () => res(true)));
+    const extra = await connect();
+    // ...and the client just gets closed on, with no HTTP response at all.
+    const closed = new Promise((res) => extra.once("close", () => res(true)));
+    extra.write("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n");
+    let answered = "";
+    extra.on("data", (c) => (answered += c));
+
+    assert.equal(await dropped, true);
+    assert.equal(await closed, true);
+    assert.equal(answered, "");
+  } finally {
+    server.maxConnections = before;
+    for (const s of open) s.destroy();
+  }
+});
+
+// ---- XERK-258: the in-flight body budget ------------------------------------
+
+test("budget: the ceilings are derived from the container limit, and only tighten", async () => {
+  // Fixed numbers are what made this a bug: UPLOAD_TOTAL_MAX_BYTES was a flat
+  // 128 MiB, DOUBLE the 256m the hub is deployed with, so it could never refuse
+  // anything before the OOM killer fired. Every ceiling is now a fraction of the
+  // limit -- and capped, so a big host can't hand one request the whole machine.
+  assert.ok(hub.MEMORY_LIMIT > 0);
+  assert.ok(hub.BODY_INFLIGHT_TOTAL_MAX <= Math.floor(hub.MEMORY_LIMIT / 4));
+  assert.ok(hub.BODY_INFLIGHT_MAX <= Math.floor(hub.MEMORY_LIMIT / 8));
+  assert.ok(hub.BODY_INFLIGHT_MAX <= 32 << 20, "one body may never exceed the sanity bound");
+  assert.ok(hub.UPLOAD_TOTAL_MAX_BYTES <= Math.floor(hub.MEMORY_LIMIT / 4));
+  // The per-request ceiling must stay strictly under the total, or one body
+  // could fill the budget and the concurrency bound would mean nothing.
+  assert.ok(hub.BODY_INFLIGHT_MAX < hub.BODY_INFLIGHT_TOTAL_MAX);
+});
+
+test("budget: an idle hub admits any single body; a busy one refuses over budget", async () => {
+  assert.equal(hub.bodyInflightHeld(), 0, "no request should be in flight here");
+  const total = hub.BODY_INFLIGHT_TOTAL_MAX;
+  try {
+    // The first body in is admitted even ABOVE the whole budget -- that is what
+    // keeps a single 65 MiB migration bundle (larger than the budget at 256m)
+    // working, and it is safe precisely because nothing is held beside it.
+    assert.equal(hub.chargeBody(total * 2), true, "an idle hub admits a lone oversized body");
+    // ...but nothing may join it while it is held.
+    assert.equal(hub.chargeBody(1), false, "a second body must not be admitted over budget");
+    hub.releaseBody(total * 2);
+
+    // Under budget, bodies accumulate; the one that would cross it is refused
+    // rather than admitted-and-then-OOM'd.
+    assert.equal(hub.chargeBody(Math.floor(total / 2)), true);
+    assert.equal(hub.chargeBody(Math.floor(total / 2) - 1), true);
+    assert.equal(hub.chargeBody(total), false);
+    assert.ok(hub.bodyInflightHeld() <= total, "the sum never exceeds the budget");
+  } finally {
+    hub.releaseBody(hub.bodyInflightHeld());
+  }
+  assert.equal(hub.bodyInflightHeld(), 0, "every charge must be given back");
+});
+
+test("budget: a release can never drive the held total negative", async () => {
+  // A double release would read as "idle" and silently disable the budget --
+  // the same OOM again, only with the guard apparently in place.
+  hub.releaseBody(1 << 30);
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("http: a request over the budget is refused 503, not 413", async () => {
+  // The two refusals mean opposite things to the caller: 413 says "your body is
+  // too big, send less", 503 says "the hub is momentarily full, send it again".
+  // Collapsing them would tell an agent to shrink a beat that was fine.
+  try {
+    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX);
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "budget-host" },
+      headers: { ...agentHeaders, connection: "close" },
+    });
+    assert.equal(res.status, 503);
+    assert.match(res.body.error, /busy/i);
+    assert.equal(res.body.limit, hub.BODY_INFLIGHT_TOTAL_MAX);
+  } finally {
+    hub.releaseBody(hub.bodyInflightHeld());
+  }
+  // And with the budget clear again the very same beat succeeds -- the refusal
+  // was transient, which is exactly what the 503 promised.
+  const ok = await request("POST", "/api/heartbeat", {
+    body: { device: "budget-host" }, headers: agentHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test("budget: a body that completes gives its charge back", async () => {
+  // The leak that would matter most: a charge outliving its buffer ratchets the
+  // budget shut, and the hub 503s everything forever with nothing logged.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  for (let i = 0; i < 5; i++) {
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "leak-host", pad: "z".repeat(64 * 1024) }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200);
+  }
+  assert.equal(hub.bodyInflightHeld(), 0, "nothing may still be charged once the beats are answered");
+});
+
+test("budget: a body refused for being too large also gives its charge back", async () => {
+  // The 413 path releases on a DIFFERENT branch to the success path, so it is
+  // its own way for the budget to leak.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "big-host", pad: "y".repeat((33 << 20)) },
+    headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(hub.bodyInflightHeld(), 0, "a refused body must not stay charged");
+});

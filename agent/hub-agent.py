@@ -10603,25 +10603,46 @@ class SessionManager:
                         shutil.copyfileobj(src, f)
                 # anything else (symlink/device/fifo) is silently skipped
 
+    # A bundle is the largest thing an agent ever sends, so it is the body most
+    # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
+    # try again". Nothing else would retry it — a lost bundle strands the whole
+    # move until it times out hub-side — and the hub deliberately holds the
+    # migration in `exporting` on that refusal so a re-POST can still land.
+    # 4xx is NOT retried: the hub parsed the bundle and declined it, and sending
+    # the same bytes again would be refused the same way.
+    MIGRATION_UPLOAD_ATTEMPTS = 3
+    MIGRATION_UPLOAD_BACKOFF_SEC = 2
+
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,
-        agent-authed). Best-effort: a failure leaves the migration to time out
-        hub-side rather than raising into the command loop."""
-        try:
-            headers = {"Content-Type": "application/octet-stream",
-                       "User-Agent": "hub-agent/1.0"}
-            if TURMA_TOKEN:
-                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
-            url = (f"{TURMA_URL}/api/agents/"
-                   f"{urllib.parse.quote(self.device, safe='')}"
-                   f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
-            req = urllib.request.Request(url, data=blob, headers=headers,
-                                         method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp.read()
-            log(f"migration {migration_id}: uploaded {len(blob)} bytes")
-        except Exception as e:
-            log(f"migration upload failed for {migration_id}: {e}")
+        agent-authed). Best-effort: once the retries below are spent, a failure
+        leaves the migration to time out hub-side rather than raising into the
+        command loop."""
+        headers = {"Content-Type": "application/octet-stream",
+                   "User-Agent": "hub-agent/1.0"}
+        if TURMA_TOKEN:
+            headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+        url = (f"{TURMA_URL}/api/agents/"
+               f"{urllib.parse.quote(self.device, safe='')}"
+               f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
+        for attempt in range(1, self.MIGRATION_UPLOAD_ATTEMPTS + 1):
+            try:
+                req = urllib.request.Request(url, data=blob, headers=headers,
+                                             method="POST")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp.read()
+                log(f"migration {migration_id}: uploaded {len(blob)} bytes")
+                return
+            except Exception as e:
+                code = getattr(e, "code", None)
+                transient = not isinstance(code, int) or code >= 500
+                last = attempt >= self.MIGRATION_UPLOAD_ATTEMPTS
+                if not transient or last:
+                    log(f"migration upload failed for {migration_id}: {e}")
+                    return
+                log(f"migration {migration_id}: upload attempt {attempt} failed "
+                    f"({e}) — retrying")
+                time.sleep(self.MIGRATION_UPLOAD_BACKOFF_SEC * attempt)
 
     def _migration_download(self, migration_id):
         """GET a transcript bundle from the hub's migration relay. Returns the

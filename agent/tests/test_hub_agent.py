@@ -4053,6 +4053,41 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         sm.export_session("s", "mig1")
         self.assertEqual(called, [])
 
+    def test_migration_upload_retries_a_busy_hub_but_not_a_refusal(self):
+        # A bundle is the largest body an agent ever sends, so it is the one most
+        # likely to meet the hub's in-flight budget and be told 503 (XERK-258).
+        # Nothing else retries it, and a lost bundle strands the whole move until
+        # it times out hub-side.
+        sm = self._manager()
+        sm.MIGRATION_UPLOAD_BACKOFF_SEC = 0  # don't actually sleep in the suite
+
+        def attempts_for(codes):
+            """Run an upload whose Nth call raises codes[N], and count the calls."""
+            calls = []
+
+            def fake_urlopen(req, timeout=None):
+                calls.append(req)
+                code = codes[len(calls) - 1] if len(calls) <= len(codes) else None
+                if code is not None:
+                    raise urllib.error.HTTPError(
+                        req.full_url, code, "nope", {}, None)
+                return mock.MagicMock(
+                    __enter__=lambda s: mock.Mock(read=lambda: b""),
+                    __exit__=lambda *a: False)
+
+            with mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+                sm._migration_upload("mig1", b"bundle")
+            return len(calls)
+
+        # 503 twice then success: it keeps trying and the move survives.
+        self.assertEqual(attempts_for([503, 503]), 3)
+        # A 4xx is the hub having parsed the bundle and declined it — re-sending
+        # the same bytes would be refused identically, so it gives up at once.
+        self.assertEqual(attempts_for([413]), 1)
+        # And it never retries forever.
+        self.assertEqual(attempts_for([503, 503, 503, 503, 503]),
+                         sm.MIGRATION_UPLOAD_ATTEMPTS)
+
     def test_import_unpacks_and_resumes_with_identity(self):
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig")  # not on disk here
         # Pack a transcript on a "source", then import it on this "target".

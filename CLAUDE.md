@@ -239,6 +239,30 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
     a refusal, and folding them together burned 60s and then said nothing.
   - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+- **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers**
+  (XERK-258, XERK-273). It runs at `mem_limit: 256m`, so a flat constant larger than that can never
+  refuse anything before the OOM killer fires — which is how a flat 128 MiB upload ceiling and an
+  unbounded socket count each killed the fleet's whole control plane, `restart: unless-stopped`
+  looping the outage. `containerMemoryLimit()` reads the cgroup; everything derives from it and is
+  logged at boot. Raising `mem_limit` in DockerOps widens them with no code change.
+  - **A body is charged `BODY_PARSE_COST` x its wire size, not its wire size.** The bill is the JS
+    string plus what `JSON.parse` builds beside it; charging wire bytes admitted two 30 MiB beats
+    against a 64 MiB budget and OOM'd anyway. Raw (Buffer) bodies keep 1x — nothing parses them.
+  - **A body arriving into an IDLE hub is always admitted**, up to its own per-request cap. That is
+    what keeps a single 65 MiB migration bundle (bigger than the whole budget at 256m) working, and
+    it is safe only because nothing is held beside it. Never make it unconditional.
+  - **The per-request ceiling only ever TIGHTENS** (`min(sanity bound, limit/8)`); only the TOTAL
+    budget widens with the container, because that is what buys concurrency. Deriving the
+    per-request one purely from the limit hands a big host an 8 GB single-body ceiling.
+  - **413 and 503 mean opposite things and must not be collapsed**: 413 is "your body is too big,
+    send less", 503 is "the hub is momentarily full, send it again". Every `readRawBody` caller has
+    to draw the distinction itself — both did answer a flat 413 once. On a 503 the migration relay
+    HOLDS the migration in `exporting`, and `_migration_upload` retries (5xx only); nothing else
+    would, and a lost bundle strands the move.
+  - `server.maxConnections` bounds the socket count, which no byte budget can: each socket costs a
+    read buffer, parser and req/res objects before a body byte arrives. It counts the upgraded
+    WebSockets too, so the number must clear steady-state SSE/tunnel/terminal use with room spare —
+    set it too low and the UI breaks looking like a network fault, which is why drops are logged.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 
