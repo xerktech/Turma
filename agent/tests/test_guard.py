@@ -136,6 +136,10 @@ ATTRIB_BLOCKED = [
     "gh pr create --title t --body 'Generated with Claude'",
     "glab mr create --title t --description 'Generated with Claude'",
     "az repos pr create --title t --description 'Generated with Claude'",
+    # An on-prem ADO host opens its PRs with a local wrapper, not az — by name
+    # or, when it has fallen off PATH, through its interpreter.
+    "ado pr-create --title t --description 'Generated with Claude Code'",
+    "python3 ~/git/ado/ado.py pr-create --description 'Generated with Claude'",
 ]
 
 ATTRIB_OK = [
