@@ -261,9 +261,19 @@ npm_install_claude() {
     return 1
   fi
   elapsed=$(( $(date +%s) - started ))
+  # A BACKWARDS clock step makes this negative, and `remaining` then EXCEEDS the
+  # budget — measured at 3897s against a 300s budget, i.e. the retry running far
+  # past the number the launcher's floor is computed from, which fires the
+  # watchdog mid-install. This is not exotic: it runs during a start, which is
+  # exactly when chrony/timesyncd corrects a host with no battery-backed RTC.
+  [ "$elapsed" -lt 0 ] && elapsed=0
   remaining=$(( budget - elapsed ))
+  # Below ~10s an `npm install -g` of a ~300 MB package cannot finish, so
+  # starting one only guarantees it is SIGKILLed mid-write — which leaves NO
+  # claude at all, where letting it be is merely stale.
   if [ "$remaining" -lt 10 ]; then
-    logmsg "claude: no time left in the ${budget}s install budget for the $HOME/.local retry"
+    logmsg "claude: ${remaining}s left of the ${budget}s install budget — too little to finish" \
+           "an install, so not retrying into $HOME/.local"
     return 1
   fi
   bounded "$remaining" \

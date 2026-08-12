@@ -857,6 +857,59 @@ STUB
   rm -rf "$root" "$d"
 fi
 
+# 16n. A BACKWARDS clock step during the install step must not enlarge the shared
+#      budget. `$(( now - started ))` goes negative there, so `remaining` comes
+#      out LARGER than the budget — and the launcher's floor is computed from
+#      that budget, so the watchdog would fire mid-install. This runs during a
+#      start, which is exactly when a host with no battery-backed RTC has its
+#      clock corrected.
+if [ "$(id -u)" = 0 ]; then
+  pass "clock-step case needs the root-gated retry branch; runs on non-root (CI)"
+else
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+  echo "0.3.0" >"$prefix/VERSION"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  install_fake_claude_toolchain "$bin" "2.0.1" "2.0.9" yes
+  cat > "$bin/timeout" <<STUB
+#!/bin/sh
+echo "timeout \$*" >> "\$CLAUDE_LOG"
+exec /usr/bin/timeout "\$@"
+STUB
+  # A clock that steps back an hour on its Nth read — the shape of a boot-time
+  # NTP correction landing mid-install. Every other date format passes through.
+  cat > "$bin/date" <<STUB
+#!/bin/sh
+if [ "\$1" = "+%s" ]; then
+  n=\$(cat "$root/dcount" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "$root/dcount"
+  base=\$(/usr/bin/date +%s)
+  [ "\$n" -ge "\${STUB_DATE_JUMP_AFTER:-99}" ] && base=\$((base - 3600))
+  echo "\$base"
+else
+  exec /usr/bin/date "\$@"
+fi
+STUB
+  chmod +x "$bin/timeout" "$bin/date"
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+  : > "$root/claude.log"
+  env FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
+    TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" \
+    TURMA_NPM_INSTALL_TIMEOUT=30 STUB_NPM_ALWAYS_FAIL=1 STUB_DATE_JUMP_AFTER=3 \
+    "$bin/turma-agent-update" --claude-only >"$root/out.log" 2>&1 || true
+  retry="$(grep 'timeout -k .* npm install -g --prefix' "$root/claude.log" \
+           | sed -n 's/.*timeout -k [0-9]* \([0-9]*\) .*/\1/p' | head -1 || true)"
+  if [ -z "$retry" ]; then
+    pass "the retry was skipped under a backwards clock step"
+  elif [ "$retry" -le 30 ]; then
+    pass "a backwards clock step cannot enlarge the install budget (retry bound ${retry}s of 30s)"
+  else
+    fail "a backwards clock step gave the retry ${retry}s against a 30s budget — the floor no longer covers it"
+  fi
+  rm -rf "$root" "$d"
+fi
+
 # --- The --boot rate limit (XERK-254) ----------------------------------------
 # The launcher fires --boot on every start, and systemd's Restart=always makes a
 # crash-looping manager start every 5s. Unthrottled that is a release+registry

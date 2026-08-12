@@ -120,7 +120,11 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     - **The two install attempts SHARE one budget** (`TURMA_NPM_INSTALL_TIMEOUT`, the retry gets the
       remainder): per-attempt bounds let the step take twice the operator's number, which is
       arithmetic the floor is built on — and counting them separately instead would mean promising a
-      965s boot for the same work.
+      965s boot for the same work. The elapsed-time subtraction is **clamped at zero**: this runs
+      during a start, which is when a host with no battery-backed RTC gets its clock corrected, and
+      a backwards step made `remaining` EXCEED the budget (measured: 3897s against 300s). Under ~10s
+      left the retry is skipped rather than started — an install that cannot finish is one that gets
+      SIGKILLed mid-write, and that leaves no claude at all.
     - **`ensure_npm_prefix` must be called DIRECTLY, never as `$(...)`** — a command substitution is
       a subshell, so a memo written as a value-returning function silently never memoised and every
       caller re-read the prefix.
