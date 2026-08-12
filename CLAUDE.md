@@ -11,9 +11,10 @@ that component's files.
 | File | Loads when Claude touches | Covers |
 |------|---------------------------|--------|
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
-| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, PR status, usage ledger, transcript blocks, archive, image |
+| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
+| `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**` | guard hook, AskUserQuestion bridge |
 | `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | container boot, start-time Claude Code check, bundled toolchains |
@@ -36,8 +37,8 @@ that component's files.
     cost of a large file is context tokens and weaker adherence, which is what the ceiling protects.
     A ceiling stated as a truncation cliff was wrong; do not restore that framing.
   - **When a file approaches the ceiling, split it by path into another rules file** — that is the
-    remedy, not raising the number and not deleting rationale. `agent-board.md`, `turma-board.md`
-    and `turma-sessions.md` exist for exactly that reason.
+    remedy, not raising the number and not deleting rationale. `agent-board.md`, `agent-prs.md`,
+    `turma-board.md` and `turma-sessions.md` exist for exactly that reason.
 - **Put a fact in the narrowest file that always sees it.** Component detail → that component's
   rules file. A rule spanning two components → "Cross-cutting contracts" below, since a
   `paths:`-scoped file does not load when Claude works on the other side of the contract.
@@ -239,6 +240,19 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     restore is the first thing it serves). Coerce to the "can't tell you" value every client already
     handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer agent
     adds is dropped fleet-wide unless it is added there too.
+- **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses
+  commands with a status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host
+  offline, 404 stale attachment, 413 too long, 429 queue full); a client that reads the body and
+  ignores `res.status` shows a refused kill/rename/spawn as one that worked.
+  - Web: `post()`/`del()` (both pages) resolve **null on a refusal, having already toasted**
+    `TurmaNav.refusalText`, and callers roll back whatever they painted optimistically on that null.
+    `TurmaNav.toast` (nav.js, `.toast` in app.css) is the ONE failure surface — nothing announces
+    success through it, so a toast on screen always means a command did not run.
+  - Android: `hubErrorMessage` reads the `{error}` off an `HttpException` **or** a typed `Response`;
+    `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
+    pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
+    a refusal, and folding them together burned 60s and then said nothing.
+  - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 

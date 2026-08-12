@@ -16,6 +16,7 @@ import com.xerktech.turma.net.hubErrorMessage
 import com.xerktech.turma.net.ResumeRequest
 import com.xerktech.turma.net.SpawnRequest
 import com.xerktech.turma.net.SummaryRequest
+import com.xerktech.turma.net.hubErrorMessage
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -61,17 +62,35 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() = container.fleet.stop()
     fun refresh() = container.fleet.nudge()
 
-    private fun run(ok: String, block: suspend () -> OkResponse) {
+    /**
+     * Fire one command and report what actually happened.
+     *
+     * A refusal the hub EXPLAINED — an org mismatch, an agent too old to run it,
+     * an offline host, a command queue too full to take another — arrives as a
+     * non-2xx, which Retrofit throws as an HttpException with the body attached.
+     * Reporting that as "hub unreachable" sent the operator hunting for a
+     * network fault that isn't there (XERK-264), so [hubErrorMessage] reads the
+     * hub's own `{error}` text and only a genuine transport failure keeps the
+     * generic wording.
+     *
+     * `pendKeys` are the optimistic rows this command painted: a command that
+     * never reached the agent must not keep a spinner up for the whole TTL, so
+     * they come straight back off on a failure.
+     */
+    private fun run(ok: String, vararg pendKeys: String, block: suspend () -> OkResponse) {
         viewModelScope.launch {
             val msg = try {
                 val r = block()
                 if (r.error.isNotEmpty()) "✗ ${r.error}" else "✓ $ok"
             } catch (e: Exception) {
-                // Prefer the hub's OWN reason when it gave one (XERK-246): a
-                // refused spawn — "host has no local model configured" on a 409
-                // — used to read "hub unreachable", which is both wrong and
-                // unactionable. Only a genuinely unanswered request says that.
                 "✗ " + (hubErrorMessage(e) ?: "hub unreachable")
+            }
+            // Main landed this same `hubErrorMessage` line independently under
+            // XERK-264, so the two sides agree on the wording; the docstring
+            // above now carries the reason this branch wrote it for. What is
+            // ONLY on main's side is the pendKeys clearing — keep it.
+            if (msg.startsWith("✗") && pendKeys.isNotEmpty()) {
+                _pending.value = _pending.value - pendKeys.toSet()
             }
             _messages.tryEmit(msg)
             container.fleet.nudge()
@@ -102,23 +121,23 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
 
     fun kill(host: String, id: String) {
         mark(host, id, "kill")
-        run("kill queued") { container.client.api.sessionAction(host, id, "kill") }
+        run("kill queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "kill") }
     }
     fun start(host: String, id: String) {
         mark(host, id, "start")
-        run("start queued") { container.client.api.sessionAction(host, id, "start") }
+        run("start queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "start") }
     }
     fun restart(host: String, id: String) {
         mark(host, id, "restart")
-        run("restart queued") { container.client.api.sessionAction(host, id, "restart") }
+        run("restart queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "restart") }
     }
     fun resume(host: String, id: String) {
         mark(host, id, "resume")
-        run("resume queued") { container.client.api.sessionAction(host, id, "resume") }
+        run("resume queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "resume") }
     }
     fun delete(host: String, id: String) {
         mark(host, id, "delete")
-        run("delete queued") { container.client.api.deleteSession(host, id) }
+        run("delete queued", pendKey(host, id)) { container.client.api.deleteSession(host, id) }
     }
 
     /** Move a running session to another agent in the same org (XERK-101). The

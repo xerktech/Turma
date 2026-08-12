@@ -135,11 +135,23 @@ object ModelSource {
         queued: String,
         failed: String,
     ): String {
+        if (accepted(ok, bodyError)) return queued
         val refusal = bodyError?.takeIf { it.isNotBlank() }
             ?: hubMessage?.takeIf { it.isNotBlank() }
-        if (ok && refusal == null) return queued
         return "✗ " + (refusal ?: failed)
     }
+
+    /**
+     * Did the hub actually take the command? A 2xx is not enough on its own —
+     * `OkResponse.error` on a 200 is a refusal.
+     *
+     * Separate from [outcomeMessage] because the model-source switch needs the
+     * same verdict TWICE, for two different things: what the bar says, and
+     * whether the memo survives ([afterAttempt]). Deriving the second from the
+     * first — by comparing the rendered string — would make a wording change
+     * silently pin the chip on a refused switch.
+     */
+    fun accepted(ok: Boolean, bodyError: String?): Boolean = ok && bodyError.isNullOrBlank()
 
     /**
      * The `modelSource` a spawn should carry, or null to omit it.
