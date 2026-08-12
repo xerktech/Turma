@@ -150,7 +150,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
-      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage,"
+      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -1674,4 +1674,24 @@ test("composer: the chosen 'Run against' actually reaches the spawn request", ()
   assert.equal(spawnWith("local").body.modelSource, "local");
   // The default is not sent at all, so a host without a local model is unaffected.
   assert.equal(spawnWith("subscription").body.modelSource, undefined);
+});
+
+// XERK-162: the sidebar's own prBadgeHtml copy labels a GitLab MR / ADO PR
+// with its platform's !n sigil, GitHub with #n. Guarded here because a QA
+// mutation pass flipped this copy's sigil back to "#" and every suite stayed
+// green — only chat.js's copy was covered.
+test("prBadgeHtml: !n for GitLab/ADO, #n for GitHub", () => {
+  const { prBadgeHtml } = loadPage();
+  assert.match(prBadgeHtml({ url: "https://github.com/o/r/pull/7", number: 7, state: "OPEN" }), /#7/);
+  const mr = prBadgeHtml({
+    url: "https://gitlab.example.com/grp/app/-/merge_requests/12",
+    number: 12, state: "OPEN",
+  });
+  assert.match(mr, /!12/);
+  assert.doesNotMatch(mr, /#12/);
+  // The URL fallback (bare {url} chip, no status yet) takes the same sigil.
+  assert.match(
+    prBadgeHtml({ url: "https://gitlab.example.com/grp/app/-/merge_requests/13" }), /!13/);
+  assert.match(
+    prBadgeHtml({ url: "https://dev.azure.com/org/P/_git/app/pullrequest/9" }), /!9/);
 });

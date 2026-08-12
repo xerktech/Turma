@@ -792,21 +792,25 @@ test("prFooterChip: derives #number from the URL when absent, no mark when unkno
 });
 
 // XERK-162: a GitLab merge request is a chip exactly like a PR — same badge,
-// same states — and a bare {url} still derives its number pre-status.
-test("prFooterChip: a GitLab MR chips like a PR", () => {
+// same states — and a bare {url} still derives its number pre-status. The
+// label is GitLab's own !n sigil (mirroring the agent's _pr_ref), whether the
+// number comes from the status or the URL.
+test("prFooterChip: a GitLab MR chips like a PR, labelled !n", () => {
   const html = prFooterChip({ prs: [
     { url: "https://gitlab.example.com/grp/app/-/merge_requests/12" },
     { url: "https://gitlab.example.com/grp/app/-/merge_requests/13", number: 13,
       state: "OPEN", checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
   ] });
-  assert.match(html, /#12/);                        // number from the MR URL
-  assert.match(html, /#13 Open/);
+  assert.match(html, /!12/);                        // number from the MR URL
+  assert.match(html, /!13 Open/);                   // number from the status
+  assert.doesNotMatch(html, /#1[23]/);
   assert.match(html, /pr-ready ready/);
   assert.match(html, /href="https:\/\/gitlab\.example\.com\/grp\/app\/-\/merge_requests\/12"/);
 });
 
 // XERK-226: and so is an Azure DevOps pull request — the third source, chipped
 // identically, its number derived from the ADO URL before any status lands.
+// ADO also reads !n: there #n addresses a WORK ITEM.
 test("prFooterChip: an Azure DevOps PR chips like a GitHub PR", () => {
   const url = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12";
   const html = prFooterChip({ prs: [
@@ -814,8 +818,8 @@ test("prFooterChip: an Azure DevOps PR chips like a GitHub PR", () => {
     { url: url.replace("/12", "/13"), number: 13, state: "OPEN",
       checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
   ] });
-  assert.match(html, /#12/);                        // number from the ADO URL
-  assert.match(html, /#13 Open/);
+  assert.match(html, /!12/);                        // number from the ADO URL
+  assert.match(html, /!13 Open/);
   assert.match(html, /pr-ready ready/);
   assert.match(html, new RegExp('href="' + url.replace(/[/.]/g, "\\$&") + '"'));
 });

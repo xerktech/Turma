@@ -2004,8 +2004,11 @@ MR_URL_RE = re.compile(r"https://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/
 # `git push` hint ends in `/pullrequestcreate?sourceRef=…` — a link to the
 # CREATE form, which the `/<digits>` deliberately doesn't match, exactly as
 # GitLab's `/merge_requests/new` doesn't.
+# http as well as https: an on-prem collection is routinely served over plain
+# http on the LAN, and a scheme-only mismatch would drop the chip in silence on
+# exactly the deployment this half exists for.
 AZDO_PR_URL_RE = re.compile(
-    r"https://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
+    r"https?://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
     re.IGNORECASE)
 # The pull-request id inside such a URL, for the places that need the number
 # without re-deciding whether the URL is ours.
@@ -2017,9 +2020,67 @@ AZDO_PR_URL_ID_RE = re.compile(r"/pullrequest/(\d+)", re.IGNORECASE)
 # PR/MR as its own output, and that pairing — this command, this output — is
 # the only thing in a transcript that says the session opened the PR rather
 # than merely looked at one. See _scan_pr_line.
-PR_CREATE_RE = re.compile(
-    r"\bgh\s+pr\s+create\b|\bglab\s+mr\s+create\b|\bmerge_request\.create\b"
-    r"|\baz\s+repos\s+pr\s+create\b")
+#
+# An on-prem Azure DevOps Server host has NO vendor CLI to name here: the
+# `azure-devops` az extension refuses a self-hosted collection outright ("works
+# only with Azure DevOps Services"), so those hosts open their PRs through a
+# local wrapper over the REST API. `ado pr-create` is the common spelling and
+# is built in; TURMA_PR_CREATE_CMDS registers any other wrapper, so a host
+# whose PRs are opened by its own tool still gets chips.
+PR_CREATE_CMDS = os.environ.get("TURMA_PR_CREATE_CMDS", "")
+
+# An entry whose longest word is shorter than this is ignored: a one- or
+# two-character token matches half the commands a session runs, and attribution
+# failing OPEN hangs other people's PRs on this session's card.
+PR_CREATE_CMD_MIN = 3
+
+# The built-in creating commands, as (word, ...) prefixes. A wrapper is named
+# with and without the `.py` its script carries, because a host that loses it
+# from PATH runs it as `python3 .../ado.py pr-create` — the same PR, opened the
+# same way, and silently unchipped if only the bare name were known.
+PR_CREATE_BUILTINS = (
+    ("gh", "pr", "create"),
+    ("glab", "mr", "create"),
+    ("az", "repos", "pr", "create"),
+    ("ado", "pr-create"),
+    ("ado.py", "pr-create"),
+)
+
+
+def _pr_create_alt(words):
+    """One alternative matching `words` as a whole command: every word escaped
+    and matched literally, the run anchored so it can only be a whole command.
+
+    The anchors exclude `-` as well as word characters, so this can't match the
+    tail of `run-mkpr` or the head of `mkpr-old`; the trailing one excludes `.`
+    too, so `ado.py pr-create.md` is a filename, not a create. The leading one
+    deliberately does NOT, since a path-qualified `./mkpr` or
+    `~/.local/bin/ado` is the same command."""
+    return (r"(?<![\w-])" + r"\s+".join(re.escape(w) for w in words)
+            + r"(?![\w.-])")
+
+
+def _pr_create_pattern(extra=""):
+    """The PR_CREATE_RE source: the built-in creating commands, plus one
+    alternative per comma-separated entry in `extra`.
+
+    Each entry is a whitespace-separated command prefix (`mkpr`, `tfs pr new`)
+    and goes through the same literal, anchored treatment as a built-in, so
+    nothing free-form reaches the regex engine. An entry that is blank or
+    shorter than PR_CREATE_CMD_MIN widens nothing."""
+    pats = [_pr_create_alt(w) for w in PR_CREATE_BUILTINS]
+    pats.append(r"\bmerge_request\.create\b")   # a push OPTION, not a command
+    for entry in (extra or "").split(","):
+        words = entry.split()
+        # The LONGEST word, not the joined length: `a b` is three characters
+        # but still two one-character tokens, and would match `cat a b`.
+        if not words or max(len(w) for w in words) < PR_CREATE_CMD_MIN:
+            continue
+        pats.append(_pr_create_alt(words))
+    return "|".join(pats)
+
+
+PR_CREATE_RE = re.compile(_pr_create_pattern(PR_CREATE_CMDS))
 # Unresolved `gh pr create` tool_use ids remembered per session between beats.
 # Capped: a call whose result never lands (the turn was interrupted, the pane
 # died) must not grow the set for the life of the session.
@@ -2175,17 +2236,30 @@ def pr_status(url):
 
 def _mr_url_parts(url):
     """(project_path, iid) when `url` is a merge-request URL under the
-    configured GITLAB_URL, else None. Prefix-matched against gitlab_base() so a
+    configured GITLAB_URL, else None. Matched against gitlab_base()'s host so a
     GitLab installed under a subpath still resolves its project path; an MR on
     any OTHER GitLab host stays None — this host holds no credential for it,
-    so its chip renders as a bare link, like a PR gh can't see."""
+    so its chip renders as a bare link, like a PR gh can't see.
+
+    The match is on the HOST(:port), case-insensitively, ignoring the scheme —
+    not a byte-for-byte URL prefix. Hostnames are case-insensitive and a
+    GITLAB_URL configured as `http://` (or with odd casing) still names the
+    same GitLab the MR lives on; an exact-prefix compare silently left every
+    attributed MR a bare link chip forever over such a mismatch."""
     base = gitlab_base()
     if not base or not gitlab_configured():
         return None
-    u = str(url or "")
-    if not u.startswith(base + "/"):
+    bm = re.match(r"^[a-zA-Z][\w.+-]*://([^/]+)(/.*)?$", base)
+    um = re.match(r"^https?://([^/]+)(/.+)$", str(url or ""))
+    if not bm or not um or bm.group(1).lower() != um.group(1).lower():
         return None
-    m = re.match(r"(.+?)/-/merge_requests/(\d+)$", u[len(base) + 1:])
+    tail = um.group(2)
+    bpath = (bm.group(2) or "").rstrip("/")
+    if bpath:
+        if not tail.lower().startswith(bpath.lower() + "/"):
+            return None
+        tail = tail[len(bpath):]
+    m = re.match(r"/(.+?)/-/merge_requests/(\d+)$", tail)
     if not m:
         return None
     return m.group(1), m.group(2)
@@ -2207,6 +2281,21 @@ def _mr_check_class(status):
     return None
 
 
+# How detailed_merge_status buckets into GitHub's three-value mergeability.
+# GitHub's `mergeable` answers ONE question — do the branches conflict? —
+# while GitLab's enum also reports approvals, discussions, CI and workflow
+# gates. Bucketing anything non-mergeable to UNKNOWN left every healthy MR at
+# ● forever (not_approved, ci_still_running …) where the equivalent GitHub PR
+# shows ✓. So: only the git-level can't-merge states are CONFLICTING, only the
+# still-computing states are UNKNOWN, and every OTHER known status means the
+# branches themselves merge — MERGEABLE, exactly what GitHub would say. An
+# unrecognized future status lands in MERGEABLE by that same logic (it exists
+# because the merge-check RAN); only absence stays UNKNOWN.
+_MR_CONFLICT_STATUSES = {"conflict", "broken_status", "cannot_be_merged"}
+_MR_UNVERIFIED_STATUSES = {"checking", "unchecked", "preparing",
+                           "approvals_syncing"}
+
+
 def _summarize_mr(data):
     """Condense a GitLab merge-request API payload into the SAME compact status
     dict _summarize_pr builds, so every renderer treats an MR chip exactly like
@@ -2214,10 +2303,9 @@ def _summarize_mr(data):
     (draft→DRAFT), merged→MERGED, closed→CLOSED, locked→OPEN (a transient
     in-between); the head pipeline is the whole CI rollup (GitLab exposes no
     per-check rollup on the MR itself), one entry classed by _mr_check_class;
-    mergeability comes from detailed_merge_status ("mergeable"→MERGEABLE,
-    "conflict"→CONFLICTING, anything else UNKNOWN — unproven is not proven,
-    exactly the discipline _merge_ready applies to GitHub's UNKNOWN), with the
-    older merge_status can/cannot_be_merged as the fallback vocabulary."""
+    mergeability comes from detailed_merge_status, bucketed by
+    _MR_CONFLICT_STATUSES/_MR_UNVERIFIED_STATUSES, with the older merge_status
+    can/cannot_be_merged as the fallback vocabulary."""
     raw_state = str(data.get("state") or "").lower()
     state = {"opened": "OPEN", "locked": "OPEN", "merged": "MERGED",
              "closed": "CLOSED"}.get(raw_state, raw_state.upper())
@@ -2236,9 +2324,13 @@ def _summarize_mr(data):
                   else "pending" if counts["pending"] else "passing")
     detailed = str(data.get("detailed_merge_status") or "").lower()
     legacy = str(data.get("merge_status") or "").lower()
-    if detailed == "mergeable" or (not detailed and legacy == "can_be_merged"):
+    if detailed in _MR_CONFLICT_STATUSES:
+        mergeable = "CONFLICTING"
+    elif detailed and detailed not in _MR_UNVERIFIED_STATUSES:
         mergeable = "MERGEABLE"
-    elif detailed == "conflict" or (not detailed and legacy == "cannot_be_merged"):
+    elif not detailed and legacy == "can_be_merged":
+        mergeable = "MERGEABLE"
+    elif not detailed and legacy == "cannot_be_merged":
         mergeable = "CONFLICTING"
     else:
         mergeable = "UNKNOWN"
@@ -3321,7 +3413,8 @@ def _scan_pr_line(raw, state, report):
 
     Attribution is deliberately narrow: a URL counts only when it comes back in
     a PR/MR-creating call's OWN tool_result (`gh pr create`, `glab mr create`,
-    `az repos pr create`, or a `git push` carrying the `merge_request.create`
+    `az repos pr create`, `ado pr-create`, a host wrapper registered via
+    TURMA_PR_CREATE_CMDS, or a `git push` carrying the `merge_request.create`
     push option — see PR_CREATE_RE) — i.e. the session literally opened that PR. A PR link reaches a transcript a dozen other ways (`gh pr
     list`/`view`/`checks` output, a link the operator pasted, the model quoting
     a PR another session opened), and taking any of those as "this session's
@@ -3343,7 +3436,7 @@ def _scan_pr_line(raw, state, report):
 # PR's browser link is built on. Anchored whole so nothing but a repo root is
 # ever extended into a PR link.
 AZDO_REPO_WEB_RE = re.compile(
-    r"^https://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
+    r"^https?://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
 # `{` probes tried when looking for a JSON object in a tool result. The az
 # output starts with one, so a real create hits on the first; the cap keeps a
 # result that is merely full of braces from costing a re-parse per brace.
@@ -3390,9 +3483,11 @@ def _azdo_created_pr_url(text):
     if not isinstance(repo, dict) or not isinstance(pr_id, int):
         return None
     web = str(repo.get("webUrl") or repo.get("remoteUrl") or "").strip()
-    # `remoteUrl` can carry a `user@` prefix on some collections; the link the
-    # chip points at must not.
-    web = re.sub(r"^(https://)[^/@]+@", r"\1", web).rstrip("/")
+    # ADO's `remoteUrl` carries an `<org>@` prefix, and the az extension's SDK
+    # has no `webUrl` field at all, so this strip is on the ONLY path a vendor
+    # create can take. It must know both schemes, or a plain-http on-prem
+    # collection composes nothing and the chip is dropped in silence.
+    web = re.sub(r"^(https?://)[^/@]+@", r"\1", web, flags=re.IGNORECASE).rstrip("/")
     if not AZDO_REPO_WEB_RE.match(web):
         return None
     return f"{web}/pullrequest/{pr_id}"
@@ -9464,6 +9559,14 @@ class SessionManager:
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
         )
+        # glab reads its default host from GITLAB_HOST — never the agent's own
+        # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
+        # can't auth without this, falls back to a raw API call, and the MR
+        # never gets a chip (_scan_pr_line only attributes the creating
+        # command's own tool_result). Sessions already inherit GITLAB_TOKEN
+        # from the manager env; an operator-set GITLAB_HOST wins.
+        if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
+            env_prefix += f"GITLAB_HOST={shlex.quote(gitlab_base())} "
         claude_cmd = env_prefix + claude_cmd
         if local_env_file:
             # SOURCED, never inlined and never passed as `tmux -e`: both put the

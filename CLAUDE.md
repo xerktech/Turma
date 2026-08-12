@@ -16,6 +16,7 @@ that component's files.
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**` | guard hook, AskUserQuestion bridge |
+| `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | container boot, start-time Claude Code check, bundled toolchains |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |

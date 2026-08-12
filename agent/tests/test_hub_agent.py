@@ -1098,6 +1098,80 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [])
 
+    # The real shape from an on-prem TFS host: the `azure-devops` az extension
+    # refuses a self-hosted collection, so the session opens its PR with a
+    # local REST wrapper that prints the link itself.
+    ADO_WRAPPER_OUT = (
+        "Created PR !10068: Keep the model loaded in VRAM\n"
+        "  https://tfsserver.example.com/tfs/DefaultCollection/DevOps/_git/App"
+        "/pullrequest/10068\n"
+        "  linked work item #80995")
+    ADO_WRAPPER_URL = ("https://tfsserver.example.com/tfs/DefaultCollection"
+                       "/DevOps/_git/App/pullrequest/10068")
+
+    def test_on_prem_ado_wrapper_create_is_this_sessions_pr(self):
+        """An on-prem ADO host has no vendor CLI to name, so `ado pr-create`
+        is a built-in creating command — without it that host's PRs are never
+        attributed and its cards never chip."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call("w1", cmd='ado pr-create --title "x" \\\n  --work-item 80995'),
+            self.tool_result("w1", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.ADO_WRAPPER_URL])
+
+    def test_path_qualified_wrapper_still_counts(self):
+        """The wrapper is routinely invoked by path (`~/.local/bin/ado`), and
+        after a `cd` into the worktree."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call(
+                "w2", cmd="cd /home/u/git/app && ~/.local/bin/ado pr-create --title x"),
+            self.tool_result("w2", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.ADO_WRAPPER_URL])
+
+    def test_an_on_prem_collection_over_plain_http_still_chips(self):
+        """A self-hosted collection on the LAN is routinely served over http,
+        and a scheme-only mismatch would drop the chip in silence."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        url = "http://tfs.corp.local:8080/tfs/DefaultCollection/Dev/_git/App/pullrequest/7"
+        write_jsonl(path, [
+            self.pr_create_call("h1", cmd="ado pr-create --title x"),
+            self.tool_result("h1", f"Created PR !7:\n  {url}"),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [url])
+
+    def test_a_wrapper_that_only_lists_prs_is_not_a_create(self):
+        """`ado pr-list` prints every open PR's link — the exact loose text the
+        narrow rule exists to keep off this session's card."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call("w3", cmd="ado pr-list --repo App"),
+            self.tool_result("w3", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [])
+
     def test_plain_push_mr_hint_is_not_a_created_mr(self):
         """A plain `git push` prints GitLab's "to create a merge request …
         visit …/merge_requests/new" hint (and, on later pushes, the existing
@@ -4881,6 +4955,29 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
         self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
 
+    def test_spawn_exports_gitlab_host_for_glab(self):
+        """A GitLab-configured host tells every session's glab WHERE to auth:
+        glab reads GITLAB_HOST, never the agent's GITLAB_URL, so without this a
+        self-hosted session's `glab mr create` can't auth, the model falls back
+        to a raw API call, and the MR never gets a chip (_scan_pr_line only
+        attributes the creating command's own tool_result)."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, GITLAB_URL="gitlab.example.com",
+                                 GITLAB_TOKEN="tok"):
+            sm.spawn("Turma")
+        self.assertIn("GITLAB_HOST=https://gitlab.example.com ",
+                      self._claude_cmd())
+
+    def test_spawn_leaves_an_operator_set_gitlab_host_alone(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, GITLAB_URL="gitlab.example.com",
+                                 GITLAB_TOKEN="tok"), \
+                mock.patch.dict(os.environ, {"GITLAB_HOST": "https://other.tld"}):
+            sm.spawn("Turma")
+        self.assertNotIn("GITLAB_HOST=", self._claude_cmd())
+
     def test_spawn_onto_the_local_model(self):
         """Starting NEW work on the local model matters as much as failing an
         existing session over: once usage is gone you cannot spawn either. A
@@ -6652,6 +6749,84 @@ class TestAzdoPrCommentEvents(AzdoPrMixin, unittest.TestCase):
                 "https://dev.azure.com/other/P/_git/r/pullrequest/1", ""))
 
 
+class TestPrCreatePattern(unittest.TestCase):
+    """TURMA_PR_CREATE_CMDS: a host whose PRs are opened by its own wrapper can
+    register it, without loosening attribution for anyone else."""
+
+    def _re(self, extra=""):
+        return re.compile(ha._pr_create_pattern(extra))
+
+    def test_built_ins_need_no_configuration(self):
+        rx = self._re()
+        for cmd in ("gh pr create --fill", "glab mr create", "ado pr-create -t x",
+                    "az repos pr create", "git push -o merge_request.create"):
+            self.assertTrue(rx.search(cmd), cmd)
+
+    def test_the_wrapper_run_through_its_interpreter_still_counts(self):
+        """The on-prem wrapper is a script, and a host that loses it from PATH
+        runs it by path — the same PR, opened the same way."""
+        rx = self._re()
+        for cmd in ("ado.py pr-create --title x",
+                    "python3 /home/u/git/ado/ado.py pr-create --title x",
+                    "python3 ado.py pr-create",
+                    "~/.local/bin/ado pr-create --title x",
+                    "./ado.py pr-create"):
+            self.assertTrue(rx.search(cmd), cmd)
+        self.assertIsNone(rx.search("cat ado.py"))
+        self.assertIsNone(rx.search("vim ado.py pr-create.md"))
+
+    def test_a_built_in_is_anchored_against_a_hyphen_too(self):
+        """`\\b` treats `-` as a boundary, so an unanchored built-in matches the
+        tail of a different command."""
+        rx = self._re()
+        for cmd in ("run-ado pr-create", "my-gh pr create", "x-az repos pr create"):
+            self.assertIsNone(rx.search(cmd), cmd)
+
+    def test_a_registered_wrapper_matches(self):
+        rx = self._re("mkpr, tfs pr new")
+        self.assertTrue(rx.search("mkpr --title x"))
+        self.assertTrue(rx.search("tfs   pr  new --repo app"))
+
+    def test_an_unregistered_wrapper_does_not(self):
+        self.assertIsNone(self._re("mkpr").search("openpr --title x"))
+
+    def test_a_registered_word_is_not_matched_inside_a_longer_one(self):
+        """Anchoring is what keeps a short entry from matching half a command."""
+        rx = self._re("mkpr")
+        self.assertIsNone(rx.search("mkprod deploy"))
+        self.assertIsNone(rx.search("run-mkpr --title x"))
+        self.assertTrue(rx.search("./mkpr --title x"))
+
+    def test_a_built_in_is_not_matched_inside_a_longer_word(self):
+        self.assertIsNone(self._re().search("myado pr-create"))
+
+    def test_entries_are_literal_not_patterns(self):
+        """The value is host config, but it must never reach the engine as a
+        pattern — a stray `.` or `*` would silently widen attribution."""
+        rx = self._re("mk.pr")
+        self.assertTrue(rx.search("mk.pr --title x"))
+        self.assertIsNone(rx.search("mkxpr --title x"))
+
+    def test_blank_and_malformed_entries_widen_nothing(self):
+        for extra in ("", "   ", ",,", " , ,"):
+            self.assertEqual(ha._pr_create_pattern(extra),
+                             ha._pr_create_pattern(), extra)
+
+    def test_a_too_short_entry_is_ignored(self):
+        """Attribution must not fail OPEN: a one- or two-character token makes
+        half the commands a session runs read as "opened a PR"."""
+        for extra in ("a", "x,pr", " a "):
+            self.assertEqual(ha._pr_create_pattern(extra),
+                             ha._pr_create_pattern(), extra)
+        self.assertIsNone(self._re("a").search("ls -a /tmp"))
+        # Two one-character words are three characters JOINED, and still match
+        # half of what a session runs — the longest word is what counts.
+        self.assertEqual(ha._pr_create_pattern("a b"), ha._pr_create_pattern())
+        self.assertIsNone(self._re("a b").search("cat a b"))
+        # …but a real short wrapper name still registers.
+        self.assertTrue(self._re("prc").search("prc --title x"))
+
+
 class TestAzdoCreatedPrUrl(unittest.TestCase):
     """XERK-226: `az repos pr create` prints the created PR as JSON and no link
     at all, so the chip's URL is composed from that object."""
@@ -6675,6 +6850,17 @@ class TestAzdoCreatedPrUrl(unittest.TestCase):
         self.assertEqual(
             ha._azdo_created_pr_url(out),
             "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12")
+
+    def test_an_on_prem_http_remote_url_composes_too(self):
+        """`remoteUrl` is the ONLY field the az extension's SDK can supply (it
+        has no webUrl), and it carries the `<org>@` prefix — so a plain-http
+        on-prem collection composes nothing unless the strip knows http."""
+        out = self._out(repository={
+            "name": "app",
+            "remoteUrl": "http://Collection@tfs.corp.local:8080/tfs/C/P/_git/app"})
+        self.assertEqual(
+            ha._azdo_created_pr_url(out),
+            "http://tfs.corp.local:8080/tfs/C/P/_git/app/pullrequest/12")
 
     def test_finds_the_object_past_a_cli_banner(self):
         noisy = "WARNING: extension is in preview\n" + self._out()
@@ -10938,8 +11124,22 @@ class TestMrStatus(unittest.TestCase):
         with self._configured():
             self.assertIsNone(ha._mr_url_parts(
                 "https://other.gitlab.tld/g/a/-/merge_requests/1"))
+            # Suffix-spoofing host: gitlab.example.com.evil.com is NOT ours.
+            self.assertIsNone(ha._mr_url_parts(
+                "https://gitlab.example.com.evil.com/g/a/-/merge_requests/1"))
         with mock.patch.multiple(ha, GITLAB_URL="", GITLAB_TOKEN=""):
             self.assertIsNone(ha._mr_url_parts(self.MR))
+
+    def test_mr_url_parts_matches_host_not_bytes(self):
+        # Hostnames are case-insensitive and the scheme doesn't change WHICH
+        # GitLab an MR lives on — a byte-for-byte prefix compare left every
+        # attributed MR a bare link chip forever over a trivial GITLAB_URL
+        # spelling difference.
+        for base in ("https://GitLab.Example.com", "http://gitlab.example.com",
+                     "gitlab.example.com", "https://gitlab.example.com/"):
+            with mock.patch.multiple(ha, GITLAB_URL=base, GITLAB_TOKEN="tok"):
+                self.assertEqual(ha._mr_url_parts(self.MR),
+                                 ("grp/sub/app", "12"), base)
 
     def test_mr_check_class(self):
         self.assertEqual(ha._mr_check_class("success"), "pass")
@@ -10976,20 +11176,36 @@ class TestMrStatus(unittest.TestCase):
             ha._summarize_mr({"state": "merged", "draft": True})["state"], "MERGED")
 
     def test_summarize_conflict_blocks_and_unknown_is_unproven(self):
-        conflicted = ha._summarize_mr({
-            "state": "opened", "detailed_merge_status": "conflict",
-            "head_pipeline": {"status": "success"},
-        })
-        self.assertEqual(conflicted["mergeable"], "CONFLICTING")
-        self.assertEqual(conflicted["ready"], "blocked")
-        # Any other detailed status (checking, need_rebase, not_approved …) is
-        # UNKNOWN — green CI alone must not claim ✓.
-        checking = ha._summarize_mr({
-            "state": "opened", "detailed_merge_status": "checking",
-            "head_pipeline": {"status": "success"},
-        })
-        self.assertEqual(checking["mergeable"], "UNKNOWN")
-        self.assertEqual(checking["ready"], "pending")
+        for status in ("conflict", "broken_status"):
+            conflicted = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(conflicted["mergeable"], "CONFLICTING", status)
+            self.assertEqual(conflicted["ready"], "blocked", status)
+        # A still-computing status is UNKNOWN — green CI alone must not claim ✓.
+        for status in ("checking", "unchecked", "preparing"):
+            out = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(out["mergeable"], "UNKNOWN", status)
+            self.assertEqual(out["ready"], "pending", status)
+
+    def test_summarize_non_conflict_statuses_read_mergeable(self):
+        # GitHub's `mergeable` answers conflicts ONLY, so a GitLab enum that
+        # reports an approvals/CI/workflow gate — not a git-level can't-merge —
+        # must read MERGEABLE, or every healthy MR sits at ● forever where the
+        # equivalent GitHub PR shows ✓.
+        for status in ("mergeable", "not_approved", "ci_still_running",
+                       "discussions_not_resolved", "need_rebase",
+                       "some_future_status"):
+            out = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(out["mergeable"], "MERGEABLE", status)
+            self.assertEqual(out["ready"], "ready", status)
 
     def test_summarize_legacy_merge_status_fallback(self):
         old = ha._summarize_mr({"state": "opened", "merge_status": "can_be_merged"})

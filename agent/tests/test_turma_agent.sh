@@ -62,6 +62,11 @@ cat > "$WORK/stub-bin/python3" <<STUB
 #!/bin/sh
 echo "named=\${TURMA_MANAGER_PID:-unset} actual=\$\$" > "$WORK/manager.log"
 echo "claude=\$(command -v claude || echo missing)" >> "$WORK/manager.log"
+# Whether the start-time Claude Code check had FINISHED before the manager
+# existed. That ordering is the whole D1 safety argument: while the package is
+# being replaced claude is absent from PATH, and the manager is what launches
+# sessions into it.
+echo "claudecheck=\$([ -f "$WORK/claude-done" ] && echo done || echo unfinished)" >> "$WORK/manager.log"
 sleep 30
 STUB
 chmod +x "$WORK/stub-bin/python3"
@@ -82,6 +87,15 @@ mkdir -p "$REPOS_ROOT"
 # given command until it succeeds. The predicates below are invoked through it.
 wait_for() {  # <command> [args...]
   for _ in $(seq 1 50); do
+    if "$@" 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# Same, with a budget wide enough for a derived timeout to elapse.
+wait_longer() {  # <command> [args...]
+  for _ in $(seq 1 300); do
     if "$@" 2>/dev/null; then return 0; fi
     sleep 0.1
   done
@@ -352,6 +366,162 @@ case "$out" in
   *"preflight"*) ok "carried on into preflight rather than aborting" ;;
   *)             fail "launcher did not reach preflight with HOME unset: $out" ;;
 esac
+
+# --- Case 11: every start is an update check (XERK-254) ----------------------
+# A restart — an operator's, systemd's after a crash, a host reboot — is the
+# moment to be running current code, so the launcher fires both halves. They are
+# fired DIFFERENTLY and the difference is load-bearing:
+#   * Claude Code is AWAITED, before the manager exists. Replacing that package
+#     leaves `claude` briefly absent from PATH, and the manager is what launches
+#     sessions into it — a backgrounded check puts the hole under the first
+#     relaunches, which then die on exec.
+#   * the agent self-update is DETACHED: it waits on GitHub, and a successful
+#     one restarts this very unit.
+echo "case: the run path fires both start checks"
+# Stands in for the real updater. Records each invocation; the --claude-only run
+# marks that it FINISHED, which the manager stub then reports on. The --boot run
+# blocks for longer than a launcher start takes, so a launcher that waited for
+# it would never reach the manager.
+cat > "$PREFIX/bin/turma-agent-update" <<STUB
+#!/bin/sh
+echo "update \$*" >> "$WORK/boot-update.log"
+case "\$1" in
+  --claude-only) sleep "\${TEST_CLAUDE_CHECK_SLEEP:-0}"; touch "$WORK/claude-done" ;;
+  --boot) sleep 20 ;;
+esac
+STUB
+chmod +x "$PREFIX/bin/turma-agent-update"
+: > "$WORK/boot-update.log"
+rm -f "$WORK/manager.log" "$WORK/claude-done"
+PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run5.log" 2>&1 &
+if wait_for logged "update --boot" "$WORK/boot-update.log"; then
+  ok "fired both start checks"
+else
+  fail "start checks did not both fire: $(cat "$WORK/boot-update.log") / $(cat "$WORK/run5.log")"
+fi
+if grep -q -- "update --claude-only" "$WORK/boot-update.log"; then
+  ok "checked Claude Code too"
+else
+  fail "no Claude Code check on start"
+fi
+if wait_for file_has_content "$WORK/manager.log"; then
+  ok "manager started anyway — the detached agent check never blocks the boot"
+else
+  fail "the manager never started; a check blocked it"
+fi
+if grep -q "claudecheck=done" "$WORK/manager.log"; then
+  ok "the Claude Code check finished BEFORE the manager could launch anything"
+else
+  fail "the manager started while claude was still being replaced — sessions launched then die on exec"
+fi
+# The shipped default deadline: a FIXED generous number, deliberately not
+# arithmetic over the updater's per-call timeouts. Deriving it tightly coupled
+# this launcher to that script's exact call graph, and every miscount of it was
+# a defect; the deadline only ever needed to sit above the legitimate worst case.
+bound="$(sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' "$WORK/run5.log" | head -1)"
+if [ "$bound" = "1800" ]; then
+  ok "default deadline is 1800s"
+else
+  fail "default deadline is ${bound:-unreported}s, not the shipped 1800s"
+fi
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent-update" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 12: the awaited check is bounded --------------------------------
+# Awaiting it is only safe because it cannot wait forever: a wedged npm registry
+# must delay the manager, never stop it.
+echo "case: a hung Claude Code check does not hold the boot"
+: > "$WORK/boot-update.log"
+rm -f "$WORK/manager.log" "$WORK/claude-done"
+# The deadline is held clear of the INSTALL budget and nothing else, so a small
+# budget is how a test gets a small deadline without touching the property.
+TEST_CLAUDE_CHECK_SLEEP=600 TURMA_CLAUDE_UPDATE_TIMEOUT=8 TURMA_NPM_INSTALL_TIMEOUT=1 \
+  PATH="$WORK/stub-bin:$PATH" \
+  setsid "$PREFIX/bin/turma-agent" >"$WORK/run7.log" 2>&1 &
+if wait_longer file_has_content "$WORK/manager.log"; then
+  ok "the manager started despite a check that never returns"
+else
+  fail "a hung check held the boot: $(cat "$WORK/run7.log")"
+fi
+if grep -q "did not finish" "$WORK/run7.log"; then
+  ok "and said so"
+else
+  fail "no notice that the check was cut short: $(cat "$WORK/run7.log")"
+fi
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent-update" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 12b: the awaited check's deadline is derived, not dictated ---------
+# `timeout` signals its direct child only, so a deadline that can fire while an
+# `npm install -g` is running leaves npm replacing the package while the manager
+# comes up and launches sessions into it — the very window awaiting the check
+# exists to close. The bound must therefore exceed the sum of the per-call
+# timeouts, and an operator value below that floor is raised, out loud.
+echo "case: a deadline that could fire mid-install is raised"
+: > "$WORK/boot-update.log"
+rm -f "$WORK/manager.log" "$WORK/claude-done"
+# The ONE coupling the fixed deadline keeps: it must stay clear of the install
+# budget, because `timeout` signals its direct child only — fire it while npm is
+# replacing the package and npm carries on while the manager launches sessions
+# into it. An operator raising the install budget past the deadline is the shape
+# that matters, and it must not be honoured silently.
+TURMA_CLAUDE_UPDATE_TIMEOUT=5 TURMA_NPM_INSTALL_TIMEOUT=600 \
+  PATH="$WORK/stub-bin:$PATH" setsid \
+  "$PREFIX/bin/turma-agent" >"$WORK/run8.log" 2>&1 &
+if wait_for logged "claude check bounded at" "$WORK/run8.log"; then
+  bound="$(sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' "$WORK/run8.log" | head -1)"
+  if [ -n "$bound" ] && [ "$bound" -ge 1200 ]; then
+    ok "raised 5s clear of a 600s install budget (bounded at ${bound}s)"
+  else
+    fail "honoured a deadline that can fire mid-install (bounded at ${bound:-?}s)"
+  fi
+else
+  fail "the launcher never reported its bound: $(cat "$WORK/run8.log")"
+fi
+if grep -q "could fire while an install is running" "$WORK/run8.log"; then
+  ok "and said so"
+else
+  fail "raised the deadline silently"
+fi
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 13: TURMA_BOOT_UPDATE=0 opts out -----------------------------------
+# For a prefix someone is editing in place, which the updater would otherwise
+# overwrite with the latest release.
+echo "case: TURMA_BOOT_UPDATE=0 suppresses both checks"
+: > "$WORK/boot-update.log"
+rm -f "$WORK/manager.log"
+TURMA_BOOT_UPDATE=0 PATH="$WORK/stub-bin:$PATH" setsid \
+  "$PREFIX/bin/turma-agent" >"$WORK/run6.log" 2>&1 &
+if wait_for file_has_content "$WORK/manager.log"; then
+  sleep 0.5
+  if [ -s "$WORK/boot-update.log" ]; then
+    fail "ran a check despite TURMA_BOOT_UPDATE=0 ($(cat "$WORK/boot-update.log"))"
+  else
+    ok "no update check when opted out"
+  fi
+else
+  fail "manager never started: $(cat "$WORK/run6.log")"
+fi
+pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 14: --preflight never updates --------------------------------------
+# install.sh --verify calls it. A report is a report: it must not go and rewrite
+# the very prefix the installer is in the middle of verifying.
+echo "case: --preflight runs no update check"
+: > "$WORK/boot-update.log"
+PATH="$WORK/stub-bin:$PATH" timeout 10 \
+  "$PREFIX/bin/turma-agent" --preflight >"$WORK/pre3.log" 2>&1 || true
+if [ -s "$WORK/boot-update.log" ]; then
+  fail "--preflight triggered an update ($(cat "$WORK/boot-update.log"))"
+else
+  ok "--preflight only reports"
+fi
+rm -f "$PREFIX/bin/turma-agent-update"
 
 if [ "$FAILED" = 0 ]; then echo "all turma-agent launcher tests passed"; else echo "FAILURES"; fi
 exit "$FAILED"

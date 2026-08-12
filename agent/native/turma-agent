@@ -224,6 +224,86 @@ fi
 
 report_creds
 
+# ---- update checks on every start (XERK-254) -------------------------------
+# A restart — an operator's, systemd's after a crash, the hub's, a host reboot —
+# is the moment to be running current code, so every start checks both halves of
+# what this host runs. They are fired DIFFERENTLY, and the difference is the
+# whole safety argument:
+#
+#   * Claude Code, AWAITED, right here, before the manager exists. Replacing the
+#     package leaves `claude` briefly absent from PATH (~1.7s for an npm
+#     install), and a session launched in that window dies on exec with ENOENT.
+#     Before the manager starts, nothing can be launching — after it starts, a
+#     hub-requested spawn can land right in the hole. So this one blocks, and is
+#     bounded by `timeout` instead: a slow registry may delay the manager, but
+#     it cannot delay it forever, and a late start is visible while a session
+#     that died on a missing binary is not. It is a no-op (two version reads)
+#     unless something newer is actually published.
+#
+#   * The agent self-update, DETACHED. It does network I/O against GitHub (a
+#     start must not wait on that), and a successful update restarts this very
+#     unit — so it has to be outside the process tree that restart tears down.
+#     setsid + KillMode=process is what lets it survive to finish its own swap.
+#
+# Both rate-limit themselves (see throttled()) so a crash-looping unit can't turn
+# Restart=always into an update check every five seconds.
+#
+# Placed BEFORE the credential gate below on purpose: a host idling for want of
+# a Claude login is exactly a host that should still be picking up new builds,
+# and a MISSING claude is something this check installs rather than reports.
+# TURMA_BOOT_UPDATE=0 opts out (a checkout you are editing in place).
+if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]; then
+  # The updater tees its own log; create the dir here because the redirect below
+  # is evaluated by THIS shell, before it ever runs. stdout goes to /dev/null
+  # for the detached run — the updater already writes to the log, so letting
+  # both land there records every line twice.
+  mkdir -p "$HOME/.turma" 2>/dev/null || true
+  echo "[turma-agent] checking Claude Code (before any session can launch)"
+  if command -v timeout >/dev/null 2>&1; then
+    # A plausible whole number of seconds, or the default. `timeout 0` DISABLES
+    # the bound and an oversized value overflows the arithmetic below, so both
+    # read as "use the default"; leading zeros are stripped rather than making a
+    # sane value fail the length test.
+    _num() {
+      case "$1" in ''|*[!0-9]*) printf '%s' "$2"; return ;; esac
+      local v="${1#"${1%%[!0]*}"}"
+      [ -n "$v" ] || { printf '%s' "$2"; return; }
+      if [ "${#v}" -le 6 ] && [ "$v" -le 86400 ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+    }
+    # A FIXED, deliberately generous deadline — not arithmetic over the
+    # updater's per-call timeouts. It only ever needed to sit above the
+    # legitimate worst case; deriving it tightly coupled this launcher to the
+    # exact call graph inside turma-agent-update, and that coupling produced a
+    # run of defects (multipliers that miscounted the calls, a count taken as
+    # the wrong uid, an overflowing floor). What must remain true is only that
+    # it cannot fire while an install is running — `timeout` signals its direct
+    # child only, so npm would keep replacing the package while the manager
+    # comes up and launches sessions into it. Hence the one coupling kept: 2.5x
+    # the install budget — two for the install's own clock-skewed worst case and
+    # a half for the bounded work that runs before it — so the deadline cannot
+    # land inside an install however that knob is set. Interrupting a version
+    # read or a registry query orphans nothing, so nothing else needs covering.
+    claude_deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-1800}" 1800)"
+    claude_min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 5 / 2 ))
+    if [ "$claude_deadline" -lt "$claude_min" ]; then
+      echo "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${claude_deadline}s could fire while an" \
+        "install is running; using ${claude_min}s"
+      claude_deadline="$claude_min"
+    fi
+    echo "[turma-agent] claude check bounded at ${claude_deadline}s"
+    timeout "$claude_deadline" \
+      "$SELF_DIR/turma-agent-update" --claude-only \
+      || echo "[turma-agent] claude update check did not finish in ${claude_deadline}s; carrying on." \
+              "If it was mid-install, that install can still be replacing claude — a session" \
+              "started in the next few minutes may fail to launch."
+  else
+    "$SELF_DIR/turma-agent-update" --claude-only \
+      || echo "[turma-agent] claude update check failed; carrying on"
+  fi
+  echo "[turma-agent] checking for a newer agent build (detached)"
+  setsid "$SELF_DIR/turma-agent-update" --boot >/dev/null 2>&1 &
+fi
+
 # The one fatal check: Remote Control needs a subscription OAuth login. Idle
 # rather than crash-loop, so a systemd service self-heals the moment the user
 # logs in on the host without needing a manual restart.

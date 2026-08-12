@@ -266,6 +266,19 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   (XERK-162); `az repos pr create` (XERK-226), whose JSON carries no link, so `_azdo_created_pr_url`
   builds one from `repository.webUrl` + `pullRequestId`. Call and result land in different beats, so
   pending tool_use ids carry across (capped); the scan parses whole lines.
+  - **An on-prem Azure DevOps Server host has no vendor CLI to name here** — the `azure-devops` az
+    extension refuses a self-hosted collection outright, so those hosts open PRs with a local REST
+    wrapper. `ado pr-create` **and `ado.py pr-create`** are built in (a host that loses the wrapper
+    from PATH runs it as `python3 …/ado.py`, the same PR opened the same way);
+    **`TURMA_PR_CREATE_CMDS`** (CSV of command prefixes) registers any other, so a host isn't
+    chipless because its tool isn't a vendor's.
+  - `_pr_create_pattern` treats every command — built-in and configured alike — as literal escaped
+    words, anchored against `-` (and `.` trailing) so one can't match the tail of `run-mkpr` or a
+    `pr-create.md` filename. An entry whose longest word is under `PR_CREATE_CMD_MIN` chars is
+    **ignored**: attribution must not fail OPEN, and a 1–2 char token matches half the commands a
+    session runs (measuring the JOINED length lets `a b` through).
+  - The ADO URL regexes take **http as well as https** — an on-prem collection is routinely served
+    over plain http on the LAN, and a scheme-only mismatch drops the chip in silence.
   - Cost: a PR opened another way (subagent, MCP tool, web UI) gets no chip. **Widen only by
     teaching `_scan_pr_line` another creation event, never by scanning loose text.**
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: `pr_status`/`_pr_comment_events`
@@ -274,7 +287,18 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   BOARD's PAT and has no CI rollup, so `checks` is the **CI-bearing branch POLICY evaluations only**
   (`AZDO_CI_POLICY_IDS`) — reviewer/work-item policies would read a PR awaiting a human as "CI
   pending". `mergeable` is `mergeStatus`, conflicts alone. The image bundles `glab` and az's
-  `azure-devops` extension.
+  `azure-devops` extension (Services only — see the wrapper note above); the native install ships
+  `glab` too (`ensure_glab`) — without it a session improvises with the raw GitLab API, the one
+  MR-creation path the scan can't attribute.
+  - **An MR's `mergeable` answers conflicts ONLY, like GitHub's**: `detailed_merge_status` buckets
+    via `_MR_CONFLICT_STATUSES`/`_MR_UNVERIFIED_STATUSES`, every other KNOWN status → MERGEABLE —
+    mapping only `"mergeable"` parked every healthy MR (not_approved, ci_still_running …) at ●.
+  - `_mr_url_parts` matches GITLAB_URL by **host(:port), case-insensitively, ignoring scheme** — a
+    byte-prefix compare left attributed MRs as bare link chips over a trivial spelling mismatch.
+  - Every session launch exports **`GITLAB_HOST`** (from `gitlab_base()`, operator's own wins):
+    glab reads that var, never GITLAB_URL, so self-hosted `glab mr create` can't auth without it.
+  - Chips label an MR/ADO PR **`!n`, not `#n`** (in ADO `#n` is a WORK ITEM) — every renderer
+    (web ×3, android `PrBadge`, glasses `phone/render.ts` + vendored chat.cjs) mirrors `_pr_ref`.
 - Tests: `TestPrStatus`, `TestMr*`, `TestAzdoPr*`, `TestRefreshPrStatus`, `TestPrLedger`.
 
 ### PR comment delivery (XERK-49) and conflict nudges (XERK-223)
@@ -451,22 +475,8 @@ See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_se
 
 ## `entrypoint.sh` and the bundled toolchains
 
-- Creds preflight, then launches the tunnel (a simple respawn loop, XERK-34) and `exec`s the session
-  manager as PID 1 — the container stays up with zero sessions. Uid resolution is in `CLAUDE.md`'s
-  "Run-as identity". Tests: `test_entrypoint.sh`.
-- **Cloud CLIs** (terraform/`az`/`aws`, pinned via
-  `TERRAFORM_VERSION`/`AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`) live in the
-  `tooling` stage, so **every tier carries them and the CI scan covers them** — they are
-  credential-bearing tools talking to cloud control planes.
-  - **Creds are the host's, via optional bind mounts** (`/root/.aws` or `AWS_*`, `/root/.azure`,
-    `/root/.terraform.d`); the image bakes none. **A host that mounts none is supported, not an
-    error**: the preflight only LOGS which stores it found, keying on a **login-marker file** never
-    the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's
-    build-time smoke test drops the stores it creates. `permissions.deny` protects them.
-- **Android toolchain** — JDK 17 + Gradle + Android SDK (`gradle`/`sdkmanager`/`avdmanager`/`adb`/
-  `aapt2` on PATH), pinned via
-  `GRADLE_VERSION`/`ANDROID_CMDLINE_TOOLS`/`ANDROID_PLATFORM`/`ANDROID_BUILD_TOOLS` in
-  `agent/Dockerfile`; tiering in `.claude/rules/release.md`.
+See `.claude/rules/agent-image.md` (scoped to `agent/entrypoint.sh` + `agent/Dockerfile`) — the boot
+sequence, the start-time Claude Code check, and the cloud/Android toolchains the image bundles.
 
 ## `native/` — non-Docker install
 
