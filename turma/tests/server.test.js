@@ -6512,6 +6512,10 @@ test("connections: a connection over the cap is refused, and says so", async () 
 });
 
 // ---- XERK-258: the in-flight body budget ------------------------------------
+// Mirrors BODY_PARSE_COST in server.js: a JSON body is charged a multiple of
+// its wire size, because the string and JSON.parse's object graph are the real
+// bill. Held here so a test can assert the exact charge rather than "> 0".
+const BODY_PARSE_COST_EXPECTED = 3;
 
 test("budget: the ceilings are derived from the container limit, and only tighten", async () => {
   // Fixed numbers are what made this a bug: UPLOAD_TOTAL_MAX_BYTES was a flat
@@ -6606,4 +6610,54 @@ test("budget: a body refused for being too large also gives its charge back", as
   });
   assert.equal(res.status, 413);
   assert.equal(hub.bodyInflightHeld(), 0, "a refused body must not stay charged");
+});
+
+test("budget: a declared Content-Length reserves NOTHING until the bytes arrive", async () => {
+  // Charging the declared length turned the budget into a cheap DoS: one socket
+  // that declares a huge body and then sends nothing held the whole budget for
+  // the request timeout, and every other body on the hub was refused 503. It
+  // needs no credentials (/api/login reads a body before any auth gate), no
+  // bandwidth, and is renewable -- a worse outage than the OOM this prevents.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/login HTTP/1.1\r\nHost: x\r\n" +
+        "Content-Type: application/json\r\nContent-Length: 33554432\r\n\r\n{"
+    );
+    // Give the hub every chance to have charged something for the 32 MiB the
+    // socket claims it is about to send.
+    await new Promise((r) => setTimeout(r, 150));
+    // Charging the declaration would hold 32 MiB x BODY_PARSE_COST here. Only
+    // what genuinely arrived may be charged, which is at most the single byte.
+    assert.ok(
+      hub.bodyInflightHeld() <= 1 * BODY_PARSE_COST_EXPECTED,
+      `nothing may be reserved for bytes that never came (held ${hub.bodyInflightHeld()})`
+    );
+
+    // ...and the hub is still fully serving everyone else meanwhile.
+    const beat = await request("POST", "/api/heartbeat", {
+      body: { device: "unwedged-host" }, headers: agentHeaders,
+    });
+    assert.equal(beat.status, 200);
+  } finally {
+    sock.destroy();
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(hub.bodyInflightHeld(), 0, "the abandoned read must give its charge back");
+});
+
+test("budget: a lone oversized body still completes once it has started", async () => {
+  // The flip side of charging only real bytes: a body admitted into an idle hub
+  // must not be refused mid-stream by its OWN accumulated charge. This is what
+  // keeps a single 65 MiB migration bundle -- larger than the whole budget at
+  // 256m -- working.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const pad = "q".repeat(Math.min(4 << 20, hub.BODY_INFLIGHT_MAX - (1 << 16)));
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "lone-big-host", pad }, headers: agentHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(hub.bodyInflightHeld(), 0);
 });

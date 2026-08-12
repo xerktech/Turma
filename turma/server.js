@@ -1848,22 +1848,42 @@ class BodyBudgetExceeded extends Error {
 let bodyInflightBytes = 0;
 
 /**
- * Charge `n` bytes to the global budget, or refuse.
+ * Charge `n` budget units for bytes THAT HAVE ALREADY ARRIVED, or refuse.
  *
- * **A body arriving into an idle hub is always admitted**, up to its own
- * per-request cap — that is what keeps a single legitimate 65 MiB migration
- * bundle (MIGRATE_BLOB_MAX, larger than the whole budget at 256m) working, and
- * it is safe precisely because nothing else is being held beside it. Every body
- * after that one is admitted only while the running sum stays under budget.
+ * **Only real, buffered bytes are ever charged — never a declared
+ * `Content-Length`.** Reserving on the declared length looks like the better
+ * trade (it refuses a doomed body before buffering any of it) and is a
+ * denial-of-service: a socket that declares the maximum body and then sends
+ * nothing holds the whole budget for as long as the request timeout allows,
+ * and every other body on the hub is refused 503. That costs an attacker no
+ * bandwidth, needs no credentials (`/api/login` reads a body before any auth
+ * gate) and is renewable, so it wedges the fleet's control plane far more
+ * cheaply than the OOM this budget exists to prevent. A declared length is a
+ * CLAIM; the budget may only ever track what was actually spent.
  *
- * Refusing on arrival rather than mid-read is the point: almost nothing is
- * buffered for a request that is turned away, so a flood of large bodies costs
- * the hub far less than a flood of small ones.
+ * `sole` carries the one exception. **A body that began while the hub was
+ * completely idle runs to completion whatever the budget says** — that is what
+ * keeps a single legitimate 65 MiB migration bundle (MIGRATE_BLOB_MAX, larger
+ * than the whole budget at 256m) working. It has to be sticky for the whole
+ * read: judged per top-up instead, such a body would sail past the budget on
+ * its first chunk and then be refused mid-stream by its own accumulated charge.
+ * It is safe because nothing else was being held when it started, and anything
+ * arriving after it sees the real total and is refused normally.
  */
-function chargeBody(n) {
-  if (bodyInflightBytes > 0 && bodyInflightBytes + n > BODY_INFLIGHT_TOTAL_MAX) return false;
+function chargeBody(n, sole = false) {
+  if (!sole && !willFitBudget(n)) return false;
   bodyInflightBytes += n;
   return true;
+}
+
+/**
+ * Whether `n` more budget units would fit right now — the admission rule on its
+ * own, holding nothing. Both readers ask this of a body's DECLARED length up
+ * front: it is the same question chargeBody answers, asked about bytes that have
+ * not arrived yet, and answering it costs nobody anything.
+ */
+function willFitBudget(n) {
+  return bodyInflightBytes === 0 || bodyInflightBytes + n <= BODY_INFLIGHT_TOTAL_MAX;
 }
 
 /**
@@ -1923,21 +1943,39 @@ function readBody(req, cap = BODY_MAX) {
     const refuse = (err, from = cap) => {
       over = true;
       data = ""; // release it — it is not going to be used
-      drainLimit = from + RAW_BODY_DRAIN_SLACK;
+      drainLimit = from + (err.budgetExceeded ? BUDGET_DRAIN_SLACK : RAW_BODY_DRAIN_SLACK);
       release();
+      // A budget refusal STOPS READING rather than draining. Draining is a
+      // courtesy paid out of the very resource that has just run out, and Node
+      // hands us whatever has accumulated in one `data` event — megabytes — so
+      // even "destroy on the first chunk" costs a chunk per socket, and 256 of
+      // those OOM-killed the hub with not one body being buffered. Paused, the
+      // bytes stop at the kernel's socket buffer and TCP backpressure tells the
+      // client to stop; the 503 already queued still flushes, and Node closes
+      // the connection once it has.
+      if (err.budgetExceeded) req.pause();
       reject(err);
     };
 
-    // Refuse on the DECLARED length, before a byte is buffered, whenever the
-    // client tells us one. A chunked body has no Content-Length and is caught
-    // incrementally below instead.
     const declared = Number(req.headers["content-length"]);
-    if (Number.isFinite(declared) && declared > 0) {
-      if (declared > cap) return refuse(new BodyTooLarge(cap));
-      if (!chargeBody(costOf(declared)))
-        return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
-      held = costOf(declared);
-    }
+    if (Number.isFinite(declared) && declared > cap) return refuse(new BodyTooLarge(cap));
+    // A declared length is CHECKED against the budget but never CHARGED to it
+    // (see chargeBody). The distinction is the whole point: checking costs an
+    // attacker's idle socket nothing, because a claim that is never charged is
+    // never held, so nothing is denied to anyone else.
+    //
+    // The check has to exist, though. Node delivers whatever has accumulated in
+    // one `data` event — megabytes, not one buffer's worth — so a body refused
+    // on its first chunk has already been buffered that far. Waiting for bytes
+    // to arrive before refusing let 256 sockets streaming 30 MiB each OOM the
+    // hub anyway. Refusing on the claim keeps that to nothing, and a client that
+    // under-declares is still caught by the incremental charge below.
+    if (Number.isFinite(declared) && declared > 0 && !willFitBudget(costOf(declared)))
+      return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+
+    // Whether this read began while nothing else was in flight. Latched on the
+    // first charge and held for the whole body — see chargeBody.
+    let sole = false;
 
     req.on("data", (c) => {
       len += c.length;
@@ -1946,13 +1984,13 @@ function readBody(req, cap = BODY_MAX) {
         return;
       }
       if (len > cap) return refuse(new BodyTooLarge(cap));
-      // Undeclared (or under-declared) length: top the charge up to what has
-      // actually arrived. Compared in BUDGET UNITS, not wire bytes — against
-      // `len` this would stop topping up after the first chunk and a chunked
-      // body would ride most of the way in uncharged.
+      // Top the charge up to what has actually arrived. Compared in BUDGET
+      // UNITS, not wire bytes — against `len` this would stop topping up after
+      // the first chunk and a body would ride most of the way in uncharged.
       const want = costOf(len);
       if (want > held) {
-        if (!chargeBody(want - held))
+        if (held === 0 && bodyInflightBytes === 0) sole = true;
+        if (!chargeBody(want - held, sole))
           return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
         held = want;
       }
@@ -1969,6 +2007,13 @@ function readBody(req, cap = BODY_MAX) {
 // hang up, and "the network broke" is the wrong thing to tell someone whose
 // file was simply too big (XERK-234).
 const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
+// The same courtesy, rationed, for a body refused on BUDGET rather than on size.
+// A budget refusal happens when the hub is ALREADY at its ceiling and, unlike an
+// oversize one, happens to many requests at once — 256 sockets each draining a
+// megabyte to read their 503 is a quarter-gigabyte of churn at exactly the wrong
+// moment, and it OOM-killed the hub even though not one of those bodies was
+// being buffered. This is enough for the response to flush and no more.
+const BUDGET_DRAIN_SLACK = 64 << 10; // 64 KiB
 
 // Collect a request body as raw bytes (for the binary migration relay and the
 // attachment uploads, which readBody's 1 MiB string cap would truncate). Rejects
@@ -1988,17 +2033,28 @@ function readRawBody(req, cap) {
     const refuse = (err, from = cap) => {
       over = true;
       chunks = []; // release what we'd buffered — it is not going to be used
-      drainLimit = from + RAW_BODY_DRAIN_SLACK;
+      drainLimit = from + (err.budgetExceeded ? BUDGET_DRAIN_SLACK : RAW_BODY_DRAIN_SLACK);
       release();
+      // A budget refusal STOPS READING rather than draining. Draining is a
+      // courtesy paid out of the very resource that has just run out, and Node
+      // hands us whatever has accumulated in one `data` event — megabytes — so
+      // even "destroy on the first chunk" costs a chunk per socket, and 256 of
+      // those OOM-killed the hub with not one body being buffered. Paused, the
+      // bytes stop at the kernel's socket buffer and TCP backpressure tells the
+      // client to stop; the 503 already queued still flushes, and Node closes
+      // the connection once it has.
+      if (err.budgetExceeded) req.pause();
       reject(err);
     };
 
+    // Same rule readBody follows: a declared length is checked — against the
+    // per-request cap and against the budget — and charged to nothing.
     const declared = Number(req.headers["content-length"]);
-    if (Number.isFinite(declared) && declared > 0) {
-      if (declared > cap) return refuse(new Error("body too large"));
-      if (!chargeBody(declared)) return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
-      held = declared;
-    }
+    if (Number.isFinite(declared) && declared > cap) return refuse(new Error("body too large"));
+    if (Number.isFinite(declared) && declared > 0 && !willFitBudget(declared))
+      return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+
+    let sole = false;
 
     req.on("data", (c) => {
       len += c.length;
@@ -2010,15 +2066,38 @@ function readRawBody(req, cap) {
       }
       if (len > cap) return refuse(new Error("body too large"));
       if (len > held) {
-        const extra = len - held;
-        if (!chargeBody(extra)) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
-        held += extra;
+        if (held === 0 && bodyInflightBytes === 0) sole = true;
+        if (!chargeBody(len - held, sole))
+          return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        held = len;
       }
       chunks.push(c);
     });
     req.on("end", () => { if (!over) { release(); resolve(Buffer.concat(chunks)); } });
     req.on("error", (e) => { release(); reject(e); });
   });
+}
+
+/**
+ * Close the connection under a request whose body we refused on BUDGET, once its
+ * response has flushed.
+ *
+ * Pausing the request is not enough on its own. Node keeps a connection alive by
+ * DUMPING an unread body when the response finishes — it resumes the stream we
+ * paused and reads the whole thing, discarding it. Discarded or not, those bytes
+ * are read into memory, and with 256 sockets each sending a 30 MiB body that is
+ * gigabytes of churn while the hub is already at its ceiling. It OOM-killed the
+ * hub at the deployed 256m with not one of those bodies being buffered.
+ *
+ * So the socket goes, and it goes AFTER `finish` so the 503 the caller needs
+ * (XERK-264) is on the wire first. The connection is not reusable anyway — we
+ * never read its body — which is what `Connection: close` tells the client.
+ */
+function endRefusedConnection(req, res) {
+  try { req.pause(); } catch {}
+  const kill = () => { try { req.socket.destroy(); } catch {} };
+  if (res.writableFinished) kill();
+  else res.once("finish", kill);
 }
 
 function json(res, code, obj) {
@@ -3871,7 +3950,9 @@ const server = http.createServer(async (req, res) => {
         // refused, so this is the case that would break most often.
         if (e && e.budgetExceeded) {
           res.setHeader("Retry-After", "1");
-          return json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+          res.setHeader("Connection", "close");
+          json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+          return endRefusedConnection(req, res);
         }
         m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
         publishMigrations();
@@ -4247,7 +4328,9 @@ const server = http.createServer(async (req, res) => {
           // the hub and tells them to press send again.
           if (e && e.budgetExceeded) {
             res.setHeader("Retry-After", "1");
-            return json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+            res.setHeader("Connection", "close");
+            json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+            return endRefusedConnection(req, res);
           }
           return json(res, 413, {
             error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
@@ -5035,8 +5118,10 @@ const server = http.createServer(async (req, res) => {
     if (err && err.budgetExceeded) {
       if (!res.writableEnded) {
         res.setHeader("Retry-After", "1");
+        res.setHeader("Connection", "close");
         json(res, 503, { error: err.message, held: err.held, limit: err.limit });
       }
+      endRefusedConnection(req, res);
       return;
     }
     json(res, 400, { error: err.message });
