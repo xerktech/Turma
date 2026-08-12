@@ -3773,19 +3773,50 @@ const server = http.createServer(async (req, res) => {
     // a migrated session's raw transcript bundle. Agent-authed above. Body is
     // the raw gzipped tar; storing it advances the migration to `importing` and
     // queues importSession on the target (XERK-101).
+    // Scoped to the migration's OWN source host (XERK-266), like the uploads
+    // route below. **Defense in depth, NOT an identity check**: every agent
+    // shares one token, so `<host>` is the CALLER's to pick and one naming the
+    // real source passes. What it buys is that no token-holder can make the
+    // real target `claude --resume` bytes it chose *by mis-addressing*. Binding
+    // the segment to the credential — the actual fix, and the only thing that
+    // stops a deliberate attacker — is XERK-268.
+    // **Every refusal answers the SAME 404** — wrong host, wrong phase, an
+    // upload already in flight, a spool that could not be written, empty body,
+    // vanished source session; the 413 below is the one exception, and is
+    // discussed there — and that uniformity is the point, not
+    // tidiness: any RESPONSE a non-source cannot also get names the source to a
+    // prober. So do NOT restore a friendlier 409/400/500 at any of them, and
+    // **enumerate what this route can answer rather than eyeballing the guard**
+    // — the `source session gone` branch below is why. The real source loses
+    // nothing it acts on: it only logs the failure, and the RECORD still
+    // carries the true reason for the operator.
+    // **Never reason as if the migration id were the two participants' alone.**
+    // It rides the user-authed fleet payload, and `device` on /api/heartbeat is
+    // self-asserted just like `<host>` here, so any token-holder beating as a
+    // host is handed that host's queued commands — `migrationId` among them.
+    // Two residual leaks remain, so **the oracle is narrowed, not shut**, and
+    // only XERK-268 shuts it: the TIMING of the reply (this guard runs BEFORE
+    // the body read, so a caller that PASSES it blocks while one that doesn't
+    // answers at once — 15 probes and 960 bytes to find a source, mutating
+    // nothing), and the 413 (loud, and ~1 MiB per wrong-host probe since the
+    // guard cuts it off early — the full >MIGRATE_BLOB_MAX only on the hit).
+    // Neither is closeable without reading an unbounded body from an unverified
+    // caller.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m) return json(res, 404, { error: "unknown migration" });
-      if (m.phase !== "exporting")
-        return json(res, 409, { error: "migration not awaiting a bundle" });
+      if (!m || m.srcHost !== host || m.phase !== "exporting")
+        return json(res, 404, { error: "unknown migration" });
       // Two uploads for one migration would interleave into a single spool
       // file, since the phase only flips once the first finishes writing.
-      // Drained first, so the loser reads the 409 instead of a socket error.
+      // Drained first, so the loser reads the reply instead of a socket error
+      // — and it is the SAME 404 as every other refusal above, since only the
+      // real source can reach this line.
       if (m.uploading) {
         req.resume();
-        return json(res, 409, { error: "bundle already uploading" });
+        return json(res, 404, { error: "unknown migration" });
       }
       // Spooled to disk rather than buffered (XERK-263); the record keeps only
       // the path, so an in-flight move costs the hub bytes, not megabytes.
@@ -3801,11 +3832,16 @@ const server = http.createServer(async (req, res) => {
         m.error = tooBig ? "transcript bundle too large" : "transcript bundle spool failed";
         m.at = Date.now();
         publishMigrations();
+        // The 413 is the enumerated exception discussed above. A SPOOL failure
+        // is not a second one: it answers the uniform 404 like every other
+        // refusal, because a distinct status would name the source to anyone
+        // holding the id the moment the hub's disk misbehaved. Nothing is lost
+        // — the agent only logs the reply, the RECORD carries the real reason
+        // for the operator, and the detail (which names the spool path) goes to
+        // the hub's log where it is actionable.
         if (tooBig) return json(res, 413, { error: e.message });
-        // The detail (which names the spool path) goes to the hub's log, not
-        // over the wire — the agent can do nothing with it either way.
         console.error(`migration ${m.id}: spool failed: ${e && e.message}`);
-        return json(res, 500, { error: "could not store the transcript bundle" });
+        return json(res, 404, { error: "unknown migration" });
       }
       m.uploading = false;
       if (!size) {
@@ -3814,7 +3850,7 @@ const server = http.createServer(async (req, res) => {
         // retriable, and a fire-and-forget unlink could land after a retry had
         // already re-created the same path and deleted the good bundle.
         try { fs.unlinkSync(spool); } catch {}
-        return json(res, 400, { error: "empty bundle" });
+        return json(res, 404, { error: "unknown migration" });
       }
       m.blobPath = spool;
       m.blobSize = size;
@@ -3828,10 +3864,16 @@ const server = http.createServer(async (req, res) => {
       const s = src && (src.sessions || []).find((x) => x.id === m.srcSessionId);
       const cwd = s && s.worktreePath;
       if (!cwd) {
+        // The RECORD says what really happened (the operator reads that, and it
+        // stays truthful), but the REPLY is the same 404 as every other refusal
+        // — only the real source can reach this line, so a distinct status here
+        // would name it to anyone holding the id, exactly like the spool and
+        // empty-body refusals above. Nothing consumes this reply; the agent
+        // only logs it.
         m.phase = "failed"; m.error = "source session gone";
         dropMigrationBlob(m); m.at = Date.now();
         publishMigrations();
-        return json(res, 409, { error: "source session gone" });
+        return json(res, 404, { error: "unknown migration" });
       }
       m.importCmdId = queueCommand(m.targetHost, {
         type: "importSession",
@@ -3853,12 +3895,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     // GET /api/agents/<host>/migrations/<id>/blob — the TARGET agent pulling the
-    // bundle to unpack + resume. Agent-authed above.
+    // bundle to unpack + resume. Agent-authed above, and scoped to the
+    // migration's OWN target host (XERK-266) on the same defense-in-depth
+    // terms as the POST above — the bundle is the raw transcript of another
+    // host's conversation, so the id alone should not be enough to read it,
+    // but a caller naming the real target still passes (XERK-268). Unlike the
+    // POST, the oracle here CANNOT be closed by making the refusals uniform:
+    // the success IS the disclosure, so a token-holder with the id can walk
+    // the host names until one returns bytes. Only XERK-268 fixes that.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m || !m.blobPath) return json(res, 404, { error: "no bundle" });
+      if (!m || m.targetHost !== host || !m.blobPath)
+        return json(res, 404, { error: "no bundle" });
       // SNAPSHOT the path and size together, before the first async hop. A
       // concurrent settle (a heartbeat's handoff, the timeout sweep) calls
       // dropMigrationBlob, which zeroes both — and since the unlink leaves this
@@ -3891,8 +3942,12 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
     // operator attached to a message (XERK-234). Agent-authed above. Scoped to
-    // the host the upload was staged for, so one host's agent token can't pull
-    // another host's pending attachment. The blob is NOT dropped on read: the
+    // the host the upload was staged for — like the migration GET above and
+    // with the same limit: `<host>` is self-asserted, and a hit returns the
+    // bytes, so an agent-token holder knowing the upload id can walk the host
+    // names until the operator's attached file comes back. Read that comment
+    // before trusting this line; binding the segment to the credential covers
+    // this route too (XERK-268). The blob is NOT dropped on read: the
     // agent may be re-issued the command (at-least-once delivery), and letting it
     // expire on the TTL costs nothing a re-download doesn't.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&

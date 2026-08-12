@@ -6174,8 +6174,10 @@ test("migrate: an empty bundle is refused and leaves no spool file", async () =>
   const mid = r.body.migrationId;
   const up = await requestRaw("POST", `/api/agents/emA/migrations/${mid}/blob`,
     { headers: { authorization: "Bearer agenttok", "content-length": "0" } });
-  assert.equal(up.status, 400);
-  assert.match(up.body.error, /empty bundle/);
+  // The uniform 404 every other POST refusal answers (XERK-266) — the point is
+  // that this one is indistinguishable from a stranger's probe.
+  assert.equal(up.status, 404);
+  assert.match(up.body.error, /unknown migration/);
   const m = migrations.get(mid);
   assert.equal(m.phase, "exporting"); // still awaiting a real bundle
   assert.equal(m.blobPath, null);
@@ -6222,10 +6224,12 @@ test("migrate: a second upload for one migration can't interleave into the spool
       { body: Buffer.alloc(1 << 20, 0x42), headers: hdr }),
   ]);
   const codes = [a.status, b.status].sort();
-  assert.deepEqual(codes, [200, 409]);
-  const loser = a.status === 409 ? a : b;
-  // The loser is REFUSED, not hung up on: it must read a real reply.
-  assert.match(loser.body.error, /already uploading|not awaiting a bundle/);
+  assert.deepEqual(codes, [200, 404]);
+  const loser = a.status === 404 ? a : b;
+  // The loser is REFUSED, not hung up on: it must read a real reply — and it is
+  // the same 404 as every other POST refusal (XERK-266), not a distinct status
+  // that would name the source to anyone holding the id.
+  assert.match(loser.body.error, /unknown migration/);
   const spooled = fs.readFileSync(migrations.get(mid).blobPath);
   assert.equal(spooled.length, 1 << 20);
   assert.equal(new Set(spooled).size, 1, "the spool must hold ONE upload's bytes, not two interleaved");
@@ -6245,8 +6249,11 @@ test("migrate: a spool that can't be written fails the move, and doesn't hang", 
   // assertion rather than by running the whole CI job out of time.
   const up = await requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
     { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" }, timeoutMs: 2000 });
-  assert.equal(up.status, 500);
-  // The reply must not hand the agent the hub's filesystem layout.
+  // Uniform with every other POST refusal (XERK-266) — a status of its own
+  // would name the source the moment the hub's disk misbehaved. It also can't
+  // hand the agent the hub's filesystem layout; that detail goes to the log.
+  assert.equal(up.status, 404);
+  assert.match(up.body.error, /unknown migration/);
   assert.doesNotMatch(up.body.error, /\//);
   const m = migrations.get(mid);
   assert.equal(m.phase, "failed");
@@ -6328,10 +6335,16 @@ test("migrate: too many moves in flight is refused, not spooled", async () => {
   });
   await migHost("cpB", "cp.atlassian.net");
   // The cap is fleet-wide (so is /data), so settle what earlier cases left in
-  // flight rather than counting on an empty map.
-  for (const m of migrations.values()) {
-    if (m.phase === "exporting" || m.phase === "importing") m.phase = "failed";
-  }
+  // flight rather than counting on an empty map — and settle this case's own
+  // moves on the way out, or it hands every later test a fleet already at the
+  // cap and their migrate() calls come back 503.
+  const settleInFlight = () => {
+    for (const m of migrations.values()) {
+      if (m.phase === "exporting" || m.phase === "importing") m.phase = "failed";
+    }
+  };
+  settleInFlight();
+  try {
   for (const id of ["s1", "s2", "s3", "s4"]) {
     assert.equal((await migrate("cpA", id, { host: "cpB" })).status, 200, id);
   }
@@ -6343,6 +6356,9 @@ test("migrate: too many moves in flight is refused, not spooled", async () => {
     (m) => m.srcHost === "cpA" && m.srcSessionId === "s1");
   first.phase = "failed";
   assert.equal((await migrate("cpA", "s5", { host: "cpB" })).status, 200);
+  } finally {
+    settleInFlight();
+  }
 });
 
 test("migrate: the boot sweep clears spool files a restart orphaned", async () => {
@@ -6367,6 +6383,122 @@ test("migrate: the blob relay rejects an unauthenticated caller", async () => {
   const badTok = await requestRaw("POST", `/api/agents/auA/migrations/${mid}/blob`,
     { body: Buffer.from("x"), headers: { authorization: "Bearer nope" } });
   assert.equal(badTok.status, 401);
+});
+
+test("migrate: the blob relay is scoped to the migration's own two hosts", async () => {
+  // The <host> segment is checked against the migration's own halves (XERK-266),
+  // so a mis-addressed call can no longer act on someone else's move. It is
+  // defense in depth, not identity: the segment is self-asserted, and a caller
+  // that names the real source/target still passes (XERK-268).
+  await migHost("hsA", "hs.atlassian.net");
+  await migHost("hsB", "hs.atlassian.net");
+  await migHost("hsC", "hs.atlassian.net"); // same org, no part of the move
+  const mid = (await migrate("hsA", "s1", { host: "hsB" })).body.migrationId;
+  const agentTok = { authorization: "Bearer agenttok" };
+
+  // A host that is not the SOURCE can't inject a bundle: 404 (not 403 — the
+  // relay doesn't confirm the id exists), and the move stays exporting.
+  const inject = await requestRaw("POST", `/api/agents/hsC/migrations/${mid}/blob`,
+    { body: Buffer.from("ATTACKER-BYTES"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(inject.status, 404);
+  assert.equal(migrations.get(mid).phase, "exporting");
+  assert.equal(migrations.get(mid).blobPath, null);
+  assert.ok(!agents.hsB.commands.some((c) => c.type === "importSession"));
+
+  // The POST compare is EXACT, and this has to be asked while the migration is
+  // still AWAITING its bundle — that is the state where the host compare is the
+  // only thing that can answer. Asked after the upload it would sit behind the
+  // phase check and "pass" on a build whose compare is lenient, which is not
+  // what it is here to catch.
+  const nearMissUp = await requestRaw("POST", `/api/agents/HSA/migrations/${mid}/blob`,
+    { body: Buffer.from("x"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(nearMissUp.status, 404);
+  assert.equal(migrations.get(mid).phase, "exporting");
+
+  // The real source's upload still works.
+  const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
+  const up = await requestRaw("POST", `/api/agents/hsA/migrations/${mid}/blob`,
+    { body: blob, headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(up.status, 200);
+
+  // A host that is not the TARGET can't read the bundle — it is the raw
+  // transcript of another host's conversation.
+  const steal = await requestRaw("GET", `/api/agents/hsC/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(steal.status, 404);
+  // The source can't read it back either — only the target has business with it.
+  const backAtSrc = await requestRaw("GET", `/api/agents/hsA/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(backAtSrc.status, 404);
+  // The real target still gets the bytes.
+  const dl = await requestRaw("GET", `/api/agents/hsB/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(dl.status, 200);
+  assert.ok(blob.equals(dl.buf));
+
+  // Same on the GET: a host name that merely resembles the target's is a
+  // different host, and a lenient compare would hand it the bundle.
+  const nearMiss = await requestRaw("GET", `/api/agents/HSB/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(nearMiss.status, 404);
+});
+
+test("migrate: every POST refusal is the same 404, so the responses name no host", async () => {
+  // `<host>` is self-asserted (XERK-268), so any refusal a NON-source can't
+  // also get names the source to anyone holding the id — and then the injection
+  // above is a matter of re-addressing. The refusals are therefore uniform: a
+  // wrong host, a wrong phase, an empty body and a spool that could not be
+  // written must be indistinguishable.
+  // This pins the RESPONSES only. The route still leaks the source through the
+  // timing of an accepted vs rejected POST, which no test here can close —
+  // see the route's comment; that one needs XERK-268.
+  await migHost("orA", "or.atlassian.net");
+  await migHost("orB", "or.atlassian.net");
+  await migHost("orC", "or.atlassian.net");
+  const agentTok = { authorization: "Bearer agenttok", "content-type": "application/octet-stream" };
+  const post = (host, id, body) =>
+    requestRaw("POST", `/api/agents/${host}/migrations/${id}/blob`, { body, headers: agentTok });
+  const mid = (await migrate("orA", "s1", { host: "orB" })).body.migrationId;
+
+  // The empty-body probe is the cheap one: it mutates nothing, so without this
+  // the source could be found silently, at no cost and without tripping a move.
+  const emptyAtSrc = await post("orA", mid, Buffer.alloc(0));
+  const emptyElsewhere = await post("orC", mid, Buffer.alloc(0));
+  assert.equal(emptyAtSrc.status, 404);
+  assert.deepEqual(emptyAtSrc.body, emptyElsewhere.body);
+  assert.equal(emptyAtSrc.status, emptyElsewhere.status);
+  assert.equal(migrations.get(mid).phase, "exporting"); // and nothing moved
+
+  // Same once the real bundle has landed: the source re-POSTing (at-least-once
+  // delivery makes that ordinary) reads exactly like a stranger's probe.
+  assert.equal((await post("orA", mid, Buffer.from("REAL"))).status, 200);
+  const rePost = await post("orA", mid, Buffer.from("REAL"));
+  const stranger = await post("orC", mid, Buffer.from("REAL"));
+  assert.equal(rePost.status, 404);
+  assert.deepEqual(rePost.body, stranger.body);
+  // An unknown id answers the same thing again.
+  const unknown = await post("orA", "0123456789abcdef", Buffer.from("REAL"));
+  assert.equal(unknown.status, 404);
+  assert.deepEqual(unknown.body, rePost.body);
+  // The re-POST didn't disturb the move it was refused from.
+  assert.equal(migrations.get(mid).phase, "importing");
+  assert.ok(fs.readFileSync(migrations.get(mid).blobPath).equals(Buffer.from("REAL")));
+
+  // The refusal AFTER the body read counts too: only the real source can reach
+  // "source session gone", so a status of its own would name it. The reply is
+  // the same 404; the RECORD keeps the true reason for the operator.
+  await migHost("orD", "or.atlassian.net", { session: "s9" });
+  await migHost("orE", "or.atlassian.net");
+  const gone = (await migrate("orD", "s9", { host: "orE" })).body.migrationId;
+  await request("POST", "/api/heartbeat", { // the source session vanishes mid-move
+    body: { device: "orD", repos: [{ name: "Turma", path: "/git/Turma" }], sessions: [] },
+    headers: agentHeaders,
+  });
+  const afterGone = await post("orD", gone, Buffer.from("REAL"));
+  assert.equal(afterGone.status, 404);
+  assert.deepEqual(afterGone.body, rePost.body);
+  assert.equal(migrations.get(gone).phase, "failed");
+  assert.equal(migrations.get(gone).error, "source session gone");
 });
 
 // ---- file attachments (XERK-234) -------------------------------------------

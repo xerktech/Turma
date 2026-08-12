@@ -111,6 +111,16 @@ class HubClient(private val config: Config) {
     sealed interface HistoryResult {
         data class Ready(val entries: List<TailEntry>, val truncated: Boolean) : HistoryResult
         data class Pending(val cmdId: String) : HistoryResult
+
+        /**
+         * The hub REFUSED the fetch (XERK-264) — an unknown host or session, an
+         * offline agent, a command queue too full to take another. Distinct from
+         * [Pending] because polling cannot fix it: a refusal folded into "not
+         * fetched yet" ran the caller's 20×3s poll out and then gave up with no
+         * word to the operator. [why] is the hub's own `{error}` text when it
+         * sent one, else the bare status.
+         */
+        data class Failed(val why: String) : HistoryResult
     }
 
     /** GET history, mapping the hub's 202-pending into a typed result. */
@@ -131,12 +141,24 @@ class HubClient(private val config: Config) {
         label: String,
     ): HistoryResult = mapHistory(api.subagentHistory(host, sessionId, type, label))
 
-    private fun mapHistory(resp: retrofit2.Response<com.xerktech.turma.model.HistoryResponse>): HistoryResult {
-        val body = resp.body()
-        return if (resp.code() == 202 || body == null || body.pending) {
-            HistoryResult.Pending(body?.cmdId ?: "")
-        } else {
-            HistoryResult.Ready(body.entries, body.truncated)
+    companion object {
+        /**
+         * The hub's 202-pending, a real answer, and a refusal are three different
+         * things. A null body used to collapse the last two into
+         * [HistoryResult.Pending] (XERK-264): an error body Retrofit couldn't
+         * decode as a history reply looked exactly like "the agent hasn't
+         * fetched it yet", so the caller polled it for 60 seconds and then gave
+         * up in silence. The status is what separates them — only a 2xx can be
+         * pending. On the companion so it can be unit-tested without a Config.
+         */
+        fun mapHistory(resp: retrofit2.Response<com.xerktech.turma.model.HistoryResponse>): HistoryResult {
+            if (!resp.isSuccessful) return HistoryResult.Failed(hubErrorMessage(resp))
+            val body = resp.body()
+            return if (resp.code() == 202 || body == null || body.pending) {
+                HistoryResult.Pending(body?.cmdId ?: "")
+            } else {
+                HistoryResult.Ready(body.entries, body.truncated)
+            }
         }
     }
 }

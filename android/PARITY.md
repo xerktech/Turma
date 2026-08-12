@@ -102,12 +102,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   mirrors the web target filter (tested in `SessionsTest`). One deliberate difference: the web stage
   auto-follows the moved session onto its new host (`advanceMigrationFollow`); Android just lets it
   reappear in the session list on its new host (no stage to follow on a phone), so the "Moving…" card
-  hint and the follow are web-only.
-  - **P1 gap, `FleetViewModel.run` (XERK-263):** Retrofit throws on any non-2xx, so every refusal the
-    hub words for the operator — the `/migrate` 409s, and now its 503 when too many moves are in
-    flight — reaches the phone as "✗ hub unreachable". The web toasts `out.error` verbatim. Not
-    Move-specific: `run()` is every session/board action, so the fix is to read the error body off
-    `HttpException` there once. Tracked in XERK-271.
+  hint and the follow are web-only. Its refusals — including the 503 when too many moves are in
+  flight (XERK-263) — reach the operator in the hub's own words through `hubErrorMessage`, like
+  every other command (XERK-264).
 - **One Sessions search box, doing both halves (XERK-243).** The web sidebar's single box searches the
   archive only, hiding the live lists while a query is up. Android's box filters the live/queued/ended
   lists as you type AND, past two characters, appends an "In history" section of archive full-text
@@ -334,6 +331,12 @@ those are marked `[MODEL]`.
 - ~~P1 Clone bar: collapse + search + multi-select + `🔒` private marker + clone-job status rows.~~
   Done (XERK-126, see Done below).
 - P1 `[MODEL]` Repo blocks: branch/dirty meta, remote link, orphan repos, prune-note, empty state.
+  - The prune-note now also covers a prune IN FLIGHT (XERK-256): the agent sweeps on a worker thread
+    and reports `prunes[].status` as `queued`/`running` with a progress summary, which the web uses
+    both for the note and to keep the Prune button spinning for the whole sweep (minutes on a big
+    repo). Android's `prune()` fires and forgets, so its button releases immediately and the
+    operator has no sign the sweep is still going. Decode `prunes[]` and mirror `repoBlock`'s rule:
+    busy while `status` is `queued` or `running`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)

@@ -143,16 +143,6 @@
     display: flex; align-items: center; gap: 6px;
     font-size: 11.5px; color: var(--accent); margin-top: 4px;
   }
-  /* A transient bottom-centre notice (a failed move, today). */
-  .toast {
-    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
-    z-index: 50; max-width: min(92vw, 480px);
-    background: var(--critical); color: #fff; font-size: 13px;
-    padding: 10px 16px; border-radius: var(--radius-md); box-shadow: var(--shadow-md);
-    opacity: 0; pointer-events: none; transition: opacity .2s;
-  }
-  .toast.show { opacity: 1; }
-
   /* Inline rename field, opened from the menu; replaces the card while editing. */
   .s-rename {
     display: flex; gap: 6px; align-items: center;
@@ -1022,12 +1012,15 @@ async function moveTo(ev, srcHost, id, targetHost) {
   menuOpenId = null;
   render(cache);
   const out = await post(`/api/agents/${enc(srcHost)}/sessions/${enc(id)}/migrate`,
-    { host: targetHost });
-  if (out && out.migrationId) {
+    { host: targetHost }, "Move");
+  // A refusal already toasted the hub's reason; a 2xx with no migrationId is the
+  // only case left to word here.
+  if (!out) return;
+  if (out.migrationId) {
     pendingMigration = out.migrationId;
     pendingMigrationFollowed = false;
   } else {
-    toast(out && out.error ? "Move failed: " + out.error : "Move failed");
+    toast(out.error ? "Move failed — " + out.error : "Move failed");
   }
 }
 // Advance a followed migration each render: hand off to followSpawn the moment
@@ -1047,20 +1040,10 @@ function advanceMigrationFollow() {
   }
   if (m.phase === "done") pendingMigration = null;
 }
-// A tiny non-blocking toast (migration is the only caller today).
-let toastTimer = null;
+// The page's failures all go through the chrome's one toast (XERK-264), so a
+// refused command reads the same here, on the dashboard, and from the chat.
 function toast(msg) {
-  let el = document.getElementById("toast");
-  if (!el) {
-    el = document.createElement("div");
-    el.id = "toast";
-    el.className = "toast";
-    document.body.appendChild(el);
-  }
-  el.textContent = msg;
-  el.classList.add("show");
-  if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove("show"), 6000);
+  if (window.TurmaNav && TurmaNav.toast) TurmaNav.toast(msg);
 }
 
 function toggleCardMenu(ev, id) {
@@ -1100,9 +1083,10 @@ function cardKill(ev, host, id) {
   disarmCardKill();
   menuOpenId = null;
   // The card disappears on the beat that reports the kill; nothing optimistic to
-  // paint in the meantime, so just close the menu.
+  // paint in the meantime, so just close the menu. A refusal toasts, which is
+  // the only sign the card staying put would otherwise be a failure and not lag.
   render(cache);
-  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/kill`);
+  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/kill`, null, "Kill");
 }
 
 // Rename swaps the card for an inline field seeded with the current name. The
@@ -1133,7 +1117,10 @@ function submitRename(host, id) {
   // with its old name and reads as a rename that did nothing.
   renameOptimistic.set(id, { text: summary, at: Date.now() });
   render(cache);
-  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/summary`, { summary });
+  // …and take it straight back if the hub refused: the painted name would
+  // otherwise stand for PENDING_TTL_MS as a rename that never happened.
+  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/summary`, { summary }, "Rename")
+    .then((ok) => { if (!ok) { renameOptimistic.delete(id); render(cache); } });
 }
 // DOM id for a composer field, derived from the (host::repo) key + field name.
 function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
@@ -2037,24 +2024,55 @@ function hostBlock(a) {
 
 // ---- actions → endpoints ----------------------------------------------------
 function enc(s) { return encodeURIComponent(s); }
-// Returns the parsed JSON reply (or null if it isn't JSON) — the spawn/resume
-// endpoints answer with the queued command's `cmdId`, which awaitSpawn() needs
-// to recognize the session the agent mints for it.
-async function post(url, body) {
-  const res = await fetch(url, body
-    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
-    : { method: "POST" });
+// Fire a command at the hub. Resolves to the parsed JSON reply on success (`{}`
+// when the reply wasn't JSON) — the spawn/resume endpoints answer with the
+// queued command's `cmdId`, which awaitSpawn() needs to recognize the session
+// the agent mints for it.
+//
+// **Null means the hub refused it, and the operator has already been told.**
+// The status used to be ignored entirely (XERK-264), so a 409/413/429/503 was
+// parsed for a cmdId that wasn't there and the click looked like it worked. Now
+// every refusal raises the hub's own explanation through the shared toast, and
+// callers that painted something optimistically roll it back on a null.
+// `what` names the action for that notice ("Kill", "Rename", …).
+async function post(url, body, what) {
+  let res;
+  try {
+    res = await fetch(url, body
+      ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+      : { method: "POST" });
+  } catch {
+    toast(what ? `${what} failed — the hub is unreachable` : "The hub is unreachable");
+    return null;
+  }
+  // An expired login is the one failure with somewhere better to go than a
+  // toast: the whole page is dead until it's renewed.
+  if (res.status === 401) { location.href = "/login"; return null; }
   let out = null;
   try { out = await res.json(); } catch { /* not JSON — nothing to correlate */ }
   refresh();
   fastPoll();
-  return out;
+  if (!res.ok) {
+    toast(window.TurmaNav && TurmaNav.refusalText
+      ? TurmaNav.refusalText(what, res.status, out)
+      : `${what || "That"} failed`);
+    return null;
+  }
+  return out || {};
 }
 function busy(key, val, run) {
   if (pending.has(key)) return;
   setPending(key, val);
   render(cache);
-  run();
+  // A refused command never reached the agent, so drop the optimistic row the
+  // click painted: left up it reads as a command still in flight, and sits
+  // there for the whole PENDING_TTL_MS. Runners resolve the post()'s reply, so
+  // a falsy result is exactly "the hub said no" (or the fetch never landed).
+  Promise.resolve(run()).then((ok) => {
+    if (ok) return;
+    pending.delete(key);
+    render(cache);
+  });
 }
 // Spawn from the composer. Reads the panel's fields, forwards only the ones that
 // differ from today's defaults (so it degrades to the bare fast path when the
@@ -2087,9 +2105,10 @@ function startSession(key, repo) {
   composerScroll.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    // Open the new session on the stage as soon as the agent reports it.
-    () => post(`/api/agents/${enc(key)}/sessions`, body)
-      .then(r => followSpawn(r && r.cmdId)));
+    // Open the new session on the stage as soon as the agent reports it. The
+    // reply is returned so busy() can drop the "starting…" row on a refusal.
+    () => post(`/api/agents/${enc(key)}/sessions`, body, "Start")
+      .then(r => { followSpawn(r && r.cmdId); return r; }));
 }
 // Bring an ended session back. The endpoint depends on which channel reported
 // it (see endedEntry): a KILLED session was dropped from the registry and comes
@@ -2129,8 +2148,9 @@ function resumeEnded(ev, id) {
         baseline: (e.a.sessions || []).filter(s => s.repo === e.s.repo).length }
     : { kind: "start", host: e.a.key, id };
   busy(pendKey("start", e.a.key, id), val,
-    () => post(url, body).then(r => {
+    () => post(url, body, "Resume").then(r => {
       if (e.kind === "resumable") followSpawn(r && r.cmdId);
+      return r;
     }));
 }
 // The ended-session pane's own Resume button.
@@ -2511,7 +2531,7 @@ function killCurrentTerminal() {
     return;
   }
   disarmTermKill();
-  post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`);
+  post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill");
   if (viewPushed) { viewPushed = false; history.back(); }
   clearStage();
 }
@@ -2549,7 +2569,7 @@ function killCurrentChat() {
     return;
   }
   disarmChatKill();
-  post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`);
+  post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill");
   if (viewPushed) { viewPushed = false; history.back(); }
   clearStage();
 }
@@ -2602,9 +2622,13 @@ async function sendTermInput() {
     });
     // 413 is the hub's "past this host's character cap" (XERK-227) — an
     // actionable failure, unlike the generic one, so it says so and carries the
-    // cap. Worded by the chat engine, which shares this session's draft.
+    // cap. Worded by the chat engine, which shares this session's draft. Every
+    // other refusal reaches the operator through the page's toast in the hub's
+    // own words (XERK-264), since the button only has room for a label.
     if (!r.ok) {
       const err = await r.json().catch(() => null);
+      toast(window.TurmaNav && TurmaNav.refusalText
+        ? TurmaNav.refusalText("Send", r.status, err) : "Send failed");
       throw new Error(TurmaChat.sendFailure(r.status, err && err.limit, err && err.error));
     }
     // Only once it landed — a failed send leaves the chips where they were so

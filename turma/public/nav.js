@@ -152,7 +152,46 @@
     if (window.scrollX !== winX || window.scrollY !== winY) window.scrollTo(winX, winY);
   }
 
-  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll };
+  // ---- the shared failure toast (XERK-264) ----------------------------------
+  // The hub refuses a command with an HTTP status and a JSON `{error}` body — an
+  // org mismatch, an agent too old, an offline host, an expired attachment, a
+  // full command queue. Every page used to drop that on the floor, so a refused
+  // kill/rename/spawn looked exactly like one that worked. This is the one place
+  // a refusal is shown, so a page never has to invent its own: failures ONLY,
+  // which is what makes a toast on screen mean "that didn't happen".
+  //
+  // It lives in the chrome rather than in any page for the same reason the
+  // header does — every page fires commands, and a second copy would drift.
+  const TOAST_MS = 6000;
+  let toastTimer = null;
+  function toast(msg) {
+    const text = String(msg == null ? "" : msg).trim();
+    if (!text || typeof document === "undefined") return;
+    let el = document.getElementById("toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "toast";
+      el.className = "toast";
+      document.body.appendChild(el);
+    }
+    // textContent, never innerHTML: the hub's `error` string is server text and
+    // some of it echoes operator input (a repo name, a field label).
+    el.textContent = text;
+    el.classList.add("show");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove("show"), TOAST_MS);
+  }
+  // What a refused command reads as. The hub's own words when it sent them —
+  // they say something the operator can act on ("the target agent is offline",
+  // "too many queued commands") — and the bare status only when it didn't, which
+  // beats silence. `what` names the action so the notice says what didn't happen.
+  function refusalText(what, status, body) {
+    const said = body && typeof body.error === "string" ? body.error.trim() : "";
+    const why = said || `the hub answered HTTP ${status}`;
+    return what ? `${what} failed — ${why}` : why;
+  }
+
+  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll, toast, refusalText };
   if (typeof window !== "undefined") window.TurmaNav = api;
   // Guarded on `document`, not `window`: a test can put a stand-in on a fake
   // global `window` before requiring this and still drive mount() itself.
