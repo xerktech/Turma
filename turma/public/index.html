@@ -90,9 +90,11 @@
   .repo-head .r-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; justify-content: flex-end; }
   .repo-empty { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
-  /* Transient summary line after a repo prune (merged worktrees/branches swept). */
+  /* Progress line while a repo prune runs, then its summary (merged
+     worktrees/branches swept) for a moment after. */
   .prune-note { color: var(--ink-2); font-size: 12px; margin-top: 8px; }
   .prune-note.err { color: var(--critical); }
+  .prune-note.run { color: var(--muted); }
 
   /* Per-repo picker of recently killed sessions that can be resumed. */
   .resume-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
@@ -517,8 +519,11 @@ function reconcilePending(agents) {
                          (a.repos || []).some(r => r.name === p.name));
       if (seen) pending.delete(key);
     } else if (p.kind === "prune") {
-      // Done once the agent reports a NEW prune result for this repo (its `at`
-      // differs from whatever was showing when we queued it).
+      // Done once the agent reports a NEW prune record for this repo (its `at`
+      // differs from whatever was showing when we queued it) — which is now the
+      // `queued`/`running` one, the moment the command lands. From there the
+      // reported status drives the spinner (repoBlock), so this record only has
+      // to cover the gap before the agent has answered at all.
       const a = byHost.get(p.host);
       const r = a && (a.prunes || []).find(x => x.repo === p.repo);
       if (r && r.at !== p.prevAt) pending.delete(key);
@@ -1253,15 +1258,20 @@ function repoBlock(a, repo, sessList, now) {
     : "";
   // Prune: sweep this repo's merged worktrees + branches (non-root only). Arms
   // on first click, confirms on the second; a busy spinner until the result lands.
-  const pruning = pending.has(pendKey("prune", a.key, repo.name));
+  // The agent runs the sweep on a worker thread (XERK-256) and reports it as
+  // queued/running with progress, so the spinner is driven by the AGENT's state
+  // as well as the local pending record — a sweep is minutes long on a big repo,
+  // far past PENDING_TTL_MS, and the button must stay busy for all of it.
+  const pruneRes = (a.prunes || []).find(p => p.repo === repo.name);
+  const pruneLive = pruneRes && (pruneRes.status === "running" || pruneRes.status === "queued");
+  const pruning = pruneLive || pending.has(pendKey("prune", a.key, repo.name));
   const pruneArmed = confirming.has("prune::" + a.key + "::" + repo.name);
   const canPrune = a.online && !repo.missing && !repo.isRoot;
   const pruneBtn = canPrune
     ? `<button class="btn-sm ${pruneArmed ? "confirm" : ""}" title="Remove merged branches and worktrees" ${pruning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();pruneRepo('${escJs(a.key)}','${escJs(repo.name)}')">${pruning ? '<span class="spin"></span> Pruning…' : pruneArmed ? "Confirm prune" : "Prune"}</button>`
     : "";
-  const pruneRes = (a.prunes || []).find(p => p.repo === repo.name);
   const pruneNote = pruneRes
-    ? `<div class="prune-note ${pruneRes.status === "error" ? "err" : ""}">${esc(pruneRes.status === "error" ? (pruneRes.error || "prune failed") : pruneRes.summary || "pruned")}</div>`
+    ? `<div class="prune-note ${pruneRes.status === "error" ? "err" : pruneLive ? "run" : ""}">${esc(pruneRes.status === "error" ? (pruneRes.error || "prune failed") : pruneRes.summary || "pruned")}</div>`
     : "";
   const resumePanel = canResume && resumeOpen.has(rkey)
     ? `<div class="resume-list">${(resumable || legacyClosed).map(item => {
