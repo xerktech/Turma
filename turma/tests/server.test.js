@@ -6927,6 +6927,52 @@ test("isPlainHostKey refuses exactly the names the hub cannot address", () => {
   }
 });
 
+test("dropUnusableHostKeys actually REMOVES the keys, in every position", () => {
+  // A source regex over the restore loop proves the call is there, not that it
+  // drops anything: removing the `delete` still printed "dropping …" while
+  // dropping nothing, and `continue`→`break` made survival depend on JSON key
+  // order. Both kept the suite green, so this asserts the mutation instead.
+  const store = {
+    ".": { device: "." }, "truenas": { device: "truenas" },
+    "..": { device: ".." }, "HOST.local.": { device: "HOST.local." },
+    "__proto__x": { device: "__proto__x" }, "...": { device: "..." },
+  };
+  // A bad key FIRST, LAST and in the MIDDLE — an early `break` survives only a
+  // fixture whose refused keys happen to lead.
+  const dropped = hub.dropUnusableHostKeys(store);
+  assert.deepEqual(dropped.sort(), [".", ".."], "both dot keys reported");
+  assert.deepEqual(Object.keys(store).sort(),
+    ["...", "HOST.local.", "__proto__x", "truenas"],
+    "the dot keys are GONE and every ordinary name survived");
+  assert.equal(Object.hasOwn(store, "."), false);
+
+  // Nothing to do is not an error, and reports nothing.
+  const clean = { truenas: {} };
+  assert.deepEqual(hub.dropUnusableHostKeys(clean), []);
+  assert.deepEqual(Object.keys(clean), ["truenas"]);
+
+  // A corrupt state file is not a registry: Object.keys("hello") is ["0".."4"],
+  // which restored a five-"agent" fleet out of a bare JSON string.
+  for (const junk of ["hello", [], null, undefined, 12, true]) {
+    assert.deepEqual(hub.dropUnusableHostKeys(junk), [],
+      `${JSON.stringify(junk)} must be left alone, not iterated`);
+  }
+});
+
+test("a refused device name is truncated before it reaches the log", () => {
+  // `sanitizeHeartbeat` does not cap `device` — only HEARTBEAT_MAX (32 MiB)
+  // does — so logging a refused key raw let two beats write 9 MiB into the hub
+  // log, synchronously, on the request path.
+  const huge = "z".repeat(5 * 1024 * 1024);
+  const line = hub.hostKeyLabel(huge);
+  assert.ok(line.length < 200, `logged ${line.length} chars for a 5 MiB key`);
+  assert.match(line, /\(5242880 chars\)/, "the real length is still reported");
+  // Short keys are logged whole, quoted, so the common case stays readable.
+  assert.equal(hub.hostKeyLabel("."), '"."');
+  assert.equal(hub.hostKeyLabel("__proto__"), '"__proto__"');
+  assert.equal(hub.hostKeyLabel(12), '"12"', "a non-string key still logs safely");
+});
+
 test("the state.json restore coerces too, not just the ingest path", () => {
   // A hub restart is exactly when a new coercion ships, and the restore is the
   // FIRST thing it serves. A record written before it — or belonging to an
@@ -6949,7 +6995,12 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   // the fourth (`sanitizeLiveAgents`) missing from the restore — enumerating is
   // exactly the shape that let the hole exist.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  const loader = src.slice(src.indexOf("agents = JSON.parse"), src.indexOf("first boot or no volume"));
+  // Anchored on the section header rather than a statement, so rewording the
+  // parse doesn't silently slice nothing and pass this whole block vacuously.
+  const loStart = src.indexOf("---- persistence");
+  const loEnd = src.indexOf("first boot or no volume");
+  assert.ok(loStart > -1 && loEnd > loStart, "the loader block must be locatable");
+  const loader = src.slice(loStart, loEnd);
   assert.ok(/normalizeRecord\(a\)/.test(loader),
     "the state.json restore must go through normalizeRecord, like the ingest path");
   const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
@@ -6965,7 +7016,7 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   // guard shipped only at ingest leaves an already-persisted bad key restored
   // verbatim at boot. A dot-segment key is uncommandable AND undeletable, so it
   // would sit there until prune() ages it out days later (XERK-269).
-  assert.ok(/isPlainHostKey\(key\)/.test(loader),
+  assert.ok(/dropUnusableHostKeys\(agents\)/.test(loader),
     "the state.json restore must drop keys the ingest path would refuse");
   assert.ok(/isPlainHostKey\(key\)/.test(ingest),
     "the heartbeat ingest must go through the same key guard");

@@ -371,7 +371,17 @@ const liveClients = {};
 // ---- persistence (best-effort: survives hub restarts so the UI isn't blank
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
-  agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  // Parsed into a LOCAL first: `agents` must not be assigned until the shape is
+  // known good, or a throw below leaves the junk in place — the catch swallows
+  // it, so the hub would then serve a corrupt registry with nothing logged.
+  const loaded = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  // A parsed blob that isn't a plain object is not a registry: `Object.keys` of
+  // a JSON string yields character indices, which restored "5 agents" out of
+  // `"hello"` and then threw deeper in, into that same silent catch.
+  if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
+    throw new Error(`state file is ${Array.isArray(loaded) ? "an array" : typeof loaded}, not an object`);
+  }
+  agents = loaded;
   // Records written before a coercion existed — and any host that is OFFLINE,
   // so no beat will ever rewrite its record — carry whatever shape was current
   // when they were saved. Normalize what we LOAD, not just what arrives: the
@@ -386,10 +396,14 @@ try {
   // undeletable (`DELETE /api/agents/.` is itself one of the routes whose path
   // collapses), so without this it sits there until `prune()` ages it out days
   // later. Dropping it is safe: a live host re-registers on its next beat.
-  for (const key of Object.keys(agents)) {
-    if (isPlainHostKey(key)) continue;
-    console.warn(`dropping restored agent under unusable device name ${JSON.stringify(key)}`);
-    delete agents[key];
+  //
+  // `dropUnusableHostKeys` and `isPlainHostKey` are FUNCTION declarations far
+  // below this line and are reached only because those hoist. Do not convert
+  // either to a `const`: the TDZ ReferenceError would land in this block's
+  // catch, which swallows everything, and the hub would boot with no agents
+  // and no error printed anywhere.
+  for (const key of dropUnusableHostKeys(agents)) {
+    console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(key)}`);
   }
   for (const a of Object.values(agents)) normalizeRecord(a);
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
@@ -1983,6 +1997,43 @@ function isPlainHostKey(key) {
   return typeof key === "string" && key.length > 0 && key.length <= 200 &&
     key !== "__proto__" && key !== "constructor" && key !== "prototype" &&
     key !== "." && key !== "..";
+}
+
+/**
+ * A refused key is attacker-controlled and NOT length-capped on the way in —
+ * `sanitizeHeartbeat` doesn't bound `device`, so only HEARTBEAT_MAX (32 MiB)
+ * does. Logging it raw let two refused beats write 9 MiB into the hub log, a
+ * synchronous write on the request path that blocks every other host's beat
+ * while it runs. Always log a key through this.
+ */
+function hostKeyLabel(key) {
+  const s = typeof key === "string" ? key : String(key);
+  return s.length > 80
+    ? `${JSON.stringify(s.slice(0, 80))}… (${s.length} chars)`
+    : JSON.stringify(s);
+}
+
+/**
+ * Drop every key `isPlainHostKey` refuses, returning the dropped names.
+ *
+ * Extracted from the restore loop so it can be tested directly: a regex over
+ * the loader's source proves the call is THERE, not that it drops anything —
+ * removing the `delete` still logs "dropping …" while dropping nothing, and
+ * `continue`→`break` silently makes survival depend on JSON key order. Both
+ * kept the suite green.
+ *
+ * Non-object input returns empty rather than iterating: `Object.keys("hello")`
+ * is ["0".."4"], which restored a five-"agent" registry out of a corrupt file.
+ */
+function dropUnusableHostKeys(store) {
+  const dropped = [];
+  if (!store || typeof store !== "object" || Array.isArray(store)) return dropped;
+  for (const key of Object.keys(store)) {
+    if (isPlainHostKey(key)) continue;
+    dropped.push(key);
+    delete store[key];
+  }
+  return dropped;
 }
 
 function normalizeRecord(a) {
@@ -3881,7 +3932,7 @@ const server = http.createServer(async (req, res) => {
       // the host simply vanishes from the dashboard. This line is the only
       // place the reason is recoverable.
       if (!isPlainHostKey(key)) {
-        console.warn(`refused heartbeat: device ${JSON.stringify(key)} is not a plain host name`);
+        console.warn(`refused heartbeat: device ${hostKeyLabel(key)} is not a plain host name`);
         return json(res, 400, { error: "device must be a plain host name" });
       }
       const prev = agents[key] || {};
@@ -5760,8 +5811,12 @@ if (process.env.TURMA_TEST) {
     normalizeRecord,
     normalizeLocalModel,
     // The KEY half of that pair, shared by the ingest and the restore for the
-    // same anti-drift reason (XERK-269).
-    isPlainHostKey,
+    // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
+    // because a source-regex over the restore loop proves the CALL exists, not
+    // that it drops anything — two mutations of an inline loop kept the suite
+    // green while restoring the ghost. `hostKeyLabel` because a refused key is
+    // attacker-controlled and unbounded.
+    isPlainHostKey, dropUnusableHostKeys, hostKeyLabel,
     // The holder the heartbeat's coercion step goes through, exported so a test
     // can make it throw and hold the rollback that follows (XERK-262). See its
     // declaration for why that rollback cannot be reached from the wire.
