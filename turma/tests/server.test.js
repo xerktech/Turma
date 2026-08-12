@@ -6930,8 +6930,15 @@ function blankNonCode(src, blankStrings) {
   const pad = (s) => s.replace(/[^\n]/g, " ");   // keep line numbering intact
   for (let i = 0; i < src.length; ) {
     if (src.startsWith('"""', i)) {              // Kotlin raw string
+      let stop = src.length;
       const end = src.indexOf('"""', i + 3);
-      const stop = end === -1 ? src.length : end + 3;
+      if (end !== -1) {
+        // A raw string may END with a quote (`"""ab""""`), so the closer is the
+        // LAST three of the run, not the first: stopping at the first leaves a
+        // stray `"` that opens a phantom string over the rest of the file.
+        stop = end + 3;
+        while (src[stop] === '"') stop++;
+      }
       out += blankStrings ? pad(src.slice(i, stop)) : src.slice(i, stop);
       i = stop;
     } else if (src.startsWith("//", i)) {
@@ -6947,10 +6954,19 @@ function blankNonCode(src, blankStrings) {
     } else if (src[i] === '"' || src[i] === "'" || src[i] === "`") {
       const quote = src[i];
       let j = i + 1;
+      let quoteIsCode = false;
       for (; j < src.length; j++) {
         if (src[j] === "\\") { j++; continue; }  // an escaped quote does not close
         if (src[j] === quote) { j++; break; }
+        // Neither language lets a `'`/`"` literal span a line, so one that does
+        // was never a string — overwhelmingly a quote inside a JS REGEX class
+        // (`/[.,;:!?'"]+$/`, which this repo really contains). Reading it as a
+        // string opens a phantom literal that swallows every comment to the next
+        // matching quote, un-blanking them: the P3 false positive, re-armed by a
+        // one-character edit to any character class.
+        if (src[j] === "\n" && quote !== "`") { quoteIsCode = true; break; }
       }
+      if (quoteIsCode) { out += quote; i++; continue; }
       const lit = src.slice(i, j);
       const closed = lit.length >= 2 && lit.endsWith(quote);
       out += blankStrings
@@ -6978,6 +6994,11 @@ test("turma/Dockerfile copies every local module the hub requires", () => {
   const dir = path.join(__dirname, "..");
   const dockerfile = fs.readFileSync(path.join(dir, "Dockerfile"), "utf8")
     .replace(/^\s*#[^\n]*/gm, "");             // a name in a COMMENT copies nothing
+  // Known bounds, all accepted: a require written INSIDE a string reads as a
+  // real one (the walk needs string contents to read the path out, so it cannot
+  // tell them apart without a parser), and `../`, `require.resolve` and a
+  // computed path stay invisible — two of those are not statically analysable
+  // and the hub uses none of them.
   const local = /require\(\s*['"`]\.\/([\w./-]+)['"`]\s*\)/g;
   const seen = new Set(["server.js"]);
   const queue = ["server.js"];
