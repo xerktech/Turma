@@ -29,6 +29,39 @@ export class HttpError extends Error {
   }
 }
 
+// What a refused hub call reads as: the hub's OWN `{error}` text when it sent
+// one, and the bare status only when it didn't (XERK-270).
+//
+// The hub explains every refusal it makes — "the target agent is in a different
+// org" (409), "the host is offline" (503), the character cap (413), the queue
+// limit (429) — and this client used to throw all of them away as "hub request
+// failed: <status> <path>". On a display this small the message IS the whole
+// feedback, so a status number tells the wearer nothing they can act on.
+//
+// Worded to match the other two clients — `TurmaNav.refusalText` in
+// `turma/public/nav.js` and `hubErrorMessage` in `android/.../net/HubApi.kt` —
+// so the same refusal reads the same on all three.
+export function refusalText(status: number, body: unknown): string {
+  const said = (body as { error?: unknown } | null)?.error;
+  const words = typeof said === "string" ? said.trim() : "";
+  return words || `the hub answered HTTP ${status}`;
+}
+
+/** The same reading for a response whose body hasn't been consumed yet. */
+export async function refusal(res: Response): Promise<HttpError> {
+  // The body may be empty, HTML from an edge, or unreadable on a torn socket —
+  // and on a polyfilled Response `json` may not even be a function. Any of
+  // those means "the hub sent no words", never a failure of its own, so the
+  // try/catch has to cover a SYNCHRONOUS throw as well as a rejection.
+  let body: unknown = {};
+  try {
+    body = await res.json();
+  } catch {
+    body = {};
+  }
+  return new HttpError(res.status, refusalText(res.status, body));
+}
+
 export interface HubClientOptions {
   config: Config;
   fetchFn?: typeof fetch;
@@ -71,8 +104,9 @@ export function timeoutFetch(
 
 // Typed REST client for the hub API (`turma/server.js`). Every method
 // sends the Basic auth header, JSON in/out; every non-2xx response throws an
-// HttpError carrying its status — except getHistory's 202 ("still fetching"),
-// which is a normal, non-throwing return per the brief's 202-pending pattern.
+// HttpError carrying its status AND the hub's own `{error}` words (see
+// `refusal`) — except getHistory's 202 ("still fetching"), which is a normal,
+// non-throwing return per the brief's 202-pending pattern.
 export class HubClient {
   private readonly config: Config;
   private readonly fetchFn: typeof fetch;
@@ -128,9 +162,7 @@ export class HubClient {
       ...init,
       headers: { ...this.headers(), ...(init.headers as Record<string, string> | undefined) },
     });
-    if (!res.ok) {
-      throw new HttpError(res.status, `hub request failed: ${res.status} ${path}`);
-    }
+    if (!res.ok) throw await refusal(res);
     return (await res.json()) as T;
   }
 
@@ -206,9 +238,7 @@ export class HubClient {
   ): Promise<{ status: 200; body: HistoryResponse } | { status: 202; body: HistoryPending }> {
     const path = `/api/agents/${encodeURIComponent(host)}/sessions/${encodeURIComponent(id)}/history`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    if (!res.ok) {
-      throw new HttpError(res.status, `hub request failed: ${res.status} ${path}`);
-    }
+    if (!res.ok) throw await refusal(res);
     const body = await res.json();
     if (res.status === 202) return { status: 202, body: body as HistoryPending };
     return { status: 200, body: body as HistoryResponse };
@@ -228,7 +258,7 @@ export class HubClient {
   ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: { pending: true; cmdId: string } }> {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    if (!res.ok) throw new HttpError(res.status, `hub request failed: ${res.status} ${path}`);
+    if (!res.ok) throw await refusal(res);
     const body = await res.json();
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
@@ -285,7 +315,7 @@ export class HubClient {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/create-meta${q}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok && res.status !== 202) throw new HttpError(res.status, (body as { error?: string }).error || `HTTP ${res.status}`);
+    if (!res.ok && res.status !== 202) throw new HttpError(res.status, refusalText(res.status, body));
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
   createTicket(siteKey: string, body: { project: string; issueType: string; summary: string; description?: string; labels?: string[] }): Promise<QueuedResponse> {
@@ -302,7 +332,7 @@ export class HubClient {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/tickets/${encodeURIComponent(cmdId)}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok && res.status !== 202) throw new HttpError(res.status, (body as { error?: string }).error || `HTTP ${res.status}`);
+    if (!res.ok && res.status !== 202) throw new HttpError(res.status, refusalText(res.status, body));
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
 

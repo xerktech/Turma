@@ -195,6 +195,74 @@ describe("HubClient", () => {
     await expect(client.sessionAction("badhost", "s1", "kill")).rejects.toThrow();
   });
 
+  // XERK-270: the hub explains every refusal it makes, and this client used to
+  // throw all of them away as "hub request failed: <status> <path>" — on a
+  // display this small the message IS the whole feedback.
+  it("puts the hub's own {error} text on the thrown HttpError", async () => {
+    const fetchFn = fakeFetch({ error: "too many queued commands for that host" }, 429);
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.sendInput("h1", "s1", "hello")).rejects.toMatchObject({
+      status: 429,
+      message: "too many queued commands for that host",
+    });
+  });
+
+  it("falls back to the status when the hub sent no {error}, worded like the other clients", async () => {
+    const client = new HubClient({ config, fetchFn: fakeFetch({}, 503) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({
+      status: 503,
+      message: "the hub answered HTTP 503",
+    });
+  });
+
+  it("falls back to the status when the body is unreadable rather than failing on it", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: false,
+      status: 502,
+      json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+    })) as unknown as typeof fetch;
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.sessionAction("h1", "s1", "kill")).rejects.toMatchObject({
+      status: 502,
+      message: "the hub answered HTTP 502",
+    });
+  });
+
+  it("reads the hub's words on getHistory and jiraDetail too, not just request()", async () => {
+    const refused = { error: "that agent is in a different org" };
+    const history = new HubClient({ config, fetchFn: fakeFetch(refused, 409) });
+    await expect(history.getHistory("h1", "s1")).rejects.toMatchObject({
+      status: 409,
+      message: "that agent is in a different org",
+    });
+
+    const jira = new HubClient({ config, fetchFn: fakeFetch(refused, 409) });
+    await expect(jira.jiraDetail("site", "XERK-1")).rejects.toMatchObject({
+      status: 409,
+      message: "that agent is in a different org",
+    });
+  });
+
+  it("createMeta/createResult share that wording and still pass a 202 through", async () => {
+    const meta = new HubClient({ config, fetchFn: fakeFetch({}, 500) });
+    await expect(meta.createMeta("site")).rejects.toMatchObject({
+      status: 500,
+      message: "the hub answered HTTP 500",
+    });
+
+    const result = new HubClient({ config, fetchFn: fakeFetch({ error: "no such command" }, 404) });
+    await expect(result.createResult("site", "cmd1")).rejects.toMatchObject({
+      status: 404,
+      message: "no such command",
+    });
+
+    const pending = new HubClient({ config, fetchFn: fakeFetch({ pending: true }, 202) });
+    await expect(pending.createMeta("site")).resolves.toEqual({ status: 202, body: { pending: true } });
+  });
+
   it("defaults fetchFn to globalThis.fetch when not injected", () => {
     const client = new HubClient({ config });
     expect(client).toBeInstanceOf(HubClient);

@@ -258,7 +258,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
     pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
     a refusal, and folding them together burned 60s and then said nothing.
-  - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+  - Glasses + veiller's fork (XERK-270): `hub-client.ts`'s `refusal()` reads the body BEFORE it
+    throws, so the `HttpError` carries the hub's words — and `app.ts`'s `failureFlash` is what puts
+    them on the display. Both halves or neither: the client throwing good text is invisible while
+    every `.catch` flashes a flat "hub unreachable", which is also wrong (the hub answered, it said
+    no). `FLASH_HUB_UNREACHABLE` is now only for a failure with **no status** — a dead socket or the
+    fetch timeout. A one-line header clips a long refusal with "…" (`headerLine`); the session
+    screen wraps it whole.
+  - All three fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
 - **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
   agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
   the tunnel's `?name=` — and each agent runs on its OWN token,

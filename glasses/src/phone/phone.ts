@@ -581,9 +581,15 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     if (box) { box.textContent = ""; box.hidden = true; }
   }
   function sendFailed(text: string, err: unknown): void {
-    const status = (err as { status?: number } | null)?.status;
+    const e = err as { status?: number; message?: string } | null;
+    const status = e?.status;
+    // The hub's own words first (XERK-270) — its 413 names the actual character
+    // count and cap, which beats any wording invented here. The hand-written
+    // lines stay as the fallback for a refusal it sent no body with.
+    const said = typeof status === "number" && e?.message ? e.message : "";
     showSendError(
-      status === 413 ? "Too long — shorten the message and try again"
+      said ? `Send failed — ${said}`
+        : status === 413 ? "Too long — shorten the message and try again"
         : status === 401 ? "Not authorised — check the hub login"
         : status ? `Send failed (${status})`
         : "Send failed — hub unreachable",
