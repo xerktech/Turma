@@ -1141,6 +1141,22 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.ADO_WRAPPER_URL])
 
+    def test_an_on_prem_collection_over_plain_http_still_chips(self):
+        """A self-hosted collection on the LAN is routinely served over http,
+        and a scheme-only mismatch would drop the chip in silence."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        url = "http://tfs.corp.local:8080/tfs/DefaultCollection/Dev/_git/App/pullrequest/7"
+        write_jsonl(path, [
+            self.pr_create_call("h1", cmd="ado pr-create --title x"),
+            self.tool_result("h1", f"Created PR !7:\n  {url}"),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [url])
+
     def test_a_wrapper_that_only_lists_prs_is_not_a_create(self):
         """`ado pr-list` prints every open PR's link — the exact loose text the
         narrow rule exists to keep off this session's card."""
@@ -6723,6 +6739,26 @@ class TestPrCreatePattern(unittest.TestCase):
                     "az repos pr create", "git push -o merge_request.create"):
             self.assertTrue(rx.search(cmd), cmd)
 
+    def test_the_wrapper_run_through_its_interpreter_still_counts(self):
+        """The on-prem wrapper is a script, and a host that loses it from PATH
+        runs it by path — the same PR, opened the same way."""
+        rx = self._re()
+        for cmd in ("ado.py pr-create --title x",
+                    "python3 /home/u/git/ado/ado.py pr-create --title x",
+                    "python3 ado.py pr-create",
+                    "~/.local/bin/ado pr-create --title x",
+                    "./ado.py pr-create"):
+            self.assertTrue(rx.search(cmd), cmd)
+        self.assertIsNone(rx.search("cat ado.py"))
+        self.assertIsNone(rx.search("vim ado.py pr-create.md"))
+
+    def test_a_built_in_is_anchored_against_a_hyphen_too(self):
+        """`\\b` treats `-` as a boundary, so an unanchored built-in matches the
+        tail of a different command."""
+        rx = self._re()
+        for cmd in ("run-ado pr-create", "my-gh pr create", "x-az repos pr create"):
+            self.assertIsNone(rx.search(cmd), cmd)
+
     def test_a_registered_wrapper_matches(self):
         rx = self._re("mkpr, tfs pr new")
         self.assertTrue(rx.search("mkpr --title x"))
@@ -6752,6 +6788,16 @@ class TestPrCreatePattern(unittest.TestCase):
         for extra in ("", "   ", ",,", " , ,"):
             self.assertEqual(ha._pr_create_pattern(extra),
                              ha._pr_create_pattern(), extra)
+
+    def test_a_too_short_entry_is_ignored(self):
+        """Attribution must not fail OPEN: a one- or two-character token makes
+        half the commands a session runs read as "opened a PR"."""
+        for extra in ("a", "x,pr", " a "):
+            self.assertEqual(ha._pr_create_pattern(extra),
+                             ha._pr_create_pattern(), extra)
+        self.assertIsNone(self._re("a").search("ls -a /tmp"))
+        # …but a real short wrapper name still registers.
+        self.assertTrue(self._re("prc").search("prc --title x"))
 
 
 class TestAzdoCreatedPrUrl(unittest.TestCase):

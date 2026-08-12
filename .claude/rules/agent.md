@@ -268,9 +268,16 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   pending tool_use ids carry across (capped); the scan parses whole lines.
   - **An on-prem Azure DevOps Server host has no vendor CLI to name here** — the `azure-devops` az
     extension refuses a self-hosted collection outright, so those hosts open PRs with a local REST
-    wrapper. `ado pr-create` is built in; **`TURMA_PR_CREATE_CMDS`** (CSV of command prefixes)
-    registers any other, so a host isn't chipless because its tool isn't a vendor's
-    (`_pr_create_pattern`, entries escaped and anchored — never a pattern).
+    wrapper. `ado pr-create` **and `ado.py pr-create`** are built in (a host that loses the wrapper
+    from PATH runs it as `python3 …/ado.py`, the same PR opened the same way);
+    **`TURMA_PR_CREATE_CMDS`** (CSV of command prefixes) registers any other, so a host isn't
+    chipless because its tool isn't a vendor's.
+  - `_pr_create_pattern` treats every command — built-in and configured alike — as literal escaped
+    words, anchored against `-` (and `.` trailing) so one can't match the tail of `run-mkpr` or a
+    `pr-create.md` filename. An entry under `PR_CREATE_CMD_MIN` chars is **ignored**: attribution
+    must not fail OPEN, and a 1–2 char token matches half the commands a session runs.
+  - The ADO URL regexes take **http as well as https** — an on-prem collection is routinely served
+    over plain http on the LAN, and a scheme-only mismatch drops the chip in silence.
   - Cost: a PR opened another way (subagent, MCP tool, web UI) gets no chip. **Widen only by
     teaching `_scan_pr_line` another creation event, never by scanning loose text.**
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: `pr_status`/`_pr_comment_events`

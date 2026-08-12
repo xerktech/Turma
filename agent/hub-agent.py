@@ -2004,8 +2004,11 @@ MR_URL_RE = re.compile(r"https://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/
 # `git push` hint ends in `/pullrequestcreate?sourceRef=…` — a link to the
 # CREATE form, which the `/<digits>` deliberately doesn't match, exactly as
 # GitLab's `/merge_requests/new` doesn't.
+# http as well as https: an on-prem collection is routinely served over plain
+# http on the LAN, and a scheme-only mismatch would drop the chip in silence on
+# exactly the deployment this half exists for.
 AZDO_PR_URL_RE = re.compile(
-    r"https://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
+    r"https?://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
     re.IGNORECASE)
 # The pull-request id inside such a URL, for the places that need the number
 # without re-deciding whether the URL is ours.
@@ -2026,26 +2029,52 @@ AZDO_PR_URL_ID_RE = re.compile(r"/pullrequest/(\d+)", re.IGNORECASE)
 # whose PRs are opened by its own tool still gets chips.
 PR_CREATE_CMDS = os.environ.get("TURMA_PR_CREATE_CMDS", "")
 
+# A registered entry shorter than this is ignored: a one- or two-character
+# token matches half the commands a session runs, and attribution failing OPEN
+# hangs other people's PRs on this session's card.
+PR_CREATE_CMD_MIN = 3
+
+# The built-in creating commands, as (word, ...) prefixes. A wrapper is named
+# with and without the `.py` its script carries, because a host that loses it
+# from PATH runs it as `python3 .../ado.py pr-create` — the same PR, opened the
+# same way, and silently unchipped if only the bare name were known.
+PR_CREATE_BUILTINS = (
+    ("gh", "pr", "create"),
+    ("glab", "mr", "create"),
+    ("az", "repos", "pr", "create"),
+    ("ado", "pr-create"),
+    ("ado.py", "pr-create"),
+)
+
+
+def _pr_create_alt(words):
+    """One alternative matching `words` as a whole command: every word escaped
+    and matched literally, the run anchored so it can only be a whole command.
+
+    The anchors exclude `-` as well as word characters, so this can't match the
+    tail of `run-mkpr` or the head of `mkpr-old`; the trailing one excludes `.`
+    too, so `ado.py pr-create.md` is a filename, not a create. The leading one
+    deliberately does NOT, since a path-qualified `./mkpr` or
+    `~/.local/bin/ado` is the same command."""
+    return (r"(?<![\w-])" + r"\s+".join(re.escape(w) for w in words)
+            + r"(?![\w.-])")
+
 
 def _pr_create_pattern(extra=""):
     """The PR_CREATE_RE source: the built-in creating commands, plus one
     alternative per comma-separated entry in `extra`.
 
-    Each entry is a whitespace-separated command prefix (`mkpr`, `tfs pr new`),
-    matched literally — every word is escaped and the run is anchored so it can
-    only match a whole command, never a substring of a longer one. The anchor
-    excludes `-` as well as word characters, so a short entry can't match the
-    tail of `run-mkpr`, while a path-qualified `./mkpr` still does. Nothing
-    free-form reaches the regex engine, and a malformed entry widens nothing."""
-    pats = [r"\bgh\s+pr\s+create\b", r"\bglab\s+mr\s+create\b",
-            r"\bmerge_request\.create\b", r"\baz\s+repos\s+pr\s+create\b",
-            r"\bado\s+pr-create\b"]
+    Each entry is a whitespace-separated command prefix (`mkpr`, `tfs pr new`)
+    and goes through the same literal, anchored treatment as a built-in, so
+    nothing free-form reaches the regex engine. An entry that is blank or
+    shorter than PR_CREATE_CMD_MIN widens nothing."""
+    pats = [_pr_create_alt(w) for w in PR_CREATE_BUILTINS]
+    pats.append(r"\bmerge_request\.create\b")   # a push OPTION, not a command
     for entry in (extra or "").split(","):
         words = entry.split()
-        if not words:
+        if not words or len(" ".join(words)) < PR_CREATE_CMD_MIN:
             continue
-        pats.append(r"(?<![\w-])" + r"\s+".join(re.escape(w) for w in words)
-                    + r"(?![\w-])")
+        pats.append(_pr_create_alt(words))
     return "|".join(pats)
 
 
@@ -3374,7 +3403,7 @@ def _scan_pr_line(raw, state, report):
 # PR's browser link is built on. Anchored whole so nothing but a repo root is
 # ever extended into a PR link.
 AZDO_REPO_WEB_RE = re.compile(
-    r"^https://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
+    r"^https?://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
 # `{` probes tried when looking for a JSON object in a tool result. The az
 # output starts with one, so a real create hits on the first; the cap keeps a
 # result that is merely full of braces from costing a re-parse per brace.
