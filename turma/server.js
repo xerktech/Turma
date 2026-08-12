@@ -158,6 +158,14 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// What EVERY host's history caches may hold together, in bytes. The count cap
+// above cannot see size, so 8 sessions x tens of MiB x N hosts sailed past it and
+// OOM-killed the hub with each individual limit respected. Derived from the
+// container like the other ceilings, because a flat number here is the same
+// mistake in a different constant (XERK-258).
+const HISTORY_TOTAL_MAX_BYTES =
+  Number(process.env.HISTORY_TOTAL_MAX_BYTES) ||
+  (HUB_MEM_LIMIT ? Math.floor(HUB_MEM_LIMIT / 8) : 64 << 20);
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -298,7 +306,7 @@ function sweepUploads(now = Date.now()) {
 function uploadCapFor(agent) {
   const reported = Number(agent && agent.uploadMaxBytes);
   if (!Number.isFinite(reported) || reported <= 0) return 0;
-  return Math.min(reported, UPLOAD_MAX_BYTES);
+  return Math.min(reported, effectiveCap(UPLOAD_MAX_BYTES));
 }
 // Board ticket detail (description + comments), fetched on demand from the host
 // that owns the org's Jira creds. Cached briefly so reopening a ticket, or two
@@ -1175,7 +1183,8 @@ function ingestHistory(agent, historyResults) {
   for (const r of historyResults || []) {
     if (!r || !r.sessionId) continue;
     agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated,
-      queued: Array.isArray(r.queued) ? r.queued : [], fetchedAt: now };
+      queued: Array.isArray(r.queued) ? r.queued : [], fetchedAt: now,
+      bytes: cacheEntryBytes(r.entries) };
   }
   for (const [sessionId, h] of Object.entries(agent.history)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.history[sessionId];
@@ -1186,6 +1195,51 @@ function ingestHistory(agent, historyResults) {
       .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
       .slice(0, over)
       .forEach(([sessionId]) => delete agent.history[sessionId]);
+  }
+  sweepHistoryBytes();
+}
+
+// The serialized size of one cached delivery, measured ONCE at ingest so the
+// sweep below can add up what the caches hold without re-stringifying megabytes
+// every beat. Unserializable counts as huge — it cannot be sent on anyway.
+function cacheEntryBytes(entries) {
+  try {
+    return JSON.stringify(entries ?? null).length;
+  } catch {
+    return Infinity;
+  }
+}
+
+// The on-demand history caches hold whatever the agent delivered, VERBATIM. They
+// are counted by nothing else: `AGENT_CACHE_KEYS` strips them before
+// `AGENT_RECORD_MAX` measures a record, and `retainedBytes` deliberately leaves
+// them out (they must not gate a lone body's escape — see bodyBudget). That left
+// them invisible to every ceiling, and seven sequential 25 MiB deliveries from ONE
+// authorized host — each answered 200, no concurrency at all — OOM-killed the hub
+// at the deployed limit. Bounded here in BYTES, fleet-wide, oldest first: the
+// count and age caps above cannot see size, and 8 sessions x tens of MiB is over
+// any container this runs in (XERK-258).
+function sweepHistoryBytes() {
+  const held = [];
+  let total = 0;
+  for (const a of Object.values(agents)) {
+    for (const [key, h] of Object.entries(a.history || {})) {
+      const bytes = Number(h.bytes) || 0;
+      total += bytes;
+      held.push({ cache: a.history, key, bytes, at: h.fetchedAt || 0 });
+    }
+    for (const [key, h] of Object.entries(a.subagentHistory || {})) {
+      const bytes = Number(h.bytes) || 0;
+      total += bytes;
+      held.push({ cache: a.subagentHistory, key, bytes, at: h.fetchedAt || 0 });
+    }
+  }
+  if (total <= HISTORY_TOTAL_MAX_BYTES) return;
+  held.sort((x, y) => x.at - y.at); // oldest delivery evicted first
+  for (const h of held) {
+    if (total <= HISTORY_TOTAL_MAX_BYTES) break;
+    delete h.cache[h.key];
+    total -= h.bytes;
   }
 }
 
@@ -1204,7 +1258,8 @@ function ingestSubagentHistory(agent, results) {
   for (const r of results || []) {
     if (!r || !r.sessionId) continue;
     agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label)] =
-      { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+      { entries: r.entries, truncated: r.truncated, fetchedAt: now,
+        bytes: cacheEntryBytes(r.entries) };
   }
   for (const [k, h] of Object.entries(agent.subagentHistory)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.subagentHistory[k];
@@ -1216,6 +1271,7 @@ function ingestSubagentHistory(agent, results) {
       .slice(0, over)
       .forEach(([k]) => delete agent.subagentHistory[k]);
   }
+  sweepHistoryBytes(); // the byte bound is fleet-wide — see ingestHistory
 }
 
 // Merge the agent's on-demand Jira issue deliveries (heartbeat
@@ -1724,6 +1780,19 @@ const BODY_MAX = 1 << 20; // 1 MiB
 // nothing logged (XERK-235).
 const HEARTBEAT_MAX = 32 << 20; // 32 MiB
 
+// What the hub will ACTUALLY take, and the number it advertises. HEARTBEAT_MAX is
+// the documented ceiling for a legitimate delivery (~5 MiB at the full block caps);
+// this is what the container can afford to PARSE. A body costs ~5x its own size as
+// a string plus an object graph, and V8 sizes its heap from the cgroup limit — so
+// it will happily grow into the container and let the kernel decide. Eight
+// sequential 25 MiB deliveries, each individually legal under HEARTBEAT_MAX and
+// each answered 200, pegged a 256 MiB container at its ceiling; at a sixteenth
+// they are refused before a byte is parsed, and the agent sheds to fit instead
+// (XERK-258). Never widen this back to a flat constant.
+const HEARTBEAT_ACCEPT_MAX_RAW = HUB_MEM_LIMIT
+  ? Math.min(HEARTBEAT_MAX, Math.max(8 << 20, Math.floor(HUB_MEM_LIMIT / 16)))
+  : HEARTBEAT_MAX;
+
 // ---- the fleet-wide in-flight body budget (XERK-258) ------------------------
 // HEARTBEAT_MAX bounds ONE body and says nothing about how many arrive at once,
 // so two beats each legal under it exceeded the whole container together and the
@@ -2113,10 +2182,25 @@ function readBody(req, cap = BODY_MAX) {
   });
 }
 
-// How far past a refusal the CALM case keeps reading and discarding before it
-// gives up on being heard and cuts the socket. Only reached when nothing else is
-// in flight, so this is one body's worth of churn, never a flood's.
-const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
+/**
+ * The largest body a route can ACTUALLY accept, which is not always its own cap.
+ *
+ * A lone read escapes the concurrency ceilings only while `retained + charged`
+ * fits BODY_INFLIGHT_ESCAPE_MAX, so on a small container a route whose cap
+ * exceeds that ceiling advertises and enforces a size it will then always refuse
+ * — and refuse with 503, "retry", for a condition that is permanent. Measured at
+ * `-m 32m`: the hub advertised 32 MiB and 503'd a 20 MiB beat forever, with zero
+ * bytes held. Every cap a client is told, and every cap a read is bounded by,
+ * goes through here.
+ */
+function effectiveCap(cap) {
+  return Math.min(cap, BODY_INFLIGHT_ESCAPE_MAX + BODY_INFLIGHT_FREE);
+}
+
+/** The heartbeat body cap: what the container can parse, and admissible with it. */
+function heartbeatAcceptMax() {
+  return effectiveCap(HEARTBEAT_ACCEPT_MAX_RAW);
+}
 
 /**
  * A body whose OWN DECLARED LENGTH is already past the route cap, refused before
@@ -2126,14 +2210,15 @@ const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
  * when the truth is 413, "this will never fit": the budget bites after a couple
  * of megabytes while the cap is only crossed at thirty, so the wrong answer
  * arrives first and an agent that believes it retries forever. Content-Length is
- * safe for this the same way pausing is: it picks a STATUS, never
- * an allocation or a reservation, so a client that lies only mislabels its own
- * refusal (and the real cap check still runs over the bytes that arrive).
+ * safe for this: it picks a STATUS, never an allocation or a reservation, so a
+ * client that lies only mislabels its own refusal (and the real cap check still
+ * runs over the bytes that actually arrive).
  */
 function declaredOverCap(req, cap) {
   const declared = Number(req.headers["content-length"]);
   return Number.isFinite(declared) && declared > cap;
 }
+
 
 /**
  * What a REFUSED read does with the bytes still coming.
@@ -2257,9 +2342,16 @@ function refuse(res, code, obj) {
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
+  // A route that answers WITHOUT reading the request body (a 404 or 409 ahead of
+  // readBody) leaves node no choice but to destroy the socket once the reply is
+  // out — but the reply says `keep-alive`, so the client pools a doomed socket and
+  // its NEXT request dies with ECONNRESET. Ask for the close whenever the body has
+  // not been consumed; `refuse()` already does this for its own paths.
+  const unread = res.req && !res.req.complete;
   res.writeHead(code, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
+    ...(unread ? { Connection: "close" } : {}),
   });
   res.end(body);
 }
@@ -3843,7 +3935,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
-      const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX)) || "{}");
+      const raw = JSON.parse((await readBody(req, heartbeatAcceptMax())) || "{}");
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
@@ -4006,7 +4098,7 @@ const server = http.createServer(async (req, res) => {
       // capability flags on this wire, and absent means "can't tell you".
       return json(res, 200, {
         commands: reply,
-        heartbeatMaxBytes: HEARTBEAT_MAX,
+        heartbeatMaxBytes: heartbeatAcceptMax(),
         ...(archiveHave ? { archiveHave } : {}),
       });
     }
@@ -4073,7 +4165,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 409, { error: "migration not awaiting a bundle" });
       let blob;
       try {
-        blob = await readRawBody(req, MIGRATE_BLOB_MAX);
+        blob = await readRawBody(req, effectiveCap(MIGRATE_BLOB_MAX));
       } catch (e) {
         // The agent's upload is fire-and-forget (it logs a failure and moves on),
         // so a refused bundle FAILS the migration either way — leaving it
@@ -5626,6 +5718,8 @@ if (process.env.TURMA_TEST) {
     // show up as a hub that has stopped taking heartbeats.
     detectMemoryLimit, HUB_MEM_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_FREE,
     BODY_INFLIGHT_TOTAL_MAX, BODY_INFLIGHT_ESCAPE_MAX, retainedBytes, HEARTBEAT_MAX,
+    effectiveCap, heartbeatAcceptMax, ingestHistory, sweepHistoryBytes,
+    HISTORY_TOTAL_MAX_BYTES,
     UPLOAD_MAX_BYTES, UPLOAD_TOTAL_MAX_BYTES,
     inFlightBodyBytes: () => inFlightBodyBytes,
     inFlightTotalBytes: () => inFlightTotalBytes,
@@ -5712,11 +5806,11 @@ if (process.env.TURMA_TEST) {
     //   raw byte bodies ~2x (the chunk list, then Buffer.concat of it)
     // Understating this is how the first version of this warning stayed silent at
     // the deployed limit while a lone bundle could still take the hub out.
-    const worstString = HEARTBEAT_MAX * 5;
+    const worstString = heartbeatAcceptMax() * 5;
     const worstRaw = Math.max(MIGRATE_BLOB_MAX, UPLOAD_MAX_BYTES) * 2;
     const worst = Math.max(worstString, worstRaw) + (32 << 20); // + the hub's own footprint
     console.log(
-      `largest single body: ${mib(HEARTBEAT_MAX)} json / ` +
+      `largest single body: ${mib(heartbeatAcceptMax())} json / ` +
         `${mib(Math.max(MIGRATE_BLOB_MAX, UPLOAD_MAX_BYTES))} raw ` +
         `(admitted even over the ceilings; ~${mib(worst)} peak to hold)`
     );

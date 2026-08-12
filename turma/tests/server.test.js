@@ -1735,6 +1735,64 @@ test("http: an ordinary beat is never refused because a big one is in flight", a
   );
 });
 
+test("the history caches are bounded in BYTES, fleet-wide (XERK-258)", () => {
+  // They hold whatever the agent delivered, verbatim, and NOTHING else counts
+  // them: AGENT_CACHE_KEYS strips them before AGENT_RECORD_MAX measures a record,
+  // and retainedBytes leaves them out on purpose. Seven sequential 25 MiB
+  // deliveries from ONE host — each answered 200, no concurrency — OOM-killed the
+  // hub with every individual limit respected. The count cap cannot see size.
+  const mod = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(256 << 20);
+    env.HISTORY_TOTAL_MAX_BYTES = String(4 << 20); // 4 MiB, to keep the test small
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+  });
+  const host = { history: {}, subagentHistory: {} };
+  mod.agents.byteHost = host;
+  try {
+    const big = (n) => [{ uuid: `u${n}`, role: "user", text: "x".repeat(1 << 20) }];
+    // Six deliveries of ~1 MiB each, well inside HISTORY_MAX_SESSIONS...
+    for (let i = 0; i < 6; i++) {
+      mod.ingestHistory(host, [{ sessionId: `s${i}`, entries: big(i) }]);
+    }
+    const held = Object.values(host.history).reduce((n, h) => n + h.bytes, 0);
+    assert.ok(held <= (4 << 20), `history caches must stay under the byte ceiling (held ${held})`);
+    assert.ok(Object.keys(host.history).length < 6, "the oldest deliveries were evicted");
+    // The NEWEST delivery must survive — evicting what an operator just opened
+    // would make the feature useless under pressure.
+    assert.ok(host.history.s5, "the newest delivery is kept");
+  } finally {
+    delete mod.agents.byteHost;
+  }
+});
+
+test("http: the advertised cap is the cap the hub can actually accept (XERK-258)", () => {
+  // A lone body escapes the ceilings only while it fits BODY_INFLIGHT_ESCAPE_MAX,
+  // so on a small container a route whose cap exceeds that would advertise — and
+  // enforce — a size it then always refuses, with 503 ("retry") for a permanently
+  // impossible request. Measured at -m 32m: 32 MiB advertised, a 20 MiB beat 503'd
+  // forever with zero bytes held.
+  const tiny = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(32 << 20);
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+    delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
+  });
+  assert.ok(
+    tiny.effectiveCap(tiny.HEARTBEAT_MAX) <= tiny.BODY_INFLIGHT_ESCAPE_MAX + tiny.BODY_INFLIGHT_FREE,
+    "what is advertised must be admissible"
+  );
+  assert.ok(tiny.effectiveCap(tiny.HEARTBEAT_MAX) < tiny.HEARTBEAT_MAX, "and smaller than the constant here");
+  // At the deployed limit the escape ceiling is generous, so the cap is unchanged.
+  const deployed = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(256 << 20);
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+    delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
+  });
+  assert.equal(deployed.effectiveCap(deployed.HEARTBEAT_MAX), deployed.HEARTBEAT_MAX);
+});
+
 test("http: every beat reply advertises the body cap, so the agent sheds before posting", async () => {
   // The 413 cannot be relied on to ARRIVE — the hub answers mid-upload, node tears
   // the socket down at that point, and the agent's urllib writes its whole body

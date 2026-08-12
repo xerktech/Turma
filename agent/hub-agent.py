@@ -76,6 +76,13 @@ from html.parser import HTMLParser
 _poke = threading.Event()
 
 TURMA_URL = os.environ.get("TURMA_URL", "http://turma:8300")
+# The largest `heartbeatMaxBytes` the agent will believe from a hub reply
+# (XERK-258). A cap is only useful as a pre-flight bound, so a value bigger than
+# any conceivable beat is indistinguishable from having no cap at all — and
+# accepting one silently disables the shed that keeps an oversized beat off the
+# wire. Comfortably above the hub's own 32 MiB ceiling.
+HEARTBEAT_CAP_SANE_MAX = 1 << 30  # 1 GiB
+
 # Bearer token for the hub's /api/heartbeat (the UI itself sits behind basic
 # auth; this lets agents report without those user credentials). Must match
 # the hub's TURMA_AGENT_TOKEN.
@@ -14362,24 +14369,41 @@ class SessionManager:
     # sheds them in this order (see post): the first tier is what actually makes a
     # beat multi-megabyte, and shedding the small caches with it would throw away
     # a create/status outcome the UI is polling for, for no size gain.
+    # (attribute, payload key) for each staged on-demand deliverable, grouped into
+    # shed tiers — biggest first. A 413 (or a pre-flight over-cap) sheds ONE tier:
+    # the first is what actually makes a beat multi-megabyte, and taking the small
+    # caches with it would throw away a create/status outcome the UI is polling for,
+    # for no size gain.
     SHED_TIERS = (
-        ("history_results", "subagent_history_results"),
-        ("jira_issue_results", "ticket_status_results",
-         "create_meta_results", "create_ticket_results"),
+        (("history_results", "historyResults"),
+         ("subagent_history_results", "subagentHistoryResults")),
+        (("jira_issue_results", "jiraIssueResults"),
+         ("ticket_status_results", "ticketStatusResults"),
+         ("create_meta_results", "createMetaResults"),
+         ("create_ticket_results", "createTicketResults")),
     )
 
-    def _shed_staged_results(self):
-        """Drop staged on-demand results after the hub refused a beat as too
-        large, and describe what went. One tier per call, so a beat that is still
-        too big keeps shrinking beat by beat instead of losing everything at
-        once."""
+    def _shed_staged_results(self, payload=None):
+        """Drop ONE tier of staged on-demand results and describe what went, or
+        None when there was nothing left to drop.
+
+        **Sheds from the payload and the staging list together.** Clearing a list
+        whose results are still in the payload (or vice versa) silently destroys a
+        deliverable that was never sent, and the hub reads a missing result as a
+        MISSING CAPABILITY: `resolveResultWaits` marks the command kind
+        `unsupported`, and every board write to that host is then refused with "your
+        agent is too old" for `UNSUPPORTED_TTL_MS` — half an hour of refusals
+        earned by a beat that was merely too big."""
         for tier in self.SHED_TIERS:
-            shed = [f"{name}={len(getattr(self, name))}"
-                    for name in tier if getattr(self, name)]
-            if shed:
-                for name in tier:
-                    getattr(self, name).clear()
-                return ", ".join(shed)
+            shed = [f"{attr}={len(getattr(self, attr))}"
+                    for attr, _ in tier if getattr(self, attr)]
+            if not shed:
+                continue
+            for attr, key in tier:
+                getattr(self, attr).clear()
+                if payload is not None:
+                    payload.pop(key, None)
+            return ", ".join(shed)
         return None
 
     def _fit_to_hub_cap(self, payload):
@@ -14399,16 +14423,22 @@ class SessionManager:
         if not cap or len(body) <= cap:
             return body
         while len(body) > cap:
-            shed = self._shed_staged_results()
+            # Sheds ONE tier, from the payload and the staging list together — see
+            # _shed_staged_results for why splitting those two costs the operator
+            # half an hour of refused board writes.
+            shed = self._shed_staged_results(payload)
             if not shed:
+                # The base payload alone is over the cap, so there is nothing left
+                # to trade away. It still goes out: the hub must hear from this host
+                # or the host reads as offline. Deliberately NOT promising that the
+                # hub will explain itself — an over-cap body is refused mid-upload
+                # and reaches us as a broken pipe, so this beat is simply lost and
+                # the next one will be too until the payload itself shrinks.
                 log(f"heartbeat is {len(body)} bytes, over the hub's {cap} cap, with nothing "
-                    f"left to shed — posting anyway so the hub can say why")
+                    f"left to shed — sending it anyway, but expect it to be refused")
                 return body
             log(f"heartbeat would be {len(body)} bytes, over the hub's {cap} cap — "
                 f"dropped staged {shed} before sending; re-open the view to fetch them again")
-            for name in ("historyResults", "subagentHistoryResults", "jiraIssueResults",
-                         "ticketStatusResults", "createMetaResults", "createTicketResults"):
-                payload.pop(name, None)
             body = json.dumps(payload).encode()
         return body
 
@@ -14435,8 +14465,14 @@ class SessionManager:
             # clearing it — the field is a capability flag, and absent means "can't
             # tell you", never "unlimited".
             if isinstance(reply, dict):
+                # `not isinstance(cap, bool)` is load-bearing: bool IS an int in
+                # python, so a hub sending `true` would otherwise set a cap of ONE
+                # byte and the agent would shed everything, every beat, forever.
+                # Bounded above as well — an absurd value silently disables the
+                # pre-flight shed, which is the whole protection.
                 cap = reply.get("heartbeatMaxBytes")
-                if isinstance(cap, int) and cap > 0:
+                if (isinstance(cap, int) and not isinstance(cap, bool)
+                        and 0 < cap <= HEARTBEAT_CAP_SANE_MAX):
                     self.heartbeat_max_bytes = cap
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle

@@ -9222,86 +9222,111 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         self.assertIsNone(sm.heartbeat_max_bytes, "unknown until a hub says so")
 
-        sent = []
-
-        class FakeResp:
-            def __init__(self, body):
-                self.body = body
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self):
-                return self.body
-
         def urlopen(req, timeout=None):
-            sent.append(req.data)
-            return FakeResp(b'{"commands":[],"heartbeatMaxBytes":4096}')
+            sent.append(req)
+            return self._fake_resp(b'{"commands":[],"heartbeatMaxBytes":4096}')
 
+        sent = []
         with mock.patch.object(ha.urllib.request, "urlopen", urlopen):
             sm.post(sm.build_payload(0))
         self.assertEqual(sm.heartbeat_max_bytes, 4096)
 
         # Now stage something far over that cap: it must never reach the wire.
         sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 20000}]})
+        sent = []
         with mock.patch.object(ha.urllib.request, "urlopen", urlopen):
             sm.post(sm.build_payload(1))
-        self.assertLessEqual(len(sent[-1]), 4096, "the oversized beat must be shed, not sent")
-        self.assertNotIn(b"historyResults", sent[-1])
+        beat = [r for r in sent if "/api/heartbeat" in r.full_url][0]
+        self.assertLessEqual(len(beat.data), 4096, "the oversized beat must be shed, not sent")
+        self.assertNotIn(b"historyResults", beat.data)
 
-    def test_hub_cap_absent_means_unknown_not_unlimited(self):
+    def test_hub_cap_absent_or_nonsense_means_unknown_not_unlimited(self):
         # A hub too old to advertise the cap must leave the last known value alone.
         # Treating an absent capability flag as "no limit" is the mistake the
-        # heartbeat wire contract exists to prevent.
+        # heartbeat wire contract exists to prevent. Each value is really INJECTED
+        # here: an earlier version of this test looped over a list it never fed to
+        # the stub, so it asserted the absent case four times and missed that `true`
+        # became a cap of ONE byte (bool is an int in python).
         sm = self.make_manager()
-        sm.heartbeat_max_bytes = 4096
-
-        class FakeResp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self):
-                return b'{"commands":[]}'
-
-        with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
-            sm.post(sm.build_payload(0))
-        self.assertEqual(sm.heartbeat_max_bytes, 4096)
-        for bad in (0, -1, "lots", None):
-            with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
-                sm.post(sm.build_payload(1))
-            self.assertEqual(sm.heartbeat_max_bytes, 4096, f"{bad!r} must not become a cap")
+        for reply in (b'{"commands":[]}',            # absent
+                      b'{"commands":[],"heartbeatMaxBytes":0}',
+                      b'{"commands":[],"heartbeatMaxBytes":-1}',
+                      b'{"commands":[],"heartbeatMaxBytes":"lots"}',
+                      b'{"commands":[],"heartbeatMaxBytes":null}',
+                      b'{"commands":[],"heartbeatMaxBytes":true}',
+                      b'{"commands":[],"heartbeatMaxBytes":false}',
+                      b'{"commands":[],"heartbeatMaxBytes":1.5}',
+                      b'{"commands":[],"heartbeatMaxBytes":999999999999999999999}'):
+            sm.heartbeat_max_bytes = 4096
+            with mock.patch.object(ha.urllib.request, "urlopen",
+                                    return_value=self._fake_resp(reply)):
+                sm.post(sm.build_payload(0))
+            self.assertEqual(sm.heartbeat_max_bytes, 4096,
+                              f"{reply!r} must not replace a known cap")
 
     def test_a_beat_over_the_cap_with_nothing_to_shed_is_still_sent(self):
         # The base payload can exceed the cap on its own (a host with very many
-        # sessions). Refusing to send it would take the host offline silently;
-        # sending it gets a 413 the operator can at least see.
+        # sessions). Refusing to send it would take the host offline silently.
         sm = self.make_manager()
         sm.heartbeat_max_bytes = 8  # smaller than any real payload
-        sent = []
+        # Count the HEARTBEAT request only. build_payload also polls Jira when
+        # JIRA_SITE/JIRA_TOKEN are set in the environment — which they are in a real
+        # agent session — so counting every urlopen call made this test pass on CI
+        # (no Jira env) and fail for the operator running it locally.
+        beats = [r for r in self._record_posts(sm, sm.build_payload(0))
+                 if "/api/heartbeat" in r.full_url]
+        self.assertEqual(len(beats), 1, "the oversized beat still goes out")
 
+    def test_413_shed_never_destroys_a_result_it_did_not_send(self):
+        # The pre-flight shed used to drop ONE tier from the staging lists while
+        # popping ALL SIX result keys from the payload, and post() then cleared every
+        # list as "delivered". Results that were never sent were destroyed — and the
+        # hub reads a missing result as a MISSING CAPABILITY (resolveResultWaits →
+        # `unsupported[kind]`), so every board write to that host is refused with
+        # "your agent is too old" for half an hour. Earned by a beat that was
+        # merely too big.
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 20000}]})
+        sm.jira_issue_results.append({"key": "ENG-1", "fields": {}})
+        sm.create_ticket_results.append({"cmdId": "c1", "key": "ENG-2"})
+        sm.heartbeat_max_bytes = 4096
+
+        payload = sm.build_payload(0)
+        sent = self._record_posts(sm, payload)
+        wire = json.loads([r for r in sent if "/api/heartbeat" in r.full_url][0].data)
+
+        # Tier one went (it is what made the beat oversized)...
+        self.assertNotIn("historyResults", wire)
+        self.assertEqual(sm.history_results, [])
+        # ...and tier two was DELIVERED, not quietly binned.
+        self.assertIn("jiraIssueResults", wire)
+        self.assertIn("createTicketResults", wire)
+        self.assertEqual(wire["createTicketResults"], [{"cmdId": "c1", "key": "ENG-2"}])
+
+    def _fake_resp(self, body=b'{"commands":[]}'):
         class FakeResp:
-            def __enter__(self):
-                return self
+            def __enter__(self_inner):
+                return self_inner
 
-            def __exit__(self, *a):
+            def __exit__(self_inner, *a):
                 return False
 
-            def read(self):
-                return b"{}"
+            def read(self_inner):
+                return body
+
+        return FakeResp()
+
+    def _record_posts(self, sm, payload):
+        """post() the payload, returning every urllib Request that was made."""
+        seen = []
 
         def urlopen(req, timeout=None):
-            sent.append(req.data)
-            return FakeResp()
+            seen.append(req)
+            return self._fake_resp()
 
         with mock.patch.object(ha.urllib.request, "urlopen", urlopen):
-            sm.post(sm.build_payload(0))
-        self.assertEqual(len(sent), 1, "it still goes out")
+            sm.post(payload)
+        return seen
 
     def test_413_keeps_pending_pr_links(self):
         # PR chips are not an on-demand deliverable and are tiny; shedding them

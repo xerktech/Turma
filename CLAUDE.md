@@ -231,6 +231,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   POST succeeds, so re-sending is right for 503 and an infinite loop for 413 — `post()` therefore
   SHEDS a tier of staged results on 413 (`_shed_staged_results`) and keeps everything on 503. Never
   collapse the two into one status.
+  - **A shed drops the payload key and the staging list TOGETHER.** Dropping one without the other
+    destroys a result that was never sent, and the hub reads a missing result as a missing CAPABILITY
+    (`resolveResultWaits` → `unsupported[kind]`): half an hour of board writes refused with "your
+    agent is too old", earned by a beat that was merely too big.
   - **But nothing may DEPEND on a mid-upload refusal arriving.** The hub answers while the body is
     still coming, node then tears the socket down, and `urllib` writes everything before it reads — so
     that 413 often reaches the agent as a broken pipe. Hence the cap is **advertised**

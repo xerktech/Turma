@@ -209,6 +209,16 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
     composer checks `uploadMaxBytes` before it uploads. **Prevention, not diagnosis** — a rationed
     "be patient so the 413 lands" scheme was tried and made the ration itself the attack (four idle
     sockets exhausted it, and then no 413 was receivable at all, which IS the retry-forever loop).
+  - **What is advertised must be what is ADMISSIBLE** (`effectiveCap`, `heartbeatAcceptMax`). A cap
+    above `BODY_INFLIGHT_ESCAPE_MAX` would be advertised, enforced, and then refused with 503
+    ("retry") for a permanently impossible request — measured at `-m 32m`: 32 MiB advertised, a
+    20 MiB beat 503'd forever with zero bytes held. Every cap a client is told goes through there.
+  - **`HEARTBEAT_MAX` is the documented ceiling; `heartbeatAcceptMax()` is what the container can
+    PARSE**, a sixteenth of the limit (16 MiB at the deployed 256m). A body costs ~5x its size to
+    hold and V8 sizes its heap from the cgroup, so it grows into the container and lets the kernel
+    decide: eight sequential 25 MiB deliveries, each legal under `HEARTBEAT_MAX` and each answered
+    200, pegged a 256 MiB container at its ceiling. Refused on the headers instead, the same
+    sequence peaks at 77 MiB. Never restore a flat constant here.
   - **A 413 raised AFTER a complete read is still delivered normally** (`AGENT_RECORD_MAX` — the body
     finished, so `json()` answers on a healthy socket). That is the 413 the agent's shed most relies
     on, and it must stay that way.
@@ -221,6 +231,15 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   could exceed the container on that basis; understating it is how the first version stayed silent at
   the deployed limit. **`readRawBody` deliberately does NOT preallocate from `Content-Length`** — that
   would size an allocation from a claim, one byte behind a 65 MiB header.
+- **The on-demand history caches are bounded in BYTES too** (`sweepHistoryBytes`,
+  `HISTORY_TOTAL_MAX_BYTES`, fleet-wide, oldest delivery evicted first). `HISTORY_MAX_SESSIONS`
+  cannot see size, `AGENT_CACHE_KEYS` strips these caches before `AGENT_RECORD_MAX` measures a
+  record, and `retainedBytes` deliberately leaves them out — so they were invisible to every ceiling
+  and seven sequential 25 MiB deliveries from ONE authorized host OOM-killed the hub.
+- **A route that answers WITHOUT reading the body must close the connection** (`json()` adds
+  `Connection: close` when `res.req` is incomplete). Node destroys such a socket once the reply is
+  out, so a `keep-alive` header hands the client a doomed pooled socket and its NEXT request dies
+  with ECONNRESET.
 - `readBody` decodes through a `StringDecoder`, not `data += chunk`: a UTF-8 sequence split across
   chunks became replacement bytes, silently corrupting transcript text hundreds of times in a
   multi-MiB beat.
