@@ -474,7 +474,9 @@ fun SessionsListPane(
     // ended list — reports through FleetViewModel.messages, which ONLY the
     // dashboard used to collect: a refusal raised here reached nobody, which is
     // the same "it looked like it worked" bug the hub's `{error}` text exists to
-    // prevent (XERK-264). One host, like FleetScreen's.
+    // prevent (XERK-264). One host, like FleetScreen's. The "Run against" row
+    // on this pane's spawn composer gives it a first-class refusal to carry
+    // (409 "host has no local model configured", XERK-246).
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
@@ -519,7 +521,6 @@ fun SessionsListPane(
     // New-session picker: pick an online host + repo, then the spawn composer.
     var pickerOpen by remember { mutableStateOf(false) }
     var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
-
     Box(modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         ScreenHeader("Sessions") {
@@ -724,9 +725,14 @@ fun SessionsListPane(
     spawnFor?.let { (host, repo, isRoot) ->
         SpawnDialog(
             host = host, repo = repo, isRoot = isRoot,
+            // The TARGET host's own local model, not the fleet's: the failover
+            // is configured per host, so only the one being spawned on can
+            // offer it. Pure + tested, because "the wrong loop" is a shape this
+            // repo has shipped before.
+            localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
             onDismiss = { spawnFor = null },
-            onSpawn = { prompt, label, baseRef, model, mode ->
-                vm.spawn(host, repo, prompt, label, baseRef, model, mode); spawnFor = null
+            onSpawn = { prompt, label, baseRef, model, mode, source ->
+                vm.spawn(host, repo, prompt, label, baseRef, model, mode, source); spawnFor = null
             },
         )
     }

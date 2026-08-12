@@ -106,7 +106,10 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   session is marked (🏠, warn colour) — it is a weaker model, and nobody should have to wonder which
   one wrote a turn. Like the mode switch it paints from a MEMO, never an optimistic write onto
   `sess`, so a stale beat can't flash the old value back; the memo ages out so a switch that never
-  lands doesn't pin the chip. Tests: the `model source:` cases in `chat.test.js`.
+  lands doesn't pin the chip. **`normalizeLocalModel` coerces the block at ingest** — the block is
+  typed on Android and `/api/agents` decodes atomically there, so one host's `available:"yes"` hid
+  the whole fleet from the phone; see CLAUDE.md's heartbeat contract. Tests: the `model source:`
+  cases in `chat.test.js`, `normalizeLocalModel` in `server.test.js`.
 - The compose footer's agent-mode / model selectors are joined by a compact **PR status chip**
   (`prFooterChip`) when it has one, and a `jira-chip` when the session has a ticket.
 - The **model selector is accurate** (XERK-33) — never a hardcoded menu, and never rewriting the

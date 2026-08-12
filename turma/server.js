@@ -90,6 +90,15 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// Bounds for a session's live agent rows (sanitizeLiveAgents, far below). They
+// live UP HERE, away from their function, because the state.json restore runs
+// at module init and calls that function: a `const` declared later is in its
+// temporal dead zone then, so reading one throws a ReferenceError that the
+// restore's own `catch {}` swallows — the record loads half-coerced and says
+// nothing. Any constant a restore-path function reads has to be declared above
+// the restore.
+const LIVE_AGENTS_MAX = 32;
+const LIVE_AGENT_FIELD_MAX = 400;
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -363,10 +372,14 @@ const liveClients = {};
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
   agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  // Records written before the ingest-side coercion below (and any host that is
-  // OFFLINE, so no beat will ever rewrite its record) still carry the legacy
-  // per-model usage shape — normalize what we load, not just what arrives.
-  for (const a of Object.values(agents)) normalizeUsage(a);
+  // Records written before a coercion existed — and any host that is OFFLINE,
+  // so no beat will ever rewrite its record — carry whatever shape was current
+  // when they were saved. Normalize what we LOAD, not just what arrives: the
+  // first `/api/agents` after a restart serves the raw record, and a hub
+  // restart is exactly when a new coercion ships. `normalizeRecord` is shared
+  // with the ingest path so the two cannot drift; adding a coercion in one
+  // place covers both. Tests: `the state.json restore coerces too`.
+  for (const a of Object.values(agents)) normalizeRecord(a);
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
 } catch {
   /* first boot or no volume mounted */
@@ -693,8 +706,8 @@ function setOrgColor(siteKey, slot) {
 //      resumes the same conversation there;
 //   3. target session comes up -> the source session is KILLED (kept, so its
 //      worktree/uncommitted work stays resumable on the origin as a fallback).
-// State is in-memory and short-lived (the blob rides in the record); a hub
-// restart mid-migration aborts it, leaving the source session intact.
+// State is in-memory and short-lived; a hub restart mid-migration aborts it,
+// leaving the source session intact.
 const migrations = new Map(); // migrationId -> record (see startMigration)
 const MIGRATE_TIMEOUT_MS = Number(process.env.MIGRATE_TIMEOUT_MS) || 5 * 60 * 1000;
 const MIGRATE_DONE_KEEP_MS = 30 * 1000; // keep a done/failed record briefly so UI can observe
@@ -702,6 +715,76 @@ const MIGRATIONS_MAX = 40; // backstop against unbounded growth
 // Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
 // legitimate at-cap bundle isn't rejected for framing overhead.
 const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
+// **The bundle NEVER rides in the record** (XERK-263). At 65 MiB a pair of
+// concurrent moves — two clicks of the Sessions page's Move control — would
+// retain 130 MiB in a hub running at mem_limit 256m, so the relay spools each
+// one to a file here and the record keeps only its path. Same volume as the
+// rest of /data, but nothing in it is durable: a file outliving its migration
+// is garbage, which is why boot sweeps the whole directory.
+const MIGRATE_SPOOL_DIR = process.env.MIGRATE_SPOOL_DIR || "/data/migrations";
+// Spooling moved the pressure off the heap and onto /data, which the archive
+// shares — so bound how much of it a burst of moves can hold at once. Enforced
+// where a move STARTS, not on the relay upload: an agent's upload is
+// best-effort with no retry, so refusing one strands a migration, while
+// refusing the operator's click just says "not right now" on the Move control.
+const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
+
+// The id `crypto.randomBytes(8).toString("hex")` produces in startMigration, and
+// the filename that makes — the second being the ONLY thing the boot sweep may
+// delete. Keep the two in step: they are the same name either side of `.bin`.
+const MIGRATE_ID_RE = /^[0-9a-f]{16}$/;
+const MIGRATE_SPOOL_RE = /^[0-9a-f]{16}\.bin$/;
+
+// Where a migration's spooled bundle lives. Keyed on the HUB-MINTED id (hex
+// from crypto.randomBytes, and only ever an id already in `migrations`), never
+// on the path segment the agent sent — the relay is a host boundary, so the
+// filename must not be something a caller can steer.
+// It ENFORCES that rather than trusting it: the id is checked against the shape
+// startMigration mints, so a caller-supplied one could not name a path here even
+// if some future route passed one through. Throwing is right — the request
+// handler turns it into a 500, and there is no sane fallback path to spool to.
+function migrationSpoolPath(id) {
+  if (!MIGRATE_ID_RE.test(String(id)))
+    throw new Error("refusing to spool under a migration id this hub did not mint");
+  // Not path-traversable: the guard above leaves 16 hex characters, so no
+  // component can hold a separator or '..'.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  return path.join(MIGRATE_SPOOL_DIR, `${id}.bin`);
+}
+
+// Release a migration's spooled bundle. Idempotent, and safe to call while the
+// target is still streaming it out: the unlink drops the name, and the reader's
+// open fd keeps the bytes alive until it finishes. Every path that settles or
+// abandons a migration goes through this — a leaked file is 65 MiB of disk that
+// nothing will ever come back for.
+function dropMigrationBlob(m) {
+  const p = m && m.blobPath;
+  if (!p) return;
+  m.blobPath = null;
+  m.blobSize = 0;
+  fs.unlink(p, () => {});
+}
+
+// Boot sweep: the migration records are in memory, so a restart abandons every
+// in-flight move and anything still in the spool dir belongs to no one. Without
+// this, a hub killed mid-relay leaks its bundle to disk permanently.
+//
+// It deletes ONLY names this hub could have written (MIGRATE_SPOOL_RE), never
+// whatever it happens to find. MIGRATE_SPOOL_DIR is deployment config, and a
+// one-word compose slip pointing it at /data would otherwise have boot delete
+// state.json and devices.json.
+function sweepMigrationSpool() {
+  let names;
+  try {
+    names = fs.readdirSync(MIGRATE_SPOOL_DIR);
+  } catch {
+    return; // no spool dir yet — nothing has been relayed on this volume
+  }
+  for (const n of names) {
+    if (!MIGRATE_SPOOL_RE.test(n)) continue;
+    try { fs.unlinkSync(path.join(MIGRATE_SPOOL_DIR, n)); } catch {}
+  }
+}
 
 // The wire shape (blob stripped) the /api/agents payload and SSE carry, so the
 // UI can follow a migration to its new host and surface a failure.
@@ -934,7 +1017,7 @@ function startMigration(srcHost, s, targetHost) {
         if (!oldest || m.at < oldest.at) oldest = m;
       }
     }
-    if (oldest) migrations.delete(oldest.id);
+    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
   }
   const id = crypto.randomBytes(8).toString("hex");
   const m = {
@@ -960,7 +1043,10 @@ function startMigration(srcHost, s, targetHost) {
       ticket: s.ticket || null,
     },
     phase: "exporting", // exporting -> importing -> done | failed
-    blob: null, importCmdId: null, targetSessionId: null,
+    // The bundle is spooled to disk, so the record carries only where it is and
+    // how big it is (for the target's Content-Length) — see MIGRATE_SPOOL_DIR.
+    blobPath: null, blobSize: 0, uploading: false,
+    importCmdId: null, targetSessionId: null,
     // The reason an agent gave for declining its half (XERK-265), staged here by
     // ingestSpawnFailures and turned into a terminal failure by advanceMigrations
     // rather than applied on the spot — the handoff check must still win the tie.
@@ -989,7 +1075,7 @@ function advanceMigrations() {
         m.targetSessionId = up.id;
         m.phase = "done";
         m.error = null;
-        m.blob = null;
+        dropMigrationBlob(m);
         m.at = now;
         if (agents[m.srcHost]) {
           queueCommand(m.srcHost, { type: "kill", sessionId: m.srcSessionId });
@@ -1006,7 +1092,7 @@ function advanceMigrations() {
     if ((m.phase === "exporting" || m.phase === "importing") && m.refusal) {
       m.phase = "failed";
       m.error = m.refusal;
-      m.blob = null;
+      dropMigrationBlob(m);   // the spool file, exactly as the timeout below
       m.at = now;
       publishMigrations();
       continue;
@@ -1017,7 +1103,7 @@ function advanceMigrations() {
         now - m.startedAt > MIGRATE_TIMEOUT_MS) {
       m.phase = "failed";
       m.error = "migration timed out";
-      m.blob = null;
+      dropMigrationBlob(m);
       m.at = now;
       publishMigrations();
       continue;
@@ -1026,6 +1112,7 @@ function advanceMigrations() {
     // terminal state before it disappears.
     if ((m.phase === "done" || m.phase === "failed") &&
         now - m.at > MIGRATE_DONE_KEEP_MS) {
+      dropMigrationBlob(m); // settling already dropped it; this is the backstop
       migrations.delete(m.id);
       publishMigrations();
     }
@@ -1059,8 +1146,22 @@ function normalizeModelUsage(usage) {
 function normalizeUsage(payload) {
   if (!payload || typeof payload !== "object") return;
   normalizeModelUsage(payload.usage);
-  for (const r of payload.repoUsage || []) normalizeModelUsage(r && r.usage);
-  for (const s of payload.sessions || []) normalizeModelUsage(s && s.usage);
+  // `Array.isArray`, not `|| []`: a non-iterable `repoUsage`/`sessions` (an
+  // OBJECT, say) makes a bare `for…of` THROW, and a throw here is uniquely
+  // costly — on the restore path it lands in a silent `catch {}` and abandons
+  // every host after this one, uncoerced, on every boot.
+  // Both are typed LISTS on Android, so a non-array is decode-fatal for the
+  // WHOLE fleet payload, not just this host — rewrite it rather than merely
+  // stepping around it. (Safe because normalizeRecord runs past the raw-size
+  // gate; before it, this would have shrunk away an amplifier.)
+  if (!Array.isArray(payload.repoUsage)) {
+    if ("repoUsage" in payload) payload.repoUsage = [];
+  } else {
+    for (const r of payload.repoUsage) normalizeModelUsage(r && r.usage);
+  }
+  if (Array.isArray(payload.sessions)) {
+    for (const s of payload.sessions) normalizeModelUsage(s && s.usage);
+  }
 }
 
 // The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for
@@ -1096,6 +1197,68 @@ function normalizeLimits(payload) {
   out.capturedAt = captured;
   if (typeof lim.source === "string") out.source = lim.source.slice(0, 32);
   payload.limits = out;
+}
+
+// Coerce the local-model block at ingest, for exactly the reason normalizeLimits
+// above does it (XERK-246): this fans out to web, Android and glasses, and
+// Android decodes it into TYPED fields — `available: Boolean`, `contextTokens:
+// Int?` — so an `available` of "yes" or a contextTokens past 2^31 from ONE buggy
+// host fails the decode of the WHOLE /api/agents array, and every other host
+// silently vanishes from that phone's fleet.
+//
+// Anything unusable becomes null, which every client already reads as "this host
+// cannot fail over" — the same degradation as an agent too old to report it.
+function normalizeLocalModel(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const lm = payload.localModel;
+  if (!lm || typeof lm !== "object" || Array.isArray(lm)) {
+    if ("localModel" in payload) payload.localModel = null;
+    return;
+  }
+  // Strictly boolean: a truthy string would turn a host that cannot fail over
+  // into one the UI offers the switch on, and the command would be dropped.
+  if (lm.available !== true) {
+    payload.localModel = { available: false, model: null, contextTokens: null };
+    return;
+  }
+  // Nothing XML-ILLEGAL may leave here, from either direction — the whole class,
+  // not just the one case that bit us. A lone surrogate, a C0 control and the
+  // noncharacters U+FFFE/U+FFFF are all unencodable in XML, and each kills
+  // Android's `uiautomator dump` outright (`KXmlSerializer: Illegal character`
+  // / a 0-byte file), i.e. the tool a QA pass drives the app with. Cutting with
+  // `slice(60)` through an astral pair MANUFACTURES a lone surrogate, so that
+  // cut is on CODE POINTS and runs after the strip. Only a rogue agent reaches
+  // this — a real one is bounded by LOCAL_MODEL_NAME_RE — which is this
+  // function's whole threat model.
+  //
+  // BOUND FIRST, THEN SPREAD. `[...s]` materialises one array element per code
+  // point over the WHOLE string, and this runs BEFORE the AGENT_RECORD_MAX check
+  // that refuses an oversized beat — so spreading the raw value let a single
+  // agent-authed heartbeat with a 24 MiB name OOM-kill the hub at its deployed
+  // `mem_limit: 256m` (32M chars measured at 288 MB heap), which
+  // `restart: unless-stopped` turns into an outage loop of the fleet's whole
+  // control plane. 512 UTF-16 units is far more than the 60 code points that
+  // survive, and cutting there can only split an astral pair — which the
+  // surrogate replace immediately below then handles.
+  const name = typeof lm.model === "string"
+    ? [...lm.model.slice(0, 512)
+        .replace(/\p{Surrogate}/gu, "�")     // unpaired halves -> replacement
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]/g, "")  // XML-illegal
+        .trim()]
+      .slice(0, 60).join("")
+    : "";
+  const ctx = lm.contextTokens;
+  payload.localModel = {
+    available: true,
+    // The name is display-only here (the agent validates its own charset before
+    // launching), but it must be A STRING or the decode dies.
+    model: name || null,
+    // Int-safe or nothing: the field is unused by the UI, so dropping a bad one
+    // costs nothing and keeps the fleet decodable.
+    contextTokens:
+      typeof ctx === "number" && Number.isSafeInteger(ctx) &&
+      ctx > 0 && ctx <= 2_147_483_647 ? ctx : null,
+  };
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
@@ -1832,15 +1995,146 @@ function sanitizeHeartbeat(payload, key) {
   // session's live agent rows come from a pane scrape and are re-shaped and
   // bounded here for the same reason the `turn` frame's are — the clients turn
   // this list into a count and a label, and nothing else bounds it.
+  // Pre-ceiling, so this may only ever SHRINK (see normalizeRecord, which runs
+  // past the gate and is free to rewrite). Live agent rows come from a pane
+  // scrape and are re-shaped and bounded here for the same reason the `turn`
+  // frame's are — clients turn this list into a count and a label, and nothing
+  // else bounds it.
   if (Array.isArray(payload.sessions)) {
     for (const s of payload.sessions) {
-      const live = s && typeof s === "object" ? s.session : null;
-      if (live && typeof live === "object" && "agents" in live) {
+      const live = objectish(s) ? s.session : null;
+      if (objectish(live) && "agents" in live) {
         live.agents = sanitizeLiveAgents(live.agents) || [];
       }
     }
   }
   return payload;
+}
+
+/**
+ * Is this a plain object — the thing a client that TYPED a field will accept?
+ *
+ * The one predicate every shape check in the coercion path goes through, because
+ * the obvious spelling is wrong in the same way every time: `typeof [] ===
+ * "object"`, so `!x || typeof x !== "object"` passes arrays straight through,
+ * and the follow-on `"k" in []` is false so an array is neither coerced nor
+ * rejected. Both escapes were measured the same way — the Android login probe
+ * decodes /api/agents, so one raw array anywhere in the payload reads as "Could
+ * not reach the hub" and the app cannot sign in at all.
+ *
+ * A `function` declaration, not a `const`: it is used ~70 lines ABOVE this point
+ * by `sanitizeHeartbeat`, and this file has already shipped a coercion that
+ * threw a ReferenceError at module init from exactly that pattern (a const in
+ * its temporal dead zone, swallowed by the restore's `catch {}` — see
+ * `normalizeRecord`'s ordering comment). Declarations hoist; consts do not.
+ */
+function objectish(x) {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
+
+/**
+ * Every coercion an agent record needs before a client sees it, in ONE place.
+ *
+ * Called from the heartbeat ingest and from the `state.json` restore, because a
+ * coercion applied at only one of those is a hole straight through itself: the
+ * restore serves whatever was persisted, for one beat on a live host and up to
+ * the record's whole life on an offline one. Add a new `normalize*` HERE and
+ * both paths get it.
+ *
+ * The stakes are Android's: `/api/agents` decodes atomically into typed fields,
+ * so one host's wrong-typed value throws for the whole array and every OTHER
+ * host silently disappears from that phone.
+ */
+function normalizeRecord(a) {
+  // Order is NOT load-bearing, and must not become so: each of these guards its
+  // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
+  // here lands in the restore's silent `catch {}` and abandons every host after
+  // this one, uncoerced, on every boot. Sessions first only because it is the
+  // one that rewrites a shape the others iterate.
+  normalizeSessions(a);
+  normalizeUsage(a);
+  normalizeLimits(a);
+  normalizeLocalModel(a);
+}
+
+/**
+ * The heartbeat's coercion step, reached through a holder so a test can force it
+ * to throw (XERK-262). Production always holds the real [normalizeRecord]; only
+ * a `TURMA_TEST` suite ever replaces `normalize`.
+ *
+ * The indirection exists because the backstop around this call cannot be
+ * reached from the heartbeat wire today, and a QA mutation pass deleted the
+ * whole try/catch with the suite green.
+ *
+ * Why it is unreachable: every `normalize*` guards its own input shape, so the
+ * only throw the path has ever had was `sanitizeLiveAgents`'s `String(...)` on a
+ * value with no primitive conversion (pure JSON can express one —
+ * `{"toString":1,"valueOf":1}`), and `sanitizeHeartbeat` walks those same rows
+ * BEFORE any record is installed. Do not read that as "the input is impossible":
+ * the same value reaches `sanitizeLiveAgents` from the `/agent/control` frame
+ * handler, where nothing catches it (XERK-278).
+ *
+ * Being unreachable is exactly why deleting this catch reads as safe. It is not:
+ * `agents[key] = next` has ALREADY run by the time the coercion is called, so
+ * without the rollback a throw leaves the RAW, uncoerced record installed and
+ * served — defeating every gate downstream, `normalizeLocalModel`'s
+ * strict-boolean `available` check included. One `normalize*` that can throw on
+ * an input `sanitizeHeartbeat` does not walk makes this load-bearing with no
+ * other warning.
+ */
+const recordCoercion = { normalize: normalizeRecord };
+
+// The per-SESSION coercions (see normalizeRecord).
+//
+// `sessions` is a KNOWN key, so sanitizeHeartbeat's unknown-field sweep never
+// looks inside it — everything typed under a session has to be handled here.
+// Android decodes /api/agents into typed fields, so an object or array where it
+// expects a String throws for the WHOLE array and every other host disappears
+// from that phone; a field only becomes this dangerous once a client TYPES it,
+// which is why `modelSource`/`modelSourceAt` are here from the commit that
+// declared them on `SessionInfo`.
+function normalizeSessions(payload) {
+  if (!payload || typeof payload !== "object") return;
+  // A non-array `sessions` is REWRITTEN, not skipped. It is decode-fatal on
+  // Android — measured as the app failing to sign in at all, reporting "Could
+  // not reach the hub" — and on the restore path it also throws out of
+  // normalizeUsage's `for … of`, silently abandoning the record. Rewriting is
+  // safe only because this now runs PAST the AGENT_RECORD_MAX gate: doing it
+  // before would have erased the amplifier that gate exists to refuse.
+  if (!Array.isArray(payload.sessions)) {
+    if ("sessions" in payload) payload.sessions = [];
+    return;
+  }
+  // DROP a non-object element, never skip past it: `sessions` is typed
+  // `List<SessionInfo>` on Android, so a `null` or a bare string in the array is
+  // as fatal as a wrong-typed field inside one — measured as a host silently
+  // missing from the phone while the tile still counted it.
+  if (!payload.sessions.every(objectish)) payload.sessions = payload.sessions.filter(objectish);
+  for (const s of payload.sessions) {
+    // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
+    // never goes through that: idempotent, so running twice costs nothing.
+    //
+    // REWRITE a non-object `session`, never merely skip past it. `session` is
+    // typed `LiveSignals?` on Android, so any non-object is decode-fatal for
+    // the WHOLE /api/agents array — measured as the app unable to sign in at
+    // all, since the login probe decodes it and reads the throw as "Could not
+    // reach the hub". Skipping the sanitize is NOT enough: the raw value stays
+    // in the record and is what gets served. `null` is the "can't tell you"
+    // value every client already handles.
+    //
+    // An array is the case a bare `typeof live === "object"` guard misses, and
+    // `"agents" in []` is false, so it fell through both halves of the old
+    // test. Rewriting is safe here only because normalizeSessions runs PAST the
+    // AGENT_RECORD_MAX gate — see normalizeRecord's ordering comment.
+    if ("session" in s && !objectish(s.session)) s.session = null;
+    const live = s.session;
+    if (live && "agents" in live) {
+      live.agents = sanitizeLiveAgents(live.agents) || [];
+    }
+    for (const k of ["modelSource", "modelSourceAt"]) {
+      if (k in s && typeof s[k] !== "string") s[k] = "";
+    }
+  }
 }
 
 // Thrown past the cap so a route can answer 413 instead of leaking a generic
@@ -1916,6 +2210,98 @@ function readRawBody(req, cap) {
     });
     req.on("end", () => { if (!over) resolve(Buffer.concat(chunks)); });
     req.on("error", reject);
+  });
+}
+
+// Collect a request body straight into a FILE, never the heap (XERK-263), and
+// resolve with the byte count. For the migration relay, whose bundle can be 65
+// MiB against a hub that runs at mem_limit 256m: buffering one costs a quarter
+// of the container's memory, and the operator can start two at once.
+//
+// Reads with backpressure (the socket is paused whenever the file stream is
+// behind) so a fast uploader can't queue the whole body in the write buffer and
+// undo the point of spooling. Past `cap` it follows readRawBody's drain rule —
+// keep reading a little further so the route can answer 413 on the same
+// connection instead of hanging the socket up on the agent.
+//
+// On ANY failure the partial file is removed BEFORE the rejection lands, so a
+// caller only has to fail the migration; on success the file is the caller's to
+// unlink (see dropMigrationBlob).
+function spoolRawBody(req, cap, filePath) {
+  return new Promise((resolve, reject) => {
+    let out;
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      out = fs.createWriteStream(filePath);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let len = 0;
+    let settled = false;
+    // Whichever fails first — the request or the file — tears the spool down
+    // and rejects exactly once.
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      // The socket may be paused on the file stream's backpressure, and that
+      // stream is gone — resume so the drain rule above can run (and, on the
+      // over-cap path, so the 413 reaches the agent instead of a hang-up).
+      req.resume();
+      const cleanup = () => fs.unlink(filePath, () => reject(err));
+      // A write stream that ALREADY errored has emitted its `close`, so waiting
+      // for another one would hang the request forever instead of failing it.
+      if (out.destroyed || out.closed) cleanup();
+      else { out.once("close", cleanup); out.destroy(); }
+    };
+    req.on("data", (c) => {
+      len += c.length;
+      if (settled) {
+        // Still coming after we've said no: read and throw it away up to a
+        // point, then stop paying for a client that won't stop.
+        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        return;
+      }
+      if (len > cap) {
+        fail(new BodyTooLarge(cap));
+        return;
+      }
+      if (!out.write(c)) {
+        req.pause();
+        out.once("drain", () => req.resume());
+      }
+    });
+    req.on("error", fail);
+    req.on("aborted", () => fail(new Error("request aborted")));
+    req.on("end", () => {
+      if (settled) return;
+      // Resolve only once the bytes are actually on disk — the target agent may
+      // GET this file the moment the migration flips to `importing`.
+      //
+      // **The end callback's error is the whole point of this shape**: a write
+      // that fails during the FINAL flush (an ENOSPC on the last ≤64 KiB, which
+      // is every body small enough to fit the write buffer) surfaces here and
+      // nowhere else. Swallowing it answered 200 for a truncated bundle, which
+      // the target then failed to unpack with nothing logged anywhere. Settle
+      // only INSIDE the callback, so `fail` is still armed when it fires.
+      out.end((err) => {
+        if (err) return fail(err);
+        // Resolve with what reached the DISK, never with what came off the
+        // socket: a short write is a corrupt bundle, not a smaller one.
+        if (out.bytesWritten !== len)
+          return fail(new Error(`spool wrote ${out.bytesWritten} of ${len} bytes`));
+        // And resolve on `close`, not here: the end callback runs BEFORE the
+        // descriptor is closed (end-cb → finish → close), so a close(2) failure
+        // would land on `error` after a resolve and be swallowed — the same
+        // shape as the flush error above.
+        out.once("close", () => {
+          if (settled) return;
+          settled = true;
+          resolve(len);
+        });
+      });
+    });
+    out.on("error", fail);
   });
 }
 
@@ -2150,17 +2536,49 @@ function fmtDur(ms) {
 // and cost that repaint; the cap matches the agent's own PANE_AGENTS_MAX.
 // `null` (not `[]`) for a frame with no `agents` key at all, so the chat can
 // tell "this agent can't report them" from "no agents are running".
-const LIVE_AGENTS_MAX = 32;
-const LIVE_AGENT_FIELD_MAX = 400;
+/**
+ * `String(x)` for a value that came off the wire — it CANNOT throw (XERK-278).
+ *
+ * Plain `String(x)` throws `TypeError: Cannot convert object to primitive value`
+ * when a value has no usable primitive conversion, and **pure JSON can express
+ * one**: `{"toString":1,"valueOf":1}` gives both hooks as own, non-callable
+ * properties, so neither ToPrimitive path works. `JSON.parse` of an
+ * attacker-controlled body produces exactly that object.
+ *
+ * That was a one-packet remote kill of the whole hub. `sanitizeLiveAgents` has
+ * three callers; two are on the heartbeat path, where the request handler's
+ * catch turns the throw into a 400. The third is the `/agent/control` WebSocket
+ * frame handler, which runs inside a `socket.on("data")` listener with no
+ * try/catch above it — and this process installs no `uncaughtException` handler,
+ * so the throw exited node. Under DockerOps' `restart: unless-stopped` that is a
+ * repeatable outage loop of the fleet's entire control plane, and the ordinary
+ * single-user web login is enough to open the socket.
+ *
+ * Fixed HERE rather than by wrapping the caller: a coercion that throws on
+ * untrusted input is the bug, and a caller-side guard is one that the next
+ * caller gets added without.
+ */
+function safeString(v) {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
+  try {
+    return String(v);
+  } catch {
+    // Unconvertible. Treated as absent, which is what every field here already
+    // does with a missing value — nothing downstream could render it anyway.
+    return "";
+  }
+}
+
 function sanitizeLiveAgents(raw) {
   if (!Array.isArray(raw)) return null;
   const out = [];
   for (const a of raw) {
     if (!a || typeof a !== "object") continue;
-    const type = String(a.type == null ? "" : a.type).slice(0, LIVE_AGENT_FIELD_MAX);
+    const type = safeString(a.type).slice(0, LIVE_AGENT_FIELD_MAX);
     if (!type) continue;
     out.push({ sel: !!a.sel, type,
-      label: String(a.label == null ? "" : a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
+      label: safeString(a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
     if (out.length >= LIVE_AGENTS_MAX) break;
   }
   return out;
@@ -3511,8 +3929,6 @@ const server = http.createServer(async (req, res) => {
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
-      normalizeUsage(payload);
-      normalizeLimits(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.
@@ -3617,6 +4033,40 @@ const server = http.createServer(async (req, res) => {
       // and then restoring `prev` restored an object the ingests had already
       // mutated — a refused beat still poisoned the caches and its content came
       // back out of /history with a 413 on the wire.
+      const refuseOversized = (size) => {
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        console.error(
+          `heartbeat from ${key}: record is ${size} bytes, over the ` +
+            `${AGENT_RECORD_MAX} limit — beat refused`
+        );
+        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+      };
+      // TWO measurements, one ceiling. The RAW size is the amplifier check: a
+      // coercion that discards junk must not be able to shrink an oversized
+      // beat into an accepted one (rewriting an 8 MiB string `sessions` to `[]`
+      // did exactly that, turning a 413 into a 200). The COERCED size is what
+      // actually gets stored and served, and a coercion can EXPAND —
+      // normalizeModelUsage rewrites `"m"` to `{model:"m"}`, ~3.5x, so an 8 MiB
+      // beat of model names parked 28 MiB per host for a week. Neither
+      // measurement alone holds the ceiling.
+      const rawSize = agentRecordSize(next);
+      if (rawSize > AGENT_RECORD_MAX) return refuseOversized(rawSize);
+      // Coercion sits BETWEEN the two, so it never walks an unbounded record —
+      // that is how a 24 MiB model name reached a per-code-point spread and
+      // OOM-killed the hub. A throw here would leave the RAW record installed
+      // (`agents[key] = next` is already done), which is worse than refusing:
+      // it defeats every gate downstream, including localModelAvailable's
+      // strict-boolean check. The coercions are written not to throw; this is
+      // the backstop that makes that not matter.
+      try {
+        recordCoercion.normalize(next);
+      } catch (e) {
+        console.error(`heartbeat from ${key}: coercion failed (${e.message}) — beat refused`);
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        return json(res, 400, { error: "malformed heartbeat" });
+      }
       const recordSize = agentRecordSize(next);
       // Visible BEFORE it 413s. Measured against the operator's real fleet the
       // largest record is 0.30 MiB, so half the ceiling means something has
@@ -3632,15 +4082,7 @@ const server = http.createServer(async (req, res) => {
         );
       }
       recordSizeWarned.set(key, overHalf);
-      if (recordSize > AGENT_RECORD_MAX) {
-        if (prev && Object.keys(prev).length) agents[key] = prev;
-        else delete agents[key];
-        console.error(
-          `heartbeat from ${key}: record is ${recordSize} bytes, over the ` +
-            `${AGENT_RECORD_MAX} limit — beat refused`
-        );
-        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
-      }
+      if (recordSize > AGENT_RECORD_MAX) return refuseOversized(recordSize);
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
@@ -3742,11 +4184,12 @@ const server = http.createServer(async (req, res) => {
     // real target `claude --resume` bytes it chose *by mis-addressing*. Binding
     // the segment to the credential — the actual fix, and the only thing that
     // stops a deliberate attacker — is XERK-268.
-    // **Every refusal answers the SAME 404** — wrong host, wrong phase, empty
-    // body, vanished source session; the 413 below is the one exception, and
-    // is discussed there — and that uniformity is the point, not
+    // **Every refusal answers the SAME 404** — wrong host, wrong phase, an
+    // upload already in flight, a spool that could not be written, empty body,
+    // vanished source session; the 413 below is the one exception, and is
+    // discussed there — and that uniformity is the point, not
     // tidiness: any RESPONSE a non-source cannot also get names the source to a
-    // prober. So do NOT restore a friendlier 409/400 at any of them, and
+    // prober. So do NOT restore a friendlier 409/400/500 at any of them, and
     // **enumerate what this route can answer rather than eyeballing the guard**
     // — the `source session gone` branch below is why. The real source loses
     // nothing it acts on: it only logs the failure, and the RECORD still
@@ -3770,16 +4213,62 @@ const server = http.createServer(async (req, res) => {
       const m = migrations.get(id);
       if (!m || m.srcHost !== host || m.phase !== "exporting")
         return json(res, 404, { error: "unknown migration" });
-      let blob;
-      try {
-        blob = await readRawBody(req, MIGRATE_BLOB_MAX);
-      } catch (e) {
-        m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
-        publishMigrations();
-        return json(res, 413, { error: e.message });
+      // Two uploads for one migration would interleave into a single spool
+      // file, since the phase only flips once the first finishes writing.
+      // Drained first, so the loser reads the reply instead of a socket error
+      // — and it is the SAME 404 as every other refusal above, since only the
+      // real source can reach this line.
+      if (m.uploading) {
+        req.resume();
+        return json(res, 404, { error: "unknown migration" });
       }
-      if (!blob.length) return json(res, 404, { error: "unknown migration" });
-      m.blob = blob;
+      // Spooled to disk rather than buffered (XERK-263); the record keeps only
+      // the path, so an in-flight move costs the hub bytes, not megabytes.
+      const spool = migrationSpoolPath(m.id);
+      let size;
+      m.uploading = true;
+      try {
+        size = await spoolRawBody(req, MIGRATE_BLOB_MAX, spool);
+      } catch (e) {
+        m.uploading = false;
+        const tooBig = e && e.tooLarge;
+        m.phase = "failed";
+        m.error = tooBig ? "transcript bundle too large" : "transcript bundle spool failed";
+        m.at = Date.now();
+        publishMigrations();
+        // The 413 is the enumerated exception discussed above. A SPOOL failure
+        // is not a second one: it answers the uniform 404 like every other
+        // refusal, because a distinct status would name the source to anyone
+        // holding the id the moment the hub's disk misbehaved. Nothing is lost
+        // — the agent only logs the reply, the RECORD carries the real reason
+        // for the operator, and the detail (which names the spool path) goes to
+        // the hub's log where it is actionable.
+        if (tooBig) return json(res, 413, { error: e.message });
+        console.error(`migration ${m.id}: spool failed: ${e && e.message}`);
+        return json(res, 404, { error: "unknown migration" });
+      }
+      m.uploading = false;
+      if (!size) {
+        // Never recorded on m, so drop the empty file here — and drop it
+        // BEFORE answering. This is the one path that leaves the migration
+        // retriable, and a fire-and-forget unlink could land after a retry had
+        // already re-created the same path and deleted the good bundle.
+        try { fs.unlinkSync(spool); } catch {}
+        return json(res, 404, { error: "unknown migration" });
+      }
+      // The move may have SETTLED while those bytes were being written — a
+      // refusal the source staged for this very upload (its POST timed out
+      // while the hub was still spooling, XERK-265) fails it within one beat,
+      // and the timeout can land here too. Advancing anyway would resurrect a
+      // move the operator was already told had failed, queue an importSession
+      // for it, and then kill the source when the target came up. Same careful
+      // unlink as the empty-body path: this file is now nobody's.
+      if (m.phase !== "exporting") {
+        try { fs.unlinkSync(spool); } catch {}
+        return json(res, 404, { error: "unknown migration" });
+      }
+      m.blobPath = spool;
+      m.blobSize = size;
       m.phase = "importing";
       m.at = Date.now();
       // Hand the target everything it needs to resume the moved session as its
@@ -3793,9 +4282,11 @@ const server = http.createServer(async (req, res) => {
         // The RECORD says what really happened (the operator reads that, and it
         // stays truthful), but the REPLY is the same 404 as every other refusal
         // — only the real source can reach this line, so a distinct status here
-        // would name it to anyone holding the id, exactly like the 409 and 400
-        // above. Nothing consumes this reply; the agent only logs it.
-        m.phase = "failed"; m.error = "source session gone"; m.blob = null; m.at = Date.now();
+        // would name it to anyone holding the id, exactly like the spool and
+        // empty-body refusals above. Nothing consumes this reply; the agent
+        // only logs it.
+        m.phase = "failed"; m.error = "source session gone";
+        dropMigrationBlob(m); m.at = Date.now();
         publishMigrations();
         return json(res, 404, { error: "unknown migration" });
       }
@@ -3832,13 +4323,36 @@ const server = http.createServer(async (req, res) => {
       const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m || m.targetHost !== host || !m.blob) return json(res, 404, { error: "no bundle" });
-      res.writeHead(200, {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": m.blob.length,
-        "Cache-Control": "no-store",
+      if (!m || m.targetHost !== host || !m.blobPath)
+        return json(res, 404, { error: "no bundle" });
+      // SNAPSHOT the path and size together, before the first async hop. A
+      // concurrent settle (a heartbeat's handoff, the timeout sweep) calls
+      // dropMigrationBlob, which zeroes both — and since the unlink leaves this
+      // read's fd valid, reading the size later served the full body under a
+      // `Content-Length: 0`, which the agent's urllib read as an empty bundle.
+      const blobPath = m.blobPath;
+      const blobSize = m.blobSize;
+      // Streamed off the spool file, so handing a 65 MiB bundle down costs the
+      // hub a read buffer rather than a second copy of the whole thing.
+      const stream = fs.createReadStream(blobPath);
+      // Headers wait for `open`, so a spool file that was never written (or is
+      // unreadable) is still a clean 404 rather than a truncated 200.
+      stream.once("open", () => {
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": blobSize,
+          "Cache-Control": "no-store",
+        });
+        stream.pipe(res);
       });
-      return res.end(m.blob);
+      stream.on("error", (e) => {
+        if (res.headersSent) return res.destroy();
+        json(res, 404, { error: "no bundle" });
+        console.error(`migration ${id}: bundle read failed: ${e && e.message}`);
+      });
+      // The agent hanging up mid-download must not leave the read running.
+      res.on("close", () => stream.destroy());
+      return;
     }
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
@@ -4134,12 +4648,24 @@ const server = http.createServer(async (req, res) => {
           });
         // Single-flight: don't start a second move of the same session while one
         // is already exporting/importing (a double-click must not fan out).
+        let inFlight = 0;
         for (const m of migrations.values()) {
-          if (m.srcHost === key && m.srcSessionId === sessionId &&
-              (m.phase === "exporting" || m.phase === "importing")) {
+          if (m.phase !== "exporting" && m.phase !== "importing") continue;
+          inFlight++;
+          if (m.srcHost === key && m.srcSessionId === sessionId) {
             return json(res, 409, { error: "this session is already being moved" });
           }
         }
+        // Each in-flight move is a 65 MiB bundle already spooled onto /data or
+        // about to be (an `exporting` one is waiting on exactly that upload),
+        // and /data is shared with the archive — so cap how many can be in that
+        // state at once. Refusing HERE is safe in a way refusing the relay
+        // upload isn't: this is the operator's own click, and the web Move
+        // control shows the reason (see PARITY.md for the Android gap).
+        if (inFlight >= MIGRATE_INFLIGHT_MAX)
+          return json(res, 503, {
+            error: `too many moves in flight (${MIGRATE_INFLIGHT_MAX}) — wait for one to finish`,
+          });
         const m = startMigration(key, s, target);
         return json(res, 200, { ok: true, migrationId: m.id });
       }
@@ -5035,12 +5561,18 @@ server.on("upgrade", async (req, socket, head) => {
       if (op !== 0x1) return;
       let msg;
       try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
-      if (msg && msg.tail && Array.isArray(msg.entries)) {
+      // The session id must be a STRING, not merely truthy (XERK-278). It is
+      // used as a property key in `liveFanout`, and coercing an object to a key
+      // runs the same ToPrimitive that `safeString` exists to survive — so an
+      // object id here threw out of this listener and killed the process, the
+      // moment any viewer socket was open on that host. Every real id is a
+      // string, so this only ever refuses a malformed frame.
+      if (msg && typeof msg.tail === "string" && msg.tail && Array.isArray(msg.entries)) {
         // `queued` = still-queued prompts typed mid-turn (foldQueueOp in
         // tunnel-agent.js); absent from agents predating it.
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
           queued: Array.isArray(msg.queued) ? msg.queued : [] });
-      } else if (msg && msg.turn && typeof msg.text === "string") {
+      } else if (msg && typeof msg.turn === "string" && msg.turn && typeof msg.text === "string") {
         // `agents` = the session's live agent list, which outlives the turn
         // (a background agent keeps running after the main one stops), so it
         // rides beside `status` rather than inside it; absent from agents
@@ -5276,6 +5808,10 @@ server.on("upgrade", async (req, socket, head) => {
   socket.destroy();
 });
 
+// Nothing in the migration spool survives a restart usefully (the records that
+// name those files were in memory), so clear it before anything can relay.
+sweepMigrationSpool();
+
 // Test hooks: when TURMA_TEST is set (never in the image — the Dockerfile
 // runs `node server.js` with it unset), export the internals for the test
 // suite and skip binding the production port (tests listen on an ephemeral
@@ -5307,6 +5843,16 @@ if (process.env.TURMA_TEST) {
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
     HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+    // Ingest coercion, exported for the same reason as the rest of this group:
+    // Android decodes /api/agents atomically, so one host's wrong-typed field
+    // hides the WHOLE fleet from that phone (XERK-246). `normalizeRecord` is
+    // the one both the ingest path and the state.json restore call.
+    normalizeRecord,
+    normalizeLocalModel,
+    // The holder the heartbeat's coercion step goes through, exported so a test
+    // can make it throw and hold the rollback that follows (XERK-262). See its
+    // declaration for why that rollback cannot be reached from the wire.
+    recordCoercion,
 
     queueCommand,
     findSession,
@@ -5360,6 +5906,12 @@ if (process.env.TURMA_TEST) {
     findTicketHost,
     migrations,
     advanceMigrations,
+    // The relay spools bundles here rather than holding them in the record
+    // (XERK-263); exported so a test can look at what is actually on disk.
+    MIGRATE_SPOOL_DIR,
+    sweepMigrationSpool,
+    dropMigrationBlob,
+    migrationSpoolPath,
     siteKeyOf,
   };
 } else {

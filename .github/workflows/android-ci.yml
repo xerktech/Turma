@@ -1,7 +1,13 @@
 name: android-ci
 
 # PR gate for the Android client: unit-test the pure core (transcript/
-# sessions/chat-items + serialization) and assemble a debug APK.
+# sessions/chat-items + serialization), the ViewModels and the Compose call
+# sites (Robolectric, XERK-262), then assemble a debug APK.
+#
+# `testDebugUnitTest` is the ONLY Android gate this repo runs, which is why the
+# Compose tests live in the unit-test source set rather than androidTest — see
+# .claude/rules/android.md. Adding an emulator job would be the alternative;
+# don't move those tests without adding one.
 #
 # Runs on GitHub-hosted `ubuntu-latest`, using the JDK + Android SDK that runner
 # image preinstalls. It used to run on the self-hosted box inside the multi-GB
@@ -74,7 +80,26 @@ jobs:
       - name: Ensure SDK packages
         run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
 
-      - name: Unit tests (pure core)
+      # Robolectric fetches an ~190MB instrumented `android-all` for the SDK the
+      # tests pin (35, matching compileSdk) into ~/.m2 on first use, and a hosted
+      # runner starts empty every time. Without this the ViewModel/Compose tests
+      # (XERK-262) re-download it on every run of the repo's most expensive
+      # non-image job.
+      #
+      # The key is the gradle file's hash — i.e. "the dependency set changed",
+      # not "Robolectric was bumped": an unrelated gradle edit misses the exact
+      # key, and `restore-keys` then restores across versions anyway. That is
+      # safe rather than sloppy, because Robolectric's cache path encodes the
+      # exact build (`android-all-instrumented/<sdk>-robolectric-<build>-i7`), so
+      # a stale jar can never be SERVED — only accumulated.
+      - name: Cache Robolectric android-all jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-${{ runner.os }}-${{ hashFiles('android/app/build.gradle.kts') }}
+          restore-keys: robolectric-${{ runner.os }}-
+
+      - name: Unit tests (core, ViewModels, Compose)
         run: gradle :app:testDebugUnitTest --no-daemon --stacktrace
 
       - name: Assemble debug APK
