@@ -197,16 +197,21 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   - **Retained bytes gate that escape and nothing else.** Charging them to the ceilings outright
     refused ordinary heartbeats fleet-wide for as long as an attachment sat in a composer — a staged
     upload lives 20 minutes.
-- **A refusal must REACH the client, and a 413 more than a 503.** The agent sheds its oversized
-  staged results only when it sees a 413, so a lost one is the retry-forever loop it replaced; a lost
-  503 costs nothing, since the client retries either way. So a 413 is **patient** — the body is read
-  to its declared end and the status sent only once the request is complete, because node tears down a
-  socket whose response finished first, and a client that writes everything before reading (python's
-  urllib, which is how the agent posts) would see a broken pipe. Patience is capped at
-  `PATIENT_REFUSALS_MAX` concurrent reads; everything else is refused terminally (paused, answered,
-  socket cut), because reading a body per refusal is what OOM-killed the hub under a flood.
-  - `Connection: close` goes only on a terminal refusal. On the patient path it IS the reset that
-    path exists to avoid.
+- **Every refusal is TERMINAL** (`refuse`): stop reading, flush the status, cut the socket. Both
+  alternatives are worse — draining a body per refusal OOM-killed the hub under a flood, and pausing
+  instead is no better because cgroup v2 counts kernel socket buffers against the container.
+- **So a mid-upload refusal may not be RECEIVED, and nothing may depend on it being received.** The
+  hub answers while the body is still arriving, node tears down a socket whose response finished
+  before its request did, and a client that writes everything before reading a byte (python's urllib
+  — how the agent posts) sees a broken pipe instead. Two consequences, both load-bearing:
+  - **The caps are ADVERTISED, and the clients pre-check.** The beat reply carries
+    `heartbeatMaxBytes`, and the agent sheds staged results before it posts (`_fit_to_hub_cap`); the
+    composer checks `uploadMaxBytes` before it uploads. **Prevention, not diagnosis** — a rationed
+    "be patient so the 413 lands" scheme was tried and made the ration itself the attack (four idle
+    sockets exhausted it, and then no 413 was receivable at all, which IS the retry-forever loop).
+  - **A 413 raised AFTER a complete read is still delivered normally** (`AGENT_RECORD_MAX` — the body
+    finished, so `json()` answers on a healthy socket). That is the 413 the agent's shed most relies
+    on, and it must stay that way.
 - **`release()` must run on every exit path**, which is why it is idempotent and guarded on `close`
   as well as `error`/`end`: a leaked reservation is never recovered, and enough of them refuse every
   large body for the life of the process.

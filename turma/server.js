@@ -2058,8 +2058,6 @@ function readBody(req, cap = BODY_MAX) {
     let data = "";
     let len = 0;
     let refused = false;
-    let drainUntil = 0; // >0 while a patient refusal is still reading; see below
-    let pending = null; // the refusal being held back until the body is drained
     let settled = false;
     const settle = (err) => {
       if (settled) return;
@@ -2070,37 +2068,27 @@ function readBody(req, cap = BODY_MAX) {
       data = ""; // release it — it is not going to be used
       refused = true;
       budget.release();
-      err.patient = takePatience(err);
-      if (!err.patient) {
-        req.pause(); // stalled; refuse() cuts it once the status is out
-        return settle(err);
-      }
-      // PATIENT: read the rest of the body away, and answer only once it is in.
-      // Answering first is what loses the status: node tears down a socket whose
-      // response finished before its request did, and a client that writes its
-      // whole body before reading a byte (python's urllib — exactly how the agent
-      // posts) then sees a broken pipe instead of the 413 it needs in order to
-      // shed and stop retrying.
-      drainUntil = patientDrainTarget(req, cap);
-      pending = err;
-      req.once("close", releasePatience); // only ever for a slot we took
+      // EVERY refusal is terminal: stop reading, answer, and let refuse() cut the
+      // socket once the status is out. There is deliberately no "patient" mode
+      // that keeps reading so a slow client can be sure to see the status —
+      // draining a body per refusal is what OOM-killed the hub under a flood, and
+      // rationing patience made the ration itself the attack (four idle sockets
+      // could exhaust it and then no 413 was receivable at all). What replaced it
+      // is prevention: the hub ADVERTISES its cap on every beat reply, so a
+      // current agent sheds before it ever POSTs something this size.
+      req.pause();
+      settle(err);
     };
     req.on("data", (c) => {
       len += c.length;
-      if (refused) {
-        // Past what it said it would send: stop waiting to be polite.
-        if (drainUntil && len > drainUntil) { req.destroy(); settle(pending); }
-        return; // paused or draining; either way these bytes are dropped
-      }
+      if (refused) return; // paused; anything still arriving is dropped
       if (len > cap) return fail(new BodyTooLarge(cap));
       const overBudget = budget.note(len);
       if (overBudget) return fail(overBudget);
       data += decoder.write(c);
     });
     req.on("end", () => {
-      if (settled) return;
-      if (pending) return settle(pending); // drained; now it can be answered
-      if (refused) return;
+      if (settled || refused) return;
       settled = true;
       budget.release();
       resolve(data + decoder.end());
@@ -2129,55 +2117,6 @@ function readBody(req, cap = BODY_MAX) {
 // gives up on being heard and cuts the socket. Only reached when nothing else is
 // in flight, so this is one body's worth of churn, never a flood's.
 const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
-
-// How many refused reads may be PATIENT at once — kept being read and discarded
-// so their client finishes uploading and reads the status, instead of having the
-// socket cut from under it.
-//
-// Patience is spent only on 413, and only a few at a time, because those two
-// bounds are what make it affordable. A 413 must be RECEIVED: the agent sheds its
-// oversized staged results only when it sees one, and a 413 lost to a socket reset
-// is the retry-forever loop it was introduced to replace. A 503 needs no such
-// care — the client's response to a lost 503 and to a received one is the same
-// beat, retried. And the cost is real: reading a body per refusal to the end is
-// what OOM-killed the hub under a flood of large POSTs, which is the opposite of
-// what refusing them is for.
-const PATIENT_REFUSALS_MAX = 4;
-let patientRefusals = 0;
-
-/** Claim one of the patience slots for `err`, if it deserves and can have one. */
-function takePatience(err) {
-  if (!err || !err.tooLarge) return false; // 503s are not worth a slot
-  if (patientRefusals >= PATIENT_REFUSALS_MAX) return false;
-  patientRefusals++;
-  return true;
-}
-
-/** Give a patience slot back. Idempotent per read (guarded by the caller). */
-function releasePatience() {
-  if (patientRefusals > 0) patientRefusals--;
-}
-
-// How far past the route cap a PATIENT refusal will still read, as a multiple of
-// the cap. It has to be more than 1: the client of a 413 is by definition sending
-// MORE than the cap, so draining only to the cap cuts it off just before it
-// finishes — and a client that writes its whole body before reading (python's
-// urllib, which is exactly how the agent posts) then loses the status to a broken
-// pipe and never sheds. Bounded anyway, because an absurdly declared body is not
-// worth reading to be polite.
-const PATIENT_DRAIN_CAP_MULT = 4;
-
-/**
- * How far a patient refusal reads before giving up on being heard: to the end of
- * what the client SAID it was sending, so it can finish and read the status.
- * Discarded bytes cost no memory, and at most PATIENT_REFUSALS_MAX reads are ever
- * doing this at once.
- */
-function patientDrainTarget(req, cap) {
-  const declared = Number(req.headers["content-length"]);
-  const target = Number.isFinite(declared) && declared > 0 ? declared : cap;
-  return Math.min(target, cap * PATIENT_DRAIN_CAP_MULT) + RAW_BODY_DRAIN_SLACK;
-}
 
 /**
  * A body whose OWN DECLARED LENGTH is already past the route cap, refused before
@@ -2236,8 +2175,6 @@ function readRawBody(req, cap) {
     let chunks = [];
     let len = 0;
     let refused = false;
-    let drainUntil = 0; // see readBody: a patient refusal drains before answering
-    let pending = null;
     let settled = false;
     const settle = (err) => {
       if (settled) return;
@@ -2248,30 +2185,27 @@ function readRawBody(req, cap) {
       chunks = []; // release what we'd buffered — it is not going to be used
       refused = true;
       budget.release();
-      err.patient = takePatience(err);
-      if (!err.patient) {
-        req.pause();
-        return settle(err);
-      }
-      drainUntil = patientDrainTarget(req, cap);
-      pending = err;
-      req.once("close", releasePatience);
+      // EVERY refusal is terminal: stop reading, answer, and let refuse() cut the
+      // socket once the status is out. There is deliberately no "patient" mode
+      // that keeps reading so a slow client can be sure to see the status —
+      // draining a body per refusal is what OOM-killed the hub under a flood, and
+      // rationing patience made the ration itself the attack (four idle sockets
+      // could exhaust it and then no 413 was receivable at all). What replaced it
+      // is prevention: the hub ADVERTISES its cap on every beat reply, so a
+      // current agent sheds before it ever POSTs something this size.
+      req.pause();
+      settle(err);
     };
     req.on("data", (c) => {
       len += c.length;
-      if (refused) {
-        if (drainUntil && len > drainUntil) { req.destroy(); settle(pending); }
-        return; // paused or draining; either way these bytes are dropped
-      }
+      if (refused) return; // paused; anything still arriving is dropped
       if (len > cap) return fail(new BodyTooLarge(cap));
       const overBudget = budget.note(len);
       if (overBudget) return fail(overBudget);
       chunks.push(c);
     });
     req.on("end", () => {
-      if (settled) return;
-      if (pending) return settle(pending);
-      if (refused) return;
+      if (settled || refused) return;
       settled = true;
       const body = Buffer.concat(chunks);
       chunks = [];
@@ -2303,32 +2237,22 @@ function readRawBody(req, cap) {
  * flushed — the client gets its status AND its connection pool doesn't keep a
  * half-written socket it will hand to the next request, which stalls that one.
  */
-function refuse(res, code, obj, patient) {
+function refuse(res, code, obj) {
   if (res.writableEnded) return;
   res.writeHead(code, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
-    // `Connection: close` is NOT harmless here: node destroys the socket once the
-    // response is out whenever the request body was left unread, so sending it on
-    // the patient path is itself the socket reset that path exists to avoid — the
-    // client never got to finish its upload and read the status. Only the terminal
-    // path, which is trying to free the socket, asks for the close.
-    ...(patient ? {} : { Connection: "close" }),
+    Connection: "close",
     ...(code === 503 ? { "Retry-After": "1" } : {}),
   });
-  // `patient` is the calm case (see the readers' fail()): the body keeps being
-  // read and discarded, so a client that is still uploading finishes its write
-  // and READS this status. That matters most for 413 — the agent sheds its
-  // oversized staged results only if it actually sees one, and a lost 413 is the
-  // retry-forever loop it replaced.
-  //
-  // Otherwise the socket is stalled and paused, and a stalled socket is not free:
-  // cgroup v2 counts kernel socket buffers against the container, so 512 of them
-  // held open OOM-killed the hub as surely as reading them would have. Flush
-  // first, then destroy, so there is still a status on the wire to be read if the
-  // client is listening.
-  if (patient) res.end(JSON.stringify(obj));
-  else res.end(JSON.stringify(obj), () => res.socket && res.socket.destroy());
+  // The body is paused, so the socket is stalled with bytes nobody will read —
+  // and a stalled socket is not free: cgroup v2 counts kernel socket buffers
+  // against the container, so holding 512 of them open OOM-kills the hub as surely
+  // as reading them would. Flush the status first, THEN destroy, so a client that
+  // reads while it writes still gets something to branch on. A client that writes
+  // its whole body before reading (python's urllib) may still lose it, which is
+  // why the cap is advertised on every beat reply rather than only enforced here.
+  res.end(JSON.stringify(obj), () => res.socket && res.socket.destroy());
 }
 
 function json(res, code, obj) {
@@ -4070,8 +3994,21 @@ const server = http.createServer(async (req, res) => {
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
-      return json(res, 200,
-        archiveHave ? { commands: reply, archiveHave } : { commands: reply });
+      // Tell the agent how big a beat this hub will take. PREVENTION, not
+      // diagnosis: a 413 only helps if the agent receives it, and it cannot be
+      // relied on to — the hub answers while the body is still uploading, node
+      // tears the socket down at that point, and the agent's urllib writes
+      // everything before it reads a byte, so an oversized beat reaches it as a
+      // broken pipe. It then keeps the same payload and re-sends it forever, and
+      // the host stays offline (XERK-235's symptom). Knowing the cap, a current
+      // agent sheds BEFORE it posts and never gets into that state; the 413 stays
+      // as the backstop for an agent too old to read this. Named like the other
+      // capability flags on this wire, and absent means "can't tell you".
+      return json(res, 200, {
+        commands: reply,
+        heartbeatMaxBytes: HEARTBEAT_MAX,
+        ...(archiveHave ? { archiveHave } : {}),
+      });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
@@ -4147,7 +4084,7 @@ const server = http.createServer(async (req, res) => {
         m.error = busy ? "hub too busy to accept the transcript bundle" : "transcript bundle too large";
         m.at = Date.now();
         publishMigrations();
-        return refuse(res, busy ? 503 : 413, { error: e.message }, e.patient);
+        return refuse(res, busy ? 503 : 413, { error: e.message });
       }
       if (!blob.length) return json(res, 400, { error: "empty bundle" });
       m.blob = blob;
@@ -4519,11 +4456,11 @@ const server = http.createServer(async (req, res) => {
           // attachment so the operator can retry the same one (XERK-258).
           if (e && e.overBudget)
             return refuse(res, 503,
-              { error: "the hub is busy receiving other data — try again shortly" }, e.patient);
+              { error: "the hub is busy receiving other data — try again shortly" });
           return refuse(res, 413, {
             error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
             limit: cap,
-          }, e.patient);
+          });
         }
         if (!bytes.length) return json(res, 400, { error: "empty file" });
         // Refuse rather than evict: the blobs already held belong to messages
@@ -5297,7 +5234,7 @@ const server = http.createServer(async (req, res) => {
     // The socket is still open here precisely because readBody drained instead
     // of destroying it (XERK-235).
     if (err && err.tooLarge) {
-      refuse(res, 413, { error: "body too large", limit: err.cap }, err.patient);
+      refuse(res, 413, { error: "body too large", limit: err.cap });
       return;
     }
     // Not too big — badly timed. 503 + Retry-After is what tells an agent to
@@ -5313,7 +5250,7 @@ const server = http.createServer(async (req, res) => {
         `over the ${err.ceiling} in-flight ceiling (${err.held} of ${err.limit} bytes held): ` +
           `${req.method} ${url.pathname}`
       );
-      refuse(res, 503, { error: err.message }, err.patient);
+      refuse(res, 503, { error: err.message });
       return;
     }
     json(res, 400, { error: err.message });
@@ -5688,7 +5625,7 @@ if (process.env.TURMA_TEST) {
     // every large body for the life of the process, and would otherwise only
     // show up as a hub that has stopped taking heartbeats.
     detectMemoryLimit, HUB_MEM_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_FREE,
-    BODY_INFLIGHT_TOTAL_MAX, BODY_INFLIGHT_ESCAPE_MAX, retainedBytes,
+    BODY_INFLIGHT_TOTAL_MAX, BODY_INFLIGHT_ESCAPE_MAX, retainedBytes, HEARTBEAT_MAX,
     UPLOAD_MAX_BYTES, UPLOAD_TOTAL_MAX_BYTES,
     inFlightBodyBytes: () => inFlightBodyBytes,
     inFlightTotalBytes: () => inFlightTotalBytes,

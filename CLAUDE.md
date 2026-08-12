@@ -231,10 +231,11 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   POST succeeds, so re-sending is right for 503 and an infinite loop for 413 — `post()` therefore
   SHEDS a tier of staged results on 413 (`_shed_staged_results`) and keeps everything on 503. Never
   collapse the two into one status.
-  - The hub's half of that contract is that a **413 has to be RECEIVABLE**: it drains the body before
-    answering, because node tears down a socket whose response finished before its request did, and
-    the agent's `urllib` writes its whole body before reading a byte. A 413 lost to a broken pipe is
-    the retry-forever loop with extra steps. Detail in `.claude/rules/turma.md`.
+  - **But nothing may DEPEND on a mid-upload refusal arriving.** The hub answers while the body is
+    still coming, node then tears the socket down, and `urllib` writes everything before it reads — so
+    that 413 often reaches the agent as a broken pipe. Hence the cap is **advertised**
+    (`heartbeatMaxBytes` on every beat reply) and the agent sheds BEFORE posting; the 413 is only the
+    backstop for an agent too old to read the field. Detail in `.claude/rules/turma.md`.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 

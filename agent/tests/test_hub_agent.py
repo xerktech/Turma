@@ -9213,6 +9213,96 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
                                 side_effect=self._http_error(413)):
             self.assertIsNone(sm.post(sm.build_payload(3)))
 
+    def test_hub_cap_is_learned_from_the_reply_and_sheds_before_posting(self):
+        # The 413 cannot be relied on to ARRIVE: the hub answers mid-upload and its
+        # socket goes down at that point, while urllib writes the whole body before
+        # reading a byte — so an oversized beat comes back as a broken pipe and the
+        # host re-sends it forever (XERK-235's symptom). The hub therefore
+        # advertises its cap and the agent sheds BEFORE posting.
+        sm = self.make_manager()
+        self.assertIsNone(sm.heartbeat_max_bytes, "unknown until a hub says so")
+
+        sent = []
+
+        class FakeResp:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return self.body
+
+        def urlopen(req, timeout=None):
+            sent.append(req.data)
+            return FakeResp(b'{"commands":[],"heartbeatMaxBytes":4096}')
+
+        with mock.patch.object(ha.urllib.request, "urlopen", urlopen):
+            sm.post(sm.build_payload(0))
+        self.assertEqual(sm.heartbeat_max_bytes, 4096)
+
+        # Now stage something far over that cap: it must never reach the wire.
+        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 20000}]})
+        with mock.patch.object(ha.urllib.request, "urlopen", urlopen):
+            sm.post(sm.build_payload(1))
+        self.assertLessEqual(len(sent[-1]), 4096, "the oversized beat must be shed, not sent")
+        self.assertNotIn(b"historyResults", sent[-1])
+
+    def test_hub_cap_absent_means_unknown_not_unlimited(self):
+        # A hub too old to advertise the cap must leave the last known value alone.
+        # Treating an absent capability flag as "no limit" is the mistake the
+        # heartbeat wire contract exists to prevent.
+        sm = self.make_manager()
+        sm.heartbeat_max_bytes = 4096
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"commands":[]}'
+
+        with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
+            sm.post(sm.build_payload(0))
+        self.assertEqual(sm.heartbeat_max_bytes, 4096)
+        for bad in (0, -1, "lots", None):
+            with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
+                sm.post(sm.build_payload(1))
+            self.assertEqual(sm.heartbeat_max_bytes, 4096, f"{bad!r} must not become a cap")
+
+    def test_a_beat_over_the_cap_with_nothing_to_shed_is_still_sent(self):
+        # The base payload can exceed the cap on its own (a host with very many
+        # sessions). Refusing to send it would take the host offline silently;
+        # sending it gets a 413 the operator can at least see.
+        sm = self.make_manager()
+        sm.heartbeat_max_bytes = 8  # smaller than any real payload
+        sent = []
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def urlopen(req, timeout=None):
+            sent.append(req.data)
+            return FakeResp()
+
+        with mock.patch.object(ha.urllib.request, "urlopen", urlopen):
+            sm.post(sm.build_payload(0))
+        self.assertEqual(len(sent), 1, "it still goes out")
+
     def test_413_keeps_pending_pr_links(self):
         # PR chips are not an on-demand deliverable and are tiny; shedding them
         # would drop a session's PR from every surface to save nothing.

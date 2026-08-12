@@ -1735,6 +1735,52 @@ test("http: an ordinary beat is never refused because a big one is in flight", a
   );
 });
 
+test("http: every beat reply advertises the body cap, so the agent sheds before posting", async () => {
+  // The 413 cannot be relied on to ARRIVE — the hub answers mid-upload, node tears
+  // the socket down at that point, and the agent's urllib writes its whole body
+  // before reading a byte, so an oversized beat comes back as a broken pipe and is
+  // re-sent forever. Prevention is the contract; the 413 is only the backstop.
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "cap-host" }, headers: agentHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.heartbeatMaxBytes, hub.HEARTBEAT_MAX);
+  assert.ok(res.body.heartbeatMaxBytes > 0);
+  // It must not displace what the reply already carried.
+  assert.deepEqual(res.body.commands, []);
+});
+
+test("http: a body DECLARING more than the ledger has room for is refused on its headers", async () => {
+  // Refusing large declared bodies before they stream is what keeps the cost of a
+  // flood down — at 512 sockets the expense is the sockets, not the bytes. It is a
+  // status decision only (budget.peek reserves nothing), which is what separates it
+  // from the reservation-on-Content-Length that was a denial of service.
+  await withHeldPost(
+    "/api/heartbeat", beatOfSize("peek-holder", 2.5 * 1024 * 1024), agentHeaders,
+    async () => {
+      // Headers only — not one byte of body — declaring far more than is free.
+      const sock = net.connect(new URL(baseUrl).port, "127.0.0.1");
+      try {
+        await new Promise((r, rej) => { sock.once("connect", r); sock.once("error", rej); });
+        let reply = "";
+        sock.on("data", (c) => (reply += c));
+        sock.on("error", () => {});
+        sock.write(
+          "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\n" +
+            "Authorization: Bearer agenttok\r\nContent-Type: application/json\r\n" +
+            `Content-Length: ${8 << 20}\r\n\r\n`
+        );
+        await waitUntil(() => reply.includes("\r\n\r\n"), "a refusal on the headers alone");
+        assert.match(reply, /^HTTP\/1\.1 503/, "declared-over-budget is refused before it streams");
+        // And it reserved nothing on the way past.
+        assert.ok(inFlightTotalBytes() > 0, "only the held body is counted");
+      } finally {
+        sock.destroy();
+      }
+    }
+  );
+});
+
 test("http: a socket that DECLARES a body and sends nothing reserves nothing (XERK-258)", async () => {
   // The first version of this budget reserved off Content-Length before reading a
   // byte, to refuse an over-budget POST without paying to receive it. That was an
@@ -2472,7 +2518,12 @@ test("http: command queue rides the reply until acked", async () => {
   // Register the host; queue is empty at first.
   let res = await beat({ device: "h1" });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { commands: [] });
+  assert.deepEqual(res.body.commands, []);
+  // The reply also carries the body cap the agent pre-sheds against (XERK-258).
+  // Asserted here as well as in its own case because this is the test that pins
+  // the reply's SHAPE, and a capability flag silently dropped from it puts every
+  // agent back to discovering the cap by 413 — which it cannot reliably receive.
+  assert.equal(res.body.heartbeatMaxBytes, hub.HEARTBEAT_MAX);
 
   // The UI queues two session commands (as the /api/agents/... routes do).
   const spawnRes = await request("POST", "/api/agents/h1/sessions", {

@@ -8458,6 +8458,12 @@ class SessionManager:
         self.session_facts = {}
         # Throttled `docker logs` tail (LOG_TAIL_EVERY beats); reused in between.
         self.log_tail_cache = None
+        # The largest heartbeat body the hub says it will take, learned from each
+        # beat reply (`heartbeatMaxBytes`, XERK-258). None until the first reply, or
+        # from a hub too old to send it — in which case nothing is pre-shed and the
+        # 413 backstop applies. See _fit_to_hub_cap for why the 413 alone isn't
+        # enough to rely on.
+        self.heartbeat_max_bytes = None
         # Staged `history` command results awaiting the next heartbeat payload
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
@@ -14376,6 +14382,36 @@ class SessionManager:
                 return ", ".join(shed)
         return None
 
+    def _fit_to_hub_cap(self, payload):
+        """Shed staged results until the encoded payload fits the cap the hub
+        advertised, and return the bytes to send.
+
+        **Never rely on the 413 to find this out.** The hub answers while the body
+        is still uploading and its socket goes down at that point, while urllib
+        writes the whole request before reading a byte — so an oversized beat
+        reaches us as a broken pipe, not a status, and re-sending it forever is how
+        a host stays offline with nothing to show for it (XERK-235's symptom,
+        XERK-258's fix). The cap rides every beat reply; until the first reply, or
+        from a hub too old to send it, `heartbeat_max_bytes` is None and we simply
+        post and let the 413 backstop apply."""
+        body = json.dumps(payload).encode()
+        cap = self.heartbeat_max_bytes
+        if not cap or len(body) <= cap:
+            return body
+        while len(body) > cap:
+            shed = self._shed_staged_results()
+            if not shed:
+                log(f"heartbeat is {len(body)} bytes, over the hub's {cap} cap, with nothing "
+                    f"left to shed — posting anyway so the hub can say why")
+                return body
+            log(f"heartbeat would be {len(body)} bytes, over the hub's {cap} cap — "
+                f"dropped staged {shed} before sending; re-open the view to fetch them again")
+            for name in ("historyResults", "subagentHistoryResults", "jiraIssueResults",
+                         "ticketStatusResults", "createMetaResults", "createTicketResults"):
+                payload.pop(name, None)
+            body = json.dumps(payload).encode()
+        return body
+
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
         (pending PR links are kept so they aren't lost on a failed beat)."""
@@ -14388,12 +14424,20 @@ class SessionManager:
                 headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
             req = urllib.request.Request(
                 f"{TURMA_URL}/api/heartbeat",
-                data=json.dumps(payload).encode(),
+                data=self._fit_to_hub_cap(payload),
                 headers=headers,
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
+            # Remember the hub's body cap for the NEXT beat's pre-flight shed. A
+            # hub too old to send it leaves the last known value alone rather than
+            # clearing it — the field is a capability flag, and absent means "can't
+            # tell you", never "unlimited".
+            if isinstance(reply, dict):
+                cap = reply.get("heartbeatMaxBytes")
+                if isinstance(cap, int) and cap > 0:
+                    self.heartbeat_max_bytes = cap
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
             self.subagent_history_results.clear()  # delivered — same lifecycle
