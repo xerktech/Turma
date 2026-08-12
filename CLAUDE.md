@@ -259,6 +259,24 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
     a refusal, and folding them together burned 60s and then said nothing.
   - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+- **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
+  agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
+  the tunnel's `?name=` — and each agent runs on its OWN token,
+  `<base64url(device)>.<HMAC(TURMA_AGENT_TOKEN, device)>`, which the hub re-derives against the host
+  that was named. **The token NAMES its host on purpose**: an HMAC can't be inverted, so a bare
+  digest could only be checked once the host was known, and `/api/heartbeat` — whose host is buried
+  in a 32 MiB body — would have had to admit any bearer before reading it.
+  - **Scoping a route to a host is not a security check on its own.** Under one fleet-shared token
+    `<host>` was self-asserted, so `m.srcHost !== host` refused a caller naming ITSELF and passed one
+    naming the victim; `device` was the same, so any token-holder could beat as another host and be
+    handed the commands queued for it. Both halves — the scope AND the binding — or neither is worth
+    stating. Never write a comment claiming a `<host>` compare keeps one agent out of another's data
+    without checking the credential is bound.
+  - That is also why a **per-relay one-time secret is not the fix** and must not be re-proposed: it
+    would ride on exactly the commands an impersonated heartbeat hands out.
+  - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
+    **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
+    `.claude/rules/turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 
@@ -363,8 +381,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 ## Deployment (DockerOps, not here)
 
 - `compose/turma-truenas.yaml` defines the `turma` service and a single per-host `agent-host`
-  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, the shared
-  `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
+  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, that host's OWN
+  `TURMA_TOKEN` (`node turma/server.js --agent-token <device>` against the hub's master
+  `TURMA_AGENT_TOKEN`; `TURMA_AGENT_STRICT` on the hub once every host has one — see XERK-268 in the
+  contracts above), the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
   basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
   env — usage is counted in tokens per model, so there is no rate table.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land
