@@ -251,8 +251,26 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 
 - UI, API, and the click-to-attach live terminal (`/term/<sessionId>/`, reverse-tunneled to that
   session's ttyd by port) sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`).
-  Agents authenticate heartbeats, tunnel WebSockets, and ttyd with one shared token (`TURMA_TOKEN`
-  in the agent's env = `TURMA_AGENT_TOKEN` on the hub).
+  Agents authenticate heartbeats, tunnel WebSockets, and ttyd with a **per-host** token —
+  `TURMA_TOKEN` in the agent's env, `hostAgentToken()` = `HMAC(TURMA_AGENT_TOKEN, <device>)` on the
+  hub. See `CLAUDE.md`'s cross-cutting contracts for the rule; the mechanics:
+  - The hub keeps only the master and **re-derives** the expected value for whatever host a request
+    names, so adding a host needs no hub-side list and no restart. Print one with `node
+    turma/server.js --agent-token <device>`. The name is IN the token, so a **host rename
+    invalidates it** — deliberate, since the hub cannot tell a rename from an impersonation.
+  - `agentBearerKind(req, host)` is the single resolver → `proved` (that host's derived token) /
+    `operator` (the user login, allowed to name any host — it already drives them all) / `legacy`
+    (the raw master, refused under `TURMA_AGENT_STRICT`) / null. `agentHostRefusal` turns it into
+    the response. **Never settle for `agentAuthorized` where a host is in hand**: it answers "an
+    agent", not "which".
+  - The heartbeat is the one surface bound in its HANDLER, not at the route gate, since `device` is
+    in the body. The gate's `agentPresented` only refuses a credential-less caller before the body
+    is read; it cannot tell a derived token from a wrong one without a host to check against.
+  - `ttydAuth(host)` sends the token that host's ttyd is actually running (`tokenBound` on the
+    record, from how its own heartbeat authenticated), so a half-rolled fleet keeps every terminal
+    working. It is hub-derived and **stripped from the fleet payload** — putting it on the wire
+    would make it a client contract.
+  - Tests: the `XERK-268:` cases in `server.test.js`.
 - The hub also serves the `glasses/` client: a CORS'd `/api/*` surface for that cross-origin
   WebView; per-session `input`/`history` endpoints; `GET /api/ws-token` for short-lived WebSocket
   auth; an `/audio` STT WebSocket (G2-mic PCM to the LiteLLM instance's transcription endpoint); and

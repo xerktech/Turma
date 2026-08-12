@@ -27,10 +27,16 @@ services:
       # The hub's URL, reachable from this host. Use the public/tunnel URL when
       # the agent is on a different machine than the hub.
       TURMA_URL: "${HUB_URL:?set HUB_URL in .env}"
-      # Must equal the hub's TURMA_AGENT_TOKEN. Also doubles as the basic-auth
-      # password for each session's ttyd, so do not leave it empty — an empty
-      # value silently falls back to the literal "changeme".
-      TURMA_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}"
+      # THIS host's own agent token, not the fleet master: run
+      # `node turma/server.js --agent-token <DEVICE_NAME>` on the hub and put
+      # the result in .env as AGENT_TOKEN. It must be derived from the SAME
+      # device name this container reports below, or the hub refuses the beat.
+      # The hub's raw TURMA_AGENT_TOKEN also works and is what a fleet
+      # mid-rollover looks like — but then this agent can act as any other host,
+      # which is what per-host tokens exist to stop.
+      # Also doubles as the basic-auth password for each session's ttyd, so do
+      # not leave it empty — an empty value silently falls back to "changeme".
+      TURMA_TOKEN: "${AGENT_TOKEN:?set AGENT_TOKEN in .env (node turma/server.js --agent-token <device>)}"
 
       # How the hub keys and labels this host. Defaults to a docker/SMB probe;
       # set it explicitly and the probe is skipped.
