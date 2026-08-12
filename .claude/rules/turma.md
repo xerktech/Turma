@@ -204,6 +204,12 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
     delta append onto a hole, leaving a truncated conversation behind a `msgCount` that claimed
     otherwise. `ingestChunk` re-checks the file on every chunk, so the transcript simply
     re-archives from the start.
+  - **Only a genuine deletion counts, and `fileIsGone` is deliberately paranoid about it**
+    (never `fs.existsSync`, which collapses every errno to false). A false "gone" resets the cursor
+    and ingest APPENDS, so the re-push writes a SECOND copy of the conversation into a file that
+    was there all along — durable corruption of the store's own source of truth. So: only ENOENT,
+    and only when `ARCHIVE_DIR` itself still stats, since a missing parent reports ENOENT for
+    every row at once and one bad moment on the archive mount would otherwise empty the index.
 - Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.
 
 ## `POST /api/trigger` — external automation

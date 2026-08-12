@@ -215,6 +215,35 @@ function totalArchiveBytes() {
   return (r && r.n) || 0;
 }
 
+// Has this transcript's file actually been DELETED — as opposed to being
+// momentarily unreachable? The difference is not academic: a false "gone" drops
+// the row and resets the cursor, and since ingest APPENDS, the re-push from
+// offset 0 writes a second copy of the conversation into a file that was there
+// all along. That is durable corruption of the store's own source of truth, so
+// this errs hard toward "still there".
+//
+//   - Only ENOENT counts. `fs.existsSync` collapses EVERY error to false, so an
+//     EACCES/EIO/ESTALE blip on the archive volume read as a deletion.
+//   - A missing PARENT also reports ENOENT, so an archive mount that drops for
+//     one syscall would make every row look deleted at once — hence the second
+//     check. If ARCHIVE_DIR itself isn't there, nothing was deleted; the volume
+//     is gone, and the right response is to touch nothing.
+function fileIsGone(relPath) {
+  const paths = filePaths(relPath);
+  try {
+    fs.statSync(paths.jsonl);
+    return false;                       // still there
+  } catch (e) {
+    if (e.code !== "ENOENT") return false;   // unreachable != deleted
+  }
+  try {
+    fs.statSync(ARCHIVE_DIR);
+  } catch {
+    return false;                       // the whole store is unreachable
+  }
+  return true;
+}
+
 // Forget a transcript whose organized file is no longer on disk: its row, its
 // budget spend and its FTS entries. Returns true if anything was dropped.
 //
@@ -229,7 +258,7 @@ function totalArchiveBytes() {
 // hub accept the NEXT delta as if the earlier ones were still stored, silently
 // leaving a truncated conversation behind a msgCount that claimed otherwise.
 function forgetMissingTranscript(transcriptId, relPath) {
-  if (!relPath || fs.existsSync(filePaths(relPath).jsonl)) return false;
+  if (!relPath || !fileIsGone(relPath)) return false;
   tx(() => {
     db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(transcriptId);
     db.prepare("DELETE FROM sessions WHERE transcriptId=?").run(transcriptId);
@@ -244,6 +273,9 @@ function forgetMissingTranscript(transcriptId, relPath) {
 // recoverable ceiling and a wedged one — so it is rate-limited rather than run
 // per chunk.
 let lastReconcileAt = 0;
+// Test seam: reach past the rate limit the way a later beat would, rather than
+// making a unit test sleep a minute to observe a recovery.
+function __resetReconcileClock() { lastReconcileAt = 0; }
 function reconcileMissingFiles() {
   const now = Date.now();
   if (now - lastReconcileAt < 60 * 1000) return 0;
@@ -654,8 +686,9 @@ function rebuildIndex() {
 
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
-  slugify, archiveRelPath, ftsQuery, byteCeiling,
+  slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits,
+  reconcileMissingFiles, __resetReconcileClock,
   searchArchive, listArchive, getTranscript,
 };

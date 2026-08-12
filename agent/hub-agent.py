@@ -241,12 +241,24 @@ def _byte_ceiling(raw, fallback):
 
     Deliberately total, unlike the bare int() the other tunables here use: this
     runs at import, so a malformed value would stop hub-agent.py from loading at
-    all and take every session on the host down with it."""
+    all and take every session on the host down with it. Hence the bare except
+    and the int() INSIDE the try — str.isdigit() is True for characters int()
+    refuses ("16777216²" is a digit string to Python and a ValueError to int),
+    so a footnote marker pasted into the compose env would crash the fleet.
+
+    ASCII-only, because /^\\d+$/ on the hub side is: str.isdigit() also accepts
+    Arabic-Indic, Devanagari and fullwidth digits, and a value the agent read as
+    16 while the hub read 16 MiB would strip every preview fleet-wide. Bounded
+    at 2**53-1 for the same reason — past that the hub's Number.isSafeInteger
+    rejects and this would not."""
     try:
         s = str(raw if raw is not None else "").strip()
+        if not (s.isascii() and s.isdigit()):
+            return fallback
+        n = int(s)
+        return n if n <= (1 << 53) - 1 else fallback
     except Exception:
         return fallback
-    return int(s) if s.isdigit() else fallback
 
 
 # How many bytes of SendUserFile payload one transcript may put in the archive
@@ -3401,7 +3413,7 @@ def _shed_block_payloads(blocks):
                 val = f.get(key)
                 if not isinstance(val, str) or not val:
                     continue
-                dropped += len(val)
+                dropped += len(val.encode("utf-8", "replace"))
                 del f[key]
                 f["kind"] = "file"
                 f["shed"] = True
@@ -3422,7 +3434,11 @@ def _block_payload_bytes(blocks):
             for key in ("src", "html"):
                 val = f.get(key)
                 if isinstance(val, str):
-                    total += len(val)
+                    # UTF-8 bytes, not code points: the budget is named in bytes
+                    # and the hub spends it in bytes, so counting characters let
+                    # a non-ASCII HTML preview ship 3-4x its share before this
+                    # side started shedding.
+                    total += len(val.encode("utf-8", "replace"))
     return total
 
 

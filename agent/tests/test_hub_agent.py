@@ -11256,18 +11256,46 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         self.assertEqual(ha._byte_ceiling("", 999), 999)
         self.assertEqual(ha._byte_ceiling(None, 999), 999)
         self.assertEqual(ha._byte_ceiling(" 1048576 ", 999), 1048576)
+        # str.isdigit() says yes to characters int() then refuses, so a stray
+        # footnote marker pasted into the compose env would RAISE here — at
+        # import, taking the host's whole fleet down.
+        self.assertEqual(ha._byte_ceiling("16777216²", 999), 999)
+        self.assertEqual(ha._byte_ceiling("①", 999), 999)
+        # Non-ASCII digits parse for Python and not for the hub's /^\d+$/, and
+        # a ceiling of 16 where the hub reads 16 MiB strips every preview.
+        self.assertEqual(ha._byte_ceiling("١٦", 999), 999)   # Arabic-Indic 16
+        self.assertEqual(ha._byte_ceiling("１６", 999), 999)   # fullwidth 16
+        # Past 2**53-1 the hub's Number.isSafeInteger refuses; agree with it.
+        self.assertEqual(ha._byte_ceiling(str((1 << 53) - 1), 999), (1 << 53) - 1)
+        self.assertEqual(ha._byte_ceiling(str(1 << 53), 999), 999)
+
+    def test_payload_bytes_are_utf8_bytes_not_code_points(self):
+        # The budget is named in bytes and the hub spends it in bytes; counting
+        # characters let a non-ASCII preview ship 3-4x its share.
+        html = "中" * 500 + "\U0001f600" * 100
+        blocks = [{"t": "tool_use", "files": [{"name": "p.html", "kind": "html", "html": html}]}]
+        self.assertEqual(ha._block_payload_bytes(blocks), len(html.encode("utf-8")))
+        self.assertNotEqual(len(html.encode("utf-8")), len(html))   # they really differ
 
     def test_a_disabled_ceiling_keeps_every_preview(self):
         # 0 means "no ceiling" on the hub, so it must not mean "shed everything"
         # here — that inversion would silently strip previews fleet-wide.
+        #
+        # SEVERAL deliveries, deliberately: the budget is checked AFTER an entry
+        # is emitted, so a one-delivery transcript keeps its preview under either
+        # reading and the test proves nothing.
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/aaa"
-        self._write_transcript(wt, "t1.jsonl", [self._delivery("a1", self._png("a.png", 4096))])
+        png = self._png("a.png", 4096)
+        self._write_transcript(wt, "t1.jsonl", [
+            self._delivery("a%d" % i, png, "2026-07-01T10:0%d:00Z" % i) for i in range(4)])
         self._ledger(sm, wt)
         sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
         with mock.patch.object(ha, "ARCHIVE_PAYLOAD_MAX", 0):
-            f = self._files_of(self._push(sm)[0])[0]
-        self.assertEqual(f["kind"], "image")
+            files = self._files_of(self._push(sm)[0])
+        self.assertEqual(len(files), 4)
+        self.assertTrue(all(f["kind"] == "image" for f in files), files)
+        self.assertFalse(any(f.get("shed") for f in files))
 
     def test_an_ordinary_delivery_still_archives_with_its_preview(self):
         sm = self.make_manager()
