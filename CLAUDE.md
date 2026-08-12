@@ -183,6 +183,12 @@ One agent container per host, multiplexing sessions across every repo it scans.
   repo-cloned + running/non-root/has-conversation, single-flight per session. State is in-memory; a
   hub restart mid-move aborts it, leaving the source intact. **The target must already have the repo
   cloned** (v1).
+- **The bundle NEVER rides in the hub's heap** (XERK-263): the relay spools it to `MIGRATE_SPOOL_DIR`
+  (`/data/migrations`) and streams it back out, so a 65 MiB move costs a hub capped at 256 MiB a
+  buffer rather than a quarter of its memory. The record keeps only the path/size; every settle,
+  timeout and failure unlinks it, and boot sweeps the dir (nothing there outlives a restart usefully).
+  `MIGRATE_INFLIGHT_MAX` bounds the disk that burst can hold — refused where a move STARTS, since the
+  agent's upload is best-effort with no retry and refusing THAT strands the migration.
 - Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
   `eligibleMoveTargets` in android `SessionsTest`.
 
@@ -337,6 +343,9 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
+  - It also carries the migration spool (`MIGRATE_SPOOL_DIR`), which is transient by design and
+    shares that volume's SPACE with the archive — hence `MIGRATE_INFLIGHT_MAX`. No compose change:
+    both default under `/data`.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
   `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
   the agent reports `localModel.available:false` so clients hide the control.
