@@ -3621,23 +3621,33 @@ const server = http.createServer(async (req, res) => {
     // queues importSession on the target (XERK-101).
     // Scoped to the migration's OWN source host (XERK-266), like the uploads
     // route below. **Defense in depth, NOT an identity check**: every agent
-    // shares one token, so `<host>` is the CALLER's to pick and one naming the
-    // real source still passes. What it buys is that an attacker must also know
-    // which two hosts the move is between, on top of the migration id
-    // (`crypto.randomBytes(8)`, handed only to the two participants) — without
-    // it the id alone lets any token-holder make the real target
-    // `claude --resume` bytes it chose. Binding the segment to the credential
-    // is XERK-268. 404 rather than 403 so a caller naming the wrong host isn't
-    // told the id exists (a caller naming the RIGHT one still learns it, from
-    // the 409 below — that much the 404 does not hide).
+    // shares one token, so `<host>` is the CALLER's to pick, and one that names
+    // the real source passes — it is not "the attacker must know the hosts",
+    // because the route would otherwise hand the name back (below). What it
+    // buys is that the migration id alone no longer lets any token-holder make
+    // the real target `claude --resume` bytes it chose: a wrong address now
+    // fails, so this cannot happen by mis-addressing, and a would-be injector
+    // must commit the injection itself against each candidate host rather than
+    // finding the right one first. Binding the segment to the credential —
+    // which is the actual fix — is XERK-268.
+    // **Every refusal here answers the SAME 404**, and that uniformity is the
+    // point, not tidiness: this route is otherwise a free host-name ORACLE.
+    // Any response that a non-source can't also get identifies the source, and
+    // with the id (which rides the user-authed fleet payload, so it is not only
+    // the two agents') a few hundred silent probes then find it. So a wrong
+    // host, a wrong phase and an empty body are deliberately indistinguishable
+    // — do NOT restore a friendlier 409/400 here, and note the real source
+    // loses nothing it acts on (it logs the failure and the move times out
+    // either way). The residual leak is the 413, which cannot be closed without
+    // reading an unbounded body from an unverified caller; it costs a
+    // >MIGRATE_BLOB_MAX upload per probe and fails the migration loudly.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m || m.srcHost !== host) return json(res, 404, { error: "unknown migration" });
-      if (m.phase !== "exporting")
-        return json(res, 409, { error: "migration not awaiting a bundle" });
+      if (!m || m.srcHost !== host || m.phase !== "exporting")
+        return json(res, 404, { error: "unknown migration" });
       let blob;
       try {
         blob = await readRawBody(req, MIGRATE_BLOB_MAX);
@@ -3646,7 +3656,7 @@ const server = http.createServer(async (req, res) => {
         publishMigrations();
         return json(res, 413, { error: e.message });
       }
-      if (!blob.length) return json(res, 400, { error: "empty bundle" });
+      if (!blob.length) return json(res, 404, { error: "unknown migration" });
       m.blob = blob;
       m.phase = "importing";
       m.at = Date.now();
@@ -3686,7 +3696,10 @@ const server = http.createServer(async (req, res) => {
     // migration's OWN target host (XERK-266) on the same defense-in-depth
     // terms as the POST above — the bundle is the raw transcript of another
     // host's conversation, so the id alone should not be enough to read it,
-    // but a caller naming the real target still passes (XERK-268).
+    // but a caller naming the real target still passes (XERK-268). Unlike the
+    // POST, the oracle here CANNOT be closed by making the refusals uniform:
+    // the success IS the disclosure, so a token-holder with the id can walk
+    // the host names until one returns bytes. Only XERK-268 fixes that.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
@@ -3703,10 +3716,12 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
     // operator attached to a message (XERK-234). Agent-authed above. Scoped to
-    // the host the upload was staged for — like the migration routes above and
-    // with the same limit: `<host>` is self-asserted, so this raises the bar
-    // (the id AND the host) rather than binding the caller (XERK-268). The
-    // blob is NOT dropped on read: the
+    // the host the upload was staged for — like the migration GET above and
+    // with the same limit: `<host>` is self-asserted, and a hit returns the
+    // bytes, so an agent-token holder knowing the upload id can walk the host
+    // names until the operator's attached file comes back. Read that comment
+    // before trusting this line; binding the segment to the credential covers
+    // this route too (XERK-268). The blob is NOT dropped on read: the
     // agent may be re-issued the command (at-least-once delivery), and letting it
     // expire on the TTL costs nothing a re-download doesn't.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&

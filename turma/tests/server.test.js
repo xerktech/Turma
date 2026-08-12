@@ -6146,9 +6146,9 @@ test("migrate: the blob relay rejects an unauthenticated caller", async () => {
 
 test("migrate: the blob relay is scoped to the migration's own two hosts", async () => {
   // The <host> segment is checked against the migration's own halves (XERK-266),
-  // so agent-auth plus the id is not on its own enough to act as someone else's
-  // move. It is defense in depth, not identity: the segment is self-asserted,
-  // and a caller that names the real source/target still passes (XERK-268).
+  // so a mis-addressed call can no longer act on someone else's move. It is
+  // defense in depth, not identity: the segment is self-asserted, and a caller
+  // that names the real source/target still passes (XERK-268).
   await migHost("hsA", "hs.atlassian.net");
   await migHost("hsB", "hs.atlassian.net");
   await migHost("hsC", "hs.atlassian.net"); // same org, no part of the move
@@ -6163,6 +6163,16 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
   assert.equal(migrations.get(mid).phase, "exporting");
   assert.equal(migrations.get(mid).blob, null);
   assert.ok(!agents.hsB.commands.some((c) => c.type === "importSession"));
+
+  // The POST compare is EXACT, and this has to be asked while the migration is
+  // still AWAITING its bundle — that is the state where the host compare is the
+  // only thing that can answer. Asked after the upload it would sit behind the
+  // phase check and "pass" on a build whose compare is lenient, which is not
+  // what it is here to catch.
+  const nearMissUp = await requestRaw("POST", `/api/agents/HSA/migrations/${mid}/blob`,
+    { body: Buffer.from("x"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(nearMissUp.status, 404);
+  assert.equal(migrations.get(mid).phase, "exporting");
 
   // The real source's upload still works.
   const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
@@ -6185,15 +6195,49 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
   assert.equal(dl.status, 200);
   assert.ok(blob.equals(dl.buf));
 
-  // The compare is EXACT, on the same string the hub keys agents by. A host
-  // name that merely resembles a participant's is a different host, and a
-  // lenient compare here would hand it the bundle.
+  // Same on the GET: a host name that merely resembles the target's is a
+  // different host, and a lenient compare would hand it the bundle.
   const nearMiss = await requestRaw("GET", `/api/agents/HSB/migrations/${mid}/blob`,
     { headers: agentTok });
   assert.equal(nearMiss.status, 404);
-  const nearMissUp = await requestRaw("POST", `/api/agents/HSA/migrations/${mid}/blob`,
-    { body: Buffer.from("x"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
-  assert.equal(nearMissUp.status, 404);
+});
+
+test("migrate: every POST refusal is the same 404, so the relay is no host oracle", async () => {
+  // `<host>` is self-asserted (XERK-268), so any refusal a NON-source can't
+  // also get names the source to anyone holding the id — and then the injection
+  // above is a matter of re-addressing. The refusals are therefore uniform: a
+  // wrong host, a wrong phase and an empty body must be indistinguishable.
+  await migHost("orA", "or.atlassian.net");
+  await migHost("orB", "or.atlassian.net");
+  await migHost("orC", "or.atlassian.net");
+  const agentTok = { authorization: "Bearer agenttok", "content-type": "application/octet-stream" };
+  const post = (host, id, body) =>
+    requestRaw("POST", `/api/agents/${host}/migrations/${id}/blob`, { body, headers: agentTok });
+  const mid = (await migrate("orA", "s1", { host: "orB" })).body.migrationId;
+
+  // The empty-body probe is the cheap one: it mutates nothing, so without this
+  // the source could be found silently, at no cost and without tripping a move.
+  const emptyAtSrc = await post("orA", mid, Buffer.alloc(0));
+  const emptyElsewhere = await post("orC", mid, Buffer.alloc(0));
+  assert.equal(emptyAtSrc.status, 404);
+  assert.deepEqual(emptyAtSrc.body, emptyElsewhere.body);
+  assert.equal(emptyAtSrc.status, emptyElsewhere.status);
+  assert.equal(migrations.get(mid).phase, "exporting"); // and nothing moved
+
+  // Same once the real bundle has landed: the source re-POSTing (at-least-once
+  // delivery makes that ordinary) reads exactly like a stranger's probe.
+  assert.equal((await post("orA", mid, Buffer.from("REAL"))).status, 200);
+  const rePost = await post("orA", mid, Buffer.from("REAL"));
+  const stranger = await post("orC", mid, Buffer.from("REAL"));
+  assert.equal(rePost.status, 404);
+  assert.deepEqual(rePost.body, stranger.body);
+  // An unknown id answers the same thing again.
+  const unknown = await post("orA", "0123456789abcdef", Buffer.from("REAL"));
+  assert.equal(unknown.status, 404);
+  assert.deepEqual(unknown.body, rePost.body);
+  // The re-POST didn't disturb the move it was refused from.
+  assert.equal(migrations.get(mid).phase, "importing");
+  assert.ok(migrations.get(mid).blob.equals(Buffer.from("REAL")));
 });
 
 // ---- file attachments (XERK-234) -------------------------------------------
