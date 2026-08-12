@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.net.AnswerRequest
 import com.xerktech.turma.net.CloneRequest
 import com.xerktech.turma.net.InputRequest
@@ -81,8 +82,14 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
                 val r = block()
                 if (r.error.isNotEmpty()) "✗ ${r.error}" else "✓ $ok"
             } catch (e: Exception) {
+                // Prefer the hub's OWN reason when it gave one (XERK-246): a
+                // refused spawn — "host has no local model configured" on a 409
+                // — used to read "hub unreachable", which is both wrong and
+                // unactionable. Only a genuinely unanswered request says that.
                 "✗ " + (hubErrorMessage(e) ?: "hub unreachable")
             }
+            // A refusal also rolls back whatever was painted optimistically
+            // (XERK-264) — the card must not sit dimmed on a command that never ran.
             if (msg.startsWith("✗") && pendKeys.isNotEmpty()) {
                 _pending.value = _pending.value - pendKeys.toSet()
             }
@@ -105,17 +112,11 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun spawn(
         host: String, repo: String, prompt: String? = null, label: String? = null,
         baseRef: String? = null, model: String? = null, permissionMode: String? = null,
+        modelSource: String? = null,
     ) = run("session queued") {
         container.client.api.spawnSession(
             host,
-            SpawnRequest(
-                repo = repo,
-                prompt = prompt?.ifBlank { null },
-                label = label?.ifBlank { null },
-                baseRef = baseRef?.ifBlank { null },
-                model = model?.ifBlank { null },
-                permissionMode = permissionMode?.ifBlank { null },
-            ),
+            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource),
         )
     }
 
@@ -177,6 +178,32 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         fun pendKey(host: String, id: String) = "$host::$id"
+
+        /**
+         * The body a "New session" spawn posts. Pure, and separate from [spawn]
+         * so the wire shape is pinned by a test rather than only by driving the
+         * app: every blank optional is omitted, so a bare one-click spawn queues
+         * exactly `{repo}` as it always did.
+         *
+         * `modelSource` is sent ONLY for the local model (XERK-246) —
+         * "subscription" is what a spawn already meant. `model` is sent whatever
+         * the source, matching the web composer: the agent drops `--model` for a
+         * local session itself, and the alias is what that session goes back to
+         * if it is later switched to the subscription.
+         */
+        fun spawnRequest(
+            repo: String, prompt: String? = null, label: String? = null,
+            baseRef: String? = null, model: String? = null, permissionMode: String? = null,
+            modelSource: String? = null,
+        ) = SpawnRequest(
+            repo = repo,
+            prompt = prompt?.ifBlank { null },
+            label = label?.ifBlank { null },
+            baseRef = baseRef?.ifBlank { null },
+            model = model?.ifBlank { null },
+            permissionMode = permissionMode?.ifBlank { null },
+            modelSource = ModelSource.spawnValue(modelSource),
+        )
 
         /** The in-flight action kind for a session, or null (web sessPending). */
         fun sessPending(pending: Map<String, SessPending>, host: String, id: String): String? =

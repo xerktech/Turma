@@ -131,6 +131,27 @@ data class AgentInfo(
     // which is what hides the composer's 📎 rather than letting the operator
     // attach into a void. See the hub's uploadCapFor.
     val uploadMaxBytes: Long = 0,
+    /**
+     * Whether this host can run a session against its own self-hosted model
+     * (XERK-246), and which one. Doubles as the capability flag, exactly like
+     * [uploadMaxBytes]: an agent predating the failover — or one with no
+     * LOCAL_MODEL_* env — reports nothing, and an ABSENT block means "that host
+     * cannot do it", never "assume it can". Clients hide the control rather than
+     * queue a command the host would ack and drop.
+     */
+    val localModel: LocalModelInfo? = null,
+)
+
+/**
+ * A host's self-hosted-model configuration (hub-agent's `localModel` block).
+ * [model] and [contextTokens] are null exactly when [available] is false, so
+ * nothing may read them as a fallback for an unconfigured host.
+ */
+@Serializable
+data class LocalModelInfo(
+    val available: Boolean = false,
+    val model: String? = null,
+    val contextTokens: Int? = null,
 )
 
 /** A host's session ceiling and live counts (hub-agent `_capacity_payload`). */
@@ -495,6 +516,15 @@ data class SessionInfo(
     val ttydPort: Int = 0,
     val model: String = "",
     val permissionMode: String = "",
+    /**
+     * Which model this session runs against (XERK-246): "subscription" (the
+     * host's shared Claude login) or "local" (its self-hosted model). An agent
+     * predating the failover reports nothing, which reads as the subscription —
+     * the only thing such a host can run.
+     */
+    val modelSource: String = "",
+    /** When it was last switched; "" for a session that never moved. */
+    val modelSourceAt: String = "",
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
     /**

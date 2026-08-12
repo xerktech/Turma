@@ -28,6 +28,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **No hover tooltips on the two compose-bar model chips** (XERK-246); a phone has no hover, so the
+  web's `title=` text goes to the accessibility layer or nowhere.
+  - The **"run against"** chip: nowhere. Its tooltip only names the self-hosted model, which is
+    already the chip's own text.
+  - The **fixed-model** chip on a local session: it carries the web's wording as a
+    `contentDescription` instead. That tooltip is not redundant — it explains why the chip is inert
+    and names the way out — so dropping it entirely would leave a dead-looking control beside two
+    live ones with no account of itself.
 - **Ticket-detail fields tap-to-change** (XERK-138 follow-up). The web detail panel shows each editable
   field's value beside a separate "Change" link/control that swaps in a `<select>`. Android instead
   renders the value itself as the control — a pill with a trailing ▾ (`SelectableValue` in
@@ -102,7 +110,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   mirrors the web target filter (tested in `SessionsTest`). One deliberate difference: the web stage
   auto-follows the moved session onto its new host (`advanceMigrationFollow`); Android just lets it
   reappear in the session list on its new host (no stage to follow on a phone), so the "Moving…" card
-  hint and the follow are web-only.
+  hint and the follow are web-only. Its refusals — including the 503 when too many moves are in
+  flight (XERK-263) — reach the operator in the hub's own words through `hubErrorMessage`, like
+  every other command (XERK-264).
 - **One Sessions search box, doing both halves (XERK-243).** The web sidebar's single box searches the
   archive only, hiding the live lists while a query is up. Android's box filters the live/queued/ended
   lists as you type AND, past two characters, appends an "In history" section of archive full-text
@@ -315,6 +325,40 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   the drop case. Sharing INTO the app is not wired up (no `ACTION_SEND` intent filter yet) — a
   reasonable follow-up, tracked below.
 
+## Done (XERK-246 — local-model failover controls)
+
+- **Switch a running session between the subscription and the host's self-hosted model.** A third
+  compose-bar chip beside model and mode ("run: subscription" / "run: <model>") POSTing
+  `.../sessions/<id>/model-source`; the agent relaunches with `--resume`, so the conversation,
+  worktree and branch carry over. The chip paints from a memo until the heartbeat agrees — the
+  relaunch takes several beats, and without it the value springs back and reads as a dead control —
+  and the memo ages out (`ModelSource.SWITCH_SETTLE_MS`) so a switch that never lands can't pin it
+  on a lie. A refused switch (the hub 409s a host with no local model) drops the memo at once and
+  says why.
+- **Start NEW work on the local model**: a "Run against" row in the spawn composer, the web's
+  `sessions.html` field. Without it you could fail existing sessions over from the phone but not
+  begin anything once usage was gone — which is exactly when you need to.
+- Both follow the **host's** `localModel.available`, exactly as the 📎 follows `uploadMaxBytes`; an
+  agent reporting nothing cannot do it, so the control is hidden rather than offered and refused.
+  The compose-bar chip is also shown when the session is already `local`, so one whose host later
+  lost its configuration keeps a visible way back.
+- **The Claude model picker is hidden on a live local session** (a static chip states the model
+  instead), matching the web's `cc-model-fixed`: every alias it could offer — "default" included,
+  since that resolves to the shared login's default — is one the self-hosted endpoint refuses. The
+  **spawn composer keeps its Model row**, also matching the web (`sessions.html` renders and sends
+  it whatever the source): the agent drops `--model` for a local session itself, and the alias is
+  what that session goes back to if it is later switched to the subscription, so discarding it
+  would give an Android-spawned session a different model from a web-spawned one.
+- The memo lives in `AppContainer.modelSwitches`, not the chat ViewModel, for the same reason
+  `drafts` does — the VM is scoped to the chat's nav entry, so a memo kept there died the moment
+  you walked back to the session list, mid-switch, which is when it is doing its job.
+- Pure half in `core/ModelSource.kt` (`ModelSourceTest.kt`), the state reads in `ChatUiStateTest.kt`;
+  the wire block is locked in `AgentDecodeTest.kt`, including the all-nulls shape an unconfigured
+  host reports and the null `modelSourceAt` every unmoved session carries.
+- **Still open:** the 🏠 mark on live and ended session CARDS (see below) — inside a session the
+  compose-bar chip already names the model. The chip's missing tooltip is a deliberate difference,
+  recorded above.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -338,19 +382,11 @@ those are marked `[MODEL]`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
-- **P1 Local-model failover control + chip (XERK-246).** The web compose bar carries a third
-  selector beside agent-mode and model — "Run against: Claude subscription / <self-hosted model>" —
-  which POSTs `/api/agents/<host>/sessions/<id>/model-source` and relaunches the session on the
-  local model, keeping its conversation. A session on the local model is marked (🏠 + warn colour)
-  so nobody has to wonder which model wrote a turn. Android shows neither the control nor the mark.
-  Gate it on the host's `localModel.available`, exactly as the 📎 gates on `uploadMaxBytes` — an
-  agent that reports nothing cannot do it. Field: `session.modelSource`
-  (`"subscription"`/`"local"`). This matters on a phone precisely when it matters most: usage runs
-  out while you are away from a desk. Three parts, all missing: the compose-bar selector, the mark
-  on live AND ended session cards, and a **"Run against" option in the spawn composer** (without the
-  last one you can fail existing sessions over from the phone but cannot start new work once usage
-  is gone). Note the web hides the model picker entirely for a local session — every alias it could
-  offer is one the gateway refuses.
+- **P2 Local-model mark on session CARDS (XERK-246 remainder).** The two controls are done (see Done
+  above); what's left is the web's 🏠 + warn-colour mark on live and ended session cards, so a
+  glance at the list says which sessions are on the weaker model without opening each one. Read
+  `session.modelSource == "local"`, titled with `modelSourceAt`. Both fields already decode onto
+  `SessionInfo`.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
 - ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
   see Done above; the read-only review itself was XERK-70).
