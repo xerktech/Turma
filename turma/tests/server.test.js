@@ -63,6 +63,9 @@ process.env.ORG_COLORS_FILE = path.join(
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
+// The migration relay spools its transcript bundles to disk (XERK-263) — under
+// a throwaway dir here, since the production default is the /data volume.
+process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-migrate-"));
 // LiteLLM backend (Whisper STT derives its endpoint from this): configured so
 // the "enabled" code paths are exercised. The "unset" branch is tested via a
 // separately required module (freshServerModule).
@@ -124,6 +127,7 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   orgColors, setOrgColor,
   migrations, advanceMigrations,
+  MIGRATE_SPOOL_DIR, MIGRATE_INFLIGHT_MAX, sweepMigrationSpool,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
 } = hub;
 
@@ -6103,9 +6107,115 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(after.targetSessionId, "new1");
   assert.ok(agents.mgA.commands.some((c) => c.type === "kill" && c.sessionId === "s1"),
     "source session should be killed once the target is up");
-  // The blob is freed on handoff.
-  assert.equal(after.blob, null);
+  // The bundle is freed on handoff — record AND spool file (XERK-263).
+  assert.equal(after.blobPath, null);
+  assert.deepEqual(fs.readdirSync(MIGRATE_SPOOL_DIR), [],
+    "the spooled bundle should be unlinked once the move completes");
 });
+
+test("migrate: the bundle is spooled to disk, never held on the record", async () => {
+  await migHost("spA", "sp.atlassian.net");
+  await migHost("spB", "sp.atlassian.net");
+  const r = await migrate("spA", "s1", { host: "spB" });
+  const mid = r.body.migrationId;
+  const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES-ON-DISK");
+  const up = await requestRaw("POST", `/api/agents/spA/migrations/${mid}/blob`,
+    { body: blob, headers: { authorization: "Bearer agenttok" } });
+  assert.equal(up.status, 200);
+  const m = migrations.get(mid);
+  // The whole point of XERK-263: the hub retains a PATH, not 65 MiB of bytes.
+  assert.equal(m.blob, undefined);
+  assert.equal(typeof m.blobPath, "string");
+  assert.equal(m.blobSize, blob.length);
+  assert.equal(path.dirname(m.blobPath), MIGRATE_SPOOL_DIR);
+  assert.ok(blob.equals(fs.readFileSync(m.blobPath)));
+  // Cleanly settle it so the spool is empty for the next test.
+  m.startedAt = Date.now() - 10 * 60 * 1000;
+  advanceMigrations();
+  assert.deepEqual(fs.readdirSync(MIGRATE_SPOOL_DIR), []);
+});
+
+test("migrate: an over-cap bundle is refused and leaves nothing spooled", async () => {
+  await migHost("bgA", "bg.atlassian.net");
+  await migHost("bgB", "bg.atlassian.net");
+  const r = await migrate("bgA", "s1", { host: "bgB" });
+  const mid = r.body.migrationId;
+  // A hair over MIGRATE_BLOB_MAX (65 MiB). Written in chunks so the cap trips
+  // mid-stream, which is the path that has to clean up after itself.
+  const chunk = Buffer.alloc(1 << 20, 0x61);
+  const over = await new Promise((resolve, reject) => {
+    const req = http.request(baseUrl + `/api/agents/bgA/migrations/${mid}/blob`,
+      { method: "POST", headers: { authorization: "Bearer agenttok" } },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      });
+    req.on("error", reject);
+    (function write(n) {
+      if (n === 0) return req.end();
+      if (req.write(chunk)) return write(n - 1);
+      req.once("drain", () => write(n - 1));
+    })(66);
+  });
+  assert.equal(over, 413);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /too large/);
+  assert.equal(m.blobPath, null);
+  assert.deepEqual(fs.readdirSync(MIGRATE_SPOOL_DIR), [],
+    "a refused upload must not leave a partial bundle on the spool");
+});
+
+test("migrate: a hub restart sweeps bundles its aborted migrations left behind", () => {
+  // Migrations are in-memory, so a restart abandons every in-flight move; the
+  // boot sweep is the only thing that reclaims their spooled bundles.
+  const orphan = path.join(MIGRATE_SPOOL_DIR, "deadbeefdeadbeef.tgz");
+  const keep = path.join(MIGRATE_SPOOL_DIR, "not-ours.txt");
+  fs.writeFileSync(orphan, "leftover");
+  fs.writeFileSync(keep, "someone else's");
+  sweepMigrationSpool();
+  assert.equal(fs.existsSync(orphan), false);
+  // Scoped to the names this module writes, so a mis-set spool dir can't take
+  // anything else with it.
+  assert.equal(fs.existsSync(keep), true);
+  fs.unlinkSync(keep);
+});
+
+test("migrate: concurrent moves are capped so the spool stays bounded", async () => {
+  await migHost("capT", "cap.atlassian.net");
+  const started = [];
+  for (let i = 0; i < MIGRATE_INFLIGHT_MAX; i++) {
+    const host = `capS${i}`;
+    await migHost(host, "cap.atlassian.net");
+    const r = await migrate(host, "s1", { host: "capT" });
+    assert.equal(r.status, 200, `move ${i} should start`);
+    started.push(r.body.migrationId);
+  }
+  await migHost("capOver", "cap.atlassian.net");
+  const refused = await migrate("capOver", "s1", { host: "capT" });
+  assert.equal(refused.status, 503);
+  assert.match(refused.body.error, /already moving/);
+  // Freeing one lets the next through — the cap is on CONCURRENCY, not a
+  // lifetime budget.
+  const m = migrations.get(started[0]);
+  m.startedAt = Date.now() - 10 * 60 * 1000;
+  advanceMigrations();
+  assert.equal((await migrate("capOver", "s1", { host: "capT" })).status, 200);
+  // Leave nothing in flight for the tests after this one — the cap is global.
+  for (const rec of migrations.values()) rec.startedAt = Date.now() - 10 * 60 * 1000;
+  advanceMigrations();
+  assert.equal(migrationsInFlightForTest(), 0);
+});
+
+// The hub's in-flight count, as the cap sees it (no export needed — the record
+// phases are the whole rule).
+function migrationsInFlightForTest() {
+  let n = 0;
+  for (const m of migrations.values()) {
+    if (m.phase === "exporting" || m.phase === "importing") n++;
+  }
+  return n;
+}
 
 test("migrate: a second move of the same session is single-flighted", async () => {
   await migHost("sfA", "sf.atlassian.net");
@@ -6117,7 +6227,7 @@ test("migrate: a second move of the same session is single-flighted", async () =
   assert.match(second.body.error, /already being moved/);
 });
 
-test("migrate: a stalled move times out and frees its blob", async () => {
+test("migrate: a stalled move times out and frees its bundle", async () => {
   await migHost("toA", "to.atlassian.net");
   await migHost("toB", "to.atlassian.net");
   const r = await migrate("toA", "s1", { host: "toB" });
@@ -6126,7 +6236,7 @@ test("migrate: a stalled move times out and frees its blob", async () => {
   advanceMigrations();
   assert.equal(m.phase, "failed");
   assert.match(m.error, /timed out/);
-  assert.equal(m.blob, null);
+  assert.equal(m.blobPath, null);
 });
 
 test("migrate: the blob relay rejects an unauthenticated caller", async () => {

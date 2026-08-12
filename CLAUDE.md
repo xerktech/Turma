@@ -179,6 +179,14 @@ One agent container per host, multiplexing sessions across every repo it scans.
   the command: the per-beat scan PRIMES a resumed transcript's byte offset to EOF, so `gh pr create`
   events sit past it. `_resume_at_cwd` (shared with `resume_transcript`) calls `_seed_prs` once at
   launch to scan the whole transcript, keyed by the PRESERVED transcript id. Idempotent.
+- **The relayed bundle is SPOOLED TO DISK, never held in the hub's heap** (XERK-263): the POST
+  streams into `MIGRATE_SPOOL_DIR` (`/data/migrations`) and the target's GET streams back out, so a
+  move costs the hub a socket buffer rather than up to 65 MiB retained for its whole `importing`
+  phase — which two concurrent moves would make half the deployed 256 MiB limit. Every settle path
+  goes through `freeMigrationBlob`, and a boot sweep reclaims what a hub killed mid-move left, since
+  migrations are in-memory and a restart abandons them.
+- Concurrent moves are capped (`MIGRATE_INFLIGHT_MAX`, 4) and the rest refused with a message the
+  Move control shows — the spool is bounded disk, and `MIGRATIONS_MAX` never evicts an in-flight one.
 - Blob relay is agent-authed; `POST .../sessions/<id>/migrate {host}` validates same-org + online +
   repo-cloned + running/non-root/has-conversation, single-flight per session. State is in-memory; a
   hub restart mid-move aborts it, leaving the source intact. **The target must already have the repo
@@ -337,6 +345,8 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
+  - It also takes the migration spool (`MIGRATE_SPOOL_DIR`, `/data/migrations`) — transient, swept at
+    boot, but it must be WRITABLE and hold `MIGRATE_INFLIGHT_MAX` × 65 MiB in the worst case.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
   `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
   the agent reports `localModel.available:false` so clients hide the control.

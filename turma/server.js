@@ -693,7 +693,7 @@ function setOrgColor(siteKey, slot) {
 //      resumes the same conversation there;
 //   3. target session comes up -> the source session is KILLED (kept, so its
 //      worktree/uncommitted work stays resumable on the origin as a fallback).
-// State is in-memory and short-lived (the blob rides in the record); a hub
+// State is in-memory and short-lived (the record names a spooled bundle); a hub
 // restart mid-migration aborts it, leaving the source session intact.
 const migrations = new Map(); // migrationId -> record (see startMigration)
 const MIGRATE_TIMEOUT_MS = Number(process.env.MIGRATE_TIMEOUT_MS) || 5 * 60 * 1000;
@@ -702,6 +702,63 @@ const MIGRATIONS_MAX = 40; // backstop against unbounded growth
 // Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
 // legitimate at-cap bundle isn't rejected for framing overhead.
 const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
+// The bundle is SPOOLED TO DISK, never held in the heap (XERK-263): at 65 MiB a
+// piece, two concurrent moves would retain half the deployed hub's 256 MiB
+// memory limit for the whole importing phase, before anything else it does. The
+// POST streams straight into this dir and the target's GET streams back out of
+// it, so a migration's peak cost here is a socket buffer, not its bundle.
+const MIGRATE_SPOOL_DIR = process.env.MIGRATE_SPOOL_DIR || "/data/migrations";
+// Disk is bounded too, so cap how many moves can hold a spooled bundle at once
+// and refuse the rest with something the Move control can show. `MIGRATIONS_MAX`
+// never evicts an in-flight record, so without this the worst case is 40 files.
+const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
+
+// Where a migration's bundle spools. Keyed on the hub-minted id (hex), NOT the
+// id off the URL — the two are equal by the time we get here, and using the
+// record's keeps a crafted path out of `path.join` by construction.
+function migrationBlobPath(id) {
+  return path.join(MIGRATE_SPOOL_DIR, `${id}.tgz`);
+}
+
+// Drop a migration's spooled bundle and forget it. Idempotent, and the ONLY way
+// a record stops naming a file — every settle path (handoff, timeout, failure,
+// eviction) goes through it, or the spool leaks 65 MiB a move.
+function freeMigrationBlob(m) {
+  const p = m.blobPath;
+  m.blobPath = null;
+  m.blobSize = 0;
+  if (!p) return;
+  try { fs.unlinkSync(p); } catch { /* already gone / never written */ }
+}
+
+// Migrations live in memory, so a hub restart aborts every in-flight move: any
+// file left in the spool at boot belongs to a migration that no longer exists.
+// Sweep once at startup or a hub killed mid-move leaks its bundle forever.
+// Scoped to the names this module writes, so a MIGRATE_SPOOL_DIR mis-set to a
+// shared dir can't take anything else with it.
+const MIGRATE_SPOOL_FILE_RE = /^[0-9a-f]{4,64}\.tgz$/;
+function sweepMigrationSpool() {
+  let names;
+  try {
+    names = fs.readdirSync(MIGRATE_SPOOL_DIR);
+  } catch {
+    return; // no spool dir yet — nothing to sweep
+  }
+  for (const n of names) {
+    if (!MIGRATE_SPOOL_FILE_RE.test(n)) continue;
+    try { fs.unlinkSync(path.join(MIGRATE_SPOOL_DIR, n)); } catch { /* best-effort */ }
+  }
+}
+sweepMigrationSpool();
+
+// How many moves are holding (or about to hold) a bundle right now.
+function migrationsInFlight() {
+  let n = 0;
+  for (const m of migrations.values()) {
+    if (m.phase === "exporting" || m.phase === "importing") n++;
+  }
+  return n;
+}
 
 // The wire shape (blob stripped) the /api/agents payload and SSE carry, so the
 // UI can follow a migration to its new host and surface a failure.
@@ -934,7 +991,10 @@ function startMigration(srcHost, s, targetHost) {
         if (!oldest || m.at < oldest.at) oldest = m;
       }
     }
-    if (oldest) migrations.delete(oldest.id);
+    if (oldest) {
+      freeMigrationBlob(oldest);
+      migrations.delete(oldest.id);
+    }
   }
   const id = crypto.randomBytes(8).toString("hex");
   const m = {
@@ -960,7 +1020,8 @@ function startMigration(srcHost, s, targetHost) {
       ticket: s.ticket || null,
     },
     phase: "exporting", // exporting -> importing -> done | failed
-    blob: null, importCmdId: null, targetSessionId: null,
+    // The bundle is a file on the spool, not bytes on the record (XERK-263).
+    blobPath: null, blobSize: 0, importCmdId: null, targetSessionId: null,
     error: null, startedAt: Date.now(), at: Date.now(),
   };
   migrations.set(id, m);
@@ -985,7 +1046,7 @@ function advanceMigrations() {
         m.targetSessionId = up.id;
         m.phase = "done";
         m.error = null;
-        m.blob = null;
+        freeMigrationBlob(m);
         m.at = now;
         if (agents[m.srcHost]) {
           queueCommand(m.srcHost, { type: "kill", sessionId: m.srcSessionId });
@@ -1000,7 +1061,7 @@ function advanceMigrations() {
         now - m.startedAt > MIGRATE_TIMEOUT_MS) {
       m.phase = "failed";
       m.error = "migration timed out";
-      m.blob = null;
+      freeMigrationBlob(m);
       m.at = now;
       publishMigrations();
       continue;
@@ -1009,6 +1070,7 @@ function advanceMigrations() {
     // terminal state before it disappears.
     if ((m.phase === "done" || m.phase === "failed") &&
         now - m.at > MIGRATE_DONE_KEEP_MS) {
+      freeMigrationBlob(m); // already freed on settle; the belt to that braces
       migrations.delete(m.id);
       publishMigrations();
     }
@@ -1792,8 +1854,9 @@ function readBody(req, cap = BODY_MAX) {
 // file was simply too big (XERK-234).
 const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
 
-// Collect a request body as raw bytes (for the binary migration relay and the
-// attachment uploads, which readBody's 1 MiB string cap would truncate). Rejects
+// Collect a request body as raw bytes (for the attachment uploads, which
+// readBody's 1 MiB string cap would truncate; the bigger migration bundle
+// spools to disk instead — see spoolRawBody below). Rejects
 // past `cap` so a huge or runaway upload can't exhaust the hub's memory: the
 // bytes already held are dropped on the spot, and what follows is discarded
 // rather than buffered.
@@ -1820,6 +1883,74 @@ function readRawBody(req, cap) {
     });
     req.on("end", () => { if (!over) resolve(Buffer.concat(chunks)); });
     req.on("error", reject);
+  });
+}
+
+// Stream a request body STRAIGHT TO DISK instead of buffering it, for the one
+// body big enough that holding it would be a material share of the hub's memory
+// limit: the migration relay's transcript bundle (XERK-263). Resolves the byte
+// count written; rejects with `tooLarge` past `cap`, or with the fs error if the
+// spool can't be written — and in either case leaves no partial file behind.
+//
+// Over-cap follows the same rule as the buffering readers above: stop writing
+// but keep draining for a while, so the route can still answer 413 on this
+// connection rather than reaching the agent as a socket hang-up.
+function spoolRawBody(req, cap, destPath) {
+  return new Promise((resolve, reject) => {
+    let out;
+    try {
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      // 0600: a transcript is a conversation, and the spool sits on the shared
+      // /data volume beside the archive.
+      out = fs.createWriteStream(destPath, { mode: 0o600 });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let len = 0;
+    let over = false;
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      // Close the handle BEFORE unlinking (an open fd on a deleted file still
+      // holds its bytes on disk until the last one closes), and reject only
+      // once the partial file is actually gone — the caller answers the request
+      // on this rejection, so anything after it races the reply.
+      out.destroy();
+      out.once("close", () => {
+        try { fs.unlinkSync(destPath); } catch { /* never created */ }
+        reject(err);
+      });
+    };
+    out.on("error", fail);
+    req.on("error", fail);
+    req.on("data", (c) => {
+      len += c.length;
+      if (over) {
+        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        return;
+      }
+      if (len > cap) {
+        over = true;
+        fail(new BodyTooLarge(cap));
+        return;
+      }
+      // Honour backpressure — the whole point is that the bytes don't pile up
+      // in memory while the disk catches up.
+      if (!out.write(c)) {
+        req.pause();
+        out.once("drain", () => req.resume());
+      }
+    });
+    req.on("end", () => {
+      if (settled) return;
+      out.end(() => {
+        if (settled) return;
+        settled = true;
+        resolve(len);
+      });
+    });
   });
 }
 
@@ -3626,16 +3757,36 @@ const server = http.createServer(async (req, res) => {
       if (!m) return json(res, 404, { error: "unknown migration" });
       if (m.phase !== "exporting")
         return json(res, 409, { error: "migration not awaiting a bundle" });
-      let blob;
+      // Spooled to disk, not buffered: see MIGRATE_SPOOL_DIR (XERK-263).
+      const blobPath = migrationBlobPath(m.id);
+      let size;
       try {
-        blob = await readRawBody(req, MIGRATE_BLOB_MAX);
+        size = await spoolRawBody(req, MIGRATE_BLOB_MAX, blobPath);
       } catch (e) {
-        m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
+        const tooLarge = !!e.tooLarge;
+        m.phase = "failed";
+        m.error = tooLarge
+          ? "transcript bundle too large"
+          : "the hub could not store the transcript bundle";
+        m.at = Date.now();
+        freeMigrationBlob(m);
         publishMigrations();
-        return json(res, 413, { error: e.message });
+        if (!tooLarge) console.error(`migration ${m.id}: spool failed: ${e.message}`);
+        return json(res, tooLarge ? 413 : 500, { error: e.message });
       }
-      if (!blob.length) return json(res, 400, { error: "empty bundle" });
-      m.blob = blob;
+      if (!size) {
+        try { fs.unlinkSync(blobPath); } catch {}
+        return json(res, 400, { error: "empty bundle" });
+      }
+      // The upload takes time, and the sweep can time the move out underneath
+      // it: adopting the bundle now would revive a record the UI has already
+      // been told failed — and queue an import for it.
+      if (m.phase !== "exporting") {
+        try { fs.unlinkSync(blobPath); } catch {}
+        return json(res, 409, { error: "migration no longer awaiting a bundle" });
+      }
+      m.blobPath = blobPath;
+      m.blobSize = size;
       m.phase = "importing";
       m.at = Date.now();
       // Hand the target everything it needs to resume the moved session as its
@@ -3646,7 +3797,8 @@ const server = http.createServer(async (req, res) => {
       const s = src && (src.sessions || []).find((x) => x.id === m.srcSessionId);
       const cwd = s && s.worktreePath;
       if (!cwd) {
-        m.phase = "failed"; m.error = "source session gone"; m.blob = null; m.at = Date.now();
+        m.phase = "failed"; m.error = "source session gone"; m.at = Date.now();
+        freeMigrationBlob(m);
         publishMigrations();
         return json(res, 409, { error: "source session gone" });
       }
@@ -3675,13 +3827,37 @@ const server = http.createServer(async (req, res) => {
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m || !m.blob) return json(res, 404, { error: "no bundle" });
+      if (!m || !m.blobPath) return json(res, 404, { error: "no bundle" });
+      // Streamed off the spool (XERK-263). Opened and fstat'd before the
+      // headers go out, so the Content-Length is what will actually be sent and
+      // an unreadable spool is still answerable with a status.
+      let fd;
+      let size;
+      try {
+        fd = fs.openSync(m.blobPath, "r");
+        size = fs.fstatSync(fd).size;
+      } catch (e) {
+        if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+        console.error(`migration ${m.id}: bundle unreadable: ${e.message}`);
+        return json(res, 404, { error: "no bundle" });
+      }
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
-        "Content-Length": m.blob.length,
+        "Content-Length": size,
         "Cache-Control": "no-store",
       });
-      return res.end(m.blob);
+      const stream = fs.createReadStream(null, { fd, autoClose: true });
+      // Past the headers there is no status left to send: cut the connection so
+      // the target sees a short read and gives up, rather than unpacking a
+      // truncated bundle.
+      stream.on("error", (e) => {
+        console.error(`migration ${m.id}: bundle read failed: ${e.message}`);
+        res.destroy();
+      });
+      // The agent hanging up mid-download must not leak the fd.
+      res.on("close", () => stream.destroy());
+      stream.pipe(res);
+      return;
     }
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
@@ -3978,6 +4154,15 @@ const server = http.createServer(async (req, res) => {
               (m.phase === "exporting" || m.phase === "importing")) {
             return json(res, 409, { error: "this session is already being moved" });
           }
+        }
+        // Each in-flight move spools a bundle of up to MIGRATE_BLOB_MAX on the
+        // hub's /data volume until the target has pulled it (XERK-263), so the
+        // number of them running at once is bounded rather than left to the
+        // operator's clicking.
+        if (migrationsInFlight() >= MIGRATE_INFLIGHT_MAX) {
+          return json(res, 503, {
+            error: `the hub is already moving ${MIGRATE_INFLIGHT_MAX} sessions — try again once one finishes`,
+          });
         }
         const m = startMigration(key, s, target);
         return json(res, 200, { ok: true, migrationId: m.id });
@@ -5199,6 +5384,11 @@ if (process.env.TURMA_TEST) {
     findTicketHost,
     migrations,
     advanceMigrations,
+    // The disk spool behind the relay (XERK-263): exported so a test can hold
+    // the invariant that matters — no settled migration leaves a file there.
+    MIGRATE_SPOOL_DIR,
+    MIGRATE_INFLIGHT_MAX,
+    sweepMigrationSpool,
     siteKeyOf,
   };
 } else {
