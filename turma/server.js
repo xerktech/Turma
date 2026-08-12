@@ -316,6 +316,12 @@ function hostAgentToken(host) {
   // would derive the SAME credential. No real host name does this — the point
   // is that the derivation is injective, not that anyone would hit it.
   if (name.toString() !== host) return "";
+  // Nor a name the hub would refuse to register anyway (XERK-269): minting a
+  // valid credential for an unusable host produces the worst outcome of all —
+  // the agent renames ITSELF to its next naming source, the token no longer
+  // matches, and the tunnel reconnect-loops forever without ever mentioning the
+  // name. Refusing at mint time is where the operator can still act on it.
+  if (!isPlainHostKey(host)) return "";
   return name.toString("base64url") + "." +
     crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
 }
@@ -793,7 +799,21 @@ try {
         (movedTo ? `kept at ${movedTo}` : `left in place at ${STATE_FILE} (could not move it)`)
     );
   }
-  agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  // Parsed into a LOCAL so the shape can be judged before anything is installed
+  // (XERK-269). A blob that isn't a plain object is not a registry: `Object.keys`
+  // of a JSON string yields character indices, which restored "5 agents" out of
+  // `"hello"`. The array/number/boolean shapes throw nowhere on their own, so
+  // without this check they reach `agents` intact and the catch never runs.
+  const loaded = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
+    // `typeof null` is "object", so null needs naming explicitly — otherwise the
+    // one shape with no other diagnosis reads "state file is object, not an
+    // object", which is the opposite of a useful message.
+    const shape = loaded === null ? "null"
+      : Array.isArray(loaded) ? "an array" : typeof loaded;
+    throw new Error(`state file is ${shape}, not an object`);
+  }
+  agents = loaded;
   // Records written before a coercion existed — and any host that is OFFLINE,
   // so no beat will ever rewrite its record — carry whatever shape was current
   // when they were saved. Normalize what we LOAD, not just what arrives: the
@@ -801,6 +821,22 @@ try {
   // restart is exactly when a new coercion ships. `normalizeRecord` is shared
   // with the ingest path so the two cannot drift; adding a coercion in one
   // place covers both. Tests: `the state.json restore coerces too`.
+  // The KEY is coerced here too, for the same reason the record is: a record
+  // written before the key guard existed carries a name the ingest path would
+  // now refuse, and the restore is the first thing served after a restart. A
+  // dot-segment key is the case that matters — it is uncommandable AND
+  // undeletable (`DELETE /api/agents/.` is itself one of the routes whose path
+  // collapses), so without this it sits there until `prune()` ages it out days
+  // later. Dropping it is safe: a live host re-registers on its next beat.
+  //
+  // `dropUnusableHostKeys` and `isPlainHostKey` are FUNCTION declarations far
+  // below this line and are reached only because those hoist. Do not convert
+  // either to a `const`: the TDZ ReferenceError would land in this block's
+  // catch, which swallows everything, and the hub would boot with no agents
+  // and no error printed anywhere.
+  for (const key of dropUnusableHostKeys(agents)) {
+    console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(key)}`);
+  }
   for (const a of Object.values(agents)) normalizeRecord(a);
   // Hold what we LOAD to the registry budget too — a flood that landed before
   // the restart is on disk, and restoring all of it is an OOM before the first
@@ -810,8 +846,9 @@ try {
 } catch (e) {
   // A missing file is first boot / no volume mounted and says nothing worth
   // saying. Anything else is a state file the hub HAS and could not use — an
-  // oversized one, or corrupt JSON — which the operator has to be told about,
-  // and which leaves a partially-built registry behind unless it is cleared.
+  // oversized one, corrupt JSON, or a blob that is not a registry — which the
+  // operator has to be told about, and which leaves a partially-built registry
+  // behind unless it is cleared.
   if (!e || e.code !== "ENOENT") {
     agents = {};
     console.error(`state restore skipped: ${(e && e.message) || e}`);
@@ -2468,6 +2505,67 @@ function objectish(x) {
  * so one host's wrong-typed value throws for the whole array and every OTHER
  * host silently disappears from that phone.
  */
+/**
+ * Whether a string is usable as the `agents` key, i.e. as a host this hub can
+ * actually address. Shared by the heartbeat ingest and the `state.json` restore
+ * so the two cannot drift — the same reason `normalizeRecord` is shared.
+ *
+ * Two families are refused. `agents` is a plain object, so a prototype key is
+ * not a host: `__proto__` 200'd while the beat was silently discarded, and
+ * replaced the registry's prototype (XERK-235). And a URL dot segment is
+ * unaddressable: percent-encoding leaves "." and ".." untouched (both are
+ * unreserved), and the URL parser resolving /api/agents/<host>/... then
+ * collapses the segment — "." drops it, ".." climbs a level — so such a host
+ * shows online and healthy while every route against it 404s (XERK-269).
+ *
+ * Exact match, deliberately: the padded forms (" . ", ".\n") ARE addressable,
+ * since the padding percent-encodes to %20/%0A and no parser collapses those.
+ * Names that merely contain dots ("...", ".hidden", "a.b", "HOST.local.") are
+ * ordinary host names and must keep working.
+ */
+function isPlainHostKey(key) {
+  return typeof key === "string" && key.length > 0 && key.length <= 200 &&
+    key !== "__proto__" && key !== "constructor" && key !== "prototype" &&
+    key !== "." && key !== "..";
+}
+
+/**
+ * A refused key is attacker-controlled and NOT length-capped on the way in —
+ * `sanitizeHeartbeat` doesn't bound `device`, so only HEARTBEAT_MAX (32 MiB)
+ * does. Logging it raw let two refused beats write 9 MiB into the hub log, a
+ * synchronous write on the request path that blocks every other host's beat
+ * while it runs. Always log a key through this.
+ */
+function hostKeyLabel(key) {
+  const s = typeof key === "string" ? key : String(key);
+  return s.length > 80
+    ? `${JSON.stringify(s.slice(0, 80))}… (${s.length} chars)`
+    : JSON.stringify(s);
+}
+
+/**
+ * Drop every key `isPlainHostKey` refuses, returning the dropped names.
+ *
+ * Extracted from the restore loop so it can be tested directly: a regex over
+ * the loader's source proves the call is THERE, not that it drops anything —
+ * removing the `delete` still logs "dropping …" while dropping nothing, and
+ * `continue`→`break` silently makes survival depend on JSON key order. Both
+ * kept the suite green.
+ *
+ * Non-object input returns empty rather than iterating: `Object.keys("hello")`
+ * is ["0".."4"], which restored a five-"agent" registry out of a corrupt file.
+ */
+function dropUnusableHostKeys(store) {
+  const dropped = [];
+  if (!store || typeof store !== "object" || Array.isArray(store)) return dropped;
+  for (const key of Object.keys(store)) {
+    if (isPlainHostKey(key)) continue;
+    dropped.push(key);
+    delete store[key];
+  }
+  return dropped;
+}
+
 function normalizeRecord(a) {
   // Order is NOT load-bearing, and must not become so: each of these guards its
   // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
@@ -4486,13 +4584,14 @@ const server = http.createServer(async (req, res) => {
       // fallback if the host name couldn't be read.
       const key = payload.device || payload.agentId;
       if (!key) return json(res, 400, { error: "device/agentId required" });
-      // `agents` is a plain object keyed by host name, so a non-string or a
-      // prototype key is not a host: `__proto__` 200'd while the beat was
-      // silently discarded (and replaced the registry's prototype), and an
-      // object key landed as "[object Object]" (XERK-235). Refuse it loudly —
-      // a beat the hub throws away must never report success.
-      if (typeof key !== "string" || key.length > 200 ||
-          key === "__proto__" || key === "constructor" || key === "prototype") {
+      // A beat the hub would throw away must never report success — see
+      // isPlainHostKey for which names are refused and why. Logged because the
+      // agent side cannot say why on its own: urllib's HTTPError stringifies
+      // without the body, so the agent's log shows a bare "HTTP Error 400" and
+      // the host simply vanishes from the dashboard. This line is the only
+      // place the reason is recoverable.
+      if (!isPlainHostKey(key)) {
+        console.warn(`refused heartbeat: device ${hostKeyLabel(key)} is not a plain host name`);
         return json(res, 400, { error: "device must be a plain host name" });
       }
       // `device` is the host this beat claims to BE, and the whole record —
@@ -6494,6 +6593,13 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    // The KEY half of that pair, shared by the ingest and the restore for the
+    // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
+    // because a source-regex over the restore loop proves the CALL exists, not
+    // that it drops anything — two mutations of an inline loop kept the suite
+    // green while restoring the ghost. `hostKeyLabel` because a refused key is
+    // attacker-controlled and unbounded.
+    isPlainHostKey, dropUnusableHostKeys, hostKeyLabel,
     // The holder the heartbeat's coercion step goes through, exported so a test
     // can make it throw and hold the rollback that follows (XERK-262). See its
     // declaration for why that rollback cannot be reached from the wire.
@@ -6583,7 +6689,15 @@ if (process.env.TURMA_TEST) {
     console.error("TURMA_AGENT_TOKEN is not set — there is no master to derive from");
     process.exit(2);
   } else {
-    console.log(hostAgentToken(host));
+    const token = hostAgentToken(host);
+    if (!token) {
+      // Say WHY. A blank line here sent the operator looking at the master, and
+      // the failure it prevents (a reconnect loop with no mention of the name)
+      // gives them nothing to go on either.
+      console.error(`refusing to mint a token for ${JSON.stringify(host)}: the hub cannot register that host name, so its agent would rename itself and this token would never match`);
+      process.exit(2);
+    }
+    console.log(token);
   }
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");

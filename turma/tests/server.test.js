@@ -1616,6 +1616,19 @@ test("http: a heartbeat whose device is not a plain host name is refused, not si
     const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
     assert.equal(res.status, 400, `${JSON.stringify(device)} must be refused`);
   }
+  // A URL dot segment is collapsed by the parser resolving /api/agents/<host>/...,
+  // so such a host showed online while every route against it 404'd -- including
+  // the DELETE that would remove it, leaving a card stuck for PRUNE_AFTER_MS
+  // (XERK-269). Agents no longer send these, but an un-upgraded one still can.
+  for (const device of [".", ".."]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 400, `${device} must be refused`);
+  }
+  // Names that merely CONTAIN dots are ordinary host names and must still beat.
+  for (const device of ["...", ".hidden", "a.b", "HOST.local."]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 200, `${device} must be accepted`);
+  }
   // The prototype must be intact: a route reading agents[x].commands would
   // otherwise find one on every unknown host.
   const probe = await request("POST", "/api/agents/never-seen/sessions/x/kill", { headers: userHeaders });
@@ -6761,6 +6774,17 @@ test("XERK-268: a host's token names its host and proves that name", () => {
   for (const bad of [["nas01"], { toString: () => "nas01" }, 5, null, undefined, ""]) {
     assert.equal(hostAgentToken(bad), "");
   }
+  // Nor a name the hub would refuse to REGISTER (XERK-269). Minting one is the
+  // worst outcome available: the agent renames itself to its next naming
+  // source, the token stops matching, and the tunnel reconnect-loops forever
+  // without ever naming the cause. `x`.repeat(201) is over the key length cap.
+  for (const bad of [".", "..", "__proto__", "constructor", "prototype", "x".repeat(201)]) {
+    assert.equal(hostAgentToken(bad), "", `must not mint for ${JSON.stringify(bad)}`);
+  }
+  // ...while names that merely contain dots still mint, since they register fine.
+  for (const good of ["...", ".hidden", "..host", "HOST.local."]) {
+    assert.match(hostAgentToken(good), /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/, good);
+  }
 });
 
 test("XERK-268: a bearer proves at most the ONE host it derives to", () => {
@@ -7586,6 +7610,70 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
   assert.ok(!("localModel" in old));
 });
 
+test("isPlainHostKey refuses exactly the names the hub cannot address", () => {
+  // Prototype keys (XERK-235) and URL dot segments (XERK-269): the first is not
+  // a host at all, the second is a host no /api/agents/<host>/... route can
+  // reach, because the URL parser collapses the segment before it ever matches.
+  for (const bad of ["__proto__", "constructor", "prototype", ".", "..",
+    "", "x".repeat(201), null, undefined, 12, {}, ["x"]]) {
+    assert.equal(hub.isPlainHostKey(bad), false, `${JSON.stringify(bad)} must be refused`);
+  }
+  // Padded dots ARE addressable — the padding percent-encodes to %20/%0A, which
+  // no parser collapses — so refusing them would be over-scoping the guard.
+  // Names that merely contain dots are ordinary host names.
+  for (const good of ["truenas", "WIN-DESK01", "HOST.local.", "...", ".hidden",
+    "a.b", "..host", " . ", ".\n", "\t..\n", "x".repeat(200),
+    "日本語ホスト", "host%name", "a/b"]) {
+    assert.equal(hub.isPlainHostKey(good), true, `${JSON.stringify(good)} must be accepted`);
+  }
+});
+
+test("dropUnusableHostKeys actually REMOVES the keys, in every position", () => {
+  // A source regex over the restore loop proves the call is there, not that it
+  // drops anything: removing the `delete` still printed "dropping …" while
+  // dropping nothing, and `continue`→`break` made survival depend on JSON key
+  // order. Both kept the suite green, so this asserts the mutation instead.
+  const store = {
+    ".": { device: "." }, "truenas": { device: "truenas" },
+    "..": { device: ".." }, "HOST.local.": { device: "HOST.local." },
+    "__proto__x": { device: "__proto__x" }, "...": { device: "..." },
+  };
+  // A bad key FIRST, LAST and in the MIDDLE — an early `break` survives only a
+  // fixture whose refused keys happen to lead.
+  const dropped = hub.dropUnusableHostKeys(store);
+  assert.deepEqual(dropped.sort(), [".", ".."], "both dot keys reported");
+  assert.deepEqual(Object.keys(store).sort(),
+    ["...", "HOST.local.", "__proto__x", "truenas"],
+    "the dot keys are GONE and every ordinary name survived");
+  assert.equal(Object.hasOwn(store, "."), false);
+
+  // Nothing to do is not an error, and reports nothing.
+  const clean = { truenas: {} };
+  assert.deepEqual(hub.dropUnusableHostKeys(clean), []);
+  assert.deepEqual(Object.keys(clean), ["truenas"]);
+
+  // A corrupt state file is not a registry: Object.keys("hello") is ["0".."4"],
+  // which restored a five-"agent" fleet out of a bare JSON string.
+  for (const junk of ["hello", [], null, undefined, 12, true]) {
+    assert.deepEqual(hub.dropUnusableHostKeys(junk), [],
+      `${JSON.stringify(junk)} must be left alone, not iterated`);
+  }
+});
+
+test("a refused device name is truncated before it reaches the log", () => {
+  // `sanitizeHeartbeat` does not cap `device` — only HEARTBEAT_MAX (32 MiB)
+  // does — so logging a refused key raw let two beats write 9 MiB into the hub
+  // log, synchronously, on the request path.
+  const huge = "z".repeat(5 * 1024 * 1024);
+  const line = hub.hostKeyLabel(huge);
+  assert.ok(line.length < 200, `logged ${line.length} chars for a 5 MiB key`);
+  assert.match(line, /\(5242880 chars\)/, "the real length is still reported");
+  // Short keys are logged whole, quoted, so the common case stays readable.
+  assert.equal(hub.hostKeyLabel("."), '"."');
+  assert.equal(hub.hostKeyLabel("__proto__"), '"__proto__"');
+  assert.equal(hub.hostKeyLabel(12), '"12"', "a non-string key still logs safely");
+});
+
 test("the state.json restore coerces too, not just the ingest path", () => {
   // A hub restart is exactly when a new coercion ships, and the restore is the
   // FIRST thing it serves. A record written before it — or belonging to an
@@ -7608,7 +7696,12 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   // the fourth (`sanitizeLiveAgents`) missing from the restore — enumerating is
   // exactly the shape that let the hole exist.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  const loader = src.slice(src.indexOf("agents = JSON.parse"), src.indexOf("first boot or no volume"));
+  // Anchored on the section header rather than a statement, so rewording the
+  // parse doesn't silently slice nothing and pass this whole block vacuously.
+  const loStart = src.indexOf("---- persistence");
+  const loEnd = src.indexOf("first boot or no volume");
+  assert.ok(loStart > -1 && loEnd > loStart, "the loader block must be locatable");
+  const loader = src.slice(loStart, loEnd);
   assert.ok(/normalizeRecord\(a\)/.test(loader),
     "the state.json restore must go through normalizeRecord, like the ingest path");
   const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
@@ -7620,6 +7713,14 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   // the restore share ONE function, not a list of coercions to keep in step.
   assert.ok(/recordCoercion\.normalize\(next\)/.test(ingest),
     "the heartbeat ingest must go through the same normalizeRecord");
+  // The KEY needs the same treatment as the record, and for the same reason: a
+  // guard shipped only at ingest leaves an already-persisted bad key restored
+  // verbatim at boot. A dot-segment key is uncommandable AND undeletable, so it
+  // would sit there until prune() ages it out days later (XERK-269).
+  assert.ok(/dropUnusableHostKeys\(agents\)/.test(loader),
+    "the state.json restore must drop keys the ingest path would refuse");
+  assert.ok(/isPlainHostKey\(key\)/.test(ingest),
+    "the heartbeat ingest must go through the same key guard");
   // ...and BETWEEN the two size measurements. Before the raw check it could
   // shrink away the amplifier the ceiling exists to refuse (an 8 MiB string
   // `sessions` became `[]` and the beat 200'd); after the coerced check, an
@@ -7682,6 +7783,81 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
   assert.equal(rec.sessions[0].modelSourceAt, "");
   assert.deepEqual(rec.sessions[0].session.agents,
     [{ sel: true, type: "[object Object]", label: "x" }]);
+});
+
+// Boot the real module against a fixture state file and hand back its `agents`.
+// Shares the child-process approach of "the restore actually RUNS" above: the
+// restore happens at module init, so nothing short of a real load exercises it.
+function bootWithState(t, raw) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-key-"));
+  fs.writeFileSync(path.join(dir, "state.json"), raw);
+  // console.warn goes to stderr, which this harness discards, so it is captured
+  // BEFORE the require — the restore runs during module init — and handed back
+  // on stdout with the agents.
+  return require("child_process").execFileSync(process.execPath, ["-e", `
+    process.env.TURMA_TEST = "1";
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(" "));
+    // The restore reports a refused file through console.error (XERK-272) and
+    // its dropped KEYS through console.warn, so both are captured here.
+    console.error = (...a) => warns.push(a.join(" "));
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    process.stdout.write("<<<" + JSON.stringify({ agents: hub.agents, warns }) + ">>>");
+    process.exit(0);
+  `], {
+    env: { ...process.env, TURMA_TEST: "1", STATE_FILE: path.join(dir, "state.json"),
+           ARCHIVE_DIR: path.join(dir, "a"), ARCHIVE_DB: path.join(dir, "a.db"),
+           NODE_NO_WARNINGS: "1" },
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
+test("a restored state file cannot carry a host the hub could not address", () => {
+  // The end-to-end form of the drop: not "the call is in the source" and not
+  // "the helper works", but a real module init over a real file. The ghost this
+  // prevents was uncommandable AND undeletable, so it outlived every route that
+  // could have cleared it (XERK-269).
+  // Written as raw JSON, not via JSON.stringify of a literal: `"__proto__":` in
+  // an object literal sets the PROTOTYPE and creates no key, so a stringified
+  // fixture silently omits the very case XERK-235 is about. JSON.parse does
+  // make it an own property, which is the real hazard.
+  const out = bootWithState(this, '{' +
+    '"__proto__":{"device":"proto"},' +
+    '".":{"device":"."},' +
+    '"truenas":{"device":"truenas"},' +
+    '"..":{"device":".."},' +
+    '"HOST.local.":{"device":"HOST.local."},' +
+    '"...":{"device":"..."}}');
+  const { agents: restored, warns } = JSON.parse(
+    out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+  assert.deepEqual(Object.keys(restored).sort(), ["...", "HOST.local.", "truenas"],
+    "dot segments and prototype keys must not survive a restore");
+  // The log line alone is NOT evidence — a drop that reports but does not
+  // delete still prints it, which is how the earlier version passed. The key
+  // list above is the proof; this only checks the operator is told at all.
+  assert.equal(warns.filter((w) => /dropping restored agent/.test(w)).length, 3);
+});
+
+test("a corrupt state file restores nothing, rather than a registry of characters", () => {
+  // `Object.keys("hello")` is ["0".."4"], so a bare JSON string loaded as "5
+  // agents". The array/number/boolean shapes are the ones that matter most:
+  // they throw nowhere on their own, so the catch's `agents = {}` reset never
+  // fires for them and only the shape check keeps them out of the registry.
+  for (const junk of ['"hello"', "[]", "12", "null", "true"]) {
+    const out = bootWithState(this, junk);
+    const { agents: restored } = JSON.parse(
+      out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+    assert.deepEqual(restored, {}, `state.json of ${junk} must restore nothing`);
+    assert.doesNotMatch(out, /loaded \d+ agents/,
+      `${junk} must not report a successful load`);
+    // ...and it SAYS so, rather than being indistinguishable from first boot.
+    const { warns } = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+    assert.ok(warns.some((w) => /state restore skipped/.test(w)),
+      `${junk} must be reported, not silently treated as first boot`);
+  }
+  // A well-formed file still loads, so the guard isn't refusing everything.
+  const ok = bootWithState(this, JSON.stringify({ truenas: { device: "truenas" } }));
+  assert.match(ok, /loaded 1 agents from/);
 });
 
 test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
