@@ -1055,8 +1055,22 @@ function normalizeModelUsage(usage) {
 function normalizeUsage(payload) {
   if (!payload || typeof payload !== "object") return;
   normalizeModelUsage(payload.usage);
-  for (const r of payload.repoUsage || []) normalizeModelUsage(r && r.usage);
-  for (const s of payload.sessions || []) normalizeModelUsage(s && s.usage);
+  // `Array.isArray`, not `|| []`: a non-iterable `repoUsage`/`sessions` (an
+  // OBJECT, say) makes a bare `for…of` THROW, and a throw here is uniquely
+  // costly — on the restore path it lands in a silent `catch {}` and abandons
+  // every host after this one, uncoerced, on every boot.
+  // Both are typed LISTS on Android, so a non-array is decode-fatal for the
+  // WHOLE fleet payload, not just this host — rewrite it rather than merely
+  // stepping around it. (Safe because normalizeRecord runs past the raw-size
+  // gate; before it, this would have shrunk away an amplifier.)
+  if (!Array.isArray(payload.repoUsage)) {
+    if ("repoUsage" in payload) payload.repoUsage = [];
+  } else {
+    for (const r of payload.repoUsage) normalizeModelUsage(r && r.usage);
+  }
+  if (Array.isArray(payload.sessions)) {
+    for (const s of payload.sessions) normalizeModelUsage(s && s.usage);
+  }
 }
 
 // The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for
@@ -1841,9 +1855,11 @@ function sanitizeHeartbeat(payload, key) {
  * host silently disappears from that phone.
  */
 function normalizeRecord(a) {
-  // Sessions FIRST: normalizeUsage iterates `payload.sessions || []`, so a
-  // non-iterable `sessions` throws there — and on the restore path that throw
-  // lands in a silent `catch {}` and abandons the whole record half-coerced.
+  // Order is NOT load-bearing, and must not become so: each of these guards its
+  // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
+  // here lands in the restore's silent `catch {}` and abandons every host after
+  // this one, uncoerced, on every boot. Sessions first only because it is the
+  // one that rewrites a shape the others iterate.
   normalizeSessions(a);
   normalizeUsage(a);
   normalizeLimits(a);
@@ -1878,9 +1894,8 @@ function normalizeSessions(payload) {
   const bad = payload.sessions.some((s) => !s || typeof s !== "object");
   if (bad) payload.sessions = payload.sessions.filter((s) => s && typeof s === "object");
   for (const s of payload.sessions) {
-    // Live agent rows come from a pane scrape: re-shaped and bounded for the
-    // same reason the `turn` frame's are — clients turn this into a count and
-    // a label, and nothing else bounds it.
+    // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
+    // never goes through that: idempotent, so running twice costs nothing.
     const live = s.session;
     if (live && typeof live === "object" && "agents" in live) {
       live.agents = sanitizeLiveAgents(live.agents) || [];
@@ -3652,6 +3667,40 @@ const server = http.createServer(async (req, res) => {
       // and then restoring `prev` restored an object the ingests had already
       // mutated — a refused beat still poisoned the caches and its content came
       // back out of /history with a 413 on the wire.
+      const refuseOversized = (size) => {
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        console.error(
+          `heartbeat from ${key}: record is ${size} bytes, over the ` +
+            `${AGENT_RECORD_MAX} limit — beat refused`
+        );
+        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+      };
+      // TWO measurements, one ceiling. The RAW size is the amplifier check: a
+      // coercion that discards junk must not be able to shrink an oversized
+      // beat into an accepted one (rewriting an 8 MiB string `sessions` to `[]`
+      // did exactly that, turning a 413 into a 200). The COERCED size is what
+      // actually gets stored and served, and a coercion can EXPAND —
+      // normalizeModelUsage rewrites `"m"` to `{model:"m"}`, ~3.5x, so an 8 MiB
+      // beat of model names parked 28 MiB per host for a week. Neither
+      // measurement alone holds the ceiling.
+      const rawSize = agentRecordSize(next);
+      if (rawSize > AGENT_RECORD_MAX) return refuseOversized(rawSize);
+      // Coercion sits BETWEEN the two, so it never walks an unbounded record —
+      // that is how a 24 MiB model name reached a per-code-point spread and
+      // OOM-killed the hub. A throw here would leave the RAW record installed
+      // (`agents[key] = next` is already done), which is worse than refusing:
+      // it defeats every gate downstream, including localModelAvailable's
+      // strict-boolean check. The coercions are written not to throw; this is
+      // the backstop that makes that not matter.
+      try {
+        normalizeRecord(next);
+      } catch (e) {
+        console.error(`heartbeat from ${key}: coercion failed (${e.message}) — beat refused`);
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        return json(res, 400, { error: "malformed heartbeat" });
+      }
       const recordSize = agentRecordSize(next);
       // Visible BEFORE it 413s. Measured against the operator's real fleet the
       // largest record is 0.30 MiB, so half the ceiling means something has
@@ -3667,24 +3716,7 @@ const server = http.createServer(async (req, res) => {
         );
       }
       recordSizeWarned.set(key, overHalf);
-      if (recordSize > AGENT_RECORD_MAX) {
-        if (prev && Object.keys(prev).length) agents[key] = prev;
-        else delete agents[key];
-        console.error(
-          `heartbeat from ${key}: record is ${recordSize} bytes, over the ` +
-            `${AGENT_RECORD_MAX} limit — beat refused`
-        );
-        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
-      }
-      // Coerce AFTER the ceiling, never before. Coercing first let the
-      // amplifier the ceiling exists to refuse be quietly shrunk away — an
-      // 8 MiB string `sessions` rewritten to `[]` turned a 413 into a 200 — and
-      // it also meant an oversized beat was walked field-by-field before being
-      // thrown out, which is how a 24 MiB model name reached a per-code-point
-      // spread and OOM-killed the hub. Past the gate the record is bounded, so
-      // a coercion here is free to REWRITE rather than only shrink. Same
-      // function the state.json restore calls (normalizeRecord).
-      normalizeRecord(next);
+      if (recordSize > AGENT_RECORD_MAX) return refuseOversized(recordSize);
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);

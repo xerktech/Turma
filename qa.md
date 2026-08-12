@@ -383,18 +383,24 @@ started `-read-only`, which is why you cannot simply reuse the shared one.
   compose-bar chips reflow as their labels change width. Match `content-desc`
   where there is one, and **match exactly** — a substring `Sessions` hits
   `RUNNING SESSIONS` first. Snackbars live ~3s, so poll at t+2s.
-  - **But budget 30–60s per dump when a second emulator is running** — it waits
-    for window idle and the ~1s fleet beat keeps repainting, so a scripted walk
-    of six screens can take 20 minutes and looks hung. `exec-out screencap -p`
-    costs ~2s and never blocks: drive from fixed coordinates read off one
-    screenshot, and spend a dump only where you need `content-desc`.
+  - **A dump costs ~2s normally, but can stall for tens of seconds** — it waits
+    for window idle, so a screen the ~1s fleet beat keeps repainting can hold it
+    off. Measured on emulator-5556 with a second emulator running and the fleet
+    beating: 1.94–1.97s, so do NOT plan around a fixed 30–60s budget. When one
+    screen does hang, `exec-out screencap -p` costs ~2s and never blocks: drive
+    from fixed coordinates read off one screenshot, and spend a dump only where
+    you need `content-desc`.
   - A `content-desc` containing a `"` is emitted in SINGLE quotes, so
     `grep 'content-desc="…'` misses it. Grep the value, not the attribute.
   - **A row that appears/disappears reflows the buttons under it.** Hiding the
     composer's "Run against" row moved `Spawn` up ~100px, and the stale
     coordinate hit dead space — re-screenshot after any state change that can
     add or drop a field.
-- `ExposedDropdownMenuBox` opens on its **trailing caret**, not the field body.
+- `ExposedDropdownMenuBox` opens on a tap **anywhere in the field**, caret or
+  body — measured on the spawn composer's Model row (bounds `[183,1277]`–
+  `[897,1445]`, tapped at x=325, menu opened). An earlier note here said the
+  caret only; that is wrong for this build, so resolve the field's own bounds
+  and tap its centre.
 - A destructive row **arms and re-disarms**: `Kill` becomes `Confirm kill` and
   reverts in ~2s, so the two taps must be one `adb shell "input tap …; sleep
   0.4; input tap …"`. A dump between them loses the arm.

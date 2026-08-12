@@ -6555,12 +6555,16 @@ test("the state.json restore coerces too, not just the ingest path", () => {
     src.indexOf("ingestHistory(next, historyResults)"));
   assert.ok(/normalizeRecord\(next\)/.test(ingest),
     "the heartbeat ingest must go through the same normalizeRecord");
-  // ...and AFTER the ceiling, never before: coercing first shrinks away the
-  // amplifier the ceiling exists to refuse (an 8 MiB string `sessions` became
-  // `[]` and the beat 200'd), and walks an oversized record field by field
-  // before throwing it out — which is how a 24 MiB name reached a spread.
-  assert.ok(ingest.indexOf("recordSize > AGENT_RECORD_MAX") < ingest.indexOf("normalizeRecord(next)"),
-    "normalizeRecord must run past the AGENT_RECORD_MAX gate, not before it");
+  // ...and BETWEEN the two size measurements. Before the raw check it could
+  // shrink away the amplifier the ceiling exists to refuse (an 8 MiB string
+  // `sessions` became `[]` and the beat 200'd); after the coerced check, an
+  // EXPANDING coercion escapes the ceiling entirely (normalizeModelUsage is
+  // ~3.5x, and an 8 MiB beat parked 28 MiB per host for a week).
+  const iRaw = ingest.indexOf("rawSize > AGENT_RECORD_MAX");
+  const iCoerce = ingest.indexOf("normalizeRecord(next)");
+  const iStored = ingest.indexOf("recordSize > AGENT_RECORD_MAX");
+  assert.ok(iRaw > -1 && iCoerce > iRaw && iStored > iCoerce,
+    "the ingest must measure raw size, THEN coerce, THEN measure the stored size");
 });
 
 test("the restore actually RUNS — it must not throw into its own catch", () => {
@@ -6638,6 +6642,65 @@ test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
   assert.equal(huge.localModel.model, "x".repeat(60));
   // Bounded: ~0.1ms. Unbounded at this size: several hundred ms and ~600 MB.
   assert.ok(ms < 60, `coercing a 32 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
+});
+
+test("http: an EXPANDING coercion cannot escape the record ceiling", async () => {
+  // normalizeModelUsage rewrites `"m"` to `{model:"m"}` — ~3.5x. Measuring only
+  // the raw size let an 8 MiB beat of bare model names park 28 MiB per host for
+  // a week, in state.json, in every /api/agents response and every SSE frame:
+  // exactly the amplification the ceiling was added to stop.
+  const host = "fat-expand";
+  const models = new Array(2_000_000).fill("m");
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [], usage: { models } },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(agents[host], undefined, "a refused beat must not install a record");
+});
+
+test("http: a beat whose coercion throws is refused, never installed raw", async () => {
+  // The coercion runs AFTER `agents[key] = next`, so a throw inside it would
+  // leave the RAW record installed — worse than refusing, because every gate
+  // downstream then reads uncoerced values (`localModelAvailable` treats the
+  // string "yes" as true and hands out a switch the host cannot honour), and
+  // the poison reaches state.json where the restore chokes on it forever.
+  const host = "throw-host";
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    // A non-iterable `repoUsage` used to throw out of normalizeUsage's `for…of`.
+    body: { device: host, sessions: [], repoUsage: { a: 1 },
+            localModel: { available: "yes" } },
+  });
+  // Either it coerces cleanly (the guards below) or it is refused — never both
+  // 4xx AND installed.
+  if (res.status !== 200) {
+    assert.equal(agents[host], undefined, "a refused beat must not install a record");
+  } else {
+    // Accepted means fully coerced — never accepted-and-raw, which is the state
+    // that defeats every gate downstream and poisons state.json.
+    assert.equal(agents[host].localModel.available, false, "served uncoerced");
+    assert.deepEqual(agents[host].repoUsage, [], "a non-array repoUsage must not be served");
+  }
+  // And the capability gate must not be fooled by the raw string either way.
+  const spawn = await request("POST", `/api/agents/${host}/sessions`, {
+    headers: userHeaders, body: { repo: "Turma", modelSource: "local" },
+  });
+  assert.equal(spawn.status, 409, "an uncoerced `available` must not pass the gate");
+});
+
+test("normalizeUsage survives a non-iterable repoUsage or sessions", () => {
+  // A bare `for (… of payload.repoUsage || [])` throws on an object, and on the
+  // restore path that throw aborts EVERY host after this one, silently.
+  for (const bad of [{ a: 1 }, "str", 7, true]) {
+    const p = { device: "h", repoUsage: bad, sessions: bad, usage: { models: ["m"] } };
+    hub.normalizeRecord(p);             // must not throw
+    // BOTH are typed lists on Android, so both are rewritten — not merely
+    // stepped around. Guarding the loop alone turned a 400 (which never
+    // installed the host) into a 200 serving a fleet-killing shape.
+    assert.deepEqual(p.sessions, []);
+    assert.deepEqual(p.repoUsage, []);
+  }
 });
 
 test("normalizeSessions coerces the per-session fields Android types", () => {
