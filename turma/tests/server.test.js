@@ -6202,7 +6202,7 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
   assert.equal(nearMiss.status, 404);
 });
 
-test("migrate: every POST refusal is the same 404, so the relay is no host oracle", async () => {
+test("migrate: every POST refusal is the same 404, so the responses name no host", async () => {
   // `<host>` is self-asserted (XERK-268), so any refusal a NON-source can't
   // also get names the source to anyone holding the id — and then the injection
   // above is a matter of re-addressing. The refusals are therefore uniform: a
@@ -6241,6 +6241,22 @@ test("migrate: every POST refusal is the same 404, so the relay is no host oracl
   // The re-POST didn't disturb the move it was refused from.
   assert.equal(migrations.get(mid).phase, "importing");
   assert.ok(migrations.get(mid).blob.equals(Buffer.from("REAL")));
+
+  // The refusal AFTER the body read counts too: only the real source can reach
+  // "source session gone", so a status of its own would name it. The reply is
+  // the same 404; the RECORD keeps the true reason for the operator.
+  await migHost("orD", "or.atlassian.net", { session: "s9" });
+  await migHost("orE", "or.atlassian.net");
+  const gone = (await migrate("orD", "s9", { host: "orE" })).body.migrationId;
+  await request("POST", "/api/heartbeat", { // the source session vanishes mid-move
+    body: { device: "orD", repos: [{ name: "Turma", path: "/git/Turma" }], sessions: [] },
+    headers: agentHeaders,
+  });
+  const afterGone = await post("orD", gone, Buffer.from("REAL"));
+  assert.equal(afterGone.status, 404);
+  assert.deepEqual(afterGone.body, rePost.body);
+  assert.equal(migrations.get(gone).phase, "failed");
+  assert.equal(migrations.get(gone).error, "source session gone");
 });
 
 // ---- file attachments (XERK-234) -------------------------------------------

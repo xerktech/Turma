@@ -3634,17 +3634,22 @@ const server = http.createServer(async (req, res) => {
     // Any RESPONSE a non-source can't also get identifies the source, and with
     // the id (which rides the user-authed fleet payload, so it is not only the
     // two agents') a few hundred silent probes then find it. So a wrong host, a
-    // wrong phase and an empty body are deliberately indistinguishable — do NOT
-    // restore a friendlier 409/400 here, and note the real source loses nothing
-    // it acts on (it logs the failure and the move times out either way).
-    // Two residual leaks remain, and neither is closeable without reading an
-    // unbounded body from an unverified caller — so **the oracle is narrowed,
-    // not shut**, and only XERK-268 shuts it: the TIMING of an accepted vs
+    // wrong phase, an empty body and a vanished source session are deliberately
+    // indistinguishable — do NOT restore a friendlier 409/400 at any of them,
+    // and note the real source loses nothing it acts on (it logs the failure
+    // and the move times out either way; the RECORD still carries the real
+    // reason for the operator). Adding a reply only the source can reach
+    // re-opens this, so **enumerate what this route can answer, don't eyeball
+    // the guard** — the `source session gone` branch below is why.
+    // Two residual leaks remain, so **the oracle is narrowed, not shut**, and
+    // only XERK-268 shuts it — neither is closeable here without reading an
+    // unbounded body from an unverified caller: the TIMING of an accepted vs
     // rejected POST (this guard runs BEFORE the body read, so an accepted
     // caller blocks while a rejected one answers at once — measured at 15
     // probes and 960 bytes to find a source, mutating nothing), and the 413,
-    // which costs a >MIGRATE_BLOB_MAX upload per probe and fails the migration
-    // loudly.
+    // which fails the migration loudly and costs an upload per probe — ~1 MiB
+    // at a wrong host, which the guard cuts off early, and the full
+    // >MIGRATE_BLOB_MAX only on the hit.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
       const host = decodeURIComponent(parts[2]);
@@ -3672,9 +3677,14 @@ const server = http.createServer(async (req, res) => {
       const s = src && (src.sessions || []).find((x) => x.id === m.srcSessionId);
       const cwd = s && s.worktreePath;
       if (!cwd) {
+        // The RECORD says what really happened (the operator reads that, and it
+        // stays truthful), but the REPLY is the same 404 as every other refusal
+        // — only the real source can reach this line, so a distinct status here
+        // would name it to anyone holding the id, exactly like the 409 and 400
+        // above. Nothing consumes this reply; the agent only logs it.
         m.phase = "failed"; m.error = "source session gone"; m.blob = null; m.at = Date.now();
         publishMigrations();
-        return json(res, 409, { error: "source session gone" });
+        return json(res, 404, { error: "unknown migration" });
       }
       m.importCmdId = queueCommand(m.targetHost, {
         type: "importSession",
