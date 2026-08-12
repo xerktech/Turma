@@ -36,6 +36,9 @@ process.env.CONTROL_DEAD_AFTER_MS = "400";
 // Same trick for the create single-flight's expiry (XERK-241): the fleet gives
 // an unresolved create 60s to rejoin a retry, which is only testable wound down.
 process.env.CREATE_INFLIGHT_TTL_MS = "300";
+// Same trick for the stalled-body reclaim (XERK-258): the fleet gives a body
+// holding budget 20s of silence, which is only testable wound down.
+process.env.BODY_IDLE_TIMEOUT_MS = "400";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
@@ -6756,4 +6759,35 @@ test("drain: only so many refused bodies may drain at once", async () => {
   });
   assert.equal(res.status, 413);
   assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
+});
+
+test("budget: a body that goes silent while holding budget is taken back", async () => {
+  // The budget bounds how MUCH may be held; this bounds how LONG. One socket
+  // that streamed 22 MiB and then stopped took the big lane and refused every
+  // other body on the hub -- tiny heartbeats and the operator's own login --
+  // until the 300s request timeout, renewably, for ~0.6 kbit/s.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    const pad = "z".repeat(256 * 1024);
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        `{"device":"staller","pad":"${pad}`
+    );
+    // ...and then nothing. Wait for the charge to land, then for it to be taken.
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(hub.bodyInflightHeld() > 0, "the bytes it DID send are charged");
+
+    const deadline = Date.now() + hub.BODY_IDLE_TIMEOUT_MS + 5000;
+    while (hub.bodyInflightHeld() > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(hub.bodyInflightHeld(), 0, "a hold with no progress must not be permanent");
+    // The lane has to come back too, or every large body is refused from here on.
+    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), "big");
+  } finally {
+    sock.destroy();
+  }
 });

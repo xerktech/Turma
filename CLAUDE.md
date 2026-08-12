@@ -282,6 +282,15 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - **A refused body must be closed, not merely paused.** Node DUMPS an unread body when the
     response finishes, to keep the connection alive — it resumes the paused stream and reads the
     whole thing. Discarded bytes are still read into memory.
+  - **A body holding budget that goes SILENT is taken back** (`BODY_IDLE_TIMEOUT_MS`). The budget
+    bounds how much may be held; only this bounds how long. One socket that streamed 22 MiB and
+    stopped held the big lane until `requestTimeout` (300s), refusing every body on the hub —
+    including the operator's login — for ~0.6 kbit/s. Armed only while a charge is held and reset by
+    every chunk, so a genuinely slow client is untouched; it is silence, not slowness, that is
+    reclaimed.
+  - **Known gap: CHUNKED bodies bypass the declared-length pre-check** and can still OOM the hub at
+    256m (XERK-287). Fixing it means capping undeclared-body concurrency, which is only safe once
+    it's known whether the Cloudflare tunnel preserves agent framing — measure before capping.
   - `server.maxConnections` bounds the socket count, which no byte budget can: each socket costs a
     read buffer, parser and req/res objects before a body byte arrives. It counts the upgraded
     WebSockets too, so the number must clear steady-state SSE/tunnel/terminal use with room spare —

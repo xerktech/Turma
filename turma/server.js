@@ -1982,7 +1982,23 @@ function readBody(req, cap = BODY_MAX) {
     let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
     const release = () => { releaseBody(held, lane); held = 0; lane = null; };
     const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
-    req.on("close", endDrain);
+    // Armed only while this read holds budget, and reset by every chunk: a slow
+    // client keeps sending and is never touched; an abandoned one is.
+    let idleTimer = null;
+    const disarmIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+    const armIdle = () => {
+      disarmIdle();
+      idleTimer = setTimeout(() => {
+        if (over) return;
+        over = true;
+        release();
+        reject(new BodyStalled());
+        try { req.destroy(); } catch {}
+      }, BODY_IDLE_TIMEOUT_MS);
+      // Must not hold the process open on its own (the suite would never exit).
+      if (idleTimer.unref) idleTimer.unref();
+    };
+    req.on("close", () => { endDrain(); disarmIdle(); });
     const refuse = (err, from = cap) => {
       over = true;
       data = ""; // release it — it is not going to be used
@@ -1997,6 +2013,7 @@ function readBody(req, cap = BODY_MAX) {
       if (drainingNow >= DRAIN_CONCURRENCY_MAX) { drainLimit = 0; err.noDrain = true; }
       else { drainingNow++; draining = true; }
       release();
+      disarmIdle();
       // A budget refusal STOPS READING rather than draining. Draining is a
       // courtesy paid out of the very resource that has just run out, and Node
       // hands us whatever has accumulated in one `data` event — megabytes — so
@@ -2055,11 +2072,12 @@ function readBody(req, cap = BODY_MAX) {
         lane = next;
         chargeBody(want - held, lane);
         held = want;
+        armIdle();
       }
       data += c;
     });
-    req.on("end", () => { if (!over) { release(); resolve(data); } });
-    req.on("error", (e) => { release(); reject(e); });
+    req.on("end", () => { if (!over) { disarmIdle(); release(); resolve(data); } });
+    req.on("error", (e) => { disarmIdle(); release(); reject(e); });
   });
 }
 
@@ -2093,6 +2111,30 @@ let drainingNow = 0;
 // being buffered. This is enough for the response to flush and no more.
 const BUDGET_DRAIN_SLACK = 64 << 10; // 64 KiB
 
+// How long a body holding budget may go silent before the hub takes it back.
+//
+// The budget bounds how MUCH may be held; without this nothing bounded how
+// LONG. One socket that streamed 22 MiB and then simply stopped took the big
+// lane and refused every other body on the hub — tiny heartbeats and the
+// operator's own login included — until `requestTimeout` (300s) expired, and it
+// cost ~0.6 kbit/s to renew forever. A hold with no progress is not slow, it is
+// abandoned, and the two are told apart by whether bytes are still arriving.
+//
+// Only armed while a read actually holds a charge, and reset by every chunk, so
+// a genuinely slow client on a bad link is untouched — it keeps sending. The
+// window is generous for that reason: this is not a throughput floor.
+const BODY_IDLE_TIMEOUT_MS = Number(process.env.BODY_IDLE_TIMEOUT_MS) || 20 * 1000;
+
+// Thrown when a body holding budget stops arriving. Its socket is destroyed —
+// a caller that stopped mid-body is not waiting to read a status, and by this
+// point it is holding room the rest of the fleet needs.
+class BodyStalled extends Error {
+  constructor() {
+    super("body stalled while holding the in-flight budget");
+    this.stalled = true;
+  }
+}
+
 // Collect a request body as raw bytes (for the binary migration relay and the
 // attachment uploads, which readBody's 1 MiB string cap would truncate). Rejects
 // past `cap` so a huge or runaway upload can't exhaust the hub's memory: the
@@ -2111,7 +2153,23 @@ function readRawBody(req, cap) {
     let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
     const release = () => { releaseBody(held, lane); held = 0; lane = null; };
     const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
-    req.on("close", endDrain);
+    // Armed only while this read holds budget, and reset by every chunk: a slow
+    // client keeps sending and is never touched; an abandoned one is.
+    let idleTimer = null;
+    const disarmIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+    const armIdle = () => {
+      disarmIdle();
+      idleTimer = setTimeout(() => {
+        if (over) return;
+        over = true;
+        release();
+        reject(new BodyStalled());
+        try { req.destroy(); } catch {}
+      }, BODY_IDLE_TIMEOUT_MS);
+      // Must not hold the process open on its own (the suite would never exit).
+      if (idleTimer.unref) idleTimer.unref();
+    };
+    req.on("close", () => { endDrain(); disarmIdle(); });
     const refuse = (err, from = cap) => {
       over = true;
       chunks = []; // release what we'd buffered — it is not going to be used
@@ -2126,6 +2184,7 @@ function readRawBody(req, cap) {
       if (drainingNow >= DRAIN_CONCURRENCY_MAX) { drainLimit = 0; err.noDrain = true; }
       else { drainingNow++; draining = true; }
       release();
+      disarmIdle();
       // A budget refusal STOPS READING rather than draining. Draining is a
       // courtesy paid out of the very resource that has just run out, and Node
       // hands us whatever has accumulated in one `data` event — megabytes — so
@@ -2159,11 +2218,12 @@ function readRawBody(req, cap) {
         lane = next;
         chargeBody(len - held, lane);
         held = len;
+        armIdle();
       }
       chunks.push(c);
     });
-    req.on("end", () => { if (!over) { release(); resolve(Buffer.concat(chunks)); } });
-    req.on("error", (e) => { release(); reject(e); });
+    req.on("end", () => { if (!over) { disarmIdle(); release(); resolve(Buffer.concat(chunks)); } });
+    req.on("error", (e) => { disarmIdle(); release(); reject(e); });
   });
 }
 
@@ -4037,6 +4097,7 @@ const server = http.createServer(async (req, res) => {
         // perfectly valid move on a momentarily busy hub — and since a bundle is
         // the largest body an agent ever sends, it is the one most likely to be
         // refused, so this is the case that would break most often.
+        if (e && e.stalled) return;
         if (e && e.budgetExceeded) {
           res.setHeader("Retry-After", "1");
           res.setHeader("Connection", "close");
@@ -4417,6 +4478,7 @@ const server = http.createServer(async (req, res) => {
           // Same distinction the migration relay draws: "too big" is about the
           // file and tells the operator to pick a smaller one; "busy" is about
           // the hub and tells them to press send again.
+          if (e && e.stalled) return;
           if (e && e.budgetExceeded) {
             res.setHeader("Retry-After", "1");
             res.setHeader("Connection", "close");
@@ -5220,6 +5282,8 @@ const server = http.createServer(async (req, res) => {
       endRefusedConnection(req, res);
       return;
     }
+    // A stalled body's socket is already gone — there is nobody to answer.
+    if (err && err.stalled) return;
     json(res, 400, { error: err.message });
   }
 });
@@ -5611,7 +5675,7 @@ if (process.env.TURMA_TEST) {
     // "idle hub admits anything, a busy one does not" rule can be held directly.
     MEMORY_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
     bodyLaneFor, chargeBody, releaseBody, bodyInflightHeld, BODY_PARSE_COST,
-    DRAIN_CONCURRENCY_MAX,
+    DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
