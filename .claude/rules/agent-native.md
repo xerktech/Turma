@@ -113,9 +113,14 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
       start attempts a futile repair, no check ever runs". `0` reads as the default too — it
       disables `timeout` outright. Shipped default deadline (585s) pinned by a test.
     - **The floor's multipliers are measured, not read off the source** — shim `timeout` on PATH and
-      count. The worst path is the REPAIR one (4 probes, 2 npm-metadata reads, 1 install = 7
-      invocations, hence 7 graces); reading them off the code gave 585s against a path needing 630s,
-      which would have fired the watchdog mid-install. A test pins the shipped 655s.
+      count, **as the identity the code will run as**: the EACCES retry is behind `[ "$(id -u)" = 0
+      ]`, so a root-only measurement cannot see it at all. Worst path is the REPAIR one on a
+      NON-ROOT host (4 probes, 2 npm-metadata reads, an install step of 2 attempts = 8 invocations,
+      hence 8 graces). A test pins the shipped 665s.
+    - **The two install attempts SHARE one budget** (`TURMA_NPM_INSTALL_TIMEOUT`, the retry gets the
+      remainder): per-attempt bounds let the step take twice the operator's number, which is
+      arithmetic the floor is built on — and counting them separately instead would mean promising a
+      965s boot for the same work.
     - **`ensure_npm_prefix` must be called DIRECTLY, never as `$(...)`** — a command substitution is
       a subshell, so a memo written as a value-returning function silently never memoised and every
       caller re-read the prefix.

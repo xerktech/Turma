@@ -421,6 +421,9 @@ case "\$1 \$2" in
      echo "npm-install \$*" >> "\$CLAUDE_LOG"
      # \$STUB_NPM_FAIL makes the FIRST install fail the way an EACCES against a
      # root-owned global prefix does, so the fallback is observable.
+     # \$STUB_NPM_INSTALL_SLEEP burns part of the install budget, so a retry's
+     # bound can be seen to be the REMAINDER rather than a fresh full one.
+     [ -n "\${STUB_NPM_INSTALL_SLEEP:-}" ] && sleep "\$STUB_NPM_INSTALL_SLEEP"
      # \$STUB_NPM_ALWAYS_FAIL is the network-is-down shape: the install never
      # reaches the registry, on this start and the next.
      [ -n "\${STUB_NPM_ALWAYS_FAIL:-}" ] && exit 243
@@ -805,6 +808,54 @@ for bad in 0 abc -5; do
   fi
   rm -rf "$root" "$d"
 done
+
+# 16m. The EACCES retry is a SECOND `npm install -g`, and both attempts share ONE
+#      budget. Per-attempt bounds would let the install step take twice the
+#      operator's number, and the launcher's floor is arithmetic over that number
+#      — so the watchdog would fire mid-install on exactly the non-root host the
+#      retry exists for. The branch is gated on `[ "$(id -u)" = 0 ]`, so it is
+#      only reachable — and only measurable — as a non-root user.
+if [ "$(id -u)" = 0 ]; then
+  pass "EACCES retry is root-gated by design; the assertion runs on non-root (CI)"
+else
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+  echo "0.3.0" >"$prefix/VERSION"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  install_fake_claude_toolchain "$bin" "2.0.1" "2.0.9" yes
+  # Record what each bounded call was given, then hand off to the real timeout.
+  cat > "$bin/timeout" <<STUB
+#!/bin/sh
+echo "timeout \$*" >> "\$CLAUDE_LOG"
+exec /usr/bin/timeout "\$@"
+STUB
+  chmod +x "$bin/timeout"
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.3.0" "0.3.0" "v0.3.0"
+  : > "$root/claude.log"
+  env FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
+    TURMA_REPO="xerktech/turma" CLAUDE_LOG="$root/claude.log" \
+    TURMA_NPM_INSTALL_TIMEOUT=30 STUB_NPM_ALWAYS_FAIL=1 STUB_NPM_INSTALL_SLEEP=5 \
+    "$bin/turma-agent-update" --claude-only >"$root/out.log" 2>&1 || true
+  installs="$(grep -c 'npm-install' "$root/claude.log" 2>/dev/null || true)"
+  # `|| true`: under `set -o pipefail` a grep that matches nothing fails the
+  # pipeline and would abort the suite rather than report — and "no second
+  # install was bounded at all" is one of the things this is here to catch.
+  second="$(grep 'timeout -k .* npm install -g --prefix' "$root/claude.log" \
+            | sed -n 's/.*timeout -k [0-9]* \([0-9]*\) .*/\1/p' | head -1 || true)"
+  if [ "${installs:-0}" = "2" ]; then
+    pass "a non-root EACCES retries the install"
+  else
+    fail "expected 2 install attempts on the retry path, got ${installs:-0}"
+  fi
+  if [ -n "$second" ] && [ "$second" -lt 30 ]; then
+    pass "the retry gets the REMAINDER of the install budget (${second}s of 30s)"
+  else
+    fail "the retry got a fresh full budget (${second:-?}s) — the step can take twice the operator's number"
+  fi
+  rm -rf "$root" "$d"
+fi
 
 # --- The --boot rate limit (XERK-254) ----------------------------------------
 # The launcher fires --boot on every start, and systemd's Restart=always makes a

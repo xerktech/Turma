@@ -226,13 +226,23 @@ on_path() {  # <dir>
 }
 
 npm_install_claude() {
-  local gbin lbin
+  local gbin lbin budget started elapsed remaining
   ensure_npm_prefix
   gbin="$(npm_bin_dir)"
   lbin="$HOME/.local/bin"   # the prefix install.sh blesses and the launcher exports
 
+  # ONE budget for the whole install step, shared across both attempts, not one
+  # per attempt. The EACCES retry below is a SECOND `npm install -g`, so
+  # per-attempt bounds would let this step take twice the operator's number —
+  # and the launcher's floor is arithmetic over that number, so the watchdog
+  # would fire mid-install on exactly the non-root host the retry exists for.
+  # Sharing the budget is also what the knob plainly means: how long installing
+  # Claude Code may take.
+  budget="$(num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300)"
+  started="$(date +%s)"
+
   if on_path "$gbin"; then
-    bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+    bounded "$budget" \
       npm install -g "$CLAUDE_PKG@latest" >>"$LOG" 2>&1 && return 0
     # A non-root user against a root-owned global prefix fails with EACCES.
     # Root takes no retry: it can write the real global prefix, so a failure
@@ -250,7 +260,13 @@ npm_install_claude() {
            "an install would land somewhere no session can run; not installing"
     return 1
   fi
-  bounded "${TURMA_NPM_INSTALL_TIMEOUT:-300}" \
+  elapsed=$(( $(date +%s) - started ))
+  remaining=$(( budget - elapsed ))
+  if [ "$remaining" -lt 10 ]; then
+    logmsg "claude: no time left in the ${budget}s install budget for the $HOME/.local retry"
+    return 1
+  fi
+  bounded "$remaining" \
     npm install -g --prefix "$HOME/.local" "$CLAUDE_PKG@latest" >>"$LOG" 2>&1
 }
 

@@ -415,16 +415,16 @@ else
   fail "the manager started while claude was still being replaced — sessions launched then die on exec"
 fi
 # The SHIPPED default deadline, pinned: 4x30 probe + 45 view + 300 install +
-# 2x30 npm-metadata + 7x10 kill-grace + 60 slack. Those multipliers are the
+# 2x30 npm-metadata + 8x10 kill-grace + 60 slack. Those multipliers are the
 # bounded-call COUNTS on the updater's worst path (the repair one), measured by
 # shimming `timeout` on PATH — reading them off the source is how they were
 # wrong before, at 585s against a path that needed 630s. The tuned cases below
 # are scale-invariant and would not catch that.
 bound="$(sed -n 's/.*claude check bounded at \([0-9]*\)s.*/\1/p' "$WORK/run5.log" | head -1)"
-if [ "$bound" = "655" ]; then
-  ok "default deadline is 655s"
+if [ "$bound" = "665" ]; then
+  ok "default deadline is 665s"
 else
-  fail "default deadline is ${bound:-unreported}s, not the 655s the worst path's bounds imply"
+  fail "default deadline is ${bound:-unreported}s, not the 665s the worst path's bounds imply"
 fi
 pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent-update" 2>/dev/null || true

@@ -290,16 +290,21 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
     # The multipliers are the COUNTS OF BOUNDED CALLS on the updater's worst
     # path, measured by shimming `timeout` on PATH rather than read off the
     # source — the source is what got them wrong. Worst path is the REPAIR one
-    # (claude present, version unreadable): 4 probes, 2 npm-metadata reads, 1
-    # install, and no version read = 7 `timeout` invocations, hence 7 graces.
-    # The upgrade paths are strictly smaller (6 and 5 calls), so including the
-    # view term keeps this an upper bound over all of them. If a call is added
-    # or removed, this arithmetic and the test pinning its result both move.
+    # (claude present, version unreadable, on a NON-ROOT host where the global
+    # npm prefix returns EACCES): 4 probes, 2 npm-metadata reads, and an install
+    # step of 2 attempts = 8 `timeout` invocations, hence 8 graces. The two
+    # attempts SHARE one install budget, so the install term stays 1x; counting
+    # them separately would be a 965s floor for the same work. The upgrade paths
+    # are strictly smaller, so including the view term keeps this an upper bound
+    # over all of them. Counts come from shimming `timeout` on PATH and counting
+    # — AS THE IDENTITY THE CODE RUNS AS, since `[ "$(id -u)" = 0 ]` hides that
+    # retry from any root-only measurement. If a call is added or removed, this
+    # arithmetic and the test pinning its result both move.
     claude_floor=$(( $(_num "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" 30) * 4 \
                      + $(_num "${TURMA_NPM_VIEW_TIMEOUT:-45}" 45) \
                      + $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) \
                      + $(_num "${TURMA_NPM_META_TIMEOUT:-30}" 30) * 2 \
-                     + claude_grace * 7 + claude_slack ))
+                     + claude_grace * 8 + claude_slack ))
     claude_deadline="$(_num "${TURMA_CLAUDE_UPDATE_TIMEOUT:-0}" 0)"
     if [ "$claude_deadline" -lt "$claude_floor" ]; then
       [ "$claude_deadline" -gt 0 ] && echo "[turma-agent] TURMA_CLAUDE_UPDATE_TIMEOUT=${claude_deadline}s is below" \
