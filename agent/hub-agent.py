@@ -8541,6 +8541,10 @@ class SessionManager:
         # Worktrees the worker removed, drained by _poll_prunes. self.closed is
         # the BEAT's to mutate — the worker only ever names paths for it.
         self._prune_swept = []
+        # Worktrees a `git worktree remove` is running against RIGHT NOW. The
+        # resume paths refuse a cwd listed here (_claim_worktree), so a session
+        # can't be launched into a directory that is halfway unlinked.
+        self._prune_removing = set()
         # In-flight session-summary subprocesses keyed by session id (the Popen
         # + its output file live here; the finished text lands on the session
         # record). Empty when no session has a prompt to summarize.
@@ -10271,7 +10275,11 @@ class SessionManager:
             "stoppedAt": None,
             "errorMsg": None,
         }
-        self.registry.append(sess)
+        # A prune removing this very worktree would leave claude running in a
+        # half-unlinked dir, so the registration and that check are one step.
+        if not self._claim_worktree(sess["worktreePath"], sess):
+            log(f"resume refused: {sess['worktreePath']} is being pruned")
+            return
         self.closed = [c for c in self.closed if c.get("id") != sid]
         try:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
@@ -10431,7 +10439,12 @@ class SessionManager:
             "errorMsg": None,
             "spawnCmdId": cmd_id,
         }
-        self.registry.append(sess)
+        # Same handshake as resume(): never register onto a worktree a prune is
+        # removing right now — the dir still exists for most of that removal, so
+        # the isdir check below would skip the re-add and launch into it.
+        if not self._claim_worktree(cwd, sess):
+            log(f"resume refused: {cwd} is being pruned")
+            return None
         try:
             # A deleted/pruned Turma worktree (or a migrated session, whose
             # worktree only ever existed on the source host): re-add a detached
@@ -13268,6 +13281,42 @@ class SessionManager:
         call from the prune worker while the beat mutates sessions."""
         return {s.get("worktreePath") for s in list(self.registry)}
 
+    def _claim_for_removal(self, path):
+        """Prune-worker side of the removal handshake: take `path` if no session
+        holds it, marking it as being-removed so the beat can't claim it while
+        `git worktree remove` runs. False = a session has it; leave it alone.
+
+        Reading the registry INSIDE the lock is the whole point. `worktree
+        remove` takes 10-37s on a real pool, and for almost all of that the dir
+        still exists — so a resume landing mid-removal would see `os.path.isdir`
+        True, skip _worktree_add, and launch claude into a directory about to be
+        unlinked. A bare check before the removal doesn't close that: only
+        pairing it with the beat's own claim under ONE lock does."""
+        with self._prune_lock:
+            if path in {s.get("worktreePath") for s in list(self.registry)}:
+                return False
+            self._prune_removing.add(path)
+            return True
+
+    def _release_removal(self, path):
+        with self._prune_lock:
+            self._prune_removing.discard(path)
+
+    def _claim_worktree(self, path, sess):
+        """Beat side of that handshake: register `sess` unless a prune is
+        removing its worktree right now. The registry append happens INSIDE the
+        lock — a check that merely preceded the append would let the worker claim
+        in between, which is the race this exists to close.
+
+        Only the resume paths need it. A spawn mints a fresh random path, and a
+        stopped session's record is still in the registry, so a prune never
+        considers either."""
+        with self._prune_lock:
+            if path in self._prune_removing:
+                return False
+            self.registry.append(sess)
+            return True
+
     def _run_prune(self, repo_name):
         """Sweep a repo's finished work: remove session worktrees whose commits
         are fully merged into the latest default branch (skipping any still
@@ -13332,17 +13381,28 @@ class SessionManager:
             if rc != 0 or dirty:
                 skipped_wt += 1               # uncommitted work, or unreadable
                 continue
-            head = wt["head"]
-            merged = head and run_ok(
+            # HEAD is re-read HERE and NEVER taken from the listing above. On a
+            # long sweep that listing is minutes old, and in between a session
+            # can be given work, COMMIT it and be killed — which keeps the
+            # worktree and takes it out of the live set. Judged by the stale HEAD
+            # it still looks merged, and the removal destroys commits reachable
+            # from no ref. A failed read reads as unmerged, so it keeps the tree.
+            rc, head = run_out(["git", "-C", p, "rev-parse", "HEAD"],
+                               timeout=PRUNE_GIT_TIMEOUT_SEC)
+            merged = rc == 0 and head and run_ok(
                 ["git", "-C", path, "merge-base", "--is-ancestor", head, tip],
                 timeout=PRUNE_GIT_TIMEOUT_SEC)[0] == 0
             if not merged:
                 skipped_wt += 1               # unmerged commits — keep it
                 continue
-            if p in self._live_worktree_paths():
+            if not self._claim_for_removal(p):
                 continue                      # claimed while we were checking it
-            if run_ok(["git", "-C", path, "worktree", "remove", p],
-                      timeout=PRUNE_GIT_TIMEOUT_SEC)[0] == 0:
+            try:
+                rc = run_ok(["git", "-C", path, "worktree", "remove", p],
+                            timeout=PRUNE_GIT_TIMEOUT_SEC)[0]
+            finally:
+                self._release_removal(p)
+            if rc == 0:
                 removed_wt += 1
                 with self._prune_lock:
                     self._prune_swept.append(p)

@@ -37,10 +37,18 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     payload carries `queued`/`running` + progress so the dashboard shows the sweep instead of a dark
     host. **Only a FINISHED record carries `finishedMono`**, which starts the linger clock — else a
     sweep ages out from under itself.
-  - **The live-worktree set is re-read before EVERY removal**, never snapshotted: resuming a killed
-    session RE-CREATES its worktree at a path the sweep already listed, and a spawn/migration can
-    land mid-sweep. **`self.closed` stays the BEAT's to mutate** — the worker only appends paths to
-    `_prune_swept` for `_poll_prunes` to fold in.
+  - **Every input to "is this removable" is re-read at removal time, never taken from the listing**,
+    which is minutes old by then. The live set, the dirty check and **`HEAD`** — a session can be
+    given work, COMMIT it and be killed mid-sweep, which keeps the worktree and drops it from the
+    live set, so the listing's HEAD still says merged and the removal destroys commits reachable
+    from no ref. A failed read reads as unmerged.
+  - **The removal is a two-sided handshake, not a check** (`_claim_for_removal` / `_claim_worktree`,
+    both reading and writing under `_prune_lock`): `worktree remove` takes 10-37s and the dir exists
+    for most of it, so a resume landing mid-removal sees `isdir` True, skips `_worktree_add` and
+    launches claude into a directory about to be unlinked. The registry append happens INSIDE the
+    lock — a check merely preceding it loses the race it exists to close.
+  - **`self.closed` stays the BEAT's to mutate** — the worker only appends paths to `_prune_swept`
+    for `_poll_prunes` to fold in.
   - Git here is bounded by `PRUNE_GIT_TIMEOUT_SEC`, not `run()`'s 15s (reaping a removal mid-flight
     made a removable worktree "kept" every sweep); the fetch stays short so one dead remote can't
     hold the queue. The dirty check uses **`run_out`, not `run`** — `run` collapses failure into

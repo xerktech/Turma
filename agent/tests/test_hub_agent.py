@@ -10863,6 +10863,84 @@ class TestPruneRepo(unittest.TestCase):
         self.assertEqual([c["id"] for c in sm.closed], ["keep"])
         self.assertEqual(sm._prune_swept, [])
 
+    def test_prune_rereads_head_and_keeps_work_committed_mid_sweep(self):
+        """The listing is minutes old on a real sweep. A session given work can
+        COMMIT it and be killed while the sweep runs — the worktree is kept, so it
+        leaves the live set, and judged by the HEAD read at listing time it still
+        looks merged. Removing it there destroys commits reachable from no ref."""
+        sm = ha.SessionManager()
+        victim = self._add_worktree("victim")            # detached at main
+
+        # Land the commit between the listing and the merged check, exactly as a
+        # session finishing its turn mid-sweep would.
+        real_run_out = ha.run_out
+
+        def commit_then_answer(cmd, *a, **kw):
+            if "status" in cmd and "--porcelain" in cmd:
+                self._run("commit", "-q", "--allow-empty", "-m", "landed mid-sweep",
+                          cwd=victim)
+            return real_run_out(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_out", side_effect=commit_then_answer):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+
+        self.assertTrue(os.path.isdir(victim))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertGreaterEqual(res["skippedWorktrees"], 1)
+        # ...and the commit is still reachable, which is the thing that matters.
+        sha = self._run("rev-parse", "HEAD", cwd=victim).stdout.strip()
+        self.assertEqual(
+            ha.run_ok(["git", "-C", self.repo, "cat-file", "-e", sha])[0], 0)
+
+    def test_prune_skips_a_worktree_claimed_between_the_checks(self):
+        """The re-check right before the removal, not the one at the top of the
+        loop: a resume can land while this tree's own status/merge checks run."""
+        sm = ha.SessionManager()
+        claimed = self._add_worktree("claimed")
+        real_run_ok = ha.run_ok
+
+        def claim_then_answer(cmd, *a, **kw):
+            if "merge-base" in cmd:
+                sm.registry.append({"id": "late", "worktreePath": claimed})
+            return real_run_ok(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_ok", side_effect=claim_then_answer):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+        self.assertTrue(os.path.isdir(claimed))
+        self.assertEqual(res["removedWorktrees"], 0)
+
+    def test_a_resume_cannot_land_on_a_worktree_being_removed(self):
+        """`git worktree remove` runs for 10-37s on a real pool and the dir
+        exists for most of it, so a resume mid-removal would skip the re-add and
+        launch claude into a directory about to be unlinked. The claim is what
+        makes the registration and the check one step."""
+        sm = ha.SessionManager()
+        wt = self._add_worktree("contested")
+        self.assertTrue(sm._claim_for_removal(wt))       # worker gets there first
+        self.assertFalse(sm._claim_worktree(wt, {"id": "r1", "worktreePath": wt}))
+        self.assertEqual(sm.registry, [])                # ...and did not register
+        sm._release_removal(wt)
+        self.assertTrue(sm._claim_worktree(wt, {"id": "r1", "worktreePath": wt}))
+        self.assertEqual([s["id"] for s in sm.registry], ["r1"])
+        # With the session registered, the worker no longer gets the tree.
+        self.assertFalse(sm._claim_for_removal(wt))
+
+    def test_progress_updates_never_stamp_a_finish(self):
+        """finishedMono is what starts the linger clock, so only a terminal
+        record may carry it — else a long sweep ages out of the heartbeat while
+        it is still running."""
+        sm = ha.SessionManager()
+        sm._publish_prune("demo", status="running", summary="pruning… worktree 4 of 31")
+        self.assertIsNone(sm.prunes["demo"].get("finishedMono"))
+        # Even with an `at` far in the past, a running record survives the poll.
+        sm.prunes["demo"]["at"] = "2000-01-01T00:00:00Z"
+        sm._poll_prunes()
+        self.assertIn("demo", sm.prunes)
+        sm._finish_prune("demo", "done", None, "removed 1 worktree")
+        self.assertIsNotNone(sm.prunes["demo"]["finishedMono"])
+
     def test_prune_keeps_a_worktree_whose_status_cannot_be_read(self):
         """`git status` failing or timing out must not read as CLEAN — run()
         collapses both to '', which is why this path uses run_out."""
