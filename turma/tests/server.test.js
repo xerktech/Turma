@@ -6532,34 +6532,63 @@ test("budget: the ceilings are derived from the container limit, and only tighte
   assert.ok(hub.BODY_INFLIGHT_MAX < hub.BODY_INFLIGHT_TOTAL_MAX);
 });
 
-test("budget: an idle hub admits any single body; a busy one refuses over budget", async () => {
+test("budget: one big body may exceed the budget, and exactly one", async () => {
   assert.equal(hub.bodyInflightHeld(), 0, "no request should be in flight here");
   const total = hub.BODY_INFLIGHT_TOTAL_MAX;
   try {
-    // The first body in is admitted even ABOVE the whole budget -- that is what
-    // keeps a single 65 MiB migration bundle (larger than the budget at 256m)
-    // working, and it is safe precisely because nothing is held beside it.
-    assert.equal(hub.chargeBody(total * 2), true, "an idle hub admits a lone oversized body");
-    // ...but nothing may join it while it is held.
-    assert.equal(hub.chargeBody(1), false, "a second body must not be admitted over budget");
-    hub.releaseBody(total * 2);
+    // A body too big for the shared budget takes the BIG lane. Keyed on the hub
+    // being bit-for-bit idle instead, this was unusable: one trickling request
+    // defeated it, and a real 65 MiB migration bundle was refused with 3 KB in
+    // flight -- stranding the move -- while HEARTBEAT_MAX went on advertising a
+    // 32 MiB beat as legal that no concurrent moment would accept.
+    hub.chargeBody(4096, "shared");
+    assert.equal(hub.bodyLaneFor(total * 2), "big",
+      "a big body is admitted even though the hub is not idle");
+    hub.chargeBody(total * 2, "big");
 
-    // Under budget, bodies accumulate; the one that would cross it is refused
-    // rather than admitted-and-then-OOM'd.
-    assert.equal(hub.chargeBody(Math.floor(total / 2)), true);
-    assert.equal(hub.chargeBody(Math.floor(total / 2) - 1), true);
-    assert.equal(hub.chargeBody(total), false);
-    assert.ok(hub.bodyInflightHeld() <= total, "the sum never exceeds the budget");
+    // ...but only one at a time, and the shared lane is now full too.
+    assert.equal(hub.bodyLaneFor(total * 2), null, "a second big body must be refused");
+    assert.equal(hub.bodyLaneFor(1), null, "the shared lane is over budget as well");
+
+    hub.releaseBody(total * 2, "big");
+    assert.equal(hub.bodyLaneFor(total * 2), "big", "the lane frees for the next one");
   } finally {
-    hub.releaseBody(hub.bodyInflightHeld());
+    hub.releaseBody(hub.bodyInflightHeld(), "big");
   }
   assert.equal(hub.bodyInflightHeld(), 0, "every charge must be given back");
+});
+
+test("budget: ordinary bodies share the budget until it is full", async () => {
+  const total = hub.BODY_INFLIGHT_TOTAL_MAX;
+  try {
+    assert.equal(hub.bodyLaneFor(Math.floor(total / 2)), "shared");
+    hub.chargeBody(Math.floor(total / 2), "shared");
+    assert.equal(hub.bodyLaneFor(Math.floor(total / 2)), "shared");
+    hub.chargeBody(Math.floor(total / 2), "shared");
+    // Full: the next ordinary body falls through to the big lane rather than
+    // being admitted over budget.
+    assert.equal(hub.bodyLaneFor(total), "big");
+    assert.ok(hub.bodyInflightHeld() <= total, "the shared lane never exceeds the budget");
+  } finally {
+    hub.releaseBody(hub.bodyInflightHeld(), null);
+  }
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("budget: a leaked big lane would refuse every large body forever", async () => {
+  // The one bookkeeping slip that is silent AND permanent: the bytes come back
+  // but the lane does not, and from then on nothing large is ever admitted.
+  const total = hub.BODY_INFLIGHT_TOTAL_MAX;
+  hub.chargeBody(total * 2, "big");
+  hub.releaseBody(total * 2, "big");
+  assert.equal(hub.bodyInflightHeld(), 0);
+  assert.equal(hub.bodyLaneFor(total * 2), "big", "the lane must be free again");
 });
 
 test("budget: a release can never drive the held total negative", async () => {
   // A double release would read as "idle" and silently disable the budget --
   // the same OOM again, only with the guard apparently in place.
-  hub.releaseBody(1 << 30);
+  hub.releaseBody(1 << 30, null);
   assert.equal(hub.bodyInflightHeld(), 0);
 });
 
@@ -6568,7 +6597,11 @@ test("http: a request over the budget is refused 503, not 413", async () => {
   // too big, send less", 503 says "the hub is momentarily full, send it again".
   // Collapsing them would tell an agent to shrink a beat that was fine.
   try {
-    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX);
+    // BOTH lanes have to be occupied for a refusal: the shared budget full, and
+    // the one big-body lane taken. With the big lane free, a body that does not
+    // fit the shared budget is admitted there -- that is the point of it.
+    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX, "shared");
+    hub.chargeBody(1, "big");
     const res = await request("POST", "/api/heartbeat", {
       body: { device: "budget-host" },
       headers: { ...agentHeaders, connection: "close" },
@@ -6577,7 +6610,7 @@ test("http: a request over the budget is refused 503, not 413", async () => {
     assert.match(res.body.error, /busy/i);
     assert.equal(res.body.limit, hub.BODY_INFLIGHT_TOTAL_MAX);
   } finally {
-    hub.releaseBody(hub.bodyInflightHeld());
+    hub.releaseBody(hub.bodyInflightHeld(), "big");
   }
   // And with the budget clear again the very same beat succeeds -- the refusal
   // was transient, which is exactly what the 503 promised.
@@ -6660,4 +6693,67 @@ test("budget: a lone oversized body still completes once it has started", async 
   });
   assert.equal(res.status, 200);
   assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("http: a large LEGAL body is admitted while other traffic is in flight", async () => {
+  // The rule this replaced was keyed on the hub being bit-for-bit idle, so a few
+  // KB in flight refused a body the hub itself advertises as legal: a real
+  // 65 MiB migration bundle 503'd with 3 KB held, stranding the move, and
+  // HEARTBEAT_MAX promised a 32 MiB beat that no concurrent moment accepted.
+  // A ceiling only reachable on a perfectly idle hub is not a ceiling.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  try {
+    // Leave the shared lane with almost nothing free, so a modest and plainly
+    // legal body cannot fit it. Expressed against the budget rather than in
+    // absolute bytes, because the ceilings scale with the container and the
+    // suite does not run in one.
+    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX - 1024, "shared");
+    const wire = 64 * 1024; // costs 192 KiB, far past the 1 KiB left
+    assert.ok(wire <= hub.BODY_INFLIGHT_MAX, "the probe must still be a LEGAL body");
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "big-legal-host", pad: "w".repeat(wire) }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200, "a body within HEARTBEAT_MAX must not be refused");
+  } finally {
+    hub.releaseBody(hub.bodyInflightHeld(), null);
+  }
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("http: an oversize body is NOT refused on its declaration", async () => {
+  // XERK-235 in one assertion. Refusing at header time makes Node close the
+  // connection under a request still being written, and a client that writes its
+  // whole body before reading -- python urllib, which is what hub-agent.py posts
+  // with -- loses the response and sees a socket error instead of its LIMIT.
+  // That is the loop XERK-235 fixed: the agent re-sends the same oversized body
+  // every beat forever, host offline, nothing logged. Proven end to end against
+  // a real container with real urllib; held here as the cheap guard.
+  //
+  // What keeps this bounded is the BUDGET, not an early size check: those bytes
+  // are charged like any other, so a flood is refused 503 before buffering and
+  // only what the hub can afford ever buffers its way to a 413.
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "declared-oversize", pad: "y".repeat(33 << 20) },
+    headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413, "the caller must get a status, not a reset");
+  assert.equal(res.body.limit, hub.BODY_INFLIGHT_MAX,
+    "and the limit it needs to resize against");
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("drain: only so many refused bodies may drain at once", async () => {
+  // Draining lets a refused request still read its 413 (XERK-235), but it is not
+  // free: Node allocates for every read, and 256 sockets streaming past an
+  // oversize refusal out-allocated the collector and OOM-killed the hub --
+  // unauthenticated, through /api/login's 1 MiB cap.
+  assert.ok(hub.DRAIN_CONCURRENCY_MAX >= 1);
+  // The one oversize body a healthy fleet produces still drains and still gets
+  // its status back, which is the whole reason the cap is a count and not zero.
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "oversize-host", pad: "y".repeat((33 << 20)) },
+    headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413);
+  assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
 });

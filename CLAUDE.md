@@ -248,9 +248,23 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - **A body is charged `BODY_PARSE_COST` x its wire size, not its wire size.** The bill is the JS
     string plus what `JSON.parse` builds beside it; charging wire bytes admitted two 30 MiB beats
     against a 64 MiB budget and OOM'd anyway. Raw (Buffer) bodies keep 1x — nothing parses them.
-  - **A body arriving into an IDLE hub is always admitted**, up to its own per-request cap. That is
-    what keeps a single 65 MiB migration bundle (bigger than the whole budget at 256m) working, and
-    it is safe only because nothing is held beside it. Never make it unconditional.
+  - **Two lanes: the shared budget, and ONE big body at a time** (`bodyLaneFor`). The big lane is
+    what makes the hub's own advertised ceilings reachable — keyed instead on the hub being
+    bit-for-bit idle, one trickling request refused a real 65 MiB migration bundle with 3 KB in
+    flight, and `HEARTBEAT_MAX` promised a 32 MiB beat that no concurrent moment accepted. A ceiling
+    only reachable on a perfectly idle hub is not a ceiling.
+  - **The lane is re-judged on every top-up, not latched.** A shared-lane body that stops fitting is
+    promoted to the big lane if free, else refused. Deciding once and then charging blindly is how
+    two 30 MiB beats grew past the ceiling together with the budget nominally in force.
+  - **Only bytes that ARRIVED are ever charged; a declared `Content-Length` is checked, never
+    charged.** Reserving on the declaration wedged every POST route into 503 from one silent socket
+    — no bandwidth, no credentials (`/api/login` reads a body before any auth gate), renewable. A
+    claim that is never held is never denied to anyone else.
+  - **An OVERSIZE body is deliberately NOT refused on its declaration** — it is read to `cap` first.
+    Refusing early makes Node close the connection under a request still being written, and a client
+    that writes before reading (python urllib — what `hub-agent.py` posts with) loses the response
+    and sees a socket error, which is exactly XERK-235's offline loop. The budget is what bounds it:
+    those bytes are charged like any other, so a flood is refused 503 before buffering.
   - **The per-request ceiling only ever TIGHTENS** (`min(sanity bound, limit/8)`); only the TOTAL
     budget widens with the container, because that is what buys concurrency. Deriving the
     per-request one purely from the limit hands a big host an 8 GB single-body ceiling.
@@ -259,6 +273,15 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     to draw the distinction itself — both did answer a flat 413 once. On a 503 the migration relay
     HOLDS the migration in `exporting`, and `_migration_upload` retries (5xx only); nothing else
     would, and a lost bundle strands the move.
+  - **Draining a refused body is capped by CONCURRENCY** (`DRAIN_CONCURRENCY_MAX`), and past the cap
+    the refusal closes the connection (`endRefusedConnection`, after `finish` so the status is on
+    the wire first). Draining is unbuffered but not free — Node allocates per read, and 256 sockets
+    streaming past a refusal OOM-killed the hub with nothing buffered. The cap is a COUNT, not a
+    byte budget: the cost is concurrent read churn. Under it, the one oversize beat a real fleet
+    produces still drains and still gets its 413.
+  - **A refused body must be closed, not merely paused.** Node DUMPS an unread body when the
+    response finishes, to keep the connection alive — it resumes the paused stream and reads the
+    whole thing. Discarded bytes are still read into memory.
   - `server.maxConnections` bounds the socket count, which no byte budget can: each socket costs a
     read buffer, parser and req/res objects before a body byte arrives. It counts the upgraded
     WebSockets too, so the number must clear steady-state SSE/tunnel/terminal use with room spare —
