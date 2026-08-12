@@ -379,7 +379,12 @@ try {
   // a JSON string yields character indices, which restored "5 agents" out of
   // `"hello"` and then threw deeper in, into that same silent catch.
   if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
-    throw new Error(`state file is ${Array.isArray(loaded) ? "an array" : typeof loaded}, not an object`);
+    // `typeof null` is "object", so null needs naming explicitly — otherwise the
+    // one shape with no other diagnosis reads "state file is object, not an
+    // object", which is the opposite of a useful message.
+    const shape = loaded === null ? "null"
+      : Array.isArray(loaded) ? "an array" : typeof loaded;
+    throw new Error(`state file is ${shape}, not an object`);
   }
   agents = loaded;
   // Records written before a coercion existed — and any host that is OFFLINE,
