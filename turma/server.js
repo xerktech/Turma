@@ -1881,6 +1881,27 @@ function bodyLaneFor(n) {
 }
 
 /**
+ * Move an already-charged `n` from the shared lane into the big one, when a read
+ * that started ordinary outgrows the budget and is promoted.
+ *
+ * Without this the charge is split across two counters while the read owns only
+ * ONE lane, and `release()` — which can only name the lane the read ENDED in —
+ * hands the whole amount back to the big lane, leaking the shared portion
+ * forever. That is not an attack: a single legitimate 22 MiB heartbeat (well
+ * inside HEARTBEAT_MAX, and the size XERK-235 exists because staged history
+ * reaches) permanently consumed the entire shared budget, after which every
+ * non-trivial body was refused for the life of the process.
+ *
+ * A body's charge must live entirely in the lane it currently occupies. Then
+ * release is correct by construction, and so is every reading of either counter.
+ */
+function migrateToBigLane(n) {
+  bodyInflightBytes -= n;
+  if (bodyInflightBytes < 0) bodyInflightBytes = 0;
+  bigLaneBytes += n;
+}
+
+/**
  * Whether the budget is contended enough for a non-progressing read to be worth
  * reclaiming. True while the one big lane is occupied, or the shared budget is
  * more than half spent — the two states in which one body holding on actually
@@ -2126,7 +2147,11 @@ function readBody(req, cap = BODY_MAX) {
       if (want > held) {
         const next = laneForCharge(lane, want - held);
         if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
-        if (lane !== "big" && next === "big") bigLaneSince = Date.now();
+        if (lane !== "big" && next === "big") {
+          // Carry what is already charged into the lane this read now occupies.
+          if (lane === "shared") migrateToBigLane(held);
+          bigLaneSince = Date.now();
+        }
         lane = next;
         chargeBody(want - held, lane);
         held = want;
@@ -2327,7 +2352,11 @@ function readRawBody(req, cap) {
       if (len > held) {
         const next = laneForCharge(lane, len - held);
         if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
-        if (lane !== "big" && next === "big") bigLaneSince = Date.now();
+        if (lane !== "big" && next === "big") {
+          // Carry what is already charged into the lane this read now occupies.
+          if (lane === "shared") migrateToBigLane(held);
+          bigLaneSince = Date.now();
+        }
         lane = next;
         chargeBody(len - held, lane);
         held = len;

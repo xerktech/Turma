@@ -6974,3 +6974,55 @@ test("budget: the big lane cannot be held past its occupancy ceiling", async () 
     hub.releaseBody(stage, "shared");
   }
 });
+
+test("budget: a body PROMOTED to the big lane leaks nothing", async () => {
+  // The leak this pins was not an attack: one legitimate 22 MiB heartbeat --
+  // inside HEARTBEAT_MAX, and the size XERK-235 exists because staged history
+  // reaches -- permanently consumed the whole shared budget, after which every
+  // non-trivial body was refused for the life of the process.
+  //
+  // Cause: a large body starts in the shared lane (its first chunks are small),
+  // is promoted when it outgrows the budget, and then release() can only name
+  // the lane it ENDED in -- so the pre-promotion charge was never given back.
+  // A body's charge has to live entirely in the lane it currently occupies.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  // Force promotion by leaving almost no shared room, then sending a body that
+  // starts small enough to be admitted there and grows past what is left.
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - (2 << 20);
+  hub.chargeBody(stage, "shared");
+  try {
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "promoted", pad: "m".repeat(4 << 20) }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200, "a legal body must still be served");
+  } finally {
+    hub.releaseBody(stage, "shared");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0, "the promoted body's whole charge came back");
+  // And the shared lane is genuinely usable again, not merely reading as zero.
+  assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX), "shared");
+  assert.equal(hub.budgetUnderPressure("shared"), false);
+});
+
+test("budget: a big-lane holder leaves the shared budget to everyone else", async () => {
+  // The other half of the same bug. While a promoted body held the lane, its
+  // pre-promotion charge stayed billed to shared, so a holder occupied ~the
+  // entire shared budget: a 0.5 MiB beat, a 4 MiB attachment upload and a
+  // 65 MiB migration bundle were all refused behind it. "Ordinary traffic is
+  // unaffected" has to mean more than the few hundred KB that fit in the sliver.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - (2 << 20);
+  hub.chargeBody(stage, "shared");
+  let promoted = 0;
+  try {
+    // Drive a body through promotion and measure what it leaves behind.
+    await request("POST", "/api/heartbeat", {
+      body: { device: "holder", pad: "h".repeat(4 << 20) }, headers: agentHeaders,
+    });
+    promoted = hub.bodyInflightHeld();
+  } finally {
+    hub.releaseBody(stage, "shared");
+  }
+  assert.equal(promoted - stage, 0,
+    "a promoted body must not go on holding shared budget after it completes");
+});

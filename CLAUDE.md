@@ -298,7 +298,12 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     shared budget, merely OCCUPYING the big lane was a TOTAL outage — the big body's own charge
     exceeds the budget, so a 200-byte heartbeat and the operator's own login were refused behind it,
     one authenticated socket holding the control plane down for ~29 kbit/s. Kept apart, a big body
-    delays only other LARGE bodies.
+    delays only bodies that themselves need the lane.
+    - **A promoted body's charge MOVES lanes with it** (`migrateToBigLane`). A read admitted to the
+      shared lane and later promoted owns one lane but was billed to two, and `release()` can only
+      name the lane it ENDED in — so one legitimate 22 MiB heartbeat leaked the whole shared budget
+      permanently, and every non-trivial body was refused for the life of the process. A charge must
+      live entirely in the lane its read currently occupies; then release is right by construction.
   - **`BIG_LANE_MAX_HOLD_MS` bounds how long one body may occupy the lane, however well it
     behaves.** The progress floor cannot close this: a body dribbling AT the floor is byte-for-byte
     indistinguishable from a legitimate slow migration at the same rate, so no rate threshold
