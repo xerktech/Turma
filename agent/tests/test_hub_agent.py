@@ -11179,6 +11179,163 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(calls), 1)  # one attempt, then it bails (no loop)
 
 
+class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
+    """The archive's SendUserFile payload budget (XERK-267): the previews are
+    bounded per delivery but unbounded relative to the transcript, so a
+    screenshot-heavy session archives orders of magnitude larger than the
+    conversation it records."""
+
+    def setUp(self):
+        super().setUp()
+        self.files_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.files_dir, ignore_errors=True)
+
+    def _write_transcript(self, worktree, fname, entries):
+        d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(worktree))
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, fname), entries)
+
+    def _ledger(self, sm, worktree):
+        sm.usage_ledger = {worktree: {"repo": "Turma",
+                                      "remote": "git@github.com:xerk/Turma.git",
+                                      "slug": ha._project_slug(worktree)}}
+
+    def _png(self, name, size):
+        """A real file on disk — _send_user_file_detail reads and base64s it."""
+        path = os.path.join(self.files_dir, name)
+        with open(path, "wb") as fh:
+            fh.write(b"\x89PNG" + b"\x00" * (size - 4))
+        return path
+
+    def _delivery(self, uuid, path, ts="2026-07-01T10:00:00Z"):
+        return {"type": "assistant", "uuid": uuid, "timestamp": ts,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "x" + uuid, "name": "SendUserFile",
+                     "input": {"files": [path], "display": "render"}}]}}
+
+    def _push(self, sm, **kwargs):
+        pushed = []
+
+        def fake_post(tid, body):
+            pushed.append(body)
+            return {"bytesStored": body["endOffset"]}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fake_post):
+            sm._archive_deltas({}, **kwargs)
+        return pushed
+
+    def _files_of(self, body):
+        return [e["blocks"][0].get("files", [{}])[0] for e in body["entries"]]
+
+    def test_shed_block_payloads_leaves_an_identifiable_chip(self):
+        blocks = [{"t": "tool_use", "name": "SendUserFile", "files": [
+            {"name": "shot.png", "kind": "image", "src": "data:image/png;base64,AAAA"},
+            {"name": "page.html", "kind": "html", "html": "<h1>hi</h1>"},
+            {"name": "notes.txt", "kind": "file"},
+        ]}]
+        dropped = ha._shed_block_payloads(blocks)
+        self.assertEqual(dropped, len("data:image/png;base64,AAAA") + len("<h1>hi</h1>"))
+        self.assertEqual(blocks[0]["files"], [
+            # Dropped for size, and says so — never confused with a file that
+            # was unreadable when the preview was taken.
+            {"name": "shot.png", "kind": "file", "shed": True},
+            {"name": "page.html", "kind": "file", "shed": True},
+            {"name": "notes.txt", "kind": "file"},   # nothing to drop, untouched
+        ])
+        # Idempotent: a second pass finds nothing left to drop.
+        self.assertEqual(ha._shed_block_payloads(blocks), 0)
+
+    def test_an_ordinary_delivery_still_archives_with_its_preview(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [self._delivery("a1", self._png("a.png", 512))])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        f = self._files_of(self._push(sm)[0])[0]
+        self.assertEqual(f["kind"], "image")
+        self.assertTrue(f["src"].startswith("data:image/png;base64,"))
+
+    def test_the_hub_naming_a_transcript_sheds_it_before_the_wire(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [self._delivery("a1", self._png("a.png", 512))])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        body = self._push(sm, shed_ids=["t1"])[0]
+        self.assertEqual(self._files_of(body)[0], {"name": "a.png", "kind": "file", "shed": True})
+        # The delivery's own card survives — only the payload went.
+        self.assertEqual(body["entries"][0]["blocks"][0]["name"], "SendUserFile")
+
+    def test_the_agent_sheds_a_runaway_transcript_without_being_told(self):
+        # A first-time offender: the hub has never seen it, so nothing on the
+        # reply names it. The local counter keeps the bytes off the wire anyway.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        big = self._png("big.png", 4096)
+        self._write_transcript(wt, "t1.jsonl", [
+            self._delivery("a%d" % i, big, "2026-07-01T10:0%d:00Z" % i) for i in range(6)])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        # base64 of 4096 bytes is ~5.5 KB, so a 8 KB budget spans two deliveries.
+        with mock.patch.object(ha, "ARCHIVE_PAYLOAD_MAX", 8192):
+            files = self._files_of(self._push(sm)[0])
+        self.assertEqual(files[0]["kind"], "image")     # under budget
+        self.assertTrue(all(f.get("shed") for f in files[2:]),
+                        "everything past the budget should be a chip")
+        self.assertEqual(files[-1]["name"], "big.png")  # ...still named
+
+    def test_a_shed_verdict_on_the_reply_applies_to_the_next_chunk(self):
+        # The hub counts STORED bytes and we count only sheddable payload, so it
+        # can cross its ceiling first; its answer wins from that chunk on.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        png = self._png("a.png", 512)
+        self._write_transcript(wt, "t1.jsonl", [
+            self._delivery("a%d" % i, png, "2026-07-01T10:0%d:00Z" % i) for i in range(4)])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+
+        def fake_post(tid, body):
+            pushed.append(body)
+            return {"bytesStored": body["endOffset"], "shed": True}
+
+        # One entry per chunk, so the verdict lands between two of them.
+        with mock.patch.object(ha, "ARCHIVE_CHUNK_BYTES", 400), \
+             mock.patch.object(sm, "_post_archive_chunk", fake_post):
+            sm._archive_deltas({})
+        self.assertGreater(len(pushed), 1)
+        self.assertEqual(self._files_of(pushed[0])[0]["kind"], "image")   # before
+        self.assertTrue(self._files_of(pushed[1])[0]["shed"])             # after
+
+    def test_a_full_store_is_not_pushed_at_at_all(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hello")])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        self.assertEqual(self._push(sm, store_full=True), [])
+
+    def test_a_full_verdict_mid_pass_stops_the_pass(self):
+        # Two transcripts; the hub fills up on the first. The second must not be
+        # attempted — a refused chunk is not a chunk to retry (XERK-255).
+        sm = self.make_manager()
+        for i, name in enumerate(("aaa", "bbb")):
+            wt = "/w/.turma/worktrees/Turma/" + name
+            self._write_transcript(wt, "t%d.jsonl" % i, [_text_entry("u1", "user", "hello")])
+            sm.usage_ledger = dict(sm.usage_ledger or {}, **{wt: {
+                "repo": "Turma", "remote": "git@github.com:xerk/Turma.git",
+                "slug": ha._project_slug(wt)}})
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        self.assertEqual(len(sm._archive_pending), 2)
+        calls = []
+
+        with mock.patch.object(sm, "_post_archive_chunk",
+                               lambda tid, body: (calls.append(tid), {"bytesStored": 0, "full": True})[1]):
+            sm._archive_deltas({})
+        self.assertEqual(len(calls), 1)
+
+
 class TestPrStatus(unittest.TestCase):
     """The `gh pr view` status helpers: check-rollup classification, the compact
     summary the cards render, and the URL fetch wrapper."""

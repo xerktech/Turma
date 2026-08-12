@@ -337,7 +337,9 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
-  persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
+  persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`; sized by
+  `ARCHIVE_TRANSCRIPT_MAX_BYTES` / `ARCHIVE_TOTAL_MAX_BYTES` (`.claude/rules/turma.md`), the second
+  of which is what stops an archive blow-up taking `state.json`'s volume with it.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
   `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
   the agent reports `localModel.available:false` so clients hide the control.

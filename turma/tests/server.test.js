@@ -1818,6 +1818,11 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   assert.equal(r2.body.archiveHave.tr1, 120);
   // The bulky manifest is not persisted onto the agent record.
   assert.equal(agents.nas.archiveManifest, undefined);
+  // Nothing here is near either archive ceiling, so the budget fields stay off
+  // the wire entirely — an agent reads their absence as "no limit reached", and
+  // a hub too old to send them is the same case (XERK-267).
+  assert.equal("archiveShed" in r2.body, false);
+  assert.equal("archiveFull" in r2.body, false);
 });
 
 test("http: login page is public; /api/login sets a working session cookie", async () => {

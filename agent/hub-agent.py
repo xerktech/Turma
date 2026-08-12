@@ -233,6 +233,18 @@ CLAUDE_AUTH_WARN_MS = int(
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
+# How many bytes of SendUserFile payload one transcript may put in the archive
+# before the rest of it ships as name-only chips (XERK-267). The previews are
+# bounded per tool call (SEND_FILE_MAX_FILES x SEND_FILE_MAX_BYTES) but unbounded
+# relative to the transcript they came from — a screenshot-heavy conversation
+# archives orders of magnitude larger than the bytes it records.
+#
+# The HUB owns the real ceiling (turma/archive.js ARCHIVE_TRANSCRIPT_MAX, same
+# default) and applies it whatever an agent sends; this counter exists so a
+# first-time offender's payloads never reach the wire at all, and so counts only
+# what shedding could actually remove — prose isn't sheddable, so charging a long
+# but ordinary conversation for its length would degrade it for nothing.
+ARCHIVE_PAYLOAD_MAX = int(os.environ.get("ARCHIVE_TRANSCRIPT_MAX_BYTES", str(1 << 24)))
 # The compressed transcript bundle a session migration ships through the hub
 # (source host -> hub -> target host). A single gzipped POST, capped so a
 # pathologically long conversation fails loudly rather than OOM-ing the hub's
@@ -3346,6 +3358,53 @@ def _send_user_file_detail(inp):
                 pass  # unreadable / gone → name chip
         out.append(entry)
     return out or None
+
+
+def _shed_block_payloads(blocks):
+    """Strip the SendUserFile payloads embedded on a block list — the base64
+    data: URI of an image, the raw markup of an HTML preview — leaving the
+    name-only chip a delivery already degrades to when its file is oversized or
+    unreadable. `shed:True` marks it dropped-for-size rather than never-captured.
+    Mutates in place; returns the bytes dropped.
+
+    Used on the ARCHIVE path only (XERK-267). The live tail and on-demand
+    `history` keep their previews: they are re-read from the transcript on
+    demand, so they cost nothing durable."""
+    dropped = 0
+    for block in blocks or []:
+        files = block.get("files") if isinstance(block, dict) else None
+        if not isinstance(files, list):
+            continue
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            for key in ("src", "html"):
+                val = f.get(key)
+                if not isinstance(val, str) or not val:
+                    continue
+                dropped += len(val)
+                del f[key]
+                f["kind"] = "file"
+                f["shed"] = True
+    return dropped
+
+
+def _block_payload_bytes(blocks):
+    """How many bytes of embedded SendUserFile payload a block list carries —
+    what _shed_block_payloads would drop from it, measured without dropping it."""
+    total = 0
+    for block in blocks or []:
+        files = block.get("files") if isinstance(block, dict) else None
+        if not isinstance(files, list):
+            continue
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            for key in ("src", "html"):
+                val = f.get(key)
+                if isinstance(val, str):
+                    total += len(val)
+    return total
 
 
 def _tool_use_detail(block, name, inp, caps):
@@ -12096,13 +12155,23 @@ class SessionManager:
             m.pop("path", None)
         return out
 
-    def _archive_deltas(self, archive_have):
+    def _archive_deltas(self, archive_have, shed_ids=None, store_full=False):
         """Push the byte-range deltas the hub is missing for each manifest entry,
         using the archiveHave cursors it returned. Append-only and bounded: at most
         ARCHIVE_BEAT_BUDGET bytes per pass, so a big backfill trickles across beats.
-        A failed POST just stops this pass — the next manifest re-offers it."""
+        A failed POST just stops this pass — the next manifest re-offers it.
+
+        `shed_ids`/`store_full` are the hub's budget state from the same reply
+        (XERK-267): transcripts already over their archive budget ship with their
+        inline file payloads stripped, and a full store is skipped outright rather
+        than pushed at and refused. Both are absent from an older hub's reply, in
+        which case nothing sheds here and the hub does it all."""
         if not self._archive_pending:
             return
+        if store_full:
+            log("archive store is full at the hub; skipping this sync pass")
+            return
+        shed_set = set(shed_ids or ())
         budget = ARCHIVE_BEAT_BUDGET
         for tid, m in list(self._archive_pending.items()):
             have = int((archive_have or {}).get(tid, 0) or 0)
@@ -12116,6 +12185,10 @@ class SessionManager:
                 "createdAt": m.get("createdAt"), "endedTs": m.get("endedTs"),
                 "summary": m.get("summary"),
             }
+            # Sticky for the whole transcript once set, so a conversation doesn't
+            # flicker between full previews and chips chunk to chunk.
+            shed = tid in shed_set
+            payload_sent = 0
             while have < size and budget > 0:
                 try:
                     with open(path, "rb") as f:
@@ -12150,6 +12223,14 @@ class SessionManager:
                     blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
                     if text is None and not blocks:
                         continue
+                    # ...except the SendUserFile payloads, once this transcript
+                    # has spent its archive budget on them (XERK-267).
+                    if shed:
+                        _shed_block_payloads(blocks)
+                    else:
+                        payload_sent += _block_payload_bytes(blocks)
+                        if payload_sent >= ARCHIVE_PAYLOAD_MAX:
+                            shed = True
                     entries.append({
                         # _entry_id, not the raw uuid: a pr-link entry has none,
                         # and the archived row's synthesized id must match the
@@ -12165,6 +12246,16 @@ class SessionManager:
                 reply = self._post_archive_chunk(tid, body)
                 if reply is None:
                     return  # POST failed; retry on a later beat
+                if reply.get("full"):
+                    # The store filled up mid-pass; nothing further can land, and
+                    # the hub is telling us rather than erroring so we stop
+                    # instead of retrying (XERK-267).
+                    log("archive store is full at the hub; stopping this sync pass")
+                    return
+                # The hub's own budget beat ours to it (it counts stored bytes,
+                # we count only sheddable payload) — take its word for the rest.
+                if reply.get("shed"):
+                    shed = True
                 budget -= len(complete)
                 new_have = int(reply.get("bytesStored", have) or have)
                 if new_have <= have:
@@ -14746,7 +14837,9 @@ class SessionManager:
                 # Best-effort: a sync hiccup must never disrupt the beat loop.
                 if reply.get("archiveHave"):
                     try:
-                        self._archive_deltas(reply["archiveHave"])
+                        self._archive_deltas(reply["archiveHave"],
+                                             reply.get("archiveShed"),
+                                             bool(reply.get("archiveFull")))
                     except Exception as e:
                         log(f"archive sync failed: {e}")
                 if self.handle_commands(reply.get("commands")):

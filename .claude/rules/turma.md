@@ -177,7 +177,25 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
   browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest
   is agent-token-authed; the manifest cursors ride the heartbeat reply.
-- Tests: `archive.test.js`, `server.test.js`.
+- **Two size ceilings, both enforced in `ingestChunk` whatever an agent sends** (XERK-267):
+  - `ARCHIVE_TRANSCRIPT_MAX_BYTES` (16 MiB) per transcript. What lands here is the agent's
+    pre-parsed entries, and a SendUserFile block carries the delivered file INLINE, so an archived
+    session can dwarf the conversation it records (measured: 28 KB of transcript → 447 MB stored).
+    Past it, that transcript's file payloads shed to the name-only chip the chat already renders
+    for an unpreviewable delivery — **sticky for the rest of the transcript**, so a reader sees one
+    clean cutover rather than a flicker. Ordinary sessions are untouched; the largest real archived
+    file measured 1.2 MB.
+  - `ARCHIVE_TOTAL_MAX_BYTES` (64 GiB) for the store. `ARCHIVE_DIR` shares its volume with
+    `state.json`, so a blow-up takes the hub's own state down with it.
+  - **Both refuse by handing back the real cursor plus a flag, never an error** — an agent reads
+    that as no forward progress and drops the chunk, where an error status is re-sent forever
+    (XERK-255). `archiveLimits` puts the same verdict on the heartbeat reply
+    (`archiveShed`/`archiveFull`) so an agent sheds before the bytes reach the wire; that is an
+    optimisation, and the hub never relies on it.
+  - Budget spend is the `archiveBytes` column, **re-derived from the files by `rebuildIndex`** —
+    the index is disposable, so reading it from a sidecar would drift (and every pre-XERK-267
+    sidecar has no such field).
+- Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.
 
 ## `POST /api/trigger` — external automation
 

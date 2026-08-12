@@ -30,13 +30,47 @@ const { DatabaseSync } = require("node:sqlite");
 const ARCHIVE_DIR = process.env.ARCHIVE_DIR || "/data/archive";
 const ARCHIVE_DB = process.env.ARCHIVE_DB || path.join(ARCHIVE_DIR, "index.db");
 // 2: dropped the never-populated `cost` column when the product went
-// token-only. A bump recreates the tables and refills them from the files.
-const SCHEMA_VERSION = 2;
+// token-only. 3: added archiveBytes (the budget below reads it). A bump
+// recreates the tables and refills them from the files.
+const SCHEMA_VERSION = 3;
 
 // The largest byte offset a transcript may claim (1 TiB). Far above any real
 // conversation, far below the 2^53 point where a stored value stops being
 // readable back as a JS number. See the cursor guard in appendDelta.
 const MAX_TRANSCRIPT_BYTES = 1024 ** 4;
+
+// One of the two ceilings below, read from the environment. An explicit 0 turns
+// that ceiling OFF and is honoured as such — `parseInt(x) || default` would read
+// it as "unset" and quietly restore the default, which is the opposite answer.
+// Anything unparseable or negative falls back.
+function byteCeiling(raw, fallback) {
+  const n = parseInt(raw == null ? "" : raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+// Per-transcript archive budget (XERK-267). What we store is the agent's
+// PRE-PARSED entries, and a SendUserFile block carries the delivered file inline
+// — a base64 data: URI per image, raw markup per HTML page. That is bounded per
+// tool call agent-side (SEND_FILE_MAX_FILES x SEND_FILE_MAX_BYTES) but unbounded
+// relative to the transcript it came from: a measured 28 KB screenshot-heavy
+// transcript archived as 447 MB, ~15,700x its source.
+//
+// So an ordinary session keeps full fidelity, and only a transcript that crosses
+// this ceiling degrades — its file payloads shed to the same name-only chip the
+// live chat already shows for an unreadable or oversized delivery, for the REST
+// of that transcript. The largest archived .jsonl on the reference host is 1.2 MB,
+// so this leaves better than a 10x margin over anything real.
+const ARCHIVE_TRANSCRIPT_MAX = byteCeiling(
+  process.env.ARCHIVE_TRANSCRIPT_MAX_BYTES, 16 * 1024 * 1024);
+// Whole-store ceiling. ARCHIVE_DIR shares its volume with the hub's state.json,
+// so an archive blow-up takes the hub's own state down with it when the volume
+// fills — this is the backstop against that, not a sizing target (the reference
+// deployment holds ~110 MB on a 12 TB pool). Past it we stop STORING rather than
+// stop replying: ingest hands back its real cursor, which the agent reads as no
+// forward progress and drops, instead of retrying a doomed POST forever the way
+// an error response did (XERK-255).
+const ARCHIVE_TOTAL_MAX = byteCeiling(
+  process.env.ARCHIVE_TOTAL_MAX_BYTES, 64 * 1024 * 1024 * 1024);
 
 // ---- filename / path building ----------------------------------------------
 
@@ -82,6 +116,7 @@ function createSchema() {
      host TEXT, remoteKey TEXT, repo TEXT, worktree TEXT, slug TEXT,
      createdAt TEXT, endedTs TEXT, summary TEXT,
      msgCount INTEGER DEFAULT 0, bytesStored INTEGER DEFAULT 0,
+     archiveBytes INTEGER DEFAULT 0,
      filePath TEXT, updatedAt TEXT)`);
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
      text, transcriptId UNINDEXED, uuid UNINDEXED, role UNINDEXED, ts UNINDEXED)`);
@@ -160,6 +195,53 @@ function writeSidecar(metaPath, obj) {
   fs.renameSync(tmp, metaPath);
 }
 
+// Bytes of .jsonl the whole store holds, summed over the index. The index is
+// disposable but self-heals from the files (rebuildIndex re-stats each one), so
+// this stays true across a lost DB rather than drifting quietly upward.
+function totalArchiveBytes() {
+  const r = db.prepare("SELECT SUM(archiveBytes) AS n FROM sessions").get();
+  return (r && r.n) || 0;
+}
+
+// Drop the SendUserFile payloads embedded on an entry's blocks — the base64
+// data: URI of an image, the raw markup of an HTML preview — leaving the
+// name-only chip the chat already renders for a delivery it can't preview
+// (chat.js renderToolFiles: anything that isn't a valid image/html src). `shed`
+// marks it as dropped-for-size rather than never-captured, so the stored .jsonl
+// stays honest about what happened to it. Mutates the entry in place; it was
+// parsed out of this one request body and is written straight after.
+function shedFilePayloads(entry) {
+  let dropped = 0;
+  const blocks = entry && Array.isArray(entry.blocks) ? entry.blocks : [];
+  for (const b of blocks) {
+    if (!b || !Array.isArray(b.files)) continue;
+    for (const f of b.files) {
+      if (!f || typeof f !== "object") continue;
+      for (const key of ["src", "html"]) {
+        if (typeof f[key] !== "string" || !f[key]) continue;
+        dropped += f[key].length;
+        delete f[key];
+        f.kind = "file";
+        f.shed = true;
+      }
+    }
+  }
+  return dropped;
+}
+
+// Rate-limited operator warning: a full store is a standing condition, so it
+// would otherwise print once per delta of every transcript, every sync pass.
+let lastFullWarnAt = 0;
+function warnArchiveFull(total) {
+  const now = Date.now();
+  if (now - lastFullWarnAt < 60 * 60 * 1000) return;
+  lastFullWarnAt = now;
+  console.error(
+    `archive is full: ${total} bytes stored, ceiling ${ARCHIVE_TOTAL_MAX} ` +
+    `(ARCHIVE_TOTAL_MAX_BYTES) — refusing new deltas so ${ARCHIVE_DIR}'s volume ` +
+    `stays writable for the hub's own state`);
+}
+
 // Ingest one delta chunk pushed by an agent. `entries` are the already-parsed,
 // displayable {uuid,role,ts,text} records for the raw byte range
 // [startOffset,endOffset) of the agent's source transcript; startOffset must
@@ -169,8 +251,18 @@ function writeSidecar(metaPath, obj) {
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
   openDb();
   meta = meta || {};
-  const row = db.prepare("SELECT bytesStored, filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = db.prepare(
+    "SELECT bytesStored, archiveBytes, filePath FROM sessions WHERE transcriptId=?"
+  ).get(transcriptId);
   const have = row ? row.bytesStored : 0;
+  // Store full: hand back the cursor we already hold and store nothing. Not an
+  // error status — the agent must read this as "no progress" and move on, never
+  // as a chunk to retry (XERK-267).
+  const total = totalArchiveBytes();
+  if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) {
+    warnArchiveFull(total);
+    return { bytesStored: have, full: true };
+  }
   if (Number(startOffset) !== have) return { bytesStored: have };
   // The cursor only ever moves forward. Without this an endOffset BELOW
   // startOffset rewound bytesStored, and the next chunk re-ingested a range
@@ -203,6 +295,12 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   const prevCount = row ? (db.prepare("SELECT msgCount FROM sessions WHERE transcriptId=?").get(transcriptId)?.msgCount || 0) : 0;
   const msgCount = prevCount + list.length;
   const bytesStored = Number(endOffset);
+  // What this transcript's .jsonl already costs us, and whether that has taken
+  // it past its budget. Sticky once crossed — the rest of the conversation sheds
+  // rather than every other chunk flipping, so a reader sees one clean cutover.
+  let archiveBytes = (row && row.archiveBytes) || 0;
+  let shed = ARCHIVE_TRANSCRIPT_MAX > 0 && archiveBytes >= ARCHIVE_TRANSCRIPT_MAX;
+  let shedBytes = 0;
 
   tx(() => {
     let lines = "";
@@ -214,36 +312,54 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
       // The FTS index still keys on `text` only (search scope unchanged).
       const rec = { uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text };
       if (Array.isArray(e.blocks) && e.blocks.length) rec.blocks = e.blocks;
-      lines += JSON.stringify(rec) + "\n";
+      if (shed) shedBytes += shedFilePayloads(rec);
+      const line = JSON.stringify(rec) + "\n";
+      lines += line;
+      // Budget checked per ENTRY, not per chunk: one 8 MiB delta can carry the
+      // whole overshoot on its own, so waiting for the next chunk to notice
+      // would store the very thing the ceiling exists to refuse.
+      archiveBytes += Buffer.byteLength(line);
+      if (ARCHIVE_TRANSCRIPT_MAX > 0 && archiveBytes >= ARCHIVE_TRANSCRIPT_MAX) shed = true;
       insert.run(text, transcriptId, e.uuid || null, e.role || null, e.ts || null);
     }
     if (lines) fs.appendFileSync(paths.jsonl, lines);
     db.prepare(`INSERT INTO sessions(
         transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
-        summary, msgCount, bytesStored, filePath, updatedAt)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        summary, msgCount, bytesStored, archiveBytes, filePath, updatedAt)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(transcriptId) DO UPDATE SET
         host=excluded.host, remoteKey=excluded.remoteKey, repo=excluded.repo,
         worktree=excluded.worktree, slug=excluded.slug,
         createdAt=COALESCE(excluded.createdAt, sessions.createdAt),
         endedTs=excluded.endedTs, summary=COALESCE(excluded.summary, sessions.summary),
         msgCount=excluded.msgCount, bytesStored=excluded.bytesStored,
+        archiveBytes=excluded.archiveBytes,
         filePath=excluded.filePath, updatedAt=excluded.updatedAt`).run(
       transcriptId, host, meta.remoteKey || null, meta.repo || null,
       meta.worktree || null, meta.slug || null, meta.createdAt || null,
       meta.endedTs || null, meta.summary || null, msgCount, bytesStored,
-      relPath, nowIso
+      archiveBytes, relPath, nowIso
     );
   });
+  if (shedBytes) {
+    console.error(
+      `archive: ${transcriptId} is over its ${ARCHIVE_TRANSCRIPT_MAX}-byte budget ` +
+      `(ARCHIVE_TRANSCRIPT_MAX_BYTES); dropped ${shedBytes} bytes of inline file ` +
+      `previews from this delta`);
+  }
 
   writeSidecar(paths.meta, {
     transcriptId, host, remoteKey: meta.remoteKey || null, repo: meta.repo || null,
     worktree: meta.worktree || null, slug: meta.slug || null,
     createdAt: meta.createdAt || null, endedTs: meta.endedTs || null,
-    summary: meta.summary || null, msgCount, bytesStored, updatedAt: nowIso,
+    summary: meta.summary || null, msgCount, bytesStored, archiveBytes,
+    updatedAt: nowIso,
   });
 
-  return { bytesStored };
+  // `shed` tells the agent this transcript is over budget so it stops putting
+  // the payloads on the wire at all; the hub sheds regardless, since an agent
+  // too old to read the flag still pushes them.
+  return shed ? { bytesStored, shed: true } : { bytesStored };
 }
 
 // Upsert metadata rows for a manifest and return the bytes-have cursor map the
@@ -276,6 +392,30 @@ function manifestCursors(host, manifest) {
     }
   });
   return have;
+}
+
+// The budget state the heartbeat reply carries back beside archiveHave (XERK-267):
+// which of these transcripts have already spent their per-transcript budget, and
+// whether the store as a whole is full. It lets the agent shed BEFORE the bytes
+// go on the wire and skip a push that could only be refused — but it is an
+// optimisation, not the enforcement: ingestChunk applies both ceilings itself,
+// because an agent too old to read either flag keeps pushing regardless.
+function archiveLimits(ids) {
+  openDb();
+  const shed = [];
+  const list = Array.isArray(ids) ? ids : [];
+  if (ARCHIVE_TRANSCRIPT_MAX > 0 && list.length) {
+    // One query for the over-budget set, intersected in JS, rather than a point
+    // lookup per manifest entry: this runs on every heartbeat of every host, a
+    // manifest carries up to ARCHIVE_MANIFEST_MAX (200) ids, and in the ordinary
+    // case the over-budget set is empty.
+    const over = new Set(db.prepare(
+      "SELECT transcriptId FROM sessions WHERE archiveBytes >= ?"
+    ).all(ARCHIVE_TRANSCRIPT_MAX).map((r) => r.transcriptId));
+    for (const id of list) if (over.has(id)) shed.push(id);
+  }
+  const total = totalArchiveBytes();
+  return { shed, full: !!(ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) };
 }
 
 // ---- query ------------------------------------------------------------------
@@ -407,8 +547,8 @@ function rebuildIndex() {
   );
   const upsert = db.prepare(`INSERT OR REPLACE INTO sessions(
       transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
-      summary, msgCount, bytesStored, filePath, updatedAt)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      summary, msgCount, bytesStored, archiveBytes, filePath, updatedAt)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   for (const jsonl of files) {
     const meta = readSidecar(jsonl + ".meta") || {};
     const transcriptId = meta.transcriptId;
@@ -416,6 +556,10 @@ function rebuildIndex() {
     const relPath = path.relative(ARCHIVE_DIR, jsonl);
     let raw = "";
     try { raw = fs.readFileSync(jsonl, "utf8"); } catch { /* empty */ }
+    // From the file, not the sidecar: this is what the budgets spend, so it has
+    // to be what's actually on disk even if a sidecar is stale or predates the
+    // field (every pre-XERK-267 archive has none).
+    const archiveBytes = Buffer.byteLength(raw);
     tx(() => {
       let msgCount = 0;
       for (const line of raw.split("\n")) {
@@ -430,15 +574,17 @@ function rebuildIndex() {
       upsert.run(transcriptId, meta.host || null, meta.remoteKey || null,
         meta.repo || null, meta.worktree || null, meta.slug || null,
         meta.createdAt || null, meta.endedTs || null, meta.summary || null,
-        msgCount, meta.bytesStored || 0, relPath, meta.updatedAt || null);
+        msgCount, meta.bytesStored || 0, archiveBytes, relPath,
+        meta.updatedAt || null);
     });
   }
   return files.length;
 }
 
 module.exports = {
-  ARCHIVE_DIR, ARCHIVE_DB,
+  ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
   slugify, archiveRelPath, ftsQuery,
   openDb, closeDb, rebuildIndex,
-  ingestChunk, manifestCursors, searchArchive, listArchive, getTranscript,
+  ingestChunk, manifestCursors, archiveLimits,
+  searchArchive, listArchive, getTranscript,
 };

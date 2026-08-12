@@ -414,6 +414,21 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,
   `TestResumableReport`.
+- **The archive is the ONE place a SendUserFile preview is shed** (`_shed_block_payloads`,
+  XERK-267): the payloads are bounded per delivery but unbounded relative to the transcript, so a
+  screenshot-heavy session archives orders of magnitude larger than what it records (measured:
+  28 KB of transcript → 447 MB archived). Past `ARCHIVE_PAYLOAD_MAX` the rest of that transcript
+  ships as name-only chips flagged `shed`. The live tail and `history` keep their previews — those
+  are re-read from the transcript on demand and cost nothing durable.
+- **The hub owns the ceiling, this is only an early stop.** `archiveShed`/`archiveFull` on the
+  heartbeat reply are the hub's verdict (`turma/archive.js`), which the agent applies to keep the
+  bytes off the wire and to skip a pass at a full store; the hub re-applies both itself, since an
+  agent too old to read either flag pushes regardless. Counting differs on purpose: the hub spends
+  STORED bytes, the agent only sheddable PAYLOAD bytes — charging a long but ordinary conversation
+  for its prose would degrade it for nothing. Tests: `TestArchivePayloadBudget`.
+- A refused delta comes back as **the hub's real cursor plus a flag, never an error status** — the
+  agent must read it as no forward progress and drop it, not as a chunk to re-send forever
+  (XERK-255).
 
 ## Hooks
 
