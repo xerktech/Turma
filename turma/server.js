@@ -1891,8 +1891,14 @@ function normalizeSessions(payload) {
   // `List<SessionInfo>` on Android, so a `null` or a bare string in the array is
   // as fatal as a wrong-typed field inside one — measured as a host silently
   // missing from the phone while the tile still counted it.
-  const bad = payload.sessions.some((s) => !s || typeof s !== "object");
-  if (bad) payload.sessions = payload.sessions.filter((s) => s && typeof s === "object");
+  //
+  // `Array.isArray` is not redundant with the `typeof` test, it is the case that
+  // test MISSES: `typeof [] === "object"`, so a nested array element sails past
+  // a `!s || typeof s !== "object"` predicate and is served raw. Measured worse
+  // than a hidden host — the login probe decodes /api/agents, so the decode
+  // throw reads as "Could not reach the hub" and the app cannot sign in at all.
+  const objectish = (s) => !!s && typeof s === "object" && !Array.isArray(s);
+  if (!payload.sessions.every(objectish)) payload.sessions = payload.sessions.filter(objectish);
   for (const s of payload.sessions) {
     // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
     // never goes through that: idempotent, so running twice costs nothing.

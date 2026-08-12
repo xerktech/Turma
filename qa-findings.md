@@ -145,3 +145,34 @@ exercised code in the tree.
   `ws`, so through that await `ws` is null and the guard waves a second
   connection through. Unit tests that hand the guard a socket object never see
   it. Count the sockets (§3, `page.on("websocket")`), don't read the guard.
+
+### 5.8 What the ELEVENTH round found — again in the previous round's own fix
+
+- **`typeof [] === "object"`, in a validator whose whole job is "is this an
+  object".** `normalizeSessions` dropped a `null` and a bare string from
+  `sessions` and served a nested ARRAY element raw, because its predicate was
+  `!s || typeof s !== "object"`. The comment above it named the two cases the
+  fixture used, and the fixture used the two cases the comment named — so the
+  third non-object shape existed in neither, and the fix read as complete from
+  every angle except running it. Measured as the phone unable to SIGN IN, since
+  the login probe decodes `/api/agents` and reads the throw as "Could not reach
+  the hub". **When you write an is-an-object test in JS, write `Array.isArray`
+  in the same breath, and put every non-object shape in the fixture — `null`,
+  a string, a number, `[]`, and a non-empty array — not a representative one.**
+  This is §5.3 again, one round later, in the code that fixed §5.3.
+- **A TTL read from a Composable body is a timer that never fires.** The
+  model-switch memo aged out inside `canSwitchModelSource()`, evaluated at
+  composition time from `System.currentTimeMillis()`. Compose skips
+  recomposition while the state compares equal, so on a quiet fleet nothing
+  re-read the clock: the control vanished on an unconfirmed switch and was still
+  gone at t+120s, with the bar naming a model the session was not running.
+  **Expiry has to change STATE, not merely change what a read would return** —
+  retire the value from the store on a bounded alarm. The web had no such bug
+  because its poll recomputes the same predicate unconditionally every beat;
+  when porting a per-beat web computation to Compose, ask what re-runs it.
+- **A discarded `Result` turns every refusal into a success.** `setModel` and
+  `setMode` ran `runCatching { … }` and then emitted "✓ queued" unconditionally.
+  Harmless while those routes only failed on the network — and then a sibling
+  commit gave the hub a first-class 409 for them, which the bar reported as a
+  success. **Grep for `runCatching` whose result is not bound**; each one is a
+  silent success waiting for someone to add a refusal to that route.

@@ -6713,10 +6713,20 @@ test("normalizeSessions coerces the per-session fields Android types", () => {
       { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"] },
       { id: "s2", modelSource: "local", modelSourceAt: "2026-08-11T00:00:00Z" },
       { id: "s3", session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+      // Every non-object shape, not a representative one. An ARRAY element is
+      // the case a `typeof s !== "object"` predicate misses (`typeof [] ===
+      // "object"`), and it is decode-fatal exactly like the other two: measured
+      // as the Android app unable to SIGN IN, because the login probe decodes
+      // /api/agents and reads the throw as "Could not reach the hub".
       null,
+      "nope",
+      [1, 2],
+      [],
     ],
   };
   hub.normalizeRecord(payload);
+  assert.equal(payload.sessions.length, 3, "every non-object element is dropped");
+  assert.deepEqual(payload.sessions.map((s) => s.id), ["s1", "s2", "s3"]);
   assert.equal(payload.sessions[0].modelSource, "");
   assert.equal(payload.sessions[0].modelSourceAt, "");
   assert.equal(payload.sessions[1].modelSource, "local");        // good values untouched

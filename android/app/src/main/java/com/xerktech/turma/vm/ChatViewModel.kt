@@ -166,7 +166,40 @@ class ChatViewModel(
         // until the next keystroke.
         viewModelScope.launch { draft.collect { text -> _state.update { it.copy(draft = text) } } }
         viewModelScope.launch {
-            modelSwitch.collect { p -> _state.update { it.copy(modelSourcePending = p) } }
+            modelSwitch.collect { p ->
+                _state.update { it.copy(modelSourcePending = p) }
+                armMemoExpiry(p)
+            }
+        }
+    }
+
+    /**
+     * Wake once when the outstanding memo ages out and retire it (XERK-246).
+     *
+     * Without this the TTL is only ever observed by whoever next reads the clock,
+     * and on a quiet fleet nobody does — Compose skips recomposition while the
+     * state compares equal, so an expired memo stays painted indefinitely. The
+     * heartbeat's own `settle` cannot cover it either: it runs on fleet
+     * emissions, which is exactly what a quiet fleet does not produce.
+     *
+     * Collected off the STORE rather than set alongside each POST, so a memo
+     * carried in from another nav entry is armed too — that is the case the
+     * store exists for. Self-cancelling and bounded: one alarm per memo, none at
+     * all when there is no memo.
+     */
+    private var memoExpiryJob: Job? = null
+
+    private fun armMemoExpiry(pending: ModelSource.Pending?) {
+        memoExpiryJob?.cancel()
+        if (pending == null) return
+        memoExpiryJob = viewModelScope.launch {
+            val left = ModelSource.SWITCH_SETTLE_MS - (System.currentTimeMillis() - pending.at)
+            if (left > 0) delay(left)
+            // Re-read the store rather than closing over `pending`: the heartbeat
+            // may have settled it and a newer switch replaced it while we slept.
+            modelSwitch.value = ModelSource.settle(
+                modelSwitch.value, _state.value.session, System.currentTimeMillis(),
+            )
         }
     }
 
@@ -211,7 +244,8 @@ class ChatViewModel(
                 // Retire a memo the heartbeat has caught up with, through the
                 // store — the state copy is a mirror, so clearing only that
                 // would let the next emission paint the stale memo back.
-                modelSwitch.value = ModelSource.settle(modelSwitch.value, session)
+                modelSwitch.value =
+                    ModelSource.settle(modelSwitch.value, session, System.currentTimeMillis())
                 _state.update { it.fromFleet(agent, session, host) }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
@@ -508,14 +542,37 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * Report what the hub actually said, never a blanket "✓ queued" (XERK-246).
+     *
+     * These two discarded their result, so every refusal painted as a success.
+     * That was survivable while the routes only failed on the network, but the
+     * hub now 409s `/model` on a session running the self-hosted model —
+     * deliberately, so an out-of-parity client cannot silently drop the command
+     * — and a session CAN be on the local model while the compose bar still
+     * offers the picker, in the window before a switch settles. Same shape as
+     * [setModelSource]'s handler, and the same reason `FleetViewModel.run`
+     * stopped collapsing every failure into "hub unreachable".
+     */
+    private fun reportedOutcome(res: Result<*>, queued: String, failed: String) {
+        _messages.tryEmit(
+            ModelSource.outcomeMessage(
+                ok = res.isSuccess,
+                hubMessage = res.exceptionOrNull()?.let { hubErrorMessage(it) },
+                queued = queued,
+                failed = failed,
+            )
+        )
+    }
+
     fun setModel(model: String) = viewModelScope.launch {
-        runCatching { client.api.setModel(host, sessionId, ModelRequest(model)) }
-        _messages.tryEmit("✓ model queued")
+        val res = runCatching { client.api.setModel(host, sessionId, ModelRequest(model)) }
+        reportedOutcome(res, "✓ model queued", "could not set the model")
     }
 
     fun setMode(mode: String) = viewModelScope.launch {
-        runCatching { client.api.setMode(host, sessionId, ModeRequest(mode)) }
-        _messages.tryEmit("✓ mode queued")
+        val res = runCatching { client.api.setMode(host, sessionId, ModeRequest(mode)) }
+        reportedOutcome(res, "✓ mode queued", "could not set the mode")
     }
 
     /**
