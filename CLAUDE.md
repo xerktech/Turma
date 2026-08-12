@@ -11,9 +11,10 @@ that component's files.
 | File | Loads when Claude touches | Covers |
 |------|---------------------------|--------|
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
-| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, PR status, usage ledger, transcript blocks, archive, image |
+| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
+| `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**` | guard hook, AskUserQuestion bridge |
 | `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | container boot, start-time Claude Code check, bundled toolchains |
@@ -36,8 +37,8 @@ that component's files.
     cost of a large file is context tokens and weaker adherence, which is what the ceiling protects.
     A ceiling stated as a truncation cliff was wrong; do not restore that framing.
   - **When a file approaches the ceiling, split it by path into another rules file** — that is the
-    remedy, not raising the number and not deleting rationale. `agent-board.md`, `turma-board.md`
-    and `turma-sessions.md` exist for exactly that reason.
+    remedy, not raising the number and not deleting rationale. `agent-board.md`, `agent-prs.md`,
+    `turma-board.md` and `turma-sessions.md` exist for exactly that reason.
 - **Put a fact in the narrowest file that always sees it.** Component detail → that component's
   rules file. A rule spanning two components → "Cross-cutting contracts" below, since a
   `paths:`-scoped file does not load when Claude works on the other side of the contract.

@@ -160,8 +160,8 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - **Azure DevOps git/CLI enablement is container-only**: `--wire-azure-git` and
     `AZURE_DEVOPS_EXT_PAT` are wired by `entrypoint.sh`, and `az` isn't installed natively at all, so
     a native ADO host authenticates git and opens PRs with its own tooling. PR chips still work —
-    attribution is the creating COMMAND (`TURMA_PR_CREATE_CMDS`, see `.claude/rules/agent.md`), not
-    the CLI — but nothing here provides that tooling.
+    attribution is the creating COMMAND (`TURMA_PR_CREATE_CMDS`, see
+    `.claude/rules/agent-prs.md`), not the CLI — but nothing here provides that tooling.
   - `startedAt` is docker's StartedAt where docker can answer, else the manager's OWN start time —
     **never empty** (`TestStartedAt`), keeping the restart-loop alert (keyed on `startedAt`
     CHANGING) and card Uptime working natively. The log tail stays container-only.
