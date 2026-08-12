@@ -36,6 +36,13 @@ process.env.CONTROL_DEAD_AFTER_MS = "400";
 // Same trick for the create single-flight's expiry (XERK-241): the fleet gives
 // an unresolved create 60s to rejoin a retry, which is only testable wound down.
 process.env.CREATE_INFLIGHT_TTL_MS = "300";
+// The registry cap (XERK-272) is sized for a FLEET — the deployed one is a
+// handful of hosts. This suite is not a fleet: it invents ~100 synthetic host
+// names in one process and never removes them, so it is lifted here rather than
+// having every later test refused. The cap itself, its eviction rule and the
+// restore trim get their own process in registry-cap.test.js, which pins tiny
+// values and drives them over the wire.
+process.env.AGENTS_MAX = "1000";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
@@ -7791,6 +7798,9 @@ function bootWithState(t, raw) {
     process.env.TURMA_TEST = "1";
     const warns = [];
     console.warn = (...a) => warns.push(a.join(" "));
+    // The restore reports a refused file through console.error (XERK-272) and
+    // its dropped KEYS through console.warn, so both are captured here.
+    console.error = (...a) => warns.push(a.join(" "));
     const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
     process.stdout.write("<<<" + JSON.stringify({ agents: hub.agents, warns }) + ">>>");
     process.exit(0);
@@ -7830,9 +7840,9 @@ test("a restored state file cannot carry a host the hub could not address", () =
 
 test("a corrupt state file restores nothing, rather than a registry of characters", () => {
   // `Object.keys("hello")` is ["0".."4"], so a bare JSON string loaded as "5
-  // agents" and then threw deeper in, into the restore's silent catch. The
-  // parse now lands in a local and is shape-checked BEFORE `agents` is assigned,
-  // so a throw cannot leave the junk installed.
+  // agents". The array/number/boolean shapes are the ones that matter most:
+  // they throw nowhere on their own, so the catch's `agents = {}` reset never
+  // fires for them and only the shape check keeps them out of the registry.
   for (const junk of ['"hello"', "[]", "12", "null", "true"]) {
     const out = bootWithState(this, junk);
     const { agents: restored } = JSON.parse(
@@ -7840,11 +7850,9 @@ test("a corrupt state file restores nothing, rather than a registry of character
     assert.deepEqual(restored, {}, `state.json of ${junk} must restore nothing`);
     assert.doesNotMatch(out, /loaded \d+ agents/,
       `${junk} must not report a successful load`);
-    // ...and it SAYS so. The restore's catch swallowed everything, so a corrupt
-    // file was indistinguishable from first boot and the shape check above threw
-    // a message nothing ever printed.
+    // ...and it SAYS so, rather than being indistinguishable from first boot.
     const { warns } = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
-    assert.ok(warns.some((w) => /ignoring unusable state file/.test(w)),
+    assert.ok(warns.some((w) => /state restore skipped/.test(w)),
       `${junk} must be reported, not silently treated as first boot`);
   }
   // A well-formed file still loads, so the guard isn't refusing everything.
