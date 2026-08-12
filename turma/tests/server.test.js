@@ -36,6 +36,13 @@ process.env.CONTROL_DEAD_AFTER_MS = "400";
 // Same trick for the create single-flight's expiry (XERK-241): the fleet gives
 // an unresolved create 60s to rejoin a retry, which is only testable wound down.
 process.env.CREATE_INFLIGHT_TTL_MS = "300";
+// The registry cap (XERK-272) is sized for a FLEET — the deployed one is a
+// handful of hosts. This suite is not a fleet: it invents ~100 synthetic host
+// names in one process and never removes them, so it is lifted here rather than
+// having every later test refused. The cap itself, its eviction rule and the
+// restore trim get their own process in registry-cap.test.js, which pins tiny
+// values and drives them over the wire.
+process.env.AGENTS_MAX = "1000";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`

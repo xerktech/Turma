@@ -253,6 +253,38 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   session's ttyd by port) sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`).
   Agents authenticate heartbeats, tunnel WebSockets, and ttyd with one shared token (`TURMA_TOKEN`
   in the agent's env = `TURMA_AGENT_TOKEN` on the hub).
+  - **One token means the heartbeat's `device` is attacker-chosen**, so it names a record but never
+    authorizes one. Anything keyed on it needs its own bound.
+
+### The agent registry's ceiling (XERK-272)
+
+- **`agents` is bounded as an AGGREGATE, not just per record.** `AGENT_RECORD_MAX` (8 MiB) bounds
+  ONE record and `prune()` only reclaims at 7 days, so an unbounded NUMBER of `device` names was an
+  unbounded amount of retained memory — 512 beats of 0.9 MiB under 512 names OOM-killed a 256 MiB
+  hub, while the same 512 beats under ONE name peaked at 169 MiB.
+- Two budgets, bounding different things: **`AGENTS_TOTAL_MAX`** (aggregate record bytes, defaulting
+  to an eighth of the container's own cgroup limit, clamped 8–64 MiB) and **`AGENTS_MAX`** (record
+  count, default 64). The count cap is not redundant — the byte budget measures what
+  `agentRecordSize` measures, which EXCLUDES the on-demand caches, so only a cap on hosts bounds
+  their multiple. A ceiling above the limit the kernel kills on is not a ceiling: size it from the
+  container, never pick a number.
+- **A newcomer never displaces a host that is still around.** Past the cap a record is reclaimed
+  only if it has been unseen for `AGENT_EVICT_IDLE_MS` (1h, ≫ `OFFLINE_AFTER_MS`) — a record holds
+  an offline host's last known sessions, PR chips and usage, so a host rebooting or updating keeps
+  its slot and the new `device` gets a 429 instead. The accepted cost is that a flood of names can
+  squat slots and block onboarding a genuinely new host until it stops or `AGENTS_MAX` is raised;
+  per-agent tokens are the real fix and are not this.
+- A host **already in the registry is always admitted** — turning the cap into a wall for the fleet's
+  own hosts is the same outage from the other side. The aggregate can still refuse its beat, which
+  is contention (it lands on a later beat), not a wall, and never damages the record being served.
+- **The state.json restore enforces the same budget** (`trimRestoredAgents`, keep-newest): a flood
+  that landed before a restart is on disk, and a bound the loading path skips is not a bound. Same
+  reason `normalizeRecord` runs on the restore as well as the ingest.
+- Byte accounting is a side map (`recordBytes`), never a field on the record — anything on a record
+  is served to every client — and `registryBytes()` re-measures unknown keys and forgets dead ones,
+  so the many places that `delete agents[key]` need not remember it.
+- Tests: `registry-cap.test.js`, which pins tiny caps in its own process (`server.test.js` lifts
+  `AGENTS_MAX` because ~100 synthetic host names is not a fleet).
 - The hub also serves the `glasses/` client: a CORS'd `/api/*` surface for that cross-origin
   WebView; per-session `input`/`history` endpoints; `GET /api/ws-token` for short-lived WebSocket
   auth; an `/audio` STT WebSocket (G2-mic PCM to the LiteLLM instance's transcription endpoint); and
