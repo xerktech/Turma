@@ -1245,9 +1245,13 @@ function ingestSpawnFailures(hostKey, agent, ownCmdIds, results) {
     const error = typeof r.error === "string" && r.error
       ? r.error.slice(0, SPAWN_FAILURE_ERROR_MAX)
       : "the agent refused it";
-    // `__proto__` as a key would invoke the prototype setter rather than store
-    // an entry — silently dropping the refusal and re-pointing the cache's
-    // prototype. Refused for the same reason `device` refuses these names.
+    // The length and key-name checks are belt-and-braces BEHIND `ownCmdIds`:
+    // `queueCommand` mints ids from crypto.randomBytes, so the hub can never
+    // have issued one called `__proto__` or 200 chars long, and no test can
+    // fail on their removal today. They are here for the day that membership
+    // check is relaxed — `__proto__` would then invoke the prototype setter
+    // rather than store an entry, silently dropping the refusal, which is why
+    // `device` refuses the same names.
     if (typeof r.cmdId === "string" && r.cmdId &&
         r.cmdId.length <= SPAWN_FAILURE_CMDID_MAX &&
         r.cmdId !== "__proto__" && r.cmdId !== "constructor" &&
@@ -3646,7 +3650,12 @@ const server = http.createServer(async (req, res) => {
       // Scoped to the commands this host was actually given: `prev.commands` is
       // the queue BEFORE this beat's acks were filtered out, and the agent
       // stages a refusal in the same handle_commands call that acks it, so the
-      // two always ride together.
+      // two always ride together. A hub restart inside `scheduleSave`'s debounce
+      // forgets the queue and therefore drops that refusal — correctly: the hub
+      // can no longer tell whose command it was, and the wait simply degrades to
+      // the pre-XERK-265 timeout. Never authenticate it from the beat's own
+      // `ackedCommands` instead; that is the agent's word, which is the thing
+      // being checked.
       ingestSpawnFailures(key, next,
         new Set((prev.commands || []).map((c) => c && c.cmdId)), spawnFailures);
       // Ordered after every ingest above: an ack settles against what this same
