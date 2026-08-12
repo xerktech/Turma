@@ -10808,16 +10808,31 @@ class TestPruneRepo(unittest.TestCase):
         self._await_prune(sm)
 
     def test_prune_of_a_repo_already_in_flight_is_not_stacked(self):
+        """Three clicks on a repo already queued leave ONE sweep and ONE worker.
+
+        The worker is stubbed rather than gated: gating it still lets it POP the
+        entry before the assertion runs, so reading the queue length races it —
+        which is exactly how this test first failed in CI and passed locally."""
         sm = ha.SessionManager()
-        gate = threading.Event()
-        real = sm._run_prune
-        sm._run_prune = lambda repo: (gate.wait(10), real(repo))
-        sm.prune_repo("demo")
-        sm.prune_repo("demo")
-        sm.prune_repo("demo")
-        self.assertEqual(len(sm._prune_queue), 1)
-        gate.set()
-        self._await_prune(sm)
+        started = []
+
+        class FakeThread:
+            def __init__(self, **kw):
+                started.append(kw.get("name"))
+
+            def is_alive(self):
+                return True      # so a later enqueue sees a worker already up
+
+            def start(self):
+                pass
+
+        with mock.patch.object(ha.threading, "Thread", FakeThread):
+            sm.prune_repo("demo")
+            sm.prune_repo("demo")
+            sm.prune_repo("demo")
+        self.assertEqual(list(sm._prune_queue), ["demo"])
+        self.assertEqual(started, ["prune-worker"])
+        self.assertEqual(sm.prunes["demo"]["status"], "queued")
 
     def test_running_prune_never_ages_out_of_the_heartbeat(self):
         """_poll_prunes drops a record once it has lingered — a sweep in flight
