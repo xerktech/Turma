@@ -80,8 +80,21 @@ const BODY_INFLIGHT_ABSOLUTE_MAX = 32 << 20; // 32 MiB — the largest one body 
 const BODY_INFLIGHT_MAX =
   Number(process.env.BODY_INFLIGHT_MAX) ||
   Math.min(BODY_INFLIGHT_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 8));
+// The ceiling on EVERYTHING being read at once, across BOTH lanes.
+//
+// It has to be one number covering both, because two independent ceilings have
+// to be ADDED to know the worst case and nobody does that arithmetic when
+// tuning one of them. That is not hypothetical: when the lanes were made
+// genuinely independent, the real worst case silently became `shared + a whole
+// big body` — the shared half having been sized back when a big body still
+// consumed it — and the 256-concurrent-30 MiB flood started OOM-killing the hub
+// that had survived it for four commits.
+//
+// Half the container, so that one max-size body (BODY_INFLIGHT_MAX at
+// BODY_PARSE_COST, i.e. three quarters of this) plus the shared traffic beside
+// it still leaves room for the response, the working set and the sockets.
 const BODY_INFLIGHT_TOTAL_MAX =
-  Number(process.env.BODY_INFLIGHT_TOTAL_MAX) || Math.floor(MEMORY_LIMIT / 4);
+  Number(process.env.BODY_INFLIGHT_TOTAL_MAX) || Math.floor(MEMORY_LIMIT / 2);
 
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
@@ -1912,7 +1925,7 @@ function budgetUnderPressure(lane) {
   // body however much room the shared budget has. A stall there is contention
   // by definition.
   if (lane === "big") return true;
-  return bodyInflightBytes * 2 > BODY_INFLIGHT_TOTAL_MAX;
+  return (bodyInflightBytes + bigLaneBytes) * 2 > BODY_INFLIGHT_TOTAL_MAX;
 }
 
 /**
@@ -1933,7 +1946,13 @@ function budgetUnderPressure(lane) {
  */
 function laneForCharge(lane, delta) {
   if (lane === "big") return "big"; // already exempt, for the whole read
-  if (bodyInflightBytes + delta <= BODY_INFLIGHT_TOTAL_MAX) return "shared";
+  // Shared admission counts the big lane too. A big body really is occupying
+  // memory, so pretending otherwise is what let the true worst case drift above
+  // what the container can hold. As it grows, ordinary traffic's room shrinks —
+  // but never to nothing, because the ceiling is set above what one body can
+  // ever charge, which is what keeps a holder from starving everyone (the total
+  // outage that made the lanes separate accounts in the first place).
+  if (bodyInflightBytes + bigLaneBytes + delta <= BODY_INFLIGHT_TOTAL_MAX) return "shared";
   if (!bigLaneTaken) return "big";
   return null;
 }
@@ -5895,7 +5914,8 @@ if (process.env.TURMA_TEST) {
     const mib = (n) => `${Math.round(n / (1 << 20))} MiB`;
     console.log(
       `memory limit ${mib(MEMORY_LIMIT)} -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
-        `${mib(BODY_INFLIGHT_TOTAL_MAX)} total; uploads held ${mib(UPLOAD_TOTAL_MAX_BYTES)}`
+        `${mib(BODY_INFLIGHT_TOTAL_MAX)} across both lanes; uploads held ` +
+        `${mib(UPLOAD_TOTAL_MAX_BYTES)}`
     );
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile

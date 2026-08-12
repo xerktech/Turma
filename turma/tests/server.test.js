@@ -6517,6 +6517,12 @@ test("connections: a connection over the cap is refused, and says so", async () 
 });
 
 // ---- XERK-258: the in-flight body budget ------------------------------------
+// The most a single real body can charge: the per-request wire cap at full
+// parse cost. Strictly below the ceiling by design, so a body holding the
+// exclusive lane always leaves room beside it — staging anything larger models
+// a body that cannot exist.
+const bigMax = () => hub.BODY_INFLIGHT_MAX * hub.BODY_PARSE_COST;
+
 // Mirrors BODY_PARSE_COST in server.js: a JSON body is charged a multiple of
 // its wire size, because the string and JSON.parse's object graph are the real
 // bill. Held here so a test can assert the exact charge rather than "> 0".
@@ -6528,44 +6534,40 @@ test("budget: the ceilings are derived from the container limit, and only tighte
   // anything before the OOM killer fired. Every ceiling is now a fraction of the
   // limit -- and capped, so a big host can't hand one request the whole machine.
   assert.ok(hub.MEMORY_LIMIT > 0);
-  assert.ok(hub.BODY_INFLIGHT_TOTAL_MAX <= Math.floor(hub.MEMORY_LIMIT / 4));
+  assert.ok(hub.BODY_INFLIGHT_TOTAL_MAX <= Math.floor(hub.MEMORY_LIMIT / 2));
   assert.ok(hub.BODY_INFLIGHT_MAX <= Math.floor(hub.MEMORY_LIMIT / 8));
   assert.ok(hub.BODY_INFLIGHT_MAX <= 32 << 20, "one body may never exceed the sanity bound");
   assert.ok(hub.UPLOAD_TOTAL_MAX_BYTES <= Math.floor(hub.MEMORY_LIMIT / 4));
-  // The per-request ceiling must stay strictly under the total, or one body
-  // could fill the budget and the concurrency bound would mean nothing.
-  assert.ok(hub.BODY_INFLIGHT_MAX < hub.BODY_INFLIGHT_TOTAL_MAX);
+  // The load-bearing relationship: ONE max-size body, at its full parse cost,
+  // must leave room beside it. Otherwise a body holding the exclusive lane
+  // starves ordinary traffic outright -- the total outage that separating the
+  // lanes was meant to end -- and the worst case stops fitting the container.
+  assert.ok(
+    hub.BODY_INFLIGHT_MAX * hub.BODY_PARSE_COST < hub.BODY_INFLIGHT_TOTAL_MAX,
+    "a max-size body must not be able to consume the whole ceiling"
+  );
 });
 
-test("budget: one big body may exceed the budget, and exactly one", async () => {
+test("budget: one big body may exceed the room left, and exactly one", async () => {
   assert.equal(hub.bodyInflightHeld(), 0, "no request should be in flight here");
-  const total = hub.BODY_INFLIGHT_TOTAL_MAX;
+  // Leave less room than one big body needs, so the big lane is the only way in.
+  // (With the hub quiet a max-size body simply fits the shared lane -- the
+  // exclusive lane exists for when it does not.)
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - Math.floor(bigMax() / 2);
   try {
-    // A body too big for the shared budget takes the BIG lane. Keyed on the hub
-    // being bit-for-bit idle instead, this was unusable: one trickling request
-    // defeated it, and a real 65 MiB migration bundle was refused with 3 KB in
-    // flight -- stranding the move -- while HEARTBEAT_MAX went on advertising a
-    // 32 MiB beat as legal that no concurrent moment would accept.
-    hub.chargeBody(4096, "shared");
-    assert.equal(hub.bodyLaneFor(total * 2), "big",
+    hub.chargeBody(stage, "shared");
+    // Keyed on the hub being bit-for-bit IDLE instead, this was unusable: one
+    // trickling request defeated it, and a real 65 MiB migration bundle was
+    // refused with 3 KB in flight -- stranding the move -- while HEARTBEAT_MAX
+    // went on advertising a 32 MiB beat no concurrent moment would accept.
+    assert.equal(hub.bodyLaneFor(bigMax()), "big",
       "a big body is admitted even though the hub is not idle");
-    hub.chargeBody(total * 2, "big");
-
-    // ...but only one at a time, and the shared lane is now full too.
-    assert.equal(hub.bodyLaneFor(total * 2), null, "a second big body must be refused");
-    // ...and the SHARED lane is untouched by it. The lanes are accounted
-    // separately, which is what stopped one big body from refusing every tiny
-    // one: billed to the shared budget, merely holding the lane refused a
-    // 200-byte heartbeat and the operator's own login, a total outage for
-    // ~29 kbit/s.
-    assert.equal(hub.bodyLaneFor(1), "shared", "ordinary traffic must flow past it");
-
-    hub.releaseBody(total * 2, "big");
-    assert.equal(hub.bodyLaneFor(total * 2), "big", "the lane frees for the next one");
+    hub.chargeBody(bigMax(), "big");
+    assert.equal(hub.bodyLaneFor(bigMax()), null, "a second big body must be refused");
+    hub.releaseBody(bigMax(), "big");
+    assert.equal(hub.bodyLaneFor(bigMax()), "big", "the lane frees for the next one");
   } finally {
-    // Each lane is given back on its own; bodyInflightHeld() sums both, so it
-    // cannot be handed to a single release.
-    hub.releaseBody(4096, "shared");
+    hub.releaseBody(stage, "shared");
   }
   assert.equal(hub.bodyInflightHeld(), 0, "every charge must be given back");
 });
@@ -6590,11 +6592,16 @@ test("budget: ordinary bodies share the budget until it is full", async () => {
 test("budget: a leaked big lane would refuse every large body forever", async () => {
   // The one bookkeeping slip that is silent AND permanent: the bytes come back
   // but the lane does not, and from then on nothing large is ever admitted.
-  const total = hub.BODY_INFLIGHT_TOTAL_MAX;
-  hub.chargeBody(total * 2, "big");
-  hub.releaseBody(total * 2, "big");
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - Math.floor(bigMax() / 2);
+  try {
+    hub.chargeBody(stage, "shared");
+    hub.chargeBody(bigMax(), "big");
+    hub.releaseBody(bigMax(), "big");
+    assert.equal(hub.bodyLaneFor(bigMax()), "big", "the lane must be free again");
+  } finally {
+    hub.releaseBody(stage, "shared");
+  }
   assert.equal(hub.bodyInflightHeld(), 0);
-  assert.equal(hub.bodyLaneFor(total * 2), "big", "the lane must be free again");
 });
 
 test("budget: a release can never drive the held total negative", async () => {
@@ -6919,16 +6926,18 @@ test("budget: holding the big lane does not starve ordinary traffic", async () =
   // Accounted separately, it delays only other LARGE bodies.
   assert.equal(hub.bodyInflightHeld(), 0);
   try {
-    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX * 2, "big");
+    // The largest body that can exist, holding the exclusive lane. The ceiling
+    // is set above it on purpose, so what it leaves behind is real room.
+    hub.chargeBody(bigMax(), "big");
     assert.equal(hub.bodyLaneFor(1), "shared", "a tiny body still has its lane");
     const res = await request("POST", "/api/heartbeat", {
       body: { device: "unstarved" }, headers: agentHeaders,
     });
     assert.equal(res.status, 200, "ordinary traffic must flow past a held big lane");
-    // Another LARGE body is what legitimately waits.
-    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), null);
+    // Another body needing the LANE is what legitimately waits.
+    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX), null);
   } finally {
-    hub.releaseBody(hub.BODY_INFLIGHT_TOTAL_MAX * 2, "big");
+    hub.releaseBody(bigMax(), "big");
   }
   assert.equal(hub.bodyInflightHeld(), 0);
 });
@@ -6956,17 +6965,17 @@ test("budget: the big lane cannot be held past its occupancy ceiling", async () 
         `{"device":"lanehog","pad":"${"h".repeat(warm)}`
     );
     await new Promise((r) => setTimeout(r, 200));
-    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), null,
+    assert.equal(hub.bodyLaneFor(bigMax()), null,
       "it is holding the lane");
     pump = setInterval(() => {
       try { sock.write("h".repeat(hub.BODY_MIN_PROGRESS_BYTES * 2)); } catch {}
     }, Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 2)));
 
     const deadline = Date.now() + hub.BIG_LANE_MAX_HOLD_MS + 4000;
-    while (hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2) === null && Date.now() < deadline) {
+    while (hub.bodyLaneFor(bigMax()) === null && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
     }
-    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX * 2), "big",
+    assert.equal(hub.bodyLaneFor(bigMax()), "big",
       "paying the floor rate must not buy the lane forever");
   } finally {
     if (pump) clearInterval(pump);

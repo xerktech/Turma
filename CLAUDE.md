@@ -265,6 +265,13 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     that writes before reading (python urllib — what `hub-agent.py` posts with) loses the response
     and sees a socket error, which is exactly XERK-235's offline loop. The budget is what bounds it:
     those bytes are charged like any other, so a flood is refused 503 before buffering.
+  - **`BODY_INFLIGHT_TOTAL_MAX` covers BOTH lanes, and must exceed one max-size body's full parse
+    cost.** One ceiling, not two: two independent ones have to be ADDED to know the worst case and
+    nobody does that arithmetic when tuning one. Making the lanes genuinely independent silently
+    moved the true worst case to `shared + a whole big body` and the 256-concurrent flood began
+    OOM-killing a hub that had survived it for four commits. The headroom above one max body is what
+    ordinary traffic runs in while the exclusive lane is held, so that inequality is load-bearing —
+    `BODY_INFLIGHT_MAX * BODY_PARSE_COST < BODY_INFLIGHT_TOTAL_MAX`, asserted in the suite.
   - **The per-request ceiling only ever TIGHTENS** (`min(sanity bound, limit/8)`); only the TOTAL
     budget widens with the container, because that is what buys concurrency. Deriving the
     per-request one purely from the limit hands a big host an 8 GB single-body ceiling.
