@@ -6728,6 +6728,267 @@ test("normalizeSessions coerces the per-session fields Android types", () => {
   hub.normalizeRecord({ device: "h", sessions: [{ id: "s4" }] });
 });
 
+// ---- the wire-shape sweep (XERK-259) ---------------------------------------
+// `/api/agents` decodes ATOMICALLY on Android, so any one of these shapes hides
+// the WHOLE fleet from the phone — measured as the app refusing to sign in at
+// all ("Could not reach the hub — check the URL"), because the login probe
+// decodes that payload.
+
+test("repoUsage ELEMENTS are coerced, not just the field's type (XERK-259)", () => {
+  // The four shapes the QA pass drove through a real heartbeat. Coercing the
+  // field to `[]` when it isn't an array, and then serving `[null]` unchanged,
+  // fixes the shape nobody sends and keeps the one that breaks the phone.
+  const p = {
+    device: "h",
+    repoUsage: [null, "nope", [1], { repo: { a: 1 } },
+                { repo: "good", remoteKey: "gh:o/r" }],
+  };
+  hub.normalizeRecord(p);
+  // Non-objects DROPPED (a null element is fatal even though a null FIELD is
+  // fine — `coerceInputValues` reaches the field's default, not the element).
+  // `[1]` is the case a `typeof el !== "object"` test lets through.
+  assert.deepEqual(p.repoUsage, [{ repo: "" }, { repo: "good", remoteKey: "gh:o/r" }]);
+});
+
+test("http: repoUsage:[null] no longer hides the fleet from the phone", async () => {
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: "ru-null", sessions: [], repoUsage: [null] },
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "ru-null");
+  assert.deepEqual(host.repoUsage, [], "the fatal element must not be served");
+  assert.ok(res.body.agents.length > 1, "and the rest of the fleet is still there");
+});
+
+test("the shape sweep drops a bad list element in EVERY typed list, not just sessions", () => {
+  // One field at a time is how this bug got filed twice. Everything a client
+  // types as a list is swept the same way, and `[]` (whose `typeof` is
+  // "object") is the element shape a careless predicate serves raw.
+  const p = {
+    device: "h",
+    repos: [[], { name: "r", resumable: [null, { transcriptId: "t" }] }],
+    closedSessions: ["x", { id: "c1", prs: [[], { url: "u", number: 3 }] }],
+    sessions: [[1, 2], { id: "s1", prs: [null] }],
+    clones: [null, { repo: "o/r" }],
+    gitSources: [7, { source: "azure", repos: ["nope", { name: "r" }] }],
+    jira: { tickets: [null, { key: "X-1", labels: [null, "ok", { a: 1 }] }],
+            repoOptions: [[], { name: "r" }] },
+    github: { repos: [null, { name: "r" }] },
+    models: { available: [null, "sonnet", { a: 1 }] },
+  };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.repos, [{ name: "r", resumable: [{ transcriptId: "t" }] }]);
+  assert.deepEqual(p.closedSessions, [{ id: "c1", prs: [{ url: "u", number: 3 }] }]);
+  assert.deepEqual(p.sessions, [{ id: "s1", prs: [] }]);
+  assert.deepEqual(p.clones, [{ repo: "o/r" }]);
+  assert.deepEqual(p.gitSources, [{ source: "azure", repos: [{ name: "r" }] }]);
+  assert.deepEqual(p.jira.tickets, [{ key: "X-1", labels: ["ok"] }]);
+  assert.deepEqual(p.jira.repoOptions, [{ name: "r" }]);
+  assert.deepEqual(p.github.repos, [{ name: "r" }]);
+  assert.deepEqual(p.models.available, ["sonnet"]);
+});
+
+test("a wrong-typed field becomes its client's can't-tell value, never a plausible one", () => {
+  const p = {
+    device: { a: 1 },                       // String <- object: decode-fatal
+    agentVersion: ["1.2"],                  // String <- array: decode-fatal
+    uploadMaxBytes: 1.5,                    // Long cannot take a fractional literal
+    capacity: { maxSessions: 99999999999999, running: "3", free: 2 }, // Int is 32-bit
+    github: "nope",                         // object <- string
+    claudeAuth: { present: "yes", refreshExpiresAt: "soon" },
+    sessions: [{
+      id: "s1", ttydPort: 2.5, restartCount: -1,
+      work: { pushed: "maybe", aheadOfBase: 9e99, baseRef: { a: 1 } },
+      session: { paneBusy: "busy", transcriptAgeSec: "3", questionIndex: 1.5 },
+      ticket: { key: "X-1", branch: ["b"] },
+    }],
+  };
+  hub.normalizeRecord(p);
+  assert.equal(p.device, "");
+  assert.equal(p.agentVersion, "");
+  assert.equal(p.uploadMaxBytes, 0);
+  assert.deepEqual(p.capacity, { maxSessions: 0, running: 0, free: 2 });
+  assert.equal(p.github, null);
+  assert.deepEqual(p.claudeAuth, { present: false, refreshExpiresAt: null });
+  const s = p.sessions[0];
+  assert.equal(s.ttydPort, 0);
+  assert.equal(s.restartCount, -1, "a legitimate value is untouched");
+  // A NULLABLE field coerces to null, not to a zero — `pushed: false` would read
+  // as "this branch is definitely not pushed" and `aheadOfBase: 0` as "nothing
+  // to lose", which is the opposite of what the work-risk line is for.
+  assert.deepEqual(s.work, { pushed: null, aheadOfBase: null, baseRef: null });
+  assert.deepEqual(s.session, { paneBusy: null, transcriptAgeSec: null,
+                                questionIndex: null });   // no `agents` key invented
+  assert.deepEqual(s.ticket, { key: "X-1", branch: null });
+});
+
+test("a map VALUE that would throw is dropped, unlike a field's", () => {
+  // `usage.days` is a Map<String, UsageBucket>: `coerceInputValues` does not
+  // reach map values, so a null there is fatal where a null FIELD is not.
+  const p = { device: "h", usage: { days: { a: null, b: "x", c: [1],
+                                            "2026-08-12": { input: 5 } } } };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.usage.days, { "2026-08-12": { input: 5 } });
+  // ...and a non-object `days` becomes the empty map, not an array.
+  const q = { device: "h", usage: { days: [1, 2] } };
+  hub.normalizeRecord(q);
+  assert.deepEqual(q.usage.days, {});
+});
+
+test("a transcript block whose `t` is not a string decodes as unknown, not as a throw", () => {
+  // Blocks are polymorphic on `t`. An unknown NAME falls back to UnknownBlock,
+  // but a non-string discriminator throws out of the decoder, so it is coerced
+  // to "" — which lands on that same fallback.
+  const p = { device: "h", sessions: [{ id: "s1", session: { tail: [
+    null,
+    { id: "e1", blocks: [null, "x", { t: { a: 1 } }, { t: "text", text: { a: 1 } },
+                         { t: "tool_use", input: { any: ["shape", 1, null] } }] },
+  ] } }] };
+  hub.normalizeRecord(p);
+  const tail = p.sessions[0].session.tail;
+  assert.equal(tail.length, 1, "a null tail entry is fatal too");
+  assert.deepEqual(tail[0].blocks, [
+    { t: "" }, { t: "text", text: "" },
+    // A tool_use block's `input` is typed JsonElement? — any shape is legal, so
+    // it must survive verbatim.
+    { t: "tool_use", input: { any: ["shape", 1, null] } },
+  ]);
+});
+
+test("the sweep is not a whitelist: untyped keys ride through untouched", () => {
+  // Rebuilding these objects instead of coercing them in place would drop every
+  // sub-key a newer agent adds, fleet-wide, until this table caught up — the
+  // failure mode that makes a whitelist worse than the hole it closes.
+  const p = {
+    device: "h", futureField: { deep: [1, { x: null }] },
+    sessions: [{ id: "s1", futureSessionField: { a: [null] } }],
+    jira: { tickets: [{ key: "X-1", futureTicketField: ["anything"] }] },
+  };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.futureField, { deep: [1, { x: null }] });
+  assert.deepEqual(p.sessions[0].futureSessionField, { a: [null] });
+  assert.deepEqual(p.jira.tickets[0].futureTicketField, ["anything"]);
+});
+
+test("an older agent's payload comes out byte-identical", () => {
+  // The sweep must never ADD a key: a field the record does not carry means
+  // "this agent can't tell you", and inventing "" or 0 for it turns that into a
+  // measurement. Nulls are left alone for the same reason — every client already
+  // reads one as its default.
+  const before = JSON.stringify({
+    device: "old", agentVersion: "0.1", repoUsage: [{ repo: "r" }],
+    sessions: [{ id: "s1", session: { paneBusy: null }, usage: null }],
+    jira: { tickets: [{ key: "X-1", dueDate: null }] },
+  });
+  const p = JSON.parse(before);
+  hub.normalizeRecord(p);
+  assert.equal(JSON.stringify(p), before);
+});
+
+test("the sweep runs AFTER normalizeModelUsage, so a legacy model list survives", () => {
+  // Old agents report `usage.models` as bare model-name STRINGS, which
+  // normalizeModelUsage rewrites into objects. Sweeping first would drop them as
+  // non-objects and silently zero that host's usage page.
+  const p = { device: "h", usage: { models: ["sonnet", "opus"] },
+              repoUsage: [{ repo: "r", usage: { models: ["haiku"] } }] };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.usage.models, [{ model: "sonnet" }, { model: "opus" }]);
+  assert.deepEqual(p.repoUsage[0].usage.models, [{ model: "haiku" }]);
+});
+
+test("the shape table only uses tags the walker knows", () => {
+  // The walker passes an unrecognised tag THROUGH rather than throwing (a throw
+  // on ingest refuses the beat; on the restore path it abandons every record
+  // after it). That makes a typo in the table silent — so it is caught here
+  // instead.
+  const known = new Set(["s", "s?", "b", "b?", "i", "i?", "l", "l?", "d", "d?"]);
+  const seen = new Set();
+  const walk = (spec, where) => {
+    if (typeof spec === "string") {
+      assert.ok(known.has(spec), `unknown spec tag ${JSON.stringify(spec)} at ${where}`);
+      return;
+    }
+    assert.ok(["obj", "list", "map"].includes(spec.kind),
+      `unknown spec kind ${JSON.stringify(spec.kind)} at ${where}`);
+    if (spec.kind === "obj") {
+      if (seen.has(spec)) return;             // shared sub-shapes are reused by reference
+      seen.add(spec);
+      for (const [k, v] of Object.entries(spec.fields)) walk(v, `${where}.${k}`);
+    } else walk(spec.of, `${where}[]`);
+  };
+  for (const [k, v] of Object.entries(hub.AGENT_WIRE_SHAPE)) walk(v, k);
+});
+
+test("every field Android types on the fleet payload is in the shape table", () => {
+  // The durable form of "typing a field on a client and coercing it hub-side are
+  // ONE change": this reads `Models.kt` and walks it, so a field typed there
+  // without an entry here fails the hub's own suite rather than waiting for a
+  // phone to stop signing in. Two blocks are deliberately absent — `limits` and
+  // `localModel` are rebuilt wholesale by their own normalize*.
+  const src = fs.readFileSync(path.join(__dirname, "..", "..", "android", "app", "src",
+    "main", "java", "com", "xerktech", "turma", "model", "Models.kt"), "utf8");
+  // One entry per `data class X(...)`: its fields as {name, type}. Scanned by
+  // matching parens rather than by regex — a constructor body carries its own
+  // `()` (`= UsageBucket()`) and the block classes are written on one line, so
+  // a "up to the next `\n)`" pattern silently mis-parses both.
+  const classes = {};
+  const subclassesOfBlock = [];
+  for (const m of src.matchAll(/data class (\w+)\(/g)) {
+    let depth = 1, i = m.index + m[0].length;
+    for (; i < src.length && depth; i++) {
+      if (src[i] === "(") depth++;
+      else if (src[i] === ")") depth--;
+    }
+    const body = src.slice(m.index + m[0].length, i - 1);
+    classes[m[1]] = [...body.matchAll(/^[ \t]*val (\w+): ([\w<>, ?]+?)\s*=/gm)]
+      .map((f) => ({ name: f[1], type: f[2].trim() }));
+    if (/^\s*:\s*Block\(\)/.test(src.slice(i))) subclassesOfBlock.push(m[1]);
+  }
+  assert.ok(classes.AgentInfo && subclassesOfBlock.length >= 5, "Models.kt did not parse");
+  // A transcript block is polymorphic: the table carries the UNION of every
+  // subclass's fields under one object spec.
+  classes.__Block = [{ name: "t", type: "String" },
+    ...subclassesOfBlock.flatMap((c) => classes[c])];
+
+  const SKIP = new Set([
+    "AgentInfo.limits",      // normalizeLimits rebuilds it
+    "AgentInfo.localModel",  // normalizeLocalModel rebuilds it
+    "AgentInfo.key", "AgentInfo.online", "AgentInfo.terminalOnline",
+    "AgentInfo.lastSeen",    // hub-authored in serializeAgent, never off the wire
+    "__Block.input",         // typed JsonElement? — any shape is legal
+  ]);
+  const scalars = { String: "s", Boolean: "b", Int: "i", Long: "l", Double: "d" };
+  const missing = [];
+  const walk = (className, spec, path) => {
+    for (const f of classes[className] || []) {
+      if (SKIP.has(`${className}.${f.name}`)) continue;
+      const here = `${path}.${f.name}`;
+      const sub = spec && spec.kind === "obj" ? spec.fields[f.name] : undefined;
+      if (!sub) { missing.push(`${here} (${f.type})`); continue; }
+      const list = /^List<(\w+)>\??$/.exec(f.type);
+      const map = /^Map<String, (\w+)>\??$/.exec(f.type);
+      const bare = f.type.replace(/\?$/, "");
+      if (list || map) {
+        const el = (list || map)[1];
+        const inner = (list ? sub.kind === "list" : sub.kind === "map") ? sub.of : null;
+        if (!inner) { missing.push(`${here} (${f.type} is not a ${list ? "list" : "map"} here)`); continue; }
+        if (classes[el] || el === "Block") walk(el === "Block" ? "__Block" : el, inner, here + "[]");
+        else if (inner !== scalars[el]) missing.push(`${here} element (${el} vs ${inner})`);
+      } else if (classes[bare]) {
+        if (sub.kind !== "obj") missing.push(`${here} (${f.type} is not an object here)`);
+        else walk(bare, sub, here);
+      } else if (scalars[bare]) {
+        const want = scalars[bare] + (f.type.endsWith("?") ? "?" : "");
+        if (sub !== want) missing.push(`${here} (${f.type} wants ${want}, table has ${JSON.stringify(sub)})`);
+      }
+    }
+  };
+  walk("AgentInfo", { kind: "obj", fields: hub.AGENT_WIRE_SHAPE }, "AgentInfo");
+  assert.deepEqual(missing, [],
+    "Models.kt types these but the hub does not coerce them — add them to AGENT_WIRE_SHAPE");
+});
+
 test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async () => {
   await request("POST", "/api/heartbeat", {
     body: { device: "lm6", localModel: { available: "yes", contextTokens: 9999999999 } },

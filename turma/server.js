@@ -33,6 +33,10 @@ const archive = require("./archive.js");
 // Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
 // FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
 const push = require("./push.js");
+// The wire-shape coercion (XERK-259). Required, not inlined: the state.json
+// restore below runs at module init and calls it, so its table must already be
+// evaluated — see the header of wire-shape.js.
+const { normalizeWireShapes, AGENT_WIRE_SHAPE } = require("./wire-shape.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
@@ -1855,15 +1859,21 @@ function sanitizeHeartbeat(payload, key) {
  * host silently disappears from that phone.
  */
 function normalizeRecord(a) {
-  // Order is NOT load-bearing, and must not become so: each of these guards its
-  // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
-  // here lands in the restore's silent `catch {}` and abandons every host after
-  // this one, uncoerced, on every boot. Sessions first only because it is the
-  // one that rewrites a shape the others iterate.
+  // Each of these guards its own input shape (`Array.isArray`, not `|| []`),
+  // because a throw anywhere in here lands in the restore's silent `catch {}`
+  // and abandons every host after this one, uncoerced, on every boot.
+  //
+  // The block-specific passes run FIRST and `normalizeWireShapes` LAST, and that
+  // order IS load-bearing: the shape sweep coerces `usage.models` to the objects
+  // Android types, so run before normalizeModelUsage it would DROP an old
+  // agent's bare model-name strings instead of letting that pass rewrite them.
+  // Anything a `normalize*` rebuilds wholesale (`limits`, `localModel`) is
+  // deliberately absent from the shape table rather than covered twice.
   normalizeSessions(a);
   normalizeUsage(a);
   normalizeLimits(a);
   normalizeLocalModel(a);
+  normalizeWireShapes(a);
 }
 
 // The per-SESSION coercions (see normalizeRecord).
@@ -5333,6 +5343,9 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    // The shape table itself, so a test can walk it rather than re-listing what
+    // it covers — a hand-copied list of fields is what drifts (XERK-259).
+    AGENT_WIRE_SHAPE,
 
     queueCommand,
     findSession,

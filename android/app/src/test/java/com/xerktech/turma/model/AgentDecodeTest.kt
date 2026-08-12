@@ -2,6 +2,7 @@ package com.xerktech.turma.model
 
 import kotlinx.serialization.decodeFromString
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -288,5 +289,78 @@ class AgentDecodeTest {
         val plain = TurmaJson.decodeFromString<Block>("""{"t":"tool_use","id":"t2","name":"Bash"}""")
         assertTrue((plain as ToolUseBlock).files.isEmpty())
         assertEquals("", plain.caption)
+    }
+
+    // ---- the shapes the hub MUST coerce (XERK-259) --------------------------
+    //
+    // The client half of the contract `turma/wire-shape.js` holds up. Each of
+    // these was served raw by the hub, and each one is fatal for the WHOLE
+    // fleet — measured on a phone as sign-in itself failing with "Could not
+    // reach the hub — check the URL", because the login probe decodes
+    // /api/agents. They are pinned HERE so the hub's table can never be
+    // "simplified" back past them: if one of these stops throwing, the client
+    // got more tolerant and the note beside the coercion is what needs
+    // updating, not the coercion.
+
+    private fun decodes(host: String): Boolean = try {
+        TurmaJson.decodeFromString<AgentsResponse>("""{"now":1,"agents":[$host]}""")
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    @Test fun `a bad list ELEMENT is as fatal as a bad list`() {
+        val h = """"key":"h","device":"h""""
+        // The four shapes XERK-259 was filed for.
+        assertFalse(decodes("""{$h,"repoUsage":[null]}"""))
+        assertFalse(decodes("""{$h,"repoUsage":["nope"]}"""))
+        // `typeof [] === "object"` — the element shape a careless hub-side
+        // predicate lets straight through.
+        assertFalse(decodes("""{$h,"repoUsage":[[1]]}"""))
+        assertFalse(decodes("""{$h,"repoUsage":[{"repo":{"a":1}}]}"""))
+        // Not a repoUsage quirk: every typed list behaves this way.
+        assertFalse(decodes("""{$h,"sessions":[[1,2]]}"""))
+        assertFalse(decodes("""{$h,"closedSessions":[null]}"""))
+        assertFalse(decodes("""{$h,"repos":[{"name":"r","resumable":["x"]}]}"""))
+        assertFalse(decodes("""{$h,"jira":{"tickets":[{"key":"X-1","labels":[null]}]}}"""))
+    }
+
+    @Test fun `the other shapes the hub coerces are fatal too`() {
+        val h = """"key":"h","device":"h""""
+        assertFalse(decodes("""{$h,"agentVersion":{"a":1}}"""))          // String <- object
+        assertFalse(decodes("""{$h,"github":"nope"}"""))                 // object <- string
+        assertFalse(decodes("""{$h,"uploadMaxBytes":1.5}"""))            // Long <- fraction
+        assertFalse(decodes("""{$h,"capacity":{"maxSessions":99999999999999}}"""))  // Int is 32-bit
+        assertFalse(decodes("""{$h,"claudeAuth":{"present":"yes"}}"""))  // Boolean <- word
+        // A map VALUE has no `coerceInputValues` fallback, unlike a field.
+        assertFalse(decodes("""{$h,"usage":{"days":{"2026-08-12":null}}}"""))
+        // A block whose discriminator is not a string reaches neither a known
+        // block nor the UnknownBlock fallback.
+        assertFalse(decodes(
+            """{$h,"sessions":[{"session":{"tail":[{"blocks":[{"t":{"a":1}}]}]}}]}"""))
+        // ...while an unknown or absent `t` is fine, which is why the hub can
+        // coerce a bad one to "" instead of dropping the block.
+        assertTrue(decodes(
+            """{$h,"sessions":[{"session":{"tail":[{"blocks":[{"t":""},{"text":"hi"}]}]}}]}"""))
+    }
+
+    @Test fun `the record the hub now serves for those inputs decodes`() {
+        // Exactly what `normalizeRecord` emits for the poisoned beat above (the
+        // hub suite asserts the same values from the other side), plus a good
+        // host beside it — the point being that neither disappears.
+        val poisoned = """
+            { "key": "bad", "device": "", "online": true,
+              "repoUsage": [ { "repo": "" }, { "repo": "good", "remoteKey": "gh:o/r" } ],
+              "sessions": [ { "id": "s1", "ttydPort": 0,
+                              "work": { "pushed": null, "aheadOfBase": null } } ],
+              "capacity": { "maxSessions": 0 }, "github": null,
+              "usage": { "days": { } } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(
+            """{"now":1,"agents":[$plainHost,$poisoned]}""")
+        assertEquals(listOf("mxh-t16", "bad"), resp.agents.map { it.key })
+        assertEquals(2, resp.agents[1].repoUsage.size)
+        assertEquals("good", resp.agents[1].repoUsage[1].repo)
+        assertNull(resp.agents[1].sessions[0].work!!.pushed)
     }
 }
