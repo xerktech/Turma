@@ -1584,6 +1584,19 @@ test("http: a heartbeat whose device is not a plain host name is refused, not si
     const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
     assert.equal(res.status, 400, `${JSON.stringify(device)} must be refused`);
   }
+  // A URL dot segment is collapsed by the parser resolving /api/agents/<host>/...,
+  // so such a host showed online while every route against it 404'd -- including
+  // the DELETE that would remove it, leaving a card stuck for PRUNE_AFTER_MS
+  // (XERK-269). Agents no longer send these, but an un-upgraded one still can.
+  for (const device of [".", ".."]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 400, `${device} must be refused`);
+  }
+  // Names that merely CONTAIN dots are ordinary host names and must still beat.
+  for (const device of ["...", ".hidden", "a.b", "HOST.local."]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 200, `${device} must be accepted`);
+  }
   // The prototype must be intact: a route reading agents[x].commands would
   // otherwise find one on every unknown host.
   const probe = await request("POST", "/api/agents/never-seen/sessions/x/kill", { headers: userHeaders });

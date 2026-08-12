@@ -228,6 +228,12 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   `_entry_blocks`/`entryBlocks`, `_entry_text`, `transcript_tail`, `_busy_from_capture`/
   `paneShowsBusy`, `_fold_queue_op`/`foldQueueOp`, `_send_user_file_detail`/`sendUserFileDetail`.
   Both live in `agent/`; parity-tested in `tunnel-agent.test.js`.
+  - **`device_name`/`deviceName` + `_usable_hostname`/`usableHostname` are on that list too.** They
+    must resolve the SAME name: `openChannel` keys `controlChannels` by it, so a tunnel and a
+    manager under different names is a host whose commands work while its terminal, live tail and
+    heartbeat poke are dead — and a ghost card `DELETE` cannot reach. `entrypoint.sh` exports an
+    operator-set `DEVICE_NAME` to both processes unvalidated, so an env-path divergence is the one
+    that bites. Tests: `TestDeviceName`, `usableHostname`/`deviceName` in `tunnel-agent.test.js`.
 - **The heartbeat is the wire contract** between `hub-agent.py` and `turma/server.js` (and through
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,

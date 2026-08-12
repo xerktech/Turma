@@ -3843,8 +3843,15 @@ const server = http.createServer(async (req, res) => {
       // silently discarded (and replaced the registry's prototype), and an
       // object key landed as "[object Object]" (XERK-235). Refuse it loudly —
       // a beat the hub throws away must never report success.
+      // "." and ".." are refused for the same reason, one layer up: they survive
+      // percent-encoding untouched and the URL parser resolving
+      // /api/agents/<host>/... then collapses the segment, so such a host shows
+      // online while every route against it 404s and even DELETE can't remove it
+      // (XERK-269). The agent no longer reports them, but an un-upgraded one in a
+      // mixed fleet still can, and a loud 400 in its log beats a 7-day ghost.
       if (typeof key !== "string" || key.length > 200 ||
-          key === "__proto__" || key === "constructor" || key === "prototype") {
+          key === "__proto__" || key === "constructor" || key === "prototype" ||
+          key === "." || key === "..") {
         return json(res, 400, { error: "device must be a plain host name" });
       }
       const prev = agents[key] || {};

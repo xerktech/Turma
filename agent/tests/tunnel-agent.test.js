@@ -1630,3 +1630,49 @@ test("watch -> transcript -> frame: the turn frame carries the live agents", asy
     mod.__setControlSink(null);
   }
 });
+
+// --- device name: parity with hub-agent.py's _usable_hostname ---------------
+// The two processes must resolve the SAME name: openChannel() keys
+// controlChannels by it, so a tunnel registered under one name and a manager
+// under another is a host whose commands work but whose terminal and live tail
+// are dead, plus a ghost card no DELETE can reach (XERK-269).
+
+test("usableHostname refuses URL dot segments", () => {
+  const { usableHostname } = require("../tunnel-agent.js");
+  for (const bad of [".", "..", " . ", "\t..\n"]) {
+    assert.equal(usableHostname(bad), "", `refused ${JSON.stringify(bad)}`);
+  }
+  // Only the bare segments collapse; these merely contain dots.
+  for (const good of ["...", ".hidden", "a.b", "HOST.local.", "..host"]) {
+    assert.equal(usableHostname(good), good, `kept ${JSON.stringify(good)}`);
+  }
+  // The pre-existing rejects still hold.
+  for (const bad of ["", "  ", "localhost", "LOCALHOST", "docker-desktop",
+    "unknown-device", "fe0e38df73b4"]) {
+    assert.equal(usableHostname(bad), "", `refused ${JSON.stringify(bad)}`);
+  }
+  assert.equal(usableHostname("truenas"), "truenas");
+});
+
+test("deviceName refuses a dot-segment DEVICE_NAME override", () => {
+  const { deviceName } = require("../tunnel-agent.js");
+  const saved = { d: process.env.DEVICE_NAME, c: process.env.COMPUTERNAME };
+  try {
+    delete process.env.COMPUTERNAME;
+    for (const bad of [".", ".."]) {
+      process.env.DEVICE_NAME = bad;
+      const got = deviceName();
+      // Whatever source it falls through to, it must not be the dot segment —
+      // entrypoint.sh exports an operator-set DEVICE_NAME to both processes
+      // unvalidated, so this is the path that would split the identity.
+      assert.notEqual(got, bad, `fell through instead of returning ${bad}`);
+      assert.ok(got && got.length, "resolved to some usable name");
+    }
+    process.env.DEVICE_NAME = "truenas";
+    assert.equal(deviceName(), "truenas", "an ordinary override still wins");
+  } finally {
+    if (saved.d === undefined) delete process.env.DEVICE_NAME;
+    else process.env.DEVICE_NAME = saved.d;
+    if (saved.c !== undefined) process.env.COMPUTERNAME = saved.c;
+  }
+});
