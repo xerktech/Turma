@@ -2029,9 +2029,9 @@ AZDO_PR_URL_ID_RE = re.compile(r"/pullrequest/(\d+)", re.IGNORECASE)
 # whose PRs are opened by its own tool still gets chips.
 PR_CREATE_CMDS = os.environ.get("TURMA_PR_CREATE_CMDS", "")
 
-# A registered entry shorter than this is ignored: a one- or two-character
-# token matches half the commands a session runs, and attribution failing OPEN
-# hangs other people's PRs on this session's card.
+# An entry whose longest word is shorter than this is ignored: a one- or
+# two-character token matches half the commands a session runs, and attribution
+# failing OPEN hangs other people's PRs on this session's card.
 PR_CREATE_CMD_MIN = 3
 
 # The built-in creating commands, as (word, ...) prefixes. A wrapper is named
@@ -2072,7 +2072,9 @@ def _pr_create_pattern(extra=""):
     pats.append(r"\bmerge_request\.create\b")   # a push OPTION, not a command
     for entry in (extra or "").split(","):
         words = entry.split()
-        if not words or len(" ".join(words)) < PR_CREATE_CMD_MIN:
+        # The LONGEST word, not the joined length: `a b` is three characters
+        # but still two one-character tokens, and would match `cat a b`.
+        if not words or max(len(w) for w in words) < PR_CREATE_CMD_MIN:
             continue
         pats.append(_pr_create_alt(words))
     return "|".join(pats)
@@ -3450,9 +3452,11 @@ def _azdo_created_pr_url(text):
     if not isinstance(repo, dict) or not isinstance(pr_id, int):
         return None
     web = str(repo.get("webUrl") or repo.get("remoteUrl") or "").strip()
-    # `remoteUrl` can carry a `user@` prefix on some collections; the link the
-    # chip points at must not.
-    web = re.sub(r"^(https://)[^/@]+@", r"\1", web).rstrip("/")
+    # ADO's `remoteUrl` carries an `<org>@` prefix, and the az extension's SDK
+    # has no `webUrl` field at all, so this strip is on the ONLY path a vendor
+    # create can take. It must know both schemes, or a plain-http on-prem
+    # collection composes nothing and the chip is dropped in silence.
+    web = re.sub(r"^(https?://)[^/@]+@", r"\1", web, flags=re.IGNORECASE).rstrip("/")
     if not AZDO_REPO_WEB_RE.match(web):
         return None
     return f"{web}/pullrequest/{pr_id}"

@@ -6796,6 +6796,10 @@ class TestPrCreatePattern(unittest.TestCase):
             self.assertEqual(ha._pr_create_pattern(extra),
                              ha._pr_create_pattern(), extra)
         self.assertIsNone(self._re("a").search("ls -a /tmp"))
+        # Two one-character words are three characters JOINED, and still match
+        # half of what a session runs — the longest word is what counts.
+        self.assertEqual(ha._pr_create_pattern("a b"), ha._pr_create_pattern())
+        self.assertIsNone(self._re("a b").search("cat a b"))
         # …but a real short wrapper name still registers.
         self.assertTrue(self._re("prc").search("prc --title x"))
 
@@ -6823,6 +6827,17 @@ class TestAzdoCreatedPrUrl(unittest.TestCase):
         self.assertEqual(
             ha._azdo_created_pr_url(out),
             "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12")
+
+    def test_an_on_prem_http_remote_url_composes_too(self):
+        """`remoteUrl` is the ONLY field the az extension's SDK can supply (it
+        has no webUrl), and it carries the `<org>@` prefix — so a plain-http
+        on-prem collection composes nothing unless the strip knows http."""
+        out = self._out(repository={
+            "name": "app",
+            "remoteUrl": "http://Collection@tfs.corp.local:8080/tfs/C/P/_git/app"})
+        self.assertEqual(
+            ha._azdo_created_pr_url(out),
+            "http://tfs.corp.local:8080/tfs/C/P/_git/app/pullrequest/12")
 
     def test_finds_the_object_past_a_cli_banner(self):
         noisy = "WARNING: extension is in preview\n" + self._out()

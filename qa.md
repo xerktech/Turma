@@ -799,3 +799,19 @@ From that host's own probes, recorded in the archive:
 - `TTYD_PORT_BASE`, `~/.turma` and the real tracker env leak into any agent you
   boot here — see §1. For PR work, patch `ha.AZDO_URL`/`ha.AZDO_TOKEN` on the
   module rather than exporting them, so nothing can reach a live org.
+
+### 8.6 Two traps in the ADO URL handling itself
+
+- **Scheme assumptions hide on the compose path.** `_azdo_created_pr_url`
+  strips the `<org>@` prefix ADO puts on `remoteUrl` — and `remoteUrl` is the
+  ONLY field a vendor create can supply, because the pinned `azure-devops`
+  extension's SDK (`azext_devops/devops_sdk/v5_0/git/models.py`, `GitRepository`)
+  has no `web_url` at all. A strip that knows only `https://` therefore drops
+  every plain-http on-prem create in silence. When you widen a URL regex to
+  `https?`, grep the same area for other hardcoded `https://`.
+- **A regex can be widened without being tested.** `AZDO_REPO_WEB_RE`'s http
+  half survived a mutation (reverting it to https-only broke nothing) because
+  the only http test drove the WRAPPER path, where the link is already in the
+  output and that regex is never consulted. Mutation-test each widened pattern
+  separately; a test that exercises the feature is not necessarily a test that
+  exercises the line.

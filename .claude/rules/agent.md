@@ -274,8 +274,9 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     chipless because its tool isn't a vendor's.
   - `_pr_create_pattern` treats every command — built-in and configured alike — as literal escaped
     words, anchored against `-` (and `.` trailing) so one can't match the tail of `run-mkpr` or a
-    `pr-create.md` filename. An entry under `PR_CREATE_CMD_MIN` chars is **ignored**: attribution
-    must not fail OPEN, and a 1–2 char token matches half the commands a session runs.
+    `pr-create.md` filename. An entry whose longest word is under `PR_CREATE_CMD_MIN` chars is
+    **ignored**: attribution must not fail OPEN, and a 1–2 char token matches half the commands a
+    session runs (measuring the JOINED length lets `a b` through).
   - The ADO URL regexes take **http as well as https** — an on-prem collection is routinely served
     over plain http on the LAN, and a scheme-only mismatch drops the chip in silence.
   - Cost: a PR opened another way (subagent, MCP tool, web UI) gets no chip. **Widen only by
