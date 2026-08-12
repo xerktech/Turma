@@ -233,18 +233,37 @@ CLAUDE_AUTH_WARN_MS = int(
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
+def _byte_ceiling(raw, fallback):
+    """A byte ceiling read from the environment, mirroring byteCeiling() in
+    turma/archive.js — the two read the SAME variable, so they must agree that
+    an explicit 0 disables the ceiling and that a value must be entirely digits
+    ("16MiB" is a typo to reject, not the number 16).
+
+    Deliberately total, unlike the bare int() the other tunables here use: this
+    runs at import, so a malformed value would stop hub-agent.py from loading at
+    all and take every session on the host down with it."""
+    try:
+        s = str(raw if raw is not None else "").strip()
+    except Exception:
+        return fallback
+    return int(s) if s.isdigit() else fallback
+
+
 # How many bytes of SendUserFile payload one transcript may put in the archive
 # before the rest of it ships as name-only chips (XERK-267). The previews are
 # bounded per tool call (SEND_FILE_MAX_FILES x SEND_FILE_MAX_BYTES) but unbounded
 # relative to the transcript they came from — a screenshot-heavy conversation
-# archives orders of magnitude larger than the bytes it records.
+# archives orders of magnitude larger than the bytes it records. 0 disables it.
 #
 # The HUB owns the real ceiling (turma/archive.js ARCHIVE_TRANSCRIPT_MAX, same
-# default) and applies it whatever an agent sends; this counter exists so a
-# first-time offender's payloads never reach the wire at all, and so counts only
-# what shedding could actually remove — prose isn't sheddable, so charging a long
-# but ordinary conversation for its length would degrade it for nothing.
-ARCHIVE_PAYLOAD_MAX = int(os.environ.get("ARCHIVE_TRANSCRIPT_MAX_BYTES", str(1 << 24)))
+# variable and default) and applies it whatever an agent sends; this counter
+# exists so a first-time offender's payloads never reach the wire at all. It
+# counts only what shedding could actually remove — prose isn't sheddable, so
+# charging a long but ordinary conversation for its length would degrade it for
+# nothing — and it counts PER SYNC PASS, since it starts over each beat; the
+# hub's verdict is what makes the decision stick across passes.
+ARCHIVE_PAYLOAD_MAX = _byte_ceiling(
+    os.environ.get("ARCHIVE_TRANSCRIPT_MAX_BYTES"), 1 << 24)
 # The compressed transcript bundle a session migration ships through the hub
 # (source host -> hub -> target host). A single gzipped POST, capped so a
 # pathologically long conversation fails loudly rather than OOM-ing the hub's
@@ -12227,7 +12246,7 @@ class SessionManager:
                     # has spent its archive budget on them (XERK-267).
                     if shed:
                         _shed_block_payloads(blocks)
-                    else:
+                    elif ARCHIVE_PAYLOAD_MAX > 0:   # 0 = ceiling disabled
                         payload_sent += _block_payload_bytes(blocks)
                         if payload_sent >= ARCHIVE_PAYLOAD_MAX:
                             shed = True

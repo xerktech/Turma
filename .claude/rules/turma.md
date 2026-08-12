@@ -195,6 +195,15 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   - Budget spend is the `archiveBytes` column, **re-derived from the files by `rebuildIndex`** —
     the index is disposable, so reading it from a sidecar would drift (and every pre-XERK-267
     sidecar has no such field).
+  - **Deleting archives is the way out of a full store, so the spend must give those bytes back**
+    (`forgetMissingTranscript` / `reconcileMissingFiles`): a column that only grows leaves the
+    ceiling measured against files that no longer exist, with no exit short of deleting
+    `index.db`. It runs on **both** full paths — `ingestChunk` AND `archiveLimits` — because a
+    `full` verdict stops the agent pushing, so ingest alone would never run again to notice.
+  - Dropping that row also **repairs the cursor**: a deleted file with its row kept made the next
+    delta append onto a hole, leaving a truncated conversation behind a `msgCount` that claimed
+    otherwise. `ingestChunk` re-checks the file on every chunk, so the transcript simply
+    re-archives from the start.
 - Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.
 
 ## `POST /api/trigger` — external automation

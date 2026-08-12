@@ -11245,6 +11245,30 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         # Idempotent: a second pass finds nothing left to drop.
         self.assertEqual(ha._shed_block_payloads(blocks), 0)
 
+    def test_byte_ceiling_agrees_with_the_hub_and_never_raises(self):
+        # Both sides read the SAME env var, so a disagreement here means one of
+        # them does the opposite of what the operator asked. And this runs at
+        # IMPORT: raising would stop hub-agent.py loading and take every session
+        # on the host down over a typo'd tunable.
+        self.assertEqual(ha._byte_ceiling("0", 999), 0)        # 0 disables, not "unset"
+        self.assertEqual(ha._byte_ceiling("16MiB", 999), 999)  # a typo, not 16
+        self.assertEqual(ha._byte_ceiling("-5", 999), 999)
+        self.assertEqual(ha._byte_ceiling("", 999), 999)
+        self.assertEqual(ha._byte_ceiling(None, 999), 999)
+        self.assertEqual(ha._byte_ceiling(" 1048576 ", 999), 1048576)
+
+    def test_a_disabled_ceiling_keeps_every_preview(self):
+        # 0 means "no ceiling" on the hub, so it must not mean "shed everything"
+        # here — that inversion would silently strip previews fleet-wide.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [self._delivery("a1", self._png("a.png", 4096))])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        with mock.patch.object(ha, "ARCHIVE_PAYLOAD_MAX", 0):
+            f = self._files_of(self._push(sm)[0])[0]
+        self.assertEqual(f["kind"], "image")
+
     def test_an_ordinary_delivery_still_archives_with_its_preview(self):
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/aaa"

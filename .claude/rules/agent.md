@@ -424,8 +424,11 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   heartbeat reply are the hub's verdict (`turma/archive.js`), which the agent applies to keep the
   bytes off the wire and to skip a pass at a full store; the hub re-applies both itself, since an
   agent too old to read either flag pushes regardless. Counting differs on purpose: the hub spends
-  STORED bytes, the agent only sheddable PAYLOAD bytes — charging a long but ordinary conversation
-  for its prose would degrade it for nothing. Tests: `TestArchivePayloadBudget`.
+  STORED bytes and the agent only sheddable PAYLOAD bytes (charging a long but ordinary conversation
+  for its prose would degrade it for nothing), and the agent's counter is **per sync pass**, since
+  it restarts each beat — only the hub's verdict makes a shed stick across passes. Both read the
+  same `ARCHIVE_TRANSCRIPT_MAX_BYTES`, so `_byte_ceiling` must agree with `byteCeiling` that 0
+  disables and that a non-numeric value is a typo to reject. Tests: `TestArchivePayloadBudget`.
 - A refused delta comes back as **the hub's real cursor plus a flag, never an error status** — the
   agent must read it as no forward progress and drop it, not as a chunk to re-send forever
   (XERK-255).

@@ -39,13 +39,20 @@ const SCHEMA_VERSION = 3;
 // readable back as a JS number. See the cursor guard in appendDelta.
 const MAX_TRANSCRIPT_BYTES = 1024 ** 4;
 
-// One of the two ceilings below, read from the environment. An explicit 0 turns
-// that ceiling OFF and is honoured as such — `parseInt(x) || default` would read
-// it as "unset" and quietly restore the default, which is the opposite answer.
-// Anything unparseable or negative falls back.
+// One of the two ceilings below, read from the environment. Two rules, both of
+// which a bare parseInt gets wrong in a damaging direction:
+//   - an explicit 0 turns that ceiling OFF and is honoured as such, where
+//     `parseInt(x) || fallback` reads it as "unset" and restores the default;
+//   - a value must be ENTIRELY digits, where parseInt("16MiB") is 16 — a
+//     plausible operator typo that would otherwise set a 16-BYTE ceiling and
+//     shed every payload in the store.
+// Anything else falls back to the default. Mirrored by _byte_ceiling in
+// hub-agent.py, which must agree on both rules (XERK-267).
 function byteCeiling(raw, fallback) {
-  const n = parseInt(raw == null ? "" : raw, 10);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
+  const s = String(raw == null ? "" : raw).trim();
+  if (!/^\d+$/.test(s)) return fallback;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : fallback;
 }
 
 // Per-transcript archive budget (XERK-267). What we store is the agent's
@@ -58,8 +65,15 @@ function byteCeiling(raw, fallback) {
 // So an ordinary session keeps full fidelity, and only a transcript that crosses
 // this ceiling degrades — its file payloads shed to the same name-only chip the
 // live chat already shows for an unreadable or oversized delivery, for the REST
-// of that transcript. The largest archived .jsonl on the reference host is 1.2 MB,
-// so this leaves better than a 10x margin over anything real.
+// of that transcript.
+//
+// Sized against the RAW transcripts on the reference host, not against what is
+// already archived there: the biggest stored .jsonl is ~1.2 MB, but that is an
+// artefact of the 1 MiB ingest body cap (XERK-255) truncating exactly the large
+// sessions, so it measures the transport rather than the sessions. Re-running
+// _entry_blocks over the 12 largest real transcripts (11.0 MB down to 3.8 MB
+// raw) encodes them at 0.07x-0.31x, a 2.6 MB worst case — so this ceiling sits
+// ~6x above the largest real session and no real conversation reaches it.
 const ARCHIVE_TRANSCRIPT_MAX = byteCeiling(
   process.env.ARCHIVE_TRANSCRIPT_MAX_BYTES, 16 * 1024 * 1024);
 // Whole-store ceiling. ARCHIVE_DIR shares its volume with the hub's state.json,
@@ -195,12 +209,50 @@ function writeSidecar(metaPath, obj) {
   fs.renameSync(tmp, metaPath);
 }
 
-// Bytes of .jsonl the whole store holds, summed over the index. The index is
-// disposable but self-heals from the files (rebuildIndex re-stats each one), so
-// this stays true across a lost DB rather than drifting quietly upward.
+// Bytes of .jsonl the whole store holds, summed over the index.
 function totalArchiveBytes() {
   const r = db.prepare("SELECT SUM(archiveBytes) AS n FROM sessions").get();
   return (r && r.n) || 0;
+}
+
+// Forget a transcript whose organized file is no longer on disk: its row, its
+// budget spend and its FTS entries. Returns true if anything was dropped.
+//
+// The FILES are the source of truth here, not the index — so deleting one has
+// to actually give its bytes back. Without this, `archiveBytes` only ever grows
+// and the operator's obvious remedy for a full store (delete some archives)
+// changes nothing, leaving the ceiling measured against bytes that no longer
+// exist and no way out short of deleting index.db.
+//
+// It also repairs the cursor: an agent still holding that transcript re-offers
+// it, sees have=0, and re-pushes from the start — where a kept cursor made the
+// hub accept the NEXT delta as if the earlier ones were still stored, silently
+// leaving a truncated conversation behind a msgCount that claimed otherwise.
+function forgetMissingTranscript(transcriptId, relPath) {
+  if (!relPath || fs.existsSync(filePaths(relPath).jsonl)) return false;
+  tx(() => {
+    db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(transcriptId);
+    db.prepare("DELETE FROM sessions WHERE transcriptId=?").run(transcriptId);
+  });
+  console.error(`archive: ${transcriptId}'s file is gone (${relPath}); ` +
+    `dropped its index row, so it re-archives from the start`);
+  return true;
+}
+
+// Sweep every indexed transcript for a file that has since been deleted. Only
+// worth its cost on the full-store path, where it is the difference between a
+// recoverable ceiling and a wedged one — so it is rate-limited rather than run
+// per chunk.
+let lastReconcileAt = 0;
+function reconcileMissingFiles() {
+  const now = Date.now();
+  if (now - lastReconcileAt < 60 * 1000) return 0;
+  lastReconcileAt = now;
+  let dropped = 0;
+  for (const row of db.prepare("SELECT transcriptId, filePath FROM sessions").all()) {
+    if (forgetMissingTranscript(row.transcriptId, row.filePath)) dropped++;
+  }
+  return dropped;
 }
 
 // Drop the SendUserFile payloads embedded on an entry's blocks — the base64
@@ -219,7 +271,7 @@ function shedFilePayloads(entry) {
       if (!f || typeof f !== "object") continue;
       for (const key of ["src", "html"]) {
         if (typeof f[key] !== "string" || !f[key]) continue;
-        dropped += f[key].length;
+        dropped += Buffer.byteLength(f[key]);   // bytes, not UTF-16 units
         delete f[key];
         f.kind = "file";
         f.shed = true;
@@ -251,17 +303,28 @@ function warnArchiveFull(total) {
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
   openDb();
   meta = meta || {};
-  const row = db.prepare(
+  let row = db.prepare(
     "SELECT bytesStored, archiveBytes, filePath FROM sessions WHERE transcriptId=?"
   ).get(transcriptId);
+  // Someone deleted this transcript's file out from under the index. Forget it
+  // and take the push as a fresh one rather than appending onto a hole.
+  if (row && row.bytesStored > 0 && forgetMissingTranscript(transcriptId, row.filePath)) {
+    row = undefined;
+  }
   const have = row ? row.bytesStored : 0;
   // Store full: hand back the cursor we already hold and store nothing. Not an
   // error status — the agent must read this as "no progress" and move on, never
   // as a chunk to retry (XERK-267).
-  const total = totalArchiveBytes();
-  if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) {
-    warnArchiveFull(total);
-    return { bytesStored: have, full: true };
+  if (ARCHIVE_TOTAL_MAX && totalArchiveBytes() >= ARCHIVE_TOTAL_MAX) {
+    // Deleted archives are the way out of a full store, so give them back
+    // before refusing — else the ceiling is measured against bytes that are no
+    // longer there and no amount of deleting reopens it.
+    reconcileMissingFiles();
+    const total = totalArchiveBytes();
+    if (total >= ARCHIVE_TOTAL_MAX) {
+      warnArchiveFull(total);
+      return { bytesStored: have, full: true };
+    }
   }
   if (Number(startOffset) !== have) return { bytesStored: have };
   // The cursor only ever moves forward. Without this an endOffset BELOW
@@ -414,8 +477,16 @@ function archiveLimits(ids) {
     ).all(ARCHIVE_TRANSCRIPT_MAX).map((r) => r.transcriptId));
     for (const id of list) if (over.has(id)) shed.push(id);
   }
-  const total = totalArchiveBytes();
-  return { shed, full: !!(ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) };
+  let full = !!(ARCHIVE_TOTAL_MAX && totalArchiveBytes() >= ARCHIVE_TOTAL_MAX);
+  if (full) {
+    // Reconcile HERE too, not only in ingestChunk: a `full` verdict makes the
+    // agent skip the push entirely, so ingest would never run again to notice
+    // that the operator has since deleted archives — the store would stay full
+    // forever on the strength of files that no longer exist.
+    reconcileMissingFiles();
+    full = totalArchiveBytes() >= ARCHIVE_TOTAL_MAX;
+  }
+  return { shed, full };
 }
 
 // ---- query ------------------------------------------------------------------
@@ -583,7 +654,7 @@ function rebuildIndex() {
 
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
-  slugify, archiveRelPath, ftsQuery,
+  slugify, archiveRelPath, ftsQuery, byteCeiling,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits,
   searchArchive, listArchive, getTranscript,
