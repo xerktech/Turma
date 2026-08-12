@@ -225,6 +225,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
+  - **A heartbeat can be answered 503, and that means "not now", not "wrong"** (XERK-258): the hub
+    holds a global in-flight byte budget across concurrent bodies, so a beat can be refused because
+    another host's is mid-flight. An agent must keep its staged results and re-send on its next
+    beat — never treat it as delivered, and never resize the payload against it.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 

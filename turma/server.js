@@ -23,6 +23,7 @@
 
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { Duplex } = require("stream");
@@ -1757,12 +1758,124 @@ class BodyTooLarge extends Error {
   }
 }
 
+// ---- Global in-flight body budget (XERK-258) --------------------------------
+//
+// Every per-request cap above bounds ONE body; none of them bound the SUM. Two
+// concurrent heartbeats, each comfortably under HEARTBEAT_MAX, together exceed
+// the whole container's memory limit and the kernel OOM-kills the hub — which,
+// under `restart: unless-stopped`, is a repeating fleet-wide outage rather than
+// one crash. All agents share one TURMA_AGENT_TOKEN, so a single buggy or
+// compromised host can trigger it. Measured at the deployed 256 MiB limit:
+// one ~30 MiB beat survives, two kill the container (and did on main too).
+//
+// So bodies are charged against ONE global byte budget, held from the first
+// chunk until the response closes — the parse and the handling that follow are
+// where the bytes actually multiply, so releasing at end-of-read would bound
+// the wrong window.
+
+// Read the container's own memory ceiling rather than guessing: the budget must
+// track what the deployment actually gives us (cgroup v2 first, then v1).
+// "max" / an implausibly huge v1 sentinel both mean unlimited -> fall back to
+// the machine's RAM.
+function containerMemoryLimit() {
+  for (const p of ["/sys/fs/cgroup/memory.max",
+                   "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
+    try {
+      const raw = fs.readFileSync(p, "utf8").trim();
+      if (raw === "max") continue;
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0 && n < Number.MAX_SAFE_INTEGER / 2) return n;
+    } catch {}
+  }
+  return os.totalmem();
+}
+
+// What fraction of that ceiling may be committed to request bodies at once.
+// The rest is the hub's own working set: the agent records, the /api/agents
+// cache, the archive DB and V8's headroom for the parse each body pays for.
+const BODY_INFLIGHT_FRACTION = 8;
+
+// The floor is HEARTBEAT_MAX, and that is load-bearing: a budget below the
+// transport cap would refuse a legitimate large beat FOREVER, and the agent
+// holds its staged results until a POST succeeds — the XERK-235 wedge, where a
+// host stays offline re-sending the same body. A single request is therefore
+// always admissible on its own; the budget only ever bounds CONCURRENCY.
+const BODY_INFLIGHT_MAX = Number(process.env.BODY_INFLIGHT_MAX) ||
+  Math.max(HEARTBEAT_MAX, Math.floor(containerMemoryLimit() / BODY_INFLIGHT_FRACTION));
+
+// Bytes of request body currently held across every budgeted in-flight request.
+let inflightBodyBytes = 0;
+const inflightBodyBytesNow = () => inflightBodyBytes;
+
+// Thrown when admitting more of this body would put the hub over the budget.
+// Distinct from BodyTooLarge: the body is a fine size, the MOMENT is wrong, so
+// the answer is a retryable 503 rather than a 413 the caller should give up on.
+class BodyOverBudget extends Error {
+  constructor(held) {
+    super("hub is busy — too many large request bodies in flight");
+    this.overBudget = true;
+    this.held = held;
+    this.limit = BODY_INFLIGHT_MAX;
+  }
+}
+
+// One request's claim on the budget. `charge` returns false when the request
+// must be refused; `release` is idempotent and wired to the response closing,
+// which node fires on every path (normal end, client abort, socket error).
+//
+// The sole-request exemption: a request that is the ONLY one holding bytes may
+// exceed the budget, up to its own per-route cap. That is exactly the load the
+// deployment already survives, and it is what keeps the floor above from being
+// the only thing standing between a big beat and a permanent refusal.
+function bodyBudgetTicket(res) {
+  const t = { charged: 0, released: false };
+  t.release = () => {
+    if (t.released) return;
+    t.released = true;
+    inflightBodyBytes -= t.charged;
+    t.charged = 0;
+  };
+  // `force` charges regardless — for a body that must be ACCOUNTED for even
+  // though it may not be refused, so it still displaces what can be.
+  t.charge = (n, force) => {
+    const others = inflightBodyBytes - t.charged;
+    if (!force && others > 0 && inflightBodyBytes + n > BODY_INFLIGHT_MAX) return false;
+    inflightBodyBytes += n;
+    t.charged += n;
+    return true;
+  };
+  if (res) res.on("close", t.release);
+  return t;
+}
+
+// One log line per refusal, rate-limited per host: a fleet that keeps crossing
+// the budget should be visible without becoming the log.
+const budgetRefusedAt = new Map();
+const BUDGET_LOG_EVERY_MS = 30 * 1000;
+function logBudgetRefusal(who, held) {
+  const now = Date.now();
+  if (now - (budgetRefusedAt.get(who) || 0) < BUDGET_LOG_EVERY_MS) return;
+  budgetRefusedAt.set(who, now);
+  if (budgetRefusedAt.size > 500) budgetRefusedAt.clear();
+  console.error(
+    `refused body from ${who}: ${held} bytes already in flight, ` +
+      `budget ${BODY_INFLIGHT_MAX} (XERK-258)`
+  );
+}
+
 // Collect a request body as a string. Past `cap` it keeps DRAINING for a while
 // rather than destroying the socket: draining is what lets the route write a
 // 413 on the same connection, where a mid-body destroy reaches the client as a
 // socket hang-up with no status to branch on. Same rule readRawBody follows.
-function readBody(req, cap = BODY_MAX) {
+//
+// Pass `res` to charge the body against the global in-flight budget (XERK-258).
+// Only the routes whose cap exceeds BODY_MAX do: filling a 32 MiB budget out of
+// 1 MiB bodies takes 32 concurrent user-authed requests, where the heartbeat
+// needs two, and threading `res` through thirty small call sites to bound that
+// would cost more than it buys.
+function readBody(req, cap = BODY_MAX, res = null) {
   return new Promise((resolve, reject) => {
+    const budget = res ? bodyBudgetTicket(res) : null;
     let data = "";
     let len = 0;
     let over = false;
@@ -1775,13 +1888,26 @@ function readBody(req, cap = BODY_MAX) {
       if (len > cap) {
         over = true;
         data = ""; // release it — it is not going to be used
+        if (budget) budget.release();
         reject(new BodyTooLarge(cap));
+        return;
+      }
+      if (budget && !budget.charge(c.length)) {
+        over = true;
+        // Dropped, but we KEEP DRAINING to the same limit an oversized body
+        // does: that is what lets the 503 land as a status the agent can log
+        // rather than a socket reset it can only guess at (XERK-235).
+        data = "";
+        budget.release();
+        const held = inflightBodyBytes; // what OTHER requests are holding
+        logBudgetRefusal(`${req.socket && req.socket.remoteAddress} ${req.url}`, held);
+        reject(new BodyOverBudget(held));
         return;
       }
       data += c;
     });
     req.on("end", () => { if (!over) resolve(data); });
-    req.on("error", reject);
+    req.on("error", (e) => { if (budget) budget.release(); reject(e); });
   });
 }
 
@@ -1797,8 +1923,21 @@ const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
 // past `cap` so a huge or runaway upload can't exhaust the hub's memory: the
 // bytes already held are dropped on the spot, and what follows is discarded
 // rather than buffered.
-function readRawBody(req, cap) {
+//
+// `res` charges the body against the global in-flight budget (XERK-258), and
+// `refusable` says whether crossing it may REFUSE this request or only account
+// for it. The migration relay is charged but never refused: the source agent
+// uploads its transcript bundle best-effort with no retry (`_migration_upload`),
+// and agents older than this hub never will, so a 503 there strands the
+// migration. It still has to occupy the budget, though, or a beat would be
+// admitted alongside 65 MiB of bundle.
+//   Residual, deliberately left to XERK-263: a forced body can ride on top of a
+//   full budget, and the relay then RETAINS the whole bundle in `m.blob` until
+//   the target downloads it — so the fix is to spool it to disk, not to refuse
+//   it here.
+function readRawBody(req, cap, res = null, refusable = true) {
   return new Promise((resolve, reject) => {
+    const budget = res ? bodyBudgetTicket(res) : null;
     let chunks = [];
     let len = 0;
     let over = false;
@@ -1813,13 +1952,23 @@ function readRawBody(req, cap) {
       if (len > cap) {
         over = true;
         chunks = []; // release what we'd buffered — it is not going to be used
+        if (budget) budget.release();
         reject(new Error("body too large"));
+        return;
+      }
+      if (budget && !budget.charge(c.length, !refusable)) {
+        over = true;
+        chunks = []; // dropped, but still drained — see readBody
+        budget.release();
+        const held = inflightBodyBytes; // what OTHER requests are holding
+        logBudgetRefusal(`${req.socket && req.socket.remoteAddress} ${req.url}`, held);
+        reject(new BodyOverBudget(held));
         return;
       }
       chunks.push(c);
     });
     req.on("end", () => { if (!over) resolve(Buffer.concat(chunks)); });
-    req.on("error", reject);
+    req.on("error", (e) => { if (budget) budget.release(); reject(e); });
   });
 }
 
@@ -3411,7 +3560,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
-      const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX)) || "{}");
+      // `res` opts this body into the global in-flight budget (XERK-258): the
+      // charge is held past the parse and the record update, which is where a
+      // 30 MiB beat actually costs its memory, and released when the response
+      // closes. A refusal here is a 503 the agent retries on its next beat.
+      const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX, res)) || "{}");
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
@@ -3628,7 +3781,10 @@ const server = http.createServer(async (req, res) => {
         return json(res, 409, { error: "migration not awaiting a bundle" });
       let blob;
       try {
-        blob = await readRawBody(req, MIGRATE_BLOB_MAX);
+        // Charged against the in-flight budget but NOT refusable: the source
+        // agent uploads best-effort with no retry, so a 503 would strand the
+        // migration (XERK-258).
+        blob = await readRawBody(req, MIGRATE_BLOB_MAX, res, false);
       } catch (e) {
         m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
         publishMigrations();
@@ -3997,8 +4153,12 @@ const server = http.createServer(async (req, res) => {
         sweepUploads();
         let bytes;
         try {
-          bytes = await readRawBody(req, cap);
-        } catch {
+          bytes = await readRawBody(req, cap, res);
+        } catch (e) {
+          // Over the global in-flight budget is a "not now", not a "too big" —
+          // the composer keeps the attachment and the operator can retry
+          // (XERK-258).
+          if (e && e.overBudget) throw e;
           return json(res, 413, {
             error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
             limit: cap,
@@ -4779,6 +4939,23 @@ const server = http.createServer(async (req, res) => {
       if (!res.writableEnded) json(res, 413, { error: "body too large", limit: err.cap });
       return;
     }
+    // Over the global in-flight body budget (XERK-258). 503 + Retry-After, not
+    // 413: the body is an acceptable size and the caller should send it again.
+    // The agent's next beat is ~20s away and carries the same staged results,
+    // so nothing is lost by refusing this one.
+    if (err && err.overBudget) {
+      if (!res.writableEnded) {
+        res.writeHead(503, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "Retry-After": "1",
+        });
+        res.end(JSON.stringify({
+          error: err.message, inFlight: err.held, limit: err.limit,
+        }));
+      }
+      return;
+    }
     json(res, 400, { error: err.message });
   }
 });
@@ -5146,6 +5323,10 @@ if (process.env.TURMA_TEST) {
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
     HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+    // XERK-258 global in-flight body budget. Exported so the concurrency bound
+    // can be held directly: the per-request caps above stay green with this
+    // whole mechanism removed, and removing it OOM-kills the hub.
+    BODY_INFLIGHT_MAX, bodyBudgetTicket, inflightBodyBytesNow, containerMemoryLimit,
 
     queueCommand,
     findSession,
@@ -5207,6 +5388,21 @@ if (process.env.TURMA_TEST) {
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT}`);
+    // What the hub thinks it may spend on concurrent request bodies, and where
+    // that number came from. Printed because the failure it prevents (XERK-258)
+    // is an OOM kill with nothing in the hub's own log, so the only way to tell
+    // an under-provisioned container from a healthy one is to see this figure
+    // beside the container's `mem_limit`.
+    console.log(
+      `in-flight body budget ${BODY_INFLIGHT_MAX} bytes ` +
+        `(container limit ${containerMemoryLimit()}, per-beat cap ${HEARTBEAT_MAX})`
+    );
+    if (BODY_INFLIGHT_MAX < HEARTBEAT_MAX) {
+      console.warn(
+        "WARNING: BODY_INFLIGHT_MAX is below the heartbeat cap — a large but " +
+          "legitimate beat can never be admitted, and the agent will re-send it forever"
+      );
+    }
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile
     // notifications (every notify() is a no-op), and that has silently bitten us

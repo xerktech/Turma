@@ -77,6 +77,11 @@ process.env.WHISPER_MODEL = "whisper-1";
 process.env.WHISPER_API_KEY = "whisperkey";
 process.env.WHISPER_LANGUAGE = "en";
 process.env.WHISPER_TIMEOUT_MS = "30000";
+// Global in-flight body budget (XERK-258). The real one is a fraction of the
+// container's memory limit, which on a test host is either huge or absent — so
+// it is pinned small enough that two ordinary test bodies cross it. A LONE
+// request is exempt by design, so every other body test is unaffected.
+process.env.BODY_INFLIGHT_MAX = String(4 << 20); // 4 MiB
 
 // A benign default global fetch. notify() no longer touches it (it fans out via
 // push.sendFcm, stubbed below); only transcribePcm/the audio WS use it, and
@@ -116,6 +121,7 @@ const {
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+  BODY_INFLIGHT_MAX, bodyBudgetTicket, inflightBodyBytesNow, containerMemoryLimit,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -1565,6 +1571,127 @@ test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare res
   assert.equal(res.status, 413);
   assert.equal(res.body.error, "body too large");
   assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
+});
+
+// ---- XERK-258: the global in-flight body budget ------------------------------
+//
+// Every per-request cap bounds ONE body; none bound the SUM. Two concurrent
+// heartbeats, each under HEARTBEAT_MAX, together exceeded the deployed 256 MiB
+// container limit and the kernel OOM-killed the hub — a repeating fleet-wide
+// outage under `restart: unless-stopped`, reachable by any one of the hosts
+// that share the single agent token.
+
+test("body budget: a lone request is exempt, a second one is refused", () => {
+  assert.equal(inflightBodyBytesNow(), 0, "no test may leak a charge");
+  const a = bodyBudgetTicket(null);
+  // Alone, a request may exceed the whole budget: that is the load the
+  // deployment already survives, and refusing it instead would wedge an agent
+  // that re-sends the same staged results forever (the XERK-235 failure).
+  assert.equal(a.charge(BODY_INFLIGHT_MAX * 2), true);
+  assert.equal(inflightBodyBytesNow(), BODY_INFLIGHT_MAX * 2);
+
+  // With someone else holding bytes, the budget bites.
+  const b = bodyBudgetTicket(null);
+  assert.equal(b.charge(1024), false, "a second body must not pile on top");
+  assert.equal(inflightBodyBytesNow(), BODY_INFLIGHT_MAX * 2, "a refusal charges nothing");
+
+  // `force` is how a body that may not be REFUSED (the migration relay) is
+  // still ACCOUNTED for, so it displaces what can be.
+  assert.equal(b.charge(1024, true), true);
+  assert.equal(inflightBodyBytesNow(), BODY_INFLIGHT_MAX * 2 + 1024);
+
+  a.release();
+  b.release();
+  assert.equal(inflightBodyBytesNow(), 0);
+  a.release(); // idempotent — release is wired to the response closing too
+  assert.equal(inflightBodyBytesNow(), 0);
+});
+
+test("body budget: two bodies under the budget both fit", () => {
+  const a = bodyBudgetTicket(null);
+  const b = bodyBudgetTicket(null);
+  assert.equal(a.charge(BODY_INFLIGHT_MAX / 4), true);
+  assert.equal(b.charge(BODY_INFLIGHT_MAX / 4), true);
+  assert.equal(b.charge(BODY_INFLIGHT_MAX), false, "…until the sum crosses");
+  a.release();
+  b.release();
+  assert.equal(inflightBodyBytesNow(), 0);
+});
+
+test("body budget: the ceiling comes from the container, not the machine", () => {
+  const limit = containerMemoryLimit();
+  assert.ok(Number.isFinite(limit) && limit > 0, "a limit must always resolve");
+  // The floor is the transport cap: a budget below it would refuse a legitimate
+  // large beat forever. (Here BODY_INFLIGHT_MAX is the pinned test override.)
+  const fresh = freshServerModule((env) => { delete env.BODY_INFLIGHT_MAX; });
+  assert.ok(
+    fresh.BODY_INFLIGHT_MAX >= 32 << 20,
+    "the derived budget must never sit below HEARTBEAT_MAX"
+  );
+});
+
+test("http: two concurrent big heartbeats — one is refused 503, the hub survives", async () => {
+  // The reproduction, scaled to the pinned 4 MiB test budget: hold one beat
+  // mid-body, send a second, and the second must come back 503 rather than
+  // being admitted alongside it. Raw sockets, because the point is the OVERLAP
+  // — two ordinary requests can complete one after the other.
+  const body = JSON.stringify({ device: "budget-b", pad: "z".repeat(3 << 20) });
+  const held = JSON.stringify({ device: "budget-a", pad: "y".repeat(3 << 20) });
+
+  const port = server.address().port;
+  const head = (len) =>
+    "POST /api/heartbeat HTTP/1.1\r\n" +
+    `Host: 127.0.0.1:${port}\r\n` +
+    "Authorization: Bearer agenttok\r\n" +
+    "Content-Type: application/json\r\n" +
+    `Content-Length: ${Buffer.byteLength(len)}\r\n` +
+    "Connection: close\r\n\r\n";
+
+  const open = () =>
+    new Promise((resolve) => {
+      const sock = net.connect(port, "127.0.0.1", () => resolve(sock));
+      sock.setNoDelay(true);
+      sock.reply = "";
+      sock.on("data", (c) => (sock.reply += c));
+      // A refused request is answered and closed while its body is still
+      // being written, so the writer sees EPIPE/ECONNRESET. That is the
+      // mechanism working, not a test failure.
+      sock.on("error", () => {});
+    });
+  const write = (sock, s) => new Promise((r) => sock.write(s, () => r()));
+  const settle = () => new Promise((r) => setTimeout(r, 150));
+  const status = (sock) => Number((sock.reply.match(/^HTTP\/1\.1 (\d+)/) || [])[1]);
+  const closed = (sock) => new Promise((r) => sock.on("close", r));
+
+  // A: headers + most of the body, then stop — the hub is now holding ~3 MiB.
+  const a = await open();
+  const b = await open();
+  try {
+    await write(a, head(held) + held.slice(0, held.length - 16));
+    await settle();
+    assert.ok(inflightBodyBytesNow() > 0, "the held body must be charged");
+
+    // B: a whole second beat while A is still in flight. 3 + 3 MiB > the 4 MiB
+    // budget, so B is the one that crosses it.
+    b.write(head(body) + body); // not awaited: the refusal cuts it short
+    await closed(b);
+    assert.equal(status(b), 503, "the second concurrent big body must be refused");
+    assert.match(b.reply, /Retry-After: 1/i, "a 503 the agent should retry, not give up on");
+
+    // A finishes normally: the refusal is about the MOMENT, not about A.
+    await write(a, held.slice(held.length - 16));
+    await closed(a);
+    assert.equal(status(a), 200, "the request that got there first still completes");
+
+    await settle();
+    assert.equal(inflightBodyBytesNow(), 0, "both charges must be released");
+    assert.equal(agents["budget-b"], undefined, "a refused beat must not register");
+  } finally {
+    // A half-written request would otherwise hold the suite's server open past
+    // test.after(), turning one assertion failure into a hung run.
+    a.destroy();
+    b.destroy();
+  }
 });
 
 test("http: a heartbeat whose device is not a plain host name is refused, not silently dropped", async () => {

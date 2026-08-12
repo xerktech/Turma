@@ -247,6 +247,34 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 - Tests: `push.test.js`, `prAlertDecision`/`readyForReview`/`XERK-154`/`pushEnabled` in
   `server.test.js`.
 
+## Request-body memory budget (XERK-258)
+
+- **Every per-request cap bounds ONE body; `BODY_INFLIGHT_MAX` bounds the SUM.** Two concurrent
+  heartbeats each under `HEARTBEAT_MAX` together exceeded the deployed 256 MiB `mem_limit` and the
+  kernel OOM-killed the hub — under `restart: unless-stopped` a repeating fleet-wide outage, and
+  every agent shares one token, so any one host could cause it.
+- Derived from the **container's own cgroup limit** (`containerMemoryLimit()`, v2 then v1, falling
+  back to machine RAM) over `BODY_INFLIGHT_FRACTION`, and **floored at `HEARTBEAT_MAX`** — a budget
+  under the transport cap would refuse a legitimate large beat forever while the agent holds its
+  staged results and re-sends, which is the XERK-235 wedge. Overridable by env, logged at boot
+  beside the detected limit.
+- `bodyBudgetTicket` charges per chunk and is **held until the response closes**, not until the read
+  ends: the JSON parse and the record update after it are where a 30 MiB beat actually costs its
+  memory.
+- **A request that is the only one holding bytes is exempt** and may run up to its own route cap —
+  that is the load the deployment already survives, and it is what keeps a lone big beat admissible.
+  The budget therefore bounds CONCURRENCY, never a single request.
+- Only routes whose cap exceeds `BODY_MAX` opt in (they pass `res` to `readBody`/`readRawBody`).
+  **The migration relay is charged but NOT refusable** (`refusable:false` → the charge is forced):
+  the source agent uploads best-effort with no retry (and an older agent never will), so a 503 would
+  strand the migration — but it must still displace what can be refused. Its residual (a forced body
+  rides on top of a full budget, and the relay then RETAINS the bundle) is XERK-263.
+- A refusal is **503 + `Retry-After`, never 413** — the body is a fine size, the moment is wrong.
+  Both keep DRAINING to the same limit an oversized body does, so the caller gets a status rather
+  than a socket reset (XERK-235).
+- Tests: the `body budget:` and `two concurrent big heartbeats` cases in `server.test.js`, which pin
+  `BODY_INFLIGHT_MAX` small — the real one is a fraction of a limit a test host doesn't have.
+
 ## Auth and the glasses surface
 
 - UI, API, and the click-to-attach live terminal (`/term/<sessionId>/`, reverse-tunneled to that
