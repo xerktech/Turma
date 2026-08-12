@@ -63,16 +63,34 @@ object ModelSource {
         return session?.modelSource?.takeIf { it.isNotBlank() } ?: SUBSCRIPTION
     }
 
+    /** Has [pending] outlived [SWITCH_SETTLE_MS]? */
+    fun expired(pending: Pending?, now: Long): Boolean =
+        pending != null && now - pending.at >= SWITCH_SETTLE_MS
+
     /**
-     * Retire a memo the heartbeat has caught up with.
+     * Retire a memo the heartbeat has caught up with, or one that has aged out.
      *
      * The same "clears on its own completion signal, not a blind timer" rule the
      * dashboard's per-session pending follows; [SWITCH_SETTLE_MS] is only the
      * backstop for a switch that never lands. A memo for a DIFFERENT session is
-     * never judged by this session's record.
+     * never judged by this session's record — but it IS aged out, since the TTL
+     * is about the memo, not about whose record answers it.
+     *
+     * Expiry has to retire the memo from the STORE, not merely stop [current]
+     * from honouring it. Reading the clock inside a Composable makes the TTL a
+     * silent event: Compose skips recomposition while the state compares equal,
+     * so on a quiet fleet nothing re-evaluates it and the expired value stays on
+     * screen. Measured: the whole "run against" control vanishing on an
+     * unconfirmed switch away from `local` and never coming back — still gone at
+     * t+120s, with the bar reading `model: default` while the session was in
+     * fact still on the self-hosted model. Dropping the memo is a state CHANGE,
+     * which is what makes the control repaint. The web has no equivalent bug
+     * because `onPoll` recomputes `localModelOffered()` unconditionally on every
+     * beat (`sessions.html`).
      */
-    fun settle(pending: Pending?, session: SessionInfo?): Pending? {
+    fun settle(pending: Pending?, session: SessionInfo?, now: Long): Pending? {
         if (pending == null) return null
+        if (expired(pending, now)) return null
         if (session?.id != pending.sessionId) return pending
         return if (session.modelSource == pending.value) null else pending
     }
@@ -88,6 +106,52 @@ object ModelSource {
      * the one decision a mutation could still delete unnoticed.
      */
     fun afterAttempt(pending: Pending?, ok: Boolean): Pending? = if (ok) pending else null
+
+    /**
+     * What the compose bar says after a command comes back.
+     *
+     * A blanket "✓ queued" on a discarded result is how `setModel`/`setMode`
+     * reported the hub's 409 — the one it added deliberately so an out-of-parity
+     * client could not silently drop the command — as a success. Pure and here
+     * rather than inline in the ViewModel for the same reason [afterAttempt] is:
+     * a decision inlined at a call site is one a mutation deletes unnoticed,
+     * because a ViewModel call site has no gate in this project.
+     *
+     * [hubMessage] is the hub's own words (`hubErrorMessage`), preferred over
+     * [failed] whenever it has any: "hub unreachable" for an 8ms 409 sends you
+     * looking at the network for a refusal the hub already explained.
+     *
+     * [bodyError] is `OkResponse.error` on a 2xx — a refusal the hub chose to
+     * answer 200 with. Branching on the HTTP status alone is the same shape of
+     * bug one layer up: `FleetViewModel.run` already checks it, this side did
+     * not, and a `200 {ok:false,error:…}` read as "✓ queued". No route answers
+     * that for `/model` or `/mode` today, which is exactly the position `/model`
+     * was in before it grew a 409.
+     */
+    fun outcomeMessage(
+        ok: Boolean,
+        bodyError: String?,
+        hubMessage: String?,
+        queued: String,
+        failed: String,
+    ): String {
+        if (accepted(ok, bodyError)) return queued
+        val refusal = bodyError?.takeIf { it.isNotBlank() }
+            ?: hubMessage?.takeIf { it.isNotBlank() }
+        return "✗ " + (refusal ?: failed)
+    }
+
+    /**
+     * Did the hub actually take the command? A 2xx is not enough on its own —
+     * `OkResponse.error` on a 200 is a refusal.
+     *
+     * Separate from [outcomeMessage] because the model-source switch needs the
+     * same verdict TWICE, for two different things: what the bar says, and
+     * whether the memo survives ([afterAttempt]). Deriving the second from the
+     * first — by comparing the rendered string — would make a wording change
+     * silently pin the chip on a refused switch.
+     */
+    fun accepted(ok: Boolean, bodyError: String?): Boolean = ok && bodyError.isNullOrBlank()
 
     /**
      * The `modelSource` a spawn should carry, or null to omit it.

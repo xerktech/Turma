@@ -19,6 +19,7 @@ CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent"
 CFG="$CFG_DIR/turma-agent.env"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 TTYD_VERSION="1.7.7"          # matches agent/Dockerfile
+GLAB_VERSION="1.111.0"        # matches agent/Dockerfile
 NODE_MAJOR_MIN=24            # standardized on Node 24 (tunnel-agent.js needs the global WebSocket, Node 22+)
 
 DO=install
@@ -201,6 +202,29 @@ ensure_gh() {
   fi
 }
 
+ensure_glab() {
+  # glab is how a session opens a GitLab MR that Turma can attribute — the MR
+  # counterpart of `gh pr create`. Without it a session improvises with the raw
+  # GitLab API and the MR never gets a chip (the container image bundles glab
+  # for the same reason). Static binary from GitLab's own releases, pinned to
+  # match the Dockerfile; best-effort like gh — a GitHub-only host loses nothing.
+  have glab && { info "glab present"; return 0; }
+  local arch; arch="$(uname -m)"
+  case "$arch" in
+    x86_64)  arch=amd64 ;;
+    aarch64) arch=arm64 ;;
+    *) warn "no glab for arch $arch — GitLab MR chips need it; install manually"; return 0 ;;
+  esac
+  info "downloading static glab $GLAB_VERSION ($arch) into $PREFIX/bin"
+  mkdir -p "$PREFIX/bin"
+  if ! curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${arch}.tar.gz" \
+      | tar -xz --strip-components=1 -C "$PREFIX/bin" bin/glab 2>/dev/null; then
+    warn "glab download failed (optional — only GitLab MR creation needs it)"
+    return 0
+  fi
+  chmod +x "$PREFIX/bin/glab"
+}
+
 # ---- file install ---------------------------------------------------------
 install_files() {
   info "installing runtime files into $PREFIX"
@@ -371,6 +395,8 @@ do_verify() {
   for t in python3 node tmux ttyd claude git; do
     if have "$t"; then echo "  tool $t: $(command -v "$t")"; else echo "  tool $t: MISSING"; ok=1; fi
   done
+  # Optional — only GitLab MR creation needs it, so absence doesn't fail verify.
+  have glab && echo "  tool glab: $(command -v glab)" || echo "  tool glab: none (GitLab MR chips need it)"
   echo "  node major: $(node_major) (need >= $NODE_MAJOR_MIN)"
   if [ -f "$CFG" ]; then
     echo "  config: $CFG"
@@ -420,6 +446,7 @@ if [ "$INSTALL_DEPS" = yes ]; then
   ensure_node
   ensure_ttyd
   ensure_gh
+  ensure_glab
   ensure_claude
 else
   info "--no-install-deps: skipping prerequisite installation"

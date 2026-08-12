@@ -1098,6 +1098,80 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [])
 
+    # The real shape from an on-prem TFS host: the `azure-devops` az extension
+    # refuses a self-hosted collection, so the session opens its PR with a
+    # local REST wrapper that prints the link itself.
+    ADO_WRAPPER_OUT = (
+        "Created PR !10068: Keep the model loaded in VRAM\n"
+        "  https://tfsserver.example.com/tfs/DefaultCollection/DevOps/_git/App"
+        "/pullrequest/10068\n"
+        "  linked work item #80995")
+    ADO_WRAPPER_URL = ("https://tfsserver.example.com/tfs/DefaultCollection"
+                       "/DevOps/_git/App/pullrequest/10068")
+
+    def test_on_prem_ado_wrapper_create_is_this_sessions_pr(self):
+        """An on-prem ADO host has no vendor CLI to name, so `ado pr-create`
+        is a built-in creating command — without it that host's PRs are never
+        attributed and its cards never chip."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call("w1", cmd='ado pr-create --title "x" \\\n  --work-item 80995'),
+            self.tool_result("w1", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.ADO_WRAPPER_URL])
+
+    def test_path_qualified_wrapper_still_counts(self):
+        """The wrapper is routinely invoked by path (`~/.local/bin/ado`), and
+        after a `cd` into the worktree."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call(
+                "w2", cmd="cd /home/u/git/app && ~/.local/bin/ado pr-create --title x"),
+            self.tool_result("w2", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.ADO_WRAPPER_URL])
+
+    def test_an_on_prem_collection_over_plain_http_still_chips(self):
+        """A self-hosted collection on the LAN is routinely served over http,
+        and a scheme-only mismatch would drop the chip in silence."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        url = "http://tfs.corp.local:8080/tfs/DefaultCollection/Dev/_git/App/pullrequest/7"
+        write_jsonl(path, [
+            self.pr_create_call("h1", cmd="ado pr-create --title x"),
+            self.tool_result("h1", f"Created PR !7:\n  {url}"),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [url])
+
+    def test_a_wrapper_that_only_lists_prs_is_not_a_create(self):
+        """`ado pr-list` prints every open PR's link — the exact loose text the
+        narrow rule exists to keep off this session's card."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call("w3", cmd="ado pr-list --repo App"),
+            self.tool_result("w3", self.ADO_WRAPPER_OUT),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [])
+
     def test_plain_push_mr_hint_is_not_a_created_mr(self):
         """A plain `git push` prints GitLab's "to create a merge request …
         visit …/merge_requests/new" hint (and, on later pushes, the existing
@@ -4881,6 +4955,29 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
         self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
 
+    def test_spawn_exports_gitlab_host_for_glab(self):
+        """A GitLab-configured host tells every session's glab WHERE to auth:
+        glab reads GITLAB_HOST, never the agent's GITLAB_URL, so without this a
+        self-hosted session's `glab mr create` can't auth, the model falls back
+        to a raw API call, and the MR never gets a chip (_scan_pr_line only
+        attributes the creating command's own tool_result)."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, GITLAB_URL="gitlab.example.com",
+                                 GITLAB_TOKEN="tok"):
+            sm.spawn("Turma")
+        self.assertIn("GITLAB_HOST=https://gitlab.example.com ",
+                      self._claude_cmd())
+
+    def test_spawn_leaves_an_operator_set_gitlab_host_alone(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, GITLAB_URL="gitlab.example.com",
+                                 GITLAB_TOKEN="tok"), \
+                mock.patch.dict(os.environ, {"GITLAB_HOST": "https://other.tld"}):
+            sm.spawn("Turma")
+        self.assertNotIn("GITLAB_HOST=", self._claude_cmd())
+
     def test_spawn_onto_the_local_model(self):
         """Starting NEW work on the local model matters as much as failing an
         existing session over: once usage is gone you cannot spawn either. A
@@ -6652,6 +6749,84 @@ class TestAzdoPrCommentEvents(AzdoPrMixin, unittest.TestCase):
                 "https://dev.azure.com/other/P/_git/r/pullrequest/1", ""))
 
 
+class TestPrCreatePattern(unittest.TestCase):
+    """TURMA_PR_CREATE_CMDS: a host whose PRs are opened by its own wrapper can
+    register it, without loosening attribution for anyone else."""
+
+    def _re(self, extra=""):
+        return re.compile(ha._pr_create_pattern(extra))
+
+    def test_built_ins_need_no_configuration(self):
+        rx = self._re()
+        for cmd in ("gh pr create --fill", "glab mr create", "ado pr-create -t x",
+                    "az repos pr create", "git push -o merge_request.create"):
+            self.assertTrue(rx.search(cmd), cmd)
+
+    def test_the_wrapper_run_through_its_interpreter_still_counts(self):
+        """The on-prem wrapper is a script, and a host that loses it from PATH
+        runs it by path — the same PR, opened the same way."""
+        rx = self._re()
+        for cmd in ("ado.py pr-create --title x",
+                    "python3 /home/u/git/ado/ado.py pr-create --title x",
+                    "python3 ado.py pr-create",
+                    "~/.local/bin/ado pr-create --title x",
+                    "./ado.py pr-create"):
+            self.assertTrue(rx.search(cmd), cmd)
+        self.assertIsNone(rx.search("cat ado.py"))
+        self.assertIsNone(rx.search("vim ado.py pr-create.md"))
+
+    def test_a_built_in_is_anchored_against_a_hyphen_too(self):
+        """`\\b` treats `-` as a boundary, so an unanchored built-in matches the
+        tail of a different command."""
+        rx = self._re()
+        for cmd in ("run-ado pr-create", "my-gh pr create", "x-az repos pr create"):
+            self.assertIsNone(rx.search(cmd), cmd)
+
+    def test_a_registered_wrapper_matches(self):
+        rx = self._re("mkpr, tfs pr new")
+        self.assertTrue(rx.search("mkpr --title x"))
+        self.assertTrue(rx.search("tfs   pr  new --repo app"))
+
+    def test_an_unregistered_wrapper_does_not(self):
+        self.assertIsNone(self._re("mkpr").search("openpr --title x"))
+
+    def test_a_registered_word_is_not_matched_inside_a_longer_one(self):
+        """Anchoring is what keeps a short entry from matching half a command."""
+        rx = self._re("mkpr")
+        self.assertIsNone(rx.search("mkprod deploy"))
+        self.assertIsNone(rx.search("run-mkpr --title x"))
+        self.assertTrue(rx.search("./mkpr --title x"))
+
+    def test_a_built_in_is_not_matched_inside_a_longer_word(self):
+        self.assertIsNone(self._re().search("myado pr-create"))
+
+    def test_entries_are_literal_not_patterns(self):
+        """The value is host config, but it must never reach the engine as a
+        pattern — a stray `.` or `*` would silently widen attribution."""
+        rx = self._re("mk.pr")
+        self.assertTrue(rx.search("mk.pr --title x"))
+        self.assertIsNone(rx.search("mkxpr --title x"))
+
+    def test_blank_and_malformed_entries_widen_nothing(self):
+        for extra in ("", "   ", ",,", " , ,"):
+            self.assertEqual(ha._pr_create_pattern(extra),
+                             ha._pr_create_pattern(), extra)
+
+    def test_a_too_short_entry_is_ignored(self):
+        """Attribution must not fail OPEN: a one- or two-character token makes
+        half the commands a session runs read as "opened a PR"."""
+        for extra in ("a", "x,pr", " a "):
+            self.assertEqual(ha._pr_create_pattern(extra),
+                             ha._pr_create_pattern(), extra)
+        self.assertIsNone(self._re("a").search("ls -a /tmp"))
+        # Two one-character words are three characters JOINED, and still match
+        # half of what a session runs — the longest word is what counts.
+        self.assertEqual(ha._pr_create_pattern("a b"), ha._pr_create_pattern())
+        self.assertIsNone(self._re("a b").search("cat a b"))
+        # …but a real short wrapper name still registers.
+        self.assertTrue(self._re("prc").search("prc --title x"))
+
+
 class TestAzdoCreatedPrUrl(unittest.TestCase):
     """XERK-226: `az repos pr create` prints the created PR as JSON and no link
     at all, so the chip's URL is composed from that object."""
@@ -6675,6 +6850,17 @@ class TestAzdoCreatedPrUrl(unittest.TestCase):
         self.assertEqual(
             ha._azdo_created_pr_url(out),
             "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12")
+
+    def test_an_on_prem_http_remote_url_composes_too(self):
+        """`remoteUrl` is the ONLY field the az extension's SDK can supply (it
+        has no webUrl), and it carries the `<org>@` prefix — so a plain-http
+        on-prem collection composes nothing unless the strip knows http."""
+        out = self._out(repository={
+            "name": "app",
+            "remoteUrl": "http://Collection@tfs.corp.local:8080/tfs/C/P/_git/app"})
+        self.assertEqual(
+            ha._azdo_created_pr_url(out),
+            "http://tfs.corp.local:8080/tfs/C/P/_git/app/pullrequest/12")
 
     def test_finds_the_object_past_a_cli_banner(self):
         noisy = "WARNING: extension is in preview\n" + self._out()
@@ -10549,6 +10735,18 @@ class TestPruneRepo(unittest.TestCase):
         self._run("worktree", "add", "--detach", path, base)
         return path
 
+    def _await_prune(self, sm, repo="demo", timeout=30):
+        """Block until the worker finishes `repo`, then return its record. The
+        sweep is asynchronous now (XERK-256), so every test has to wait for it."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rec = sm.prunes.get(repo)
+            if rec and rec.get("finishedMono") is not None:
+                return rec
+            time.sleep(0.02)
+        self.fail(f"prune of {repo!r} did not finish within {timeout}s "
+                  f"(last: {sm.prunes.get(repo)})")
+
     def test_prune_sweeps_merged_keeps_in_progress(self):
         sm = ha.SessionManager()
 
@@ -10566,6 +10764,7 @@ class TestPruneRepo(unittest.TestCase):
         self._run("branch", "feature-wip", wip_sha)
 
         sm.prune_repo("demo")
+        res = self._await_prune(sm)
 
         # Merged/clean worktree gone; unmerged + dirty kept.
         self.assertFalse(os.path.isdir(merged_wt))
@@ -10577,7 +10776,6 @@ class TestPruneRepo(unittest.TestCase):
         self.assertIn("feature-wip", branches)         # unmerged -> kept
         self.assertIn("main", branches)                # default -> kept
 
-        res = sm.prunes["demo"]
         self.assertEqual(res["status"], "done")
         self.assertEqual(res["removedWorktrees"], 1)
         self.assertEqual(res["deletedBranches"], 1)
@@ -10586,7 +10784,227 @@ class TestPruneRepo(unittest.TestCase):
     def test_prune_unknown_repo_reports_error(self):
         sm = ha.SessionManager()
         sm.prune_repo("nope")
-        self.assertEqual(sm.prunes["nope"]["status"], "error")
+        self.assertEqual(self._await_prune(sm, "nope")["status"], "error")
+
+    def test_prune_returns_immediately_and_reports_queued(self):
+        """The whole point of XERK-256: the command must not run the sweep on the
+        caller's thread, which is the heartbeat loop."""
+        sm = ha.SessionManager()
+        self._add_worktree("merged")
+        gate = threading.Event()
+        real = sm._run_prune
+        sm._run_prune = lambda repo: (gate.wait(10), real(repo))
+
+        start = time.monotonic()
+        sm.prune_repo("demo")
+        self.assertLess(time.monotonic() - start, 1.0)
+        # ...and the beat can already report the sweep rather than going dark.
+        self.assertEqual(sm.prunes["demo"]["status"], "queued")
+        self.assertIsNone(sm.prunes["demo"]["finishedMono"])
+        payload = sm._prunes_payload()
+        self.assertEqual([p["repo"] for p in payload], ["demo"])
+        self.assertEqual(payload[0]["status"], "queued")
+        gate.set()
+        self._await_prune(sm)
+
+    def test_prune_of_a_repo_already_in_flight_is_not_stacked(self):
+        """Three clicks on a repo already queued leave ONE sweep and ONE worker.
+
+        The worker is stubbed rather than gated: gating it still lets it POP the
+        entry before the assertion runs, so reading the queue length races it —
+        which is exactly how this test first failed in CI and passed locally."""
+        sm = ha.SessionManager()
+        started = []
+
+        class FakeThread:
+            def __init__(self, **kw):
+                started.append(kw.get("name"))
+
+            def is_alive(self):
+                return True      # so a later enqueue sees a worker already up
+
+            def start(self):
+                pass
+
+        with mock.patch.object(ha.threading, "Thread", FakeThread):
+            sm.prune_repo("demo")
+            sm.prune_repo("demo")
+            sm.prune_repo("demo")
+        self.assertEqual(list(sm._prune_queue), ["demo"])
+        self.assertEqual(started, ["prune-worker"])
+        self.assertEqual(sm.prunes["demo"]["status"], "queued")
+
+    def test_running_prune_never_ages_out_of_the_heartbeat(self):
+        """_poll_prunes drops a record once it has lingered — a sweep in flight
+        has no finishedMono, so it can't be dropped out from under itself."""
+        sm = ha.SessionManager()
+        gate = threading.Event()
+        real = sm._run_prune
+        sm._run_prune = lambda repo: (gate.wait(10), real(repo))
+        sm.prune_repo("demo")
+        sm._poll_prunes()
+        self.assertIn("demo", sm.prunes)
+        gate.set()
+        res = self._await_prune(sm)
+        # Finished: now the linger clock applies.
+        sm.prunes["demo"]["finishedMono"] = time.time() - ha.PRUNE_RESULT_LINGER_SEC - 1
+        sm._poll_prunes()
+        self.assertNotIn("demo", sm.prunes)
+        self.assertEqual(res["status"], "done")
+
+    def test_prune_leaves_a_worktree_claimed_mid_sweep_alone(self):
+        """Off the beat, a session can be spawned or resumed onto a worktree this
+        sweep already listed. The live set is re-read before every removal, so
+        the claim wins."""
+        sm = ha.SessionManager()
+        claimed = self._add_worktree("claimed")
+        sm.registry.append({"id": "s1", "worktreePath": claimed})
+        sm.prune_repo("demo")
+        res = self._await_prune(sm)
+        self.assertTrue(os.path.isdir(claimed))
+        self.assertEqual(res["removedWorktrees"], 0)
+
+    def test_worker_folds_removals_into_closed_on_the_beat(self):
+        """self.closed belongs to the beat thread: the worker only names paths,
+        and _poll_prunes applies them."""
+        sm = ha.SessionManager()
+        merged_wt = self._add_worktree("merged")
+        sm.closed = [{"id": "old", "worktreePath": merged_wt},
+                     {"id": "keep", "worktreePath": "/elsewhere"}]
+        sm.prune_repo("demo")
+        self._await_prune(sm)
+        self.assertEqual(sm._prune_swept, [merged_wt])
+        sm._poll_prunes()
+        self.assertEqual([c["id"] for c in sm.closed], ["keep"])
+        self.assertEqual(sm._prune_swept, [])
+
+    def test_prune_rereads_head_and_keeps_work_committed_mid_sweep(self):
+        """The listing is minutes old on a real sweep. A session given work can
+        COMMIT it and be killed while the sweep runs — the worktree is kept, so it
+        leaves the live set, and judged by the HEAD read at listing time it still
+        looks merged. Removing it there destroys commits reachable from no ref."""
+        sm = ha.SessionManager()
+        victim = self._add_worktree("victim")            # detached at main
+
+        # Land the commit between the listing and the merged check, exactly as a
+        # session finishing its turn mid-sweep would.
+        real_run_out = ha.run_out
+
+        def commit_then_answer(cmd, *a, **kw):
+            if "status" in cmd and "--porcelain" in cmd:
+                self._run("commit", "-q", "--allow-empty", "-m", "landed mid-sweep",
+                          cwd=victim)
+            return real_run_out(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_out", side_effect=commit_then_answer):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+
+        self.assertTrue(os.path.isdir(victim))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertGreaterEqual(res["skippedWorktrees"], 1)
+        # ...and the commit is still reachable, which is the thing that matters.
+        sha = self._run("rev-parse", "HEAD", cwd=victim).stdout.strip()
+        self.assertEqual(
+            ha.run_ok(["git", "-C", self.repo, "cat-file", "-e", sha])[0], 0)
+
+    def test_prune_skips_a_worktree_claimed_between_the_checks(self):
+        """The re-check right before the removal, not the one at the top of the
+        loop: a resume can land while this tree's own status/merge checks run."""
+        sm = ha.SessionManager()
+        claimed = self._add_worktree("claimed")
+        real_run_ok = ha.run_ok
+
+        def claim_then_answer(cmd, *a, **kw):
+            if "merge-base" in cmd:
+                sm.registry.append({"id": "late", "worktreePath": claimed})
+            return real_run_ok(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_ok", side_effect=claim_then_answer):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+        self.assertTrue(os.path.isdir(claimed))
+        self.assertEqual(res["removedWorktrees"], 0)
+
+    def test_a_resume_cannot_land_on_a_worktree_being_removed(self):
+        """`git worktree remove` runs for 10-37s on a real pool and the dir
+        exists for most of it, so a resume mid-removal would skip the re-add and
+        launch claude into a directory about to be unlinked. The claim is what
+        makes the registration and the check one step."""
+        sm = ha.SessionManager()
+        wt = self._add_worktree("contested")
+        self.assertTrue(sm._claim_for_removal(wt))       # worker gets there first
+        self.assertFalse(sm._claim_worktree(wt, {"id": "r1", "worktreePath": wt}))
+        self.assertEqual(sm.registry, [])                # ...and did not register
+        sm._release_removal(wt)
+        self.assertTrue(sm._claim_worktree(wt, {"id": "r1", "worktreePath": wt}))
+        self.assertEqual([s["id"] for s in sm.registry], ["r1"])
+        # With the session registered, the worker no longer gets the tree.
+        self.assertFalse(sm._claim_for_removal(wt))
+
+    def test_a_removal_always_releases_its_claim(self):
+        """Nothing else ever empties _prune_removing, so a claim leaked by a
+        failed removal would refuse every future resume onto that path, forever
+        — hence the `finally`. Checked on both exits: a removal that works and
+        one that fails."""
+        sm = ha.SessionManager()
+        self._add_worktree("merged")
+        sm.prune_repo("demo")
+        self._await_prune(sm)
+        self.assertEqual(sm._prune_removing, set())
+
+        sm2 = ha.SessionManager()
+        doomed = self._add_worktree("doomed")
+        real_run_ok = ha.run_ok
+
+        def failing_removal(cmd, *a, **kw):
+            if "worktree" in cmd and "remove" in cmd:
+                return 1, "boom"
+            return real_run_ok(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_ok", side_effect=failing_removal):
+            sm2.prune_repo("demo")
+            res = self._await_prune(sm2)
+        self.assertTrue(os.path.isdir(doomed))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertEqual(sm2._prune_removing, set())
+
+    def test_progress_updates_never_stamp_a_finish(self):
+        """finishedMono is what starts the linger clock, so only a terminal
+        record may carry it — else a long sweep ages out of the heartbeat while
+        it is still running."""
+        sm = ha.SessionManager()
+        sm._publish_prune("demo", status="running", summary="pruning… worktree 4 of 31")
+        self.assertIsNone(sm.prunes["demo"].get("finishedMono"))
+        # Even with an `at` far in the past, a running record survives the poll.
+        sm.prunes["demo"]["at"] = "2000-01-01T00:00:00Z"
+        sm._poll_prunes()
+        self.assertIn("demo", sm.prunes)
+        sm._finish_prune("demo", "done", None, "removed 1 worktree")
+        self.assertIsNotNone(sm.prunes["demo"]["finishedMono"])
+
+    def test_prune_keeps_a_worktree_whose_status_cannot_be_read(self):
+        """`git status` failing or timing out must not read as CLEAN — run()
+        collapses both to '', which is why this path uses run_out.
+
+        The patch is command-SELECTIVE: `rev-parse HEAD` goes through run_out too
+        now, and a blanket patch would fail that instead, leaving this guard
+        passing for the wrong reason."""
+        sm = ha.SessionManager()
+        merged_wt = self._add_worktree("merged")
+        real_run_out = ha.run_out
+
+        def unreadable_status(cmd, *a, **kw):
+            if "status" in cmd and "--porcelain" in cmd:
+                return None, ""
+            return real_run_out(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run_out", side_effect=unreadable_status):
+            sm.prune_repo("demo")
+            res = self._await_prune(sm)
+        self.assertTrue(os.path.isdir(merged_wt))
+        self.assertEqual(res["removedWorktrees"], 0)
+        self.assertGreaterEqual(res["skippedWorktrees"], 1)
 
 
 def _text_entry(uuid, role, text, ts="2026-07-01T10:00:00Z"):
@@ -10938,8 +11356,22 @@ class TestMrStatus(unittest.TestCase):
         with self._configured():
             self.assertIsNone(ha._mr_url_parts(
                 "https://other.gitlab.tld/g/a/-/merge_requests/1"))
+            # Suffix-spoofing host: gitlab.example.com.evil.com is NOT ours.
+            self.assertIsNone(ha._mr_url_parts(
+                "https://gitlab.example.com.evil.com/g/a/-/merge_requests/1"))
         with mock.patch.multiple(ha, GITLAB_URL="", GITLAB_TOKEN=""):
             self.assertIsNone(ha._mr_url_parts(self.MR))
+
+    def test_mr_url_parts_matches_host_not_bytes(self):
+        # Hostnames are case-insensitive and the scheme doesn't change WHICH
+        # GitLab an MR lives on — a byte-for-byte prefix compare left every
+        # attributed MR a bare link chip forever over a trivial GITLAB_URL
+        # spelling difference.
+        for base in ("https://GitLab.Example.com", "http://gitlab.example.com",
+                     "gitlab.example.com", "https://gitlab.example.com/"):
+            with mock.patch.multiple(ha, GITLAB_URL=base, GITLAB_TOKEN="tok"):
+                self.assertEqual(ha._mr_url_parts(self.MR),
+                                 ("grp/sub/app", "12"), base)
 
     def test_mr_check_class(self):
         self.assertEqual(ha._mr_check_class("success"), "pass")
@@ -10976,20 +11408,36 @@ class TestMrStatus(unittest.TestCase):
             ha._summarize_mr({"state": "merged", "draft": True})["state"], "MERGED")
 
     def test_summarize_conflict_blocks_and_unknown_is_unproven(self):
-        conflicted = ha._summarize_mr({
-            "state": "opened", "detailed_merge_status": "conflict",
-            "head_pipeline": {"status": "success"},
-        })
-        self.assertEqual(conflicted["mergeable"], "CONFLICTING")
-        self.assertEqual(conflicted["ready"], "blocked")
-        # Any other detailed status (checking, need_rebase, not_approved …) is
-        # UNKNOWN — green CI alone must not claim ✓.
-        checking = ha._summarize_mr({
-            "state": "opened", "detailed_merge_status": "checking",
-            "head_pipeline": {"status": "success"},
-        })
-        self.assertEqual(checking["mergeable"], "UNKNOWN")
-        self.assertEqual(checking["ready"], "pending")
+        for status in ("conflict", "broken_status"):
+            conflicted = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(conflicted["mergeable"], "CONFLICTING", status)
+            self.assertEqual(conflicted["ready"], "blocked", status)
+        # A still-computing status is UNKNOWN — green CI alone must not claim ✓.
+        for status in ("checking", "unchecked", "preparing"):
+            out = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(out["mergeable"], "UNKNOWN", status)
+            self.assertEqual(out["ready"], "pending", status)
+
+    def test_summarize_non_conflict_statuses_read_mergeable(self):
+        # GitHub's `mergeable` answers conflicts ONLY, so a GitLab enum that
+        # reports an approvals/CI/workflow gate — not a git-level can't-merge —
+        # must read MERGEABLE, or every healthy MR sits at ● forever where the
+        # equivalent GitHub PR shows ✓.
+        for status in ("mergeable", "not_approved", "ci_still_running",
+                       "discussions_not_resolved", "need_rebase",
+                       "some_future_status"):
+            out = ha._summarize_mr({
+                "state": "opened", "detailed_merge_status": status,
+                "head_pipeline": {"status": "success"},
+            })
+            self.assertEqual(out["mergeable"], "MERGEABLE", status)
+            self.assertEqual(out["ready"], "ready", status)
 
     def test_summarize_legacy_merge_status_fallback(self):
         old = ha._summarize_mr({"state": "opened", "merge_status": "can_be_merged"})

@@ -30,6 +30,7 @@ import com.xerktech.turma.net.LiveEvent
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.ModelSourceRequest
+import com.xerktech.turma.net.OkResponse
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -166,7 +167,49 @@ class ChatViewModel(
         // until the next keystroke.
         viewModelScope.launch { draft.collect { text -> _state.update { it.copy(draft = text) } } }
         viewModelScope.launch {
-            modelSwitch.collect { p -> _state.update { it.copy(modelSourcePending = p) } }
+            modelSwitch.collect { p ->
+                _state.update { it.copy(modelSourcePending = p) }
+                armMemoExpiry(p)
+            }
+        }
+    }
+
+    /**
+     * Wake once when the outstanding memo ages out and retire it (XERK-246).
+     *
+     * Without this the TTL is only ever observed by whoever next reads the clock,
+     * and on a quiet fleet nobody does — Compose skips recomposition while the
+     * state compares equal, so an expired memo stays painted indefinitely. The
+     * heartbeat's own `settle` cannot cover it either: it runs on fleet
+     * emissions, which is exactly what a quiet fleet does not produce.
+     *
+     * Collected off the STORE rather than set alongside each POST, so a memo
+     * carried in from another nav entry is armed too — that is the case the
+     * store exists for. Self-cancelling and bounded: one alarm per memo, none at
+     * all when there is no memo.
+     */
+    private var memoExpiryJob: Job? = null
+
+    private fun armMemoExpiry(pending: ModelSource.Pending?) {
+        memoExpiryJob?.cancel()
+        if (pending == null) return
+        memoExpiryJob = viewModelScope.launch {
+            val left = ModelSource.SWITCH_SETTLE_MS - (System.currentTimeMillis() - pending.at)
+            if (left > 0) delay(left)
+            // Retire by IDENTITY, never by re-asking the clock. `delay` measures
+            // elapsed UPTIME while `expired` re-reads the WALL clock, and a
+            // backward wall-clock jump between the two makes the re-check false:
+            // `settle` then returns the same instance, `MutableStateFlow` does
+            // not emit an equal value, the collector never runs, and no new
+            // alarm is armed — so the memo is pinned until the clock catches up.
+            // Measured with a 10-minute backward jump: the chip still claimed
+            // the subscription at t+190s while the record said `local`.
+            //
+            // This alarm's only job is the TTL, so it does not need `settle`'s
+            // other rules: the heartbeat-agreement case is handled by the fleet
+            // collector, and `compareAndSet` no-ops if a newer switch (a
+            // different `at`) or a settle has already replaced this memo.
+            modelSwitch.compareAndSet(pending, null)
         }
     }
 
@@ -211,7 +254,8 @@ class ChatViewModel(
                 // Retire a memo the heartbeat has caught up with, through the
                 // store — the state copy is a mirror, so clearing only that
                 // would let the next emission paint the stale memo back.
-                modelSwitch.value = ModelSource.settle(modelSwitch.value, session)
+                modelSwitch.value =
+                    ModelSource.settle(modelSwitch.value, session, System.currentTimeMillis())
                 _state.update { it.fromFleet(agent, session, host) }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
@@ -280,6 +324,13 @@ class ChatViewModel(
                 is HubClient.HistoryResult.Pending -> {
                     if (attempt < 20) { delay(3000); loadHistory(attempt + 1) }
                     else _state.update { it.copy(loadingHistory = false) }
+                }
+                // A refusal is not "not yet" (XERK-264): polling it for the full
+                // 20×3s and then giving up in silence told the operator nothing
+                // and cost them a minute. Say what the hub said, and stop.
+                is HubClient.HistoryResult.Failed -> {
+                    _messages.tryEmit("✗ " + r.why)
+                    _state.update { it.copy(loadingHistory = false) }
                 }
                 null -> _state.update { it.copy(loadingHistory = false) }
             }
@@ -477,24 +528,60 @@ class ChatViewModel(
      */
     fun kill() {
         viewModelScope.launch {
-            runCatching { client.api.sessionAction(host, sessionId, "kill") }
-            _messages.tryEmit("✓ kill queued")
+            report("kill queued") { client.api.sessionAction(host, sessionId, "kill") }
             container.fleet.nudge()
         }
+    }
+
+    /**
+     * Run one command and say what actually happened. A refusal the hub
+     * explained — an unknown session, an offline host, a command queue too full
+     * to take another — used to be swallowed by a bare `runCatching` under an
+     * unconditional "✓ queued" (XERK-264), so a command that never ran read as
+     * one that did. Retrofit throws a non-2xx as an HttpException carrying the
+     * body, which [hubErrorMessage] reads; only a transport failure is generic.
+     *
+     * XERK-246 arrived at the same helper independently and merged INTO this one
+     * rather than beside it — two report paths is how the halves drift. It adds
+     * the `OkResponse.error` read (a refusal the hub chose to answer 200 with,
+     * which a status-only branch calls a success — the same bug one layer in,
+     * and the one `FleetViewModel.run` already avoided) and an optional
+     * route-specific [failed], since "hub unreachable" is wrong for a request
+     * the hub answered. Every caller here, `kill()` included, gets both.
+     */
+    private suspend fun report(
+        ok: String,
+        failed: String = "hub unreachable",
+        block: suspend () -> OkResponse,
+    ) {
+        val r = runCatching { block() }
+        _messages.tryEmit(
+            ModelSource.outcomeMessage(
+                ok = r.isSuccess,
+                bodyError = r.getOrNull()?.error,
+                hubMessage = r.exceptionOrNull()?.let { hubErrorMessage(it) },
+                queued = "✓ $ok",
+                failed = failed,
+            )
+        )
     }
 
     /** Interrupt the in-flight turn (web "◼ Stop" — POST .../interrupt). */
     fun stop() {
         viewModelScope.launch {
-            runCatching { client.api.interruptSession(host, sessionId) }
-            _messages.tryEmit("◼ stop sent")
+            val r = runCatching { client.api.interruptSession(host, sessionId) }
+            if (r.isSuccess) _messages.tryEmit("◼ stop sent")
+            else _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             container.fleet.nudge()
         }
     }
 
     fun answerOption(index: Int) {
         viewModelScope.launch {
-            runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = index)) }
+            // Only the failure is worth a message here: the answer landing is
+            // its own visible feedback (the question box goes).
+            val r = runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = index)) }
+            if (r.isFailure) _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             container.fleet.nudge()
         }
     }
@@ -503,19 +590,22 @@ class ChatViewModel(
     fun answerMulti(picks: List<Int>) {
         if (picks.isEmpty()) return
         viewModelScope.launch {
-            runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, optionIndices = picks)) }
+            val r = runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, optionIndices = picks)) }
+            if (r.isFailure) _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             container.fleet.nudge()
         }
     }
 
     fun setModel(model: String) = viewModelScope.launch {
-        runCatching { client.api.setModel(host, sessionId, ModelRequest(model)) }
-        _messages.tryEmit("✓ model queued")
+        report("model queued", "could not set the model") {
+            client.api.setModel(host, sessionId, ModelRequest(model))
+        }
     }
 
     fun setMode(mode: String) = viewModelScope.launch {
-        runCatching { client.api.setMode(host, sessionId, ModeRequest(mode)) }
-        _messages.tryEmit("✓ mode queued")
+        report("mode queued", "could not set the mode") {
+            client.api.setMode(host, sessionId, ModeRequest(mode))
+        }
     }
 
     /**
@@ -532,18 +622,25 @@ class ChatViewModel(
         if (source == _state.value.modelSource()) return@launch
         modelSwitch.value = ModelSource.Pending(sessionId, source, System.currentTimeMillis())
         val res = runCatching { client.api.setModelSource(host, sessionId, ModelSourceRequest(source)) }
-        res.onSuccess {
-            _messages.tryEmit(
-                if (source == ModelSource.LOCAL) "✓ switching to the local model…"
-                else "✓ switching back to the subscription…"
+        val bodyError = res.getOrNull()?.error
+        // ONE verdict drives both the wording and the memo. A refusal the hub
+        // answered 200 with has to drop the memo exactly as a 409 does — a chip
+        // that keeps claiming a switch the hub refused is the lie this whole
+        // memo is bounded to prevent, and it must not depend on how the refusal
+        // was spelled on the wire.
+        val ok = ModelSource.accepted(res.isSuccess, bodyError)
+        _messages.tryEmit(
+            ModelSource.outcomeMessage(
+                ok = res.isSuccess,
+                bodyError = bodyError,
+                hubMessage = res.exceptionOrNull()?.let { hubErrorMessage(it) },
+                queued = if (source == ModelSource.LOCAL) "✓ switching to the local model…"
+                else "✓ switching back to the subscription…",
+                failed = "could not switch model",
             )
-            container.fleet.nudge()
-        }.onFailure { e ->
-            _messages.tryEmit("✗ " + (hubErrorMessage(e) ?: "could not switch model"))
-        }
-        // One place decides what survives the attempt, success or failure, so
-        // the drop-on-refusal can't be deleted without a test noticing.
-        modelSwitch.value = ModelSource.afterAttempt(modelSwitch.value, res.isSuccess)
+        )
+        if (ok) container.fleet.nudge()
+        modelSwitch.value = ModelSource.afterAttempt(modelSwitch.value, ok)
     }
 
     // ---- voice dictation into the draft --------------------------------------

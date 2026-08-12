@@ -90,9 +90,11 @@
   .repo-head .r-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; justify-content: flex-end; }
   .repo-empty { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
-  /* Transient summary line after a repo prune (merged worktrees/branches swept). */
+  /* Progress line while a repo prune runs, then its summary (merged
+     worktrees/branches swept) for a moment after. */
   .prune-note { color: var(--ink-2); font-size: 12px; margin-top: 8px; }
   .prune-note.err { color: var(--critical); }
+  .prune-note.run { color: var(--muted); }
 
   /* Per-repo picker of recently killed sessions that can be resumed. */
   .resume-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
@@ -517,8 +519,11 @@ function reconcilePending(agents) {
                          (a.repos || []).some(r => r.name === p.name));
       if (seen) pending.delete(key);
     } else if (p.kind === "prune") {
-      // Done once the agent reports a NEW prune result for this repo (its `at`
-      // differs from whatever was showing when we queued it).
+      // Done once the agent reports a NEW prune record for this repo (its `at`
+      // differs from whatever was showing when we queued it) — which is now the
+      // `queued`/`running` one, the moment the command lands. From there the
+      // reported status drives the spinner (repoBlock), so this record only has
+      // to cover the gap before the agent has answered at all.
       const a = byHost.get(p.host);
       const r = a && (a.prunes || []).find(x => x.repo === p.repo);
       if (r && r.at !== p.prevAt) pending.delete(key);
@@ -799,7 +804,10 @@ function prBadgeHtml(pr) {
   if (!pr) return "";
   const url = pr.url || "";
   const m = url.match(/\/pull\/(\d+)|\/-\/merge_requests\/(\d+)|\/pullrequest\/(\d+)/i);
-  const num = pr.number ? "#" + pr.number : (m ? "#" + (m[1] || m[2] || m[3]) : "PR");
+  // GitLab and Azure DevOps number their requests !n, not #n (in ADO #n is a
+  // WORK ITEM) — the sigil follows the URL's platform, mirroring _pr_ref.
+  const sigil = m && !m[1] ? "!" : "#";
+  const num = pr.number ? sigil + pr.number : (m ? sigil + (m[1] || m[2] || m[3]) : "PR");
   const state = String(pr.state || "").toUpperCase();
   const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
   const label = state ? state[0] + state.slice(1).toLowerCase() : "";
@@ -1250,15 +1258,20 @@ function repoBlock(a, repo, sessList, now) {
     : "";
   // Prune: sweep this repo's merged worktrees + branches (non-root only). Arms
   // on first click, confirms on the second; a busy spinner until the result lands.
-  const pruning = pending.has(pendKey("prune", a.key, repo.name));
+  // The agent runs the sweep on a worker thread (XERK-256) and reports it as
+  // queued/running with progress, so the spinner is driven by the AGENT's state
+  // as well as the local pending record — a sweep is minutes long on a big repo,
+  // far past PENDING_TTL_MS, and the button must stay busy for all of it.
+  const pruneRes = (a.prunes || []).find(p => p.repo === repo.name);
+  const pruneLive = pruneRes && (pruneRes.status === "running" || pruneRes.status === "queued");
+  const pruning = pruneLive || pending.has(pendKey("prune", a.key, repo.name));
   const pruneArmed = confirming.has("prune::" + a.key + "::" + repo.name);
   const canPrune = a.online && !repo.missing && !repo.isRoot;
   const pruneBtn = canPrune
     ? `<button class="btn-sm ${pruneArmed ? "confirm" : ""}" title="Remove merged branches and worktrees" ${pruning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();pruneRepo('${escJs(a.key)}','${escJs(repo.name)}')">${pruning ? '<span class="spin"></span> Pruning…' : pruneArmed ? "Confirm prune" : "Prune"}</button>`
     : "";
-  const pruneRes = (a.prunes || []).find(p => p.repo === repo.name);
   const pruneNote = pruneRes
-    ? `<div class="prune-note ${pruneRes.status === "error" ? "err" : ""}">${esc(pruneRes.status === "error" ? (pruneRes.error || "prune failed") : pruneRes.summary || "pruned")}</div>`
+    ? `<div class="prune-note ${pruneRes.status === "error" ? "err" : pruneLive ? "run" : ""}">${esc(pruneRes.status === "error" ? (pruneRes.error || "prune failed") : pruneRes.summary || "pruned")}</div>`
     : "";
   const resumePanel = canResume && resumeOpen.has(rkey)
     ? `<div class="resume-list">${(resumable || legacyClosed).map(item => {
@@ -1499,18 +1512,46 @@ function sessCard(a, s, now) {
 
 // ---- actions → endpoints ---------------------------------------------------
 function enc(s) { return encodeURIComponent(s); }
-// Returns the parsed JSON reply (or null if it isn't JSON) — the spawn/resume
-// endpoints answer with the queued command's `cmdId`, which followToSessions()
-// hands the sessions page so it can open the session that command creates.
-async function post(url, body) {
-  const res = await fetch(url, body
-    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
-    : { method: "POST" });
+// The page's failures all go through the chrome's one toast (XERK-264), so a
+// refused command reads the same here and on the Sessions page.
+function toast(msg) {
+  if (window.TurmaNav && TurmaNav.toast) TurmaNav.toast(msg);
+}
+// Fire a command at the hub. Resolves to the parsed JSON reply on success (`{}`
+// when the reply wasn't JSON) — the spawn/resume endpoints answer with the
+// queued command's `cmdId`, which followToSessions() hands the sessions page so
+// it can open the session that command creates.
+//
+// **Null means the hub refused it, and the operator has already been told.**
+// The status used to be ignored entirely (XERK-264), so a 409/413/429/503 was
+// parsed for a cmdId that wasn't there and the click looked like it worked. Now
+// every refusal raises the hub's own explanation through the shared toast, and
+// callers that painted something optimistically roll it back on a null.
+// `what` names the action for that notice ("Clone", "Prune", …).
+async function post(url, body, what) {
+  let res;
+  try {
+    res = await fetch(url, body
+      ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+      : { method: "POST" });
+  } catch {
+    toast(what ? `${what} failed — the hub is unreachable` : "The hub is unreachable");
+    return null;
+  }
+  // An expired login is the one failure with somewhere better to go than a
+  // toast: the whole page is dead until it's renewed.
+  if (res.status === 401) { location.href = "/login"; return null; }
   let out = null;
   try { out = await res.json(); } catch { /* not JSON — nothing to correlate */ }
   refresh();
   fastPoll();
-  return out;
+  if (!res.ok) {
+    toast(window.TurmaNav && TurmaNav.refusalText
+      ? TurmaNav.refusalText(what, res.status, out)
+      : `${what || "That"} failed`);
+    return null;
+  }
+  return out || {};
 }
 // Starting or resuming a session is a "go work in it" action, so hand off to the
 // sessions page and let it open the session. The id doesn't exist yet — the
@@ -1520,7 +1561,24 @@ async function post(url, body) {
 function followToSessions(cmdId) {
   if (cmdId) location.href = `/sessions?spawn=${enc(cmdId)}`;
 }
-async function del(url) { await fetch(url, { method: "DELETE" }); refresh(); fastPoll(); }
+// DELETE's half of post(): same refusal contract, same toast, same null.
+async function del(url, what) {
+  let res;
+  try { res = await fetch(url, { method: "DELETE" }); }
+  catch { toast(what ? `${what} failed — the hub is unreachable` : "The hub is unreachable"); return null; }
+  if (res.status === 401) { location.href = "/login"; return null; }
+  let out = null;
+  try { out = await res.json(); } catch { /* not JSON */ }
+  refresh();
+  fastPoll();
+  if (!res.ok) {
+    toast(window.TurmaNav && TurmaNav.refusalText
+      ? TurmaNav.refusalText(what, res.status, out)
+      : `${what || "That"} failed`);
+    return null;
+  }
+  return out || {};
+}
 
 // Two-click arm/confirm for destructive actions. The armed state lives in the
 // module-level `confirming` map so the 5s re-render keeps the button armed.
@@ -1535,7 +1593,7 @@ function twoClick(actionKey, doIt) {
   doIt();
 }
 
-function removeHost(key)  { del(`/api/agents/${enc(key)}`); }
+function removeHost(key)  { del(`/api/agents/${enc(key)}`, "Remove host"); }
 
 // Restart a host's agent manager (XERK-157). Arm/confirm first, then POST; the
 // pending state captures the current startedAt so reconcilePending can clear the
@@ -1546,7 +1604,7 @@ function restartHost(key) {
     const host = (cache.agents || []).find(a => a.key === key);
     busy(pendKey("restartAgent", key, "_"),
       { kind: "restartAgent", host: key, startedAt: host ? host.startedAt : null },
-      () => post(`/api/agents/${enc(key)}/restart`));
+      () => post(`/api/agents/${enc(key)}/restart`, null, "Restart"));
   });
 }
 
@@ -1557,7 +1615,15 @@ function busy(key, val, run) {
   if (pending.has(key)) return;
   setPending(key, val);
   render(cache);
-  run();
+  // A refused command never reached the agent, so drop the optimistic row the
+  // click painted: left up it reads as a command still in flight, and sits
+  // there for the whole PENDING_TTL_MS. Runners resolve the post()'s reply, so
+  // a falsy result is exactly "the hub said no" (or the fetch never landed).
+  Promise.resolve(run()).then((ok) => {
+    if (ok) return;
+    pending.delete(key);
+    render(cache);
+  });
 }
 // Clone the selected repos into a host's REPOS_ROOT. Every checked repo plus a
 // non-empty free-text owner/repo box (always GitHub) is queued as its own clone
@@ -1582,7 +1648,7 @@ function cloneRepo(key) {
     if (!name) continue;
     const body = spec.source ? { repo: spec.repo, source: spec.source } : { repo: spec.repo };
     busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec.repo },
-      () => post(`/api/agents/${enc(key)}/clone`, body));
+      () => post(`/api/agents/${enc(key)}/clone`, body, "Clone"));
   }
   cloneDraft.set(key, {}); // clear search/picks/box; progress shows as clone-job rows
   render(cache);
@@ -1619,20 +1685,24 @@ function startSession(key, repo) {
   composerDraft.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/sessions`, body)
-      .then(r => followToSessions(r && r.cmdId)));
+    // The reply is returned so busy() can drop the "starting…" row on a refusal.
+    () => post(`/api/agents/${enc(key)}/sessions`, body, "Start")
+      .then(r => { followToSessions(r && r.cmdId); return r; }));
 }
 function sessStart(key, id) {
   busy(pendKey("start", key, id), { kind: "start", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`, null, "Start"));
 }
 // Bring back a KILLED session (from the repo's Resume picker) on its kept
 // branch with its prior conversation. Not destructive, so no arm/confirm.
 function resumeSession(key, id) {
   busy(pendKey("resume", key, id), { kind: "resume", host: key, id },
     // A killed session keeps its id, so the sessions page can wait on it by id.
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`)
-      .then(() => { location.href = `/sessions?session=${enc(id)}`; }));
+    // Only follow a resume the hub took: a refusal leaves the operator here,
+    // with the toast saying why, rather than on a session page that has nothing
+    // to open (XERK-264).
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`, null, "Resume")
+      .then(r => { if (r) location.href = `/sessions?session=${enc(id)}`; return r; }));
 }
 // Resume ANY prior Claude session by its transcript id (the broadened picker,
 // repo.resumable). The origin cwd is looked up from cached state (kept out of
@@ -1649,8 +1719,8 @@ function resumeTranscript(key, transcriptId) {
   }
   const baseline = a ? (a.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("resume", key, transcriptId), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd })
-      .then(r => followToSessions(r && r.cmdId)));
+    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd }, "Resume")
+      .then(r => { followToSessions(r && r.cmdId); return r; }));
 }
 // The destructive three still arm/confirm first; the pending state begins only
 // once confirmed (inside doIt), so it reflects a real in-flight command.
@@ -1662,16 +1732,16 @@ function sessRestart(key, id) {
     const host = (cache.agents || []).find(a => a.key === key);
     const sess = host && (host.sessions || []).find(s => s.id === id);
     busy(pendKey("restart", key, id), { kind: "restart", host: key, id, restartCount: sess && sess.restartCount != null ? sess.restartCount : null },
-      () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`));
+      () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`, null, "Restart"));
   });
 }
 function sessKill(key, id) {
   twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`)));
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
 }
 function sessDelete(key, id) {
   twoClick("sd::" + key + "::" + id, () => busy(pendKey("delete", key, id), { kind: "delete", host: key, id },
-    () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`)));
+    () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`, "Delete")));
 }
 // Prune a repo's finished work on a host: the agent removes worktrees whose
 // commits are merged into the latest default branch and deletes merged branches
@@ -1683,7 +1753,7 @@ function pruneRepo(key, repo) {
     const prev = host && (host.prunes || []).find(p => p.repo === repo);
     busy(pendKey("prune", key, repo),
       { kind: "prune", host: key, repo, prevAt: prev ? prev.at : null },
-      () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/prune`));
+      () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/prune`, null, "Prune"));
   });
 }
 

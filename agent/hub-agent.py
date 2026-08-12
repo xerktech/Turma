@@ -408,15 +408,32 @@ def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
 
 
-def run(cmd, cwd=None):
-    """Run a command, return stripped stdout or '' on any failure."""
+def run(cmd, cwd=None, timeout=15):
+    """Run a command, return stripped stdout or '' on any failure.
+
+    Failure and "no output" are the SAME answer here, so callers that must tell
+    them apart (a `git status --porcelain` deciding a worktree is clean, say)
+    want run_out instead."""
     try:
         out = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=15
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
         )
         return out.stdout.strip() if out.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def run_out(cmd, cwd=None, timeout=15):
+    """Run a command, return (rc, stripped stdout). rc is None if it couldn't
+    launch or timed out — the distinction run() collapses, and the one that
+    matters when EMPTY output is itself a verdict."""
+    try:
+        out = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        )
+        return out.returncode, (out.stdout or "").strip()
+    except Exception:
+        return None, ""
 
 
 def run_stdin(cmd, data, timeout=15):
@@ -2004,8 +2021,11 @@ MR_URL_RE = re.compile(r"https://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/
 # `git push` hint ends in `/pullrequestcreate?sourceRef=…` — a link to the
 # CREATE form, which the `/<digits>` deliberately doesn't match, exactly as
 # GitLab's `/merge_requests/new` doesn't.
+# http as well as https: an on-prem collection is routinely served over plain
+# http on the LAN, and a scheme-only mismatch would drop the chip in silence on
+# exactly the deployment this half exists for.
 AZDO_PR_URL_RE = re.compile(
-    r"https://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
+    r"https?://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
     re.IGNORECASE)
 # The pull-request id inside such a URL, for the places that need the number
 # without re-deciding whether the URL is ours.
@@ -2017,9 +2037,67 @@ AZDO_PR_URL_ID_RE = re.compile(r"/pullrequest/(\d+)", re.IGNORECASE)
 # PR/MR as its own output, and that pairing — this command, this output — is
 # the only thing in a transcript that says the session opened the PR rather
 # than merely looked at one. See _scan_pr_line.
-PR_CREATE_RE = re.compile(
-    r"\bgh\s+pr\s+create\b|\bglab\s+mr\s+create\b|\bmerge_request\.create\b"
-    r"|\baz\s+repos\s+pr\s+create\b")
+#
+# An on-prem Azure DevOps Server host has NO vendor CLI to name here: the
+# `azure-devops` az extension refuses a self-hosted collection outright ("works
+# only with Azure DevOps Services"), so those hosts open their PRs through a
+# local wrapper over the REST API. `ado pr-create` is the common spelling and
+# is built in; TURMA_PR_CREATE_CMDS registers any other wrapper, so a host
+# whose PRs are opened by its own tool still gets chips.
+PR_CREATE_CMDS = os.environ.get("TURMA_PR_CREATE_CMDS", "")
+
+# An entry whose longest word is shorter than this is ignored: a one- or
+# two-character token matches half the commands a session runs, and attribution
+# failing OPEN hangs other people's PRs on this session's card.
+PR_CREATE_CMD_MIN = 3
+
+# The built-in creating commands, as (word, ...) prefixes. A wrapper is named
+# with and without the `.py` its script carries, because a host that loses it
+# from PATH runs it as `python3 .../ado.py pr-create` — the same PR, opened the
+# same way, and silently unchipped if only the bare name were known.
+PR_CREATE_BUILTINS = (
+    ("gh", "pr", "create"),
+    ("glab", "mr", "create"),
+    ("az", "repos", "pr", "create"),
+    ("ado", "pr-create"),
+    ("ado.py", "pr-create"),
+)
+
+
+def _pr_create_alt(words):
+    """One alternative matching `words` as a whole command: every word escaped
+    and matched literally, the run anchored so it can only be a whole command.
+
+    The anchors exclude `-` as well as word characters, so this can't match the
+    tail of `run-mkpr` or the head of `mkpr-old`; the trailing one excludes `.`
+    too, so `ado.py pr-create.md` is a filename, not a create. The leading one
+    deliberately does NOT, since a path-qualified `./mkpr` or
+    `~/.local/bin/ado` is the same command."""
+    return (r"(?<![\w-])" + r"\s+".join(re.escape(w) for w in words)
+            + r"(?![\w.-])")
+
+
+def _pr_create_pattern(extra=""):
+    """The PR_CREATE_RE source: the built-in creating commands, plus one
+    alternative per comma-separated entry in `extra`.
+
+    Each entry is a whitespace-separated command prefix (`mkpr`, `tfs pr new`)
+    and goes through the same literal, anchored treatment as a built-in, so
+    nothing free-form reaches the regex engine. An entry that is blank or
+    shorter than PR_CREATE_CMD_MIN widens nothing."""
+    pats = [_pr_create_alt(w) for w in PR_CREATE_BUILTINS]
+    pats.append(r"\bmerge_request\.create\b")   # a push OPTION, not a command
+    for entry in (extra or "").split(","):
+        words = entry.split()
+        # The LONGEST word, not the joined length: `a b` is three characters
+        # but still two one-character tokens, and would match `cat a b`.
+        if not words or max(len(w) for w in words) < PR_CREATE_CMD_MIN:
+            continue
+        pats.append(_pr_create_alt(words))
+    return "|".join(pats)
+
+
+PR_CREATE_RE = re.compile(_pr_create_pattern(PR_CREATE_CMDS))
 # Unresolved `gh pr create` tool_use ids remembered per session between beats.
 # Capped: a call whose result never lands (the turn was interrupted, the pane
 # died) must not grow the set for the life of the session.
@@ -2175,17 +2253,30 @@ def pr_status(url):
 
 def _mr_url_parts(url):
     """(project_path, iid) when `url` is a merge-request URL under the
-    configured GITLAB_URL, else None. Prefix-matched against gitlab_base() so a
+    configured GITLAB_URL, else None. Matched against gitlab_base()'s host so a
     GitLab installed under a subpath still resolves its project path; an MR on
     any OTHER GitLab host stays None — this host holds no credential for it,
-    so its chip renders as a bare link, like a PR gh can't see."""
+    so its chip renders as a bare link, like a PR gh can't see.
+
+    The match is on the HOST(:port), case-insensitively, ignoring the scheme —
+    not a byte-for-byte URL prefix. Hostnames are case-insensitive and a
+    GITLAB_URL configured as `http://` (or with odd casing) still names the
+    same GitLab the MR lives on; an exact-prefix compare silently left every
+    attributed MR a bare link chip forever over such a mismatch."""
     base = gitlab_base()
     if not base or not gitlab_configured():
         return None
-    u = str(url or "")
-    if not u.startswith(base + "/"):
+    bm = re.match(r"^[a-zA-Z][\w.+-]*://([^/]+)(/.*)?$", base)
+    um = re.match(r"^https?://([^/]+)(/.+)$", str(url or ""))
+    if not bm or not um or bm.group(1).lower() != um.group(1).lower():
         return None
-    m = re.match(r"(.+?)/-/merge_requests/(\d+)$", u[len(base) + 1:])
+    tail = um.group(2)
+    bpath = (bm.group(2) or "").rstrip("/")
+    if bpath:
+        if not tail.lower().startswith(bpath.lower() + "/"):
+            return None
+        tail = tail[len(bpath):]
+    m = re.match(r"/(.+?)/-/merge_requests/(\d+)$", tail)
     if not m:
         return None
     return m.group(1), m.group(2)
@@ -2207,6 +2298,21 @@ def _mr_check_class(status):
     return None
 
 
+# How detailed_merge_status buckets into GitHub's three-value mergeability.
+# GitHub's `mergeable` answers ONE question — do the branches conflict? —
+# while GitLab's enum also reports approvals, discussions, CI and workflow
+# gates. Bucketing anything non-mergeable to UNKNOWN left every healthy MR at
+# ● forever (not_approved, ci_still_running …) where the equivalent GitHub PR
+# shows ✓. So: only the git-level can't-merge states are CONFLICTING, only the
+# still-computing states are UNKNOWN, and every OTHER known status means the
+# branches themselves merge — MERGEABLE, exactly what GitHub would say. An
+# unrecognized future status lands in MERGEABLE by that same logic (it exists
+# because the merge-check RAN); only absence stays UNKNOWN.
+_MR_CONFLICT_STATUSES = {"conflict", "broken_status", "cannot_be_merged"}
+_MR_UNVERIFIED_STATUSES = {"checking", "unchecked", "preparing",
+                           "approvals_syncing"}
+
+
 def _summarize_mr(data):
     """Condense a GitLab merge-request API payload into the SAME compact status
     dict _summarize_pr builds, so every renderer treats an MR chip exactly like
@@ -2214,10 +2320,9 @@ def _summarize_mr(data):
     (draft→DRAFT), merged→MERGED, closed→CLOSED, locked→OPEN (a transient
     in-between); the head pipeline is the whole CI rollup (GitLab exposes no
     per-check rollup on the MR itself), one entry classed by _mr_check_class;
-    mergeability comes from detailed_merge_status ("mergeable"→MERGEABLE,
-    "conflict"→CONFLICTING, anything else UNKNOWN — unproven is not proven,
-    exactly the discipline _merge_ready applies to GitHub's UNKNOWN), with the
-    older merge_status can/cannot_be_merged as the fallback vocabulary."""
+    mergeability comes from detailed_merge_status, bucketed by
+    _MR_CONFLICT_STATUSES/_MR_UNVERIFIED_STATUSES, with the older merge_status
+    can/cannot_be_merged as the fallback vocabulary."""
     raw_state = str(data.get("state") or "").lower()
     state = {"opened": "OPEN", "locked": "OPEN", "merged": "MERGED",
              "closed": "CLOSED"}.get(raw_state, raw_state.upper())
@@ -2236,9 +2341,13 @@ def _summarize_mr(data):
                   else "pending" if counts["pending"] else "passing")
     detailed = str(data.get("detailed_merge_status") or "").lower()
     legacy = str(data.get("merge_status") or "").lower()
-    if detailed == "mergeable" or (not detailed and legacy == "can_be_merged"):
+    if detailed in _MR_CONFLICT_STATUSES:
+        mergeable = "CONFLICTING"
+    elif detailed and detailed not in _MR_UNVERIFIED_STATUSES:
         mergeable = "MERGEABLE"
-    elif detailed == "conflict" or (not detailed and legacy == "cannot_be_merged"):
+    elif not detailed and legacy == "can_be_merged":
+        mergeable = "MERGEABLE"
+    elif not detailed and legacy == "cannot_be_merged":
         mergeable = "CONFLICTING"
     else:
         mergeable = "UNKNOWN"
@@ -3321,7 +3430,8 @@ def _scan_pr_line(raw, state, report):
 
     Attribution is deliberately narrow: a URL counts only when it comes back in
     a PR/MR-creating call's OWN tool_result (`gh pr create`, `glab mr create`,
-    `az repos pr create`, or a `git push` carrying the `merge_request.create`
+    `az repos pr create`, `ado pr-create`, a host wrapper registered via
+    TURMA_PR_CREATE_CMDS, or a `git push` carrying the `merge_request.create`
     push option — see PR_CREATE_RE) — i.e. the session literally opened that PR. A PR link reaches a transcript a dozen other ways (`gh pr
     list`/`view`/`checks` output, a link the operator pasted, the model quoting
     a PR another session opened), and taking any of those as "this session's
@@ -3343,7 +3453,7 @@ def _scan_pr_line(raw, state, report):
 # PR's browser link is built on. Anchored whole so nothing but a repo root is
 # ever extended into a PR link.
 AZDO_REPO_WEB_RE = re.compile(
-    r"^https://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
+    r"^https?://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
 # `{` probes tried when looking for a JSON object in a tool result. The az
 # output starts with one, so a real create hits on the first; the cap keeps a
 # result that is merely full of braces from costing a re-parse per brace.
@@ -3390,9 +3500,11 @@ def _azdo_created_pr_url(text):
     if not isinstance(repo, dict) or not isinstance(pr_id, int):
         return None
     web = str(repo.get("webUrl") or repo.get("remoteUrl") or "").strip()
-    # `remoteUrl` can carry a `user@` prefix on some collections; the link the
-    # chip points at must not.
-    web = re.sub(r"^(https://)[^/@]+@", r"\1", web).rstrip("/")
+    # ADO's `remoteUrl` carries an `<org>@` prefix, and the az extension's SDK
+    # has no `webUrl` field at all, so this strip is on the ONLY path a vendor
+    # create can take. It must know both schemes, or a plain-http on-prem
+    # collection composes nothing and the chip is dropped in silence.
+    web = re.sub(r"^(https?://)[^/@]+@", r"\1", web, flags=re.IGNORECASE).rstrip("/")
     if not AZDO_REPO_WEB_RE.match(web):
         return None
     return f"{web}/pullrequest/{pr_id}"
@@ -5263,7 +5375,14 @@ GH_ORG_MAX = 20             # orgs to auto-sweep for repos (bounds the gh calls)
 CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
 CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
 CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
-PRUNE_RESULT_LINGER_SEC = 60  # keep a repo's prune summary in the heartbeat
+PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the heartbeat
+# A prune runs on its own worker thread (XERK-256), so its git commands are NOT
+# on the heartbeat's critical path and can be bounded generously instead of
+# short: a single `git worktree remove` of a node_modules-carrying tree on a ZFS
+# pool was measured at 10-37s, and reaping one mid-removal at run()'s 15s default
+# turned a removable worktree into a "kept" one on every sweep.
+PRUNE_GIT_TIMEOUT_SEC = 600
+PRUNE_QUEUE_MAX = 64          # repos that may be waiting on the prune worker
 # A GitHub owner or repo-name segment: alnum start, then GitHub's own limited
 # set. Deliberately strict — the result becomes part of a URL and a path.
 _GH_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -8411,9 +8530,21 @@ class SessionManager:
         # or on a hub `refreshJira` command, reported every beat; stays the
         # empty shape on unconfigured hosts).
         self.jira = board_empty()
-        # Recent per-repo prune results (merged branches + safe worktrees swept),
-        # keyed by repo name, lingered briefly so the UI can show the summary.
+        # Per-repo prune state (merged branches + safe worktrees swept), keyed by
+        # repo name: queued/running while the worker is on it, then the summary
+        # lingered briefly so the UI can show it. Written by the prune WORKER
+        # thread and read by the beat, so every touch holds _prune_lock.
         self.prunes = {}
+        self._prune_lock = threading.Lock()
+        self._prune_queue = deque()   # repo names the worker has yet to reach
+        self._prune_worker = None
+        # Worktrees the worker removed, drained by _poll_prunes. self.closed is
+        # the BEAT's to mutate — the worker only ever names paths for it.
+        self._prune_swept = []
+        # Worktrees a `git worktree remove` is running against RIGHT NOW. The
+        # resume paths refuse a cwd listed here (_claim_worktree), so a session
+        # can't be launched into a directory that is halfway unlinked.
+        self._prune_removing = set()
         # In-flight session-summary subprocesses keyed by session id (the Popen
         # + its output file live here; the finished text lands on the session
         # record). Empty when no session has a prompt to summarize.
@@ -9464,6 +9595,14 @@ class SessionManager:
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
         )
+        # glab reads its default host from GITLAB_HOST — never the agent's own
+        # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
+        # can't auth without this, falls back to a raw API call, and the MR
+        # never gets a chip (_scan_pr_line only attributes the creating
+        # command's own tool_result). Sessions already inherit GITLAB_TOKEN
+        # from the manager env; an operator-set GITLAB_HOST wins.
+        if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
+            env_prefix += f"GITLAB_HOST={shlex.quote(gitlab_base())} "
         claude_cmd = env_prefix + claude_cmd
         if local_env_file:
             # SOURCED, never inlined and never passed as `tmux -e`: both put the
@@ -10136,7 +10275,11 @@ class SessionManager:
             "stoppedAt": None,
             "errorMsg": None,
         }
-        self.registry.append(sess)
+        # A prune removing this very worktree would leave claude running in a
+        # half-unlinked dir, so the registration and that check are one step.
+        if not self._claim_worktree(sess["worktreePath"], sess):
+            log(f"resume refused: {sess['worktreePath']} is being pruned")
+            return
         self.closed = [c for c in self.closed if c.get("id") != sid]
         try:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
@@ -10296,7 +10439,12 @@ class SessionManager:
             "errorMsg": None,
             "spawnCmdId": cmd_id,
         }
-        self.registry.append(sess)
+        # Same handshake as resume(): never register onto a worktree a prune is
+        # removing right now — the dir still exists for most of that removal, so
+        # the isdir check below would skip the re-add and launch into it.
+        if not self._claim_worktree(cwd, sess):
+            log(f"resume refused: {cwd} is being pruned")
+            return None
         try:
             # A deleted/pruned Turma worktree (or a migrated session, whose
             # worktree only ever existed on the source host): re-add a detached
@@ -13017,11 +13165,12 @@ class SessionManager:
 
     # --- prune merged branches + safe worktrees ----------------------------
 
-    def _repo_worktrees(self, repo_path):
+    def _repo_worktrees(self, repo_path, timeout=15):
         """Parse `git worktree list --porcelain` into [{path, head, branch}].
         branch is the short name or None when detached; the main checkout is
         included (callers filter it out by path)."""
-        out = run(["git", "-C", repo_path, "worktree", "list", "--porcelain"])
+        out = run(["git", "-C", repo_path, "worktree", "list", "--porcelain"],
+                  timeout=timeout)
         trees, cur = [], None
         for line in out.splitlines():
             if line.startswith("worktree "):
@@ -13037,26 +13186,169 @@ class SessionManager:
         return trees
 
     def prune_repo(self, repo_name):
+        """QUEUE a repo for the prune worker and return — the sweep itself is
+        _run_prune, on its own thread.
+
+        It used to run inline here, on the heartbeat loop, and a sweep is minutes
+        of git on a real repo: 31 `git worktree remove`s measured at 10-37s each
+        on a ZFS pool carrying node_modules, i.e. ~20 minutes of one blocked loop
+        for a single repo. The hub marks a host offline after 75s of silence
+        (OFFLINE_AFTER_MS), so every prune past a minute greyed the host's
+        sessions out and made its terminals read unreachable — a fleet-wide sweep
+        took truenas dark for ~50 minutes (XERK-256). Off the beat, the host keeps
+        heartbeating and publishes `running` + progress instead of going dark.
+
+        ONE worker, FIFO across repos, deliberately: per-repo threads would put
+        several `worktree remove`s on the same spindle at once, which is what
+        makes each one slow to begin with. A repo already queued or running is
+        not stacked again — its record's `at` is re-stamped so the click still
+        registers on the dashboard."""
+        repo_name = (repo_name or "").strip()
+        if not repo_name:
+            log("prune refused: no repo named")
+            return
+        with self._prune_lock:
+            cur = self.prunes.get(repo_name)
+            if cur and cur.get("status") in ("queued", "running"):
+                cur["at"] = now_iso()
+                log(f"prune {repo_name}: already {cur['status']}")
+                return
+            if len(self._prune_queue) >= PRUNE_QUEUE_MAX:
+                self.prunes[repo_name] = {
+                    "repo": repo_name, "status": "error", "at": now_iso(),
+                    "error": "too many prunes queued", "summary": "prune queue full",
+                    "removedWorktrees": 0, "deletedBranches": 0,
+                    "skippedWorktrees": 0, "finishedMono": time.time()}
+                log(f"prune refused: queue full ({repo_name})")
+                return
+            self.prunes[repo_name] = {
+                "repo": repo_name, "status": "queued", "at": now_iso(),
+                "error": None, "summary": "queued for pruning",
+                "removedWorktrees": 0, "deletedBranches": 0,
+                "skippedWorktrees": 0, "finishedMono": None}
+            self._prune_queue.append(repo_name)
+            worker = self._prune_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._prune_worker_loop, name="prune-worker",
+                    daemon=True)
+                self._prune_worker = worker
+                worker.start()
+
+    def _prune_worker_loop(self):
+        """Drain the queue one repo at a time, then exit — the next command
+        starts a fresh worker. Clearing _prune_worker under the same lock the
+        enqueue takes is what makes that handoff lossless.
+
+        Daemon, and never joined on shutdown: a prune is idempotent, so a sweep
+        cut short by a restart is simply re-run, and making the manager wait
+        minutes to exit would recreate the outage this moved off the beat."""
+        while True:
+            with self._prune_lock:
+                if not self._prune_queue:
+                    self._prune_worker = None
+                    return
+                repo_name = self._prune_queue.popleft()
+            try:
+                self._run_prune(repo_name)
+            except Exception as e:
+                log(f"prune {repo_name} failed: {e}")
+                self._finish_prune(repo_name, "error", str(e), "prune failed")
+
+    def _publish_prune(self, repo_name, **fields):
+        """Merge fields into a repo's prune record. Every touch of self.prunes
+        holds the lock: the worker writes it while the beat reads it, and a bare
+        `list(self.prunes)` on the beat would raise mid-insert."""
+        with self._prune_lock:
+            rec = self.prunes.setdefault(repo_name, {"repo": repo_name})
+            rec.update(fields)
+            rec["at"] = now_iso()
+
+    def _finish_prune(self, repo_name, status, error, summary, **fields):
+        """Publish a terminal prune record. `finishedMono` is what starts the
+        linger clock, so ONLY a finished prune carries it — a running sweep must
+        never age out of the heartbeat mid-flight."""
+        self._publish_prune(repo_name, status=status, error=error,
+                            summary=summary, finishedMono=time.time(), **fields)
+        if status == "done":
+            log(f"pruned {repo_name}: {summary}")
+        else:
+            log(f"prune {repo_name}: {error or summary}")
+
+    def _live_worktree_paths(self):
+        """Worktrees currently backing a registry record, read fresh. list()
+        copies the registry in one C-level step, which is what makes this safe to
+        call from the prune worker while the beat mutates sessions."""
+        return {s.get("worktreePath") for s in list(self.registry)}
+
+    def _claim_for_removal(self, path):
+        """Prune-worker side of the removal handshake: take `path` if no session
+        holds it, marking it as being-removed so the beat can't claim it while
+        `git worktree remove` runs. False = a session has it; leave it alone.
+
+        Reading the registry INSIDE the lock is the whole point. `worktree
+        remove` takes 10-37s on a real pool, and for almost all of that the dir
+        still exists — so a resume landing mid-removal would see `os.path.isdir`
+        True, skip _worktree_add, and launch claude into a directory about to be
+        unlinked. A bare check before the removal doesn't close that: only
+        pairing it with the beat's own claim under ONE lock does."""
+        with self._prune_lock:
+            if path in {s.get("worktreePath") for s in list(self.registry)}:
+                return False
+            self._prune_removing.add(path)
+            return True
+
+    def _release_removal(self, path):
+        with self._prune_lock:
+            self._prune_removing.discard(path)
+
+    def _claim_worktree(self, path, sess):
+        """Beat side of that handshake: register `sess` unless a prune is
+        removing its worktree right now. The registry append happens INSIDE the
+        lock — a check that merely preceded the append would let the worker claim
+        in between, which is the race this exists to close.
+
+        Only the resume paths need it. A spawn mints a fresh random path, and a
+        stopped session's record is still in the registry, so a prune never
+        considers either."""
+        with self._prune_lock:
+            if path in self._prune_removing:
+                return False
+            self.registry.append(sess)
+            return True
+
+    def _run_prune(self, repo_name):
         """Sweep a repo's finished work: remove session worktrees whose commits
         are fully merged into the latest default branch (skipping any still
         backing a hub session or holding uncommitted changes), then delete local
         branches merged into that default (this also clears branches whose PR was
         merged and remote deleted). Nothing unmerged or dirty is ever touched, so
-        no in-progress work is lost. The summary rides the heartbeat briefly."""
+        no in-progress work is lost. Progress rides the heartbeat as it goes.
+
+        Runs on the prune worker, never the beat (see prune_repo), which is what
+        these two rules are about — the beat is now free to change things
+        underneath a sweep:
+
+        * The live-worktree set is re-read before EVERY removal, never
+          snapshotted once. Resuming a killed session RE-CREATES its worktree at
+          the very path a sweep already listed as removable, and a spawn/migrate
+          can land mid-sweep too.
+        * self.closed is not touched here. Removed paths go on _prune_swept and
+          _poll_prunes folds them in on the beat thread, which owns that list —
+          rebinding it from here would drop a concurrent append."""
         repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
         if not repo:
-            self.prunes[repo_name] = {
-                "repo": repo_name, "status": "error", "at": now_iso(),
-                "error": f"unknown repo {repo_name!r}", "summary": "unknown repo",
-                "finishedMono": time.time()}
-            log(f"prune refused: unknown repo {repo_name!r}")
+            self._finish_prune(repo_name, "error", f"unknown repo {repo_name!r}",
+                               "unknown repo")
             return
         path = repo["path"]
+        self._publish_prune(repo_name, status="running", summary="pruning…")
         default = default_branch_name(path)
         # Refresh remote-tracking refs so "merged into main" reflects upstream.
-        # Short-bounded: prune runs on the main loop, so a slow fetch must not
-        # stall the heartbeat — a stale/failed fetch just compares against the
-        # refs we already have.
+        # Still short-bounded now that this is off the beat: one unreachable
+        # remote must not hold the worker (and every repo behind it in the
+        # queue), and a stale/failed fetch just compares against the refs we
+        # already have.
         if default and valid_ref_name(default):
             run_ok(["git", "-C", path, "fetch", "--prune", "origin"],
                    timeout=FETCH_TIMEOUT_SEC)
@@ -13066,53 +13358,78 @@ class SessionManager:
                 tip = cand
                 break
         if not tip:
-            self.prunes[repo_name] = {
-                "repo": repo_name, "status": "error", "at": now_iso(),
-                "error": "no default branch to compare against",
-                "summary": "no default branch — nothing pruned",
-                "finishedMono": time.time()}
-            log(f"prune {repo_name}: no default branch resolved")
+            self._finish_prune(repo_name, "error",
+                               "no default branch to compare against",
+                               "no default branch — nothing pruned")
             return
 
         wt_prefix = os.path.join(WORKTREES_ROOT, repo_name) + os.sep
-        live = {s.get("worktreePath") for s in self.registry}
+        # main checkout / another repo's trees — left alone, and out of the count.
+        trees = [wt for wt in self._repo_worktrees(path, timeout=PRUNE_GIT_TIMEOUT_SEC)
+                 if wt["path"].startswith(wt_prefix)]
         removed_wt, skipped_wt = 0, 0
-        for wt in self._repo_worktrees(path):
+        for i, wt in enumerate(trees, 1):
             p = wt["path"]
-            if not p.startswith(wt_prefix):
-                continue                      # main checkout / other repo — leave
-            if p in live:
+            self._publish_prune(
+                repo_name, status="running",
+                summary=f"pruning… worktree {i} of {len(trees)}",
+                removedWorktrees=removed_wt, skippedWorktrees=skipped_wt)
+            if p in self._live_worktree_paths():
                 continue                      # backs a hub session — never touch
-            if run(["git", "-C", p, "status", "--porcelain"]):
-                skipped_wt += 1               # uncommitted work — keep it
+            rc, dirty = run_out(["git", "-C", p, "status", "--porcelain"],
+                                timeout=PRUNE_GIT_TIMEOUT_SEC)
+            if rc != 0 or dirty:
+                skipped_wt += 1               # uncommitted work, or unreadable
                 continue
-            head = wt["head"]
-            merged = head and run_ok(
-                ["git", "-C", path, "merge-base", "--is-ancestor", head, tip])[0] == 0
+            # HEAD is re-read HERE and NEVER taken from the listing above. On a
+            # long sweep that listing is minutes old, and in between a session
+            # can be given work, COMMIT it and be killed — which keeps the
+            # worktree and takes it out of the live set. Judged by the stale HEAD
+            # it still looks merged, and the removal destroys commits reachable
+            # from no ref. A failed read reads as unmerged, so it keeps the tree.
+            rc, head = run_out(["git", "-C", p, "rev-parse", "HEAD"],
+                               timeout=PRUNE_GIT_TIMEOUT_SEC)
+            merged = rc == 0 and head and run_ok(
+                ["git", "-C", path, "merge-base", "--is-ancestor", head, tip],
+                timeout=PRUNE_GIT_TIMEOUT_SEC)[0] == 0
             if not merged:
                 skipped_wt += 1               # unmerged commits — keep it
                 continue
-            if run_ok(["git", "-C", path, "worktree", "remove", p])[0] == 0:
+            if not self._claim_for_removal(p):
+                continue                      # claimed while we were checking it
+            try:
+                rc = run_ok(["git", "-C", path, "worktree", "remove", p],
+                            timeout=PRUNE_GIT_TIMEOUT_SEC)[0]
+            finally:
+                self._release_removal(p)
+            if rc == 0:
                 removed_wt += 1
-                self.closed = [c for c in self.closed
-                               if c.get("worktreePath") != p]
+                with self._prune_lock:
+                    self._prune_swept.append(p)
             else:
                 skipped_wt += 1
-        run(["git", "-C", path, "worktree", "prune"])
+        run(["git", "-C", path, "worktree", "prune"], timeout=PRUNE_GIT_TIMEOUT_SEC)
 
         # Branches merged into the default tip are safe to delete; exclude the
         # default itself and any branch still checked out in a remaining worktree
         # (git would refuse those anyway). -D is safe here: we verified merged.
-        checked_out = {wt["branch"] for wt in self._repo_worktrees(path)
+        checked_out = {wt["branch"] for wt in
+                       self._repo_worktrees(path, timeout=PRUNE_GIT_TIMEOUT_SEC)
                        if wt.get("branch")}
         merged_out = run(["git", "-C", path, "branch", "--merged", tip,
-                          "--format", "%(refname:short)"])
+                          "--format", "%(refname:short)"],
+                         timeout=PRUNE_GIT_TIMEOUT_SEC)
+        candidates = [b for b in (x.strip() for x in merged_out.splitlines())
+                      if b and b != default and b != tip and b not in checked_out]
         deleted_br, kept_br = 0, 0
-        for b in merged_out.splitlines():
-            b = b.strip()
-            if not b or b == default or b == tip or b in checked_out:
-                continue
-            if run_ok(["git", "-C", path, "branch", "-D", b])[0] == 0:
+        for i, b in enumerate(candidates, 1):
+            self._publish_prune(
+                repo_name, status="running",
+                summary=f"pruning… branch {i} of {len(candidates)}",
+                removedWorktrees=removed_wt, skippedWorktrees=skipped_wt,
+                deletedBranches=deleted_br)
+            if run_ok(["git", "-C", path, "branch", "-D", b],
+                      timeout=PRUNE_GIT_TIMEOUT_SEC)[0] == 0:
                 deleted_br += 1
             else:
                 kept_br += 1
@@ -13122,27 +13439,37 @@ class SessionManager:
         summary = "removed " + " · ".join(bits)
         if skipped_wt:
             summary += f" · kept {skipped_wt} in-progress worktree" + ("" if skipped_wt == 1 else "s")
-        self.prunes[repo_name] = {
-            "repo": repo_name, "status": "done", "at": now_iso(),
-            "error": None, "summary": summary,
-            "removedWorktrees": removed_wt, "deletedBranches": deleted_br,
-            "skippedWorktrees": skipped_wt, "finishedMono": time.time()}
-        log(f"pruned {repo_name}: {summary}")
+        self._finish_prune(repo_name, "done", None, summary,
+                           removedWorktrees=removed_wt,
+                           deletedBranches=deleted_br,
+                           skippedWorktrees=skipped_wt)
 
     def _poll_prunes(self):
-        """Drop prune summaries once they've lingered past their window."""
+        """Beat-thread half of the prune: fold the worker's removals into
+        self.closed (which only this thread may rebind), then drop FINISHED
+        summaries once they've lingered past their window. A queued/running
+        record carries no finishedMono and so is never dropped mid-sweep."""
+        with self._prune_lock:
+            swept, self._prune_swept = self._prune_swept, []
+        if swept:
+            gone = set(swept)
+            self.closed = [c for c in self.closed
+                           if c.get("worktreePath") not in gone]
         now = time.time()
-        for repo in list(self.prunes):
-            if now - self.prunes[repo].get("finishedMono", now) > PRUNE_RESULT_LINGER_SEC:
-                self.prunes.pop(repo, None)
+        with self._prune_lock:
+            for repo in list(self.prunes):
+                fin = self.prunes[repo].get("finishedMono")
+                if fin is not None and now - fin > PRUNE_RESULT_LINGER_SEC:
+                    self.prunes.pop(repo, None)
 
     def _prunes_payload(self):
-        return [
-            {"repo": j.get("repo"), "status": j.get("status"),
-             "error": j.get("error"), "summary": j.get("summary"),
-             "at": j.get("at")}
-            for j in self.prunes.values()
-        ]
+        with self._prune_lock:
+            return [
+                {"repo": j.get("repo"), "status": j.get("status"),
+                 "error": j.get("error"), "summary": j.get("summary"),
+                 "at": j.get("at")}
+                for j in list(self.prunes.values())
+            ]
 
     # --- boot auto-resume --------------------------------------------------
 

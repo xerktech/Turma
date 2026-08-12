@@ -1842,13 +1842,34 @@ function sanitizeHeartbeat(payload, key) {
   // else bounds it.
   if (Array.isArray(payload.sessions)) {
     for (const s of payload.sessions) {
-      const live = s && typeof s === "object" ? s.session : null;
-      if (live && typeof live === "object" && "agents" in live) {
+      const live = objectish(s) ? s.session : null;
+      if (objectish(live) && "agents" in live) {
         live.agents = sanitizeLiveAgents(live.agents) || [];
       }
     }
   }
   return payload;
+}
+
+/**
+ * Is this a plain object — the thing a client that TYPED a field will accept?
+ *
+ * The one predicate every shape check in the coercion path goes through, because
+ * the obvious spelling is wrong in the same way every time: `typeof [] ===
+ * "object"`, so `!x || typeof x !== "object"` passes arrays straight through,
+ * and the follow-on `"k" in []` is false so an array is neither coerced nor
+ * rejected. Both escapes were measured the same way — the Android login probe
+ * decodes /api/agents, so one raw array anywhere in the payload reads as "Could
+ * not reach the hub" and the app cannot sign in at all.
+ *
+ * A `function` declaration, not a `const`: it is used ~70 lines ABOVE this point
+ * by `sanitizeHeartbeat`, and this file has already shipped a coercion that
+ * threw a ReferenceError at module init from exactly that pattern (a const in
+ * its temporal dead zone, swallowed by the restore's `catch {}` — see
+ * `normalizeRecord`'s ordering comment). Declarations hoist; consts do not.
+ */
+function objectish(x) {
+  return !!x && typeof x === "object" && !Array.isArray(x);
 }
 
 /**
@@ -1910,13 +1931,26 @@ function normalizeSessions(payload) {
   // `List<SessionInfo>` on Android, so a `null` or a bare string in the array is
   // as fatal as a wrong-typed field inside one — measured as a host silently
   // missing from the phone while the tile still counted it.
-  const bad = payload.sessions.some((s) => !s || typeof s !== "object");
-  if (bad) payload.sessions = payload.sessions.filter((s) => s && typeof s === "object");
+  if (!payload.sessions.every(objectish)) payload.sessions = payload.sessions.filter(objectish);
   for (const s of payload.sessions) {
     // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
     // never goes through that: idempotent, so running twice costs nothing.
+    //
+    // REWRITE a non-object `session`, never merely skip past it. `session` is
+    // typed `LiveSignals?` on Android, so any non-object is decode-fatal for
+    // the WHOLE /api/agents array — measured as the app unable to sign in at
+    // all, since the login probe decodes it and reads the throw as "Could not
+    // reach the hub". Skipping the sanitize is NOT enough: the raw value stays
+    // in the record and is what gets served. `null` is the "can't tell you"
+    // value every client already handles.
+    //
+    // An array is the case a bare `typeof live === "object"` guard misses, and
+    // `"agents" in []` is false, so it fell through both halves of the old
+    // test. Rewriting is safe here only because normalizeSessions runs PAST the
+    // AGENT_RECORD_MAX gate — see normalizeRecord's ordering comment.
+    if ("session" in s && !objectish(s.session)) s.session = null;
     const live = s.session;
-    if (live && typeof live === "object" && "agents" in live) {
+    if (live && "agents" in live) {
       live.agents = sanitizeLiveAgents(live.agents) || [];
     }
     for (const k of ["modelSource", "modelSourceAt"]) {

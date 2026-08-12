@@ -68,14 +68,74 @@ class ModelSourceTest {
 
     @Test fun `a memo retires on the heartbeat agreeing, not on a blind timer`() {
         val p = ModelSource.Pending("s1", ModelSource.LOCAL, at = 1_000)
+        val inside = 1_500L
         // Heartbeat still reports the old value: hold.
-        assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s1", modelSource = "subscription")))
+        assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s1", modelSource = "subscription"), inside))
         // Heartbeat caught up: retire, well inside the TTL.
-        assertNull(ModelSource.settle(p, SessionInfo(id = "s1", modelSource = "local")))
+        assertNull(ModelSource.settle(p, SessionInfo(id = "s1", modelSource = "local"), inside))
         // A memo is never judged by a DIFFERENT session's record.
-        assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s2", modelSource = "local")))
-        assertEquals(p, ModelSource.settle(p, null))
-        assertNull(ModelSource.settle(null, SessionInfo(id = "s1")))
+        assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s2", modelSource = "local"), inside))
+        assertEquals(p, ModelSource.settle(p, null, inside))
+        assertNull(ModelSource.settle(null, SessionInfo(id = "s1"), inside))
+    }
+
+    @Test fun `an expired memo is retired from the store, not merely ignored on read`() {
+        // The TTL cannot live only in `current`, which is read from a Composable
+        // body: Compose skips recomposition while the state compares equal, so on
+        // a quiet fleet nothing re-reads the clock and the expired value stays on
+        // screen. Measured as the whole "run against" control vanishing on an
+        // unconfirmed switch and never returning — t+120s and still gone.
+        // Retiring the memo is a STATE CHANGE, which is what repaints it.
+        val p = ModelSource.Pending("s1", ModelSource.LOCAL, at = 1_000)
+        val held = SessionInfo(id = "s1", modelSource = "subscription")
+        assertEquals(p, ModelSource.settle(p, held, 60_999))
+        assertNull(ModelSource.settle(p, held, 61_001))
+        // Ageing out is about the MEMO, so it applies even when this session's
+        // record cannot speak to it — otherwise a memo left by a switch on
+        // another session would never be collected at all.
+        assertEquals(p, ModelSource.settle(p, SessionInfo(id = "s2"), 60_999))
+        assertNull(ModelSource.settle(p, SessionInfo(id = "s2"), 61_001))
+        assertNull(ModelSource.settle(p, null, 61_001))
+        // `expired` is the same boundary `current` honours, so the memo can never
+        // be retired while it is still being painted, nor painted after it is
+        // retired. Both directions asserted at the boundary.
+        assertEquals(false, ModelSource.expired(p, 60_999))
+        assertEquals(true, ModelSource.expired(p, 61_001))
+        assertEquals(false, ModelSource.expired(null, 61_001))
+        // The EXACT boundary, not just either side of it: asserting 60_999 and
+        // 61_001 alone leaves `>=` vs `>` a free choice, and that mutation
+        // survived a battery. The TTL is inclusive — at exactly one full
+        // SWITCH_SETTLE_MS the memo is spent.
+        assertEquals(true, ModelSource.expired(p, 61_000))
+        assertNull(ModelSource.settle(p, held, 61_000))
+        assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(held, p, 61_000))
+        assertEquals(ModelSource.LOCAL, ModelSource.current(held, p, 60_999))
+        assertEquals(ModelSource.SUBSCRIPTION, ModelSource.current(held, p, 61_001))
+    }
+
+    @Test fun `a refused command reports the hub's own words, never a blanket queued`() {
+        // setModel/setMode discarded their result and always said "✓ queued", so
+        // the 409 the hub added for a session on the self-hosted model — added
+        // precisely so an out-of-parity client could not silently drop the
+        // command — painted as a success.
+        val q = "✓ model queued"
+        val f = "could not set the model"
+        assertEquals(q, ModelSource.outcomeMessage(true, null, null, q, f))
+        assertEquals(q, ModelSource.outcomeMessage(true, "", "", q, f))
+        assertEquals("✗ session runs on the self-hosted model",
+            ModelSource.outcomeMessage(false, null, "session runs on the self-hosted model", q, f))
+        // A genuinely unanswered request has no hub words: fall back, and do NOT
+        // reach for a network phrase the hub never said.
+        assertEquals("✗ $f", ModelSource.outcomeMessage(false, null, null, q, f))
+        assertEquals("✗ $f", ModelSource.outcomeMessage(false, null, "   ", q, f))
+        // A refusal the hub answered 200 with. Branching on the HTTP status
+        // alone is what made this bug the first time; `FleetViewModel.run`
+        // already reads `OkResponse.error` and this side must agree.
+        assertEquals("✗ agent refused the model",
+            ModelSource.outcomeMessage(true, "agent refused the model", null, q, f))
+        // Body error outranks the transport message when somehow both exist.
+        assertEquals("✗ agent refused the model",
+            ModelSource.outcomeMessage(false, "agent refused the model", "Bad Request", q, f))
     }
 
     @Test fun `a refused switch drops the memo instead of letting it age out`() {

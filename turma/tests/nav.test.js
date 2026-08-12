@@ -253,3 +253,69 @@ test("preserveScroll: an id anchor follows a reordered list to the right row", (
     assert.equal(ctx.byId["host-a"].scrollTop, 0);
   });
 });
+
+// ---- the shared failure toast (XERK-264) ------------------------------------
+// The hub refuses commands with a status and a JSON {error} body; every page
+// used to drop that, so a refused kill/rename/spawn looked exactly like one that
+// worked. This is the one surface those refusals reach the operator through, so
+// its wording is pinned here rather than re-typed on each page.
+
+const { toast, refusalText } = require("../public/nav.js");
+
+test("refusalText: the hub's own words, named by the action that failed", () => {
+  assert.equal(refusalText("Kill", 429, { error: "the host's command queue is full" }),
+    "Kill failed — the host's command queue is full");
+  // The reason is what the operator can act on, so it survives even unlabelled.
+  assert.equal(refusalText("", 503, { error: "the target agent is offline" }),
+    "the target agent is offline");
+});
+
+test("refusalText: a refusal with no explanation still names the status", () => {
+  // Better than silence, and better than a bare number with no context: an
+  // agent too old to explain itself, or an error body that wasn't JSON.
+  assert.equal(refusalText("Move", 409, null), "Move failed — the hub answered HTTP 409");
+  assert.equal(refusalText("Move", 409, {}), "Move failed — the hub answered HTTP 409");
+  assert.equal(refusalText("Move", 409, { error: "   " }), "Move failed — the hub answered HTTP 409");
+});
+
+test("toast: shows the text, creates its element once, and never parses markup", () => {
+  const savedDoc = global.document;
+  // The 6s hide timer would otherwise hold the test runner open for its whole
+  // duration; the hide itself is CSS, not behavior worth pinning here.
+  const savedTimeout = global.setTimeout;
+  global.setTimeout = () => 0;
+  const created = [];
+  const body = { children: [], appendChild(c) { this.children.push(c); return c; } };
+  const byId = {};
+  global.document = {
+    getElementById: (id) => byId[id] || null,
+    createElement() {
+      const el = {
+        id: "", className: "", textContent: "",
+        classList: { _s: new Set(), add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); }, contains(c) { return this._s.has(c); } },
+      };
+      created.push(el);
+      return el;
+    },
+    body,
+  };
+  try {
+    toast("Kill failed — <b>nope</b>");
+    const el = created[0];
+    byId.toast = el;                       // as the real DOM would, once appended
+    assert.equal(created.length, 1);
+    assert.equal(el.id, "toast");
+    // textContent, not innerHTML: the string is server text and some of it
+    // echoes operator input.
+    assert.equal(el.textContent, "Kill failed — <b>nope</b>");
+    assert.ok(el.classList.contains("show"));
+
+    toast("Rename failed — unknown session");
+    assert.equal(created.length, 1, "the element is reused, not stacked up");
+    assert.equal(el.textContent, "Rename failed — unknown session");
+
+    // Nothing to say means nothing on screen — a toast is only ever a failure.
+    toast("");
+    assert.equal(el.textContent, "Rename failed — unknown session");
+  } finally { global.document = savedDoc; global.setTimeout = savedTimeout; }
+});

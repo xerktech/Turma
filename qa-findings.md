@@ -145,3 +145,160 @@ exercised code in the tree.
   `ws`, so through that await `ws` is null and the guard waves a second
   connection through. Unit tests that hand the guard a socket object never see
   it. Count the sockets (§3, `page.on("websocket")`), don't read the guard.
+
+### 5.8 Shapes that only appear when you RUN it (XERK-254, thirteen rounds)
+
+Every one of these passed review, shellcheck and a green suite. Attack these before anything else
+in shell that runs at boot.
+
+- **A `/bin/sh` function is not a subshell and has no `local`.** An `export` inside one escapes into
+  everything the script starts afterwards. A scratch `HOME` set that way, then `rm -rf`'d, gave the
+  container's manager, tunnel and every session a `$HOME` that did not exist — `~/.turma` (the
+  session registry) and `~/.claude` (the login) both silently missed. Use `f() ( ... )` when the
+  body changes the environment.
+- **A blocking open at PID 1 is unrecoverable.** The container stays `running`, PID 1 is alive and
+  healthy-looking, so no restart policy ever fires — worse than a crash loop, which at least
+  retries. Signature: no manager line in the log, `docker inspect` says running; confirm with
+  `/proc/1` and the child chain (there is no `ps` in the image).
+- **`kill` on a shell does not reach its grandchildren.** A watchdog that kills a check leaves that
+  check's `npm install` running — which then replaces `claude` while the manager relaunches
+  sessions into it. Either signal the process group, or keep the outer deadline clear of the inner
+  ones by construction.
+- **`timeout` without `-k` does not bound anything a child can ignore.** It signals at the deadline
+  and then WAITS: measured 30s for a `trap "" TERM; sleep` child given `timeout 2`. And
+  `timeout ... 0 ...` DISABLES the bound — `0` is the value an operator reaches for when they mean
+  "no limit". Sanitise timeout knobs where they are USED, not only where arithmetic reads them: a
+  malformed one makes `timeout` exit 125 without running the command, which reads as "the tool is
+  broken" rather than "the config is wrong".
+- **SIGKILL and SIGTERM leave different wreckage.** A SIGTERM'd `npm install -g` rolls back (5/5
+  kill points left the old version working); a SIGKILL'd one leaves NO `claude` at all (4/5). Any
+  `-k` grace is what buys the rollback.
+- **Arithmetic derived from a call graph rots.** A deadline computed from per-call timeouts has to
+  be re-derived whenever the call graph changes, and each miscount was a defect (wrong multipliers,
+  an overflowing floor, a count taken as the wrong uid, a clock-skewed budget). A fixed generous
+  number with one explicit coupling retired the whole class. Prefer that shape.
+
+### 5.9 Techniques that found what reading the source did not (XERK-254)
+
+For `agent/native/` and `agent/entrypoint.sh`; each of these surfaced a defect that
+review, shellcheck and a green suite had all passed.
+
+- **Measure as the identity the code runs as.** `[ "$(id -u)" = 0 ]` guards a whole branch of the
+  updater (the EACCES retry into `~/.local`), so a root-only fixture set cannot see it and every
+  count taken with one is wrong. Drive it with
+  `setpriv --reuid 1000 --regid 1000 --clear-groups env HOME=... PATH=... <script>` after
+  `chown -R 1000:1000` on the staged prefix. The shell suites pass under uid 1000 too — run them
+  both ways.
+- **Count bounded calls by shimming `timeout` on PATH**, never by reading them off the source:
+  ```sh
+  printf '#!/bin/sh\n{ printf "%s " "$@"; echo; } >> LOG\nexec /usr/bin/timeout "$@"\n' > $bin/timeout
+  ```
+  This is how a memo that never memoised (`$(...)` is a subshell, so the global never propagates)
+  and a deadline derived from the wrong call count both showed up.
+- **`mkfifo` in `~/.turma` is the cheapest wedge test.** That dir is writable by the identity the
+  SESSIONS run as, so a session can replace any state file there with a FIFO — and opening one
+  blocks forever, with no error for `|| true` to catch. Plant one at every path the start-time
+  check opens and assert the agent still boots.
+- **Stub `date +%s`** to test elapsed-time arithmetic. Clocks step BACKWARDS at boot (chrony /
+  timesyncd on a host with no battery-backed RTC), which is exactly when this code runs, and
+  `$(( now - started ))` is then negative.
+- **Time the recovery, don't just assert it happened.** "Never blocked" and "rescued by a watchdog
+  after N seconds" both end with a booted container; only the elapsed time tells them apart.
+- **Sample fast when measuring a swap window.** `npm install -g` unlinks the bin before extracting,
+  so `claude` is absent from PATH for ~1.5-2s; a single probe misses it, a 50ms loop doesn't.
+
+Staging and driving them, which every case above needed:
+
+- Stage a fake prefix the way `agent/tests/test_turma_agent_update.sh` does:
+  `$PREFIX/{VERSION,hub-agent.py,tunnel-agent.js,hooks/}` + `$PREFIX/bin/` with the script under
+  test, a fake `gh` serving canned releases from `$FAKE_GH_DIR`, and stub
+  `systemctl`/`turma-agentctl`.
+- Real systemd behaviour (`Restart=always`, `KillMode=process`, a detached child surviving a unit
+  restart) without touching /etc:
+  ```bash
+  systemd-run --unit=qa-$$ --collect --property=Restart=always \
+    --property=RestartSec=1 --property=KillMode=process --property=Type=exec \
+    --setenv=HOME=$SCRATCH --setenv=PATH=$BIN:/usr/bin:/bin $BIN/turma-agent
+  ```
+  Stop with `systemctl stop qa-$$`, then `rm /run/systemd/transient/qa-$$.service` and
+  `systemctl daemon-reload` — a stopped transient unit lingers as `loaded` otherwise.
+- The **real** npm registry is cheap and safe if you sandbox it: `export
+  npm_config_prefix=$SCRATCH/pfx npm_config_cache=$SCRATCH/cache`. The install is ~250 MB and ~3s;
+  `npm view @anthropic-ai/claude-code version` answers in <0.5s.
+- The container half is drivable end to end with a REAL claude: `node:24-bookworm-slim` + `npm i -g
+  @anthropic-ai/claude-code@<older>` + the real `entrypoint.sh` + stub
+  `python3`/`hub-agent.py`/`tunnel-agent.js`. Keep the stub manager alive (`sleep`) or the container
+  exits first. `test_entrypoint.sh` stubs claude+npm, so it observes the DECISION only — never file
+  ownership, writes under `/root`, or timing.
+- A **running** claude survives the package swap (one static ELF, the kernel keeps the inode); only
+  a new exec in the window fails.
+
+### 5.10 What the ELEVENTH round found — again in the previous round's own fix
+
+- **`typeof [] === "object"`, in a validator whose whole job is "is this an
+  object".** `normalizeSessions` dropped a `null` and a bare string from
+  `sessions` and served a nested ARRAY element raw, because its predicate was
+  `!s || typeof s !== "object"`. The comment above it named the two cases the
+  fixture used, and the fixture used the two cases the comment named — so the
+  third non-object shape existed in neither, and the fix read as complete from
+  every angle except running it. Measured as the phone unable to SIGN IN, since
+  the login probe decodes `/api/agents` and reads the throw as "Could not reach
+  the hub". **When you write an is-an-object test in JS, write `Array.isArray`
+  in the same breath, and put every non-object shape in the fixture — `null`,
+  a string, a number, `[]`, and a non-empty array — not a representative one.**
+  This is §5.3 again, one round later, in the code that fixed §5.3.
+- **A TTL read from a Composable body is a timer that never fires.** The
+  model-switch memo aged out inside `canSwitchModelSource()`, evaluated at
+  composition time from `System.currentTimeMillis()`. Compose skips
+  recomposition while the state compares equal, so on a quiet fleet nothing
+  re-read the clock: the control vanished on an unconfirmed switch and was still
+  gone at t+120s, with the bar naming a model the session was not running.
+  **Expiry has to change STATE, not merely change what a read would return** —
+  retire the value from the store on a bounded alarm. The web had no such bug
+  because its poll recomputes the same predicate unconditionally every beat;
+  when porting a per-beat web computation to Compose, ask what re-runs it.
+- **A discarded `Result` turns every refusal into a success.** `setModel` and
+  `setMode` ran `runCatching { … }` and then emitted "✓ queued" unconditionally.
+  Harmless while those routes only failed on the network — and then a sibling
+  commit gave the hub a first-class 409 for them, which the bar reported as a
+  success. **Grep for `runCatching` whose result is not bound**; each one is a
+  silent success waiting for someone to add a refusal to that route. The same
+  shape one layer in: branching on the HTTP status alone and ignoring
+  `OkResponse.error`, so a `200 {ok:false,error:…}` reads as success.
+
+### 5.11 What the TWELFTH round found — in the eleventh round's fixes
+
+The eleventh round's three fixes all held. Every finding below is a defect in
+one of those fixes, which is the pattern §5.7 named and this file keeps proving.
+
+- **Fixing the instance instead of the class.** The `typeof [] === "object"` fix
+  landed on `normalizeSessions`' element filter, and the identical predicate sat
+  **five lines below it**, on `s.session` — where `"agents" in []` is also false,
+  so an array fell through both halves of the guard. One heartbeat of
+  `sessions:[{id,session:[]}]` reproduced the original symptom exactly: the app
+  could not sign in. **When a bug is a wrong predicate, `grep` the predicate and
+  fix every hit in the same commit**, then hoist it into one named helper so
+  there is nothing left to grep. (When you hoist, use a `function` declaration —
+  a `const` used above its own line is the TDZ bug §5.10's siblings already
+  cost this file once.) Note which of the remaining hits are safe and WHY: here
+  `normalizeLimits` and `sanitizeLiveAgents` also test `typeof x === "object"`,
+  but both rebuild a whitelist from scratch, so an array falls out at the next
+  field read rather than reaching a client.
+- **Skipping a bad value is not coercing it.** The first attempt at the above
+  guarded the *sanitize* with the fixed predicate — and left the raw array sitting
+  in the record, which is the thing that gets served. A coercion has to REWRITE
+  (here, to `null`, the "can't tell you" value every client handles), not decline
+  to touch. Caught only because the test asserted the served VALUE rather than
+  that the code did not throw.
+- **A wall-clock deadline slept through with an uptime timer.** The memo alarm
+  computed its delay from `System.currentTimeMillis()`, slept on `delay` (which
+  measures uptime), then re-checked the wall clock — so a backward clock jump
+  made the re-check false, `settle` returned the same instance, `MutableStateFlow`
+  did not emit an equal value, the collector never ran, and no new alarm was
+  armed. The memo pinned a lie for the length of the skew (measured at t+190s
+  after a 10-minute jump). **After a `delay`, retire by IDENTITY**
+  (`compareAndSet(theSameMemo, null)`) rather than re-deriving the decision from
+  a clock that may have moved under you.
+- **Asserting either side of a boundary is not asserting the boundary.** The new
+  TTL test checked 60_999 and 61_001 and never 61_000, so `>=` → `>` survived a
+  mutation battery. Always assert the exact edge.

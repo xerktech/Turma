@@ -792,21 +792,25 @@ test("prFooterChip: derives #number from the URL when absent, no mark when unkno
 });
 
 // XERK-162: a GitLab merge request is a chip exactly like a PR — same badge,
-// same states — and a bare {url} still derives its number pre-status.
-test("prFooterChip: a GitLab MR chips like a PR", () => {
+// same states — and a bare {url} still derives its number pre-status. The
+// label is GitLab's own !n sigil (mirroring the agent's _pr_ref), whether the
+// number comes from the status or the URL.
+test("prFooterChip: a GitLab MR chips like a PR, labelled !n", () => {
   const html = prFooterChip({ prs: [
     { url: "https://gitlab.example.com/grp/app/-/merge_requests/12" },
     { url: "https://gitlab.example.com/grp/app/-/merge_requests/13", number: 13,
       state: "OPEN", checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
   ] });
-  assert.match(html, /#12/);                        // number from the MR URL
-  assert.match(html, /#13 Open/);
+  assert.match(html, /!12/);                        // number from the MR URL
+  assert.match(html, /!13 Open/);                   // number from the status
+  assert.doesNotMatch(html, /#1[23]/);
   assert.match(html, /pr-ready ready/);
   assert.match(html, /href="https:\/\/gitlab\.example\.com\/grp\/app\/-\/merge_requests\/12"/);
 });
 
 // XERK-226: and so is an Azure DevOps pull request — the third source, chipped
 // identically, its number derived from the ADO URL before any status lands.
+// ADO also reads !n: there #n addresses a WORK ITEM.
 test("prFooterChip: an Azure DevOps PR chips like a GitHub PR", () => {
   const url = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12";
   const html = prFooterChip({ prs: [
@@ -814,8 +818,8 @@ test("prFooterChip: an Azure DevOps PR chips like a GitHub PR", () => {
     { url: url.replace("/12", "/13"), number: 13, state: "OPEN",
       checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
   ] });
-  assert.match(html, /#12/);                        // number from the ADO URL
-  assert.match(html, /#13 Open/);
+  assert.match(html, /!12/);                        // number from the ADO URL
+  assert.match(html, /!13 Open/);
   assert.match(html, /pr-ready ready/);
   assert.match(html, new RegExp('href="' + url.replace(/[/.]/g, "\\$&") + '"'));
 });
@@ -1536,13 +1540,18 @@ test("compose bar: a message past the host's cap says so, with the number (XERK-
   assert.equal(sendFailure(413, 100000), "Too long — max 100,000");
   assert.equal(sendFailure(413), TOO_LONG, "an older hub sends no limit");
   assert.equal(sendFailure(413, 0), TOO_LONG);
-  assert.equal(sendFailure(500), "500");
-  assert.equal(sendFailure(404), "404");
+  // Every OTHER refusal is worded by the hub and shown as a toast (XERK-264),
+  // so the button says what happened and never a bare status number — which
+  // named nothing the operator could act on and, on the send path, was then
+  // thrown away by isTooLong anyway.
+  assert.equal(sendFailure(500), "Send failed");
+  assert.equal(sendFailure(404), "Send failed");
+  assert.equal(sendFailure(429, undefined, "the host's command queue is full"), "Send failed");
   // isTooLong is what both compose bars test the thrown message against, so a
   // numbered label must still be recognised as the actionable failure.
   assert.ok(isTooLong("Too long — max 4,000"));
   assert.ok(isTooLong(TOO_LONG));
-  assert.ok(!isTooLong("500"));
+  assert.ok(!isTooLong("Send failed"));
   assert.ok(!isTooLong(undefined));
 });
 
@@ -1652,9 +1661,10 @@ test("attachments: an expired staged file is an actionable refusal, not 'Send fa
   const msg = sendFailure(404, undefined, "an attachment expired before it was sent — re-attach it");
   assert.equal(msg, "Attachment expired — re-attach");
   assert.ok(isTooLong(msg), "both compose bars show it verbatim");
-  // A plain 404 with no attachment in it is still just a status.
-  assert.equal(sendFailure(404, undefined, "unknown agent"), "404");
-  assert.equal(sendFailure(404), "404");
+  // A plain 404 with no attachment in it has no special wording; its reason
+  // rides the toast instead (XERK-264).
+  assert.equal(sendFailure(404, undefined, "unknown agent"), "Send failed");
+  assert.equal(sendFailure(404), "Send failed");
 });
 
 test("attachments: the per-message cap matches the hub's", () => {

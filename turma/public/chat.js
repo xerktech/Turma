@@ -1285,7 +1285,7 @@
     try {
       const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/interrupt",
         { method: "POST" });
-      if (!r.ok) throw new Error(String(r.status));
+      if (!r.ok) { await hubRefused("Stop", r); throw new Error(String(r.status)); }
       if (typeof fastPoll === "function") fastPoll();
     } catch {
       stopPendingAt = 0; // the turn is still running — give Stop back right away
@@ -1545,7 +1545,10 @@
   function prBadge(pr) {
     const url = pr.url || "";
     const m = url.match(/\/pull\/(\d+)|\/-\/merge_requests\/(\d+)|\/pullrequest\/(\d+)/i);
-    const num = pr.number ? "#" + pr.number : (m ? "#" + (m[1] || m[2] || m[3]) : "PR");
+    // GitLab and Azure DevOps number their requests !n, not #n (in ADO #n is a
+    // WORK ITEM) — the sigil follows the URL's platform, mirroring _pr_ref.
+    const sigil = m && !m[1] ? "!" : "#";
+    const num = pr.number ? sigil + pr.number : (m ? sigil + (m[1] || m[2] || m[3]) : "PR");
     const state = String(pr.state || "").toUpperCase();
     const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
     const label = state ? state[0] + state.slice(1).toLowerCase() : "";
@@ -1674,11 +1677,15 @@
     modelSourcePending = { value, at: Date.now(), sessionId };
     renderComposeOpts();
     try {
-      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model-source", {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model-source", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ modelSource: value }) });
+      // A refusal (a host with no local model, an agent too old) must take the
+      // memo back with it: left up, the chip shows the model the session is NOT
+      // running on until the memo ages out (XERK-264).
+      if (!r.ok) { await hubRefused("Model switch", r); modelSourcePending = null; renderComposeOpts(); return; }
       if (typeof fastPoll === "function") fastPoll();
-    } catch {}
+    } catch { modelSourcePending = null; renderComposeOpts(); }
   }
 
   async function setSessionModel(value) {
@@ -1686,14 +1693,24 @@
     // The agent refuses this for a local session (its model comes from the host
     // configuration); don't send a request that only ever gets logged and dropped.
     if (currentModelSource() === "local") return;
+    const prevModel = sess.model;
     modelSwitchPending = { value, prevActual: sess.modelActual || null, at: Date.now() };
     sess.model = value === "default" ? null : value; // optimistic; heartbeat confirms
     renderComposeOpts();
+    // A refused switch (an invalid model, a session since gone) takes BOTH the
+    // memo and that optimistic write back — the chip would otherwise name a
+    // model the session never moved to (XERK-264).
+    const undo = () => {
+      modelSwitchPending = null;
+      sess.model = prevModel;
+      renderComposeOpts();
+    };
     try {
-      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model", {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: value }) });
+      if (!r.ok) { await hubRefused("Model switch", r); undo(); return; }
       if (typeof fastPoll === "function") fastPoll();
-    } catch {}
+    } catch { undo(); }
   }
   async function setSessionMode(value) {
     if (!hostKey || !sessionId || !sess || value === currentModeValue()) return;
@@ -1705,10 +1722,12 @@
     modeSwitchPending = { value, at: Date.now() };
     renderComposeOpts();
     try {
-      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/mode", {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/mode", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ permissionMode: value }) });
+      // Same as the model chip: a refused mode must not keep painting itself.
+      if (!r.ok) { await hubRefused("Mode switch", r); modeSwitchPending = null; renderComposeOpts(); return; }
       if (typeof fastPoll === "function") fastPoll();
-    } catch {}
+    } catch { modeSwitchPending = null; renderComposeOpts(); }
   }
 
   if (typeof document !== "undefined") {
@@ -1853,7 +1872,7 @@
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ optionNumber }),
       });
-      if (!r.ok) throw new Error(String(r.status));
+      if (!r.ok) { await hubRefused("Answer", r); throw new Error(String(r.status)); }
     } catch {
       answeredPanePrompt = null;   // let the next beat re-surface it
       actionFailed("Couldn't answer");
@@ -1877,7 +1896,7 @@
       const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
       });
-      if (!r.ok) throw new Error(String(r.status));
+      if (!r.ok) { await hubRefused("Answer", r); throw new Error(String(r.status)); }
       if (typeof fastPoll === "function") fastPoll();
     } catch {
       answeredQuestion = null; // send failed — let the pending question show again
@@ -2108,14 +2127,42 @@
   // this is a refusal the operator can act on — re-attach and send again — so it
   // gets its own wording rather than the generic "Send failed".
   const ATT_GONE = "Attachment expired — re-attach";
+  // Everything else the hub refuses — a 409, a 503, a full command queue — has
+  // already gone to the toast in the hub's own words (see hubRefused), so the
+  // button just says the send didn't happen. It used to read the bare status
+  // number, which told the operator nothing (XERK-264).
+  const SEND_FAILED = "Send failed";
   function sendFailure(status, limit, error) {
     if (status === 404 && /attachment/i.test(error || "")) return ATT_GONE;
-    if (status !== 413) return String(status);
+    if (status !== 413) return SEND_FAILED;
     const n = Number(limit);
     return n > 0 ? `Too long — max ${n.toLocaleString()}` : TOO_LONG;
   }
+  // "Is this message one WE worded?" — the gate both compose bars put a thrown
+  // message through before showing it, so a transport error's own text can't
+  // land on the button.
   function isTooLong(msg) {
     return msg === TOO_LONG || msg === ATT_GONE || /^Too long — max /.test(msg || "");
+  }
+  // ---- a refusal the hub explained ------------------------------------------
+  // The hub refuses a command with a status and a JSON `{error}` body — an org
+  // mismatch, an agent too old to run it, an offline host, an expired
+  // attachment, a command queue too full to take another. Chat dropped all of
+  // that on the floor (XERK-264): a send read as a bare status number, an
+  // answer vanished, a model switch kept the label it optimistically painted.
+  //
+  // The compose button has room for a label, not a sentence, so the hub's own
+  // words go to the page's shared toast — the one surface every refused command
+  // on the page raises — and the button keeps its short wording. Returns the
+  // parsed body so the caller can read `limit`/`error` for that wording.
+  //
+  // Guarded on TurmaNav: the vendored copies of this engine (glasses, veiller)
+  // render transcripts with none of the site chrome loaded.
+  async function hubRefused(what, res) {
+    const body = await res.json().catch(() => null);
+    const nav = typeof window !== "undefined" && window.TurmaNav;
+    if (nav && nav.toast && nav.refusalText) nav.toast(nav.refusalText(what, res.status, body));
+    return body;
   }
   async function send() {
     const inp = $("chatInput");
@@ -2152,7 +2199,7 @@
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       if (!r.ok) {
-        const err = await r.json().catch(() => null);
+        const err = await hubRefused(wasAnswer ? "Answer" : "Send", r);
         throw new Error(sendFailure(r.status, err && err.limit, err && err.error));
       }
       if (typeof fastPoll === "function") fastPoll();

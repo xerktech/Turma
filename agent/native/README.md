@@ -143,9 +143,25 @@ The agent polls the GitHub Releases (via your `gh` login), and when a newer
 native build ships it downloads + checksum-verifies it, swaps the files, and
 restarts the manager. **Running sessions are not stopped** — the tmux/claude
 processes keep running; the web UI briefly disconnects and reconnects once the
-manager is back. Driven by a systemd timer (hourly), or the
-`turma-agent-update --loop` poller on non-systemd hosts. Force a check with
-`turma-agent-update` (or `turma-agentctl update`).
+manager is back. It runs **on every agent start** and then hourly (a systemd
+timer, or the `turma-agent-update --loop` poller on non-systemd hosts). The
+start-fired one is detached, so it never delays the agent coming up. Force one
+any time with `turma-agent-update` (or `turma-agentctl update`).
+
+It also updates **Claude Code**, which is otherwise installed once at setup and
+never touched again — but **only at agent start**, never on the hourly timer.
+Replacing that package leaves `claude` missing from `PATH` for a second or two,
+and a session launched in that window dies immediately; at start the session
+manager doesn't exist yet, so nothing can be launching. That check therefore
+runs to completion *before* the agent comes up (bounded, so a slow npm registry
+can delay the start but not block it). **Restarting the agent is how a host
+takes a new Claude Code**; `turma-agent-update --claude-only` does it by hand.
+
+Both checks are rate-limited to one per `TURMA_BOOT_UPDATE_MIN_INTERVAL` (300s),
+so a crash-looping unit can't turn `Restart=always` into a check every five
+seconds. `TURMA_CLAUDE_AUTO_UPDATE=0` in `turma-agent.env` pins Claude Code;
+`TURMA_BOOT_UPDATE=0` turns off both start checks — which, since start is the
+only time Claude Code is looked at, also stops it being updated at all.
 
 It reads the unified release stream: each `v<MAJOR>.<MINOR>.<PATCH>` release
 carries a `manifest.json`, and the updater compares the manifest's **agent-native
