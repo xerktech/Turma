@@ -27,7 +27,10 @@ process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.AGENTS_MAX = "4";
-process.env.AGENTS_TOTAL_MAX = String(64 << 10);
+// Chosen so the derived per-host share (total / max = 160 KiB) sits clear of
+// BOTH the 64 KiB floor and the record sizes below — the whole point of the
+// share is that a small host and a fat one land on opposite sides of it.
+process.env.AGENTS_TOTAL_MAX = String(640 << 10);
 process.env.AGENT_EVICT_IDLE_MS = String(60 * 1000);
 
 const tmp = (name) => path.join(os.tmpdir(), `turma-regcap-${name}-${process.pid}.json`);
@@ -67,8 +70,8 @@ fs.writeFileSync(
 const hub = require("../server.js");
 const {
   server, agents, recordBytes,
-  AGENTS_MAX, AGENTS_TOTAL_MAX, AGENT_EVICT_IDLE_MS,
-  registryBytes, makeRegistryRoom, agentRecordSize,
+  AGENTS_MAX, AGENTS_TOTAL_MAX, AGENT_EVICT_IDLE_MS, AGENT_FAIR_SHARE, STATE_FILE_MAX,
+  registryBytes, makeRegistryRoom, agentRecordSize, positiveEnv, logName,
   containerMemoryLimit, defaultRegistryBudget,
 } = hub;
 
@@ -206,27 +209,56 @@ test("http: a host just short of the idle window is NOT evictable", async () => 
 test("http: records that fit the per-record ceiling still can't sum past the aggregate", async () => {
   resetRegistry();
   // AGENTS_MAX records at AGENT_RECORD_MAX is 512 MiB on a 256 MiB hub, so the
-  // per-record ceiling was never the bound. Both of these pass it easily.
-  assert.equal((await beat(chunky("fat-a", 40))).status, 200);
-  const refused = await beat(chunky("fat-b", 40));
+  // per-record ceiling was never the bound. All three pass it easily.
+  assert.ok(300 << 10 > AGENT_FAIR_SHARE, "the rig's fat record must be over-share");
+  assert.equal((await beat(chunky("fat-a", 300))).status, 200);
+  assert.equal((await beat(chunky("fat-b", 300))).status, 200);
+  const refused = await beat(chunky("fat-c", 300));
   assert.equal(refused.status, 429);
   assert.equal(refused.body.error, "agent registry full");
   assert.equal(refused.body.bytes, AGENTS_TOTAL_MAX);
-  assert.equal("fat-b" in agents, false);
-  assert.ok(registryBytes() <= AGENTS_TOTAL_MAX);
+  assert.equal(refused.body.share, AGENT_FAIR_SHARE);
+  assert.equal("fat-c" in agents, false);
 });
 
-test("http: an aggregate refusal leaves the host's PREVIOUS record intact", async () => {
+test("http: a host INSIDE its share is not refused for someone else's bulk", async () => {
+  // The regression this exists for: the aggregate gate refuses whoever beats
+  // next, and rolling a known host back to its previous record rolls back
+  // `lastSeen` too — so a live, normal-sized host was refused every beat, aged
+  // past OFFLINE_AFTER_MS, and read as offline while it was up, with nothing to
+  // tell that apart from a network failure.
+  resetRegistry();
+  assert.equal((await beat({ device: "small", repos: [{ name: "r1" }] })).status, 200);
+  assert.equal((await beat(chunky("hog-a", 300))).status, 200);
+  assert.equal((await beat(chunky("hog-b", 300))).status, 200);
+  assert.ok(registryBytes() > AGENTS_TOTAL_MAX - (300 << 10), "the rig must be under pressure");
+
+  const before = agents["small"].lastSeen;
+  await new Promise((r) => setTimeout(r, 5));
+  for (let i = 0; i < 3; i++) {
+    const ok = await beat({ device: "small", repos: [{ name: `r${i}` }] });
+    assert.equal(ok.status, 200, "a host inside its share must keep beating");
+  }
+  assert.deepEqual(agents["small"].repos, [{ name: "r2" }], "its content must be current");
+  assert.ok(agents["small"].lastSeen > before, "and its liveness must advance");
+  // The exemption is bounded, not a hole: every exempt host is under its share,
+  // so they sum to at most the budget again.
+  assert.ok(registryBytes() <= AGENTS_TOTAL_MAX + AGENTS_MAX * AGENT_FAIR_SHARE);
+});
+
+test("http: an over-share refusal leaves the host's PREVIOUS record intact", async () => {
   resetRegistry();
   assert.equal((await beat({ device: "grower", repos: [{ name: "r1" }] })).status, 200);
-  assert.equal((await beat(chunky("ballast", 40))).status, 200);
-  // `grower` is known, so admission lets it through — the aggregate is what
-  // refuses it, and a refused beat must not damage what is being served.
-  const refused = await beat(chunky("grower", 40));
+  assert.equal((await beat(chunky("ballast-a", 300))).status, 200);
+  assert.equal((await beat(chunky("ballast-b", 300))).status, 200);
+  // `grower` is known, so admission lets it through — going over its share
+  // while the registry is full is what refuses it, and a refused beat must not
+  // damage what is being served.
+  const refused = await beat(chunky("grower", 300));
   assert.equal(refused.status, 429);
   assert.deepEqual(agents["grower"].repos, [{ name: "r1" }]);
   assert.equal(recordBytes.get("grower"), agentRecordSize(agents["grower"]));
-  // Not a wall: it beats again in ~20s and lands as soon as there is room.
+  // A normal-sized beat from the same host still lands.
   assert.equal((await beat({ device: "grower", repos: [{ name: "r3" }] })).status, 200);
   assert.deepEqual(agents["grower"].repos, [{ name: "r3" }]);
 });
@@ -273,6 +305,79 @@ test("makeRegistryRoom reports failure instead of over-evicting", () => {
   assert.ok(agents["fresh"]);
   // Room for one more host is exactly what a beat from a new device asks for.
   assert.equal(makeRegistryRoom(0, 1), true);
+});
+
+test("a bad env knob is announced and ignored, never obeyed", () => {
+  // `Number(x) || default` accepted a negative silently, and a negative cap
+  // refuses the WHOLE fleet on its first beat with only a per-beat 429 to
+  // explain it — a compose typo taking every host offline.
+  const prev = process.env.__REGCAP_PROBE;
+  const warned = [];
+  const realWarn = console.warn;
+  console.warn = (m) => warned.push(String(m));
+  try {
+    for (const bad of ["-1", "0", "abc", "-1e9"]) {
+      process.env.__REGCAP_PROBE = bad;
+      assert.equal(positiveEnv("__REGCAP_PROBE", 64), 64, `${bad} was obeyed`);
+    }
+    process.env.__REGCAP_PROBE = "128";
+    assert.equal(positiveEnv("__REGCAP_PROBE", 64), 128);
+    delete process.env.__REGCAP_PROBE;
+    assert.equal(positiveEnv("__REGCAP_PROBE", 64), 64);
+  } finally {
+    console.warn = realWarn;
+    if (prev === undefined) delete process.env.__REGCAP_PROBE;
+    else process.env.__REGCAP_PROBE = prev;
+  }
+  assert.ok(warned.some((m) => m.includes("__REGCAP_PROBE")), "a bad value must be announced");
+});
+
+test("a host name cannot forge a hub log line", async () => {
+  // `device` is agent-supplied and validated only for length and prototype
+  // keys, so a newline in it wrote a line indistinguishable from the hub's own.
+  const forged = "evil\n2026-01-01T00:00:00Z FORGED: all clear";
+  assert.equal(logName(forged).includes("\n"), false);
+  assert.equal(logName("h x").includes(" "), false);
+  assert.ok(logName("plain-host").includes("plain-host"));
+  // And it reaches the log through a real refusal, not just the helper.
+  resetRegistry();
+  for (let i = 0; i < AGENTS_MAX; i++) await beat({ device: `forge-${i}` });
+  const lines = [];
+  const realErr = console.error;
+  console.error = (m) => lines.push(String(m));
+  try {
+    assert.equal((await beat({ device: forged })).status, 429);
+  } finally {
+    console.error = realErr;
+  }
+  assert.equal(lines.some((l) => l.includes("\n")), false, "a refusal log carried a raw newline");
+});
+
+test("the refusal log is throttled, and says how many it swallowed", async () => {
+  // The flood this cap exists to survive is exactly the traffic that writes
+  // this line — unthrottled, surviving the attack costs the host its disk.
+  resetRegistry();
+  for (let i = 0; i < AGENTS_MAX; i++) await beat({ device: `noisy-${i}` });
+  const lines = [];
+  const realErr = console.error;
+  console.error = (m) => lines.push(String(m));
+  try {
+    for (let i = 0; i < 60; i++) {
+      assert.equal((await beat({ device: `flood-${i}` })).status, 429);
+    }
+  } finally {
+    console.error = realErr;
+  }
+  assert.ok(lines.length <= 2, `60 refusals wrote ${lines.length} log lines`);
+});
+
+test("the state.json ceiling is measured before the file is opened", () => {
+  // The restore trim cannot protect a restore it never reaches: readFileSync +
+  // JSON.parse materialize the whole file, so a flooded state.json killed the
+  // hub at init — before any log line, on every boot, forever.
+  assert.ok(STATE_FILE_MAX >= (32 << 20), "the ceiling must clear a legitimate state file");
+  const limit = containerMemoryLimit();
+  if (limit) assert.ok(STATE_FILE_MAX <= limit, "and must not exceed the container itself");
 });
 
 test("makeRegistryRoom spends no record on a request it cannot satisfy", () => {

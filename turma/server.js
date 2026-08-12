@@ -373,19 +373,51 @@ let agents = {};
 //     rather than picked.
 //   * AGENTS_MAX — the record COUNT. The byte budget measures what
 //     `agentRecordSize` measures, which deliberately EXCLUDES the on-demand
-//     caches (history, subagent history, Jira issues, create results); those are
-//     bounded per host by count, so only a cap on hosts bounds their multiple.
+//     caches (history, subagent history, Jira issues, create results). Those are
+//     capped per host by COUNT, not by bytes, so this bounds their multiple and
+//     nothing here bounds their size — one host can still park a lot in them.
+//
+// The aggregate is what a NEWCOMER is admitted against, and what an OVER-SHARE
+// host is refused against — never a host beating a normal-sized record, whose
+// refusal would be indistinguishable from an outage. See AGENT_FAIR_SHARE.
 //
 // Both are env-overridable: an operator who grows the fleet past the cap should
 // raise it in compose, not discover the hub silently dropping a host.
-const AGENTS_MAX = Number(process.env.AGENTS_MAX) || 64;
+
+/**
+ * A positive-integer env knob, or the default. A knob that silently accepts a
+ * negative refuses the WHOLE fleet on its first beat with nothing but a
+ * per-beat 429 to explain it, so a bad value is announced and ignored rather
+ * than obeyed.
+ */
+function positiveEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  console.warn(`WARNING: ${name}=${JSON.stringify(raw)} is not a positive number — using ${fallback}`);
+  return fallback;
+}
+
+// A host name is agent-supplied and reaches the hub's log; it is validated for
+// length and prototype keys but NOT for content, so a newline in it forges a
+// log line that reads exactly like one of the hub's own. Every log that names a
+// host goes through this.
+function logName(key) {
+  // JSON.stringify does the line-forging half (a newline becomes the two
+  // characters \ and n, so it can never start a line); the sweep after it
+  // covers the control characters JSON leaves intact, which a terminal acts on.
+  return JSON.stringify(String(key).slice(0, 200)).replace(/[\u0000-\u001f\u007f]/g, "?");
+}
+
+const AGENTS_MAX = positiveEnv("AGENTS_MAX", 64);
 // How long a record must have gone unseen before the registry may reclaim its
 // slot for a host it has never met. Deliberately far longer than
 // OFFLINE_AFTER_MS: a record holds an offline host's last known sessions, PR
 // chips and usage, so a host rebooting, updating, or off for the afternoon must
 // never be displaced by a newcomer — a flood is refused instead. Only a host
 // that has been gone long enough to be uninteresting is evictable.
-const AGENT_EVICT_IDLE_MS = Number(process.env.AGENT_EVICT_IDLE_MS) || 60 * 60 * 1000;
+const AGENT_EVICT_IDLE_MS = positiveEnv("AGENT_EVICT_IDLE_MS", 60 * 60 * 1000);
 
 // The container's memory limit in bytes, or null when it cannot be read (not
 // containerised, no cgroupfs, or explicitly unlimited). cgroup v2 first, then
@@ -414,7 +446,40 @@ function defaultRegistryBudget() {
   if (!limit) return 32 << 20;
   return Math.max(8 << 20, Math.min(64 << 20, Math.floor(limit / 8)));
 }
-const AGENTS_TOTAL_MAX = Number(process.env.AGENTS_TOTAL_MAX) || defaultRegistryBudget();
+const AGENTS_TOTAL_MAX = positiveEnv("AGENTS_TOTAL_MAX", defaultRegistryBudget());
+
+// One host's share of the aggregate — 512 KiB at the deployed sizing, against a
+// measured real fleet whose LARGEST record is 0.30 MiB.
+//
+// This is what keeps a full registry from reading as an outage. The aggregate
+// gate refuses whoever happens to beat next, and rolling a known host back to
+// its previous record rolls back its `lastSeen` too — so under sustained
+// pressure a live host is refused on every beat and crosses OFFLINE_AFTER_MS
+// while it is up, silently, with no way for the operator to tell that from a
+// network failure. A host inside its share is never the reason the registry is
+// full, so it is never the one that pays: the refusal lands on the host whose
+// record is over its share, which is also the host the operator needs named.
+//
+// The cost is a bounded overshoot rather than a hard total: fat records are
+// still admitted only while the aggregate has slack, and every host inside its
+// share sums to at most AGENTS_TOTAL_MAX again — so worst-case retained is
+// ~2x the budget (a quarter of the container at the deployed sizing), not the
+// unbounded growth this replaces.
+const AGENT_FAIR_SHARE = Math.max(64 << 10, Math.floor(AGENTS_TOTAL_MAX / AGENTS_MAX));
+
+// The most state.json may be before the restore refuses to open it at all. Sized
+// like the registry budget and generously above it, because the saved blob
+// carries the on-demand caches the budget deliberately excludes; the point is
+// to catch a file that cannot fit in the container's memory, not to second-guess
+// a legitimate one. See the restore for why measuring beats parsing.
+const STATE_FILE_MAX = positiveEnv(
+  "STATE_FILE_MAX",
+  (() => {
+    const limit = containerMemoryLimit();
+    if (!limit) return 64 << 20;
+    return Math.max(32 << 20, Math.min(128 << 20, Math.floor(limit / 4)));
+  })()
+);
 
 // The cache keys `serializeAgent` strips; see AGENT_RECORD_MAX.
 //
@@ -462,6 +527,25 @@ function registryBytes() {
   return total;
 }
 
+// A refusal is one line per window, not one per beat: a flood is exactly the
+// traffic that triggers it, so an unthrottled log turns a survived attack into
+// disk pressure. The suppressed count rides the next line so nothing is hidden.
+const REFUSED_LOG_EVERY_MS = 60 * 1000;
+let refusedLogAt = 0;
+let refusedSinceLog = 0;
+function logRegistryFull(detail) {
+  refusedSinceLog += 1;
+  const now = Date.now();
+  if (now - refusedLogAt < REFUSED_LOG_EVERY_MS) return;
+  const also = refusedSinceLog > 1 ? ` (+${refusedSinceLog - 1} more refused since the last line)` : "";
+  refusedLogAt = now;
+  refusedSinceLog = 0;
+  console.error(
+    `registry is full (${Object.keys(agents).length}/${AGENTS_MAX} hosts, ` +
+      `${registryBytes()}/${AGENTS_TOTAL_MAX} bytes): ${detail}${also}`
+  );
+}
+
 // Hosts whose slot may be reclaimed for a newcomer, least-recently-seen first.
 function evictableAgents(now) {
   return Object.entries(agents)
@@ -494,11 +578,14 @@ function makeRegistryRoom(addBytes, addSlots) {
     bytes -= recordBytes.get(key) || 0;
     count -= 1;
     console.warn(
-      `registry at its limit — evicting ${key}, unseen for ` +
+      `registry at its limit — evicting ${logName(key)}, unseen for ` +
         `${Math.round((now - (agents[key].lastSeen || 0)) / 60000)}m`
     );
     delete agents[key];
     recordBytes.delete(key);
+    // Everything else keyed by host name has to let go too, or a registry that
+    // admits and evicts forever leaks a per-host entry per name it ever saw.
+    recordSizeWarned.delete(key);
     invalidateAgentsCache();
     sseBroadcast("removed", { key });
   }
@@ -557,6 +644,23 @@ const liveClients = {};
 // ---- persistence (best-effort: survives hub restarts so the UI isn't blank
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
+  // The trim below cannot protect a restore it never reaches: `readFileSync` +
+  // `JSON.parse` materialize the WHOLE file first, so a 264 MiB state.json left
+  // by a flood kills a 256 MiB hub at init — before a single log line, on every
+  // boot, which `restart: unless-stopped` turns into a permanent crash loop
+  // with nothing to read. So the file is measured before it is opened
+  // (XERK-272). Losing the cache is documented as harmless; not booting is not,
+  // and the file is preserved beside itself rather than deleted so the flood
+  // can still be examined.
+  const stateSize = fs.statSync(STATE_FILE).size;
+  if (stateSize > STATE_FILE_MAX) {
+    const aside = `${STATE_FILE}.oversized`;
+    try { fs.renameSync(STATE_FILE, aside); } catch { /* read-only volume */ }
+    throw new Error(
+      `state file is ${stateSize} bytes, over the ${STATE_FILE_MAX} limit — ` +
+        `starting with an empty registry; the file is kept at ${aside}`
+    );
+  }
   agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   // Records written before a coercion existed — and any host that is OFFLINE,
   // so no beat will ever rewrite its record — carry whatever shape was current
@@ -571,8 +675,15 @@ try {
   // request (XERK-272).
   trimRestoredAgents();
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
-} catch {
-  /* first boot or no volume mounted */
+} catch (e) {
+  // A missing file is first boot / no volume mounted and says nothing worth
+  // saying. Anything else is a state file the hub HAS and could not use — an
+  // oversized one, or corrupt JSON — which the operator has to be told about,
+  // and which leaves a partially-built registry behind unless it is cleared.
+  if (!e || e.code !== "ENOENT") {
+    agents = {};
+    console.error(`state restore skipped: ${(e && e.message) || e}`);
+  }
 }
 // The state blob, or null when it cannot be produced. JSON.stringify throws
 // RangeError once the aggregate passes V8's ~512 MiB string ceiling, and it runs
@@ -4033,11 +4144,11 @@ const server = http.createServer(async (req, res) => {
       // attacker-chosen, so an unbounded number of names is an unbounded number
       // of retained records.
       if (!known && !makeRegistryRoom(0, 1)) {
-        console.error(
-          `heartbeat from ${key}: registry is full ` +
-            `(${Object.keys(agents).length}/${AGENTS_MAX} hosts, ` +
-            `${registryBytes()}/${AGENTS_TOTAL_MAX} bytes) — new host refused`
-        );
+        // Throttled like the over-half warning, and for the same reason: the
+        // flood this exists to survive is exactly the traffic that would write
+        // this line, so a per-beat log turns a refused attack into disk
+        // pressure on the host. Once per REFUSED_LOG_EVERY_MS, with the count.
+        logRegistryFull(`new host ${logName(key)} refused`);
         return json(res, 429, {
           error: "agent registry full", limit: AGENTS_MAX, bytes: AGENTS_TOTAL_MAX,
         });
@@ -4178,11 +4289,13 @@ const server = http.createServer(async (req, res) => {
       // 256 MiB hub. Measured after the coercion, because the coerced record is
       // the one that gets retained, served and saved.
       recordBytes.set(key, recordSize);
-      if (!makeRegistryRoom(0, 0)) {
-        // This host is never what gets evicted — it was just seen, so the idle
-        // rule excludes it. And refusing here is contention, not a wall: the
-        // host beats again in ~20s and lands the moment there is room, rather
-        // than being stuck at its old record forever.
+      if (!makeRegistryRoom(0, 0) && recordSize > AGENT_FAIR_SHARE) {
+        // Only a host OVER its share is refused here. A host inside it is not
+        // the reason the registry is full, and refusing it would roll back its
+        // `lastSeen` with its record — reading as offline while it is up, every
+        // beat, with nothing to distinguish that from a network failure. See
+        // AGENT_FAIR_SHARE. This host is never what gets EVICTED either: it was
+        // just seen, so the idle rule excludes it.
         if (prev && Object.keys(prev).length) {
           agents[key] = prev;
           recordBytes.set(key, agentRecordSize(prev));
@@ -4190,11 +4303,13 @@ const server = http.createServer(async (req, res) => {
           delete agents[key];
           recordBytes.delete(key);
         }
-        console.error(
-          `heartbeat from ${key}: record is ${recordSize} bytes and the registry ` +
-            `is at its ${AGENTS_TOTAL_MAX}-byte budget — beat refused`
+        logRegistryFull(
+          `${logName(key)} refused — its record is ${recordSize} bytes, over the ` +
+            `${AGENT_FAIR_SHARE}-byte per-host share`
         );
-        return json(res, 429, { error: "agent registry full", bytes: AGENTS_TOTAL_MAX });
+        return json(res, 429, {
+          error: "agent registry full", bytes: AGENTS_TOTAL_MAX, share: AGENT_FAIR_SHARE,
+        });
       }
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
@@ -5945,7 +6060,8 @@ if (process.env.TURMA_TEST) {
     // XERK-272 registry bounds. Exported for the same reason as the group above:
     // the per-record ceiling stayed green while an unbounded NUMBER of records
     // OOM-killed the hub, so the aggregate has to be pinned by name too.
-    AGENTS_MAX, AGENTS_TOTAL_MAX, AGENT_EVICT_IDLE_MS,
+    AGENTS_MAX, AGENTS_TOTAL_MAX, AGENT_EVICT_IDLE_MS, AGENT_FAIR_SHARE,
+    STATE_FILE_MAX, positiveEnv, logName,
     registryBytes, makeRegistryRoom, trimRestoredAgents, containerMemoryLimit,
     defaultRegistryBudget, recordBytes,
     // Ingest coercion, exported for the same reason as the rest of this group:
@@ -6025,6 +6141,14 @@ if (process.env.TURMA_TEST) {
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT}`);
+    // The effective registry budget, printed because it is DERIVED (from this
+    // container's own cgroup limit) rather than configured — without this the
+    // only way to learn what the hub is enforcing is to be refused by it.
+    console.log(
+      `agent registry: <=${AGENTS_MAX} hosts, <=${AGENTS_TOTAL_MAX} bytes ` +
+        `(${AGENT_FAIR_SHARE}/host), container limit ` +
+        `${containerMemoryLimit() ?? "unknown"}`
+    );
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile
     // notifications (every notify() is a no-op), and that has silently bitten us
