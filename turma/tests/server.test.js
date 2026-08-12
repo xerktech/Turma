@@ -7146,6 +7146,12 @@ test("a corrupt state file restores nothing, rather than a registry of character
     assert.deepEqual(restored, {}, `state.json of ${junk} must restore nothing`);
     assert.doesNotMatch(out, /loaded \d+ agents/,
       `${junk} must not report a successful load`);
+    // ...and it SAYS so. The restore's catch swallowed everything, so a corrupt
+    // file was indistinguishable from first boot and the shape check above threw
+    // a message nothing ever printed.
+    const { warns } = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+    assert.ok(warns.some((w) => /ignoring unusable state file/.test(w)),
+      `${junk} must be reported, not silently treated as first boot`);
   }
   // A well-formed file still loads, so the guard isn't refusing everything.
   const ok = bootWithState(this, JSON.stringify({ truenas: { device: "truenas" } }));

@@ -407,8 +407,15 @@ try {
   }
   for (const a of Object.values(agents)) normalizeRecord(a);
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
-} catch {
-  /* first boot or no volume mounted */
+} catch (e) {
+  // A missing file is the ordinary case — first boot, or no volume mounted —
+  // and stays silent. Anything else means a state file EXISTS and could not be
+  // restored, which is worth a line: without one, a corrupt file is
+  // indistinguishable from first boot, and the shape check above throws a
+  // message that nothing would ever print.
+  if (e?.code !== "ENOENT") {
+    console.warn(`ignoring unusable state file ${STATE_FILE}: ${e?.message || e}`);
+  }
 }
 // The state blob, or null when it cannot be produced. JSON.stringify throws
 // RangeError once the aggregate passes V8's ~512 MiB string ceiling, and it runs
