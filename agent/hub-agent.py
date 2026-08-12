@@ -1107,10 +1107,22 @@ def build_limits_settings(python_exe=None, statusline_path=None):
 _HOSTNAME_PLACEHOLDERS = {"", "localhost", "unknown-device", "docker-desktop"}
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12}$|^[0-9a-f]{64}$")
 
+# A name that is a URL dot segment is UNADDRESSABLE, not merely ugly: percent-
+# encoding leaves "." and ".." untouched (they are unreserved), and the URL
+# parser resolving /api/agents/<host>/... then collapses the segment away — so
+# the host heartbeats and looks online while every route against it 404s, with
+# nothing pointing at the name as the cause (XERK-269). Rejecting it here makes
+# the agent fall through to its next naming source instead.
+_DOT_SEGMENT_NAMES = {".", ".."}
+
 
 def _usable_hostname(name):
     name = (name or "").strip()
     if name.lower() in _HOSTNAME_PLACEHOLDERS:
+        return ""
+    if name in _DOT_SEGMENT_NAMES:
+        log(f"ignoring device name {name!r}: a URL dot segment is unaddressable "
+            "on /api/agents/<host>/... routes")
         return ""
     if _CONTAINER_ID_RE.match(name):
         return ""
@@ -1242,10 +1254,19 @@ def device_name():
     #      / WSL2 path, where the container is isolated from the host name.
     #   5. socket.gethostname() — only when it isn't a container id (the
     #      "fe0e38df73b4" bug); inside a container it usually is, so it's rejected.
+    # An explicit override deliberately outranks _usable_hostname()'s placeholder
+    # rules — an operator naming a host "localhost" means it. But a dot segment is
+    # unaddressable no matter who chose it (XERK-269), so that one check still
+    # applies here; the name is dropped and detection continues below.
     for env in ("DEVICE_NAME", "COMPUTERNAME"):
         name = os.environ.get(env, "").strip()
-        if name:
-            return name
+        if not name:
+            continue
+        if name in _DOT_SEGMENT_NAMES:
+            log(f"ignoring ${env}={name!r}: a URL dot segment is unaddressable "
+                "on /api/agents/<host>/... routes")
+            continue
+        return name
     try:
         with open("/host/etc/hostname") as f:
             name = _usable_hostname(f.read())
