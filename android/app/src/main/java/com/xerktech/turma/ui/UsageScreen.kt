@@ -484,20 +484,26 @@ private fun CacheLine(cache: UsageViewModel.CacheSummary) {
  * Omitted entirely when no host in view reports the split — an agent predating
  * the field can't answer, and "0% delegated" would be an answer.
  */
+/**
+ * The web card's three windows, in the one line the screen has room for. A
+ * window with no spend has no share to take, so it is dropped rather than drawn
+ * as 0% — the same distinction the card makes with a dash.
+ *
+ * Pulled out of the Composable purely so a test can reach it: `ui/` Composable
+ * bodies are ungated here (`testDebugUnitTest` is the only Android gate CI
+ * runs), and the Locale.US below is load-bearing — an ar-EG phone drew
+ * "today ٠٫٠%" beside a correct "9.0B" without it.
+ */
+internal fun subagentWindows(sub: UsageViewModel.SubagentSplit): List<String> = listOfNotNull(
+    sub.todayPct?.let { String.format(Locale.US, "today %.1f%%", it) },
+    sub.weekPct?.let { String.format(Locale.US, "7d %.1f%%", it) },
+    sub.totalPct?.let { String.format(Locale.US, "all-time %.1f%%", it) },
+)
+
 @Composable
 private fun SubagentLine(sub: UsageViewModel.SubagentSplit) {
     if (!sub.any) return
-    // The web card's three windows, in the one line this screen has room for. A
-    // window with no spend has no share to take, so it is dropped rather than
-    // drawn as 0% — same distinction the card makes with a dash.
-    // Locale.US, not the device locale: these sit beside fmtTokens' output on
-    // the same line and mirror the web card, which always renders "0.0%". An
-    // ar-EG phone drew "today ٠٫٠%" next to a correct "9.0B".
-    val windows = listOfNotNull(
-        sub.todayPct?.let { String.format(Locale.US, "today %.1f%%", it) },
-        sub.weekPct?.let { String.format(Locale.US, "7d %.1f%%", it) },
-        sub.totalPct?.let { String.format(Locale.US, "all-time %.1f%%", it) },
-    )
+    val windows = subagentWindows(sub)
     if (windows.isEmpty()) return
     Text(
         "${fmtTokens(sub.total)} delegated to sub-agents · " + windows.joinToString(" · ") +

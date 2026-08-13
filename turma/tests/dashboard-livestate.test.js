@@ -157,6 +157,10 @@ test("dashboard fmtTokens: same digits as the Usage page and Android", () => {
   assert.equal(fmtTokens(850), "850");
   assert.equal(fmtTokens(272_500_000), "272.5M");
   assert.equal(fmtTokens(1e30).includes("e+"), false);
+  // The unscaled fall-through is the same trap on the other path.
+  assert.equal(fmtTokens(-1e21), "-1000000000000000000000");
+  assert.equal(fmtTokens(5e-324), "0");
+  assert.equal(fmtTokens(-1500), "-1500");
 });
 
 test("dashboard fmtTokens: the unit boundary is inclusive, as everywhere else", () => {

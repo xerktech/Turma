@@ -284,7 +284,13 @@ function fmtTokens(n) {
   for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
     if (n >= unit) return scaleTokens(n, unit) + suffix;
   }
-  return String(n);
+  // Below the smallest unit, and still owed digits. Two shapes reach here that
+  // String() would write in exponent form: a negative count (which never
+  // scales, so that Android — whose Long.toString cannot go exponential —
+  // renders the same thing) and a denormal. Rounding settles both, and a
+  // fractional count is not a real token figure anyway.
+  const whole = Math.round(n);
+  return Math.abs(whole) >= 1e21 ? BigInt(whole).toString() : String(whole);
 }
 
 // One decimal place, rounded HALF-UP on the exact value — which `(n /
@@ -1151,9 +1157,21 @@ function cacheHitRate(b) {
     const x = Number(v);
     return Number.isFinite(x) ? x : NaN;
   };
-  const read = num(b.cacheRead);
-  const prompt = read + num(b.cacheWrite) + num(b.input);
-  if (!Number.isFinite(prompt) || prompt <= 0 || read < 0) return null;
+  const read = num(b.cacheRead), write = num(b.cacheWrite), input = num(b.input);
+  // EVERY part has to be a real, non-negative count before the division means
+  // anything — stated as the property rather than as the cases, because
+  // checking `read` alone let a negative `cacheWrite` or `input` shrink the
+  // denominator below the numerator and render "101% hit", "200% hit" and
+  // "Infinity% hit" in the page's headline. Written as `!(x >= 0)` so NaN,
+  // which fails every comparison, is refused by the same clause.
+  if (!(read >= 0) || !(write >= 0) || !(input >= 0)) return null;
+  const prompt = read + write + input;
+  // With all three non-negative, `read <= prompt` holds, so the result is in
+  // 0..100 by construction. Two things still have to be rejected: nothing to
+  // take a ratio of, and a sum that overflowed to Infinity — three finite
+  // fields can do that, and the division would then answer a confident "0%"
+  // for a bucket that was nothing but cache reads.
+  if (!(prompt > 0) || !Number.isFinite(prompt)) return null;
   return Math.round((read / prompt) * 100);
 }
 

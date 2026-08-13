@@ -1,5 +1,6 @@
 package com.xerktech.turma.ui
 
+import com.xerktech.turma.vm.UsageViewModel
 import java.util.Locale
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -66,5 +67,34 @@ class FmtTokensTest {
         assertTrue(fmtTokens(Long.MAX_VALUE).endsWith("B"))
         assertTrue(fmtTokens(Long.MAX_VALUE).startsWith("9223372036"))
         assertEquals("-5", fmtTokens(-5))
+    }
+
+    @Test fun `the sub-agent windows do not follow the device locale`() {
+        // These render on the SAME LINE as a token count, so a locale leaking
+        // into one and not the other is a single line disagreeing with itself.
+        // Ungated until subagentWindows was lifted out of the Composable.
+        // The pct properties are derived: 100 of 1000 spent is 10.0% a window.
+        val split = UsageViewModel.SubagentSplit(
+            today = 100, week = 100, total = 100,
+            ofToday = 1_000, ofWeek = 1_000, ofTotal = 1_000,
+            reporting = 1, hosts = 1,
+        )
+        for (locale in listOf(Locale.US, Locale.GERMANY, Locale("ar", "EG"))) {
+            Locale.setDefault(locale)
+            assertEquals(
+                "locale $locale",
+                listOf("today 10.0%", "7d 10.0%", "all-time 10.0%"),
+                subagentWindows(split),
+            )
+        }
+    }
+
+    @Test fun `the capture-age stamp does not follow the device locale`() {
+        // "%dh %02dm" renders Arabic-Indic digits under ar-EG, beside a
+        // subscription percentage that does not.
+        for (locale in listOf(Locale.US, Locale.GERMANY, Locale("ar", "EG"))) {
+            Locale.setDefault(locale)
+            assertEquals("locale $locale", "2h 05m", UsageViewModel.fmtDuration(7_500))
+        }
     }
 }

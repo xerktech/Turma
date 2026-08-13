@@ -576,7 +576,10 @@ function fmtTokens(n) {
       return (whole >= 1e21 ? BigInt(whole).toString() : String(whole)) + "." + tenths + suffix;
     }
   }
-  return String(n);
+  // Below the smallest unit: String() writes a negative-huge or a denormal in
+  // exponent form, which is not the shape this promises. See usage.html.
+  const whole = Math.round(n);
+  return Math.abs(whole) >= 1e21 ? BigInt(whole).toString() : String(whole);
 }
 function fmtBytes(b) {
   if (b == null) return "–";

@@ -132,6 +132,48 @@ test("cacheHitRate states no rate rather than a nonsense one", () => {
   assert.equal(H.cacheHitRate(bucket({ input: 100, cacheRead: -50 })), null);
 });
 
+// Stated as the property, over a sweep, because case-by-case guards on this
+// function have now been wrong twice: the first pass narrowed inputs but let
+// `v || 0` swallow NaN, and the second checked `cacheRead` alone, so a negative
+// `cacheWrite` or `input` shrank the denominator below the numerator and put
+// "101% hit", "200% hit" and "Infinity% hit" in the page's headline.
+test("cacheHitRate is ALWAYS null or a percentage in 0..100, over every shape", () => {
+  const values = [
+    0, 1, -1, 100, -100, 999, 0.5, -0.5, 5e-324, -5e-324, 1e308, -1e308,
+    NaN, Infinity, -Infinity, null, undefined, "", "0", "500", "oops",
+    "0500-100", [], {}, true, false,
+  ];
+  let stated = 0;
+  for (const cacheRead of values) {
+    for (const cacheWrite of values) {
+      for (const input of values) {
+        const out = H.cacheHitRate({ cacheRead, cacheWrite, input });
+        if (out === null) continue;
+        stated++;
+        assert.equal(Number.isInteger(out) && out >= 0 && out <= 100, true,
+          `cacheHitRate({cacheRead:${String(cacheRead)}, cacheWrite:${String(cacheWrite)}, ` +
+          `input:${String(input)}}) = ${out}`);
+      }
+    }
+  }
+  // Guard the guard: a rule that answered null to everything would pass the
+  // assertion above without stating a single real rate.
+  assert.equal(stated > 1000, true, `only ${stated} rates stated`);
+});
+
+test("cacheHitRate refuses a prompt that overflowed to Infinity", () => {
+  // Three finite fields can sum past Number.MAX_VALUE. The division then
+  // answers a confident "0% hit" for a bucket that was nothing but reads.
+  assert.equal(H.cacheHitRate({ cacheRead: 1e308, cacheWrite: 1e308, input: 1e308 }), null);
+});
+
+test("cacheHitRate refuses a negative in ANY of the three fields, not just the read", () => {
+  // The three that rendered live in the headline strip.
+  assert.equal(H.cacheHitRate({ input: -5, output: 10, cacheWrite: 0, cacheRead: 999 }), null);
+  assert.equal(H.cacheHitRate({ input: 0.5, output: 1, cacheWrite: -1, cacheRead: 1 }), null);
+  assert.equal(H.cacheHitRate({ input: 5e-324, output: 0, cacheWrite: -1, cacheRead: 1 }), null);
+});
+
 test("the strip's cache line carries no rate it cannot stand behind", () => {
   // The end-to-end version: renderTotals puts this string at the top of the
   // page, where "NaN% hit" was rendering.
@@ -246,6 +288,27 @@ test("fmtTokens never goes exponential, however absurd the count", () => {
   // not the shape this function promises the callers that build markup from it.
   assert.match(H.fmtTokens(1e30), /^[0-9]+\.[0-9]B$/);
   assert.equal(H.fmtTokens(1e30).includes("e+"), false);
+  // The unscaled fall-through is the same trap on the other path: a negative
+  // never scales (so Android, whose Long.toString cannot go exponential,
+  // renders the same string), and a denormal is below every unit.
+  assert.equal(H.fmtTokens(-1e21), "-1000000000000000000000");
+  assert.equal(H.fmtTokens(5e-324), "0");
+  assert.equal(H.fmtTokens(-1500), "-1500");   // parity: Kotlin gives "-1500"
+});
+
+// The shape is a contract with the callers that interpolate this into markup,
+// so assert it over a sweep rather than at the handful of values I happened to
+// think of — both exponent bugs were found by QA at values I had not.
+test("fmtTokens output ALWAYS matches its documented shape", () => {
+  const shape = /^(–|-?[0-9]+(\.[0-9])?[kMB]?)$/;
+  const values = [
+    0, 1, -1, 999, 1000, 1150, 999_950, 1e6, 1e9, 1e21, 1e30, 1e308, -1e21, -1e30,
+    5e-324, -5e-324, 0.5, -0.5, 1234.5, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER,
+    NaN, Infinity, -Infinity, null, undefined, "", "500", "abc", "<img src=x>", [], {},
+  ];
+  for (const v of values) {
+    assert.match(H.fmtTokens(v), shape, `fmtTokens(${String(v)}) escaped its shape`);
+  }
 });
 
 test("a hostile token field cannot reach the table cell as markup", () => {
