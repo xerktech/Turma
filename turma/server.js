@@ -1736,6 +1736,35 @@ function normalizeLimits(payload) {
   payload.limits = out;
 }
 
+// Longest subscription key the hub will carry (XERK-301). The agent emits 16
+// hex chars; this is the boundary bound, not that length, so an agent that
+// changes its digest still groups. It is a MAP KEY on every client, so an
+// unbounded one is a per-beat amplification of exactly the kind XERK-235 was.
+const SUBSCRIPTION_KEY_MAX = 128;
+
+// The subscription grouping key (XERK-301), coerced for the same reason
+// normalizeLimits above is: it fans out to web, Android and glasses, and
+// Android decodes it into TYPED fields. Anything unusable becomes null — the
+// "that host can't tell you" value every client already handles by leaving the
+// host on a card of its own, never a plausible default, since a bogus shared
+// key would fold two unrelated subscriptions into one set of bars.
+function normalizeSubscription(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const sub = payload.subscription;
+  if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+    if ("subscription" in payload) payload.subscription = null;
+    return;
+  }
+  const key = typeof sub.key === "string" ? sub.key.trim() : "";
+  if (!key) {
+    payload.subscription = null;
+    return;
+  }
+  const out = { key: key.slice(0, SUBSCRIPTION_KEY_MAX) };
+  if (typeof sub.source === "string") out.source = sub.source.slice(0, 32);
+  payload.subscription = out;
+}
+
 // Coerce the local-model block at ingest, for exactly the reason normalizeLimits
 // above does it (XERK-246): this fans out to web, Android and glasses, and
 // Android decodes it into TYPED fields — `available: Boolean`, `contextTokens:
@@ -2456,7 +2485,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
   "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
-  "sessions", "startedAt", "uploadMaxBytes", "usage",
+  "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "spawnFailures",
@@ -2644,6 +2673,7 @@ function normalizeRecord(a) {
   normalizeSessions(a);
   normalizeUsage(a);
   normalizeLimits(a);
+  normalizeSubscription(a);
   normalizeLocalModel(a);
 }
 

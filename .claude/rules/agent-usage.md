@@ -114,3 +114,24 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
   `/dev/zero` is an unbounded allocation), bounds both epochs, and refuses a FUTURE `capturedAt`,
   which would otherwise read as freshly captured forever and never go stale.
 - Tests: `TestLimitsSnapshot`, `TestLimitsSettings`, `test_statusline.py`.
+
+## Which subscription a host is on (XERK-301)
+
+- Those windows belong to the **ACCOUNT, not the machine**: every host logged into one Claude
+  account reads and spends the same pool, so the Usage page draws one card per subscription. The
+  heartbeat's **`subscription`** block (`subscription_identity()`) is the key it groups on.
+- The identity comes from **`oauthAccount.accountUuid` in Claude Code's own config file**, tried at
+  both real layouts (`CLAUDE_CONFIG_PATHS`: inside the config dir, then beside it). The credentials
+  file next to it cannot answer this — its tokens rotate, and `subscriptionType` names a PLAN, which
+  two different accounts share.
+- **What rides the wire is a hash, never the uuid, org uuid or email.** The hub persists every beat
+  into `state.json` and fans it out to web, Android and glasses, and grouping only ever asks whether
+  two hosts are equal.
+- **Absent means "this host can't tell you"**, and the clients keep such a host on a card of its own
+  — two hosts that both report nothing are not thereby on one plan. `TURMA_SUBSCRIPTION_KEY` pins a
+  group by hand for a host whose config this can't read; it is hashed the same way, so two hosts
+  given one string group.
+- `subscription_identity` **never raises** (beat critical path, over a file Claude Code rewrites
+  constantly) and is **cached on the file's `(mtime, size)`** — it is ~120 KiB of caches, so
+  re-parsing it every beat would be pure waste, while a re-login still wins.
+- Tests: `TestSubscriptionIdentity`.

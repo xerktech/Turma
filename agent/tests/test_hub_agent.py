@@ -3358,6 +3358,108 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         self.assertFalse(ha._looks_like_internal_tool_prompt("ok, ship the probe"))
 
 
+class TestSubscriptionIdentity(unittest.TestCase):
+    """Which subscription a host's login is on (XERK-301). The limits above are a
+    property of the ACCOUNT, so hosts sharing one account share one set of bars —
+    which needs a stable, opaque key, and needs "I can't tell" to stay tellable
+    apart from "I share yours"."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, ".claude.json")
+        ha._subscription_cache = None
+        self.addCleanup(setattr, ha, "_subscription_cache", None)
+
+    def _write(self, data, path=None):
+        with open(path or self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def _read(self, env=None):
+        return ha.subscription_identity(paths=[self.path], env=env or {})
+
+    def test_reads_the_account_from_the_claude_config(self):
+        self._write({"oauthAccount": {"accountUuid": "acc-1", "emailAddress": "a@b.c"}})
+        block = self._read()
+        self.assertEqual(block["source"], "login")
+        self.assertEqual(len(block["key"]), ha.SUBSCRIPTION_KEY_CHARS)
+
+    def test_the_key_carries_nothing_of_the_account_it_names(self):
+        # The hub persists every heartbeat and fans it out to web, Android and
+        # glasses; grouping only ever asks whether two hosts are equal, so the
+        # uuid, the org uuid and the email have no business on the wire.
+        self._write({"oauthAccount": {"accountUuid": "acc-1",
+                                      "emailAddress": "someone@example.com",
+                                      "organizationUuid": "org-9"}})
+        key = self._read()["key"]
+        for secret in ("acc-1", "someone@example.com", "org-9"):
+            self.assertNotIn(secret, key)
+
+    def test_the_same_account_gives_the_same_key_and_a_different_one_does_not(self):
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        first = self._read()["key"]
+        ha._subscription_cache = None
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        self.assertEqual(self._read()["key"], first)
+        ha._subscription_cache = None
+        self._write({"oauthAccount": {"accountUuid": "acc-2"}})
+        self.assertNotEqual(self._read()["key"], first)
+
+    def test_a_login_that_cannot_be_identified_reports_nothing(self):
+        # None is the heartbeat's "that agent can't tell you" value: such a host
+        # keeps a card of its own rather than being folded in with every other
+        # host that also can't say.
+        self.assertIsNone(self._read())                    # no file at all
+        self._write({"numStartups": 3})                    # no oauthAccount
+        self.assertIsNone(self._read())
+        ha._subscription_cache = None
+        self._write({"oauthAccount": {"accountUuid": ""}})  # blank uuid
+        self.assertIsNone(self._read())
+
+    def test_a_broken_config_costs_the_grouping_not_the_beat(self):
+        # This runs on the beat's critical path over a file Claude Code rewrites
+        # constantly, so a truncated write must never raise.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write('{"oauthAccount": {"accountUu')
+        self.assertIsNone(self._read())
+        ha._subscription_cache = None
+        self._write(["not", "an", "object"])
+        self.assertIsNone(self._read())
+
+    def test_an_implausibly_large_config_is_not_read(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(" " * (ha.SUBSCRIPTION_CONFIG_MAX_BYTES + 1))
+        self.assertIsNone(self._read())
+
+    def test_the_env_pin_overrides_the_login_and_is_hashed_too(self):
+        # For a host whose config this can't read. Two hosts given the same
+        # string must land in the same group, and neither source leaks its input.
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        pinned = self._read({ha.SUBSCRIPTION_KEY_ENV: " team-max "})
+        self.assertEqual(pinned["source"], "env")
+        self.assertNotIn("team-max", pinned["key"])
+        self.assertEqual(pinned, self._read({ha.SUBSCRIPTION_KEY_ENV: "team-max"}))
+        self.assertNotEqual(pinned["key"], self._read()["key"])
+
+    def test_the_first_readable_layout_wins(self):
+        # CLAUDE_CONFIG_DIR puts the file INSIDE the config dir; the default puts
+        # it beside it. Both are real, so both are tried in order.
+        other = os.path.join(self.dir, "other.json")
+        self._write({"oauthAccount": {"accountUuid": "acc-2"}}, path=other)
+        self.assertEqual(
+            ha.subscription_identity(paths=[os.path.join(self.dir, "nope.json"), other],
+                                     env={})["source"], "login")
+
+    def test_a_re_login_is_picked_up_rather_than_cached_forever(self):
+        # The config file is ~120 KiB and almost never changes, so it is read
+        # once per (mtime, size) — but a changed login has to win.
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        first = self._read()["key"]
+        self._write({"oauthAccount": {"accountUuid": "acc-2-longer"}})
+        os.utime(self.path, (0, 0))   # force a different mtime than the write
+        self.assertNotEqual(self._read()["key"], first)
+
+
 class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
     orphan transcript (session aged out of closed.json, or predating the ledger)

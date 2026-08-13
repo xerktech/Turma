@@ -82,7 +82,8 @@ function loadHelpers() {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheHitRate, blankBucket,
-    limitEntries, limitWindowView, fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC };`;
+    limitEntries, limitGroups, limitHostLabel, limitWindowView, fmtDuration,
+    LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC };`;
   return new Function(...keys, body)(...keys.map((k) => stubs[k]));
 }
 
@@ -214,6 +215,85 @@ test("limitEntries falls back to the agent key when a host has no device name", 
     { key: "unnamed-1", limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
   ], NOW);
   assert.equal(entries[0].host, "unnamed-1");
+});
+
+// --- limitGroups: one card per subscription (XERK-301) ----------------------
+
+const sub = (key) => ({ subscription: { key } });
+
+test("limitGroups folds hosts on one subscription into a single card", () => {
+  // Both hosts are logged into the same Claude account, so they are reading
+  // (and spending) one pool — two sets of bars was the same number twice.
+  const groups = H.limitGroups([
+    { device: "maxai", ...sub("k1"),
+      limits: { capturedAt: NOW - 600, fiveHour: { usedPct: 30 }, sevenDay: { usedPct: 10 } } },
+    { device: "truenas", ...sub("k1"),
+      limits: { capturedAt: NOW - 60, fiveHour: { usedPct: 42 }, sevenDay: { usedPct: 12 } } },
+  ], NOW);
+  assert.equal(groups.length, 1);
+  assert.deepEqual(groups[0].hosts.map((h) => h.host), ["truenas", "maxai"]);
+  assert.equal(groups[0].capturedAt, NOW - 60);
+});
+
+test("limitGroups keeps different subscriptions on their own cards", () => {
+  const groups = H.limitGroups([
+    { device: "work", ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 30 } } },
+    { device: "home", ...sub("k2"), limits: { capturedAt: NOW - 30, fiveHour: { usedPct: 5 } } },
+  ], NOW);
+  assert.deepEqual(groups.map((g) => g.hosts.map((h) => h.host)), [["work"], ["home"]]);
+});
+
+test("limitGroups never folds two hosts that merely both report NO subscription", () => {
+  // Absent means "this host can't tell you" (the heartbeat's rule), so two
+  // silent hosts are not thereby on one plan — an older agent alongside a
+  // current one must not have its bars merged into somebody else's.
+  const groups = H.limitGroups([
+    { device: "old-a", limits: { capturedAt: NOW, fiveHour: { usedPct: 30 } } },
+    { device: "old-b", limits: { capturedAt: NOW, fiveHour: { usedPct: 70 } } },
+    { device: "old-c", subscription: { key: "" },
+      limits: { capturedAt: NOW, fiveHour: { usedPct: 90 } } },
+  ], NOW);
+  assert.deepEqual(groups.map((g) => g.hosts.map((h) => h.host)),
+    [["old-a"], ["old-b"], ["old-c"]]);
+});
+
+test("limitGroups takes each window's FRESHEST reading, per window", () => {
+  // The newest read of a shared counter is simply the most recent truth — and
+  // across a reset it is the only right answer, where a maximum would keep the
+  // pre-reset figure alive. Per window, because the freshest snapshot need not
+  // carry both.
+  const groups = H.limitGroups([
+    { device: "a", ...sub("k1"),
+      limits: { capturedAt: NOW - 600, fiveHour: { usedPct: 80 }, sevenDay: { usedPct: 44 } } },
+    { device: "b", ...sub("k1"),
+      limits: { capturedAt: NOW - 60, fiveHour: { usedPct: 3 } } },
+  ], NOW);
+  assert.equal(groups[0].windows.fiveHour.win.usedPct, 3);      // freshest, not highest
+  assert.equal(groups[0].windows.sevenDay.win.usedPct, 44);     // only reading there is
+});
+
+test("limitGroups drops an aged-out snapshot before it can join a group", () => {
+  const groups = H.limitGroups([
+    { device: "dead", ...sub("k1"), limits: {
+      capturedAt: NOW - H.LIMIT_MAX_AGE_SEC - 60, fiveHour: { usedPct: 40 } } },
+    { device: "live", ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 7 } } },
+  ], NOW);
+  assert.deepEqual(groups[0].hosts.map((h) => h.host), ["live"]);
+});
+
+test("limitGroups leads with the freshest card", () => {
+  const groups = H.limitGroups([
+    { device: "stale", ...sub("k1"), limits: { capturedAt: NOW - 9000, sevenDay: { usedPct: 1 } } },
+    { device: "fresh", ...sub("k2"), limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 2 } } },
+  ], NOW);
+  assert.deepEqual(groups.map((g) => g.hosts[0].host), ["fresh", "stale"]);
+});
+
+test("limitHostLabel names the hosts, counting the tail past a few", () => {
+  const named = (...hosts) => H.limitHostLabel({ hosts: hosts.map((host) => ({ host })) });
+  assert.equal(named("solo"), "solo");
+  assert.equal(named("a", "b"), "a · b");
+  assert.equal(named("a", "b", "c", "d", "e"), "a · b · c +2 more");
 });
 
 test("limitWindowView reports the percentage and the countdown to reset", () => {

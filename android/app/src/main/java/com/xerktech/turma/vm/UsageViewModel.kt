@@ -84,13 +84,31 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val cache: CacheSummary = CacheSummary(),
     )
 
-    /** One host's subscription-limit snapshot, ready to render (XERK-247). */
+    /**
+     * One SUBSCRIPTION's limit snapshot, ready to render (XERK-247, XERK-301).
+     * [hosts] is every host on that subscription — usually one — and each
+     * window carries the freshest reading any of them took.
+     */
     data class LimitCard(
-        val host: String,
+        val hosts: List<LimitHost>,
         val capturedAt: Long,
         val fiveHour: LimitView? = null,
         val sevenDay: LimitView? = null,
-    )
+    ) {
+        /**
+         * The card's heading. There is no better name for a subscription — the
+         * key is a hash by design — and the hosts are what the operator
+         * recognises. Long lists give way to a count; every name is still in
+         * [hosts] for the detail line.
+         */
+        val host: String get() =
+            if (hosts.size <= LIMIT_HOSTS_SHOWN) hosts.joinToString(" · ") { it.host }
+            else hosts.take(LIMIT_HOSTS_SHOWN).joinToString(" · ") { it.host } +
+                " +${hosts.size - LIMIT_HOSTS_SHOWN} more"
+    }
+
+    /** One host on a subscription, with the moment IT last read the windows. */
+    data class LimitHost(val host: String, val capturedAt: Long)
 
     /**
      * One window's rendered state. [expired] beats the percentage: when the
@@ -281,22 +299,74 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
 
+        /** How many host names a card's heading spells out before counting them. */
+        const val LIMIT_HOSTS_SHOWN = 3
+
         /**
-         * One card per host that reports a usable snapshot, freshest first. A
-         * host reporting none is skipped entirely — an agent too old to send the
-         * field, a login with no subscription windows, or one that hasn't been
-         * probed yet all mean "this host can't tell you", not "0% used" — and so
-         * is one whose snapshot is older than [LIMIT_MAX_AGE_SEC].
+         * One card per SUBSCRIPTION that reports a usable snapshot, freshest
+         * first (web usage.html `limitGroups`).
+         *
+         * A host reporting no snapshot is skipped entirely — an agent too old to
+         * send the field, a login with no subscription windows, or one that
+         * hasn't been probed yet all mean "this host can't tell you", not "0%
+         * used" — and so is one whose snapshot is older than [LIMIT_MAX_AGE_SEC].
+         *
+         * Hosts logged into one Claude account read and spend the SAME 5h/7d
+         * pool, so their snapshots are readings of a single thing and fold into
+         * one card. Grouping is on the agent's opaque `subscription.key`; a host
+         * that reports none keeps a card of its own and is never folded in with
+         * another silent host, since "can't tell you" from two hosts does not
+         * make them one plan.
+         *
+         * Within a group each window takes its FRESHEST reading rather than an
+         * average or a maximum: every host reads the same server-side counter,
+         * and across a window's reset the newest read is the only right answer
+         * where a maximum would keep the pre-reset figure alive.
          */
-        fun limitCards(fleet: FleetState, nowSec: Long): List<LimitCard> =
-            fleet.agents.mapNotNull { a ->
-                val lim = a.limits ?: return@mapNotNull null
-                if (nowSec - lim.capturedAt > LIMIT_MAX_AGE_SEC) return@mapNotNull null
-                val five = limitView(lim.fiveHour, nowSec)
-                val seven = limitView(lim.sevenDay, nowSec)
-                if (five == null && seven == null) return@mapNotNull null
-                LimitCard(a.device.ifBlank { a.key }, lim.capturedAt, five, seven)
+        fun limitCards(fleet: FleetState, nowSec: Long): List<LimitCard> {
+            // Insertion-ordered so ungrouped hosts keep their place among the
+            // groups; the sort at the end is what actually orders the cards.
+            val groups = mutableListOf<MutableLimitGroup>()
+            val byKey = mutableMapOf<String, MutableLimitGroup>()
+            for (a in fleet.agents) {
+                val lim = a.limits ?: continue
+                if (nowSec - lim.capturedAt > LIMIT_MAX_AGE_SEC) continue
+                if (lim.fiveHour?.usedPct == null && lim.sevenDay?.usedPct == null) continue
+                val subKey = a.subscription?.key?.takeIf { it.isNotBlank() }
+                val group = subKey?.let { byKey[it] } ?: MutableLimitGroup().also {
+                    groups.add(it)
+                    if (subKey != null) byKey[subKey] = it
+                }
+                group.hosts.add(LimitHost(a.device.ifBlank { a.key }, lim.capturedAt))
+                group.capturedAt = maxOf(group.capturedAt, lim.capturedAt)
+                if (lim.fiveHour?.usedPct != null && lim.capturedAt >= group.fiveHourAt) {
+                    group.fiveHour = lim.fiveHour
+                    group.fiveHourAt = lim.capturedAt
+                }
+                if (lim.sevenDay?.usedPct != null && lim.capturedAt >= group.sevenDayAt) {
+                    group.sevenDay = lim.sevenDay
+                    group.sevenDayAt = lim.capturedAt
+                }
+            }
+            return groups.map { g ->
+                LimitCard(
+                    hosts = g.hosts.sortedByDescending { it.capturedAt },
+                    capturedAt = g.capturedAt,
+                    fiveHour = limitView(g.fiveHour, nowSec),
+                    sevenDay = limitView(g.sevenDay, nowSec),
+                )
             }.sortedByDescending { it.capturedAt }
+        }
+
+        /** Accumulator behind [limitCards]; never leaves this file. */
+        private class MutableLimitGroup {
+            val hosts = mutableListOf<LimitHost>()
+            var capturedAt = 0L
+            var fiveHour: com.xerktech.turma.model.LimitWindow? = null
+            var fiveHourAt = Long.MIN_VALUE
+            var sevenDay: com.xerktech.turma.model.LimitWindow? = null
+            var sevenDayAt = Long.MIN_VALUE
+        }
 
         /** How many days the stacked daily chart shows (web usage.html DAYS_SHOWN). */
         const val DAYS_SHOWN = 30

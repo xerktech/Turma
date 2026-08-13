@@ -178,7 +178,7 @@
   <div class="viewbar" id="viewbar"></div>
   <div id="chart"></div>
   <div id="models"></div>
-  <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. Token figures below are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
+  <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. There is <b>one card per subscription</b>, not per host: hosts logged into the same Claude account are reading and spending the same pool, so they fold into one card listing them all, and each window shows the freshest reading any of them took. A host whose agent is too old to say which account it's on stays on a card of its own. Token figures below are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
@@ -293,8 +293,60 @@ function limitEntries(agents, nowSec) {
     .filter(a => a && a.limits
       && LIMIT_WINDOWS.some(([k]) => typeof (a.limits[k] || {}).usedPct === "number")
       && now - (a.limits.capturedAt || 0) <= LIMIT_MAX_AGE_SEC)
-    .map(a => ({ host: a.device || a.key, limits: a.limits }))
+    .map(a => ({
+      host: a.device || a.key,
+      // The subscription this host's login is on (XERK-301), or null when it
+      // can't say — see limitGroups.
+      subKey: subscriptionKeyOf(a),
+      limits: a.limits,
+    }))
     .sort((x, y) => (y.limits.capturedAt || 0) - (x.limits.capturedAt || 0));
+}
+
+function subscriptionKeyOf(agent) {
+  const key = agent && agent.subscription && agent.subscription.key;
+  return typeof key === "string" && key ? key : null;
+}
+
+// One card per SUBSCRIPTION, not per host (XERK-301). Hosts logged into one
+// Claude account read — and spend — the same 5h/7d pool, so their snapshots are
+// readings of a single thing and one set of bars is the honest rendering of it;
+// several was the same number drawn several times.
+//
+// Grouping is on the opaque `subscription.key` each agent reports. A host that
+// reports none keeps a card of ITS OWN and is never folded in with another
+// silent host: absent means "this host can't tell you", and two hosts that both
+// can't tell you are not thereby on one plan.
+//
+// Within a group each window takes its FRESHEST reading rather than any average
+// or maximum. Every host is reading the same server-side counter, so the newest
+// read is simply the most recent truth — and across a window's reset it is the
+// only right answer, where a maximum would keep the pre-reset figure alive.
+// Groups sort freshest-first, as the per-host cards did.
+function limitGroups(agents, nowSec) {
+  const now = nowSec ?? Math.floor(Date.now() / 1000);
+  const groups = [];
+  const byKey = new Map();
+  for (const entry of limitEntries(agents, now)) {
+    const capturedAt = entry.limits.capturedAt || 0;
+    let group = entry.subKey ? byKey.get(entry.subKey) : null;
+    if (!group) {
+      group = { key: entry.subKey, hosts: [], capturedAt: 0, windows: {} };
+      groups.push(group);
+      if (entry.subKey) byKey.set(entry.subKey, group);
+    }
+    group.hosts.push({ host: entry.host, capturedAt });
+    group.capturedAt = Math.max(group.capturedAt, capturedAt);
+    for (const [key] of LIMIT_WINDOWS) {
+      const win = entry.limits[key];
+      if (!win || typeof win.usedPct !== "number") continue;
+      const held = group.windows[key];
+      if (!held || capturedAt > held.capturedAt) {
+        group.windows[key] = { win, capturedAt, host: entry.host };
+      }
+    }
+  }
+  return groups.sort((x, y) => y.capturedAt - x.capturedAt);
 }
 
 // The state one window renders in. `expired` (the reset stamp has passed) beats
@@ -523,20 +575,21 @@ function paintSwatch(el, paint) {
   if (paint.texture !== "solid") el.classList.add("tx-" + paint.texture);
 }
 
-// The limits section: one card per reporting host, or a single line saying why
-// there's nothing to show. Rendered before the chart's own empty-state returns,
-// so a fleet that has spent no tokens yet still shows its headroom.
+// The limits section: one card per reporting SUBSCRIPTION, or a single line
+// saying why there's nothing to show. Rendered before the chart's own
+// empty-state returns, so a fleet that has spent no tokens yet still shows its
+// headroom.
 function renderLimits(agents) {
   const $limits = document.getElementById("limits");
   $limits.replaceChildren();
   const nowSec = Math.floor(Date.now() / 1000);
-  const entries = limitEntries(agents, nowSec);
+  const entries = limitGroups(agents, nowSec);
   const h2 = document.createElement("h2");
   h2.textContent = "Claude subscription limits";
   const note = document.createElement("span");
   note.className = "note";
   note.textContent = entries.length
-    ? "one shared pool across claude.ai and Claude Code · snapshot per host"
+    ? "one shared pool across claude.ai and Claude Code · one card per subscription"
     : "";
   h2.append(note);
   $limits.append(h2);
@@ -561,7 +614,21 @@ function renderLimits(agents) {
   $limits.append(cards);
 }
 
-function limitCard(entry, nowSec) {
+// How many host names a card's heading spells out before it gives up and
+// counts them. Every name is still in the tooltip, with its own capture age.
+const LIMIT_HOSTS_SHOWN = 3;
+
+// The card's heading: the one host on this subscription, or the hosts sharing
+// it. There is no better name to give a subscription — the key is a hash by
+// design (XERK-301) — and the hosts are what the operator actually recognises.
+function limitHostLabel(group) {
+  const names = group.hosts.map(h => h.host);
+  if (names.length <= LIMIT_HOSTS_SHOWN) return names.join(" · ");
+  return names.slice(0, LIMIT_HOSTS_SHOWN).join(" · ")
+    + " +" + (names.length - LIMIT_HOSTS_SHOWN) + " more";
+}
+
+function limitCard(group, nowSec) {
   const card = document.createElement("div");
   card.className = "lim-card";
 
@@ -569,22 +636,31 @@ function limitCard(entry, nowSec) {
   head.className = "lim-head";
   const host = document.createElement("span");
   host.className = "lim-host";
-  host.textContent = entry.host;
+  host.textContent = limitHostLabel(group);
+  if (group.hosts.length > 1) {
+    host.title = "These hosts are logged into the same Claude account, so they "
+      + "share one 5-hour and 7-day pool. Each window below shows the freshest "
+      + "reading of it:\n"
+      + group.hosts
+        .map(h => h.host + " — captured " + fmtDuration(nowSec - h.capturedAt) + " ago")
+        .join("\n");
+  }
   const age = document.createElement("span");
-  const ageSec = nowSec - (entry.limits.capturedAt || 0);
+  const ageSec = nowSec - (group.capturedAt || 0);
   age.className = "lim-age" + (ageSec > LIMIT_STALE_SEC ? " stale" : "");
   // "captured", not "updated": this is when the host last READ the windows out
   // of Claude Code, not when the page last refreshed. (The header's own
   // last-refreshed stamp was removed fleet-wide; nav.test.js guards it.)
   age.textContent = "captured " + fmtDuration(ageSec) + " ago";
-  age.title = "Captured " + new Date((entry.limits.capturedAt || 0) * 1000).toLocaleString()
+  age.title = "Captured " + new Date((group.capturedAt || 0) * 1000).toLocaleString()
     + ". These numbers come from the host's own Claude Code, so they can trail "
     + "the real server-side counter.";
   head.append(host, age);
   card.append(head);
 
   for (const [key, label] of LIMIT_WINDOWS) {
-    const view = limitWindowView(entry.limits[key], nowSec);
+    const held = group.windows[key];
+    const view = limitWindowView(held && held.win, nowSec);
     if (!view) continue;
     const row = document.createElement("div");
     row.className = "lim-row" + (view.expired ? " expired" : "");

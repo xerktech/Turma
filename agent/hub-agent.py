@@ -41,6 +41,7 @@ stdlib only — no pip installs in the image.
 
 import base64
 import datetime
+import hashlib
 import html
 import io
 import ipaddress
@@ -224,6 +225,18 @@ CLAUDE_CREDS_PATH = os.environ.get(
 # seconds; 0 disables the early warning (the hard needsLogin edge still fires).
 CLAUDE_AUTH_WARN_MS = int(
     os.environ.get("TURMA_CLAUDE_AUTH_WARN_SEC", str(3 * 24 * 3600)) or 0) * 1000
+
+# Claude Code's own config file, which is where the logged-in ACCOUNT is
+# recorded (XERK-301). Two layouts are real, so both are tried in order: with
+# CLAUDE_CONFIG_DIR set it sits INSIDE that dir, and by default it is a SIBLING
+# of ~/.claude. Derived from PROJECTS_ROOT so a native install's override moves
+# it too; CLAUDE_CONFIG_PATH pins it outright.
+_CLAUDE_HOME = os.path.dirname(PROJECTS_ROOT)
+CLAUDE_CONFIG_PATHS = tuple(p for p in (
+    os.environ.get("CLAUDE_CONFIG_PATH"),
+    os.path.join(_CLAUDE_HOME, ".claude.json"),
+    os.path.join(os.path.dirname(_CLAUDE_HOME), ".claude.json"),
+) if p)
 
 # Archive sync: ship INACTIVE-session transcripts to the hub's durable, searchable
 # store (see turma/archive.js). The agent enumerates ended transcripts, and pushes
@@ -1524,6 +1537,104 @@ def claude_auth_status(path=None, now_ms=None):
     else:
         status["needsLogin"] = False           # present, expiry unknown: assume ok
     return status
+
+
+# --- which subscription this host is on (XERK-301) --------------------------
+# The 5-hour and 7-day windows belong to the ACCOUNT, not the machine: every
+# host logged into one Claude account reads — and spends — the same pool, so
+# the usage page draws one set of bars per subscription rather than one per
+# host. That grouping needs a stable identity for the login, and the only one
+# Claude Code records is `oauthAccount.accountUuid` in its config file. The
+# credentials file beside it is no use here: its tokens rotate, and
+# `subscriptionType` names a PLAN ("max"), which two different accounts share.
+#
+# What rides the wire is a HASH of that uuid, never the uuid, the org uuid or
+# the email. The hub persists every heartbeat into state.json and fans it out
+# to web, Android and glasses, and grouping only ever asks whether two hosts
+# are equal — so there is nothing to gain by shipping the identifier itself.
+SUBSCRIPTION_KEY_ENV = "TURMA_SUBSCRIPTION_KEY"
+# The config file is ~120 KiB of caches on a real host and grows; this is the
+# "that is not the file I think it is" bound (a path aimed at /dev/zero is an
+# unbounded allocation), not a size anyone should approach.
+SUBSCRIPTION_CONFIG_MAX_BYTES = 8 << 20
+# Truncated: this is a grouping key, not a credential, and 64 bits makes a
+# collision between two of one operator's logins a non-event.
+SUBSCRIPTION_KEY_CHARS = 16
+
+# (stat signature, block) for the config path last read. That file is big and
+# almost never changes, so re-parsing it every beat would be pure waste; a
+# changed mtime/size is what invalidates this, so a re-login is picked up.
+_subscription_cache = None
+_subscription_last_problem = None
+
+
+def _log_subscription_problem(msg):
+    """Log a bad config file ONCE per distinct problem — this runs every beat,
+    and a permanently unreadable file would otherwise bury the log."""
+    global _subscription_last_problem
+    if msg != _subscription_last_problem:
+        _subscription_last_problem = msg
+        log(msg)
+
+
+def _subscription_key(value):
+    """An opaque, stable key: equal inputs give equal keys, and nothing about
+    the input survives. Domain-separated so the digest can't be confused with
+    one of the other things this fleet hashes."""
+    digest = hashlib.sha256(("turma-subscription:" + value).encode("utf-8"))
+    return digest.hexdigest()[:SUBSCRIPTION_KEY_CHARS]
+
+
+def subscription_identity(paths=None, env=None):
+    """The heartbeat's `subscription` block — ``{key, source}`` — or None when
+    this host cannot say which subscription it is on.
+
+    None is the heartbeat contract's "that agent can't tell you" value, and the
+    usage page keeps such a host on a card of its own rather than guessing:
+    two hosts that BOTH report nothing are not thereby on the same plan.
+
+    `TURMA_SUBSCRIPTION_KEY` pins the group by hand, for a host whose config
+    file this cannot read (a login shape that stops carrying the uuid, or an
+    install that keeps it somewhere unusual). It is hashed like the uuid is, so
+    two hosts given the same string land in the same group and neither source
+    leaks its input.
+
+    Never raises. It runs on the beat's critical path over a file Claude Code
+    owns and rewrites constantly, so a truncated write or a shape a release
+    changed must cost the grouping, not the beat.
+    """
+    env = os.environ if env is None else env
+    pinned = (env.get(SUBSCRIPTION_KEY_ENV) or "").strip()
+    if pinned:
+        return {"key": _subscription_key("env:" + pinned), "source": "env"}
+    global _subscription_cache
+    for path in (paths if paths is not None else CLAUDE_CONFIG_PATHS):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue                    # not this layout; try the next
+        sig = (path, st.st_mtime_ns, st.st_size)
+        if _subscription_cache and _subscription_cache[0] == sig:
+            return _subscription_cache[1]
+        block = None
+        try:
+            if st.st_size > SUBSCRIPTION_CONFIG_MAX_BYTES:
+                _log_subscription_problem(
+                    f"claude config at {path} is implausibly large; not reading it")
+            else:
+                with open(path, encoding="utf-8") as fh:
+                    account = (json.load(fh) or {}).get("oauthAccount") or {}
+                account_uuid = account.get("accountUuid")
+                if isinstance(account_uuid, str) and account_uuid.strip():
+                    block = {"key": _subscription_key("account:" + account_uuid.strip()),
+                             "source": "login"}
+        except Exception as e:
+            _log_subscription_problem(
+                f"claude config at {path} unreadable ({e}); "
+                "this host will not be grouped by subscription")
+        _subscription_cache = (sig, block)
+        return block
+    return None
 
 
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
@@ -14626,6 +14737,12 @@ class SessionManager:
             # login lapses (XERK-98). Read fresh each beat — it's a tiny JSON
             # read and this is the fact that decides whether sessions can run.
             "claudeAuth": claude_auth_status(),
+            # Which SUBSCRIPTION that login is on, as an opaque key (XERK-301),
+            # so the usage page draws ONE set of limit bars per plan instead of
+            # one per host — hosts sharing an account are all reading the same
+            # 5h/7d pool. Absent = "this host can't tell you", which keeps it on
+            # its own card: two silent hosts are not thereby on one plan.
+            "subscription": subscription_identity(),
             # The login's real model list + what "default" currently resolves
             # to, from the models probe. None until the first successful probe;
             # the hub's model menu falls back to its static list then.
