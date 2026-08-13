@@ -38,16 +38,34 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.util.Locale
 import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.UsageViewModel
 
-/** Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens. */
-fun fmtTokens(n: Long): String = when {
-    n >= 1_000_000_000 -> "%.1fB".format(n / 1e9)
-    n >= 1_000_000 -> "%.1fM".format(n / 1e6)
-    n >= 1_000 -> "%.1fk".format(n / 1e3)
-    else -> n.toString()
+/**
+ * Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens, and
+ * has to agree with it DIGIT FOR DIGIT — the same fleet totals are on the web
+ * Usage page's headline strip and the dashboard's tiles, and an operator
+ * reading 1.1k in the browser and 1.2k on the phone can't tell which is wrong.
+ *
+ * Two things it must not do, both of which `"%.1fk".format(n / 1e3)` did:
+ * round a Double (Java rounds its shortest decimal HALF_UP, JS `toFixed`
+ * rounds the binary value, and they disagree on every `.x5` boundary), and
+ * format in the default locale (which renders `1,2k` in de_DE and `١٫٢k` in
+ * ar_EG). Integer arithmetic settles both — and splitting whole from remainder
+ * keeps `n * 10` from overflowing on an absurd count off the wire.
+ */
+fun fmtTokens(n: Long): String {
+    for ((unit, suffix) in listOf(1_000_000_000L to "B", 1_000_000L to "M", 1_000L to "k")) {
+        if (n >= unit) {
+            var whole = n / unit
+            var tenths = (n % unit * 10 + unit / 2) / unit
+            if (tenths == 10L) { whole += 1; tenths = 0 }
+            return "$whole.$tenths$suffix"
+        }
+    }
+    return n.toString()
 }
 
 /** One chart/legend series — the selected grouping's rows in stable paint order. */
@@ -458,6 +476,22 @@ private fun CacheLine(cache: UsageViewModel.CacheSummary) {
 }
 
 /**
+ * The web card's three windows, in the one line the screen has room for. A
+ * window with no spend has no share to take, so it is dropped rather than drawn
+ * as 0% — the same distinction the card makes with a dash.
+ *
+ * Pulled out of the Composable purely so a test can reach it: `ui/` Composable
+ * bodies are ungated here (`testDebugUnitTest` is the only Android gate CI
+ * runs), and the Locale.US below is load-bearing — an ar-EG phone drew
+ * "today ٠٫٠%" beside a correct "9.0B" without it.
+ */
+internal fun subagentWindows(sub: UsageViewModel.SubagentSplit): List<String> = listOfNotNull(
+    sub.todayPct?.let { String.format(Locale.US, "today %.1f%%", it) },
+    sub.weekPct?.let { String.format(Locale.US, "7d %.1f%%", it) },
+    sub.totalPct?.let { String.format(Locale.US, "all-time %.1f%%", it) },
+)
+
+/**
  * The delegated share of the figures above (web usage.html `subagentCard`,
  * XERK-302). Says "of" rather than "plus" on purpose: these tokens are already
  * inside every total on this screen, and a reader who adds them back
@@ -469,14 +503,7 @@ private fun CacheLine(cache: UsageViewModel.CacheSummary) {
 @Composable
 private fun SubagentLine(sub: UsageViewModel.SubagentSplit) {
     if (!sub.any) return
-    // The web card's three windows, in the one line this screen has room for. A
-    // window with no spend has no share to take, so it is dropped rather than
-    // drawn as 0% — same distinction the card makes with a dash.
-    val windows = listOfNotNull(
-        sub.todayPct?.let { "today %.1f%%".format(it) },
-        sub.weekPct?.let { "7d %.1f%%".format(it) },
-        sub.totalPct?.let { "all-time %.1f%%".format(it) },
-    )
+    val windows = subagentWindows(sub)
     if (windows.isEmpty()) return
     Text(
         "${fmtTokens(sub.total)} delegated to sub-agents · " + windows.joinToString(" · ") +

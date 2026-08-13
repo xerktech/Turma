@@ -2,6 +2,7 @@ package com.xerktech.turma.vm
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import java.util.Locale
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.model.UsageBucket
 import com.xerktech.turma.model.UsageInfo
@@ -345,7 +346,9 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             val mins = Math.round(s / 60.0)
             if (mins < 60) return "${mins}m"
             val hours = mins / 60
-            if (hours < 24) return "%dh %02dm".format(hours, mins % 60)
+            // Locale.US: `%d` renders Arabic-Indic digits under ar_EG, and this
+            // is the "captured 2h 05m ago" stamp beside a token count that does not.
+            if (hours < 24) return String.format(Locale.US, "%dh %02dm", hours, mins % 60)
             return "${hours / 24}d ${hours % 24}h"
         }
 

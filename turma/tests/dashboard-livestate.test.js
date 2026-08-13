@@ -48,7 +48,7 @@ function loadDashboard() {
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
     "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
-    src + "\n;globalThis.__dash = { liveState, prBadgeHtml };\n;globalThis.__setRender = (f) => { render = f; };"
+    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens };\n;globalThis.__setRender = (f) => { render = f; };"
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
      g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
@@ -125,4 +125,59 @@ test("dashboard prBadgeHtml: !n for GitLab/ADO, #n for GitHub", () => {
     prBadgeHtml({ url: "https://gitlab.example.com/grp/app/-/merge_requests/13" }), /!13/);
   assert.match(
     prBadgeHtml({ url: "https://dev.azure.com/org/P/_git/app/pullrequest/9" }), /!9/);
+});
+
+// --- fmtTokens (the dashboard's own copy) ------------------------------------
+// The THIRD copy of this formatter — usage.html and ui/UsageScreen.kt are the
+// others — and until now the only one no test loaded. Its tiles show the same
+// fleet figures as the Usage page's headline strip and the Android screens, so
+// it has to agree with them digit for digit; its own contract, which the others
+// do NOT share, is "–" for a null count.
+
+test("dashboard fmtTokens: '–' for a count the fleet cannot state", () => {
+  // The dashboard's tiles are drawn before any host has reported, so null here
+  // means "nothing known yet", not "zero tokens". A mutation to "0" was
+  // invisible to every suite.
+  const { fmtTokens } = loadDashboard();
+  assert.equal(fmtTokens(null), "–");
+  assert.equal(fmtTokens(undefined), "–");
+  assert.equal(fmtTokens(NaN), "–");
+  assert.equal(fmtTokens("<img src=x onerror=1>"), "–");
+  assert.equal(fmtTokens(0), "0");
+});
+
+test("dashboard fmtTokens: same digits as the Usage page and Android", () => {
+  // Shared vectors with turma/tests/usage.test.js and ui/FmtTokensTest.kt. The
+  // .x5 boundaries are where a float-rounding implementation diverges.
+  const { fmtTokens } = loadDashboard();
+  assert.equal(fmtTokens(1150), "1.2k");
+  assert.equal(fmtTokens(1_450_000), "1.5M");
+  assert.equal(fmtTokens(1_950_000_000), "2.0B");
+  assert.equal(fmtTokens(999_950), "1000.0k");
+  assert.equal(fmtTokens(850), "850");
+  assert.equal(fmtTokens(272_500_000), "272.5M");
+  assert.equal(fmtTokens(1e30).includes("e+"), false);
+  // The unscaled fall-through is the same trap on the other path.
+  assert.equal(fmtTokens(-1e21), "-1000000000000000000000");
+  assert.equal(fmtTokens(5e-324), "0");
+  assert.equal(fmtTokens(-1500), "-1500");
+  // Rounded BEFORE the scale is picked, like the Usage page: rounding after
+  // lets 999.6 escape the k scale and then land on "1000". Pinned here as well
+  // as there, because this copy's rounding was otherwise held only by the
+  // 5e-324 vector — which truncation satisfies too, leaving the two pages free
+  // to disagree at exactly the value this is about.
+  assert.equal(fmtTokens(999.6), "1.0k");
+  assert.equal(fmtTokens(999_999.6), "1.0M");
+  assert.equal(fmtTokens(999_999_999.6), "1.0B");
+  assert.equal(fmtTokens(999.4), "999");
+  assert.equal(fmtTokens(0.6), "1");
+});
+
+test("dashboard fmtTokens: the unit boundary is inclusive, as everywhere else", () => {
+  // 1000 is 1.0k, not "1000" — a `>` here and a `>=` on the Usage page is a
+  // divergence at exactly the value most likely to be looked at.
+  const { fmtTokens } = loadDashboard();
+  assert.equal(fmtTokens(1_000), "1.0k");
+  assert.equal(fmtTokens(1_000_000), "1.0M");
+  assert.equal(fmtTokens(1_000_000_000), "1.0B");
 });

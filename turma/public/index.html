@@ -556,12 +556,32 @@ function ghostCard() {
   return `<div class="sess ghost"><div class="busy"><span class="spin"></span> Starting a new session…</div></div>`;
 }
 
+// Compact token count. Same contract as the Usage page's fmtTokens, and it must
+// stay that way: this page's tiles and that page's headline strip show the SAME
+// fleet figures, and the Android Dashboard and Usage screens mirror both.
+// Digits, a minus, a dot and a unit letter only — every caller here builds
+// markup by string concatenation. Rounds half-up on the exact value; see
+// scaleTokens in usage.html for why toFixed(1) cannot.
 function fmtTokens(n) {
   if (n == null) return "–";
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
-  return String(n);
+  n = Number(n);
+  if (!Number.isFinite(n)) return "–";
+  // Rounded before the unit test — see usage.html; rounding after let 999.6
+  // render as "1000" beside "1.0k" for 1000.
+  n = Math.round(n);
+  for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
+    if (n >= unit) {
+      let whole = Math.floor(n / unit);
+      let tenths = Math.round((n % unit) * 10 / unit);
+      if (tenths === 10) { whole += 1; tenths = 0; }
+      // String(whole) goes exponential at 1e21, which is not the shape this
+      // promises. Reachable: the hub serves token counts raw.
+      return (whole >= 1e21 ? BigInt(whole).toString() : String(whole)) + "." + tenths + suffix;
+    }
+  }
+  // Below the smallest unit: String() writes a negative-huge count in exponent
+  // form, which is not the shape this promises. See usage.html.
+  return Math.abs(n) >= 1e21 ? BigInt(n).toString() : String(n);
 }
 function fmtBytes(b) {
   if (b == null) return "–";

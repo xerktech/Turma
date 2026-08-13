@@ -492,15 +492,40 @@ those are marked `[MODEL]`.
   rescoping.~~ Both done (XERK-78, see Done above); series colors are the categorical palette now.
 - P1 Move "By model" out of the grouping tabs into a standalone "Tokens by model" card (Today / Last
   7 days / All-time). Add a collapsible table view with the in/out and cache splits.
+- **`fmtTokens` must agree digit for digit on both platforms**, and there are three copies of it:
+  `turma/public/usage.html`, `turma/public/index.html` and `ui/UsageScreen.kt`. The same fleet
+  figures head the Usage page, the dashboard tiles and both Android screens, so a formatter that
+  disagrees shows one number in the browser and another on the phone with nothing to say which is
+  right. Two traps, both of which the obvious implementation falls into: rounding a float (Java's
+  `%.1f` rounds the shortest decimal HALF_UP, JS `toFixed` rounds the binary double — they part
+  company on every `.x5` boundary, ~1% of values), and Java's `format` following the **device
+  locale** (`1,2k` in de_DE, `١٫٢k` in ar_EG). Both sides now do integer arithmetic and build the
+  string by hand. The web copies must also never return a non-numeric input verbatim — `tokenCell`
+  interpolates the result into `innerHTML` — and their "can't state a figure" sentinel is **`–`,
+  never `0`**, since `0` asserts a measurement an idle fleet would show too. Agreement holds up to
+  2^53: past that `JSON.parse` cannot hold the count exactly and the two can differ by a tenth
+  (`9007411349999999` → `9007411.3B` on the phone, `9007411.4B` in the browser). Only BigInt
+  parsing would close that, and no real fleet reaches it. Tests: `fmtTokens` cases in
+  `turma/tests/usage.test.js` and `turma/tests/dashboard-livestate.test.js` ↔ `ui/FmtTokensTest.kt`,
+  sharing vectors. The same locale trap lives in every `String.format`/`.format` on a user-facing
+  figure — `Locale.US` explicitly, or the phone disagrees with the browser about one value.
+- The **headline totals** (Today / This week / All-time, with the all-time cache split under them)
+  are at parity. Android had them first and the web page did not; `fleetTotals`/`renderTotals` in
+  `usage.html` are the port of `UsageViewModel.compute`'s window sums, tested against the SAME
+  vectors (`turma/tests/usage.test.js` ↔ `UsageViewModelTest`). Both prefer a host's aggregate
+  `usage` block and fall back to summing its `repoUsage` only when it reports none — never both,
+  which would double-count. Platform difference: Android puts the row above the grouping tabs, the
+  web above the limits section, since its grouping bar sits lower.
 - The **cache split** (`N cached · N written · N% hit`) is at parity, laid out platform-idiomatically:
   the web hangs it under every token figure in the table view and by-model card, Android under each
   `UsageRow` and the headline stat row, since Android has no table view yet (the P1 above). The
   `CacheSummary` reducer is `UsageViewModel`'s, tested against the same vectors as the web's
   `cacheHitRate` (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`).
-- The **subscription limits section** (XERK-247) is at parity: one card per host reporting the 5h/7d
+- The **subscription limits section** (XERK-247, XERK-301) is at parity: one card per SUBSCRIPTION
+  reporting the 5h/7d
   windows, each with the percentage used, a headroom-coloured bar, the countdown to reset, and the
   "captured <age> ago" stamp that goes amber once stale. `limitCards`/`limitView`/`fmtDuration` are
-  ports of the web's `limitEntries`/`limitWindowView`/`fmtDuration`, tested case for case
+  ports of the web's `limitGroups`/`limitWindowView`/`fmtDuration`, tested case for case
   (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`). Platform difference: the web lays the cards
   out in a wrapping flex row, Android stacks them at the top of the usage list.
 - The **sub-agent split** (XERK-302) is at parity in substance: both surfaces name the delegated

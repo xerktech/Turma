@@ -1,5 +1,7 @@
 package com.xerktech.turma.core
 
+import java.util.Locale
+
 /**
  * File attachments in the chat composer (XERK-234) — the pure half, ported 1:1
  * from the web composer's attachment block in `chat.js`.
@@ -56,7 +58,10 @@ object Uploads {
     fun formatBytes(n: Long): String = when {
         n < 1024 -> "$n B"
         n < 1024 * 1024 -> "${(n + 512) / 1024} KB"
-        n < 10L * 1024 * 1024 -> String.format("%.1f MB", n / (1024.0 * 1024.0))
+        // Locale.US: the web's fmtBytes always writes "3.2 MB", and a chip
+        // reading "3,2 MB" on a German phone is the same divergence fmtTokens
+        // had.
+        n < 10L * 1024 * 1024 -> String.format(Locale.US, "%.1f MB", n / (1024.0 * 1024.0))
         else -> "${n / (1024 * 1024)} MB"
     }
 
