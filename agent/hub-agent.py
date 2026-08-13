@@ -1007,15 +1007,23 @@ _CLAUDE_DENY_DIRS = (
     "agents",          # agent definitions: a write here steers every future run
     "backups",         # the restore path for everything else here
     "bin",             # hook scripts auto-execute: a write here is RCE
+    "cache",
     "commands",
+    "downloads",
     "file-history",    # the checkpoint store `/rewind` restores from
     "hooks",
+    "ide",             # IDE lock files publish a port + token claude then dials
+    "paste-cache",
+    "plans",
     "plugins",
     "session-env",
     "sessions",        # session keys + the remote-control/IPC registry
     "shell-snapshots", # sourced by every Bash call of every live session
     "skills",
     "statsig",
+    "tasks",
+    "todos",
+    "uploads",
 )
 
 
@@ -1034,24 +1042,27 @@ def claude_config_deny_rules(home=None):
         # Sibling of the directory, not inside it: it carries `mcpServers`
         # (command lines run at the next session's startup) and the trust flags.
         "Edit(~/.claude.json)",
-        # `*` never crosses `/`, so this is every top-level FILE and no
-        # directory: settings.json, CLAUDE.md, history.jsonl, *.bak-* and
-        # anything else dropped in later.
-        "Edit(~/.claude/*)",
         # Dotfiles AND dot-directories with their contents — .credentials.json,
-        # the shared Claude login, above all.
+        # the shared Claude login, above all. Safe to wildcard because no
+        # carved-out path is dot-prefixed.
         "Edit(~/.claude/.*)",
+        # Top-level FILE patterns, denied whether or not they exist yet: the
+        # directory walk below only sees what is there when the manager starts,
+        # and `settings.json.bak-*` gets written by an operator months later.
+        # Each is anchored on a suffix or a name, so none can match the
+        # `agent-memory` or `projects` DIRECTORY entries and take their subtrees.
+        "Edit(~/.claude/*.json)",
+        "Edit(~/.claude/*.jsonl)",
+        "Edit(~/.claude/settings.json*)",   # …and its .bak-* siblings
+        "Edit(~/.claude/CLAUDE.md*)",       # injected into every session here
     ]
     rules += [f"Edit(~/.claude/{d}/**)" for d in _CLAUDE_DENY_DIRS]
-    # `projects/` holds both the transcripts and each project's `memory/`, so it
-    # is the one tree that cannot be denied wholesale. Direct children (the
-    # transcripts) and the subagent transcripts beside them are denied; the
-    # `memory/` sibling, one level deeper, is not reached by either rule.
-    # Residual: a session can create other subdirectories under a slug. Nothing
-    # reads them, which QA checked by markering each candidate and grepping the
-    # binary's outbound request.
+    # `projects/` is the one tree that cannot be denied wholesale: the
+    # transcripts and each project's `memory/` are siblings inside it. The rule
+    # must match FILES ONLY (`*.jsonl`) — `projects/*/*` would match the
+    # `memory` DIRECTORY and take its whole subtree with it.
     rules += [
-        "Edit(~/.claude/projects/*/*)",
+        "Edit(~/.claude/projects/*/*.jsonl)",
         "Edit(~/.claude/projects/*/subagents/**)",
     ]
     base = os.path.join(home or os.path.expanduser("~"), ".claude")
@@ -1064,9 +1075,16 @@ def claude_config_deny_rules(home=None):
             continue                      # the carve-out, and the tree above
         if name.startswith("."):
             continue                      # already covered by `~/.claude/.*`
-        if not os.path.isdir(os.path.join(base, name)):
-            continue                      # already covered by `~/.claude/*`
-        rule = f"Edit(~/.claude/{name}/**)"
+        # Named ONE BY ONE, never as `~/.claude/*`. A wildcard there matches the
+        # `agent-memory` directory entry, and a deny matching a directory denies
+        # its entire subtree — so that single rule is behaviourally identical to
+        # the blanket `Edit(~/.claude/**)` this whole change exists to remove.
+        # Files are listed too: the binary self-blocks the ones it knows
+        # (settings.json, CLAUDE.md, history.jsonl, .credentials.json) but not
+        # an arbitrary new one, and that is the gap this closes.
+        rule = (f"Edit(~/.claude/{name}/**)"
+                if os.path.isdir(os.path.join(base, name))
+                else f"Edit(~/.claude/{name})")
         if rule not in rules:
             rules.append(rule)
     return rules

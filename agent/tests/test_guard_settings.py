@@ -6,6 +6,7 @@ the module is loaded by file path (its name has a dash)."""
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -34,6 +35,99 @@ class TestGuardSettings(unittest.TestCase):
         self.assertIn("Edit(~/.ssh/**)", deny)
         self.assertIn("Edit(~/.claude/.*)", deny)   # the shared login, .credentials.json
         self.assertIn("Edit(~/.aws/**)", deny)
+
+    # --- the matcher, as MEASURED against claude 2.1.229 ---------------------
+    #
+    # The string assertions below this were all green while both memory trees
+    # were 100% denied, twice. They pin spellings; they cannot pin BEHAVIOUR,
+    # and behaviour is the entire claim. So model the matcher and assert against
+    # it. Two measured facts drive everything:
+    #   1. `*` matches within one segment, `**` spans any depth.
+    #   2. A rule matching a DIRECTORY denies that directory's whole subtree.
+    # (2) is the one that shipped two critical defects: `Edit(~/.claude/*)`
+    # matches the `agent-memory` entry, making it identical to `~/.claude/**`.
+    # Re-measure this if the claude version moves.
+    @staticmethod
+    def _denies(rule, path):
+        pattern = rule[len("Edit("):-1].replace("~/", "")
+        rx = ""
+        i = 0
+        while i < len(pattern):
+            if pattern.startswith("**", i):
+                rx += ".*"
+                i += 2
+            elif pattern[i] == "*":
+                rx += "[^/]*"
+                i += 1
+            else:
+                rx += re.escape(pattern[i])
+                i += 1
+        rx = re.compile(rx + r"\Z")
+        parts = path.split("/")
+        # A match on the path OR on any ANCESTOR denies it — that is fact (2).
+        return any(rx.match("/".join(parts[:n])) for n in range(1, len(parts) + 1))
+
+    def _denied_by(self, rules, path):
+        return [r for r in rules if self._denies(r, path)]
+
+    def test_matcher_model_matches_what_was_measured(self):
+        # Guard the guard: if this model drifts from the real binary the tests
+        # below become theatre, so pin the four facts the harness established.
+        self.assertTrue(self._denies("Edit(~/.claude/*)", ".claude/agent-memory/qa/x.md"),
+                        "a rule matching a directory must deny its subtree")
+        self.assertTrue(self._denies("Edit(~/.claude/projects/*/*)", ".claude/projects/s/memory/M.md"))
+        self.assertFalse(self._denies("Edit(~/.claude/projects/*/*.jsonl)", ".claude/projects/s/memory/M.md"))
+        self.assertFalse(self._denies("Edit(~/.claude/*.json)", ".claude/sessions/a.json"),
+                         "`*` must not cross a slash")
+        self.assertTrue(self._denies("Edit(~/.claude/agents/**)", ".claude/agents/a/b/c.md"))
+
+    def test_memory_is_actually_writable_under_the_generated_rules(self):
+        """The claim the string assertions cannot make. This is the one."""
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        base = os.path.join(home, ".claude")
+        for d in ("agent-memory", "projects", "shell-snapshots", "brand-new-thing"):
+            os.makedirs(os.path.join(base, d))
+        open(os.path.join(base, "settings.json"), "w").close()
+        rules = ha.claude_config_deny_rules(home=home)
+
+        for writable in (
+            ".claude/agent-memory/qa/MEMORY.md",
+            ".claude/agent-memory/qa/turma.md",
+            ".claude/agent-memory/brand-new-agent/MEMORY.md",
+            ".claude/agent-memory/qa/nested/deep.md",
+            ".claude/projects/-some-slug/memory/MEMORY.md",
+            ".claude/projects/-some-slug/memory/nested/x.md",
+        ):
+            self.assertEqual(self._denied_by(rules, writable), [],
+                             f"{writable} must stay writable — it is the feature")
+
+        for denied in (
+            ".claude/.credentials.json",                 # the fleet's shared login
+            ".claude/settings.json",
+            ".claude/settings.json.bak-preperms",
+            ".claude/CLAUDE.md",
+            ".claude/history.jsonl",
+            ".claude/brand-new-thing/evil.sh",           # present at generation time
+            ".claude/shell-snapshots/snapshot-zsh-1.sh", # RCE into every live session
+            ".claude/sessions/1.key",
+            ".claude/agents/qa.md",
+            ".claude/bin/hook.py",
+            ".claude/ide/9999.lock",
+            ".claude/todos/t.json",
+            ".claude/projects/-some-slug/a.jsonl",       # a transcript
+            ".claude/projects/-some-slug/subagents/agent-1.jsonl",
+        ):
+            self.assertNotEqual(self._denied_by(rules, denied), [],
+                                f"{denied} must stay denied")
+
+    def test_claude_deny_never_wildcards_the_top_level(self):
+        # The specific regression that shipped twice. `~/.claude/*` and
+        # `~/.claude/**` both match the `agent-memory` entry and take its
+        # subtree; every top-level entry must be named individually instead.
+        rules = ha.claude_config_deny_rules()
+        for bad in ("Edit(~/.claude/*)", "Edit(~/.claude/**)", "Edit(~/.claude/projects/*/*)"):
+            self.assertNotIn(bad, rules)
 
     def test_claude_deny_is_generated_from_what_is_there(self):
         """The ~/.claude rules fail CLOSED: deny what exists, carve out memory.
@@ -73,14 +167,14 @@ class TestGuardSettings(unittest.TestCase):
                   "session-env", "statsig"):
             self.assertIn(f"Edit(~/.claude/{d}/**)", rules)
         self.assertIn("Edit(~/.claude.json)", rules)   # mcpServers: startup exec
-        self.assertIn("Edit(~/.claude/*)", rules)      # every top-level file
+        self.assertIn("Edit(~/.claude/*.json)", rules)  # top-level files, present or not
         self.assertIn("Edit(~/.claude/.*)", rules)     # .credentials.json
 
     def test_claude_deny_unreadable_home_still_denies_the_dangerous_paths(self):
         rules = ha.claude_config_deny_rules(home="/nonexistent-turma-qa")
         self.assertIn("Edit(~/.claude/shell-snapshots/**)", rules)
         self.assertIn("Edit(~/.claude/.*)", rules)
-        self.assertIn("Edit(~/.claude/projects/*/*)", rules)
+        self.assertIn("Edit(~/.claude/projects/*/*.jsonl)", rules)
 
     def test_claude_config_denied_piecewise_but_memory_stays_writable(self):
         """~/.claude is protected file-by-file so agent memory survives.
@@ -95,7 +189,8 @@ class TestGuardSettings(unittest.TestCase):
         self.assertNotIn("Edit(~/.claude/**)", deny)
         for rule in (
             "Edit(~/.claude/.*)",                    # the shared Claude login
-            "Edit(~/.claude/*)",                     # settings.json, CLAUDE.md, history.jsonl, *.bak-*
+            "Edit(~/.claude/settings.json*)",        # …and its .bak-* siblings
+            "Edit(~/.claude/CLAUDE.md*)",            # injected into every session
             "Edit(~/.claude.json)",                  # mcpServers: executed at session startup
             "Edit(~/.claude/agents/**)",             # steers every future run
             "Edit(~/.claude/bin/**)",                # hooks auto-execute: RCE
@@ -103,7 +198,7 @@ class TestGuardSettings(unittest.TestCase):
             "Edit(~/.claude/sessions/**)",           # session keys + the remote-control registry
             "Edit(~/.claude/plugins/**)",
             "Edit(~/.claude/backups/**)",            # the restore path for all of the above
-            "Edit(~/.claude/projects/*/*)",          # transcripts feed archive/usage/--resume
+            "Edit(~/.claude/projects/*/*.jsonl)",    # transcripts feed archive/usage/--resume
             "Edit(~/.claude/projects/*/subagents/**)",
         ):
             self.assertIn(rule, deny)

@@ -422,10 +422,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   plus `permissions.deny` rules on host credential stores (`~/.ssh`, `~/.aws`, `~/.azure`,
   `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every session, so deny wins even
   under bypass.
-- **`~/.claude`'s deny rules are GENERATED from what is on the host** (`claude_config_deny_rules()`)
-  so they fail closed, with only the two agent-memory trees carved out. Never enumerate the
-  dangerous paths instead — that fails open, and `shell-snapshots/` (sourced by every Bash call of
-  every live session) is the proof. Rationale in `.claude/rules/agent.md`.
+- **`~/.claude`'s deny rules are GENERATED per host** (`claude_config_deny_rules()`), naming each
+  top-level entry so the two agent-memory trees stay writable. **A deny matching a DIRECTORY takes
+  its whole subtree**, so `~/.claude/*` is not a shorthand — it matches `agent-memory` and is the
+  blanket rule again. Rationale in `.claude/rules/agent.md`.
 - It hard-denies three narrow categories, each with a reason the agent self-corrects from:
   **destructive** (`rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes,
   recursive `chmod`/`chown` of system roots, protected-branch history destruction, `DROP

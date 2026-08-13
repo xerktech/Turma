@@ -441,15 +441,27 @@ See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_se
 - `Edit(~/.claude.json)` is in the list though it sits OUTSIDE the directory: it carries
   `mcpServers` — command lines run at the next session's startup — and the trust flags, and it is
   bind-mounted too. It was never covered by the old blanket rule either.
+- **A deny that matches a DIRECTORY denies its whole subtree.** This is the rule everything here
+  turns on, and getting it wrong shipped two critical defects in a row. It means no rule may match
+  the `agent-memory` or `projects` directory ENTRY — so the top level is enumerated name by name,
+  never as `~/.claude/*`. That single wildcard matches `agent-memory` and is therefore behaviourally
+  identical to the blanket `~/.claude/**` this change exists to remove.
 - `projects/` is the one tree that can't be denied wholesale, since the transcripts and each
-  project's `memory/` live in it. `projects/*/*` (transcripts) and `projects/*/subagents/**` are
-  denied; `memory/` is one level deeper than either reaches. **Residual:** a session can create
-  other subdirectories under a slug — nothing reads them, which QA checked by markering each
-  candidate and grepping the binary's outbound request.
-- Matcher facts these rules depend on (verified against claude 2.1.229, not inferred): `*` never
-  crosses `/`; `**` spans any depth; `.*` covers dot-directories **and their contents**; `~` is the
-  runtime `HOME`; `../` is normalised and symlinks resolved before matching; and an `Edit(...)` deny
-  blocks **Bash redirections** into the path as well as the file-editing tools.
+  project's `memory/` are siblings inside it. The rule must match **files only** —
+  `projects/*/*.jsonl`, never `projects/*/*`, which matches the `memory` directory and takes it.
+- **Residual:** a top-level entry created AFTER the manager starts, and not named in
+  `_CLAUDE_DENY_DIRS` or a static file pattern, is writable until the next restart —
+  `_ensure_guard_settings` writes the file once per manager process. `_CLAUDE_DENY_DIRS` therefore
+  names every directory Claude Code is known to create, present or not.
+- Matcher facts these rules depend on (MEASURED against claude 2.1.229 by driving the real binary,
+  not inferred from docs — re-measure on a version bump): a deny matching a directory takes its
+  subtree; `*` matches within one segment and `**` spans any depth; `.*` covers dot-directories and
+  their contents; `~` is the claude process's runtime `HOME`; `../` is normalised and symlinks
+  resolved before matching; an `Edit(...)` deny blocks **Bash redirections** into the path as well
+  as the file-editing tools; and the binary self-blocks a few of these paths on its own, so a rule
+  "covering" one proves nothing without a no-rules baseline.
+- `tests/test_guard_settings.py` MODELS that matcher and asserts the memory paths are writable.
+  String assertions alone were green through both defects — they pin spellings, not behaviour.
 - **`settings.local.json` unions on top**, so an operator writing `Edit(~/.claude/**)` there
   re-disables memory host-wide. Theirs to choose; pinned by a test so it stays a choice.
 - **Memory is instruction-adjacent and its blast radius is the whole host**: any session can write
