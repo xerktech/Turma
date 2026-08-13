@@ -85,6 +85,44 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     /**
+     * How much of the fleet's spend went to background agents (XERK-302, web
+     * usage.html `subagentCard`).
+     *
+     * The `of*` figures are the denominators, and they are NOT the fleet totals:
+     * they carry only what the hosts REPORTING a split spent. A fleet with one
+     * older host would otherwise take the share against spend that host never
+     * offered a split for, quietly understating it.
+     */
+    data class SubagentSplit(
+        val today: Long = 0,
+        val week: Long = 0,
+        val total: Long = 0,
+        val ofToday: Long = 0,
+        val ofWeek: Long = 0,
+        val ofTotal: Long = 0,
+        /** Hosts that reported a split; 0 means nothing to show at all. */
+        val reporting: Int = 0,
+        /** Hosts in view, reporting or not — `reporting < hosts` is a partial answer. */
+        val hosts: Int = 0,
+    ) {
+        val any: Boolean get() = reporting > 0
+
+        /** True when some host in view can't answer, so the figures cover only part of it. */
+        val partial: Boolean get() = reporting in 1 until hosts
+
+        /**
+         * Delegated share of a window, 0..100 — null when that window has no
+         * spend to take a ratio of ("nothing happened", never "0% delegated").
+         */
+        fun pct(spent: Long, delegated: Long): Double? =
+            if (spent > 0) delegated * 100.0 / spent else null
+
+        val todayPct: Double? get() = pct(ofToday, today)
+        val weekPct: Double? get() = pct(ofWeek, week)
+        val totalPct: Double? get() = pct(ofTotal, total)
+    }
+
+    /**
      * One SUBSCRIPTION's limit snapshot, ready to render (XERK-247, XERK-301).
      * [hosts] is every host on that subscription — usually one — and each
      * window carries the freshest reading any of them took.
@@ -144,6 +182,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val cache: CacheSummary = CacheSummary(),
         /** Freshest snapshot first; empty when no host reports any window. */
         val limits: List<LimitCard> = emptyList(),
+        /** The delegated share of the spend above (XERK-302). */
+        val subagent: SubagentSplit = SubagentSplit(),
     )
 
     companion object {
@@ -185,6 +225,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             var week = 0L
             var total = 0L
             var cache = CacheSummary()
+            var sub = SubagentSplit()
 
             for (a in fleet.agents) {
                 // Prefer the host-level block (aggregated from every transcript
@@ -208,6 +249,32 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 week += hostWeek
                 total += hostTotal
                 cache += hostCache
+
+                // The delegated slice, and beside it the spend it is a slice OF
+                // (XERK-302). Host block first, then the repo blocks — the same
+                // fallback as the totals above. A host reporting no split at all
+                // contributes to NEITHER side, so it drops out of the share
+                // instead of reading as a host that delegated nothing.
+                val hostSub = a.usage?.subagent
+                val repoSubs = if (a.usage == null) a.repoUsage.filter { it.usage.subagent != null }
+                               else emptyList()
+                if (hostSub != null || repoSubs.isNotEmpty()) {
+                    sub = sub.copy(
+                        today = sub.today + (hostSub?.today?.total
+                            ?: repoSubs.sumOf { it.usage.subagent!!.today.total }),
+                        week = sub.week + (hostSub?.week?.total
+                            ?: repoSubs.sumOf { it.usage.subagent!!.week.total }),
+                        total = sub.total + (hostSub?.totals?.total
+                            ?: repoSubs.sumOf { it.usage.subagent!!.totals.total }),
+                        ofToday = sub.ofToday + (if (hostSub != null) hostToday
+                                  else repoSubs.sumOf { it.usage.today.total }),
+                        ofWeek = sub.ofWeek + (if (hostSub != null) hostWeek
+                                 else repoSubs.sumOf { it.usage.week.total }),
+                        ofTotal = sub.ofTotal + (if (hostSub != null) hostTotal
+                                  else repoSubs.sumOf { it.usage.totals.total }),
+                        reporting = sub.reporting + 1,
+                    )
+                }
 
                 for (ru in a.repoUsage) {
                     val key = normRepo(ru.remoteKey.ifBlank { ru.repo })
@@ -248,6 +315,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 total = total,
                 cache = cache,
                 limits = limitCards(fleet, nowSec),
+                subagent = sub.copy(hosts = fleet.agents.size),
             )
         }
 

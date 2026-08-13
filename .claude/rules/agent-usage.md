@@ -19,6 +19,35 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
   `repoUsage[]` and host-level `usage`, from re-parsing *every* known transcript
   (`repo_usage_report()`). Each entry carries a `remoteKey` (`normalize_remote()`) so the hub can
   unify a repo across hosts.
+- **A slug's transcripts are BOTH the conversations and the background agents' own**
+  (`_project_transcripts`, XERK-302): `<slug>/<id>.jsonl`, plus `<slug>/<id>/subagents/agent-<x>.jsonl`
+  and a Workflow run's `subagents/workflows/wf_<run>/agent-<x>.jsonl`. Reading only the flat listing
+  left **every delegated token uncounted** — 19% of one host's real spend, rising with how much the
+  fleet delegates.
+  - The nesting under `subagents/` is Claude Code's and has already grown a level, so it is
+    **walked**, never hard-coded at either depth; and it is anchored on the `subagents` dir, not on
+    the parent transcript still existing (the tokens were spent either way).
+  - **Offsets key on the RELATIVE path**, never the bare filename: two parents' agents routinely
+    share `agent-<x>.jsonl`, and a name-keyed map silently skips one of them.
+  - Delegated tokens fold into `totals`/`days`/`models` like any other turn and are counted a second
+    time into **`usage.subagent`** ({totals, today, week}) — a **SLICE**, never an addend, so no
+    client adds it back. `sessions` still counts CONVERSATIONS only, else it inflates by the fan-out.
+  - Absent `subagent` = "that agent can't tell you"; a zeroed one asserts nothing was delegated —
+    and a genuine all-zero report must survive, or a non-delegating host is excluded and the share
+    OVER-states. The Usage page divides by these, so `normalizeSubagentUsage` **validates and drops,
+    never repairs**: a repaired block is indistinguishable from that genuine zero, so `{}` or
+    `{totals:{input:"9"}}` would land in the denominator with a fabricated 0 on top. Figures must be
+    non-negative SAFE INTEGERS — a float or a `1e308` decodes into a Kotlin `Long` and fails the
+    whole `/api/agents` array.
+  - **Only REGULAR FILES are enumerated, on both branches.** A `*.jsonl` directory would read as a
+    conversation and skip its own `subagents/` tree; a FIFO named `*.jsonl` blocks a read forever,
+    on the heartbeat's critical path. Nothing in the walk raises — an escape there is a host that
+    reads offline.
+  - `repo_usage_report` gates the host block on **tokens OR conversations**: `sessions` counts
+    conversations, so a slug left holding only a pruned session's `subagents/` tree has real spend
+    and a zero count, and gating on the count alone reported per-repo usage beside a null host block.
+  - Tests: `TestSubagentUsage`, `subagentCard` in `usage.test.js`, the split cases in
+    `UsageViewModelTest`.
 - The per-model breakdown **excludes `<synthetic>`** (and any `<...>` model): Claude Code stamps
   fabricated entries with that model and an all-zero usage block, so `_accumulate_usage` keeps them
   out of `acc.models`, else the usage page lists a phantom model that ran nothing. Their tokens

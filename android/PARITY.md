@@ -503,6 +503,12 @@ those are marked `[MODEL]`.
   ports of the web's `limitEntries`/`limitWindowView`/`fmtDuration`, tested case for case
   (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`). Platform difference: the web lays the cards
   out in a wrapping flex row, Android stacks them at the top of the usage list.
+- The **sub-agent split** (XERK-302) is at parity in substance: both surfaces name the delegated
+  share of Today / Last 7 days / All-time, take it against only the hosts that report a split, and
+  show nothing at all when none does. Platform difference: the web is a "Delegated to sub-agents"
+  card with a row per window (delegated tokens beside the share), Android is one `SubagentLine` under
+  the headline stats carrying the three shares and the all-time token figure — the same condensation
+  as the cache split above, and for the same reason (no table view yet).
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
 ### Nav / Login
