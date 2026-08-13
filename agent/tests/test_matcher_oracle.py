@@ -286,6 +286,13 @@ class TestMatcherSemantics(unittest.TestCase):
                            env=dict(os.environ, HOME=_fake_home(work)))
             self.assertEqual(got, DENIED,
                              f"{rules} does not protect the directory it names")
+            # ...and ONLY the directory it names. Asserting the deny alone would
+            # pass just as happily for a rule that denied the whole filesystem.
+            neighbour = os.path.join(work, dirname + "-other")
+            os.makedirs(neighbour, exist_ok=True)
+            self.assertEqual(_attempt(work, sp, os.path.join(neighbour, "f.py"),
+                                      env=dict(os.environ, HOME=_fake_home(work))),
+                             ALLOWED, f"{rules} over-reaches onto {neighbour}")
 
     def test_write_rules_are_inert_and_edit_rules_cover_write(self):
         # Claude Code warns about this at startup and it is easy to re-introduce:
@@ -321,8 +328,39 @@ class TestGuardedClaudeDir(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self._n = 0
 
-    #: settings payloads each case can be driven under
-    REAL, EMPTY, BLANKET = "real", "empty", "blanket"
+    #: Settings payloads each case can be driven under. The two SINGLE-LAYER
+    #: arms exist because the guard is TWO layers -- the deny patterns and the
+    #: fileguard hook -- and either one alone refused every target here, so
+    #: deleting either was invisible: unwiring the hook left 6/7 green, and
+    #: emptying all 46 deny rules left 7/7 green. Attribution has to name the
+    #: LAYER, not merely "our settings".
+    REAL, EMPTY, BLANKET, HOOK_ONLY, PATTERNS_ONLY = (
+        "real", "empty", "blanket", "hookonly", "patternsonly")
+
+    def _payload(self, arm, base):
+        if arm == self.EMPTY:
+            return {}
+        if arm == self.BLANKET:
+            # The rule this whole change removed. An arm asserting it still
+            # DENIES is what proves a positive case can detect the old broken
+            # behaviour rather than passing for free.
+            return {"permissions": {"deny": ["Edit(~/.claude/**)"]}}
+        # `local_settings_path` is pinned at a file that does not exist:
+        # build_guard_settings() otherwise folds the OPERATOR's real
+        # ~/.claude/settings.local.json into the deny list, and a single deny
+        # rule there would make every REAL-arm refusal unattributable again --
+        # on their machine, not on the one where this was written.
+        s = ha.build_guard_settings(
+            local_settings_path=os.path.join(base, "no-operator-settings.json"))
+        # setdefault, not indexing: if build_guard_settings() is ever gutted the
+        # arm must FAIL the assertion, not KeyError before it gets there.
+        if arm == self.HOOK_ONLY:
+            s.setdefault("permissions", {})["deny"] = []  # patterns gone, hook wired
+        elif arm == self.PATTERNS_ONLY:                   # hook gone, patterns kept
+            pre = s.get("hooks", {}).get("PreToolUse", [])
+            s.setdefault("hooks", {})["PreToolUse"] = [
+                h for h in pre if "Edit" not in h.get("matcher", "")]
+        return s
 
     def _case(self, target_rel, arm=REAL, mode="bypassPermissions"):
         self._n += 1
@@ -331,23 +369,31 @@ class TestGuardedClaudeDir(unittest.TestCase):
         home = _fake_home(base, trust_cwd=os.path.join(base, "home"))
         target = os.path.join(home, target_rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        payload = {self.REAL: ha.build_guard_settings,
-                   self.EMPTY: dict,
-                   # The rule this whole change removed. An arm asserting it
-                   # still DENIES is what proves a positive case can detect the
-                   # old broken behaviour rather than passing for free.
-                   self.BLANKET: lambda: {"permissions":
-                                          {"deny": ["Edit(~/.claude/**)"]}}}[arm]()
-        sp = _settings(os.path.join(base, "turma"), payload)
+        sp = _settings(os.path.join(base, "turma"), self._payload(arm, base))
         return _attempt(home, sp, target, mode=mode,
                         env=dict(os.environ, HOME=home, IS_SANDBOX="1"))
 
-    def _refuses(self, target_rel):
-        """Our layer refuses it, and the binary on its own would not have."""
+    def _refuses(self, target_rel, named_by_pattern=True):
+        """Refused, the binary alone would not have, and BY WHICH LAYER.
+
+        `named_by_pattern` says whether a `permissions.deny` rule names this
+        target. The hook covers everything under ~/.claude regardless, so
+        HOOK_ONLY must always refuse; PATTERNS_ONLY refuses only what the rule
+        list actually names. The single target no pattern names is what proves
+        the hook is load-bearing rather than decorative.
+        """
         self.assertEqual(self._case(target_rel, self.EMPTY), ALLOWED,
                          "baseline: nothing refused this with empty settings, so "
-                         "the assertion below cannot be attributed to our layer")
+                         "the assertions below cannot be attributed to our layer")
         self.assertEqual(self._case(target_rel, self.REAL), DENIED)
+        self.assertEqual(self._case(target_rel, self.HOOK_ONLY), DENIED,
+                         "the hook alone no longer refuses this, so deleting "
+                         "every deny rule would not fail a single test")
+        self.assertEqual(self._case(target_rel, self.PATTERNS_ONLY),
+                         DENIED if named_by_pattern else ALLOWED,
+                         "the pattern backstop alone no longer behaves as "
+                         "documented for this target, so unwiring the hook "
+                         "would not fail a single test")
 
     def test_a_subagent_memory_store_is_writable(self):
         """THE FEATURE. This is what the whole carve-out exists to permit.
@@ -374,9 +420,11 @@ class TestGuardedClaudeDir(unittest.TestCase):
         # across sessions, and it is the hole the enumerated-pattern attempt had.
         self._refuses(".claude/shell-snapshots/snapshot.sh")
 
-    def test_paths_no_pattern_names_are_refused_by_the_hook(self):
-        # The hook is what makes coverage complete: no backstop pattern names
-        # settings.json, and ~/.claude.json is a SIBLING of the directory.
+    def test_the_settings_file_is_refused(self):
+        # Named by BOTH layers -- `Edit(~/.claude/settings.json*)` and
+        # `Edit(~/.claude/*.json)` are in the rule list. An earlier version of
+        # this test was called "..._refused_by_the_hook" and its comment claimed
+        # no pattern named it; both were false, and it never exercised the hook.
         self._refuses(".claude/settings.json")
 
     def test_the_claude_json_sibling_is_refused(self):
@@ -384,9 +432,16 @@ class TestGuardedClaudeDir(unittest.TestCase):
         self._refuses(".claude.json")
 
     def test_the_memory_directory_entry_itself_is_not_writable(self):
-        # A FILE planted at this name makes the directory impossible to create,
-        # permanently disabling that agent's memory.
-        self._refuses(".claude/agent-memory/qa")
+        """A FILE planted at this name makes the directory impossible to create,
+        permanently disabling that agent's memory.
+
+        This is THE hook-only target: no `permissions.deny` rule names it, and
+        none can -- a pattern matching this path would match the memory tree
+        underneath it too, which is the whole reason the carve-out needed a
+        predicate. So `named_by_pattern=False` here is what proves the hook
+        carries coverage the pattern backstop cannot.
+        """
+        self._refuses(".claude/agent-memory/qa", named_by_pattern=False)
 
     def test_project_auto_memory_is_gated_by_the_binary_not_by_us(self):
         """A limit the carve-out cannot lift, pinned so a future release shows up.
