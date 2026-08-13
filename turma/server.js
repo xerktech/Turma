@@ -3758,14 +3758,43 @@ function startedTicketKeys() {
 // back on the next sweep; a manually queued one is lost and has to be clicked
 // again (its ticket is untouched, so nothing is destroyed by that).
 const TICKET_QUEUE_MAX = 200;
+// And how many ONE ORG may hold. The fleet cap alone is not a cap: an ordinary
+// 250-ticket To Do backlog on one opted-in org filled all 200 in a single sweep,
+// and every OTHER org's Start button then answered "the ticket queue is full" —
+// one org's routine backlog switching ticket-starting off fleet-wide. The queue
+// is drained per org (capacity is per org), so a per-org line is the real
+// resource; the fleet cap is only the memory bound behind it.
+const TICKET_QUEUE_PER_ORG_MAX = 25;
 // Longest a hold reason from findTicketHost is carried on an entry — it is
 // operator-facing text that rides /api/agents to every client.
 const TICKET_QUEUE_ERROR_MAX = 300;
-// FIFO. Entries: {siteKey, issueKey, source:"auto"|"manual", at, reason, error}.
-// `reason` is why it is STILL waiting, as of the last drain: "capacity" (some
-// host will free up), "blocked" (something the operator has to fix — the text is
-// in `error`), or null before the first drain has judged it.
+// Longest an issue key / siteKey may be to enter the queue. Both come off an
+// AGENT's jira block on the sweep path, and an entry is served to every client
+// on the fleet payload, so they are bounded HERE — see enqueueTicketStart.
+const TICKET_KEY_MAX = 64;
+const TICKET_SITE_MAX = 200;
+// How long an entry may sit with its ticket unresolvable (no reporting org lists
+// it any more) before it is dropped. Long enough to ride out a poll gap or a
+// host restart, short enough that a deleted/renamed ticket can't hold a place in
+// its org's line forever.
+const TICKET_QUEUE_STALE_MS = 10 * 60 * 1000;
+// How long a MANUAL entry may sit "blocked" — a hold only the operator can clear
+// (no triaged repo, a pinned agent that's gone). An auto entry blocked this way
+// is dropped at once (the sweep re-queues it the moment it's eligible again), but
+// a click deserves a while to be made good on before it is forgotten.
+const TICKET_QUEUE_BLOCKED_MAX_MS = 30 * 60 * 1000;
+// How long a dispatch is remembered, so a cancel that LOST to it can say so
+// rather than 404ing as if the ticket had never been queued.
+const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
+// FIFO. Entries: {siteKey, issueKey, source:"auto"|"manual", at, reason, error,
+// sessionsAtQueue, blockedSince, unknownSince}. `reason` is why it is STILL
+// waiting, as of the last drain: "capacity" (some host will free up), "blocked"
+// (something the operator has to fix — the text is in `error`), or null before
+// the first drain has judged it.
 const ticketQueue = [];
+// "<siteKey>\x00<issueKey>" -> when its spawn was handed to a host. Bounded by
+// the prune in rememberDispatch; read only by the cancel route.
+const ticketDispatchedAt = new Map();
 
 function ticketQueueKey(siteKey, issueKey) {
   return (siteKey || "") + "\x00" + issueKey;
@@ -3774,6 +3803,25 @@ function ticketQueueKey(siteKey, issueKey) {
 function queuedTicket(siteKey, issueKey) {
   return ticketQueue.find(
     (e) => e.siteKey === siteKey && e.issueKey === issueKey) || null;
+}
+
+// How many sessions the fleet already reports for a ticket, across every channel
+// startedTicketKeys reads. A MANUAL entry snapshots this when it's queued and is
+// retired once the count grows: that is precisely "the session I asked for has
+// started", which neither "has any session" (a deliberate second session on a
+// ticket is a supported thing to ask for) nor "has none" can express.
+function ticketSessionCount(siteKey, issueKey) {
+  let n = 0;
+  const hit = (s) => {
+    const t = s && s.ticket;
+    return t && t.key === issueKey && (t.siteKey || "") === siteKey;
+  };
+  for (const a of Object.values(agents)) {
+    for (const s of a.sessions || []) if (hit(s)) n++;
+    for (const c of a.closedSessions || []) if (hit(c)) n++;
+    for (const r of a.repos || []) for (const t of r.resumable || []) if (hit(t)) n++;
+  }
+  return n;
 }
 
 // The queue as clients see it, oldest first, with each entry's 1-based place in
@@ -3792,29 +3840,81 @@ function ticketQueuePayload() {
 
 // Rides /api/agents like ticketAgents/autoStartOrgs, plus its own SSE event so
 // an open board reflects a queue change without waiting out the poll.
+//
+// The CACHE is invalidated synchronously (the next reader must not be served a
+// stale payload) but the BROADCAST is coalesced to the end of the turn: a sweep
+// queues one ticket at a time, and publishing per entry made a routine backlog
+// cost every open board a frame per ticket — 201 frames and 2.8 MB for 200
+// tickets. Every caller in one synchronous pass therefore shares one frame.
+let ticketQueueBroadcastPending = false;
 function publishTicketQueue() {
   invalidateAgentsCache();
-  sseBroadcast("ticketQueue", ticketQueuePayload());
+  if (ticketQueueBroadcastPending) return;
+  ticketQueueBroadcastPending = true;
+  setImmediate(() => {
+    ticketQueueBroadcastPending = false;
+    sseBroadcast("ticketQueue", ticketQueuePayload());
+  }).unref?.();
 }
 
-// Put a ticket in line. Returns the entry, or null when the queue is full.
+// Remember that a ticket's spawn went out, so the cancel route can tell "you
+// already cancelled this" from "this started a moment ago" — the queue entry is
+// gone in both cases, and answering the second like the first told an operator
+// their cancel worked while a session was starting.
+function rememberDispatch(siteKey, issueKey) {
+  const now = Date.now();
+  for (const [k, at] of ticketDispatchedAt) {
+    if (now - at > TICKET_DISPATCH_MEMO_MS) ticketDispatchedAt.delete(k);
+  }
+  ticketDispatchedAt.set(ticketQueueKey(siteKey, issueKey), now);
+}
+
+function dispatchedRecently(siteKey, issueKey) {
+  const at = ticketDispatchedAt.get(ticketQueueKey(siteKey, issueKey));
+  return !!at && Date.now() - at <= TICKET_DISPATCH_MEMO_MS;
+}
+
+// Put a ticket in line. Returns the entry, or null when it can't be queued (a
+// key this hub won't serve, or a full line).
 //
 // One entry per ticket: a click on a ticket the sweep already queued UPGRADES it
 // to "manual" rather than adding a second. That upgrade is the point — an
 // operator who asked for this by hand keeps their place when the org's auto
 // switch goes off, and only the auto-queued entries are swept away.
+//
+// The key is validated HERE, not only on the manual route. On the sweep path
+// both fields come from an AGENT's `jira` block — untrusted — and an entry is
+// then served to every client on the top-level payload, where Android TYPES
+// `issueKey` as a String and decodes the whole payload atomically. An object or
+// a 20k-char key from one buggy host would break every phone's fleet decode,
+// hub-wide rather than per-host, and no `normalize*` covers this list: this
+// check is that coercion.
 function enqueueTicketStart(siteKey, issueKey, source) {
+  if (typeof siteKey !== "string" || !siteKey || siteKey.length > TICKET_SITE_MAX) return null;
+  if (typeof issueKey !== "string" || issueKey.length > TICKET_KEY_MAX
+      || !isIssueKey(issueKey)) {
+    return null;
+  }
   const existing = queuedTicket(siteKey, issueKey);
   if (existing) {
     if (source === "manual" && existing.source !== "manual") {
       existing.source = "manual";
+      // It becomes the operator's ask, so it is judged as one from here on.
+      existing.sessionsAtQueue = ticketSessionCount(siteKey, issueKey);
       publishTicketQueue();
     }
     return existing;
   }
+  if (ticketQueue.filter((e) => e.siteKey === siteKey).length >= TICKET_QUEUE_PER_ORG_MAX) {
+    return null;
+  }
   if (ticketQueue.length >= TICKET_QUEUE_MAX) return null;
   const e = { siteKey, issueKey, source: source === "manual" ? "manual" : "auto",
-    at: Date.now(), reason: null, error: null };
+    at: Date.now(), reason: null, error: null,
+    // What "the session I asked for" means for this entry (manual only; an auto
+    // entry is retired by any session at all).
+    sessionsAtQueue: source === "manual" ? ticketSessionCount(siteKey, issueKey) : 0,
+    blockedSince: 0, unknownSince: 0 };
   ticketQueue.push(e);
   publishTicketQueue();
   return e;
@@ -3853,18 +3953,29 @@ function dropAutoQueuedTickets(siteKey) {
   return n;
 }
 
-// A ticket's status category, from the same freshest-block copy the board
-// renders and the sweeps read. null when no reporting org still lists it.
-function ticketCategory(siteKey, issueKey) {
-  let cat = null, bestAt = "";
+// Each org's FRESHEST reporting block, built once per drain pass. The same copy
+// the board renders and the sweeps read — and built once rather than per entry,
+// because the walk is over every host's whole ticket list and the drain runs on
+// every heartbeat.
+function freshestJiraBlocks() {
+  const best = new Map();   // siteKey -> {block, at}
   for (const a of Object.values(agents)) {
-    if (!a.jira || a.jira.siteKey !== siteKey) continue;
-    const t = (a.jira.tickets || []).find((x) => x && x.key === issueKey);
-    if (!t) continue;
-    const at = String(a.jira.fetchedAt || "");
-    if (!cat || at > bestAt) { cat = t.statusCategory || null; bestAt = at; }
+    const j = a && a.jira;
+    if (!j || !j.siteKey) continue;
+    const at = String(j.fetchedAt || "");
+    const cur = best.get(j.siteKey);
+    if (!cur || at > cur.at) best.set(j.siteKey, { block: j, at });
   }
-  return cat;
+  return best;
+}
+
+// A queued ticket as its org's freshest block sees it: null when NO org reports
+// that key any more (deleted, renamed, or a board that stopped listing it), which
+// is a different thing from a ticket with no status.
+function queuedTicketRow(blocks, e) {
+  const hit = blocks.get(e.siteKey);
+  if (!hit) return null;
+  return (hit.block.tickets || []).find((t) => t && t.key === e.issueKey) || null;
 }
 
 // Is a spawnTicket for this ticket already riding some org host's command queue?
@@ -3894,16 +4005,16 @@ function holdQueued(e, reason, error) {
 // avoid. A second ticket for the same host waits for the next pass; a ticket for
 // a DIFFERENT host in the same pass goes straight out.
 //
-// Entries leave the queue on evidence, in strength order: the ticket has a
-// session on some channel (someone started it — us or an operator), a spawn is
-// already in flight for it, its ticket reached Done, or (for an auto entry) it
-// left To Do or its org's auto switch went off. Everything else HOLDS with a
-// reason, including a hard routing error — the operator can see it on the card
-// and cancel; nothing here throws work away because a host was briefly down.
+// Entries leave the queue on evidence, in strength order: the session that was
+// asked for has started, a spawn is already in flight for it (auto), its ticket
+// reached Done, or (for an auto entry) it left To Do or its org's auto switch
+// went off. Everything else HOLDS with a reason — but a hold is not forever: an
+// entry whose ticket no longer exists, or that no operator action is coming for,
+// ages out rather than holding a place in its org's line indefinitely.
 function drainTicketQueue() {
   if (!ticketQueue.length) return;
-  const started = startedTicketKeys();
   const now = Date.now();
+  const blocks = freshestJiraBlocks();
   const usedHosts = new Set();
   let changed = false;
   for (const e of [...ticketQueue]) {
@@ -3914,16 +4025,25 @@ function drainTicketQueue() {
       changed = true;
       if (why) console.log(`ticket queue: dropped ${logName(e.issueKey)} — ${why}`);
     };
-    const cat = ticketCategory(e.siteKey, e.issueKey);
+    const row = queuedTicketRow(blocks, e);
+    // Nobody reports this ticket any more. Give it a while (a poll gap, a host
+    // restart) and then let it go — an entry whose ticket has ceased to exist
+    // held its org's line open forever, which is what made a full queue permanent.
+    if (!row) {
+      if (!e.unknownSince) { e.unknownSince = now; changed = true; }
+      if (now - e.unknownSince > TICKET_QUEUE_STALE_MS) {
+        drop("no reporting org lists that ticket any more");
+      }
+      continue;
+    }
+    if (e.unknownSince) { e.unknownSince = 0; changed = true; }
+    const cat = row.statusCategory || null;
     if (cat === "done") { drop("its ticket moved to Done"); continue; }
     if (e.source === "auto") {
       // The auto guards, unchanged in strength from the sweep's: a session on any
       // channel means the work is under way (or was, and was killed), and a spawn
-      // in flight means one is about to be. NEITHER applies to a manual entry — a
-      // SECOND session on a ticket is a supported thing an operator can ask for
-      // (it gets the -1/-2 branch), so dropping their click because a first
-      // session exists would silently swallow it.
-      if (started.has(k)) { drop("it already has a session"); continue; }
+      // in flight means one is about to be.
+      if (startedTicketKeys().has(k)) { drop("it already has a session"); continue; }
       if (spawnTicketInFlight(e.siteKey, e.issueKey)) {
         drop("a spawn for it is already in flight");
         continue;
@@ -3932,18 +4052,43 @@ function drainTicketQueue() {
       // Auto-start only ever starts To Do work; a ticket a human has since moved
       // into progress is being handled and shouldn't gain a session behind them.
       if (cat && cat !== "todo") { drop("its ticket left To Do"); continue; }
+    } else if (ticketSessionCount(e.siteKey, e.issueKey) > (e.sessionsAtQueue || 0)) {
+      // A MANUAL entry is one operator asking for one session, so it retires when
+      // a session it didn't have at click time appears — however that happened
+      // (this queue, a direct dispatch, another board, the auto sweep). What it
+      // must NOT do is retire on "the ticket has A session", since starting a
+      // SECOND one on a ticket is a thing the + button exists to ask for.
+      drop("the session it was queued for has started");
+      continue;
     }
     const repo = ticketRepo(e.siteKey, e.issueKey);
     if (!repo) {
+      // An auto entry is re-derivable — the sweep re-queues it the moment it is
+      // eligible again — so an un-triaged ticket leaves rather than sitting on
+      // its org's line. A manual click is given a while to be made good on first.
+      if (e.source === "auto") { drop("its ticket has no triaged repo"); continue; }
       changed = holdQueued(e, "blocked", "that ticket has no triaged repo yet") || changed;
+      if (!e.blockedSince) e.blockedSince = now;
+      if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
+        drop("it stayed blocked with nothing the hub could do about it");
+      }
       continue;
     }
     const { host, error, full } = findTicketHost(
       e.siteKey, repo, e.issueKey, { requireFree: true });
     if (!host) {
       changed = holdQueued(e, full ? "capacity" : "blocked", full ? null : error) || changed;
+      // "capacity" clears itself, so it waits as long as it takes; "blocked"
+      // needs someone, and ages out like the un-triaged hold above.
+      if (full) { if (e.blockedSince) { e.blockedSince = 0; changed = true; } continue; }
+      if (e.source === "auto") { drop(`it can't be routed: ${error}`); continue; }
+      if (!e.blockedSince) e.blockedSince = now;
+      if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
+        drop("it stayed blocked with nothing the hub could do about it");
+      }
       continue;
     }
+    if (e.blockedSince) { e.blockedSince = 0; changed = true; }
     if (usedHosts.has(host)) continue;   // that host already took one this pass
     usedHosts.add(host);
     // The operator's model pin (XERK-123) rides the command, exactly as it does
@@ -3952,6 +4097,7 @@ function drainTicketQueue() {
     const mpin = ticketModelPin(e.siteKey, e.issueKey);
     queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ...(mpin ? { model: mpin.model } : {}) });
+    rememberDispatch(e.siteKey, e.issueKey);
     const wait = Math.round((now - e.at) / 1000);
     console.log(`ticket queue: dispatched ${logName(e.issueKey)} to ${logName(host)}`
       + ` (${e.source}, waited ${wait}s)`);
@@ -6284,7 +6430,16 @@ const server = http.createServer(async (req, res) => {
       // queuing can't fix any of those, and a refusal has to reach the operator.
       if (!host && full) {
         const e = enqueueTicketStart(siteKey, issueKey, "manual");
-        if (!e) return json(res, 429, { error: "the ticket queue is full" });
+        if (!e) {
+          // Which line is full decides the wording, and there are two: this org's
+          // (the real resource — the queue drains per org) and the fleet's (the
+          // memory bound behind it). One org's backlog must never be reported as
+          // "the queue is full" to another org's operator.
+          const mine = ticketQueue.filter((q) => q.siteKey === siteKey).length;
+          return json(res, 429, { error: mine >= TICKET_QUEUE_PER_ORG_MAX
+            ? `that org already has ${mine} tickets waiting to start`
+            : "the hub's ticket queue is full" });
+        }
         const pos = ticketQueuePayload().find(
           (q) => q.siteKey === siteKey && q.issueKey === issueKey);
         return json(res, 200, { ok: true, queued: true, repo,
@@ -6304,6 +6459,12 @@ const server = http.createServer(async (req, res) => {
       const cmdId = pending ? pending.cmdId
         : queueCommand(host, { type: "spawnTicket", issueKey,
             ...(mpin ? { model: mpin.model } : {}) });
+      // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
+      // a board that hadn't seen the queue yet clicked Start). Its session is
+      // starting now, so its place in line is spent — leaving it there would
+      // dispatch it AGAIN on the next free slot, hours later and unasked.
+      dropQueuedTicket(siteKey, issueKey, "dispatched by a direct start");
+      rememberDispatch(siteKey, issueKey);
       // needsClone tells the board the chosen host doesn't have the repo yet, so
       // it will clone on demand and the session starts queued behind the clone.
       return json(res, 200, { ok: true, cmdId, host, repo, needsClone });
@@ -6322,6 +6483,15 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "not a valid issue key" });
       }
       if (!dropQueuedTicket(siteKey, issueKey, "cancelled by the operator")) {
+        // The entry is equally gone whether it was cancelled a moment ago or
+        // DISPATCHED a moment ago, and answering the second like the first told
+        // an operator their cancel worked while a session was starting. So a
+        // recent dispatch is refused in the hub's own words instead.
+        if (dispatchedRecently(siteKey, issueKey)) {
+          return json(res, 409, { error:
+            "that ticket just started — its session is coming up, so stop it from "
+            + "the Sessions page" });
+        }
         return json(res, 404, { error: "that ticket isn't waiting in the queue" });
       }
       return json(res, 200, { ok: true });
@@ -7011,7 +7181,13 @@ if (process.env.TURMA_TEST) {
     dropAutoQueuedTickets,
     drainTicketQueue,
     queuedTicket,
+    ticketDispatchedAt,
+    holdQueued,
     TICKET_QUEUE_MAX,
+    TICKET_QUEUE_PER_ORG_MAX,
+    TICKET_QUEUE_ERROR_MAX,
+    TICKET_QUEUE_STALE_MS,
+    TICKET_QUEUE_BLOCKED_MAX_MS,
     migrations,
     advanceMigrations,
     // The relay spools bundles here rather than holding them in the record

@@ -170,9 +170,41 @@ this is how it works. Read it before touching `findTicketHost`, the `/session` r
   agent that is gone) still answers with a status and `{error}` — queuing fixes none of them. A
   pinned host that is merely FULL is waited for, never routed around; `{full:true}` is what tells
   the two apart.
-- An entry is `{siteKey, issueKey, source, at, reason, error}`. `reason` is why it is STILL waiting
-  as of the last drain — `capacity` (clears itself) or `blocked` (the operator has to clear it, with
-  the hub's wording in `error`) — and the card says which.
+- An entry is `{siteKey, issueKey, source, at, reason, error, sessionsAtQueue, blockedSince,
+  unknownSince}`. `reason` is why it is STILL waiting as of the last drain — `capacity` (clears
+  itself) or `blocked` (the operator has to clear it, with the hub's wording in `error`) — and the
+  card says which.
+- **`enqueueTicketStart` validates the key** (`isIssueKey` + `TICKET_KEY_MAX`, and a bounded
+  `siteKey`). On the sweep path both fields come off an AGENT's `jira` block, and an entry is then
+  served on the top-level payload where **Android TYPES `issueKey`** and decodes atomically — an
+  object or a 20k key from one host would break every phone's fleet decode, hub-wide. **This check
+  is that coercion; there is no `normalize*` covering this list.** It also keeps an unvalidated key
+  off the `spawnTicket` command the sweep path never checked.
+- **Two caps, and the per-ORG one is the one that matters.** A 250-ticket To Do backlog is an
+  ordinary board: with only `TICKET_QUEUE_MAX` (fleet), one opted-in org filled the queue in a
+  single sweep and every OTHER org's Start button answered "full". `TICKET_QUEUE_PER_ORG_MAX` is the
+  real line (the queue drains per org); the fleet cap is the memory bound behind it, and the refusal
+  names which one was hit.
+- **A hold is not forever.** An entry whose ticket no reporting org lists any more ages out
+  (`TICKET_QUEUE_STALE_MS`, long enough to ride out a poll gap or host restart); a `blocked` AUTO
+  entry leaves at once (the sweep re-queues it when it's eligible again) while a `blocked` MANUAL
+  one is given `TICKET_QUEUE_BLOCKED_MAX_MS`. Only `capacity` waits indefinitely — it is the one
+  hold that clears itself. Without this a permanently-blocked entry held its org's line open for the
+  hub's lifetime.
+- **A direct dispatch RETIRES that ticket's entry** (`/session` when a host is free), and
+  `rememberDispatch` records it. The entry and the dispatch are one intent: left in place it fired
+  again on the next free slot, a second session hours later that nobody asked for.
+- **A manual entry retires on the session it asked for**, not on "the ticket has a session":
+  `sessionsAtQueue` snapshots the count at click time and the entry goes when the count grows. The
+  `+` button exists to ask for a second session, so the stronger auto guard would swallow that ask;
+  the weaker "any session" test would leave the entry immortal.
+- **A cancel that lost the race is refused, not blessed.** The entry is equally gone whether it was
+  cancelled or DISPATCHED a moment ago, so `dispatchedRecently` (`TICKET_DISPATCH_MEMO_MS`) makes
+  the second a **409** — a 404 there told an operator their cancel worked while a session came up.
+  Both clients treat 404 as satisfied intent and 409 as a refusal to show.
+- **`publishTicketQueue` invalidates the cache synchronously but COALESCES the SSE frame** to the
+  end of the turn: a sweep queues one ticket at a time, and a frame per entry cost every open board
+  201 frames / 2.8 MB for one 200-ticket backlog.
 - **`source` decides what may sweep an entry away.** Turning an org's Auto switch off drops its
   `auto` entries and NOTHING else: not its manual ones, not another org's, and no session (there is
   none to touch). A manual click on an auto-queued ticket **upgrades** it to `manual` so it survives
@@ -189,7 +221,13 @@ this is how it works. Read it before touching `findTicketHost`, the `/session` r
 - Clients paint from the payload, with a short-lived local overlay for the round trip of a click
   only (`queueView` in `board.html` and `core/Board.kt`, retired the moment the hub agrees). The
   card replaces its Start button with the wait + a ✕ — a second press could only re-queue what is
-  queued. Tests: the `XERK-296:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.
+  queued.
+  - **`board.html` re-reads the whole payload on an SSE RECONNECT**, because the queue is the one
+    piece of its state that is hub-MEMORY: a hub restart empties it with no event that socket could
+    carry, and the 15s poll only runs while SSE is DOWN. Without the re-read the chip stuck forever,
+    and since it REPLACES the start button that ticket could not be started at all. Android polls
+    every 6s regardless, so it never had this.
+- Tests: the `XERK-296:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.
 
 #### Auto-starting To Do tickets (XERK-32)
 

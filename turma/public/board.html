@@ -259,8 +259,10 @@ async function cancelQueued(issueKey, siteKey) {
   } catch { return void fail("the hub is unreachable"); }
   if (r.status === 401) return void (location.href = "/login");
   try { body = await r.json(); } catch { /* non-JSON error body */ }
-  // A 404 means it already left the queue (dispatched, or cancelled elsewhere) —
-  // the operator's intent is satisfied either way, so it isn't a failure.
+  // A 404 means it was already out of the queue and nothing started — cancelled
+  // from another board, or never queued — so the operator's intent is satisfied.
+  // A 409 is the opposite: the cancel LOST to a dispatch and a session is coming
+  // up, which they have to be told rather than shown a vanishing chip.
   if (!r.ok && r.status !== 404) return void fail(body.error || `HTTP ${r.status}`);
 }
 
@@ -1104,7 +1106,7 @@ async function refresh() {
 
 // Live push: same SSE pattern as the other pages — patch the cached agent
 // record and re-render (debounced); the 15s poll stays as a fallback only.
-let sseOk = false, sseBackoff = 2000, renderTimer = null;
+let sseOk = false, sseEverOpen = false, sseBackoff = 2000, renderTimer = null;
 function scheduleRender() {
   if (renderTimer) return;
   renderTimer = setTimeout(() => { renderTimer = null; if (cache) render(cache); }, 1000);
@@ -1119,7 +1121,18 @@ function connectSSE() {
   let es;
   try { es = new EventSource("/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
-  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.onopen = () => {
+    // A RECONNECT re-reads the whole payload once. Everything else on this page
+    // is patched by events, but the hub's ticket queue is in-memory (XERK-296),
+    // so a hub restart empties it with no event this socket could have carried —
+    // and the poll below only runs while SSE is DOWN. Without this re-read a
+    // cancelled or dispatched ticket kept its "queued" chip forever, and since
+    // the chip REPLACES the start button, that ticket could not be started at
+    // all. Skipped on the first connect, which the initial refresh() covers.
+    if (sseEverOpen) refresh();
+    sseEverOpen = true;
+    sseOk = true; sseBackoff = 2000;
+  };
   es.addEventListener("agent", (e) => {
     try { applyAgent(JSON.parse(e.data)); } catch { return; }
     scheduleRender();
