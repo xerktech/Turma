@@ -500,6 +500,24 @@ button:disabled .spin { border-top-color: var(--ink-2); }
    to a "+" so it stops competing with the session chips for the card's width. */
 .kc-start.kc-start-more { padding: 1px 6px; font-weight: 600; color: var(--muted); }
 .kc-start.kc-start-busy { color: var(--muted); border-style: dashed; cursor: default; }
+/* A ticket waiting in the hub's queue for a free session slot (XERK-296). Same
+   chip metrics as the start button it replaces, dashed like the other "not a
+   thing yet" states; the ✕ beside it takes the ticket back out of the line. */
+.kc-queued {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px dashed var(--border); background: var(--page);
+  color: var(--muted); font-size: 10.5px; line-height: 1.5; white-space: nowrap;
+}
+.kc-queued.kc-queued-blocked { color: var(--warning); border-color: var(--warning); }
+.kc-unqueue {
+  padding: 1px 6px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--muted); font: inherit; font-size: 10.5px; line-height: 1.5;
+  cursor: pointer;
+}
+.kc-unqueue:hover { border-color: var(--critical); color: var(--critical); }
+.kc-unqueue:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
 .kc-start-err {
   color: var(--critical); font-size: 10.5px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22ch;

@@ -104,9 +104,12 @@ import com.xerktech.turma.core.ticketSessionIndex
 import com.xerktech.turma.core.ticketSessionLabel
 import com.xerktech.turma.core.ticketSessionState
 import com.xerktech.turma.core.ticketSessionsOf
+import com.xerktech.turma.core.queueView
+import com.xerktech.turma.core.queuedTicketOf
 import com.xerktech.turma.core.ticketStartControl
 import com.xerktech.turma.model.CreateTicketRequest
 import com.xerktech.turma.model.JiraTicket
+import com.xerktech.turma.model.QueuedTicket
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
 import kotlinx.coroutines.launch
@@ -142,6 +145,13 @@ fun BoardScreen(
     val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
     val starts by vm.starts.collectAsStateWithLifecycle()
     val moves by vm.moves.collectAsStateWithLifecycle()
+    // Tickets waiting for a free session slot (XERK-296): the hub's own list,
+    // through this client's in-flight optimism over it.
+    val queueAdds by vm.queueAdds.collectAsStateWithLifecycle()
+    val queueDrops by vm.queueDrops.collectAsStateWithLifecycle()
+    val ticketQueue = remember(fleet.ticketQueue, queueAdds, queueDrops) {
+        queueView(fleet.ticketQueue, queueAdds, queueDrops)
+    }
     val sites = remember(fleet) { mergeSites(fleet.agents) }
     // Ticket -> sessions reverse index over the whole fleet payload (XERK-78).
     val sessionIndex = remember(fleet) { ticketSessionIndex(fleet.agents) }
@@ -238,10 +248,12 @@ fun BoardScreen(
                             sessionIndex = sessionIndex,
                             starts = starts,
                             moves = moves,
+                            queue = ticketQueue,
                             dropTarget = drag != null && drag!!.overCat == cat && drag!!.fromCat != cat,
                             draggingKey = drag?.let { BoardViewModel.startKey(it.site.siteKey, it.ticket.key) },
                             onBounds = { r -> colBounds[cat] = r },
                             onStart = { site, t -> vm.startSession(site.siteKey, t.key) },
+                            onCancelQueued = { site, t -> vm.cancelQueued(site.siteKey, t.key) },
                             onOpenSession = { s ->
                                 if (s.status == "running" && s.id.isNotBlank()) onOpenChat(s.host, s.id)
                                 else if (s.transcriptId.isNotBlank()) onOpenEnded(s.host, s.transcriptId)
@@ -355,10 +367,12 @@ private fun KanbanColumn(
     sessionIndex: Map<String, List<TicketSession>>,
     starts: Map<String, StartState>,
     moves: Map<String, MoveState>,
+    queue: List<QueuedTicket>,
     dropTarget: Boolean,
     draggingKey: String?,
     onBounds: (Rect) -> Unit,
     onStart: (BoardSite, JiraTicket) -> Unit,
+    onCancelQueued: (BoardSite, JiraTicket) -> Unit,
     onOpenSession: (TicketSession) -> Unit,
     onOpen: (BoardSite, JiraTicket) -> Unit,
     onDragStart: (BoardSite, JiraTicket, IntSize, Offset) -> Unit,
@@ -392,9 +406,11 @@ private fun KanbanColumn(
                     sessions = ticketSessionsOf(sessionIndex, site.siteKey, t.key),
                     start = starts[moveKey],
                     move = moves[moveKey],
+                    queued = queuedTicketOf(queue, site.siteKey, t.key),
                     dragging = draggingKey == moveKey,
                     onOpenSession = onOpenSession,
                     onStart = { onStart(site, t) },
+                    onCancelQueued = { onCancelQueued(site, t) },
                     onDragStart = { size, pos -> onDragStart(site, t, size, pos) },
                     onDragDelta = onDragDelta,
                     onDragEnd = onDragEnd,
@@ -415,8 +431,10 @@ private fun TicketCard(
     sessions: List<TicketSession>,
     start: StartState?,
     move: MoveState?,
+    queued: QueuedTicket?,
     dragging: Boolean,
     onStart: () -> Unit,
+    onCancelQueued: () -> Unit,
     onOpenSession: (TicketSession) -> Unit,
     onDragStart: (IntSize, Offset) -> Unit,
     onDragDelta: (Offset) -> Unit,
@@ -480,7 +498,7 @@ private fun TicketCard(
                 }
                 RepoChip(t)
                 sessions.forEach { s -> TicketSessionChip(s, onClick = { onOpenSession(s) }) }
-                TicketStartControl(t, sessions, start, onStart)
+                TicketStartControl(t, sessions, start, queued, onStart, onCancelQueued)
                 // A drag in flight / just landed, or a failed one (XERK-141).
                 if (move?.error != null) {
                     Text("couldn't move", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
@@ -544,10 +562,45 @@ private fun TicketStartControl(
     t: JiraTicket,
     sessions: List<TicketSession>,
     start: StartState?,
+    queued: QueuedTicket?,
     onStart: () -> Unit,
+    onCancelQueued: () -> Unit,
 ) {
-    when (val c = ticketStartControl(t, sessions.size, start)) {
+    when (val c = ticketStartControl(t, sessions.size, start, queued)) {
         null -> {}
+        // Waiting in the hub's queue: no host chosen and no session created, so
+        // the only control that applies is taking it back out of the line.
+        is StartControl.Queued -> {
+            c.error?.let {
+                Text(
+                    "⚠ $it",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            Text(
+                when {
+                    c.expired -> "⌛ gave up waiting"
+                    c.blocked -> "⏳ queued · blocked"
+                    c.position > 1 -> "⏳ queued · #${c.position}"
+                    else -> "⏳ queued"
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = if (c.blocked) MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            c.reason?.takeIf { it.isNotBlank() }?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 2,
+                )
+            }
+            GhostButton("✕", onClick = onCancelQueued)
+            // "It gave up" is only useful next to the way to ask again.
+            if (c.expired) GhostButton("☐ Start session", onClick = onStart)
+        }
         is StartControl.Busy -> Text(
             "⏳ starting…",
             style = MaterialTheme.typography.labelMedium,

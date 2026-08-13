@@ -644,6 +644,69 @@ class BoardTest {
         )
     }
 
+    // ---- the hub's ticket queue on a card (XERK-296) -------------------------
+
+    private fun queued(
+        position: Int = 1,
+        reason: String? = null,
+        error: String? = null,
+    ) = com.xerktech.turma.model.QueuedTicket(
+        siteKey = "s", issueKey = "X-1", source = "manual",
+        position = position, reason = reason, error = error,
+    )
+
+    @Test fun `queuedTicketOf keys on org AND issue key`() {
+        val q = listOf(
+            com.xerktech.turma.model.QueuedTicket(siteKey = "a", issueKey = "X-1", position = 1),
+            com.xerktech.turma.model.QueuedTicket(siteKey = "b", issueKey = "X-2", position = 1),
+        )
+        assertEquals(1, queuedTicketOf(q, "a", "X-1")?.position)
+        assertEquals(null, queuedTicketOf(q, "b", "X-1"))
+        assertEquals(null, queuedTicketOf(null, "a", "X-1"))
+    }
+
+    @Test fun `queueView overlays a client's in-flight add and cancel on the hub list`() {
+        val hub = listOf(
+            com.xerktech.turma.model.QueuedTicket(siteKey = "a", issueKey = "X-1", position = 1),
+            com.xerktech.turma.model.QueuedTicket(siteKey = "a", issueKey = "X-2", position = 2),
+        )
+        val add = com.xerktech.turma.model.QueuedTicket(siteKey = "a", issueKey = "X-9", position = 3)
+        val out = queueView(hub, mapOf("a\u0000X-9" to add), setOf("a\u0000X-1"))
+        assertEquals(listOf("X-2", "X-9"), out.map { it.issueKey })
+    }
+
+    @Test fun `a queued ticket replaces the start button with the wait and its cancel`() {
+        // Nothing has been handed to a host, so a second press could only
+        // re-queue what is queued — the web board replaces the button too.
+        assertEquals(
+            StartControl.Queued(position = 3, blocked = false, reason = null),
+            ticketStartControl(guessed(true), 0, null, queued(position = 3)),
+        )
+        // A "blocked" hold needs the operator, so it must not read like the
+        // capacity wait that clears itself; the reason is the hub's own words.
+        assertEquals(
+            StartControl.Queued(position = 1, blocked = true, reason = "no triaged repo"),
+            ticketStartControl(guessed(true), 0, null,
+                queued(reason = "blocked", error = "no triaged repo")),
+        )
+        // A failed CANCEL rolled the entry back, so its reason renders on the
+        // still-queued card rather than vanishing.
+        assertEquals(
+            StartControl.Queued(position = 1, blocked = false, reason = null, error = "boom"),
+            ticketStartControl(guessed(true), 0, StartState(error = "boom"), queued()),
+        )
+        // Terminal: it waited as long as the hub allows and gave up, which the
+        // card must SAY — a click that vanished reads like someone cancelling it.
+        assertEquals(
+            StartControl.Queued(position = 0, blocked = true,
+                reason = "no agent had a free slot", error = null, expired = true),
+            ticketStartControl(guessed(true), 0, null,
+                queued(position = 0, reason = "expired", error = "no agent had a free slot")),
+        )
+        // Still nothing to start against without a triaged repo.
+        assertEquals(null, ticketStartControl(JiraTicket(key = "X-1"), 0, null, queued()))
+    }
+
     private fun sess(spawnCmdId: String) = TicketSession(
         host = "h", id = "s1", transcriptId = "t1", status = "running",
         gitBranch = "", ticketBranch = "", summary = "", summaryManual = false,

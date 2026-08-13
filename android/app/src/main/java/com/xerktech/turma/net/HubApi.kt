@@ -223,6 +223,16 @@ interface HubApi {
         @Path("issueKey") issueKey: String,
     ): Response<JiraSessionResponse>
 
+    // Take a ticket back out of the hub's queue (XERK-296). It can only ever
+    // remove a QUEUED TICKET — nothing has been dispatched, so there is no
+    // session to kill and the ticket itself is untouched. 200 {ok}, or 404 once
+    // it has already left the queue (dispatched, or cancelled elsewhere).
+    @DELETE("api/jira/{siteKey}/{issueKey}/session")
+    suspend fun cancelQueuedTicket(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+    ): Response<OkResponse>
+
     // Override which repo a ticket belongs to (fans out to every host reporting
     // the org). Body: {repo:"name"} to pin, {repo:null} for "no repo fits",
     // {auto:true} to release the pin. Built as a JsonObject so an explicit null
@@ -336,6 +346,11 @@ data class JiraSessionResponse(
     // True when no host had the repo cloned: the chosen host clones it on
     // demand and the session queues behind the clone (XERK-14).
     val needsClone: Boolean = false,
+    // True when every host in the org was full: the hub queued the TICKET
+    // instead of handing it to an agent (XERK-296), so there is no cmdId or host
+    // to follow. `position` is its place in the org's line.
+    val queued: Boolean = false,
+    val position: Int = 0,
     val error: String = "",
 )
 

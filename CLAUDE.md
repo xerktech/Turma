@@ -22,6 +22,7 @@ that component's files.
 | `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
 | `.claude/rules/turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
+| `.claude/rules/turma-ticket-queue.md` | `turma/public/board.*`, `turma/server.js` | the hub's ticket queue: admission, drain, expiries, caps |
 | `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
@@ -105,9 +106,21 @@ One agent container per host, multiplexing sessions across every repo it scans.
   (`_capacity_payload`); `free` never goes negative.
 - Queued sessions are killable (nothing to tear down); resume-on-boot skips them (the drainer picks
   them up), as do archival/usage/PR scans.
-- **The queue applies to every spawn path; only TICKET spawns split across hosts.** An explicit "+
-  New session" queues on the host whose card was clicked.
+- **The agent queue is for spawns whose HOST is already the decision** — an explicit "+ New session"
+  on the host whose card was clicked, and a ticket session waiting on its repo to finish cloning.
+  **A ticket spawn waiting for a SLOT is not one of those**: it waits in the hub's ticket queue
+  (below), so a host takes one only when it can start it. One can still land here if a host fills
+  between the hub's capacity read and its next beat — a race, not the normal path.
 - Tests: `TestSessionLifecycle`, `TestSpawnTicket` in `test_hub_agent.py`; `sessions.test.js`.
+
+### The hub's ticket queue (XERK-296)
+
+- **Work waiting for a slot is a QUEUED TICKET on the hub, never a created session on a host**, and
+  **its host is chosen at DISPATCH** — so whichever of an org's agents frees a slot first takes the
+  oldest waiting ticket. A queued ticket has no session id, no worktree and no host.
+- It rides `/api/agents` as top-level `ticketQueue` + its own SSE event, the ONLY place a waiting
+  ticket exists; `DELETE /api/jira/<siteKey>/<issueKey>/session` cancels one and can never touch a
+  running session. Mechanics and the routing rules are in `.claude/rules/turma-ticket-queue.md`.
 
 ### Repos-root sessions
 
