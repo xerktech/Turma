@@ -10,6 +10,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.xerktech.turma.core.AttachStatus
 import com.xerktech.turma.core.Attachment
+import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
@@ -17,6 +18,7 @@ import com.xerktech.turma.core.entryTruncated
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
 import com.xerktech.turma.core.tunnelOnlineOf
+import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TurnStatus
@@ -27,6 +29,8 @@ import com.xerktech.turma.net.InputRequest
 import com.xerktech.turma.net.LiveEvent
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
+import com.xerktech.turma.net.ModelSourceRequest
+import com.xerktech.turma.net.OkResponse
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -74,6 +78,11 @@ data class ChatUiState(
     // The host this session's agent runs on, shown in the header (XERK-121):
     // the agent's device name, falling back to its registration key.
     val hostLabel: String = "",
+    // This host's self-hosted model (XERK-246) and an unconfirmed switch onto or
+    // off it. Null localModel = its agent can't fail over, which is what hides
+    // the "run against" chip rather than offering a command the host would drop.
+    val localModel: com.xerktech.turma.model.LocalModelInfo? = null,
+    val modelSourcePending: ModelSource.Pending? = null,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     val question: String get() = session?.session?.question ?: ""
@@ -86,6 +95,35 @@ data class ChatUiState(
     // Attaching is off while a question is pending: the draft then routes to
     // POST .../answer, which carries no files (web chat.js renderAttachments).
     val canAttach: Boolean get() = Uploads.canAttach(uploadMaxBytes) && question.isBlank()
+
+    /**
+     * Which model this session runs against, taking an unconfirmed switch at its
+     * word until the heartbeat agrees. Read with a caller-supplied clock so the
+     * memo can age out on a repaint rather than only on the next state change.
+     */
+    fun modelSource(now: Long = System.currentTimeMillis()): String =
+        ModelSource.current(session, modelSourcePending, now)
+
+    fun canSwitchModelSource(now: Long = System.currentTimeMillis()): Boolean =
+        ModelSource.offered(localModel, modelSource(now))
+
+    /**
+     * Everything this screen takes from a fleet beat, in one place.
+     *
+     * Extracted from the two callers (the poll collector and the initial seed)
+     * so the set of carried fields is pinned by a test rather than by whoever
+     * last resolved a merge on that `copy(...)`. A field silently dropped there
+     * disables its whole feature — [localModel] going missing hides both
+     * local-model controls forever — and nothing else in the suite notices,
+     * because a Composable's body has no gate at all.
+     */
+    fun fromFleet(agent: AgentInfo?, session: SessionInfo?, host: String): ChatUiState = copy(
+        session = session,
+        hostLabel = agent?.device?.ifBlank { host } ?: host,
+        tunnelOnline = tunnelOnlineOf(agent),
+        uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
+        localModel = agent?.localModel,
+    )
 }
 
 class ChatViewModel(
@@ -115,11 +153,64 @@ class ChatViewModel(
      */
     private val draft = container.drafts.of(host, sessionId)
 
+    /**
+     * The in-flight model-source switch, held in the container for the SAME
+     * reason as [draft] (XERK-246): this ViewModel is scoped to the chat's nav
+     * entry, so a memo kept here died the moment you walked back to the session
+     * list — mid-switch, which is when it is doing its job.
+     */
+    private val modelSwitch = container.modelSwitches.of(host, sessionId)
+
     init {
         // Collected on viewModelScope (not the onEnter/onLeave jobs): the mirror
         // must survive a detail-pane swap, or a re-entry would paint an empty box
         // until the next keystroke.
         viewModelScope.launch { draft.collect { text -> _state.update { it.copy(draft = text) } } }
+        viewModelScope.launch {
+            modelSwitch.collect { p ->
+                _state.update { it.copy(modelSourcePending = p) }
+                armMemoExpiry(p)
+            }
+        }
+    }
+
+    /**
+     * Wake once when the outstanding memo ages out and retire it (XERK-246).
+     *
+     * Without this the TTL is only ever observed by whoever next reads the clock,
+     * and on a quiet fleet nobody does — Compose skips recomposition while the
+     * state compares equal, so an expired memo stays painted indefinitely. The
+     * heartbeat's own `settle` cannot cover it either: it runs on fleet
+     * emissions, which is exactly what a quiet fleet does not produce.
+     *
+     * Collected off the STORE rather than set alongside each POST, so a memo
+     * carried in from another nav entry is armed too — that is the case the
+     * store exists for. Self-cancelling and bounded: one alarm per memo, none at
+     * all when there is no memo.
+     */
+    private var memoExpiryJob: Job? = null
+
+    private fun armMemoExpiry(pending: ModelSource.Pending?) {
+        memoExpiryJob?.cancel()
+        if (pending == null) return
+        memoExpiryJob = viewModelScope.launch {
+            val left = ModelSource.SWITCH_SETTLE_MS - (System.currentTimeMillis() - pending.at)
+            if (left > 0) delay(left)
+            // Retire by IDENTITY, never by re-asking the clock. `delay` measures
+            // elapsed UPTIME while `expired` re-reads the WALL clock, and a
+            // backward wall-clock jump between the two makes the re-check false:
+            // `settle` then returns the same instance, `MutableStateFlow` does
+            // not emit an equal value, the collector never runs, and no new
+            // alarm is armed — so the memo is pinned until the clock catches up.
+            // Measured with a 10-minute backward jump: the chip still claimed
+            // the subscription at t+190s while the record said `local`.
+            //
+            // This alarm's only job is the TTL, so it does not need `settle`'s
+            // other rules: the heartbeat-agreement case is handled by the fleet
+            // collector, and `compareAndSet` no-ops if a newer switch (a
+            // different `at`) or a settle has already replaced this memo.
+            modelSwitch.compareAndSet(pending, null)
+        }
     }
 
     private var liveJob: Job? = null
@@ -160,12 +251,12 @@ class ChatViewModel(
             container.fleet.state.collect { fleet ->
                 val agent = fleet.agents.firstOrNull { it.key == host }
                 val session = agent?.sessions?.firstOrNull { it.id == sessionId }
-                val label = agent?.device?.ifBlank { host } ?: host
-                _state.update {
-                    it.copy(session = session, hostLabel = label,
-                        tunnelOnline = tunnelOnlineOf(agent),
-                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0)
-                }
+                // Retire a memo the heartbeat has caught up with, through the
+                // store — the state copy is a mirror, so clearing only that
+                // would let the next emission paint the stale memo back.
+                modelSwitch.value =
+                    ModelSource.settle(modelSwitch.value, session, System.currentTimeMillis())
+                _state.update { it.fromFleet(agent, session, host) }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
                 }
@@ -176,13 +267,11 @@ class ChatViewModel(
     private fun seedFromFleet() {
         val agent = container.fleet.state.value.agents.firstOrNull { it.key == host }
         val session = agent?.sessions?.firstOrNull { it.id == sessionId }
-        val label = agent?.device?.ifBlank { host } ?: host
         val seed = session?.session?.tail ?: emptyList()
         _state.update {
-            it.copy(session = session, hostLabel = label,
-                tunnelOnline = tunnelOnlineOf(agent),
-                uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
-                entries = mergeTail(it.entries, seed))
+            it.fromFleet(agent, session, host)
+                .copy(modelSourcePending = modelSwitch.value,
+                    entries = mergeTail(it.entries, seed))
         }
     }
 
@@ -488,12 +577,66 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * Report what the hub actually said, never a blanket "✓ queued" (XERK-246).
+     *
+     * These two discarded their result, so every refusal painted as a success.
+     * That was survivable while the routes only failed on the network, but the
+     * hub now 409s `/model` on a session running the self-hosted model —
+     * deliberately, so an out-of-parity client cannot silently drop the command
+     * — and a session CAN be on the local model while the compose bar still
+     * offers the picker, in the window before a switch settles. Same shape as
+     * [setModelSource]'s handler, and the same reason `FleetViewModel.run`
+     * stopped collapsing every failure into "hub unreachable".
+     */
+    private fun reportedOutcome(res: Result<OkResponse>, queued: String, failed: String) {
+        _messages.tryEmit(
+            ModelSource.outcomeMessage(
+                ok = res.isSuccess,
+                bodyError = res.getOrNull()?.error,
+                hubMessage = res.exceptionOrNull()?.let { hubErrorMessage(it) },
+                queued = queued,
+                failed = failed,
+            )
+        )
+    }
+
     fun setModel(model: String) = viewModelScope.launch {
-        report("model queued") { client.api.setModel(host, sessionId, ModelRequest(model)) }
+        val res = runCatching { client.api.setModel(host, sessionId, ModelRequest(model)) }
+        reportedOutcome(res, "✓ model queued", "could not set the model")
     }
 
     fun setMode(mode: String) = viewModelScope.launch {
-        report("mode queued") { client.api.setMode(host, sessionId, ModeRequest(mode)) }
+        val res = runCatching { client.api.setMode(host, sessionId, ModeRequest(mode)) }
+        reportedOutcome(res, "✓ mode queued", "could not set the mode")
+    }
+
+    /**
+     * Move this session between the subscription and the host's self-hosted
+     * model (XERK-246). The agent relaunches Claude with `--resume`, so the
+     * conversation, worktree and branch carry over — but that takes several
+     * beats, hence the memo the chip paints from meanwhile.
+     *
+     * A refusal DROPS the memo instead of letting it age out: the hub 409s when
+     * the host has no local model, and a chip that keeps claiming a switch that
+     * was rejected is worse than one that never moved.
+     */
+    fun setModelSource(source: String) = viewModelScope.launch {
+        if (source == _state.value.modelSource()) return@launch
+        modelSwitch.value = ModelSource.Pending(sessionId, source, System.currentTimeMillis())
+        val res = runCatching { client.api.setModelSource(host, sessionId, ModelSourceRequest(source)) }
+        res.onSuccess {
+            _messages.tryEmit(
+                if (source == ModelSource.LOCAL) "✓ switching to the local model…"
+                else "✓ switching back to the subscription…"
+            )
+            container.fleet.nudge()
+        }.onFailure { e ->
+            _messages.tryEmit("✗ " + (hubErrorMessage(e) ?: "could not switch model"))
+        }
+        // One place decides what survives the attempt, success or failure, so
+        // the drop-on-refusal can't be deleted without a test noticing.
+        modelSwitch.value = ModelSource.afterAttempt(modelSwitch.value, res.isSuccess)
     }
 
     // ---- voice dictation into the draft --------------------------------------

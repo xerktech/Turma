@@ -1,0 +1,34 @@
+package com.xerktech.turma.data
+
+import com.xerktech.turma.core.ModelSource
+import kotlinx.coroutines.flow.MutableStateFlow
+
+/**
+ * The in-flight model-source switch for a session, held once per process
+ * (XERK-246) — for the same reason [DraftStore] is, and discovered the same way.
+ *
+ * The switch relaunches Claude with `--resume`, so the heartbeat takes several
+ * beats to agree, and the chip paints from this memo meanwhile. Held in the
+ * chat screen's ViewModel it died on the way OUT of that screen: the VM is
+ * scoped to the nav back-stack entry, so glancing at the session list mid-switch
+ * — the natural thing to do while waiting — destroyed the memo and the chip
+ * sprang back to the old value, which is precisely the "control that did
+ * nothing" reading the memo exists to prevent. The web keeps its memo at module
+ * scope across the same navigation (`chat.js` modelSourcePending).
+ *
+ * Keyed per (host, session) so two open sessions never share one, and the flow
+ * INSTANCE is stable for a key. A memo is a few bytes and is cleared the moment
+ * the heartbeat agrees, the POST fails, or [ModelSource.SWITCH_SETTLE_MS]
+ * passes, so entries do not accumulate.
+ */
+class ModelSwitchStore {
+    private val flows = HashMap<String, MutableStateFlow<ModelSource.Pending?>>()
+
+    /** The shared pending switch for one session. Read it, write it. */
+    fun of(host: String, sessionId: String): MutableStateFlow<ModelSource.Pending?> =
+        synchronized(flows) { flows.getOrPut(key(host, sessionId)) { MutableStateFlow(null) } }
+
+    // NUL-joined, like DraftStore: a separator neither a host key nor a session
+    // id can contain.
+    private fun key(host: String, sessionId: String) = "$host\u0000$sessionId"
+}

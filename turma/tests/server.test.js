@@ -41,6 +41,13 @@ process.env.CREATE_INFLIGHT_TTL_MS = "300";
 process.env.BODY_IDLE_TIMEOUT_MS = "400";
 // And the exclusive-lane occupancy ceiling, which the fleet gives 10 minutes.
 process.env.BIG_LANE_MAX_HOLD_MS = "3000";
+// The registry cap (XERK-272) is sized for a FLEET — the deployed one is a
+// handful of hosts. This suite is not a fleet: it invents ~100 synthetic host
+// names in one process and never removes them, so it is lifted here rather than
+// having every later test refused. The cap itself, its eviction rule and the
+// restore trim get their own process in registry-cap.test.js, which pins tiny
+// values and drives them over the wire.
+process.env.AGENTS_MAX = "1000";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
@@ -65,6 +72,11 @@ process.env.ORG_COLORS_FILE = path.join(
   os.tmpdir(),
   `turma-test-org-colors-${process.pid}.json`
 );
+// The migration relay spools transcript bundles to disk (XERK-263) and sweeps
+// its whole directory at boot, so it gets a throwaway one of its own — sharing
+// /data/migrations, or one dir across test files, would have each sweep delete
+// the others' spools.
+process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-migrations-"));
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -121,14 +133,17 @@ const {
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
-  userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
+  userAuthorized, agentPresented, agentWsAuthorized, triggerAuthorized, fmtDur,
+  agentBearerKind, agentHostRefusal, agentPresentedRefusal, hostAgentToken, tokenHost, ttydAuth,
+  controlChannels, pendingChannels,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
   orgColors, setOrgColor,
-  migrations, advanceMigrations,
+  migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
+  dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
 } = hub;
 
@@ -348,14 +363,26 @@ test("userAuthorized: accepts a valid session cookie", () => {
   assert.equal(userAuthorized({ headers: { cookie: "other=1; hub_session=" + tok } }), true);
 });
 
-test("agentAuthorized: bearer token, with user-credential fallback", () => {
+test("agentPresented: a valid agent credential, whatever host it is for", () => {
   const req = (h) => ({ headers: h });
-  assert.equal(agentAuthorized(req({ authorization: "Bearer agenttok" })), true);
-  assert.equal(agentAuthorized(req({ authorization: "Bearer nope" })), false);
-  assert.equal(agentAuthorized(req({})), false);
+  assert.equal(agentPresented(req({ authorization: "Bearer agenttok" })), true);
+  assert.equal(agentPresented(req({ authorization: "Bearer nope" })), false);
+  assert.equal(agentPresented(req({})), false);
   // The single-user basic login may also exercise the heartbeat endpoint.
-  assert.equal(agentAuthorized(req({ authorization: basic("hubuser", "hubpass") })), true);
-  assert.equal(agentAuthorized(req({ authorization: basic("hubuser", "WRONG") })), false);
+  assert.equal(agentPresented(req({ authorization: basic("hubuser", "hubpass") })), true);
+  assert.equal(agentPresented(req({ authorization: basic("hubuser", "WRONG") })), false);
+  // Any host's own token passes — this gate cannot say WHICH host, only that the
+  // credential is one the hub issued. It is what keeps an unknown bearer off the
+  // heartbeat's 32 MiB body read, so it must refuse a made-up one (XERK-268).
+  assert.equal(agentPresented(req({ authorization: `Bearer ${hostAgentToken("anyhost")}` })), true);
+  const [name, mac] = hostAgentToken("anyhost").split(".");
+  // Neither half alone, and not a name swapped onto someone else's HMAC.
+  assert.equal(agentPresented(req({ authorization: `Bearer ${mac}` })), false);
+  assert.equal(agentPresented(req({ authorization: `Bearer ${name}.` })), false);
+  assert.equal(
+    agentPresented(req({ authorization: `Bearer ${Buffer.from("otherhost").toString("base64url")}.${mac}` })),
+    false
+  );
 });
 
 test("agentWsAuthorized: query token first, header fallback", () => {
@@ -367,6 +394,17 @@ test("agentWsAuthorized: query token first, header fallback", () => {
     true
   );
   assert.equal(agentWsAuthorized(new URL("http://x/agent/control"), req({})), false);
+  // With the host the socket claims (XERK-268), that host's own derived token
+  // authorizes it and another host's does not — on the query and header paths
+  // alike. The master still passes here; TURMA_AGENT_STRICT is what retires it.
+  const claim = (t) => new URL(`http://x/agent/control?name=hA&token=${t}`);
+  assert.equal(agentWsAuthorized(claim(hostAgentToken("hA")), req({}), "hA"), true);
+  assert.equal(agentWsAuthorized(claim(hostAgentToken("hB")), req({}), "hA"), false);
+  assert.equal(
+    agentWsAuthorized(new URL("http://x/agent/control?name=hA"),
+      req({ authorization: `Bearer ${hostAgentToken("hB")}` }), "hA"),
+    false
+  );
 });
 
 // ---- small helpers -------------------------------------------------------------
@@ -1582,6 +1620,19 @@ test("http: a heartbeat whose device is not a plain host name is refused, not si
   for (const device of [{ a: 1 }, ["x"], 12]) {
     const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
     assert.equal(res.status, 400, `${JSON.stringify(device)} must be refused`);
+  }
+  // A URL dot segment is collapsed by the parser resolving /api/agents/<host>/...,
+  // so such a host showed online while every route against it 404'd -- including
+  // the DELETE that would remove it, leaving a card stuck for PRUNE_AFTER_MS
+  // (XERK-269). Agents no longer send these, but an un-upgraded one still can.
+  for (const device of [".", ".."]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 400, `${device} must be refused`);
+  }
+  // Names that merely CONTAIN dots are ordinary host names and must still beat.
+  for (const device of ["...", ".hidden", "a.b", "HOST.local."]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 200, `${device} must be accepted`);
   }
   // The prototype must be intact: a route reading agents[x].commands would
   // otherwise find one on every unknown host.
@@ -5997,19 +6048,33 @@ const migHost = (device, site, {
   });
 
 // A raw-body request (the JSON `request` helper can't carry an octet-stream).
-function requestRaw(method, pathName, { body, headers } = {}) {
+//
+// It TIMES OUT rather than waiting forever. A route that stops answering — the
+// spool relay has two failure paths that could, and both were live bugs — would
+// otherwise hang whichever test reached it and take the CI job's whole budget
+// with it, reported as a timeout with no failing assertion to read. The
+// sentinel status makes the assertion that was going to run fail instead.
+const RAW_REQUEST_TIMEOUT_MS = 10_000;
+function requestRaw(method, pathName, { body, headers, timeoutMs = RAW_REQUEST_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      req.destroy();
+      resolve({ status: `no reply in ${timeoutMs}ms — the route hung`, body: null,
+        buf: Buffer.alloc(0), headers: {} });
+    }, timeoutMs);
+    timer.unref?.(); // never hold the loop open on its own
     const req = http.request(baseUrl + pathName, { method, headers }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
+        clearTimeout(timer);
         const buf = Buffer.concat(chunks);
         let parsed = null;
         try { parsed = JSON.parse(buf.toString()); } catch {}
         resolve({ status: res.statusCode, body: parsed, buf, headers: res.headers });
       });
     });
-    req.on("error", reject);
+    req.on("error", (e) => { clearTimeout(timer); reject(e); });
     if (body) req.write(body);
     req.end();
   });
@@ -6074,6 +6139,12 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(up.status, 200);
   const m = migrations.get(mid);
   assert.equal(m.phase, "importing");
+  // It landed on DISK, not in the record — that is the whole point of XERK-263.
+  assert.equal(m.blob, undefined);
+  const spoolFile = m.blobPath;
+  assert.equal(spoolFile, path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`));
+  assert.equal(m.blobSize, blob.length);
+  assert.ok(blob.equals(fs.readFileSync(spoolFile)));
   const imp = agents.mgB.commands.find((c) => c.type === "importSession");
   assert.ok(imp);
   assert.equal(imp.migrationId, mid);
@@ -6108,8 +6179,11 @@ test("migrate: full move — export, relay, import, then kill the source", async
   assert.equal(after.targetSessionId, "new1");
   assert.ok(agents.mgA.commands.some((c) => c.type === "kill" && c.sessionId === "s1"),
     "source session should be killed once the target is up");
-  // The blob is freed on handoff.
-  assert.equal(after.blob, null);
+  // The bundle is freed on handoff — the record's pointer AND the spool file
+  // (XERK-263): a leaked file is 65 MiB of disk nothing comes back for.
+  assert.equal(after.blobPath, null);
+  assert.equal(fs.existsSync(spoolFile), false,
+    "the spool file should be unlinked once the migration is done");
 });
 
 test("migrate: a second move of the same session is single-flighted", async () => {
@@ -6126,12 +6200,522 @@ test("migrate: a stalled move times out and frees its blob", async () => {
   await migHost("toA", "to.atlassian.net");
   await migHost("toB", "to.atlassian.net");
   const r = await migrate("toA", "s1", { host: "toB" });
-  const m = migrations.get(r.body.migrationId);
+  const mid = r.body.migrationId;
+  const m = migrations.get(mid);
+  const up = await requestRaw("POST", `/api/agents/toA/migrations/${mid}/blob`,
+    { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } });
+  assert.equal(up.status, 200);
+  const spoolFile = m.blobPath;
+  assert.ok(fs.existsSync(spoolFile));
   m.startedAt = Date.now() - 10 * 60 * 1000; // well past MIGRATE_TIMEOUT_MS
   advanceMigrations();
   assert.equal(m.phase, "failed");
   assert.match(m.error, /timed out/);
-  assert.equal(m.blob, null);
+  assert.equal(m.blobPath, null);
+  await new Promise((r2) => setTimeout(r2, 30)); // the unlink is async
+  assert.equal(fs.existsSync(spoolFile), false,
+    "a timed-out move must not leave its spool file behind");
+});
+
+test("migrate: an empty bundle is refused and leaves no spool file", async () => {
+  await migHost("emA", "em.atlassian.net");
+  await migHost("emB", "em.atlassian.net");
+  const r = await migrate("emA", "s1", { host: "emB" });
+  const mid = r.body.migrationId;
+  const up = await requestRaw("POST", `/api/agents/emA/migrations/${mid}/blob`,
+    { headers: { authorization: "Bearer agenttok", "content-length": "0" } });
+  // The uniform 404 every other POST refusal answers (XERK-266) — the point is
+  // that this one is indistinguishable from a stranger's probe.
+  assert.equal(up.status, 404);
+  assert.match(up.body.error, /unknown migration/);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "exporting"); // still awaiting a real bundle
+  assert.equal(m.blobPath, null);
+  await new Promise((r2) => setTimeout(r2, 30));
+  assert.equal(fs.existsSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`)), false);
+});
+
+test("migrate: a bundle past the cap is refused 413 and spools nothing", async () => {
+  await migHost("bigA", "big.atlassian.net");
+  await migHost("bigB", "big.atlassian.net");
+  const r = await migrate("bigA", "s1", { host: "bigB" });
+  const mid = r.body.migrationId;
+  // Past MIGRATE_BLOB_MAX (65 MiB), but WELL inside RAW_BODY_DRAIN_SLACK — the
+  // 413 only holds while the route is still draining, and a body sized to the
+  // exact slack boundary would make this test one byte from flaking. The route
+  // must answer on the same connection rather than hanging the socket up on the
+  // agent, and must not leave the partial spool behind.
+  const over = Buffer.alloc((1 << 26) + (1 << 20) + 4096, 0x41);
+  const up = await requestRaw("POST", `/api/agents/bigA/migrations/${mid}/blob`,
+    { body: over, headers: { authorization: "Bearer agenttok" } });
+  assert.equal(up.status, 413);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /too large/);
+  assert.equal(m.blobPath, null);
+  await new Promise((r2) => setTimeout(r2, 50));
+  assert.equal(fs.existsSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`)), false,
+    "a rejected upload must not leave a partial spool file");
+});
+
+test("migrate: a second upload for one migration can't interleave into the spool", async () => {
+  // The phase only flips to `importing` once the first upload finishes writing,
+  // so without the `uploading` guard two concurrent POSTs would both pass the
+  // phase check and write into the SAME file, producing a corrupt bundle.
+  await migHost("dupA", "dup.atlassian.net");
+  await migHost("dupB", "dup.atlassian.net");
+  const r = await migrate("dupA", "s1", { host: "dupB" });
+  const mid = r.body.migrationId;
+  const hdr = { authorization: "Bearer agenttok" };
+  const [a, b] = await Promise.all([
+    requestRaw("POST", `/api/agents/dupA/migrations/${mid}/blob`,
+      { body: Buffer.alloc(1 << 20, 0x41), headers: hdr }),
+    requestRaw("POST", `/api/agents/dupA/migrations/${mid}/blob`,
+      { body: Buffer.alloc(1 << 20, 0x42), headers: hdr }),
+  ]);
+  const codes = [a.status, b.status].sort();
+  assert.deepEqual(codes, [200, 404]);
+  const loser = a.status === 404 ? a : b;
+  // The loser is REFUSED, not hung up on: it must read a real reply — and it is
+  // the same 404 as every other POST refusal (XERK-266), not a distinct status
+  // that would name the source to anyone holding the id.
+  assert.match(loser.body.error, /unknown migration/);
+  const spooled = fs.readFileSync(migrations.get(mid).blobPath);
+  assert.equal(spooled.length, 1 << 20);
+  assert.equal(new Set(spooled).size, 1, "the spool must hold ONE upload's bytes, not two interleaved");
+});
+
+test("migrate: a spool that can't be written fails the move, and doesn't hang", async () => {
+  // Stand in for the disk saying no (ENOSPC/EACCES/EDQUOT): a DIRECTORY where
+  // the spool file goes makes the write stream error. The route must answer —
+  // an unanswerable POST would leave the source agent, which never retries,
+  // waiting out the whole migration timeout.
+  await migHost("errA", "err.atlassian.net");
+  await migHost("errB", "err.atlassian.net");
+  const r = await migrate("errA", "s1", { host: "errB" });
+  const mid = r.body.migrationId;
+  fs.mkdirSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true });
+  // requestRaw times out on its own, so an unanswerable POST fails on this
+  // assertion rather than by running the whole CI job out of time.
+  const up = await requestRaw("POST", `/api/agents/errA/migrations/${mid}/blob`,
+    { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" }, timeoutMs: 2000 });
+  // Uniform with every other POST refusal (XERK-266) — a status of its own
+  // would name the source the moment the hub's disk misbehaved. It also can't
+  // hand the agent the hub's filesystem layout; that detail goes to the log.
+  assert.equal(up.status, 404);
+  assert.match(up.body.error, /unknown migration/);
+  assert.doesNotMatch(up.body.error, /\//);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.equal(m.blobPath, null);
+  assert.equal(agents.errB.commands.some((c) => c.type === "importSession"), false,
+    "a bundle that never landed must not queue an import");
+  fs.rmSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`), { recursive: true, force: true });
+});
+
+test("migrate: a download racing the migration's settle is not truncated", async () => {
+  // dropMigrationBlob zeroes blobPath/blobSize, and the unlink leaves an open
+  // read valid — so a GET that read the size AFTER its first async hop served
+  // the whole body under `Content-Length: 0`, which the agent's reader takes
+  // for an empty bundle. The response must describe what it actually sends.
+  await migHost("rcA", "rc.atlassian.net");
+  await migHost("rcB", "rc.atlassian.net");
+  const r = await migrate("rcA", "s1", { host: "rcB" });
+  const mid = r.body.migrationId;
+  const blob = Buffer.alloc(1 << 19, 0x5a);
+  await requestRaw("POST", `/api/agents/rcA/migrations/${mid}/blob`,
+    { body: blob, headers: { authorization: "Bearer agenttok" } });
+  const m = migrations.get(mid);
+  // The window is between `createReadStream` and its `open` event, which a
+  // sleep can only straddle by luck — timed from out here this caught a
+  // reintroduced bug once in five runs, and a drop that lands EARLY hides in a
+  // legitimate 404. So land the settle in the window by construction: patch the
+  // one call that opens it, exactly where the race would put the settle.
+  const realCreateReadStream = fs.createReadStream;
+  let dropped = false;
+  fs.createReadStream = function (p, ...rest) {
+    const s = realCreateReadStream.call(fs, p, ...rest);
+    // On `open`, and registered BEFORE the route's own open handler so it runs
+    // first: that is the production window exactly — the descriptor exists (so
+    // the unlink can't stop the read) but the response header hasn't been
+    // written yet. Dropping any earlier just races the open and 404s, which is
+    // a different, harmless outcome.
+    if (p === m.blobPath) s.once("open", () => { dropMigrationBlob(m); dropped = true; });
+    return s;
+  };
+  let got;
+  try {
+    got = await requestRaw("GET", `/api/agents/rcB/migrations/${mid}/blob`,
+      { headers: { authorization: "Bearer agenttok" } });
+  } finally {
+    fs.createReadStream = realCreateReadStream;
+  }
+  assert.ok(dropped, "the settle must land inside the window, or this proves nothing");
+  // The unlink leaves this read's fd valid, so the bytes still arrive. What
+  // must never happen is a 200 whose length disagrees with what it sends: the
+  // agent's reader believes the header and takes a `Content-Length: 0` for an
+  // empty bundle.
+  assert.equal(got.status, 200);
+  assert.equal(Number(got.headers["content-length"]), got.buf.length);
+  assert.ok(blob.equals(got.buf), "the target must get every byte it was promised");
+});
+
+test("migrate: the spool path can only ever be a hub-minted id", async () => {
+  // The comment says the filename comes from the hub-minted id and not from the
+  // agent's path segment; this is what makes that true rather than a promise
+  // about today's one caller. Nothing here should be reachable from a route —
+  // that is the point of asserting it directly.
+  assert.equal(migrationSpoolPath("0123456789abcdef"),
+    path.join(MIGRATE_SPOOL_DIR, "0123456789abcdef.bin"));
+  for (const bad of ["../../etc/passwd", "0123456789abcde/", "0123456789ABCDEF",
+                     "0123456789abcdefff", "..", "", null, undefined]) {
+    assert.throws(() => migrationSpoolPath(bad), /did not mint/, `should refuse ${bad}`);
+  }
+});
+
+test("migrate: the boot sweep deletes only spool files, never a neighbour", async () => {
+  // MIGRATE_SPOOL_DIR is deployment config. Pointed at /data by a compose slip,
+  // an unfiltered sweep would delete state.json and devices.json on boot.
+  const mine = path.join(MIGRATE_SPOOL_DIR, "0123456789abcdef.bin");
+  const theirs = path.join(MIGRATE_SPOOL_DIR, "state.json");
+  fs.writeFileSync(mine, "bundle");
+  fs.writeFileSync(theirs, "{}");
+  sweepMigrationSpool();
+  assert.equal(fs.existsSync(mine), false);
+  assert.equal(fs.existsSync(theirs), true, "the sweep must not touch a name it didn't write");
+  fs.unlinkSync(theirs);
+});
+
+test("migrate: too many moves in flight is refused, not spooled", async () => {
+  // Each in-flight move can hold a 65 MiB bundle on /data, so the hub caps how
+  // many can be doing that at once (XERK-263). The refusal lands on the
+  // OPERATOR's click, where it can be shown, never on the agent's upload.
+  await migHost("cpA", "cp.atlassian.net", {
+    extraSessions: ["s2", "s3", "s4", "s5"].map((id) => ({
+      id, status: "running", root: false, repo: "Turma", transcriptId: "trans-" + id,
+      worktreePath: `/git/.turma/worktrees/Turma/${id}`,
+    })),
+  });
+  await migHost("cpB", "cp.atlassian.net");
+  // The cap is fleet-wide (so is /data), so settle what earlier cases left in
+  // flight rather than counting on an empty map — and settle this case's own
+  // moves on the way out, or it hands every later test a fleet already at the
+  // cap and their migrate() calls come back 503.
+  const settleInFlight = () => {
+    for (const m of migrations.values()) {
+      if (m.phase === "exporting" || m.phase === "importing") m.phase = "failed";
+    }
+  };
+  settleInFlight();
+  try {
+  for (const id of ["s1", "s2", "s3", "s4"]) {
+    assert.equal((await migrate("cpA", id, { host: "cpB" })).status, 200, id);
+  }
+  const over = await migrate("cpA", "s5", { host: "cpB" });
+  assert.equal(over.status, 503);
+  assert.match(over.body.error, /too many moves in flight/);
+  // Settling one frees the slot again.
+  const first = [...migrations.values()].find(
+    (m) => m.srcHost === "cpA" && m.srcSessionId === "s1");
+  first.phase = "failed";
+  assert.equal((await migrate("cpA", "s5", { host: "cpB" })).status, 200);
+  } finally {
+    settleInFlight();
+  }
+});
+
+test("migrate: the boot sweep clears spool files a restart orphaned", async () => {
+  // The records live in memory, so a restart abandons every in-flight move; the
+  // files it was relaying belong to nobody and must not survive.
+  const orphan = path.join(MIGRATE_SPOOL_DIR, "deadbeefdeadbeef.bin");
+  fs.writeFileSync(orphan, "orphaned bundle");
+  sweepMigrationSpool();
+  assert.equal(fs.existsSync(orphan), false);
+});
+
+// ---- refused session starts (XERK-265) --------------------------------------
+// A resume/import the agent DECLINES is ACKed like any other command, so before
+// this the hub could not tell a refusal from a slow spawn: the move sat in
+// `importing` for the whole MIGRATE_TIMEOUT_MS and failed with no reason.
+
+test("migrate: a target that refuses the import fails the move now, with its reason", async () => {
+  await migHost("rfA", "rf.atlassian.net");
+  await migHost("rfB", "rf.atlassian.net");
+  const r = await migrate("rfA", "s1", { host: "rfB" });
+  const mid = r.body.migrationId;
+  await requestRaw("POST", `/api/agents/rfA/migrations/${mid}/blob`,
+    { body: Buffer.from("BYTES"), headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "importing");
+  const impCmdId = m.importCmdId;
+
+  // The target beats in saying it refused, naming the migration.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "rfB",
+      spawnFailures: [{ cmdId: impCmdId, migrationId: mid,
+                        error: "the host is at MAX_SESSIONS (4)" }],
+    },
+    headers: agentHeaders,
+  });
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /MAX_SESSIONS/);
+  assert.equal(m.blobPath, null, "and its spool file is dropped, like a timeout's");
+  // The source is untouched — a refused import loses nothing, so no kill.
+  assert.ok(!(agents.rfA.commands || []).some((c) => c.type === "kill"));
+  // And it rides the fleet payload keyed by cmdId, for the page following it.
+  assert.equal(agents.rfB.spawnRefusals[impCmdId].error,
+    "the host is at MAX_SESSIONS (4)");
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  const served = fleet.body.agents.find((a) => a.key === "rfB");
+  assert.ok(served.spawnRefusals[impCmdId], "served, not stripped like the caches");
+});
+
+test("migrate: a source that never ships its blob fails the move too", async () => {
+  await migHost("rxA", "rx.atlassian.net");
+  await migHost("rxB", "rx.atlassian.net");
+  const r = await migrate("rxA", "s1", { host: "rxB" });
+  const mid = r.body.migrationId;
+  assert.equal(migrations.get(mid).phase, "exporting");
+  await request("POST", "/api/heartbeat", {
+    body: { device: "rxA", spawnFailures: [{ migrationId: mid, error: "packing failed: boom" }] },
+    headers: agentHeaders,
+  });
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /packing failed/);
+});
+
+test("migrate: a target reporting BOTH the session and a refusal still completes", async () => {
+  // Ordering guard: the handoff check runs first, so a refusal that raced a
+  // successful launch can never fail a move that actually landed.
+  await migHost("rcA", "rc.atlassian.net");
+  await migHost("rcB", "rc.atlassian.net");
+  const r = await migrate("rcA", "s1", { host: "rcB" });
+  const mid = r.body.migrationId;
+  await requestRaw("POST", `/api/agents/rcA/migrations/${mid}/blob`,
+    { body: Buffer.from("BYTES"), headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
+  const m = migrations.get(mid);
+  await migHost("rcB", "rc.atlassian.net", {
+    extraSessions: [{ id: "new9", status: "running", root: false, repo: "Turma",
+      transcriptId: "trans-rcA", worktreePath: "/git/.turma/worktrees/Turma/s1",
+      spawnCmdId: m.importCmdId }],
+  });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "rcB", spawnFailures: [{ migrationId: mid, error: "stale refusal" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(m.phase, "done");
+});
+
+test("migrate: a bundle landing after the move settled cannot resurrect it", async () => {
+  // The source's upload POST times out at 30s while the hub is still spooling,
+  // so the agent stages "uploading … failed" and the next beat fails the move
+  // (XERK-265) — then the bytes finish arriving. Advancing anyway would queue
+  // an importSession for a move the operator was told had failed, and kill the
+  // source when the target came up.
+  await migHost("resA", "res.atlassian.net");
+  await migHost("resB", "res.atlassian.net");
+  const mid = (await migrate("resA", "s1", { host: "resB" })).body.migrationId;
+  await request("POST", "/api/heartbeat", {
+    body: { device: "resA", spawnFailures: [{ migrationId: mid, error: "uploading failed" }] },
+    headers: agentHeaders,
+  });
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "failed");
+
+  const late = await requestRaw("POST", `/api/agents/resA/migrations/${mid}/blob`, {
+    body: Buffer.from("LATE-BYTES"),
+    headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" },
+  });
+  assert.equal(late.status, 404);
+  assert.equal(m.phase, "failed", "still failed");
+  assert.equal(m.blobPath, null, "and holds no spool file");
+  assert.ok(!(agents.resB.commands || []).some((c) => c.type === "importSession"),
+    "no importSession was queued for a settled move");
+});
+
+test("migrate: a move failed WHILE its bundle is being spooled is not resurrected", async () => {
+  // The route's entry guard sees `exporting` and lets the body through; the
+  // refusal lands DURING the spool, which is the real window (a 65 MiB upload
+  // is not instant, and the agent's own POST timing out is exactly what makes
+  // it stage that refusal). Only the post-spool re-check can catch this one.
+  await migHost("racA", "rac.atlassian.net");
+  await migHost("racB", "rac.atlassian.net");
+  const mid = (await migrate("racA", "s1", { host: "racB" })).body.migrationId;
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "exporting");
+
+  const body = Buffer.from("X".repeat(4096));
+  const done = new Promise((resolve, reject) => {
+    const req = http.request(`${baseUrl}/api/agents/racA/migrations/${mid}/blob`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer agenttok",
+        "content-type": "application/octet-stream",
+        "content-length": body.length * 2,
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on("error", reject);
+    req.write(body);                       // half the bundle...
+    setTimeout(() => { req.write(body); req.end(); }, 120);  // ...and the rest
+  });
+
+  // Mid-spool: the source reports its upload failed, so the hub fails the move.
+  // The beat KEEPS reporting the session — a heartbeat replaces the record, and
+  // dropping it would make the route take its "source session gone" branch and
+  // 404 for a reason that has nothing to do with what this test is pinning.
+  await new Promise((r) => setTimeout(r, 40));
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "racA",
+      repos: [{ name: "Turma", path: "/git/Turma" }],
+      sessions: [{
+        id: "s1", status: "running", root: false, repo: "Turma",
+        transcriptId: "trans-racA",
+        worktreePath: "/git/.turma/worktrees/Turma/s1",
+      }],
+      spawnFailures: [{ migrationId: mid, error: "uploading failed" }],
+    },
+    headers: agentHeaders,
+  });
+  assert.equal(m.phase, "failed", "failed while the body was still arriving");
+
+  const res = await done;
+  assert.equal(res.status, 404);
+  assert.equal(m.phase, "failed", "the completed upload must not revive it");
+  assert.equal(m.blobPath, null, "and must not leave a spool file behind");
+  assert.ok(!(agents.racB.commands || []).some((c) => c.type === "importSession"),
+    "no importSession for a move already reported failed");
+});
+
+test("migrate: a bystander host cannot fail someone else's move", async () => {
+  // Every agent shares one token, so the migration id alone must not be enough.
+  await migHost("byA", "by.atlassian.net");
+  await migHost("byB", "by.atlassian.net");
+  const r = await migrate("byA", "s1", { host: "byB" });
+  const mid = r.body.migrationId;
+  await request("POST", "/api/heartbeat", {
+    body: { device: "byC", spawnFailures: [{ migrationId: mid, error: "not mine to fail" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(migrations.get(mid).phase, "exporting");
+  // Settle it: this suite shares one hub and MIGRATE_INFLIGHT_MAX is 4, so a
+  // test that parks a move in flight silently refuses a later test's /migrate.
+  migrations.delete(mid);
+});
+
+// Queue `n` real commands on `device` and answer the beat that collects them,
+// so their cmdIds are ones the hub actually gave that host — the only ones it
+// will accept a refusal for.
+async function issuedCmds(device, n) {
+  await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+  const ids = [];
+  for (let i = 0; i < n; i++) {
+    ids.push(queueCommand(device, { type: "resumeTranscript", transcriptId: `t${i}` }));
+  }
+  return ids;
+}
+
+test("spawn refusals are bounded and age out of a host's record", async () => {
+  const ids = await issuedCmds("bndH", 60);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "bndH", spawnFailures: ids.map((c, i) => ({ cmdId: c, error: `no ${i}` })) },
+    headers: agentHeaders,
+  });
+  const kept = Object.keys(agents.bndH.spawnRefusals);
+  assert.ok(kept.length <= 40, `bounded, got ${kept.length}`);
+  assert.ok(kept.includes(ids[59]), "newest kept — the trim is oldest-first");
+  // The wire field itself never lands on the record — it's a delivery, like the
+  // other *Results.
+  assert.equal(agents.bndH.spawnFailures, undefined);
+});
+
+test("a spawn refusal ages out on its own, well under the count cap", async () => {
+  // Deliberately far from SPAWN_FAILURE_MAX, so the count trim cannot retire
+  // this entry and pass the test for the wrong reason.
+  const ids = await issuedCmds("ageH", 3);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ageH", spawnFailures: ids.map((c, i) => ({ cmdId: c, error: `no ${i}` })) },
+    headers: agentHeaders,
+  });
+  assert.equal(Object.keys(agents.ageH.spawnRefusals).length, 3);
+  agents.ageH.spawnRefusals[ids[1]].at = Date.now() - 60 * 60 * 1000;
+  const [fresh] = await issuedCmds("ageH", 1);
+  await request("POST", "/api/heartbeat",
+    { body: { device: "ageH", spawnFailures: [{ cmdId: fresh, error: "x" }] }, headers: agentHeaders });
+  assert.ok(!agents.ageH.spawnRefusals[ids[1]], "the stale one is gone");
+  assert.ok(agents.ageH.spawnRefusals[ids[0]], "its same-age neighbours stay");
+  assert.ok(agents.ageH.spawnRefusals[ids[2]]);
+  assert.ok(agents.ageH.spawnRefusals[fresh]);
+});
+
+test("a refusal cannot grow a host's record past the ceiling and wedge it", async () => {
+  // The cache is SERVED, so agentRecordSize counts it — and the ceiling check
+  // runs before the ingest. An unbounded reason would land, push the record over
+  // AGENT_RECORD_MAX, and 413 every later beat including the ones that sweep it.
+  const ids = await issuedCmds("bigH", 3);
+  const r = await request("POST", "/api/heartbeat", {
+    body: {
+      device: "bigH",
+      spawnFailures: ids.map((c) => ({ cmdId: c, error: "x".repeat(4 << 20) })),
+    },
+    headers: agentHeaders,
+  });
+  assert.equal(r.status, 200);
+  for (const c of ids) assert.ok(agents.bigH.spawnRefusals[c].error.length <= 500);
+  // The host keeps beating, and the fleet payload stays small.
+  assert.equal((await request("POST", "/api/heartbeat",
+    { body: { device: "bigH" }, headers: agentHeaders })).status, 200);
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  const served = fleet.body.agents.find((a) => a.key === "bigH");
+  assert.ok(JSON.stringify(served).length < 64 * 1024, "record stays small");
+});
+
+test("a refusal for a command this host was never given is ignored", async () => {
+  // Every agent shares one token, and the page scans the WHOLE fleet for a
+  // followed cmdId — so an unchecked one lets any host end another host's wait.
+  const [mine] = await issuedCmds("ownA", 1);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ownB", spawnFailures: [{ cmdId: mine, error: "not mine to refuse" }] },
+    headers: agentHeaders,
+  });
+  assert.deepEqual(agents.ownB.spawnRefusals, {});
+  // The host it WAS issued to is believed.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ownA", ackedCommands: [mine],
+            spawnFailures: [{ cmdId: mine, error: "at MAX_SESSIONS" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(agents.ownA.spawnRefusals[mine].error, "at MAX_SESSIONS");
+});
+
+test("a malformed refusal can't poison the cache or break the beat", async () => {
+  const [id] = await issuedCmds("malH", 1);
+  const r = await request("POST", "/api/heartbeat", {
+    body: {
+      device: "malH",
+      spawnFailures: [
+        { cmdId: "__proto__", error: "prototype setter, not an entry" },
+        { cmdId: id, error: { not: "a string" } },
+      ],
+    },
+    headers: agentHeaders,
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(Object.keys(agents.malH.spawnRefusals), [id]);
+  assert.equal(typeof agents.malH.spawnRefusals[id].error, "string");
+  assert.equal(agents.malH.spawnRefusals[id].error, "the agent refused it");
+  assert.equal(({}).error, undefined, "no prototype was re-pointed");
+  // A non-array must not throw mid-handler: the record is already replaced by
+  // then, so the host would lose its commands (and its ack) every beat.
+  const bad = await request("POST", "/api/heartbeat",
+    { body: { device: "malH", spawnFailures: 42 }, headers: agentHeaders });
+  assert.equal(bad.status, 200);
 });
 
 test("migrate: the blob relay rejects an unauthenticated caller", async () => {
@@ -6148,6 +6732,506 @@ test("migrate: the blob relay rejects an unauthenticated caller", async () => {
     { body: Buffer.from("x"), headers: { authorization: "Bearer nope" } });
   assert.equal(badTok.status, 401);
 });
+
+// ---- per-host agent identity (XERK-268) -------------------------------------
+// Scoping a relay to `m.srcHost`/`m.targetHost`/`u.host` only means something if
+// `<host>` is PROVED rather than typed. Under one fleet-shared token it was
+// typed, so the guards refused a caller naming its own host and passed one
+// naming the victim's. These hold both halves: the scoping, and the binding that
+// makes it an identity check.
+
+// The token the fleet master derives for `host` — what that host's agent runs
+// with, and what `node server.js --agent-token <host>` prints.
+const asHost = (host) => ({ authorization: `Bearer ${hostAgentToken(host)}` });
+// Settle a migration this suite started. `MIGRATE_INFLIGHT_MAX` (4) counts
+// exporting/importing moves fleet-wide, so a test that leaves one in flight
+// spends one of those four slots for the whole rest of the run — the next test
+// to start a move gets 503 and fails somewhere unrelated to what it tests.
+const settleMigration = (mid) => {
+  const m = migrations.get(mid);
+  if (m) { m.phase = "done"; m.at = Date.now(); }
+};
+
+const beatAs = (device, headers) =>
+  request("POST", "/api/heartbeat", { body: { device }, headers: { ...headers, "content-type": "application/json" } });
+
+test("XERK-268: a host's token names its host and proves that name", () => {
+  // Stable (the hub re-derives it per request rather than storing a map),
+  // distinct per host, and nothing without a master to derive from.
+  assert.equal(hostAgentToken("nas01"), hostAgentToken("nas01"));
+  assert.notEqual(hostAgentToken("nas01"), hostAgentToken("nas02"));
+  assert.match(hostAgentToken("nas01"), /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/);
+  // Never the master itself — handing an agent the master back would defeat it.
+  assert.notEqual(hostAgentToken("nas01"), "agenttok");
+  // It carries its host on its face, which is what lets the heartbeat gate
+  // identify a caller before reading a body. The name half is not a secret; the
+  // HMAC half is what makes it unforgeable, so editing the name breaks it.
+  const [name, mac] = hostAgentToken("nas01").split(".");
+  assert.equal(Buffer.from(name, "base64url").toString(), "nas01");
+  assert.equal(hostAgentToken("nas01").split(".")[1], mac);
+  // A host name with dots/unicode round-trips (the name is base64url, so the
+  // separator can never appear inside it).
+  for (const h of ["a.b.c", "héllo-01", "日本-01", "x".repeat(200)]) {
+    assert.equal(Buffer.from(hostAgentToken(h).split(".")[0], "base64url").toString(), h);
+  }
+  // Non-strings and the empty name get NO token: String() coercion would mint a
+  // real credential for an array or a toString()-carrying object.
+  for (const bad of [["nas01"], { toString: () => "nas01" }, 5, null, undefined, ""]) {
+    assert.equal(hostAgentToken(bad), "");
+  }
+  // Nor a name the hub would refuse to REGISTER (XERK-269). Minting one is the
+  // worst outcome available: the agent renames itself to its next naming
+  // source, the token stops matching, and the tunnel reconnect-loops forever
+  // without ever naming the cause. `x`.repeat(201) is over the key length cap.
+  for (const bad of [".", "..", "__proto__", "constructor", "prototype", "x".repeat(201)]) {
+    assert.equal(hostAgentToken(bad), "", `must not mint for ${JSON.stringify(bad)}`);
+  }
+  // ...while names that merely contain dots still mint, since they register fine.
+  for (const good of ["...", ".hidden", "..host", "HOST.local."]) {
+    assert.match(hostAgentToken(good), /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/, good);
+  }
+});
+
+test("XERK-268: a bearer proves at most the ONE host it derives to", () => {
+  const bearer = (t) => ({ headers: { authorization: `Bearer ${t}` } });
+  // Its own host: proved. Any other host: refused outright — that is the whole
+  // fix, and it holds without strict mode, because a wrong-host derived token
+  // matches neither the named host's token nor the master.
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hA")), "hA"), "proved");
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hA")), "hB"), null);
+  // The master authenticates "some agent" and nothing about which one.
+  assert.equal(agentBearerKind(bearer("agenttok"), "hA"), "legacy");
+  assert.equal(agentBearerKind(bearer("agenttok"), "hB"), "legacy");
+  // The operator's own login may name any host: they can already drive every
+  // host through the user API, so refusing here would only break curl.
+  assert.equal(agentBearerKind({ headers: { authorization: basic("hubuser", "hubpass") } }, "hA"), "operator");
+  assert.equal(agentBearerKind({ headers: {} }, "hA"), null);
+  assert.equal(agentBearerKind(bearer("garbage"), "hA"), null);
+  // A host token that is for someone else is NEVER downgraded to `legacy` —
+  // that would hand it the fleet-wide rights its own binding just refused.
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hB")), null), null);
+  // A non-string host cannot be coerced into one that "matches".
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hA")), ["hA"]), null);
+  assert.equal(agentBearerKind(bearer(hostAgentToken("hA")), { toString: () => "hA" }), null);
+});
+
+test("XERK-268: a wrong-host token says so, so a RENAME is diagnosable", () => {
+  // The host name is inside the token, so renaming a host silently invalidates
+  // its credential. A bare "unauthorized" sends the operator hunting for a wrong
+  // secret instead of a changed name; this tells them nothing the caller does
+  // not already hold, since the token names its own host on its face.
+  const refusal = agentHostRefusal(
+    { headers: { authorization: `Bearer ${hostAgentToken("oldname")}` } }, "newname");
+  assert.equal(refusal.status, 403);
+  assert.match(refusal.error, /oldname's, not newname's/);
+  assert.match(refusal.error, /re-derive it if the host was renamed/);
+  // A token that is not a host token at all stays a flat 401 — there is nothing
+  // to say about it, and saying more would be an oracle.
+  assert.deepEqual(agentHostRefusal({ headers: { authorization: "Bearer garbage" } }, "hA"),
+    { status: 401, error: "unauthorized" });
+});
+
+test("migrate: the blob relay's host scope holds for a proved caller", async () => {
+  await migHost("scA", "sc.atlassian.net");
+  await migHost("scB", "sc.atlassian.net");
+  await migHost("scC", "sc.atlassian.net");
+  const mid = (await migrate("scA", "s1", { host: "scB" })).body.migrationId;
+
+  // A third host naming ITSELF is refused on both halves, and told nothing
+  // about whether the id exists (404, not 403).
+  const post = await requestRaw("POST", `/api/agents/scC/migrations/${mid}/blob`,
+    { body: Buffer.from("ATTACKER-BYTES"), headers: asHost("scC") });
+  assert.equal(post.status, 404);
+  assert.equal(post.body.error, "unknown migration");
+  const get = await requestRaw("GET", `/api/agents/scC/migrations/${mid}/blob`,
+    { headers: asHost("scC") });
+  assert.equal(get.status, 404);
+
+  // Nothing moved: still awaiting the real source's bundle, nothing queued on
+  // the real target.
+  assert.equal(migrations.get(mid).phase, "exporting");
+  assert.ok(!(agents.scB.commands || []).some((c) => c.type === "importSession"));
+
+  // The GET half is scoped to the TARGET specifically, not merely to "one of the
+  // two". Once a bundle exists, even the migration's own SOURCE cannot pull it
+  // back — it is the raw transcript, and only the host resuming it needs it.
+  const up = await requestRaw("POST", `/api/agents/scA/migrations/${mid}/blob`,
+    { body: Buffer.from("SOURCE-BUNDLE"), headers: asHost("scA") });
+  assert.equal(up.status, 200);
+  const bySrc = await requestRaw("GET", `/api/agents/scA/migrations/${mid}/blob`,
+    { headers: asHost("scA") });
+  assert.equal(bySrc.status, 404);
+  const byTgt = await requestRaw("GET", `/api/agents/scB/migrations/${mid}/blob`,
+    { headers: asHost("scB") });
+  assert.equal(byTgt.status, 200);
+  settleMigration(mid);
+});
+
+test("migrate: a third host cannot relay by naming the victim's host", async () => {
+  await migHost("vcA", "vc.atlassian.net");
+  await migHost("vcB", "vc.atlassian.net");
+  const mid = (await migrate("vcA", "s1", { host: "vcB" })).body.migrationId;
+
+  // The attack the scoping alone let through: a third host spoofing the SOURCE
+  // in the path. Its own credential derives to vcC, so naming vcA is refused
+  // before the migration is ever looked up.
+  const spoofPost = await requestRaw("POST", `/api/agents/vcA/migrations/${mid}/blob`,
+    { body: Buffer.from("ATTACKER-BYTES-FORGED"), headers: asHost("vcC") });
+  assert.equal(spoofPost.status, 403);
+  assert.match(spoofPost.body.error, /is vcC's, not vcA's/);
+  assert.equal(migrations.get(mid).phase, "exporting");
+  assert.ok(!(agents.vcB.commands || []).some((c) => c.type === "importSession"));
+
+  // The real source, with its own token, still relays.
+  const real = await requestRaw("POST", `/api/agents/vcA/migrations/${mid}/blob`,
+    { body: Buffer.from("REAL-BUNDLE"), headers: asHost("vcA") });
+  assert.equal(real.status, 200);
+  assert.equal(migrations.get(mid).phase, "importing");
+
+  // ...and the download half the same way: spoofing the TARGET is refused,
+  // the real target gets its bytes.
+  const spoofGet = await requestRaw("GET", `/api/agents/vcB/migrations/${mid}/blob`,
+    { headers: asHost("vcC") });
+  assert.equal(spoofGet.status, 403);
+  const realGet = await requestRaw("GET", `/api/agents/vcB/migrations/${mid}/blob`,
+    { headers: asHost("vcB") });
+  assert.equal(realGet.status, 200);
+  assert.equal(realGet.buf.toString(), "REAL-BUNDLE");
+  settleMigration(mid);
+});
+
+test("XERK-268: an agent can only collect an attachment staged for its own host", async () => {
+  await upHost("atA");
+  const id = (await stage("atA", "s1", "a.png", Buffer.from("SECRET"))).body.uploadId;
+  // Naming the victim's host with another host's credential — the case
+  // `u.host !== host` alone could not catch.
+  const spoof = await requestRaw("GET", `/api/agents/atA/uploads/${id}/blob`, { headers: asHost("atB") });
+  assert.equal(spoof.status, 403);
+  const own = await requestRaw("GET", `/api/agents/atA/uploads/${id}/blob`, { headers: asHost("atA") });
+  assert.equal(own.status, 200);
+  assert.equal(own.buf.toString(), "SECRET");
+});
+
+test("XERK-268: a heartbeat's `device` is bound to the credential too", async () => {
+  // This is what makes the relay guards worth anything: unbound, an attacker
+  // beats as the victim and is handed the commands queued for it — including
+  // the migrationId/uploadId the relays are keyed on — so no per-relay secret
+  // could have helped.
+  await migHost("hbA", "hb.atlassian.net");
+  await migHost("hbB", "hb.atlassian.net");
+  const mid = (await migrate("hbA", "s1", { host: "hbB" })).body.migrationId;
+
+  // hbC's own token cannot beat as hbA, so the exportSession command carrying
+  // the id stays with hbA.
+  const spoof = await beatAs("hbA", asHost("hbC"));
+  assert.equal(spoof.status, 403);
+  assert.match(spoof.body.error, /is hbC's, not hbA's/);
+
+  const real = await beatAs("hbA", asHost("hbA"));
+  assert.equal(real.status, 200);
+  assert.ok(real.body.commands.some((c) => c.type === "exportSession" && c.migrationId === mid));
+  settleMigration(mid);
+});
+
+test("XERK-268: only the CANONICAL encoding of a host name authenticates", () => {
+  // tokenHost compares the WHOLE token, not just the HMAC half. Verifying only
+  // the MAC would leave the name half free to re-encode — still the same host,
+  // so not directly exploitable, but it would make a credential have many valid
+  // spellings, and every equality this system rests on assumes it has one.
+  for (const host of ["alpha", "ab", "ÿÿÿ", "a.b"]) {
+    const real = hostAgentToken(host);
+    assert.equal(tokenHost(real), host);
+    const [name, mac] = real.split(".");
+    const variants = [
+      Buffer.from(host).toString("base64") + "." + mac,         // std alphabet + padding
+      name + "=." + mac,                                        // padded
+      name.replace(/-/g, "+").replace(/_/g, "/") + "." + mac,   // +/ instead of -_
+      name.toUpperCase() + "." + mac,
+      "." + name + "." + mac,
+      name + "." + mac.toUpperCase(),
+      name + "." + mac + ".junk",
+      mac,
+      name + ".",
+    ];
+    for (const v of variants) {
+      if (v === real) continue;
+      assert.equal(tokenHost(v), null, `${host}: ${v.slice(0, 24)}… must not authenticate`);
+    }
+  }
+  // Swapping a name onto another host's MAC fails: the MAC is over the name.
+  const [aName] = hostAgentToken("alpha").split(".");
+  const [, vMac] = hostAgentToken("victim").split(".");
+  assert.equal(tokenHost(`${aName}.${vMac}`), null);
+  // A host name that does not survive the UTF-8 round trip gets no token at all,
+  // so two names can never derive one credential.
+  assert.equal(hostAgentToken("\uD800"), "");
+  assert.notEqual(hostAgentToken("�"), "");
+});
+
+test("XERK-268: a malformed <host> segment is refused, not 400'd before auth", async () => {
+  // The gate decodes the segment to check the credential against it, so a bad
+  // percent-escape must not throw there — that turned an anonymous caller's 401
+  // into a 400 that ran before any auth did.
+  for (const seg of ["%", "a%ZZb", "%E0%A4%A"]) {
+    const anon = await requestRaw("GET", `/api/agents/${seg}/uploads/x/blob`);
+    assert.equal(anon.status, 401, `anonymous ${seg}`);
+    const wrong = await requestRaw("GET", `/api/agents/${seg}/uploads/x/blob`, { headers: asHost("someone") });
+    assert.equal(wrong.status, 403, `wrong-host ${seg}`);
+  }
+});
+
+test("XERK-268: TURMA_AGENT_STRICT retires the fleet master", () => {
+  const strict = freshServerModule((env) => { env.TURMA_AGENT_STRICT = "1"; });
+  const bearer = (t) => ({ headers: { authorization: `Bearer ${t}` } });
+  // Derived tokens keep working; the master is refused with a reason the
+  // operator can act on, not a bare 401.
+  assert.equal(strict.agentHostRefusal(bearer(strict.hostAgentToken("hA")), "hA"), null);
+  const refusal = strict.agentHostRefusal(bearer("agenttok"), "hA");
+  assert.equal(refusal.status, 403);
+  assert.match(refusal.error, /hA's own agent token/);
+  // The tunnel WebSockets are held to the same rule (their token rides a query
+  // param, so they cannot share the header path).
+  const q = (t) => new URL(`http://x/agent/control?name=hA&token=${t}`);
+  assert.equal(strict.agentWsAuthorized(q(strict.hostAgentToken("hA")), { headers: {} }, "hA"), true);
+  assert.equal(strict.agentWsAuthorized(q(strict.hostAgentToken("hB")), { headers: {} }, "hA"), false);
+  assert.equal(strict.agentWsAuthorized(q("agenttok"), { headers: {} }, "hA"), false);
+  // Non-strict (the suite's own module) still accepts the master, so a fleet
+  // mid-rollover keeps beating.
+  assert.equal(agentWsAuthorized(q("agenttok"), { headers: {} }, "hA"), true);
+
+  // Strict must retire the master AT THE HEARTBEAT'S PRE-BODY GATE too, not
+  // only at the authorization check past it: that gate stands in front of a
+  // 32 MiB read, so a master still usable through it means a leaked master
+  // OOMs the hub on a fleet whose whole point was that it had been retired.
+  assert.equal(strict.agentPresented(bearer("agenttok")), false);
+  assert.equal(strict.agentPresented(bearer(strict.hostAgentToken("hA"))), true);
+  // ...and it refuses with the rollover message, host-less because the host is
+  // still unread behind that gate — never a bare "unauthorized" an agent
+  // mid-rollover cannot act on.
+  const gate = strict.agentPresentedRefusal(bearer("agenttok"));
+  assert.equal(gate.status, 403);
+  assert.match(gate.error, /each agent's own token \(TURMA_AGENT_STRICT is set\)/);
+  assert.deepEqual(strict.agentPresentedRefusal(bearer("garbage")),
+    { status: 401, error: "unauthorized" });
+  assert.equal(strict.agentPresentedRefusal(bearer(strict.hostAgentToken("hA"))), null);
+  // Non-strict lets the master through that gate, as a rollover needs.
+  assert.equal(agentPresented(bearer("agenttok")), true);
+});
+
+test("XERK-268: the tunnel control channel can only register its own host", async () => {
+  // Registering another host's tunnel would route that host's terminals through
+  // the impostor, so `?name=` is checked before the socket is accepted.
+  await assert.rejects(
+    () => wsConnect(`/agent/control?name=tunA&token=${hostAgentToken("tunB")}`, 1500),
+    /closed before headers|timed out/
+  );
+  const ok = await wsConnect(`/agent/control?name=tunA&token=${hostAgentToken("tunA")}`, 1500);
+  assert.match(ok.statusLine, /101/);
+  ok.socket.destroy();
+});
+
+test("XERK-268: a data channel can only be answered by the host it was opened for", async () => {
+  // `ch` is unguessable, but it identifies the CHANNEL and proves nothing about
+  // who dialled back — the duplex becomes that host's terminal stream.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "dchA",
+      sessions: [{ id: "dch1", repo: "Turma", status: "running", ttydPort: 7777,
+        worktreePath: "/git/.turma/worktrees/Turma/dch1", transcriptId: "t-dch" }],
+    },
+    headers: agentHeaders,
+  });
+  const ctrl = await wsConnect(`/agent/control?name=dchA&token=${hostAgentToken("dchA")}`);
+  const frames = collectFrames(ctrl.socket, ctrl.leftover);
+  try {
+    // Ask for a terminal: the hub sends {open:<ch>} down the control channel.
+    request("GET", "/term/dch1/", { headers: userHeaders }).catch(() => {});
+    await waitFor(() => frames.some((f) => {
+      try { return JSON.parse(f.payload).open; } catch { return false; }
+    }));
+    const ch = frames.map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
+      .find(Boolean);
+    assert.ok(ch);
+
+    // Another host answering it is destroyed; the channel stays pending.
+    await assert.rejects(
+      () => wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken("dchB")}`, 1500),
+      /closed before headers|timed out/
+    );
+    const ok = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken("dchA")}`, 1500);
+    assert.match(ok.statusLine, /101/);
+    ok.socket.destroy();
+  } finally {
+    ctrl.socket.destroy();
+  }
+});
+
+test("XERK-268: the tunnel maps are null-prototype", () => {
+  // Asserted on the maps THEMSELVES, not through a socket: on a plain object a
+  // `ch` of `__proto__` read back as Object.prototype — truthy, so it sailed
+  // past the "is there a pending channel" check and died on `.resolve is not a
+  // function`, out of an async upgrade handler. Reaching that through the wire
+  // means the regression is detected by the hub DYING mid-run, which reads as a
+  // CI timeout rather than as a failing test.
+  assert.equal(Object.getPrototypeOf(controlChannels), null);
+  assert.equal(Object.getPrototypeOf(pendingChannels), null);
+  // The property that actually matters: an attacker-supplied key is absent, not
+  // inherited-and-truthy.
+  for (const k of ["__proto__", "constructor", "prototype", "toString", "valueOf"]) {
+    assert.equal(pendingChannels[k], undefined, `pendingChannels[${k}]`);
+    assert.equal(controlChannels[k], undefined, `controlChannels[${k}]`);
+  }
+});
+
+test("XERK-268: a `ch` of __proto__ is not a pending channel", async () => {
+  await assert.rejects(
+    () => wsConnect("/agent/data?ch=__proto__&token=agenttok", 1500),
+    /closed before headers|timed out/
+  );
+  await assert.rejects(
+    () => wsConnect("/agent/data?ch=constructor&token=agenttok", 1500),
+    /closed before headers|timed out/
+  );
+  // Still serving: the point of the test is that the hub is alive to answer.
+  assert.equal((await request("GET", "/healthz")).status, 200);
+});
+
+test("XERK-268: ttyd is proxied with the token that host actually runs", async () => {
+  // The hub injects the agent's own credential into every proxied ttyd request.
+  // Which one that is follows how the host authenticated its heartbeat, so a
+  // half-rolled fleet keeps every terminal working instead of 401ing the hosts
+  // that haven't been given their derived token yet.
+  await beatAs("ttLegacy", { authorization: "Bearer agenttok" });
+  await beatAs("ttBound", asHost("ttBound"));
+  const cred = (h) => Buffer.from(ttydAuth(h).slice(6), "base64").toString();
+  assert.equal(cred("ttLegacy"), "term:agenttok");
+  assert.equal(cred("ttBound"), `term:${hostAgentToken("ttBound")}`);
+  // A heartbeat cannot talk itself into the bound branch.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ttLegacy", tokenBound: true },
+    headers: { authorization: "Bearer agenttok", "content-type": "application/json" },
+  });
+  assert.equal(cred("ttLegacy"), "term:agenttok");
+  // ...nor does it reach the clients as a wire field.
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  const row = fleet.body.agents.find((a) => a.key === "ttBound");
+  assert.ok(row && !("tokenBound" in row));
+});
+
+test("migrate: the blob relay is scoped to the migration's own two hosts", async () => {
+  // The <host> segment is checked against the migration's own halves (XERK-266),
+  // so a mis-addressed call can no longer act on someone else's move. It is
+  // defense in depth, not identity: the segment is self-asserted, and a caller
+  // that names the real source/target still passes (XERK-268).
+  await migHost("hsA", "hs.atlassian.net");
+  await migHost("hsB", "hs.atlassian.net");
+  await migHost("hsC", "hs.atlassian.net"); // same org, no part of the move
+  const mid = (await migrate("hsA", "s1", { host: "hsB" })).body.migrationId;
+  const agentTok = { authorization: "Bearer agenttok" };
+
+  // A host that is not the SOURCE can't inject a bundle: 404 (not 403 — the
+  // relay doesn't confirm the id exists), and the move stays exporting.
+  const inject = await requestRaw("POST", `/api/agents/hsC/migrations/${mid}/blob`,
+    { body: Buffer.from("ATTACKER-BYTES"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(inject.status, 404);
+  assert.equal(migrations.get(mid).phase, "exporting");
+  assert.equal(migrations.get(mid).blobPath, null);
+  assert.ok(!agents.hsB.commands.some((c) => c.type === "importSession"));
+
+  // The POST compare is EXACT, and this has to be asked while the migration is
+  // still AWAITING its bundle — that is the state where the host compare is the
+  // only thing that can answer. Asked after the upload it would sit behind the
+  // phase check and "pass" on a build whose compare is lenient, which is not
+  // what it is here to catch.
+  const nearMissUp = await requestRaw("POST", `/api/agents/HSA/migrations/${mid}/blob`,
+    { body: Buffer.from("x"), headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(nearMissUp.status, 404);
+  assert.equal(migrations.get(mid).phase, "exporting");
+
+  // The real source's upload still works.
+  const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
+  const up = await requestRaw("POST", `/api/agents/hsA/migrations/${mid}/blob`,
+    { body: blob, headers: { ...agentTok, "content-type": "application/octet-stream" } });
+  assert.equal(up.status, 200);
+
+  // A host that is not the TARGET can't read the bundle — it is the raw
+  // transcript of another host's conversation.
+  const steal = await requestRaw("GET", `/api/agents/hsC/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(steal.status, 404);
+  // The source can't read it back either — only the target has business with it.
+  const backAtSrc = await requestRaw("GET", `/api/agents/hsA/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(backAtSrc.status, 404);
+  // The real target still gets the bytes.
+  const dl = await requestRaw("GET", `/api/agents/hsB/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(dl.status, 200);
+  assert.ok(blob.equals(dl.buf));
+
+  // Same on the GET: a host name that merely resembles the target's is a
+  // different host, and a lenient compare would hand it the bundle.
+  const nearMiss = await requestRaw("GET", `/api/agents/HSB/migrations/${mid}/blob`,
+    { headers: agentTok });
+  assert.equal(nearMiss.status, 404);
+});
+
+test("migrate: every POST refusal is the same 404, so the responses name no host", async () => {
+  // `<host>` is self-asserted (XERK-268), so any refusal a NON-source can't
+  // also get names the source to anyone holding the id — and then the injection
+  // above is a matter of re-addressing. The refusals are therefore uniform: a
+  // wrong host, a wrong phase, an empty body and a spool that could not be
+  // written must be indistinguishable.
+  // This pins the RESPONSES only. The route still leaks the source through the
+  // timing of an accepted vs rejected POST, which no test here can close —
+  // see the route's comment; that one needs XERK-268.
+  await migHost("orA", "or.atlassian.net");
+  await migHost("orB", "or.atlassian.net");
+  await migHost("orC", "or.atlassian.net");
+  const agentTok = { authorization: "Bearer agenttok", "content-type": "application/octet-stream" };
+  const post = (host, id, body) =>
+    requestRaw("POST", `/api/agents/${host}/migrations/${id}/blob`, { body, headers: agentTok });
+  const mid = (await migrate("orA", "s1", { host: "orB" })).body.migrationId;
+
+  // The empty-body probe is the cheap one: it mutates nothing, so without this
+  // the source could be found silently, at no cost and without tripping a move.
+  const emptyAtSrc = await post("orA", mid, Buffer.alloc(0));
+  const emptyElsewhere = await post("orC", mid, Buffer.alloc(0));
+  assert.equal(emptyAtSrc.status, 404);
+  assert.deepEqual(emptyAtSrc.body, emptyElsewhere.body);
+  assert.equal(emptyAtSrc.status, emptyElsewhere.status);
+  assert.equal(migrations.get(mid).phase, "exporting"); // and nothing moved
+
+  // Same once the real bundle has landed: the source re-POSTing (at-least-once
+  // delivery makes that ordinary) reads exactly like a stranger's probe.
+  assert.equal((await post("orA", mid, Buffer.from("REAL"))).status, 200);
+  const rePost = await post("orA", mid, Buffer.from("REAL"));
+  const stranger = await post("orC", mid, Buffer.from("REAL"));
+  assert.equal(rePost.status, 404);
+  assert.deepEqual(rePost.body, stranger.body);
+  // An unknown id answers the same thing again.
+  const unknown = await post("orA", "0123456789abcdef", Buffer.from("REAL"));
+  assert.equal(unknown.status, 404);
+  assert.deepEqual(unknown.body, rePost.body);
+  // The re-POST didn't disturb the move it was refused from.
+  assert.equal(migrations.get(mid).phase, "importing");
+  assert.ok(fs.readFileSync(migrations.get(mid).blobPath).equals(Buffer.from("REAL")));
+
+  // The refusal AFTER the body read counts too: only the real source can reach
+  // "source session gone", so a status of its own would name it. The reply is
+  // the same 404; the RECORD keeps the true reason for the operator.
+  await migHost("orD", "or.atlassian.net", { session: "s9" });
+  await migHost("orE", "or.atlassian.net");
+  const gone = (await migrate("orD", "s9", { host: "orE" })).body.migrationId;
+  await request("POST", "/api/heartbeat", { // the source session vanishes mid-move
+    body: { device: "orD", repos: [{ name: "Turma", path: "/git/Turma" }], sessions: [] },
+    headers: agentHeaders,
+  });
+  const afterGone = await post("orD", gone, Buffer.from("REAL"));
+  assert.equal(afterGone.status, 404);
+  assert.deepEqual(afterGone.body, rePost.body);
+  assert.equal(migrations.get(gone).phase, "failed");
+  assert.equal(migrations.get(gone).error, "source session gone");});
 
 // ---- file attachments (XERK-234) -------------------------------------------
 // The hub is the RELAY, not the store: a client POSTs the bytes, they sit in
@@ -7034,4 +8118,685 @@ test("budget: a big-lane holder leaves the shared budget to everyone else", asyn
   }
   assert.equal(promoted - stage, 0,
     "a promoted body must not go on holding shared budget after it completes");
+});
+
+test("normalizeLocalModel coerces the block so one host cannot hide the fleet", () => {
+  // Android decodes /api/agents ATOMICALLY into typed fields, so a wrong-typed
+  // localModel from ONE host throws for the whole array and every other host
+  // silently disappears from that phone. Same contract, and same reason, as
+  // normalizeLimits beside it.
+  const norm = (localModel) => {
+    const p = { device: "h", localModel };
+    hub.normalizeLocalModel(p);
+    return p.localModel;
+  };
+
+  // A good block passes through unchanged.
+  assert.deepEqual(
+    norm({ available: true, model: "gpt-oss:120b", contextTokens: 81920 }),
+    { available: true, model: "gpt-oss:120b", contextTokens: 81920 },
+  );
+
+  // `available` is STRICTLY boolean: a truthy string would offer the switch on
+  // a host that cannot do it, and the command would be acked and dropped.
+  assert.deepEqual(norm({ available: "yes", model: "x" }),
+    { available: false, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: 1 }),
+    { available: false, model: null, contextTokens: null });
+
+  // A non-string model and an out-of-Int contextTokens degrade to null rather
+  // than failing the decode. contextTokens is unused by the UI, so this is free.
+  assert.deepEqual(norm({ available: true, model: 12345, contextTokens: 9999999999 }),
+    { available: true, model: null, contextTokens: null });
+  assert.deepEqual(norm({ available: true, model: "m", contextTokens: 1.5 }),
+    { available: true, model: "m", contextTokens: null });
+
+  // The name is BOUNDED, and cut on code points. A UTF-16 `slice` through an
+  // astral pair emits a lone surrogate — unencodable, and it kills Android's
+  // uiautomator outright. Nothing else pins this length.
+  const long = norm({ available: true, model: "x".repeat(500) });
+  assert.equal(long.model.length, 60);
+  const astral = norm({ available: true, model: "x".repeat(59) + "😀" + "tail" });
+  assert.equal([...astral.model].length, 60);
+  assert.ok(astral.model.isWellFormed(), "the cut manufactured a lone surrogate");
+  // ...and one that ARRIVES that way is replaced, not passed through. Either
+  // direction kills uiautomator, so the guarantee has to cover both.
+  for (const evil of ["qwen\uD83Dcoder", "abc\uDE00def", "x".repeat(59) + "\uD83Dtail"]) {
+    assert.ok(norm({ available: true, model: evil }).model.isWellFormed(),
+      `a lone surrogate survived: ${JSON.stringify(evil)}`);
+  }
+  // The guarantee is the whole XML-ILLEGAL class, not just surrogates: a C0
+  // control and the noncharacters U+FFFE/U+FFFF each kill `uiautomator dump`
+  // the same way (a 0-byte file), and closing only the case that bit us leaves
+  // the next one to be rediscovered — which is how the second and third of
+  // these were found, one pass apart.
+  const ctl = norm({ available: true, model: "qwen\x01ctl\x00nul\x0bvt\x7fdel" });
+  assert.equal(ctl.model, "qwenctlnulvtdel");
+  assert.equal(norm({ available: true, model: "qwen\uffffbad\ufffemore" }).model, "qwenbadmore");
+  // ...but U+FDD0 and U+1FFFE are LEGAL XML and must survive: over-stripping
+  // would mangle a name for no reason.
+  assert.equal(norm({ available: true, model: "a\ufdd0b\u{1FFFE}c" }).model, "a\ufdd0b\u{1FFFE}c");
+  // Tab/newline/CR are legal XML and are only trimmed at the edges.
+  assert.equal(norm({ available: true, model: "  a\tb  " }).model, "a\tb");
+
+  // Not an object at all -> null, which every client reads as "cannot fail over".
+  assert.equal(norm("yes"), null);
+  assert.equal(norm([1, 2]), null);
+  assert.equal(norm(null), null);
+
+  // An agent predating the failover sends nothing; the key must stay absent
+  // rather than become an explicit null, so the payload is byte-identical.
+  const old = { device: "h" };
+  hub.normalizeLocalModel(old);
+  assert.ok(!("localModel" in old));
+});
+
+test("isPlainHostKey refuses exactly the names the hub cannot address", () => {
+  // Prototype keys (XERK-235) and URL dot segments (XERK-269): the first is not
+  // a host at all, the second is a host no /api/agents/<host>/... route can
+  // reach, because the URL parser collapses the segment before it ever matches.
+  for (const bad of ["__proto__", "constructor", "prototype", ".", "..",
+    "", "x".repeat(201), null, undefined, 12, {}, ["x"]]) {
+    assert.equal(hub.isPlainHostKey(bad), false, `${JSON.stringify(bad)} must be refused`);
+  }
+  // Padded dots ARE addressable — the padding percent-encodes to %20/%0A, which
+  // no parser collapses — so refusing them would be over-scoping the guard.
+  // Names that merely contain dots are ordinary host names.
+  for (const good of ["truenas", "WIN-DESK01", "HOST.local.", "...", ".hidden",
+    "a.b", "..host", " . ", ".\n", "\t..\n", "x".repeat(200),
+    "日本語ホスト", "host%name", "a/b"]) {
+    assert.equal(hub.isPlainHostKey(good), true, `${JSON.stringify(good)} must be accepted`);
+  }
+});
+
+test("dropUnusableHostKeys actually REMOVES the keys, in every position", () => {
+  // A source regex over the restore loop proves the call is there, not that it
+  // drops anything: removing the `delete` still printed "dropping …" while
+  // dropping nothing, and `continue`→`break` made survival depend on JSON key
+  // order. Both kept the suite green, so this asserts the mutation instead.
+  const store = {
+    ".": { device: "." }, "truenas": { device: "truenas" },
+    "..": { device: ".." }, "HOST.local.": { device: "HOST.local." },
+    "__proto__x": { device: "__proto__x" }, "...": { device: "..." },
+  };
+  // A bad key FIRST, LAST and in the MIDDLE — an early `break` survives only a
+  // fixture whose refused keys happen to lead.
+  const dropped = hub.dropUnusableHostKeys(store);
+  assert.deepEqual(dropped.sort(), [".", ".."], "both dot keys reported");
+  assert.deepEqual(Object.keys(store).sort(),
+    ["...", "HOST.local.", "__proto__x", "truenas"],
+    "the dot keys are GONE and every ordinary name survived");
+  assert.equal(Object.hasOwn(store, "."), false);
+
+  // Nothing to do is not an error, and reports nothing.
+  const clean = { truenas: {} };
+  assert.deepEqual(hub.dropUnusableHostKeys(clean), []);
+  assert.deepEqual(Object.keys(clean), ["truenas"]);
+
+  // A corrupt state file is not a registry: Object.keys("hello") is ["0".."4"],
+  // which restored a five-"agent" fleet out of a bare JSON string.
+  for (const junk of ["hello", [], null, undefined, 12, true]) {
+    assert.deepEqual(hub.dropUnusableHostKeys(junk), [],
+      `${JSON.stringify(junk)} must be left alone, not iterated`);
+  }
+});
+
+test("a refused device name is truncated before it reaches the log", () => {
+  // `sanitizeHeartbeat` does not cap `device` — only HEARTBEAT_MAX (32 MiB)
+  // does — so logging a refused key raw let two beats write 9 MiB into the hub
+  // log, synchronously, on the request path.
+  const huge = "z".repeat(5 * 1024 * 1024);
+  const line = hub.hostKeyLabel(huge);
+  assert.ok(line.length < 200, `logged ${line.length} chars for a 5 MiB key`);
+  assert.match(line, /\(5242880 chars\)/, "the real length is still reported");
+  // Short keys are logged whole, quoted, so the common case stays readable.
+  assert.equal(hub.hostKeyLabel("."), '"."');
+  assert.equal(hub.hostKeyLabel("__proto__"), '"__proto__"');
+  assert.equal(hub.hostKeyLabel(12), '"12"', "a non-string key still logs safely");
+});
+
+test("the state.json restore coerces too, not just the ingest path", () => {
+  // A hub restart is exactly when a new coercion ships, and the restore is the
+  // FIRST thing it serves. A record written before it — or belonging to an
+  // OFFLINE host, where no beat will ever rewrite it — would otherwise reach
+  // the phone raw and throw for the whole fleet. Held here rather than by
+  // booting a second hub: the loader is a bare `for` over the parsed blob, so
+  // what matters is that all three coercions are applied to a loaded record.
+  const restored = {
+    device: "old",
+    localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+    limits: { fiveHour: { usedPct: "lots" } },
+  };
+  hub.normalizeLocalModel(restored);
+  assert.deepEqual(restored.localModel,
+    { available: false, model: null, contextTokens: null });
+
+  // The durable form of "the restore can't fall behind the ingest": both go
+  // through ONE function, so there is no list here to keep in step. A previous
+  // version of this test named three coercions and therefore could not notice
+  // the fourth (`sanitizeLiveAgents`) missing from the restore — enumerating is
+  // exactly the shape that let the hole exist.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  // Anchored on the section header rather than a statement, so rewording the
+  // parse doesn't silently slice nothing and pass this whole block vacuously.
+  const loStart = src.indexOf("---- persistence");
+  const loEnd = src.indexOf("first boot or no volume");
+  assert.ok(loStart > -1 && loEnd > loStart, "the loader block must be locatable");
+  const loader = src.slice(loStart, loEnd);
+  assert.ok(/normalizeRecord\(a\)/.test(loader),
+    "the state.json restore must go through normalizeRecord, like the ingest path");
+  const ingest = src.slice(src.indexOf('url.pathname === "/api/heartbeat"'),
+    src.indexOf("ingestHistory(next, historyResults)"));
+  // The ingest reaches it through `recordCoercion` (XERK-262) so a test can
+  // force the backstop around it to run; that holder carries `normalizeRecord`
+  // itself, which is asserted directly by "the coercion holder runs the real
+  // normalizeRecord in production". So this stays a check that the ingest and
+  // the restore share ONE function, not a list of coercions to keep in step.
+  assert.ok(/recordCoercion\.normalize\(next\)/.test(ingest),
+    "the heartbeat ingest must go through the same normalizeRecord");
+  // The KEY needs the same treatment as the record, and for the same reason: a
+  // guard shipped only at ingest leaves an already-persisted bad key restored
+  // verbatim at boot. A dot-segment key is uncommandable AND undeletable, so it
+  // would sit there until prune() ages it out days later (XERK-269).
+  assert.ok(/dropUnusableHostKeys\(agents\)/.test(loader),
+    "the state.json restore must drop keys the ingest path would refuse");
+  assert.ok(/isPlainHostKey\(key\)/.test(ingest),
+    "the heartbeat ingest must go through the same key guard");
+  // ...and BETWEEN the two size measurements. Before the raw check it could
+  // shrink away the amplifier the ceiling exists to refuse (an 8 MiB string
+  // `sessions` became `[]` and the beat 200'd); after the coerced check, an
+  // EXPANDING coercion escapes the ceiling entirely (normalizeModelUsage is
+  // ~3.5x, and an 8 MiB beat parked 28 MiB per host for a week).
+  const iRaw = ingest.indexOf("rawSize > AGENT_RECORD_MAX");
+  const iCoerce = ingest.indexOf("recordCoercion.normalize(next)");
+  const iStored = ingest.indexOf("recordSize > AGENT_RECORD_MAX");
+  assert.ok(iRaw > -1 && iCoerce > iRaw && iStored > iCoerce,
+    "the ingest must measure raw size, THEN coerce, THEN measure the stored size");
+});
+
+test("the restore actually RUNS — it must not throw into its own catch", () => {
+  // The restore sits at module init inside `try { … } catch {}`, so anything it
+  // throws is swallowed: the record loads HALF-coerced, with no log line and no
+  // error anywhere. That is not hypothetical — `sanitizeLiveAgents` read two
+  // module `const`s declared 1700 lines BELOW the restore, i.e. in their
+  // temporal dead zone at that moment, so the localModel half was applied and
+  // the session half silently was not, with every suite green.
+  //
+  // Held BEHAVIOURALLY, by loading the real module against a fixture in a child
+  // process. An earlier version asserted the line order of two constants BY
+  // NAME, which a third constant walks straight past — the same enumerate-the-
+  // instances mistake that let the original hole exist.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-"));
+  const state = {
+    h1: {
+      device: "h1", online: true,
+      localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+      limits: { fiveHour: { usedPct: "lots" } },
+      sessions: [
+        null,                                        // decode-fatal element
+        { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"],
+          session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+        "not-a-session",
+      ],
+    },
+  };
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(state));
+  const out = require("child_process").execFileSync(process.execPath, ["-e", `
+    process.env.TURMA_TEST = "1";
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    // Marker-delimited: the loader logs "loaded N agents …" to stdout on the
+    // way past, and that line landing here is itself the proof it ran.
+    process.stdout.write("<<<" + JSON.stringify(hub.agents) + ">>>");
+    process.exit(0);
+  `], {
+    env: { ...process.env, TURMA_TEST: "1", STATE_FILE: path.join(dir, "state.json"),
+           ARCHIVE_DIR: path.join(dir, "a"), ARCHIVE_DB: path.join(dir, "a.db"),
+           NODE_NO_WARNINGS: "1" },
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+  assert.match(out, /loaded 1 agents from/,
+    "the restore did not run — it threw into its own catch");
+  const rec = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>"))).h1;
+  assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null });
+  assert.equal(rec.limits, null);
+  assert.equal(rec.sessions.length, 1, "non-object session elements must be dropped");
+  assert.equal(rec.sessions[0].modelSource, "");
+  assert.equal(rec.sessions[0].modelSourceAt, "");
+  assert.deepEqual(rec.sessions[0].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+});
+
+// Boot the real module against a fixture state file and hand back its `agents`.
+// Shares the child-process approach of "the restore actually RUNS" above: the
+// restore happens at module init, so nothing short of a real load exercises it.
+function bootWithState(t, raw) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-key-"));
+  fs.writeFileSync(path.join(dir, "state.json"), raw);
+  // console.warn goes to stderr, which this harness discards, so it is captured
+  // BEFORE the require — the restore runs during module init — and handed back
+  // on stdout with the agents.
+  return require("child_process").execFileSync(process.execPath, ["-e", `
+    process.env.TURMA_TEST = "1";
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(" "));
+    // The restore reports a refused file through console.error (XERK-272) and
+    // its dropped KEYS through console.warn, so both are captured here.
+    console.error = (...a) => warns.push(a.join(" "));
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    process.stdout.write("<<<" + JSON.stringify({ agents: hub.agents, warns }) + ">>>");
+    process.exit(0);
+  `], {
+    env: { ...process.env, TURMA_TEST: "1", STATE_FILE: path.join(dir, "state.json"),
+           ARCHIVE_DIR: path.join(dir, "a"), ARCHIVE_DB: path.join(dir, "a.db"),
+           NODE_NO_WARNINGS: "1" },
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
+test("a restored state file cannot carry a host the hub could not address", () => {
+  // The end-to-end form of the drop: not "the call is in the source" and not
+  // "the helper works", but a real module init over a real file. The ghost this
+  // prevents was uncommandable AND undeletable, so it outlived every route that
+  // could have cleared it (XERK-269).
+  // Written as raw JSON, not via JSON.stringify of a literal: `"__proto__":` in
+  // an object literal sets the PROTOTYPE and creates no key, so a stringified
+  // fixture silently omits the very case XERK-235 is about. JSON.parse does
+  // make it an own property, which is the real hazard.
+  const out = bootWithState(this, '{' +
+    '"__proto__":{"device":"proto"},' +
+    '".":{"device":"."},' +
+    '"truenas":{"device":"truenas"},' +
+    '"..":{"device":".."},' +
+    '"HOST.local.":{"device":"HOST.local."},' +
+    '"...":{"device":"..."}}');
+  const { agents: restored, warns } = JSON.parse(
+    out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+  assert.deepEqual(Object.keys(restored).sort(), ["...", "HOST.local.", "truenas"],
+    "dot segments and prototype keys must not survive a restore");
+  // The log line alone is NOT evidence — a drop that reports but does not
+  // delete still prints it, which is how the earlier version passed. The key
+  // list above is the proof; this only checks the operator is told at all.
+  assert.equal(warns.filter((w) => /dropping restored agent/.test(w)).length, 3);
+});
+
+test("a corrupt state file restores nothing, rather than a registry of characters", () => {
+  // `Object.keys("hello")` is ["0".."4"], so a bare JSON string loaded as "5
+  // agents". The array/number/boolean shapes are the ones that matter most:
+  // they throw nowhere on their own, so the catch's `agents = {}` reset never
+  // fires for them and only the shape check keeps them out of the registry.
+  for (const junk of ['"hello"', "[]", "12", "null", "true"]) {
+    const out = bootWithState(this, junk);
+    const { agents: restored } = JSON.parse(
+      out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+    assert.deepEqual(restored, {}, `state.json of ${junk} must restore nothing`);
+    assert.doesNotMatch(out, /loaded \d+ agents/,
+      `${junk} must not report a successful load`);
+    // ...and it SAYS so, rather than being indistinguishable from first boot.
+    const { warns } = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>")));
+    assert.ok(warns.some((w) => /state restore skipped/.test(w)),
+      `${junk} must be reported, not silently treated as first boot`);
+  }
+  // A well-formed file still loads, so the guard isn't refusing everything.
+  const ok = bootWithState(this, JSON.stringify({ truenas: { device: "truenas" } }));
+  assert.match(ok, /loaded 1 agents from/);
+});
+
+test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
+  // `[...s]` allocates per code point over the WHOLE string, so an unbounded
+  // spread let one agent-authed heartbeat with a 24 MiB name OOM-kill the hub
+  // at its deployed `mem_limit: 256m`, on repeat.
+  //
+  // Two assertions, because neither is sufficient alone. A RESOURCE BUDGET is
+  // the honest behavioural check but is nondeterministic at close margins — an
+  // earlier version used 8 MiB against 50ms/64MB and caught the reintroduced
+  // bug only 5 runs in 8, decided by whether a GC landed between the samples.
+  // So the budget runs at 32 MiB (`HEARTBEAT_MAX`, the largest a beat can carry)
+  // with ~10x headroom, and a STRUCTURAL assertion holds the ordering exactly.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const spread = src.slice(src.indexOf("const name = typeof lm.model"), src.indexOf(".slice(0, 60)"));
+  assert.match(spread, /\[\.\.\.lm\.model\.slice\(/,
+    "the model name must be bounded BEFORE the per-code-point spread");
+
+  const huge = { device: "h", localModel: { available: true, model: "x".repeat(32 << 20) } };
+  const t0 = process.hrtime.bigint();
+  hub.normalizeRecord(huge);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.equal(huge.localModel.model, "x".repeat(60));
+  // Bounded: ~0.1ms. Unbounded at this size: several hundred ms and ~600 MB.
+  assert.ok(ms < 60, `coercing a 32 MiB name took ${ms.toFixed(1)}ms — is it spreading first?`);
+});
+
+test("http: an EXPANDING coercion cannot escape the record ceiling", async () => {
+  // normalizeModelUsage rewrites `"m"` to `{model:"m"}` — ~3.5x. Measuring only
+  // the raw size let an 8 MiB beat of bare model names park 28 MiB per host for
+  // a week, in state.json, in every /api/agents response and every SSE frame:
+  // exactly the amplification the ceiling was added to stop.
+  const host = "fat-expand";
+  const models = new Array(2_000_000).fill("m");
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [], usage: { models } },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(agents[host], undefined, "a refused beat must not install a record");
+});
+
+test("http: a beat whose coercion throws is refused, never installed raw", async () => {
+  // The coercion runs AFTER `agents[key] = next`, so a throw inside it would
+  // leave the RAW record installed — worse than refusing, because every gate
+  // downstream then reads uncoerced values (`localModelAvailable` treats the
+  // string "yes" as true and hands out a switch the host cannot honour), and
+  // the poison reaches state.json where the restore chokes on it forever.
+  const host = "throw-host";
+  const res = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    // A non-iterable `repoUsage` used to throw out of normalizeUsage's `for…of`.
+    body: { device: host, sessions: [], repoUsage: { a: 1 },
+            localModel: { available: "yes" } },
+  });
+  // Either it coerces cleanly (the guards below) or it is refused — never both
+  // 4xx AND installed.
+  if (res.status !== 200) {
+    assert.equal(agents[host], undefined, "a refused beat must not install a record");
+  } else {
+    // Accepted means fully coerced — never accepted-and-raw, which is the state
+    // that defeats every gate downstream and poisons state.json.
+    assert.equal(agents[host].localModel.available, false, "served uncoerced");
+    assert.deepEqual(agents[host].repoUsage, [], "a non-array repoUsage must not be served");
+  }
+  // And the capability gate must not be fooled by the raw string either way.
+  const spawn = await request("POST", `/api/agents/${host}/sessions`, {
+    headers: userHeaders, body: { repo: "Turma", modelSource: "local" },
+  });
+  assert.equal(spawn.status, 409, "an uncoerced `available` must not pass the gate");
+});
+
+test("normalizeUsage survives a non-iterable repoUsage or sessions", () => {
+  // A bare `for (… of payload.repoUsage || [])` throws on an object, and on the
+  // restore path that throw aborts EVERY host after this one, silently.
+  for (const bad of [{ a: 1 }, "str", 7, true]) {
+    const p = { device: "h", repoUsage: bad, sessions: bad, usage: { models: ["m"] } };
+    hub.normalizeRecord(p);             // must not throw
+    // BOTH are typed lists on Android, so both are rewritten — not merely
+    // stepped around. Guarding the loop alone turned a 400 (which never
+    // installed the host) into a 200 serving a fleet-killing shape.
+    assert.deepEqual(p.sessions, []);
+    assert.deepEqual(p.repoUsage, []);
+  }
+});
+
+test("normalizeSessions coerces the per-session fields Android types", () => {
+  // Typing a field on `SessionInfo` is what makes it decode-fatal: before that
+  // `ignoreUnknownKeys` skipped it and any value was harmless. `modelSource`
+  // and `modelSourceAt` were typed by XERK-246, so they are coerced from it.
+  const payload = {
+    device: "h",
+    sessions: [
+      { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"] },
+      { id: "s2", modelSource: "local", modelSourceAt: "2026-08-11T00:00:00Z" },
+      { id: "s3", session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
+      // `session` itself, not just its `agents`. `"agents" in []` is false, so
+      // a bare `typeof live === "object"` guard neither coerces nor rejects an
+      // ARRAY here and serves it raw — `LiveSignals?` is typed on Android, so
+      // that is decode-fatal for the whole payload and blocks sign-in.
+      { id: "s5", session: [] },
+      { id: "s6", session: [1, 2] },
+      { id: "s7", session: "busy" },
+      { id: "s8", session: 7 },
+      // Every non-object shape, not a representative one. An ARRAY element is
+      // the case a `typeof s !== "object"` predicate misses (`typeof [] ===
+      // "object"`), and it is decode-fatal exactly like the other two: measured
+      // as the Android app unable to SIGN IN, because the login probe decodes
+      // /api/agents and reads the throw as "Could not reach the hub".
+      null,
+      "nope",
+      [1, 2],
+      [],
+    ],
+  };
+  hub.normalizeRecord(payload);
+  assert.equal(payload.sessions.length, 7, "every non-object ELEMENT is dropped");
+  assert.deepEqual(payload.sessions.map((s) => s.id),
+    ["s1", "s2", "s3", "s5", "s6", "s7", "s8"]);
+  // ...and every non-object `session` is REWRITTEN to null, not left raw.
+  for (const id of ["s5", "s6", "s7", "s8"]) {
+    assert.equal(payload.sessions.find((s) => s.id === id).session, null, `${id}.session`);
+  }
+  // A session that never carried `session` must not gain the key.
+  assert.equal("session" in payload.sessions.find((s) => s.id === "s1"), false);
+  assert.equal(payload.sessions[0].modelSource, "");
+  assert.equal(payload.sessions[0].modelSourceAt, "");
+  assert.equal(payload.sessions[1].modelSource, "local");        // good values untouched
+  assert.equal(payload.sessions[1].modelSourceAt, "2026-08-11T00:00:00Z");
+  assert.deepEqual(payload.sessions[2].session.agents,
+    [{ sel: true, type: "[object Object]", label: "x" }]);
+  // A session that never carried the keys must not gain them — an older agent's
+  // payload has to stay byte-identical.
+  hub.normalizeRecord({ device: "h", sessions: [{ id: "s4" }] });
+});
+
+test("heartbeat: a rogue localModel is coerced at ingest, not served raw", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "lm6", localModel: { available: "yes", contextTokens: 9999999999 } },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "lm6");
+  assert.equal(host.localModel.available, false);
+  assert.equal(host.localModel.contextTokens, null);
+  // And the whole fleet is still served — the point of coercing at ingest.
+  assert.ok(res.body.agents.length > 1);
+});
+
+
+// ---- the coercion backstop (XERK-262) ---------------------------------------
+//
+// A QA mutation pass deleted the whole try/catch around the heartbeat's
+// coercion step and the entire node suite stayed green. It was reported as a
+// gap on dead defensive code — no input could be found that made
+// `normalizeRecord` throw. Half of that turned out to be wrong: one exists, and
+// the first test below pins it. What it does NOT do is reach the backstop,
+// because `sanitizeHeartbeat` walks the same rows first and refuses the beat
+// before any record is installed. That ordering is the reason the catch looks
+// dead, so both halves are held here — the ordering, and the rollback it hides.
+
+test("heartbeat: a live-agent field with no primitive conversion never reaches the record", async () => {
+  const host = "poison-host";
+  // Pure JSON, straight off the wire: an object whose own `toString` and
+  // `valueOf` are both non-callable has NO primitive conversion. It is the one
+  // input that reaches a throw anywhere in the coercion path — which is what
+  // makes the ordering below (sanitizeHeartbeat ahead of the record install)
+  // load-bearing rather than incidental.
+  const poison = JSON.parse('{"toString":1,"valueOf":1}');
+
+  const good = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running", repo: "r" }] },
+  });
+  assert.equal(good.status, 200);
+
+  const bad = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host,
+      sessions: [{ id: "s1", status: "running", session: { agents: [{ type: poison }] } }],
+    },
+  });
+  // A DEFINITE verdict, never a 5xx and never a hang. Deliberately not pinned to
+  // one status: this beat is refused 400 while the coercion can throw, and
+  // becomes an ordinary 200 with the row dropped once XERK-278 makes
+  // `sanitizeLiveAgents` total. Both are correct; what must never change is that
+  // the poisoned row does not survive and the hub keeps serving.
+  assert.ok(bad.status === 200 || bad.status === 400, `unexpected ${bad.status}`);
+  const live = agents[host].sessions[0].session;
+  assert.deepEqual(live ? live.agents : [], []);
+  // Still answering — the throw must not have escaped the request handler.
+  assert.equal((await request("GET", "/api/agents", { headers: userHeaders })).status, 200);
+});
+
+test("heartbeat: a coercion that throws rolls the record back rather than banking it raw", async () => {
+  const host = "coercion-throw-host";
+  const real = hub.recordCoercion.normalize;
+
+  // A first beat the host is entitled to keep.
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running", repo: "before" }] },
+  })).status, 200);
+
+  hub.recordCoercion.normalize = () => {
+    throw new TypeError("coercion blew up");
+  };
+  try {
+    const r = await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: host, sessions: [{ id: "s1", status: "running", repo: "after" }] },
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.error, "malformed heartbeat");
+  } finally {
+    hub.recordCoercion.normalize = real;
+  }
+
+  // `agents[key] = next` has ALREADY run by the time the coercion is called, so
+  // without the rollback the RAW, uncoerced record stays installed and is what
+  // every client is served — which is the whole reason the catch exists.
+  assert.equal(agents[host].sessions[0].repo, "before");
+});
+
+test("heartbeat: a coercion that throws on a host's FIRST beat leaves no record at all", async () => {
+  const host = "coercion-throw-first";
+  const real = hub.recordCoercion.normalize;
+  hub.recordCoercion.normalize = () => {
+    throw new TypeError("coercion blew up");
+  };
+  try {
+    const r = await request("POST", "/api/heartbeat", {
+      headers: agentHeaders,
+      body: { device: host, sessions: [{ id: "s1", status: "running", repo: "r" }] },
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    hub.recordCoercion.normalize = real;
+  }
+  // No `prev` to restore, so the half-installed record must be DELETED. Leaving
+  // it would put a host on the dashboard whose payload never passed a coercion.
+  assert.ok(!(host in agents));
+});
+
+test("heartbeat: the coercion holder runs the real normalizeRecord in production", () => {
+  // The seam must not become a place a coercion can be quietly unhooked: what
+  // the holder carries by default IS the function every client's decode depends
+  // on, and the two tests above only prove the catch given that it is.
+  assert.equal(hub.recordCoercion.normalize, hub.normalizeRecord);
+});
+
+// ---- XERK-278: an unstringifiable value must never kill the process ---------
+//
+// `String(x)` throws `TypeError: Cannot convert object to primitive value` for a
+// value with no usable primitive conversion, and pure JSON can express one:
+// `{"toString":1,"valueOf":1}` has both hooks as own, NON-CALLABLE properties.
+//
+// `sanitizeLiveAgents` took that straight off an `/agent/control` WebSocket
+// frame, inside a `socket.on("data")` listener with no try/catch above it and no
+// process-level `uncaughtException` handler — so ONE frame exited node, and
+// DockerOps' `restart: unless-stopped` turned that into an outage loop of the
+// whole control plane. The socket only needs the ordinary single-user web login
+// (`agentWsAuthorized` falls back to `agentAuthorized` falls back to
+// `userAuthorized`), which is reachable through the public tunnel.
+//
+// These run in the SAME process as the rest of the suite, so a regression does
+// not fail one assertion — it takes the entire test run down with it. That is
+// the intended signal.
+
+const UNSTRINGIFIABLE = JSON.parse('{"toString":1,"valueOf":1}');
+
+test("sanitizeLiveAgents: an unstringifiable field is dropped, never thrown on", () => {
+  // The `type` decides whether the row survives at all, so an unconvertible one
+  // reads as absent and the row goes — exactly what a blank type already gets.
+  assert.deepEqual(sanitizeLiveAgents([{ type: UNSTRINGIFIABLE }]), []);
+  // A `label` is display-only, so the row survives with a blank label rather
+  // than being dropped: losing the row would lose the "an agent is running"
+  // signal that `hasLiveAgents` reads.
+  assert.deepEqual(
+    sanitizeLiveAgents([{ type: "qa", label: UNSTRINGIFIABLE }]),
+    [{ sel: false, type: "qa", label: "" }]
+  );
+  // Good rows beside a poisoned one still come through.
+  assert.deepEqual(
+    sanitizeLiveAgents([{ type: UNSTRINGIFIABLE }, { type: "Explore", label: "look" }]),
+    [{ sel: false, type: "Explore", label: "look" }]
+  );
+  // The ordinary coercions are unchanged.
+  assert.deepEqual(sanitizeLiveAgents([{ type: 42 }]), [{ sel: false, type: "42", label: "" }]);
+});
+
+test("control WS: a poisoned agent row does not kill the hub", async () => {
+  const host = "poison-ctrl";
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({
+    turn: "s1", text: "hi", agents: [{ type: UNSTRINGIFIABLE }],
+  }))));
+
+  // The proof is that anything at all still answers afterwards. Before the fix
+  // the process was gone by this point and no assertion ran.
+  await waitFor(() => true, 200);
+  const alive = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(alive.status, 200);
+  ctrl.socket.destroy();
+});
+
+test("control WS: a non-string session id is refused, not used as a property key", async () => {
+  // `liveFanout` does `liveClients[host]?.[sessionId]`, and coercing an object
+  // to a property key runs the same ToPrimitive. It only bites once a viewer
+  // socket exists for the host (the optional chain short-circuits otherwise), so
+  // this test opens one first — which is why the frame handler now type-checks
+  // the id rather than relying on `safeString` alone.
+  const host = "poison-key";
+  agents[host] = {
+    device: host, online: true, lastSeen: Date.now(),
+    sessions: [{ id: "pk1", status: "running", repo: "r", worktreePath: "/w",
+      transcriptId: "conv-pk1", session: { tail: [] } }],
+  };
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  const token = await issueToken();
+  const live = await wsConnect(`/live/${host}/pk1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+
+  for (const frame of [
+    { turn: UNSTRINGIFIABLE, text: "hi" },
+    { tail: UNSTRINGIFIABLE, entries: [] },
+  ]) {
+    ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(frame))));
+  }
+
+  await waitFor(() => true, 200);
+  const alive = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(alive.status, 200);
+  live.socket.destroy();
+  ctrl.socket.destroy();
+  delete agents[host];
+});
+
+test("heartbeat: the same poison on the ingest path is dropped, not crashed on", async () => {
+  // The third caller. It was never the crash — the request handler's catch
+  // turned the throw into a 400 — so the fix CHANGES its answer: the coercion no
+  // longer throws, so the beat is now an ordinary 200 with the poisoned row
+  // dropped. The pre-existing XERK-262 case above deliberately accepts either
+  // status and asserts only the invariant (no poisoned row survives, the hub
+  // keeps serving); this one pins the post-fix contract exactly, so a future
+  // change back to refusing the whole beat has to be deliberate.
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: "poison-ingest",
+      sessions: [{ id: "s1", status: "running", session: { agents: [{ type: UNSTRINGIFIABLE }] } }],
+    },
+  });
+  assert.equal(r.status, 200);
+  // The poisoned row is dropped; the beat is otherwise honoured.
+  assert.deepEqual(agents["poison-ingest"].sessions[0].session.agents, []);
 });

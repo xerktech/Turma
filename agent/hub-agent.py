@@ -240,6 +240,16 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # large sessions; the guard is a backstop, not an expected limit (XERK-101).
 MIGRATION_BLOB_MAX = int(os.environ.get("TURMA_MIGRATION_BLOB_MAX", str(1 << 26)))  # 64 MiB
 
+# How many staged session-start refusals (XERK-265) a beat may carry, and how
+# long one reason may be. Neither is a normal limit — a refusal only exists where
+# a command was declined, and the reasons are one line. They are here because the
+# reason can interpolate an exception (`the session failed to launch: {e}`) whose
+# text is unbounded, and it lands in a hub cache that COUNTS against the record
+# ceiling: an 8 MiB beat would wedge this host's control plane. Matches the 500
+# `_set_error` already truncates a session's errorMsg to.
+SPAWN_FAILURES_MAX = 40
+SPAWN_FAILURE_REASON_MAX = 500
+
 
 def _project_slug(path):
     """Claude Code's project-dir slug for a cwd: EVERY non-alphanumeric
@@ -1107,10 +1117,22 @@ def build_limits_settings(python_exe=None, statusline_path=None):
 _HOSTNAME_PLACEHOLDERS = {"", "localhost", "unknown-device", "docker-desktop"}
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12}$|^[0-9a-f]{64}$")
 
+# A name that is a URL dot segment is UNADDRESSABLE, not merely ugly: percent-
+# encoding leaves "." and ".." untouched (they are unreserved), and the URL
+# parser resolving /api/agents/<host>/... then collapses the segment away — so
+# the host heartbeats and looks online while every route against it 404s, with
+# nothing pointing at the name as the cause (XERK-269). Rejecting it here makes
+# the agent fall through to its next naming source instead.
+_DOT_SEGMENT_NAMES = {".", ".."}
+
 
 def _usable_hostname(name):
     name = (name or "").strip()
     if name.lower() in _HOSTNAME_PLACEHOLDERS:
+        return ""
+    if name in _DOT_SEGMENT_NAMES:
+        log(f"ignoring device name {name!r}: a URL dot segment is unaddressable "
+            "on /api/agents/<host>/... routes")
         return ""
     if _CONTAINER_ID_RE.match(name):
         return ""
@@ -1242,10 +1264,19 @@ def device_name():
     #      / WSL2 path, where the container is isolated from the host name.
     #   5. socket.gethostname() — only when it isn't a container id (the
     #      "fe0e38df73b4" bug); inside a container it usually is, so it's rejected.
+    # An explicit override deliberately outranks _usable_hostname()'s placeholder
+    # rules — an operator naming a host "localhost" means it. But a dot segment is
+    # unaddressable no matter who chose it (XERK-269), so that one check still
+    # applies here; the name is dropped and detection continues below.
     for env in ("DEVICE_NAME", "COMPUTERNAME"):
         name = os.environ.get(env, "").strip()
-        if name:
-            return name
+        if not name:
+            continue
+        if name in _DOT_SEGMENT_NAMES:
+            log(f"ignoring ${env}={name!r}: a URL dot segment is unaddressable "
+                "on /api/agents/<host>/... routes")
+            continue
+        return name
     try:
         with open("/host/etc/hostname") as f:
             name = _usable_hostname(f.read())
@@ -5796,6 +5827,13 @@ def _http_error_detail(err):
             msg = str(parsed.get("message") or "").strip()
             if not msg:
                 msg = "; ".join(str(m) for m in (parsed.get("errorMessages") or []))
+            # The TURMA HUB says {"error": ...} — same need, same function: its
+            # refusals name the host a credential is for and whether
+            # TURMA_AGENT_STRICT is on (XERK-268), and the status line alone
+            # cannot say either. Checked AFTER both tracker shapes, so adding it
+            # cannot change what an existing Jira/ADO failure reports.
+            if not msg:
+                msg = str(parsed.get("error") or "").strip()
             errors = parsed.get("errors")
             if not msg and isinstance(errors, dict):
                 msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
@@ -8506,6 +8544,15 @@ class SessionManager:
         # same held-across-a-failed-POST lifecycle as jira_issue_results.
         self.create_meta_results = []
         self.create_ticket_results = []
+        # Staged refusals of a command that was supposed to PRODUCE a session
+        # (XERK-265) — each `{cmdId, migrationId, error, at}`, same lifecycle as
+        # the results above. A resume/import this agent declined used to be a
+        # container log line and nothing more: the command is ACKed either way,
+        # so the hub saw a session that simply never arrived and a migration sat
+        # in `importing` until MIGRATE_TIMEOUT_MS, failing with no reason. The
+        # cmdId is what the UI followed the spawn by; the migrationId is what the
+        # hub's migration bookkeeping keys on.
+        self.spawn_failures = []
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -10224,7 +10271,7 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def resume(self, sid):
+    def resume(self, sid, cmd_id=None):
         """Bring back a KILLED session with its conversation: re-register it and
         relaunch claude in its kept worktree, resuming its newest transcript
         (re-adding a detached worktree off the recorded base only if the dir has
@@ -10278,7 +10325,13 @@ class SessionManager:
         # A prune removing this very worktree would leave claude running in a
         # half-unlinked dir, so the registration and that check are one step.
         if not self._claim_worktree(sess["worktreePath"], sess):
-            log(f"resume refused: {sess['worktreePath']} is being pruned")
+            # Same prune race as _resume_at_cwd's, and reported the same way. The
+            # PAGE can't consume this one yet — a killed resume keeps its id, so
+            # the dashboard deep-links `?session=<id>`, whose wait never times
+            # out (XERK-275). Staging it still gets the refusal off the container
+            # log and onto the wire, where that fix will read it.
+            self._refuse_start(f"a prune is removing the worktree at "
+                               f"{sess['worktreePath']}", cmd_id=cmd_id)
             return
         self.closed = [c for c in self.closed if c.get("id") != sid]
         try:
@@ -10308,7 +10361,8 @@ class SessionManager:
         in spawn(): a resume-by-transcript creates a session whose id the hub
         can't predict, so that's the UI's only handle on the one it asked for."""
         if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
-            log(f"resumeTranscript: bad transcript id {transcript_id!r}")
+            self._refuse_start(f"bad transcript id {transcript_id!r}",
+                               cmd_id=cmd_id, context="resumeTranscript")
             return
         # Find the transcript dir: trust the picker's cwd hint if it still holds
         # the file, else scan PROJECTS_ROOT for it.
@@ -10320,7 +10374,8 @@ class SessionManager:
         if proj is None:
             proj = self._find_transcript_dir(transcript_id)
         if proj is None:
-            log(f"resumeTranscript: no transcript {transcript_id}")
+            self._refuse_start(f"no transcript {transcript_id} on this host",
+                               cmd_id=cmd_id, context="resumeTranscript")
             return
         path = os.path.join(proj, transcript_id + ".jsonl")
         cwd = _transcript_cwd(path) or cwd_hint
@@ -10358,7 +10413,37 @@ class SessionManager:
         extra = {"modelSource": closed.get("modelSource")} if closed else None
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
-    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None):
+    def _refuse_start(self, reason, *, cmd_id=None, migration_id=None,
+                      context="resume"):
+        """Log a refused session-creating command AND stage it for the next beat
+        so whatever asked for it learns why (XERK-265).
+
+        Every one of these paths used to end at a `log()` the hub never saw: the
+        command is ACKed regardless, so a refused resume left the Sessions page
+        spinning out its follow window and a refused migration import left the
+        move in `importing` until MIGRATE_TIMEOUT_MS, failing with no reason
+        attached. `reason` is therefore operator-facing — it is what the UI and
+        the migration record show, so it says WHY, not just that it failed.
+
+        A refusal with neither handle is logged only: `cmdId`/`migrationId` are
+        the correlation, and a malformed migration id (the very field being
+        rejected) has nothing to report against."""
+        log(f"{context} refused: {reason}")
+        if not cmd_id and not migration_id:
+            return
+        self.spawn_failures.append({
+            "cmdId": cmd_id,
+            "migrationId": migration_id,
+            # Truncated for the same reason _set_error truncates errorMsg: a
+            # reason can carry an exception's text, and this one rides the beat
+            # into a hub cache that counts against the record ceiling.
+            "error": reason[:SPAWN_FAILURE_REASON_MAX],
+            "at": now_iso(),
+        })
+        del self.spawn_failures[:-SPAWN_FAILURES_MAX]
+
+    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None,
+                       migration_id=None):
         """Launch `claude --resume <transcript_id>` cwd'd at `cwd`, the shared
         core of resume_transcript (host-local resume-any) and import_session
         (a session migrated in from another agent). The transcript file must
@@ -10371,20 +10456,27 @@ class SessionManager:
         `extra` carries fields a plain resume-any has no source for but a
         migration does — the session's ticket, name, model and mode — so the
         moved session lands looking like its old self rather than an anonymous
-        resume. Returns the new session record, or None if it couldn't launch."""
+        resume. Returns the new session record, or None if it couldn't launch —
+        and every such refusal is staged for the hub by `_refuse_start`, since
+        both callers discard the return value and the command is ACKed anyway.
+        `migration_id` is passed by import_session so the hub can fail THAT
+        migration now instead of waiting out its timeout."""
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd_id, migration_id=migration_id)
+
         # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
         # path reach git/tmux.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"resume: cwd {cwd!r} not resumable on this host")
+            refuse(f"cwd {cwd!r} is not resumable on this host")
             return None
         repo, _origin, is_root = cls
         cwd = os.path.normpath(cwd)
         if self._running_count() >= MAX_SESSIONS:
-            log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
             return None
         if is_root and self._root_running():
-            log("resume refused: a root session is already running")
+            refuse("a root session is already running on this host")
             return None
         # One live session per cwd: two claudes in the same dir share a project
         # slug + RC bridge pointer and would collide (the same reason root is
@@ -10393,11 +10485,11 @@ class SessionManager:
         if any(s.get("status") == "running"
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
-            log(f"resume refused: a session is already running in {cwd}")
+            refuse(f"a session is already running in {cwd}")
             return None
         repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
         if not is_root and not os.path.isdir(repo_path):
-            log(f"resume: repo {repo!r} is gone; cannot resume")
+            refuse(f"repo {repo!r} is gone from this host")
             return None
         extra = extra or {}
         sid = self._new_id()
@@ -10443,7 +10535,10 @@ class SessionManager:
         # removing right now — the dir still exists for most of that removal, so
         # the isdir check below would skip the re-add and launch into it.
         if not self._claim_worktree(cwd, sess):
-            log(f"resume refused: {cwd} is being pruned")
+            # THE refusal this ticket exists for: ordinary timing between two
+            # features the operator is not thinking about, so it must not read
+            # as "the migration randomly hung for the timeout" (XERK-256).
+            refuse(f"a prune is removing the worktree at {cwd}")
             return None
         try:
             # A deleted/pruned Turma worktree (or a migrated session, whose
@@ -10466,6 +10561,11 @@ class SessionManager:
             return sess
         except Exception as e:
             self._set_error(sess, e)
+            # The record survives carrying the error, but it is `status:"error"`
+            # — the hub's migration handoff waits for a RUNNING session with this
+            # cmdId, so without this the move waits out its timeout exactly like
+            # a refusal above.
+            refuse(f"the session failed to launch: {e}")
             return None
 
     # --- session migration across hosts (XERK-101) ------------------------
@@ -10484,24 +10584,31 @@ class SessionManager:
         if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
             log(f"exportSession: bad migration id {migration_id!r}")
             return
+        # Every refusal below is staged against the migration id (XERK-265): the
+        # hub is waiting on a blob that will never arrive, and without a reason
+        # the move sits in `exporting` for the whole MIGRATE_TIMEOUT_MS.
+        def refuse(reason):
+            self._refuse_start(reason, migration_id=migration_id,
+                               context="exportSession")
         sess = self._find(session_id)
         if not sess:
-            log(f"exportSession: no such session {session_id}")
+            refuse(f"no such session {session_id} on the source host")
             return
         path = _session_transcript_path(sess)
         if not path or not os.path.isfile(path):
-            log(f"exportSession: session {session_id} has no transcript to move")
+            refuse(f"session {session_id} has no transcript to move")
             return
         try:
             blob = self._pack_transcript(path)
         except Exception as e:
-            log(f"exportSession: pack failed for {session_id}: {e}")
+            refuse(f"packing the transcript failed: {e}")
             return
         if len(blob) > MIGRATION_BLOB_MAX:
-            log(f"exportSession: transcript bundle {len(blob)} bytes exceeds "
-                f"{MIGRATION_BLOB_MAX}; migration aborted")
+            refuse(f"the transcript bundle is {len(blob)} bytes, over the "
+                   f"{MIGRATION_BLOB_MAX} limit")
             return
-        self._migration_upload(migration_id, blob)
+        if not self._migration_upload(migration_id, blob):
+            refuse("uploading the transcript bundle to the hub failed")
 
     def import_session(self, cmd):
         """Target half of a migration: pull the transcript bundle the source
@@ -10517,21 +10624,30 @@ class SessionManager:
         # below use this localized cwd, so they stay self-consistent.
         cwd = self._localize_migrated_cwd(cmd.get("cwd"))
         if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
+            # The one refusal with nothing to report against — the migration id
+            # IS the handle, and this is it being rejected.
             log(f"importSession: bad migration id {migration_id!r}")
             return
+        # Everything past here is staged against the migration id (XERK-265) so
+        # advanceMigrations can fail the move now, with a reason, instead of the
+        # operator watching it hang for MIGRATE_TIMEOUT_MS.
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd.get("cmdId"),
+                               migration_id=migration_id,
+                               context="importSession")
         if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
-            log(f"importSession: bad transcript id {transcript_id!r}")
+            refuse(f"bad transcript id {transcript_id!r}")
             return
         # Classify the cwd BEFORE spending a download — a foreign path or a
         # missing repo can't be resumed here, and the hub already vetted the org
         # + repo, so this only trips on a genuinely inconsistent target.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"importSession: cwd {cwd!r} not resumable on this host")
+            refuse(f"cwd {cwd!r} is not resumable on this host")
             return
         blob = self._migration_download(migration_id)
         if blob is None:
-            log(f"importSession: could not fetch bundle for {migration_id}")
+            refuse("fetching the transcript bundle from the hub failed")
             return
         slug_dir = os.path.join(PROJECTS_ROOT,
                                 _project_slug(os.path.normpath(cwd)))
@@ -10539,7 +10655,7 @@ class SessionManager:
             os.makedirs(slug_dir, exist_ok=True)
             self._unpack_transcript(blob, slug_dir)
         except Exception as e:
-            log(f"importSession: unpack failed for {migration_id}: {e}")
+            refuse(f"unpacking the transcript bundle failed: {e}")
             return
         extra = {
             "ticket": cmd.get("ticket"),
@@ -10551,8 +10667,8 @@ class SessionManager:
             "modelSource": cmd.get("modelSource"),
             "migratedFrom": cmd.get("migratedFrom"),
         }
-        self._resume_at_cwd(transcript_id, cwd,
-                            cmd_id=cmd.get("cmdId"), extra=extra)
+        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
+                            extra=extra, migration_id=migration_id)
 
     def _pack_transcript(self, path):
         """Bundle a transcript file (+ its subagents/ dir, if any) into gzipped
@@ -10615,9 +10731,17 @@ class SessionManager:
 
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,
-        agent-authed). Best-effort: once the retries below are spent, a failure
-        leaves the migration to time out hub-side rather than raising into the
-        command loop."""
+        agent-authed). Returns True on success; a failure is reported (never
+        raised into the command loop) so the caller can tell the hub rather than
+        leaving the move to time out.
+
+        Retries a 5xx first. A bundle is the largest body an agent ever sends,
+        so it is the one most likely to meet the hub's in-flight budget and be
+        told 503 "busy, try again" (XERK-258); nothing else would retry it, and
+        the hub deliberately holds the migration in `exporting` on that refusal
+        so a re-POST can still land. 4xx is NOT retried: the hub parsed the
+        bundle and declined it, and the same bytes would be refused the same
+        way."""
         headers = {"Content-Type": "application/octet-stream",
                    "User-Agent": "hub-agent/1.0"}
         if TURMA_TOKEN:
@@ -10632,17 +10756,18 @@ class SessionManager:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     resp.read()
                 log(f"migration {migration_id}: uploaded {len(blob)} bytes")
-                return
+                return True
             except Exception as e:
                 code = getattr(e, "code", None)
                 transient = not isinstance(code, int) or code >= 500
                 last = attempt >= self.MIGRATION_UPLOAD_ATTEMPTS
                 if not transient or last:
                     log(f"migration upload failed for {migration_id}: {e}")
-                    return
+                    return False
                 log(f"migration {migration_id}: upload attempt {attempt} failed "
                     f"({e}) — retrying")
                 time.sleep(self.MIGRATION_UPLOAD_BACKOFF_SEC * attempt)
+        return False
 
     def _migration_download(self, migration_id):
         """GET a transcript bundle from the hub's migration relay. Returns the
@@ -13579,7 +13704,7 @@ class SessionManager:
                 elif ctype == "restart":
                     self.restart(cmd.get("sessionId"))
                 elif ctype == "resume":
-                    self.resume(cmd.get("sessionId"))
+                    self.resume(cmd.get("sessionId"), cmd_id=cid)
                 elif ctype == "resumeTranscript":
                     self.resume_transcript(
                         cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
@@ -14583,6 +14708,8 @@ class SessionManager:
             payload["createMetaResults"] = list(self.create_meta_results)
         if self.create_ticket_results:
             payload["createTicketResults"] = list(self.create_ticket_results)
+        if self.spawn_failures:
+            payload["spawnFailures"] = list(self.spawn_failures)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -14622,7 +14749,16 @@ class SessionManager:
             self.ticket_status_results.clear()  # delivered — same lifecycle
             self.create_meta_results.clear()  # delivered — same lifecycle
             self.create_ticket_results.clear()  # delivered — same lifecycle
+            self.spawn_failures.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
+        except urllib.error.HTTPError as e:
+            # urllib stringifies an HTTPError to just its status line and throws
+            # the body away — and for a REFUSED beat that body is the only thing
+            # that says why (XERK-268: whose token this is, whether the hub is
+            # strict). A rollover that goes wrong otherwise reads as a bare
+            # "HTTP Error 403: Forbidden" and a host that silently vanishes.
+            log(f"heartbeat failed: {_http_error_detail(e)}")
+            return None
         except Exception as e:
             log(f"heartbeat failed: {e}")
             return None
@@ -14665,6 +14801,8 @@ class SessionManager:
                 resp.read()
             log(f"announced updating to hub (reason={reason or 'restart'}"
                 f"{', v' + version if version else ''})")
+        except urllib.error.HTTPError as e:
+            log(f"updating announce failed (continuing shutdown): {_http_error_detail(e)}")
         except Exception as e:
             log(f"updating announce failed (continuing shutdown): {e}")
 

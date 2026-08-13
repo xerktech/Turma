@@ -66,6 +66,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -266,6 +268,10 @@ fun ChatScreen(
                     onMicStop = vm::stopDictation,
                     onModel = vm::setModel,
                     onMode = vm::setMode,
+                    localModel = state.localModel,
+                    modelSource = state.modelSource(),
+                    canSwitchModelSource = state.canSwitchModelSource(),
+                    onModelSource = vm::setModelSource,
                     onAttach = vm::attach,
                     onRemoveAttachment = vm::removeAttachment,
                 )
@@ -583,6 +589,10 @@ private fun ChatFooter(
     onMicStop: () -> Unit,
     onModel: (String) -> Unit,
     onMode: (String) -> Unit,
+    localModel: com.xerktech.turma.model.LocalModelInfo?,
+    modelSource: String,
+    canSwitchModelSource: Boolean,
+    onModelSource: (String) -> Unit,
     onAttach: (List<android.net.Uri>) -> Unit,
     onRemoveAttachment: (String) -> Unit,
 ) {
@@ -600,8 +610,36 @@ private fun ChatFooter(
         // shows (newest first — the freshest link leads), matching the web footer
         // chip (chat.js prFooterChip); FlowRow wraps them on a narrow phone.
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
+            // On the local model the Claude alias picker is not just useless but
+            // harmful — every alias it offers is one that endpoint refuses — so
+            // the chip states the fixed model instead (web: cc-model-fixed).
+            if (com.xerktech.turma.core.ModelSource.modelPickable(modelSource)) {
+                MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
+            } else {
+                StaticChip(
+                    "model: ${com.xerktech.turma.core.ModelSource.label(modelSource, localModel)}",
+                    why = "Fixed by this host's self-hosted model configuration. "
+                        + "Switch \"run\" back to the subscription to choose a Claude model.",
+                )
+            }
             MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
+            // "Run against" — the local-model failover (XERK-246). Hidden on a
+            // host whose agent doesn't report one, exactly as the 📎 is hidden on
+            // one that can't take files: the hub 409s the command either way.
+            if (canSwitchModelSource) {
+                val opts = com.xerktech.turma.core.ModelSource.options(localModel)
+                MenuChip(
+                    label = com.xerktech.turma.core.ModelSource.glyph(modelSource) + " run: " +
+                        com.xerktech.turma.core.ModelSource.label(modelSource, localModel),
+                    options = opts.map { it.first },
+                    onSelect = onModelSource,
+                    optionLabel = { v -> opts.firstOrNull { it.first == v }?.second ?: v },
+                    // A local session is marked, and in the warn colour: it is a
+                    // weaker model, and nobody should have to wonder which one
+                    // wrote a turn.
+                    accent = modelSource == com.xerktech.turma.core.ModelSource.LOCAL,
+                )
+            }
             session?.prs?.asReversed()?.forEach { PrBadge(it) }
         }
         // Files staged for the next message, above the box so adding one doesn't
@@ -743,20 +781,61 @@ private fun MenuSectionHeader(label: String) {
     )
 }
 
+/**
+ * A compose-bar setting: the current value, tapped to open its menu.
+ *
+ * [optionLabel] separates what a row READS from the value it SENDS, for a
+ * setting whose wire value isn't a label ("subscription" → "Claude
+ * subscription"). [accent] tints the chip for a value worth noticing.
+ */
 @Composable
-private fun MenuChip(label: String, options: List<String>, onSelect: (String) -> Unit) {
+private fun MenuChip(
+    label: String,
+    options: List<String>,
+    onSelect: (String) -> Unit,
+    optionLabel: (String) -> String = { it },
+    accent: Boolean = false,
+) {
     var open by remember { mutableStateOf(false) }
     Box {
         Text(
             label,
             Modifier
-                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                .background(
+                    if (accent) com.xerktech.turma.ui.theme.TurmaColors.waiting.copy(alpha = 0.22f)
+                    else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    RoundedCornerShape(6.dp),
+                )
                 .clickable { open = true }
                 .padding(horizontal = 8.dp, vertical = 4.dp),
             style = MaterialTheme.typography.bodySmall,
         )
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            options.forEach { o -> DropdownMenuItem(text = { Text(o) }, onClick = { onSelect(o); open = false }) }
+            options.forEach { o ->
+                DropdownMenuItem(text = { Text(optionLabel(o)) }, onClick = { onSelect(o); open = false })
+            }
         }
+    }
+}
+
+/** A compose-bar chip stating a setting that isn't the operator's to change. */
+@Composable
+private fun StaticChip(label: String, why: String) {
+    // An inert chip beside two live ones reads as broken unless it says why. The
+    // web puts this in a hover title; a phone has no hover, so it goes to the
+    // accessibility layer. It has to sit on a MERGING wrapper rather than on the
+    // Text itself — Text writes its own semantics last, so a contentDescription
+    // in the same modifier chain never reaches the tree.
+    Box(
+        Modifier
+            .semantics(mergeDescendants = true) { contentDescription = "$label. $why" }
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }

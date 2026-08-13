@@ -20,6 +20,7 @@ that component's files.
 | `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | container boot, start-time Claude Code check, bundled toolchains |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
+| `.claude/rules/turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
 | `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
@@ -184,8 +185,42 @@ One agent container per host, multiplexing sessions across every repo it scans.
   repo-cloned + running/non-root/has-conversation, single-flight per session. State is in-memory; a
   hub restart mid-move aborts it, leaving the source intact. **The target must already have the repo
   cloned** (v1).
+- **The bundle NEVER rides in the hub's heap** (XERK-263): the relay spools it to `MIGRATE_SPOOL_DIR`
+  (`/data/migrations`) and streams it back out, so a 65 MiB move costs a hub capped at 256 MiB a
+  buffer rather than a quarter of its memory. The record keeps only the path/size; every settle,
+  timeout and failure unlinks it, and boot sweeps the dir (nothing there outlives a restart usefully).
+  `MIGRATE_INFLIGHT_MAX` bounds the disk that burst can hold — refused where a move STARTS, since the
+  agent's upload is best-effort with no retry and refusing THAT strands the migration.
 - Tests: `TestMigrateSession`, `server.test.js`, the Move cases in `sessions.test.js`,
   `eligibleMoveTargets` in android `SessionsTest`.
+
+### A refused session start is REPORTED, never just logged (XERK-265)
+
+- **A command is ACKed whether the agent ran it or declined it**, so a refusal the agent only
+  `log()`s is indistinguishable from a slow spawn: the move sat in `importing` until
+  `MIGRATE_TIMEOUT_MS` and failed with no reason, and the Sessions page spun out `SPAWN_FOLLOW_MS`.
+- Every refusal in `_resume_at_cwd`, `import_session` and `export_session` therefore goes through
+  **`_refuse_start`**, staging `{cmdId, migrationId, error}` onto the beat's **`spawnFailures`** with
+  the same held-across-a-failed-POST lifecycle as `ticketStatusResults`. The `error` is
+  operator-facing — it is what the UI and the migration record show.
+- Hub-side `ingestSpawnFailures` caches it per cmdId as **`spawnRefusals`** (served with the record,
+  NOT stripped like the other caches — the client following that spawn is who needs it) and stamps
+  `m.refusal`, which `advanceMigrations` applies **after** its handoff check, so a success always
+  wins the tie. Absent = "that agent can't tell", i.e. the old timeout wait, on both halves. The
+  Sessions page mirrors that order: the session lookup runs first and clears `pendingSpawn`.
+- **Both handles are checked against what the HUB knows, never taken on the agent's word** — the
+  migrationId against that move's own src/target, the cmdId against the queue that host was actually
+  given. All agents share one token, so unchecked either one lets any host fail another host's move
+  or end its spawn wait with arbitrary text.
+- **The reason is length-capped at both ends** (agent `SPAWN_FAILURE_REASON_MAX`, hub
+  `SPAWN_FAILURE_ERROR_MAX`). It interpolates exception text, and `spawnRefusals` is the first
+  served cache that `agentRecordSize` COUNTS while the ceiling check runs BEFORE the ingest: one
+  unbounded reason lands, pushes the record past `AGENT_RECORD_MAX`, and then 413s every later beat
+  from that host — including the ones that would have swept it (XERK-235's failure class).
+- A refusal with neither handle stays a log line: the id being rejected IS the correlation.
+- **Every refusal on a session-creating path is expected to go through it**, including `resume()`'s
+  — the prune handshake (`_claim_worktree`, XERK-256) is the one this exists for, and it is ordinary
+  timing rather than operator error. A new refusal that only `log()`s re-opens the bug.
 
 ## Cross-cutting contracts
 
@@ -222,10 +257,30 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   `_entry_blocks`/`entryBlocks`, `_entry_text`, `transcript_tail`, `_busy_from_capture`/
   `paneShowsBusy`, `_fold_queue_op`/`foldQueueOp`, `_send_user_file_detail`/`sendUserFileDetail`.
   Both live in `agent/`; parity-tested in `tunnel-agent.test.js`.
+  - **`device_name`/`deviceName` + `_usable_hostname`/`usableHostname` are on that list too.** They
+    must resolve the SAME name: `openChannel` keys `controlChannels` by it, so a tunnel and a
+    manager under different names is a host whose commands work while its terminal, live tail and
+    heartbeat poke are dead — and a ghost card `DELETE` cannot reach. `entrypoint.sh` exports an
+    operator-set `DEVICE_NAME` to both processes unvalidated, so an env-path divergence is the one
+    that bites. Tests: `TestDeviceName`, `usableHostname`/`deviceName` in `tunnel-agent.test.js`.
 - **The heartbeat is the wire contract** between `hub-agent.py` and `turma/server.js` (and through
   it every client). A field older agents don't send must degrade, never break: clients gate on the
   capability flag the agent reports (`inputMaxChars`, `uploadMaxBytes`, `github.available`,
   `capacity`), and an absent flag means "that agent can't do it", not "unlimited".
+  - **A full `/api/agents` decode is ATOMIC on Android**, so one host's wrong-typed field throws for
+    the whole array — the poll fails silently while the app keeps its last snapshot and the tile
+    still says "N / N online". Per-agent SSE events decode individually, so the bad host is simply
+    missing from the list while SSE is healthy; with SSE down too, the raw decoder exception
+    replaces the screen. **Most of the payload is served raw**, so this is a live hazard, not a
+    solved one: grep `normalize`/`sanitize` in `turma/server.js` for what is actually covered rather
+    than trusting a list here, which has been wrong repeatedly.
+  - **A field becomes decode-fatal the moment a client TYPES it** — until then `ignoreUnknownKeys`
+    skips it and any value is harmless. So typing one on `SessionInfo`/`AgentInfo` and adding its
+    hub-side coercion are the SAME change; `normalizeRecord` is where it goes, and it runs on both
+    the heartbeat ingest and the `state.json` restore (a restart is when a coercion ships, and the
+    restore is the first thing it serves). Coerce to the "can't tell you" value every client already
+    handles, never to a plausible default. A `normalize*` is a WHITELIST — a sub-key a newer agent
+    adds is dropped fleet-wide unless it is added there too.
 - **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses
   commands with a status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host
   offline, 404 stale attachment, 413 too long, 429 queue full); a client that reads the body and
@@ -239,93 +294,45 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
     a refusal, and folding them together burned 60s and then said nothing.
   - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+- **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
+  agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
+  the tunnel's `?name=` — and each agent runs on its OWN token,
+  `<base64url(device)>.<HMAC(TURMA_AGENT_TOKEN, device)>`, which the hub re-derives against the host
+  that was named. **The token NAMES its host on purpose**: an HMAC can't be inverted, so a bare
+  digest could only be checked once the host was known, and `/api/heartbeat` — whose host is buried
+  in a 32 MiB body — would have had to admit any bearer before reading it.
+  - **Scoping a route to a host is not a security check on its own.** Under one fleet-shared token
+    `<host>` was self-asserted, so `m.srcHost !== host` refused a caller naming ITSELF and passed one
+    naming the victim; `device` was the same, so any token-holder could beat as another host and be
+    handed the commands queued for it. Both halves — the scope AND the binding — or neither is worth
+    stating. Never write a comment claiming a `<host>` compare keeps one agent out of another's data
+    without checking the credential is bound.
+  - That is also why a **per-relay one-time secret is not the fix** and must not be re-proposed: it
+    would ride on exactly the commands an impersonated heartbeat hands out.
+  - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
+    **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
+    `.claude/rules/turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
 - **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers**
   (XERK-258, XERK-273). It runs at `mem_limit: 256m`, so a flat constant larger than that can never
   refuse anything before the OOM killer fires — which is how a flat 128 MiB upload ceiling and an
   unbounded socket count each killed the fleet's whole control plane, `restart: unless-stopped`
   looping the outage. `containerMemoryLimit()` reads the cgroup; everything derives from it and is
-  logged at boot. Raising `mem_limit` in DockerOps widens them with no code change.
-  - **A body is charged `BODY_PARSE_COST` x its wire size, not its wire size.** The bill is the JS
-    string plus what `JSON.parse` builds beside it; charging wire bytes admitted two 30 MiB beats
-    against a 64 MiB budget and OOM'd anyway. Raw (Buffer) bodies keep 1x — nothing parses them.
-  - **Two lanes: the shared budget, and ONE big body at a time** (`bodyLaneFor`). The big lane is
-    what makes the hub's own advertised ceilings reachable — keyed instead on the hub being
-    bit-for-bit idle, one trickling request refused a real 65 MiB migration bundle with 3 KB in
-    flight, and `HEARTBEAT_MAX` promised a 32 MiB beat that no concurrent moment accepted. A ceiling
-    only reachable on a perfectly idle hub is not a ceiling.
-  - **The lane is re-judged on every top-up, not latched.** A shared-lane body that stops fitting is
-    promoted to the big lane if free, else refused. Deciding once and then charging blindly is how
-    two 30 MiB beats grew past the ceiling together with the budget nominally in force.
-  - **Only bytes that ARRIVED are ever charged; a declared `Content-Length` is checked, never
-    charged.** Reserving on the declaration wedged every POST route into 503 from one silent socket
-    — no bandwidth, no credentials (`/api/login` reads a body before any auth gate), renewable. A
-    claim that is never held is never denied to anyone else.
-  - **An OVERSIZE body is deliberately NOT refused on its declaration** — it is read to `cap` first.
-    Refusing early makes Node close the connection under a request still being written, and a client
-    that writes before reading (python urllib — what `hub-agent.py` posts with) loses the response
-    and sees a socket error, which is exactly XERK-235's offline loop. The budget is what bounds it:
-    those bytes are charged like any other, so a flood is refused 503 before buffering.
-  - **`BODY_INFLIGHT_TOTAL_MAX` covers BOTH lanes, and must exceed one max-size body's full parse
-    cost.** One ceiling, not two: two independent ones have to be ADDED to know the worst case and
-    nobody does that arithmetic when tuning one. Making the lanes genuinely independent silently
-    moved the true worst case to `shared + a whole big body` and the 256-concurrent flood began
-    OOM-killing a hub that had survived it for four commits. The headroom above one max body is what
-    ordinary traffic runs in while the exclusive lane is held, so that inequality is load-bearing —
-    `BODY_INFLIGHT_MAX * BODY_PARSE_COST < BODY_INFLIGHT_TOTAL_MAX`, asserted in the suite.
-  - **The per-request ceiling only ever TIGHTENS** (`min(sanity bound, limit/8)`); only the TOTAL
-    budget widens with the container, because that is what buys concurrency. Deriving the
-    per-request one purely from the limit hands a big host an 8 GB single-body ceiling.
+  logged at boot. Raising `mem_limit` in DockerOps widens them with no code change. The mechanics
+  are in `.claude/rules/turma-limits.md`; what spans components is here:
   - **413 and 503 mean opposite things and must not be collapsed**: 413 is "your body is too big,
     send less", 503 is "the hub is momentarily full, send it again". Every `readRawBody` caller has
     to draw the distinction itself — both did answer a flat 413 once. On a 503 the migration relay
-    HOLDS the migration in `exporting`, and `_migration_upload` retries (5xx only); nothing else
-    would, and a lost bundle strands the move.
-  - **Draining a refused body is capped by CONCURRENCY** (`DRAIN_CONCURRENCY_MAX`), and past the cap
-    the refusal closes the connection (`endRefusedConnection`, after `finish` so the status is on
-    the wire first). Draining is unbuffered but not free — Node allocates per read, and 256 sockets
-    streaming past a refusal OOM-killed the hub with nothing buffered. The cap is a COUNT, not a
-    byte budget: the cost is concurrent read churn. Under it, the one oversize beat a real fleet
-    produces still drains and still gets its 413.
-  - **A refused body must be closed, not merely paused.** Node DUMPS an unread body when the
-    response finishes, to keep the connection alive — it resumes the paused stream and reads the
-    whole thing. Discarded bytes are still read into memory.
-  - **A body holding budget must keep making PROGRESS or it is taken back** — `BODY_MIN_PROGRESS_
-    BYTES` per `BODY_IDLE_TIMEOUT_MS`, i.e. a minimum RATE (~3 KiB/s at the defaults), armed only
-    while a charge is held. The budget bounds how much may be held; only this bounds how long.
-    - A window reset by ANY byte is not a liveness check, it is one an attacker forges: one byte
-      every 15s held the big lane indefinitely — refusing every POST including the operator's login
-      — for ~0.5 bit/s, since renewing never had to re-stream. Reclaiming only silence is not
-      enough; a dribble is neither silent nor slow.
-    - The floor gives way to what the body has LEFT, so a nearly-complete upload is never reclaimed
-      over its last bytes. That is not exploitable: holding a big charge needs a large remainder.
-    - **Reclaim fires only under CONTENTION** (`budgetUnderPressure`), judged PER LANE: the shared
-      budget over half spent, or — for a big-lane body — always, since that lane is exclusive. With
-      room to spare a slow caller is left alone; dropping it would be a pure false positive.
-  - **The two lanes are accounted SEPARATELY**, and that is the point of having lanes. Billed to the
-    shared budget, merely OCCUPYING the big lane was a TOTAL outage — the big body's own charge
-    exceeds the budget, so a 200-byte heartbeat and the operator's own login were refused behind it,
-    one authenticated socket holding the control plane down for ~29 kbit/s. Kept apart, a big body
-    delays only bodies that themselves need the lane.
-    - **A promoted body's charge MOVES lanes with it** (`migrateToBigLane`). A read admitted to the
-      shared lane and later promoted owns one lane but was billed to two, and `release()` can only
-      name the lane it ENDED in — so one legitimate 22 MiB heartbeat leaked the whole shared budget
-      permanently, and every non-trivial body was refused for the life of the process. A charge must
-      live entirely in the lane its read currently occupies; then release is right by construction.
-  - **`BIG_LANE_MAX_HOLD_MS` bounds how long one body may occupy the lane, however well it
-    behaves.** The progress floor cannot close this: a body dribbling AT the floor is byte-for-byte
-    indistinguishable from a legitimate slow migration at the same rate, so no rate threshold
-    separates them. This is the orthogonal bound — not "are you progressing" but "you have had it
-    long enough" — sized well above a 65 MiB bundle at any sane rate.
-  - **Known gap (XERK-287): held UPLOADS are still a budget of their own, outside that ceiling**, so
-    the true worst case is `in-flight + uploads` — 192 MiB of a 256 MiB container — and the flood
-    row OOMs once attachments are staged beside it. The rule above applies to itself here; closing
-    it is a sizing decision with user-visible cost, not a code fix. Chunked bodies also bypass the
-    declared-length pre-check, and capping undeclared concurrency is only safe once it's known
-    whether the Cloudflare tunnel preserves agent framing — measure before capping.
-  - `server.maxConnections` bounds the socket count, which no byte budget can: each socket costs a
-    read buffer, parser and req/res objects before a body byte arrives. It counts the upgraded
-    WebSockets too, so the number must clear steady-state SSE/tunnel/terminal use with room spare —
-    set it too low and the UI breaks looking like a network fault, which is why drops are logged.
+    HOLDS the migration in `exporting`, and `_migration_upload` retries (5xx only, never 4xx);
+    nothing else would, and a lost bundle strands the move.
+  - **An OVERSIZE body is deliberately NOT refused on its declaration.** Refusing early makes Node
+    close the connection under a request still being written, and a client that writes before
+    reading — python urllib, which is what `hub-agent.py` posts with — loses the response and sees a
+    socket error. That is exactly XERK-235's offline loop, so this is an agent-facing contract, not
+    a hub detail: test agent refusals with urllib, never with fetch.
+  - **Known gap (XERK-287): held UPLOADS are a budget of their own, outside the in-flight ceiling**,
+    so the true worst case is `in-flight + uploads` — 192 MiB of a 256 MiB container — and the flood
+    row OOMs once attachments are staged beside it. Closing it is a sizing decision with
+    user-visible cost (the upload relay, `HEARTBEAT_MAX`, or `mem_limit`), not a code fix.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 
@@ -430,14 +437,19 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 ## Deployment (DockerOps, not here)
 
 - `compose/turma-truenas.yaml` defines the `turma` service and a single per-host `agent-host`
-  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, the shared
-  `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
+  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, that host's OWN
+  `TURMA_TOKEN` (`node turma/server.js --agent-token <device>` against the hub's master
+  `TURMA_AGENT_TOKEN`; `TURMA_AGENT_STRICT` on the hub once every host has one — see XERK-268 in the
+  contracts above), the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
   basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
   env — usage is counted in tokens per model, so there is no rate table.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
+  - It also carries the migration spool (`MIGRATE_SPOOL_DIR`), which is transient by design and
+    shares that volume's SPACE with the archive — hence `MIGRATE_INFLIGHT_MAX`. No compose change:
+    both default under `/data`.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
   `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
   the agent reports `localModel.available:false` so clients hide the control.

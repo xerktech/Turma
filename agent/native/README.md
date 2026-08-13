@@ -115,7 +115,12 @@ Edit `~/.config/turma-agent/turma-agent.env` (created `chmod 600` — it holds a
 token):
 
 - **`TURMA_URL`** — the hub's public URL.
-- **`TURMA_TOKEN`** — must equal the hub's `TURMA_AGENT_TOKEN`.
+- **`TURMA_TOKEN`** — this host's own agent token, printed on the hub by `node
+  turma/server.js --agent-token <DEVICE_NAME>`. It is derived from the hub's
+  `TURMA_AGENT_TOKEN` **and the device name below**, so the two must agree —
+  re-derive it if you change `DEVICE_NAME`. The hub's raw `TURMA_AGENT_TOKEN`
+  also works unless the hub sets `TURMA_AGENT_STRICT`, but then this agent can
+  act as any host in the fleet.
 - **`DEVICE_NAME`** — seeded to `$(hostname)`; the hub keys the agent by it.
 - Leave `REPOS_ROOT` / `CLAUDE_PROJECTS_ROOT` **blank** to accept the
   HOME-relative defaults (`$HOME/git`, `$HOME/.claude/projects`).

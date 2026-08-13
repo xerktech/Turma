@@ -100,6 +100,42 @@ When you touch one of these web files, check its Android counterpart:
   update. The key is deliberately in the public repo; Play App Signing supersedes it on Play.
 - Tests: `core/UpdateTest.kt`.
 
+## Testing the call sites (XERK-262)
+
+`core/` is gated by plain JVM tests; **`vm/` and `ui/` are gated by Robolectric**, in the
+`test/` source set — not `androidTest/`.
+
+- **Compose and ViewModel tests MUST stay in `test/`.** `testDebugUnitTest` is the only Android
+  gate CI runs (`android-ci.yml`); `androidTest` needs an emulator job this repo doesn't have, so a
+  test moved there gates nothing. `testOptions.unitTests.isIncludeAndroidResources = true` is what
+  makes `createComposeRule` work at all, and the test JVM is pinned to `maxHeapSize = "2g"` —
+  Gradle's 512m default OOMs during the FIRST composition.
+- **Pin `@Config(sdk = [35])`, matching `compileSdk`/`targetSdk`.** Robolectric downloads a ~190MB
+  `android-all` per SDK level, so a class left on a different level makes CI fetch a second one for
+  no fidelity gain. Move these with `compileSdk`.
+- **Never set `@Config(qualifiers = …)` on a Compose test.** Measured: any screen-size qualifier
+  puts Compose into a composition loop that never goes idle, and every test in the class then fails
+  after a 60s Espresso timeout rather than on an assertion. Use `performScrollTo` for a node below
+  the fold instead; a row inside a `LazyColumn` is UNCOMPOSED rather than merely off-screen, so
+  that one needs `performScrollToNode` on the scrollable.
+- **`harness/HubHarness`** points `Config` at a `MockWebServer` after the app has started —
+  `HubClient` rebuilds its Retrofit on a base-URL change, so no production seam is needed. Drive the
+  fleet with `seedFleet()`, which awaits `FleetRepository.refresh()` directly rather than waiting on
+  the 6s poll. It FAILS LOUD on a fixture that doesn't decode, because `/api/agents` decodes
+  atomically and `refresh()` swallows the throw into an empty fleet with an error string.
+- **Use the real HTTP stack, not a fake `HubApi`.** The refusals these tests exist to cover are a
+  409 with a JSON `error` body, which is exactly what `hubErrorMessage` digs a reason out of; a fake
+  proves only that the fake was called.
+- **`harness/MainDispatcherRule` defaults to `UnconfinedTestDispatcher`** so a ViewModel's
+  `viewModelScope.launch` runs eagerly and assertions need no `advanceUntilIdle()` — a forgotten one
+  is a test that passes against state nothing has written yet. It does NOT make the network
+  synchronous: join the `Job` a VM action returns, or use `awaitValue`/`collectMessages`.
+- **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** —
+  the state copy is a mirror the VM rebuilds, so a mirror assertion passes on a change that dropped
+  the real thing.
+- Tests: `vm/ChatModelSourceTest`, `vm/FleetOutcomeTest`, `ui/SpawnComposerTest`,
+  `ui/ChatModelChipsTest`, `ui/SessionsPaneSpawnTest`, `ui/FleetSpawnLocalModelTest`.
+
 ## Building
 
 - Gradle (wrapper generated in CI, not committed); PR-gated by `android-ci.yml` on `ubuntu-latest`,
