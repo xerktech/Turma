@@ -3369,7 +3369,9 @@ class TestSubscriptionIdentity(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, ".claude.json")
         ha._subscription_cache = {}
+        ha._subscription_last_problem = {}
         self.addCleanup(setattr, ha, "_subscription_cache", {})
+        self.addCleanup(setattr, ha, "_subscription_last_problem", {})
 
     def _write(self, data, path=None):
         with open(path or self.path, "w", encoding="utf-8") as fh:
@@ -3463,6 +3465,20 @@ class TestSubscriptionIdentity(unittest.TestCase):
         os.unlink(self.path)
         os.mkdir(self.path)
         self.assertIsNone(self._read())
+
+    def test_two_bad_paths_at_once_do_not_bury_the_log(self):
+        # The read walks EVERY candidate, so two simultaneously-bad paths
+        # alternate messages — a single-slot memo never matches either and logs
+        # both on every beat, which is thousands of lines a day and the exact
+        # burial the memo exists to prevent.
+        second = os.path.join(self.dir, "second.json")
+        os.mkdir(self.path)                 # a directory where the config should be
+        os.mkfifo(second)                   # and a FIFO at the other layout
+        lines = []
+        with mock.patch.object(ha, "log", lines.append):
+            for _ in range(5):
+                self.assertIsNone(ha.subscription_identity(paths=[self.path, second], env={}))
+        self.assertEqual(len(lines), 2, lines)   # one per path, once each
 
     @unittest.skipUnless(os.path.exists("/dev/zero"), "needs /dev/zero")
     def test_an_endless_device_is_refused_without_being_read(self):

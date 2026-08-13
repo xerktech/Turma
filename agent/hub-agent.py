@@ -1565,15 +1565,19 @@ SUBSCRIPTION_KEY_CHARS = 16
 # almost never changes, so re-parsing it every beat would be pure waste; a
 # changed mtime/size is what invalidates this, so a re-login is picked up.
 _subscription_cache = {}
-_subscription_last_problem = None
+# path -> the last problem logged about it. Keyed per PATH, not one global last
+# message: the read walks every candidate, so two simultaneously-bad paths (a
+# directory at one, a FIFO at the other) alternate messages and a single-slot
+# memo never matches — which is thousands of lines a day, the exact burial this
+# exists to prevent. Bounded by CLAUDE_CONFIG_PATHS, which is fixed and short.
+_subscription_last_problem = {}
 
 
-def _log_subscription_problem(msg):
-    """Log a bad config file ONCE per distinct problem — this runs every beat,
-    and a permanently unreadable file would otherwise bury the log."""
-    global _subscription_last_problem
-    if msg != _subscription_last_problem:
-        _subscription_last_problem = msg
+def _log_subscription_problem(path, msg):
+    """Log a bad config file ONCE per distinct problem per path — this runs
+    every beat, and a permanently unreadable file would otherwise bury the log."""
+    if _subscription_last_problem.get(path) != msg:
+        _subscription_last_problem[path] = msg
         log(msg)
 
 
@@ -1633,7 +1637,7 @@ def _subscription_from_config(path):
     # device at that path is equally not the file being looked for.
     if not stat.S_ISREG(st.st_mode):
         _log_subscription_problem(
-            f"claude config at {path} is not a regular file; ignoring it")
+            path, f"claude config at {path} is not a regular file; ignoring it")
         return None
     sig = (st.st_mtime_ns, st.st_size)
     cached = _subscription_cache.get(path)
@@ -1650,7 +1654,7 @@ def _subscription_from_config(path):
             text = fh.read(SUBSCRIPTION_CONFIG_MAX_BYTES + 1)
         if len(text) > SUBSCRIPTION_CONFIG_MAX_BYTES:
             _log_subscription_problem(
-                f"claude config at {path} is implausibly large; not reading it")
+                path, f"claude config at {path} is implausibly large; not reading it")
         else:
             account = (json.loads(text) or {}).get("oauthAccount") or {}
             account_uuid = account.get("accountUuid")
@@ -1659,7 +1663,7 @@ def _subscription_from_config(path):
                          "source": "login"}
     except Exception as e:
         _log_subscription_problem(
-            f"claude config at {path} unreadable ({e}); "
+            path, f"claude config at {path} unreadable ({e}); "
             "this host will not be grouped by subscription")
     _subscription_cache[path] = (sig, block)
     return block

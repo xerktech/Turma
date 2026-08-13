@@ -179,7 +179,10 @@ which makes an `android/` change part of the same PR) live there.
     catch, and the WHOLE registry is emptied — then the 30s save timer rewrites `state.json` from
     only the hosts that have re-beaten, losing every host offline at that moment. XERK-301 shipped
     exactly that and it is invisible to `server.test.js`, which walks the loader's body rather than
-    booting; `registry-restore.test.js` boots a hub over a fully-populated record instead.
+    booting; `registry-restore.test.js` boots a hub instead — over **two** records, one usable and
+    one unusable in every coerced field, since a `const` on an error BRANCH is invisible to a
+    fixture that only ever takes the happy one (and would then fire only on malformed records, in
+    production).
   - Tests: `usage.test.js`, the `limits` and subscription-key heartbeat cases in `server.test.js`,
     android `UsageViewModelTest`.
 

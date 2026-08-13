@@ -183,15 +183,28 @@ test("every field the restore coerces is reachable from the restore's own line",
   // coerced block at once. It is a BOOT test on purpose: server.test.js walks
   // the loader's body directly and cannot see a TDZ that only exists at
   // require time.
+  // TWO records, because a `const` on an error BRANCH is invisible to a fixture
+  // that only ever takes the happy one: `solo` carries a usable value for every
+  // coerced field (including the optional sub-keys), `junk` an unusable one, so
+  // both sides of each normalize* actually run at boot.
   const populated = tmp("state-populated");
   fs.writeFileSync(populated, JSON.stringify({
     solo: {
       key: "solo", device: "solo", lastSeen: Date.now(), repos: [],
       sessions: [{ id: "s1", usage: { models: [{ model: "m", totals: {} }] } }],
       usage: { models: [{ model: "m", totals: {} }] },
-      limits: { fiveHour: { usedPct: 12 }, capturedAt: 1_786_400_000 },
+      limits: { fiveHour: { usedPct: 12 }, sevenDay: { usedPct: 30, resetsAt: 1_786_950_000 },
+                capturedAt: 1_786_400_000, source: "statusline" },
       subscription: { key: "abc123", source: "login" },
       localModel: { available: true, model: "qwen", contextTokens: 128000 },
+    },
+    junk: {
+      key: "junk", device: "junk", lastSeen: Date.now(), repos: [],
+      sessions: [{ id: "s2", usage: { models: "nope" } }],
+      usage: { models: [{ model: 7 }] },
+      limits: { fiveHour: { usedPct: "lots" }, capturedAt: "soon" },
+      subscription: { key: 7, source: 9 },
+      localModel: { available: "yes", contextTokens: "many" },
     },
   }));
   // A successful restore logs its own "loaded N agents" line to stdout, so the
@@ -199,7 +212,10 @@ test("every field the restore coerces is reachable from the restore's own line",
   const probe = `
     const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
     process.stdout.write("<<" + JSON.stringify({
-      keys: Object.keys(hub.agents), sub: hub.agents.solo && hub.agents.solo.subscription,
+      keys: Object.keys(hub.agents).sort(),
+      sub: hub.agents.solo && hub.agents.solo.subscription,
+      junkSub: hub.agents.junk && hub.agents.junk.subscription,
+      junkLimits: hub.agents.junk && hub.agents.junk.limits,
     }) + ">>");
   `;
   const r = require("child_process").spawnSync(process.execPath, ["-e", probe], {
@@ -209,6 +225,9 @@ test("every field the restore coerces is reachable from the restore's own line",
   assert.equal(r.stderr.includes("state restore skipped"), false,
     `the restore must survive a fully-populated record:\n${r.stderr}`);
   const out = JSON.parse(r.stdout.match(/<<([\s\S]*)>>/)[1]);
-  assert.deepEqual(out.keys, ["solo"]);
+  assert.deepEqual(out.keys, ["junk", "solo"]);
   assert.deepEqual(out.sub, { key: "abc123", source: "login" });
+  // And the unusable half really did go through the coercions' other branch.
+  assert.equal(out.junkSub, null);
+  assert.equal(out.junkLimits, null);
 });

@@ -322,17 +322,28 @@ test("a window read earlier than the card's stamp says so on its own row", () =>
 });
 
 test("a hostile device name lands as TEXT, never as markup", () => {
-  // The label concatenates several agent-supplied device names, and the tooltip
-  // repeats them — agents are authenticated but a host names itself.
+  // The label concatenates several agent-supplied device names, and BOTH the
+  // heading tooltip and the per-window "read … ago" tooltip repeat them —
+  // agents are authenticated, but a host names itself.
   const evil = '<img src=x onerror="window.__xss=1">';
   const card = H.limitCard(H.limitGroups([
-    { device: evil, ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
-    { device: "alpha", ...sub("k1"), limits: { capturedAt: NOW - 1, fiveHour: { usedPct: 5 } } },
+    // The hostile host is the OLDER one, so its name reaches the window
+    // tooltip as well as the heading.
+    { device: evil, ...sub("k1"), limits: { capturedAt: NOW - 600, sevenDay: { usedPct: 44 } } },
+    { device: "alpha", ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
   ], NOW)[0], NOW);
   const host = card.children[0].children[0];
-  assert.equal(host.textContent, `${evil} · alpha`);
-  assert.equal(host.innerHTML, "", "the name must never be assigned as markup");
+  assert.equal(host.textContent, `alpha · ${evil}`);
   assert.match(host.title, /alpha/);
+  // No node anywhere in the card may have taken any of it as markup — the
+  // heading, the head tooltip and the window's "read … ago" tooltip all carry
+  // host names, and only the first of those had a test.
+  const walk = (el) => [el, ...(el.children || []).flatMap(walk)];
+  for (const el of walk(card)) {
+    assert.equal(el.innerHTML, "", "nothing in the card may be assigned as markup");
+  }
+  assert.ok(walk(card).some((el) => (el.title || "").includes(evil)),
+    "the window tooltip must actually name the host its reading came from");
 });
 
 test("limitHostLabel names the hosts, counting the tail past a few", () => {

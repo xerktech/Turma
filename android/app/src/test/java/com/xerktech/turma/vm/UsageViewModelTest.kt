@@ -398,6 +398,21 @@ class UsageViewModelTest {
         assertEquals(now - 900, card.sevenDayAt)  // older, so the row says so
     }
 
+    @Test fun `the five-hour row discloses its own read time too`() {
+        // The web renders both windows through one loop; this screen has two
+        // separate LimitRow call sites, so covering only the 7d one leaves the
+        // 5d half free to regress. Same fleet as above with the windows swapped.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", device = "old", subscription = sub("k1"),
+                limits = limits(now - 900, five = LimitWindow(usedPct = 80.0))),
+            AgentInfo(key = "new", device = "new", subscription = sub("k1"),
+                limits = limits(now - 30, seven = LimitWindow(usedPct = 12.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(now - 900, card.fiveHourAt)
+        assertEquals(now - 30, card.sevenDayAt)
+    }
+
     @Test fun `a long host list gives way to a count`() {
         val fleet = FleetState(agents = (1..5).map {
             AgentInfo(key = "h$it", device = "h$it", subscription = sub("k1"),
