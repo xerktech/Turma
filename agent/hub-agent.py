@@ -1686,10 +1686,15 @@ def _project_transcripts(proj):
             if not entry.is_dir():
                 continue          # a *.jsonl dir still gets its subagents read
             sub = os.path.join(entry.path, "subagents")
-            if not os.path.isdir(sub):
+            if not os.path.isdir(sub) or os.path.islink(sub):
                 continue
-            # followlinks stays off (the default): these dirs are written by
-            # Claude Code, but a walk that follows a symlink can be made to loop.
+            # `followlinks=False` only stops os.walk following links it finds
+            # BELOW its top; it always descends the top itself. So the `islink`
+            # above is what refuses a `subagents` SYMLINK — pointed at
+            # PROJECTS_ROOT it drags every transcript on the host into one slug,
+            # and pointed at an ancestor it re-reads the slug's own conversations
+            # flagged as delegated. No writer creates one (the guard denies
+            # ~/.claude), so this is hardening, not a live path.
             for dirpath, _dirs, files in os.walk(sub):
                 for name in sorted(files):
                     path = os.path.join(dirpath, name)

@@ -328,13 +328,32 @@ test("subagentCard takes the share against reporting spend WITHIN one series", (
 test("subagentCard measures its coverage caveat in SPEND, not in series", () => {
   // Same mixed series: one series, so "N of M series" would say nothing at all.
   const html = cardHtml([series(usage(1000, 250), usage(3000))]);
-  assert.match(html, /taken against the 1\.0k spent by hosts that report the split/);
-  assert.match(html, /a further 3\.0k is from hosts that can't/);
+  assert.match(html, /hosts that can't report one are left out of that row/);
+  assert.match(html, /3\.0k not covered/);
+});
+
+test("subagentCard states coverage PER ROW, since windows differ", () => {
+  // A skewed fleet: the reporting host spent all-time but almost nothing today,
+  // the one that can't is the reverse. One card-wide figure would claim ~100%
+  // coverage over a Today row that is covered 0.001%.
+  const win = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+  const reporting = {
+    totals: win(1_000_000), today: win(10), week: win(10), days: {}, models: [],
+    subagent: { totals: win(250_000), today: win(5), week: win(5) },
+  };
+  const blind = { totals: win(1000), today: win(900_000), week: win(900_000), days: {}, models: [] };
+  const html = cardHtml([series(reporting), series(blind)]);
+  assert.match(html, /1\.0k not covered/);      // all-time: only 1k missing
+  assert.match(html, /900\.0k not covered/);    // today: nearly everything is
+  // …and the shares themselves stay per-window honest.
+  assert.match(html, /50\.0%/);                 // today: 5 of 10
+  assert.match(html, /25\.0%/);                 // all-time: 250k of 1M
 });
 
 test("subagentCard stays quiet about coverage when every token is covered", () => {
   const html = cardHtml([series(usage(1000, 250)), series(usage(2000, 500))]);
   assert.doesNotMatch(html, /hosts that can't/);
+  assert.doesNotMatch(html, /not covered/);
   assert.match(html, /25\.0%/);   // 750 of 3000
 });
 

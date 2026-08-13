@@ -1022,17 +1022,52 @@ class TestSubagentUsage(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["sessions"], 0)
         self.assertEqual(rep["subagent"]["totals"]["input"], 20)
 
-    def test_a_fifo_named_like_a_transcript_is_skipped_not_opened(self):
+    def test_a_fifo_named_like_a_transcript_is_never_ENUMERATED(self):
         # A FIFO (or a symlink to /dev/zero) blocks a plain read forever, and
         # this walk is the cheap place to refuse it — the usage parse runs on the
         # heartbeat's critical path, where a block is a host that reads offline.
+        #
+        # **Asserted on the enumeration, which never opens anything.** Asserting
+        # it through the parse instead makes a regression HANG the suite rather
+        # than fail it: CI then burns its whole job timeout and reports as
+        # infrastructure flake instead of as this test going red.
         os.mkfifo(os.path.join(self.proj, "pipe.jsonl"))
         os.mkfifo(self._sub("main", "agent-pipe.jsonl"))
         write_jsonl(os.path.join(self.proj, "main.jsonl"),
                     [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
-        rep = self._report()   # would hang forever if either were opened
-        self.assertEqual(rep["totals"]["input"], 100)
-        self.assertEqual(rep["sessions"], 1)
+        self.assertEqual(ha._project_transcripts(self.proj), [("main.jsonl", False)])
+
+    def test_the_parse_itself_completes_over_a_fifo(self):
+        # The end-to-end half of the test above, run on a DAEMON thread with a
+        # join timeout so a lost guard fails here instead of hanging the suite.
+        os.mkfifo(os.path.join(self.proj, "pipe.jsonl"))
+        os.mkfifo(self._sub("main", "agent-pipe.jsonl"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        out = {}
+        t = threading.Thread(target=lambda: out.update(self._report()), daemon=True)
+        t.start()
+        t.join(20)
+        if t.is_alive():
+            self.fail("the usage parse blocked on a FIFO named like a transcript")
+        self.assertEqual(out["totals"]["input"], 100)
+        self.assertEqual(out["sessions"], 1)
+
+    def test_a_subagents_SYMLINK_is_refused_outright(self):
+        # os.walk always descends its own top, so followlinks=False does not
+        # cover this one. Pointed at PROJECTS_ROOT it would drag every
+        # transcript on the host into this slug.
+        os.makedirs(os.path.join(self.proj, "main"))
+        other = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(other)
+        write_jsonl(os.path.join(other, "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 999)])
+        os.symlink(other, os.path.join(self.proj, "main", "subagents"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 100)   # the foreign 999 stays out
+        self.assertEqual(rep["subagent"]["totals"], ha._usage_bucket())
 
     def test_a_symlink_loop_under_subagents_does_not_hang_or_raise(self):
         sub = os.path.join(self.proj, "main", "subagents")

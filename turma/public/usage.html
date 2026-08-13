@@ -1037,10 +1037,14 @@ function subagentCard(list) {
   h.textContent = "Delegated to sub-agents";
   card.append(h);
 
-  const sub = blankSplit(), of = blankSplit();
-  let reporting = 0, spentAll = 0;
+  // `all` is every visible series' spend, `of` only the part that came with a
+  // split. Both are kept PER WINDOW: coverage differs window by window (a host
+  // that can't report may have spent nothing all-time and everything today), so
+  // one figure describing all three rows would contradict two of them.
+  const sub = blankSplit(), of = blankSplit(), all = blankSplit();
+  let reporting = 0;
   for (const s of list) {
-    spentAll += dayTokens(s.usage?.totals);
+    addSplit(all, s.usage);
     if (!s.usage?.subagent) continue;
     reporting++;
     addSplit(sub, s.usage.subagent);
@@ -1059,13 +1063,17 @@ function subagentCard(list) {
   // The coverage caveat is measured in SPEND, not in series: a single series
   // merges every host that ran that repo, so "1 of 2 series" can hide a series
   // three quarters of whose tokens came from a host that cannot report a split.
-  const unreported = spentAll - dayTokens(of.totals);
+  // It is stated PER ROW rather than once for the card, because a single
+  // all-time figure claiming ~100% coverage sat above a Today row that was
+  // covered 0.001%.
+  const missing = (w) => dayTokens(all[w]) - dayTokens(of[w]);
+  const anyMissing = ["totals", "today", "week"].some((w) => missing(w) > 0);
   const note = document.createElement("div");
   note.className = "note";
-  note.textContent = unreported > 0
-    ? `Already counted in every figure above. The share is taken against the ${
-        fmtTokens(dayTokens(of.totals))} spent by hosts that report the split — a further ${
-        fmtTokens(unreported)} is from hosts that can't, and is left out rather than counted as zero.`
+  note.textContent = anyMissing
+    ? "Already counted in every figure above. Each share is taken against the spend that came "
+      + "with a split; hosts that can't report one are left out of that row rather than counted "
+      + "as zero, and what they spent is named beside it."
     : "Already counted in every figure above — this is the part of it spent by background agents.";
   card.append(note);
 
@@ -1078,10 +1086,12 @@ function subagentCard(list) {
         const spent = dayTokens(of[w]);
         // No spend in the window is "nothing to take a share of", not 0%.
         const share = spent ? (dayTokens(sub[w]) / spent) * 100 : null;
+        const gap = missing(w);
         return `<tr><td>${label}</td>${tokenCell(sub[w])}` +
           `<td class="total-col${share === null ? " zero" : ""}"><span class="tok">${
             share === null ? "–" : share.toFixed(1) + "%"}</span>${
-            share === null ? "" : `<span class="sub-tok">of ${fmtTokens(spent)}</span>`}</td></tr>`;
+            share === null ? "" : `<span class="sub-tok">of ${fmtTokens(spent)}</span>`}${
+            gap > 0 ? `<span class="sub-tok">${fmtTokens(gap)} not covered</span>` : ""}</td></tr>`;
       }).join("")}</tbody>
   </table>`;
   card.append(scroll);
