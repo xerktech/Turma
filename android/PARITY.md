@@ -492,6 +492,17 @@ those are marked `[MODEL]`.
   rescoping.~~ Both done (XERK-78, see Done above); series colors are the categorical palette now.
 - P1 Move "By model" out of the grouping tabs into a standalone "Tokens by model" card (Today / Last
   7 days / All-time). Add a collapsible table view with the in/out and cache splits.
+- **`fmtTokens` must agree digit for digit on both platforms**, and there are three copies of it:
+  `turma/public/usage.html`, `turma/public/index.html` and `ui/UsageScreen.kt`. The same fleet
+  figures head the Usage page, the dashboard tiles and both Android screens, so a formatter that
+  disagrees shows one number in the browser and another on the phone with nothing to say which is
+  right. Two traps, both of which the obvious implementation falls into: rounding a float (Java's
+  `%.1f` rounds the shortest decimal HALF_UP, JS `toFixed` rounds the binary double — they part
+  company on every `.x5` boundary, ~1% of values), and Java's `format` following the **device
+  locale** (`1,2k` in de_DE, `١٫٢k` in ar_EG). Both sides now do integer arithmetic and build the
+  string by hand. The web copies must also never return a non-numeric input verbatim — `tokenCell`
+  interpolates the result into `innerHTML`. Tests: `fmtTokens` cases in `turma/tests/usage.test.js`
+  ↔ `ui/FmtTokensTest.kt`, sharing vectors.
 - The **headline totals** (Today / This week / All-time, with the all-time cache split under them)
   are at parity. Android had them first and the web page did not; `fleetTotals`/`renderTotals` in
   `usage.html` are the port of `UsageViewModel.compute`'s window sums, tested against the SAME

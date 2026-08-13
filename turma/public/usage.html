@@ -262,12 +262,34 @@ function renderViewbar() {
   }
 }
 
+// Compact token count: 1.2M / 3.4k / 850.
+//
+// NEVER returns anything but digits, a minus, a dot and a unit letter. Several
+// callers interpolate the result into innerHTML (tokenCell → tableView and the
+// by-model card), so a value that isn't a number has to be turned into one
+// HERE — returning it verbatim made any token field on the heartbeat a stored
+// XSS sink, and the hub serves most of the agent payload raw.
 function fmtTokens(n) {
+  n = Number(n);
+  if (!Number.isFinite(n)) return "0";
   if (!n) return "0";
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
+    if (n >= unit) return scaleTokens(n, unit) + suffix;
+  }
   return String(n);
+}
+
+// One decimal place, rounded HALF-UP on the exact value — which `(n /
+// unit).toFixed(1)` is not: it rounds the binary double, and 1150/1e3 is really
+// 1.14999…, so it renders 1.1k where Android's Java formatter renders 1.2k.
+// Two figures for one number, on a page whose whole point is that the phone and
+// the browser agree. Split into whole and remainder so neither the multiply nor
+// the division can lose precision on a fleet-sized count.
+function scaleTokens(n, unit) {
+  let whole = Math.floor(n / unit);
+  let tenths = Math.round((n % unit) * 10 / unit);
+  if (tenths === 10) { whole += 1; tenths = 0; }
+  return whole + "." + tenths;
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
@@ -1112,7 +1134,9 @@ function cacheHitRate(b) {
 // The cache half of a bucket, as text. Empty when the bucket carries no cache
 // traffic at all — an older agent reports none, and a bare "0 cached · 0
 // written" would read as caching being broken rather than unreported.
-// Composed of formatted numbers only, so it is safe as textContent or as markup.
+// Safe as markup ONLY because fmtTokens and cacheHitRate both narrow their
+// input to a number first; this string is interpolated into innerHTML by
+// cacheSubLine below, so it is never a place to start passing text through.
 function cacheLineText(b) {
   const read = b.cacheRead || 0, write = b.cacheWrite || 0;
   if (!read && !write) return "";

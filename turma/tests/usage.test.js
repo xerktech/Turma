@@ -43,6 +43,10 @@ function makeEl() {
 // Run the page once and hand back the pure helpers. The page's boot calls
 // (renderViewbar/connectSSE/the poll) run against the shim and are inert: fetch
 // never settles and EventSource is a no-op, so nothing renders.
+// What the page's TurmaOrg.filter stub does, swappable per test. Identity by
+// default, which is "All orgs".
+let orgFilter = (agents) => agents;
+
 function loadHelpers() {
   const els = {};
   const noop = () => {};
@@ -76,15 +80,17 @@ function loadHelpers() {
     parseInt, parseFloat, isNaN, Number, String, Object, Array, Map, Set,
     addEventListener: noop, removeEventListener: noop,
     TurmaNav: { preserveScroll: (_el, paint) => paint() },
-    TurmaOrg: { get: () => "", update: noop, filter: (a) => a, subscribe: noop, sse: noop, orgColors: () => ({}) },
+    // Indirected through `orgFilter` so a test can narrow the page the way the
+    // header's org control does, and check what each section was rendered from.
+    TurmaOrg: { get: () => "", update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop, orgColors: () => ({}) },
     TurmaBoard: { orgName: (k) => k, orgColorMap: () => ({}) },
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheLineText, cacheHitRate,
     blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView,
-    fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC,
-    blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals };`;
+    fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
+    blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
   return Object.assign(new Function(...keys, body)(...keys.map((k) => stubs[k])), { els });
@@ -141,6 +147,64 @@ test("cacheSubLine survives a write-only bucket (first session on a prefix)", ()
   assert.match(out, /0% hit/);
 });
 
+// --- fmtTokens ---------------------------------------------------------------
+// It has two jobs beyond being readable: agree DIGIT FOR DIGIT with Android's
+// `fmtTokens` (UsageScreen.kt), and never hand markup to the callers that
+// interpolate it into innerHTML.
+
+test("fmtTokens rounds the tenth HALF-UP on the exact value, as Android does", () => {
+  // `(n / unit).toFixed(1)` rounds the binary double instead: 1150/1e3 is
+  // really 1.14999…, so it answered 1.1k where the phone answered 1.2k. These
+  // are the three values that showed the divergence side by side on one hub.
+  assert.equal(H.fmtTokens(1150), "1.2k");
+  assert.equal(H.fmtTokens(1_450_000), "1.5M");
+  assert.equal(H.fmtTokens(1_950_000_000), "2.0B");
+});
+
+test("fmtTokens carries a tenth that rounds up out of its remainder", () => {
+  // 999,950 is below 1e6, so it renders on the k scale — and its remainder
+  // rounds to a full unit, which has to carry into the whole part rather than
+  // print "999.10k". Android carries the same way, at the same scale.
+  assert.equal(H.fmtTokens(999_950), "1000.0k");
+  assert.equal(H.fmtTokens(999_950_000), "1000.0M");
+});
+
+test("fmtTokens keeps the ordinary scales it always had", () => {
+  assert.equal(H.fmtTokens(0), "0");
+  assert.equal(H.fmtTokens(850), "850");
+  assert.equal(H.fmtTokens(3400), "3.4k");
+  assert.equal(H.fmtTokens(272_500_000), "272.5M");
+  assert.equal(H.fmtTokens(11_300_000_000), "11.3B");
+});
+
+test("fmtTokens stays exact on a fleet-sized count", () => {
+  // Split whole from remainder rather than multiplying first, so the arithmetic
+  // can't leave the range integers are exact in.
+  assert.equal(H.fmtTokens(9_007_199_254_740_000), "9007199.3B");
+});
+
+test("fmtTokens NEVER returns markup, whatever the heartbeat put in the field", () => {
+  // tokenCell interpolates this into innerHTML, so a token field that isn't a
+  // number was a stored-XSS sink: the hub serves most of the agent payload raw,
+  // and a value returned verbatim executed in the operator's browser.
+  for (const hostile of [
+    '<img src=x onerror="window.__pwned=1">',
+    "javascript:alert(1)", {}, [], NaN, Infinity, -Infinity, undefined, null, "abc",
+  ]) {
+    assert.match(H.fmtTokens(hostile), /^-?[0-9]+(\.[0-9])?[kMB]?$/,
+      `fmtTokens(${JSON.stringify(hostile)}) escaped its numeric shape`);
+  }
+});
+
+test("a hostile token field cannot reach the table cell as markup", () => {
+  // The end-to-end version of the above, through the real sink.
+  const cell = H.tokenCell(bucket({
+    input: 100, cacheRead: '<img src=x onerror="window.__pwned=1">',
+  }));
+  assert.equal(cell.includes("<img"), false);
+  assert.equal(cell.includes("onerror"), false);
+});
+
 // --- the headline totals strip ----------------------------------------------
 // A port of the Android Usage screen's stat row, so the vectors below are the
 // ones `UsageViewModelTest` asserts against `UsageViewModel.compute` — same
@@ -177,15 +241,21 @@ test("fleetTotals falls back to a host's repos when it reports no aggregate", ()
   assert.equal(t.totals.input, 30);
 });
 
-test("fleetTotals never counts a host's repos ON TOP of its host block", () => {
+test("fleetTotals takes a host's own block and NEITHER adds nor prefers its repos", () => {
   // The repo blocks are a partition of the same spend, so a host reporting both
   // must contribute its aggregate ONCE. Adding them doubles every token on the
   // page's headline while every breakdown below it stays right — the kind of
   // disagreement that reads as the breakdown being broken.
+  //
+  // The repo figures deliberately do NOT sum to the host block: an agent's
+  // aggregate covers transcripts it cannot attribute to any repo, so the two
+  // legitimately differ. Fixtures where they tie can't tell "prefer the host
+  // block" from "prefer the repos", which is the half that decides whether
+  // unattributable spend reaches the headline at all.
   const t = H.fleetTotals([
     { key: "h1", usage: hostUsage(10, 70, 500), repoUsage: [
-      { repo: "A", usage: hostUsage(4, 30, 200) },
-      { repo: "B", usage: hostUsage(6, 40, 300) },
+      { repo: "A", usage: hostUsage(1, 2, 3) },
+      { repo: "B", usage: hostUsage(1, 2, 3) },
     ] },
   ]);
   assert.equal(t.today.input, 10);
@@ -249,6 +319,39 @@ test("renderTotals REPLACES the strip rather than appending to it", () => {
   const first = H.els.totals.children.length;
   H.renderTotals(agents);
   assert.equal(H.els.totals.children.length, first);
+});
+
+// The two below go through `render`, not `renderTotals`, because what they pin
+// is the CALL: which list the strip is rendered from, and where in renderInner
+// it happens. Both survive any assertion made against renderTotals directly.
+
+test("the strip is rendered from the ORG-SCOPED list, not the whole fleet", () => {
+  // Moving the header's org filter has to rescope the headline along with
+  // everything below it; rendered from `data.agents` it would keep showing the
+  // whole fleet's spend beside a chart scoped to one org.
+  const agents = [
+    { key: "keep", usage: hostUsage(10, 70, 500) },
+    { key: "drop", usage: hostUsage(1000, 1000, 1000) },
+  ];
+  orgFilter = (list) => list.filter((a) => a.key === "keep");
+  try {
+    H.render({ agents });
+  } finally {
+    orgFilter = (list) => list;
+  }
+  const stats = H.els.totals.children.filter((c) => c.className === "stat");
+  assert.deepEqual(stats.map((s) => s.children[1].textContent), ["10", "70", "500"]);
+});
+
+test("the strip survives the chart's empty-state return", () => {
+  // A host with an aggregate but no per-repo blocks charts nothing in "By repo"
+  // mode, and renderInner returns early on that. The totals are the one thing
+  // on this page that must be readable the instant it loads, so they are
+  // painted before the return, exactly like the limits section.
+  H.render({ agents: [{ key: "h1", usage: hostUsage(10, 70, 500), repoUsage: [] }] });
+  const stats = H.els.totals.children.filter((c) => c.className === "stat");
+  assert.deepEqual(stats.map((s) => s.children[1].textContent), ["10", "70", "500"]);
+  assert.match(H.els.chart.innerHTML, /No usage reported/);
 });
 
 test("renderTotals shows zeroes for a fleet scoped to nothing, never a stale figure", () => {

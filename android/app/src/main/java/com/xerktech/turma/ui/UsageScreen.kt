@@ -42,12 +42,29 @@ import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.UsageViewModel
 
-/** Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens. */
-fun fmtTokens(n: Long): String = when {
-    n >= 1_000_000_000 -> "%.1fB".format(n / 1e9)
-    n >= 1_000_000 -> "%.1fM".format(n / 1e6)
-    n >= 1_000 -> "%.1fk".format(n / 1e3)
-    else -> n.toString()
+/**
+ * Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens, and
+ * has to agree with it DIGIT FOR DIGIT — the same fleet totals are on the web
+ * Usage page's headline strip and the dashboard's tiles, and an operator
+ * reading 1.1k in the browser and 1.2k on the phone can't tell which is wrong.
+ *
+ * Two things it must not do, both of which `"%.1fk".format(n / 1e3)` did:
+ * round a Double (Java rounds its shortest decimal HALF_UP, JS `toFixed`
+ * rounds the binary value, and they disagree on every `.x5` boundary), and
+ * format in the default locale (which renders `1,2k` in de_DE and `١٫٢k` in
+ * ar_EG). Integer arithmetic settles both — and splitting whole from remainder
+ * keeps `n * 10` from overflowing on an absurd count off the wire.
+ */
+fun fmtTokens(n: Long): String {
+    for ((unit, suffix) in listOf(1_000_000_000L to "B", 1_000_000L to "M", 1_000L to "k")) {
+        if (n >= unit) {
+            var whole = n / unit
+            var tenths = (n % unit * 10 + unit / 2) / unit
+            if (tenths == 10L) { whole += 1; tenths = 0 }
+            return "$whole.$tenths$suffix"
+        }
+    }
+    return n.toString()
 }
 
 /** One chart/legend series — the selected grouping's rows in stable paint order. */
