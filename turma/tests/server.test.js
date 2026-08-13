@@ -7863,9 +7863,20 @@ async function forwardedRequestLine(host, sessionId, port, pathAndQuery) {
   });
   const ctrl = await wsConnect(`/agent/control?name=${host}&token=${hostAgentToken(host)}`);
   const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  let client = null;
   try {
-    // Never resolves — our fake ttyd sends no response — so it is not awaited.
-    request("GET", pathAndQuery, { headers: userHeaders }).catch(() => {});
+    // Written to a raw socket rather than through http.request: the client
+    // normalizes the target it is given (percent-encoding, backslashes), and
+    // what is asserted here is the exact bytes the hub received and passed on.
+    // Nothing answers — our fake ttyd sends no response — so it is not awaited.
+    client = net.connect(server.address().port, "127.0.0.1", () => {
+      client.write(
+        `GET ${pathAndQuery} HTTP/1.1\r\n` +
+          "Host: x\r\n" +
+          `Authorization: ${userHeaders.authorization}\r\n\r\n`
+      );
+    });
+    client.on("error", () => {});
     await waitFor(() => ctrlFrames.some((f) => {
       try { return JSON.parse(f.payload).open; } catch { return false; }
     }));
@@ -7882,6 +7893,7 @@ async function forwardedRequestLine(host, sessionId, port, pathAndQuery) {
       data.socket.destroy();
     }
   } finally {
+    if (client) client.destroy();
     ctrl.socket.destroy();
   }
 }
@@ -7909,6 +7921,28 @@ test("the terminal base path keeps its query string when the slash is restored",
   assert.equal(
     await forwardedRequestLine("slashC", "sl3", 7803, "/term/sl3?arg=1"),
     "GET /term/sl3/?arg=1 HTTP/1.1",
+  );
+});
+
+test("restoring the slash does not re-encode the query on its way to ttyd", async () => {
+  // The slash is inserted into the original target rather than rebuilt from the
+  // parsed URL, so ttyd sees the query byte-for-byte. Rebuilding it would send
+  // WHATWG-normalized bytes on the bare path and raw bytes on the slash path —
+  // the same terminal reached two ways, arriving differently.
+  assert.equal(
+    await forwardedRequestLine("slashE", "sl5", 7805, "/term/sl5?a=<>\""),
+    "GET /term/sl5/?a=<>\" HTTP/1.1",
+  );
+});
+
+test("a non-origin-form target is not rewritten into a working terminal", async () => {
+  // `new URL` reads a pathname out of absolute-form, protocol-relative and
+  // backslash targets too. Those reach ttyd as a 404 today, and restoring a
+  // slash must not quietly turn them into a served terminal — hence the rewrite
+  // only fires when the target actually STARTS with that pathname.
+  assert.equal(
+    await forwardedRequestLine("slashF", "sl6", 7806, "/term\\sl6"),
+    "GET /term\\sl6 HTTP/1.1",
   );
 });
 

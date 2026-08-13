@@ -7548,8 +7548,13 @@ const server = http.createServer(async (req, res) => {
       // asks for the slash form, so serve the document at the base path here
       // rather than depending on the slash surviving every hop to us. Only the
       // base path — assets and the WS below it never end in one.
-      if (parts.length === 2 && !url.pathname.endsWith("/")) {
-        req.url = `${url.pathname}/${url.search}`;
+      // The slash is INSERTED into the original target, never rebuilt from the
+      // parsed URL: rebuilding re-encodes the query and would newly accept
+      // absolute-form, protocol-relative and backslash targets that reach ttyd
+      // as a 404 today. `startsWith` is what holds this to origin-form requests,
+      // so the only difference on the wire is the one character.
+      if (parts.length === 2 && !url.pathname.endsWith("/") && req.url.startsWith(url.pathname)) {
+        req.url = `${url.pathname}/${req.url.slice(url.pathname.length)}`;
       }
       return proxyTerm(req, res, loc.host, loc.port);
     }

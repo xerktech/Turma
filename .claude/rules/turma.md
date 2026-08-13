@@ -298,8 +298,12 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   connected and `terminalOnline` stayed true — so the symptom reads as a Turma bug and is not one.
 - **Only the base path is rewritten.** Assets and the WS below it never end in a slash, and
   appending one there would 404 them.
-- Every client (`sessions.html`, android `TerminalScreen`, `glasses/src/hub-client.ts`) asks for the
-  slash form, so this is belt-and-braces for the wire, not a client contract.
+- Every client (`sessions.html`, android `TerminalScreen`, `glasses/src/hub-client.ts`,
+  `veiller/src/core/hub-client.ts`) asks for the slash form, so this is belt-and-braces for the
+  wire, not a client contract.
+- The slash is **inserted into the original request target**, not rebuilt from the parsed URL, and
+  only for origin-form requests — so the query reaches ttyd byte-for-byte and an absolute-form or
+  backslash target still 404s there rather than newly resolving to a terminal.
 - Tests: `the terminal document is fetched at ttyd's base path`, `assets below the terminal base
   path are never rewritten` in `server.test.js`.
 
