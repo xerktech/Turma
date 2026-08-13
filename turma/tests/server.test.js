@@ -2058,6 +2058,34 @@ test("http: a malformed limits block is coerced at ingest, not fanned out", asyn
   }
 });
 
+test("http: the subscription key reaches the clients, coerced and bounded", async () => {
+  // XERK-301: the usage page groups limit cards on this key, so it is pure
+  // carriage — but it is also a MAP KEY on every client and Android TYPES it,
+  // so an unusable shape must become the "can't tell you" null rather than a
+  // plausible default that would fold two subscriptions into one set of bars.
+  const beat = (body) =>
+    request("POST", "/api/heartbeat", { body, headers: agentHeaders });
+  const read = async () =>
+    (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === "sub-host");
+
+  await beat({ device: "sub-host", subscription: { key: "abc123", source: "login" } });
+  assert.deepEqual((await read()).subscription, { key: "abc123", source: "login" });
+
+  await beat({ device: "sub-host", subscription: { key: "x".repeat(500), source: "y".repeat(90) } });
+  assert.deepEqual((await read()).subscription,
+    { key: "x".repeat(128), source: "y".repeat(32) });
+
+  for (const subscription of [{ key: "" }, { key: 7 }, {}, [], "nope", 7, null]) {
+    await beat({ device: "sub-host", subscription });
+    assert.equal((await read()).subscription, null, JSON.stringify(subscription));
+  }
+
+  // An agent too old to know the field says nothing, and stays saying nothing.
+  await beat({ device: "sub-host" });
+  assert.equal((await read()).subscription, undefined);
+});
+
 test("http: command queue rides the reply until acked", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

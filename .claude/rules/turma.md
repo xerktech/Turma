@@ -154,7 +154,37 @@ which makes an `android/` change part of the same PR) live there.
   - A host reporting no window at all gets **no card** — an older agent, a non-subscription login and
     an unprobed host all mean "can't tell you", never 0% used. The section renders before the
     chart's empty-state returns, so headroom shows on a fleet that has charted nothing.
-  - Tests: `usage.test.js`, the `limits` heartbeat case in `server.test.js`.
+  - **One card per SUBSCRIPTION, not per host** (XERK-301, `limitGroups`): hosts sharing a Claude
+    account are reading one pool, so several cards were one number drawn several times. Grouping is
+    on the agent's opaque `subscription.key` (`.claude/rules/agent-usage.md`), and a host reporting
+    none keeps a card of its own — **never folded in with another silent host**, since "can't tell
+    you" from two hosts does not make them one plan. The card is headed by its hosts; the key is a
+    hash, so there is no other name to give a subscription.
+    - Each window takes its **FRESHEST** reading, not an average or a maximum: every host reads the
+      same counter, and across a window's reset the newest read is the only right answer where a
+      maximum would keep the pre-reset figure alive. Per window, since the freshest snapshot need
+      not carry both — so a window sourced from an older host **discloses its own read age**, the
+      head's stamp being the group's freshest rather than that row's.
+    - **Both clients sort freshest-first before folding and replace only on a STRICTLY newer read.**
+      Fold in fleet order, or accept an equal `capturedAt`, and two hosts whose snapshots tie to the
+      second resolve to a different host on each client — one subscription showing two different
+      percentages. Tests: the tie cases in `usage.test.js` and `UsageViewModelTest`.
+    - `normalizeSubscription` coerces the block at ingest for the same reason `normalizeLimits`
+      does, and because the key is a MAP KEY on every client: anything unusable becomes null, never
+      a plausible default that would fold two subscriptions into one set of bars. Its bounds are
+      **literals, not module `const`s** — see the restore-TDZ rule below.
+  - **Anything a `normalize*` closes over must be reachable from `loadState`'s line.** That loop
+    sits near the top of `server.js` and reaches each one only because function declarations hoist;
+    a module `const` declared below is in its TDZ there, the `ReferenceError` lands in the restore's
+    catch, and the WHOLE registry is emptied — then the 30s save timer rewrites `state.json` from
+    only the hosts that have re-beaten, losing every host offline at that moment. XERK-301 shipped
+    exactly that and it is invisible to `server.test.js`, which walks the loader's body rather than
+    booting; `registry-restore.test.js` boots a hub instead — over **two** records, one usable and
+    one unusable in every coerced field, since a `const` on an error BRANCH is invisible to a
+    fixture that only ever takes the happy one (and would then fire only on malformed records, in
+    production).
+  - Tests: `usage.test.js`, the `limits` and subscription-key heartbeat cases in `server.test.js`,
+    android `UsageViewModelTest`.
 
 ## Board page (`/board`)
 

@@ -185,10 +185,10 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
 
 /**
  * The Claude subscription limits section (web usage.html `renderLimits`): one
- * card per host reporting the 5-hour and 7-day windows, each with the percentage
- * used, a bar coloured by headroom, the countdown to reset, and how long ago the
- * snapshot was captured. These are snapshots, not live numbers, which is why the
- * capture age is on every card rather than implied.
+ * card per SUBSCRIPTION reporting the 5-hour and 7-day windows, each with the
+ * percentage used, a bar coloured by headroom, the countdown to reset, and how
+ * long ago the snapshot was captured. These are snapshots, not live numbers,
+ * which is why the capture age is on every card rather than implied.
  */
 @Composable
 private fun LimitsSection(cards: List<UsageViewModel.LimitCard>, anyAgents: Boolean) {
@@ -213,7 +213,7 @@ private fun LimitsSection(cards: List<UsageViewModel.LimitCard>, anyAgents: Bool
             return
         }
         Text(
-            "one shared pool across claude.ai and Claude Code · snapshot per host",
+            "one shared pool across claude.ai and Claude Code · one card per subscription",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -237,13 +237,32 @@ private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        LimitRow("Session (5h)", card.fiveHour)
-        LimitRow("Weekly (7d)", card.sevenDay)
+        // Only worth saying when the card IS a consolidation: with one host the
+        // heading already names it and its age is the line above.
+        if (card.hosts.size > 1) {
+            Text(
+                "shared by " + card.hosts.joinToString(", ") {
+                    "${it.host} (${UsageViewModel.fmtDuration(nowSec - it.capturedAt)} ago)"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        LimitRow("Session (5h)", card.fiveHour,
+            (nowSec - card.fiveHourAt).takeIf { card.fiveHourAt < card.capturedAt })
+        LimitRow("Weekly (7d)", card.sevenDay,
+            (nowSec - card.sevenDayAt).takeIf { card.sevenDayAt < card.capturedAt })
     }
 }
 
+/**
+ * One window's row. [readAgeSec] is this window's OWN age, passed only when the
+ * reading is older than the card's stamp — which happens on a consolidated card
+ * whose freshest host didn't report this window, where showing the figure under
+ * the head's age would be presenting somebody else's freshness as its own.
+ */
 @Composable
-private fun LimitRow(label: String, view: UsageViewModel.LimitView?) {
+private fun LimitRow(label: String, view: UsageViewModel.LimitView?, readAgeSec: Long? = null) {
     if (view == null) return
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val color = when {
@@ -256,7 +275,8 @@ private fun LimitRow(label: String, view: UsageViewModel.LimitView?) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(label, style = MaterialTheme.typography.bodySmall, color = muted)
             Text(
-                view.pctLabel + (if (view.reset.isEmpty()) "" else " · ${view.reset}"),
+                view.pctLabel + (if (view.reset.isEmpty()) "" else " · ${view.reset}") +
+                    (readAgeSec?.let { " · read ${UsageViewModel.fmtDuration(it)} ago" } ?: ""),
                 style = MaterialTheme.typography.bodySmall,
                 color = if (view.expired) muted else MaterialTheme.colorScheme.onSurface,
             )
@@ -389,7 +409,10 @@ private const val USAGE_FOOTER =
         "which is why every card carries the moment it was taken and goes amber once it ages. " +
         "Claude Code computes them from the sessions on that machine, so they can trail the real " +
         "server-side counter — read them as headroom at a glance, not as the authoritative " +
-        "balance. " +
+        "balance. There is one card per subscription, not per host: hosts logged into the same " +
+        "Claude account are reading and spending the same pool, so they fold into one card " +
+        "listing them all, and each window shows the freshest reading any of them took. A host " +
+        "whose agent is too old to say which account it's on stays on a card of its own. " +
         "Token figures are parsed from the Claude transcripts on each host and count every session it " +
         "has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed " +
         "sessions. A new session gets a randomly-named worktree checked out in detached HEAD off the " +
