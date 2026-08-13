@@ -121,6 +121,24 @@ implementation contract.
       outside it the approval gate masks every ALLOW), and **retries** because the model layer is
       nondeterministic — a run that wrote nothing may be the model declining, which is INCONCLUSIVE
       and fails, never a deny.
+    - **Attribution is the hard part, and it failed twice before it worked.** Anything under
+      `~/.claude` must be driven under **`bypassPermissions`**: every other mode has Claude Code
+      refusing the write on its own, and a version of the class asserting under `acceptEdits` passed
+      6/6 with the whole feature stubbed to `{}`. Then, because the guard is TWO layers, each was
+      individually invisible — unwiring the hook left 6/7 green and emptying all 46 deny rules left
+      7/7. So each refusal runs **four arms**: EMPTY allows, REAL denies, HOOK_ONLY denies,
+      PATTERNS_ONLY denies iff a rule names that target. **Assert against the LAYER, not against
+      "our settings".**
+    - `~/.claude/agent-memory/<agent>` (the directory entry) is the one target no pattern names or
+      *can* name — a pattern matching it matches the tree beneath it. Its `named_by_pattern=False`
+      arm is the proof the hook carries coverage the backstop cannot, so don't "simplify" it away.
+    - **`claude -p` reads stdin when it is not a tty**, so any probe must pass `stdin=DEVNULL`: run
+      from a heredoc it swallowed the harness's own source and refused writes as prompt injection,
+      scoring INCONCLUSIVE for reasons unrelated to permissions. Keep target filenames innocuous for
+      the same reason — with `evil.md` under `agents/` the model declines on its own.
+    - `build_guard_settings()` folds the **operator's** `~/.claude/settings.local.json` into the deny
+      list and runs in the harness process, which a fake `HOME` does not isolate; the tests pin
+      `local_settings_path` at a nonexistent file so a rule there cannot forge a refusal.
 - **AskUserQuestion bridge** (`hooks/ask.py`, same shape) — Claude's own picker is a TUI affordance
   the glasses client isn't attached to, so this hook writes
   `~/.turma/questions/<sessionId>.req.json` (session id from
