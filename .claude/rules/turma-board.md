@@ -153,51 +153,65 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
 The rule ("waiting work is a queued TICKET, and its host is chosen at dispatch") is in `CLAUDE.md`;
 this is how it works. Read it before touching `findTicketHost`, the `/session` routes or the sweeps.
 
-- **Every ticket spawn goes through it** — the Start button and the auto-start sweep alike. Both
-  reach `findTicketHost(..., {requireFree:true})`; a host with a free slot is used at once, and only
-  a fleet with none queues. The agent-side session queue (XERK-14) keeps the cases where the host IS
-  the decision: "+ New session", and a ticket session waiting on its clone.
+- **Every ticket spawn goes through it** — Start button and auto-start sweep alike, both via
+  `findTicketHost(..., {requireFree:true})`. A host with a free slot is used at once; only a fleet
+  with none queues. The agent-side session queue (XERK-14) keeps the cases where the host IS the
+  decision: "+ New session", and a ticket session waiting on its clone.
 - `drainTicketQueue()` runs on **every heartbeat** (the beat IS the capacity report, so a freed slot
-  is claimed within a beat) and on the 15s sweep after `autoStartSweep`/`autoStopSweep`.
-  **At most one dispatch per host per pass**, mirroring the agent's one-per-beat drain — the shared
-  `~/.claude` login is what limits both. The dispatch itself rides the NEXT beat's reply.
+  is claimed within a beat) and on the 15s sweep after `autoStartSweep`/`autoStopSweep`. **At most
+  one dispatch per host per pass**, mirroring the agent's one-per-beat drain — the shared
+  `~/.claude` login limits both. The dispatch rides the NEXT beat's reply.
 - **`requireFree` filters the pool BEFORE the cloned-repo preference**, so a full cloned host never
   holds a ticket back from a free one that can clone on demand (the accepted cost is a clone the old
   ordering would have avoided). `hostHasFreeSlot` reads an absent `capacity` as **"can't tell"** and
   keeps that host dispatchable — the heartbeat contract's rule, and what keeps a mixed fleet routing
   — never as "full"; `hostAvailability` already ranks it below every host with real free slots.
-- **Only capacity queues.** A hard refusal (no host reports the org, every host offline, a pinned
-  agent that is gone) still answers with a status and `{error}` — queuing fixes none of them. A
-  pinned host that is merely FULL is waited for, never routed around; `{full:true}` is what tells
-  the two apart.
-- An entry is `{siteKey, issueKey, source, at, reason, error, sessionsAtQueue, blockedSince,
-  unknownSince}`. `reason` is why it is STILL waiting as of the last drain — `capacity` (clears
-  itself) or `blocked` (the operator has to clear it, with the hub's wording in `error`) — and the
-  card says which.
-- **`enqueueTicketStart` validates the key** (`isIssueKey` + `TICKET_KEY_MAX`, and a bounded
-  `siteKey`). On the sweep path both fields come off an AGENT's `jira` block, and an entry is then
-  served on the top-level payload where **Android TYPES `issueKey`** and decodes atomically — an
-  object or a 20k key from one host would break every phone's fleet decode, hub-wide. **This check
-  is that coercion; there is no `normalize*` covering this list.** It also keeps an unvalidated key
-  off the `spawnTicket` command the sweep path never checked.
-- **Two caps, and the per-ORG one is the one that matters.** A 250-ticket To Do backlog is an
-  ordinary board: with only `TICKET_QUEUE_MAX` (fleet), one opted-in org filled the queue in a
-  single sweep and every OTHER org's Start button answered "full". `TICKET_QUEUE_PER_ORG_MAX` is the
-  real line (the queue drains per org); the fleet cap is the memory bound behind it, and the refusal
-  names which one was hit.
-- **A hold is not forever.** An entry whose ticket no reporting org lists any more ages out
-  (`TICKET_QUEUE_STALE_MS`, long enough to ride out a poll gap or host restart); a `blocked` AUTO
-  entry leaves at once (the sweep re-queues it when it's eligible again) while a `blocked` MANUAL
-  one is given `TICKET_QUEUE_BLOCKED_MAX_MS`. Only `capacity` waits indefinitely — it is the one
-  hold that clears itself. Without this a permanently-blocked entry held its org's line open for the
-  hub's lifetime.
+- **Only capacity queues.** A hard refusal at POST time (no host reports the org, every host
+  offline, a pinned agent that is gone) still answers with a status and `{error}`; `{full:true}` is
+  what tells the two apart. A pinned host that is merely FULL is waited for, never routed around.
+- An entry is `{siteKey, issueKey, source, at, reason, error, blockedSince, unknownSince}`.
+  `reason` is why it is STILL waiting as of the last drain — `capacity` (clears itself) or `blocked`
+  (the operator has to clear it, with the hub's wording in `error`) — and the card says which.
+- **`ticketQueueAdmission` validates the key** (`isIssueKey` + `TICKET_KEY_MAX`, bounded
+  `siteKey`). On the sweep path both fields come off an AGENT's `jira` block, and an entry is served
+  on the top-level payload where **Android TYPES `issueKey`** and decodes atomically — an object or
+  a 20k key from one host breaks every phone's fleet decode, hub-wide. **This check is that
+  coercion; no `normalize*` covers this list.** It also keeps an unvalidated key off the
+  `spawnTicket` command the sweep path never checked.
+- **Three admission limits, and `ticketQueueAdmission` is the one place that decides between
+  them** — an ordinary 250-ticket backlog reaches all three. `TICKET_QUEUE_PER_ORG_MAX` is the real
+  line (the queue drains per org, so one org's backlog must never refuse another's Start);
+  `TICKET_QUEUE_PER_ORG_AUTO_MAX` is the SWEEP's share of it, because an opted-in org refills its
+  line every 15s and without a reserve the starvation just moved one level down onto the person;
+  `TICKET_QUEUE_MAX` is the memory bound behind both.
+  - **A refused key is not a full queue.** The sweep must SKIP an unqueueable row and keep going —
+    reporting it as "full" truncated an org's auto-start at its first bad row, every sweep, forever,
+    and blamed a queue that was empty. Only `fleet-full` ends a sweep; `org-full` ends that org's.
+  - **A line about a STATE goes through `logQueueState`**, which throttles it. The sweep re-derives
+    every verdict every 15s, so an unthrottled "this org is at its share" is a line about a
+    condition that will still hold in 15 seconds — it buries the log in exactly the situation it
+    exists to explain. Per-event lines (queued / dispatched / dropped) are not throttled.
+- **A hold is not forever**, and `TICKET_QUEUE_MAX_WAIT_MS` is the backstop under all of them: an
+  entry whose ticket no reporting org lists any more ages out (`TICKET_QUEUE_STALE_MS`, long enough
+  to ride out a poll gap or host restart), and one nothing can route ages out
+  (`TICKET_QUEUE_BLOCKED_MAX_MS`). Without these a permanently-blocked entry held its org's line
+  open for the hub's lifetime.
+  - **A routing failure HOLDS; it does not drop.** Dropping an auto entry there dropped it into the
+    sweep's arms — an org whose hosts were all offline re-queued every 15s, churning the log, the
+    payload and the board's chip for as long as it stayed down. The one exception is a ticket with
+    **no triaged repo**, which the sweep cannot re-queue (it only ever queues a ticket that has
+    one), so an auto entry leaves there without churn.
 - **A direct dispatch RETIRES that ticket's entry** (`/session` when a host is free), and
   `rememberDispatch` records it. The entry and the dispatch are one intent: left in place it fired
   again on the next free slot, a second session hours later that nobody asked for.
-- **A manual entry retires on the session it asked for**, not on "the ticket has a session":
-  `sessionsAtQueue` snapshots the count at click time and the entry goes when the count grows. The
-  `+` button exists to ask for a second session, so the stronger auto guard would swallow that ask;
-  the weaker "any session" test would leave the entry immortal.
+- **A manual entry is never retired by fleet state.** It is one operator asking for one session,
+  and its only honest ends are their cancel, its own dispatch, its ticket reaching Done, and the
+  bounded waits above. Inferring the ask from the ticket's session count — the obvious fix for an
+  entry that outlives its purpose — swallowed the click whenever a session it never asked for
+  appeared (the sweep, another operator, another board), and a count that can DIP (an agent
+  mid-restart, a `closedSessions` eviction) swallowed it with no new session at all. **A second
+  session on a ticket is what the `+` button asks for**, so the queue cannot read the ask off a
+  number the fleet owns; the max wait is what bounds it instead.
 - **A cancel that lost the race is refused, not blessed.** The entry is equally gone whether it was
   cancelled or DISPATCHED a moment ago, so `dispatchedRecently` (`TICKET_DISPATCH_MEMO_MS`) makes
   the second a **409** — a 404 there told an operator their cancel worked while a session came up.

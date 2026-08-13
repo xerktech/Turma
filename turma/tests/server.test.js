@@ -138,9 +138,9 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
   dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot, holdQueued,
-  TICKET_QUEUE_PER_ORG_MAX, TICKET_QUEUE_ERROR_MAX, TICKET_QUEUE_STALE_MS,
+  TICKET_QUEUE_PER_ORG_MAX, TICKET_QUEUE_PER_ORG_AUTO_MAX, TICKET_QUEUE_MAX_WAIT_MS,
+  ticketQueueAdmission, TICKET_QUEUE_MAX, TICKET_QUEUE_ERROR_MAX, TICKET_QUEUE_STALE_MS,
   TICKET_QUEUE_BLOCKED_MAX_MS,
-  TICKET_QUEUE_MAX,
   orgColors, setOrgColor,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
   dropMigrationBlob, migrationSpoolPath,
@@ -5183,6 +5183,122 @@ test("XERK-296: waiting in the queue spends no auto-start attempt", async () => 
   assert.equal(autoStarted.get(k).attempts, 1, "the attempt is spent at dispatch");
 });
 
+test("XERK-296: a manual entry is NOT retired by a session it didn't ask for", async () => {
+  // The + button asks for a SECOND session, so the queue cannot infer "the ask
+  // is satisfied" from the ticket's session count: a session appearing from
+  // anywhere else (the auto sweep, another operator, another board) would eat
+  // the click, and a count that DIPS — an agent mid-restart, a closedSessions
+  // eviction — would eat it with no new session at all.
+  resetAutoStart();
+  await asBeat("tqForeign", "tq24.atlassian.net", { autoStart: false, capacity: FULL });
+  await startTicket("tq24.atlassian.net", "ENG-5");
+  assert.equal(ticketQueue.length, 1);
+  agents.tqForeign.sessions = [{ id: "s1", status: "running", transcriptId: "t1",
+    ticket: { key: "ENG-5", siteKey: "tq24.atlassian.net" } }];
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 1, "someone else's session is not the one asked for");
+  // It ends the way an operator's ask should: on a dispatch, their cancel, Done,
+  // or — the backstop — having waited too long to still be what anyone wants.
+  queuedTicket("tq24.atlassian.net", "ENG-5").at = Date.now() - TICKET_QUEUE_MAX_WAIT_MS - 1;
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0);
+  assert.equal((agents.tqForeign.commands || []).length, 0, "and it starts nothing on the way out");
+});
+
+test("XERK-296: a ticket only ONE host of a multi-host org reports still routes", async () => {
+  // Each agent polls Jira as `assignee = currentUser()`, so two hosts in one org
+  // routinely report DIFFERENT ticket lists ~10 minutes apart. Resolving a queued
+  // ticket against one winning block per org made a ticket the other host's user
+  // owns look deleted: dispatch-blocked, then aged out.
+  resetAutoStart();
+  await asBeat("tqSeenA", "tq25.atlassian.net", { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:00:00Z" });
+  await asBeat("tqSeenB", "tq25.atlassian.net", { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:05:00Z", tickets: [] });   // fresher, sees nothing
+  await startTicket("tq25.atlassian.net", "ENG-5");
+  drainTicketQueue();
+  const e = queuedTicket("tq25.atlassian.net", "ENG-5");
+  assert.ok(e, "the ticket exists — one host of the org reports it");
+  assert.equal(e.unknownSince, 0, "so it is not on the way to being aged out");
+  agents.tqSeenA.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.tqSeenA.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-296: one unqueueable ticket row doesn't stop the rest of the org's sweep", async () => {
+  // enqueue refuses a key this hub won't serve. Reported to the sweep as "the
+  // queue is full", it truncated that org's auto-start at the bad row — every
+  // sweep, forever — and blamed a queue that was empty.
+  resetAutoStart();
+  await asBeat("tqBadRow", "tq26.atlassian.net", { capacity: FULL, tickets: [
+    { key: "OK-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: { evil: 1 }, statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "OK-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "OK-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["OK-1", "OK-2", "OK-3"]);
+});
+
+test("XERK-296: an org whose hosts are all offline HOLDS, it doesn't churn", async () => {
+  // Dropping a blocked auto entry dropped it into the sweep's arms: re-queued
+  // 15s later, every 15s, churning the log, the payload and the board's chip for
+  // as long as the org stayed down.
+  resetAutoStart();
+  await asBeat("tqChurn", "tq27.atlassian.net", { capacity: FULL, tickets: [
+    { key: "CH-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  autoStartSweep();
+  drainTicketQueue();
+  agents.tqChurn.lastSeen = Date.now() - 10 * 60 * 1000;      // the org goes dark
+  for (let i = 0; i < 5; i++) { autoStartSweep(); drainTicketQueue(); }
+  const e = queuedTicket("tq27.atlassian.net", "CH-1");
+  assert.ok(e, "it keeps its place rather than being dropped and re-queued");
+  assert.equal(e.reason, "blocked");
+  assert.match(e.error, /offline/);
+  // And it starts the moment the org is back.
+  agents.tqChurn.lastSeen = Date.now();
+  agents.tqChurn.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.tqChurn.commands || []).map((c) => c.issueKey), ["CH-1"]);
+});
+
+test("XERK-296: the sweep cannot fill an org's whole line — a person can always get in", async () => {
+  // An opted-in org refills its line every 15s, so a single per-org cap just
+  // moved the starvation one level down: the operator's own Start button
+  // answering "that org already has N waiting" for as long as the backlog lasts.
+  resetAutoStart();
+  const tickets = [];
+  for (let i = 0; i < 40; i++) {
+    tickets.push({ key: `AUT-${i}`, statusCategory: "todo",
+      repoGuess: { repo: "Turma", cloned: true } });
+  }
+  tickets.push({ key: "MINE-1", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true } });
+  await asBeat("tqShare", "tq28.atlassian.net", { capacity: FULL, tickets });
+  autoStartSweep();
+  const auto = ticketQueue.filter((e) => e.source === "auto").length;
+  assert.equal(auto, TICKET_QUEUE_PER_ORG_AUTO_MAX, "the sweep takes its share and no more");
+  const r = await startTicket("tq28.atlassian.net", "MINE-1");
+  assert.equal(r.body.queued, true, "and the operator's own click still gets a place");
+  ticketQueue.length = 0;
+});
+
+test("XERK-296: the FLEET cap still bounds the queue across many orgs", async () => {
+  // The per-org cap fires first for one org, which left the memory bound behind
+  // it unexercised — so it is pinned here across enough orgs to reach it.
+  resetAutoStart();
+  const orgs = Math.ceil(TICKET_QUEUE_MAX / TICKET_QUEUE_PER_ORG_MAX) + 1;
+  for (let o = 0; o < orgs; o++) {
+    for (let i = 0; i < TICKET_QUEUE_PER_ORG_MAX; i++) {
+      enqueueTicketStart(`fleet${o}.atlassian.net`, `ENG-${100 + i}`, "manual");
+    }
+  }
+  assert.equal(ticketQueue.length, TICKET_QUEUE_MAX);
+  assert.equal(ticketQueueAdmission("fleetX.atlassian.net", "ENG-1", "manual"), "fleet-full");
+  ticketQueue.length = 0;
+});
+
 test("XERK-296: one org's backlog cannot starve ticket-starting for another org", async () => {
   // A 250-ticket To Do backlog is an ordinary board, not an attack. With only a
   // fleet-wide cap, one opted-in org filled the whole queue in a single sweep and
@@ -5192,9 +5308,9 @@ test("XERK-296: one org's backlog cannot starve ticket-starting for another org"
   await asBeat("tqHog", "tq13.atlassian.net", { autoStart: false, capacity: FULL });
   await asBeat("tqVictim", "tq14.atlassian.net", { autoStart: false, capacity: FULL });
   for (let i = 0; i < TICKET_QUEUE_PER_ORG_MAX; i++) {
-    assert.ok(enqueueTicketStart("tq13.atlassian.net", `ENG-${1000 + i}`, "auto"));
+    assert.ok(enqueueTicketStart("tq13.atlassian.net", `ENG-${1000 + i}`, "manual"));
   }
-  assert.equal(enqueueTicketStart("tq13.atlassian.net", "ENG-9999", "auto"), null,
+  assert.equal(enqueueTicketStart("tq13.atlassian.net", "ENG-9999", "manual"), null,
     "the hogging org is cut off at its own line's length");
   let r = await startTicket("tq13.atlassian.net", "ENG-5");
   assert.equal(r.status, 429);
@@ -5246,23 +5362,6 @@ test("XERK-296: a direct start retires the ticket's queue entry (never a second 
   agents.tqDouble.commands = [];
   drainTicketQueue();
   assert.equal((agents.tqDouble.commands || []).length, 0, "and nothing fires later");
-});
-
-test("XERK-296: a manual entry retires when the session it asked for starts", async () => {
-  // Not "the ticket has a session" — the + button asks for a SECOND one. The
-  // entry snapshots the count at click time and goes when that count grows.
-  resetAutoStart();
-  await asBeat("tqCount", "tq17.atlassian.net", { autoStart: false, capacity: FULL });
-  agents.tqCount.sessions = [{ id: "s1", status: "running", transcriptId: "t1",
-    ticket: { key: "ENG-5", siteKey: "tq17.atlassian.net" } }];
-  await startTicket("tq17.atlassian.net", "ENG-5");     // asking for a second
-  drainTicketQueue();
-  assert.equal(ticketQueue.length, 1, "one existing session doesn't retire it");
-  // The second session lands: the ask is satisfied.
-  agents.tqCount.sessions.push({ id: "s2", status: "running", transcriptId: "t2",
-    ticket: { key: "ENG-5", siteKey: "tq17.atlassian.net" } });
-  drainTicketQueue();
-  assert.equal(ticketQueue.length, 0);
 });
 
 test("XERK-296: a cancel that LOST to a dispatch says so, rather than reporting success", async () => {
@@ -6314,6 +6413,35 @@ test("SSE /api/events: authenticated stream pushes an `agent` event on heartbeat
   assert.equal(rec.sessions[0].id, "z1");
   assert.ok(!("history" in rec), "history cache must not leak into the SSE record");
 
+  req.destroy();
+  res.destroy();
+});
+
+test("SSE /api/events: a sweep's queued tickets cost ONE ticketQueue frame (XERK-296)", async () => {
+  // The sweep queues one ticket at a time, so a frame per entry cost every open
+  // board a frame — and the whole queue's JSON — per ticket: 201 frames and
+  // 2.8 MB for a single 200-ticket backlog. The cache is still invalidated
+  // synchronously; only the broadcast coalesces to the end of the turn.
+  ticketQueue.length = 0;
+  const { req, res } = await sseConnect(userHeaders);
+  assert.equal(res.statusCode, 200);
+  const events = collectSse(res);
+  // Measured as a DELTA, not an absolute count: a broadcast another case
+  // coalesced can still be in flight when this one connects, and under a loaded
+  // full-suite run it lands here. Settle first, then count only what our own
+  // enqueues produce.
+  await new Promise((r) => setTimeout(r, 50));
+  const frames = () => events.filter((e) => e.event === "ticketQueue");
+  const before = frames().length;
+  for (let i = 0; i < 12; i++) {
+    enqueueTicketStart("sseq.atlassian.net", `SSE-${i}`, "manual");
+  }
+  await waitFor(() => frames().length > before);
+  await new Promise((r) => setTimeout(r, 50));   // let any stragglers arrive
+  const mine = frames().slice(before);
+  assert.equal(mine.length, 1, `12 enqueues in one pass sent ${mine.length} frames`);
+  assert.equal(JSON.parse(mine[0].data).length, 12, "and the one frame is the whole queue");
+  ticketQueue.length = 0;
   req.destroy();
   res.destroy();
 });
