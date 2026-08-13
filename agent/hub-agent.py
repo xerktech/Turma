@@ -958,38 +958,6 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.aws/**)",
     "Edit(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
-    # ~/.claude is denied PIECEWISE rather than wholesale, so that the two agent
-    # memory trees below stay writable. A blanket `Edit(~/.claude/**)` is what
-    # this replaced, and it silently disabled Claude Code's memory feature for
-    # every Turma session and every subagent they spawn: `memory: user` resolves
-    # to ~/.claude/agent-memory/<agent>/, a session's own auto-memory to
-    # ~/.claude/projects/<slug>/memory/, and deny beats allow, so no rule in the
-    # operator's own settings could re-enable it. Sessions rediscovered the same
-    # repo facts on every run instead.
-    #
-    # DENY WINS OVER ALLOW, so the carve-out cannot be an allow rule — the deny
-    # has to not cover the exception in the first place. That inverts the failure
-    # mode of this list and is the cost of the feature: a NEW sensitive file or
-    # directory appearing under ~/.claude is writable until someone adds it here.
-    # Anything holding a credential, executing, or steering a future session
-    # belongs below. When in doubt, deny it — a session that cannot write a file
-    # asks; one that can rewrite the agent definitions does not.
-    "Edit(~/.claude/.*)",              # .credentials.json (the shared login), .claude.json, …
-    "Edit(~/.claude/*.json)",          # settings.json — secrets, and this list's own source
-    "Edit(~/.claude/*.jsonl)",         # history.jsonl
-    "Edit(~/.claude/CLAUDE.md*)",      # injected into every session on this host
-    "Edit(~/.claude/agents/**)",       # agent definitions: a write here steers every future run
-    "Edit(~/.claude/bin/**)",          # hook scripts auto-execute; a write here is RCE
-    "Edit(~/.claude/hooks/**)",
-    "Edit(~/.claude/commands/**)",
-    "Edit(~/.claude/skills/**)",
-    "Edit(~/.claude/plugins/**)",
-    "Edit(~/.claude/backups/**)",      # the restore path for everything above
-    # Transcripts, not the `memory/` sibling beside them: they feed the hub's
-    # archive, the usage aggregates and `--resume`, so a session editing its own
-    # history rewrites what the operator later reads back.
-    "Edit(~/.claude/projects/*/*.jsonl)",
-    "Edit(~/.claude/projects/*/subagents/**)",
     "Edit(~/.config/gcloud/**)",
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
@@ -1008,6 +976,100 @@ _GUARD_DENY_PATH_RULES = [
     "Read(~/.turma/local-model.env)",
     "Edit(~/.turma/local-model.env)",
 ]
+
+# --- ~/.claude: denied by DEFAULT, with the memory trees carved out ----------
+#
+# `~/.claude` used to be one blanket `Edit(~/.claude/**)`. That protected the
+# shared login and, as nobody noticed, disabled Claude Code's memory feature for
+# every session and subagent on the host: `memory: user` resolves to
+# ~/.claude/agent-memory/<agent>/ and a session's own auto-memory to
+# ~/.claude/projects/<slug>/memory/, both under it. Sessions rediscovered the
+# same repo facts on every run.
+#
+# DENY WINS OVER ALLOW, so the exception cannot be an allow rule — the deny must
+# simply not cover the memory trees. The obvious way to do that is to enumerate
+# the dangerous paths instead, and that was tried and is WRONG: it fails OPEN.
+# A QA pass proved it immediately by writing ~/.claude/shell-snapshots/, which
+# Claude Code `source`s on EVERY Bash call of EVERY live session — arbitrary code
+# in another session's shell, past the guard hook, from a directory nobody
+# thought to name. `~/.claude` is bind-mounted into every agent container, so
+# that reaches the whole host, not just the writing session.
+#
+# So the list is generated the other way round: deny everything that is actually
+# there, then remove the two memory trees. A directory this host grows later is
+# denied from the next manager restart, without anyone remembering to add it.
+_CLAUDE_MEMORY_DIRS = ("agent-memory",)   # the whole point of the carve-out
+# Named regardless of whether they exist yet: a fresh container has no
+# shell-snapshots/ until its first Bash call, and "not there at boot" must not
+# mean "writable for this manager's lifetime". Each is an execution or
+# instruction surface, or the material a future session trusts.
+_CLAUDE_DENY_DIRS = (
+    "agents",          # agent definitions: a write here steers every future run
+    "backups",         # the restore path for everything else here
+    "bin",             # hook scripts auto-execute: a write here is RCE
+    "commands",
+    "file-history",    # the checkpoint store `/rewind` restores from
+    "hooks",
+    "plugins",
+    "session-env",
+    "sessions",        # session keys + the remote-control/IPC registry
+    "shell-snapshots", # sourced by every Bash call of every live session
+    "skills",
+    "statsig",
+)
+
+
+def claude_config_deny_rules(home=None):
+    """Deny rules covering ~/.claude except the agent-memory trees.
+
+    Fail-closed by construction: everything present is denied and the exceptions
+    are removed, rather than the dangerous paths being listed. Returns rules in
+    a stable order so `guard-settings.json` doesn't churn between restarts.
+
+    An unreadable ~/.claude yields the static rules alone — the same direction
+    the rest of this module fails, since a session that cannot write a file asks
+    for permission, while one that can rewrite the agent definitions does not.
+    """
+    rules = [
+        # Sibling of the directory, not inside it: it carries `mcpServers`
+        # (command lines run at the next session's startup) and the trust flags.
+        "Edit(~/.claude.json)",
+        # `*` never crosses `/`, so this is every top-level FILE and no
+        # directory: settings.json, CLAUDE.md, history.jsonl, *.bak-* and
+        # anything else dropped in later.
+        "Edit(~/.claude/*)",
+        # Dotfiles AND dot-directories with their contents — .credentials.json,
+        # the shared Claude login, above all.
+        "Edit(~/.claude/.*)",
+    ]
+    rules += [f"Edit(~/.claude/{d}/**)" for d in _CLAUDE_DENY_DIRS]
+    # `projects/` holds both the transcripts and each project's `memory/`, so it
+    # is the one tree that cannot be denied wholesale. Direct children (the
+    # transcripts) and the subagent transcripts beside them are denied; the
+    # `memory/` sibling, one level deeper, is not reached by either rule.
+    # Residual: a session can create other subdirectories under a slug. Nothing
+    # reads them, which QA checked by markering each candidate and grepping the
+    # binary's outbound request.
+    rules += [
+        "Edit(~/.claude/projects/*/*)",
+        "Edit(~/.claude/projects/*/subagents/**)",
+    ]
+    base = os.path.join(home or os.path.expanduser("~"), ".claude")
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return rules                      # static rules only; see the docstring
+    for name in names:
+        if name in _CLAUDE_MEMORY_DIRS or name == "projects":
+            continue                      # the carve-out, and the tree above
+        if name.startswith("."):
+            continue                      # already covered by `~/.claude/.*`
+        if not os.path.isdir(os.path.join(base, name)):
+            continue                      # already covered by `~/.claude/*`
+        rule = f"Edit(~/.claude/{name}/**)"
+        if rule not in rules:
+            rules.append(rule)
+    return rules
 
 # Operator-supplied extra permissions. Claude Code does NOT read a *user-level*
 # ~/.claude/settings.local.json — it only honors settings.local.json at the
@@ -1097,7 +1159,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     guard_command = f'"{python_exe}" "{guard_path}"'
     ask_command = f'"{python_exe}" "{ask_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
-    perms = {"deny": list(_GUARD_DENY_PATH_RULES)}
+    perms = {"deny": list(_GUARD_DENY_PATH_RULES) + claude_config_deny_rules()}
     for rule in deny:  # operator deny unions on top of the guard's own rules
         if rule not in perms["deny"]:
             perms["deny"].append(rule)

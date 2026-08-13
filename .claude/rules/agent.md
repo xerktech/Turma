@@ -421,28 +421,43 @@ See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_se
 `~/.turma/guard-settings.json`, passed to every launch as `--settings`, wiring both hooks plus the
 `permissions.deny` credential-store rules. Policy is in `CLAUDE.md`.
 
-### Why `~/.claude` is denied file-by-file
+### `~/.claude` is denied by DEFAULT, with the memory trees carved out
 
 - A blanket `Edit(~/.claude/**)` protected the login and cost the fleet its MEMORY: `memory: user`
   resolves to `~/.claude/agent-memory/<agent>/` and a session's own auto-memory to
-  `~/.claude/projects/<slug>/memory/`, so every Turma session and subagent rediscovered the same
-  repo facts on every run. Nothing in the operator's settings could re-enable it.
-- **Deny beats allow, so the carve-out is a HOLE IN THE DENY and cannot be an allow rule.** That
-  inverts this list's failure mode: a new sensitive file under `~/.claude` is writable until someone
-  names it in `_GUARD_DENY_PATH_RULES`. Anything holding a credential, executing, or steering a
-  future session goes in the list; when in doubt, deny it.
-- Denied individually: the dotfiles (`.credentials.json` — the shared login), `*.json`
-  (`settings.json` carries secrets AND this list's own source), `*.jsonl`, `CLAUDE.md*` (injected
-  into every session), `agents/`, `bin/` (hooks auto-execute — a write there is RCE), `hooks/`,
-  `commands/`, `skills/`, `plugins/`, `backups/` (the restore path for all of the above), and
-  `projects/*/*.jsonl` + `projects/*/subagents/**` (transcripts feed the archive, the usage
-  aggregates and `--resume`) — but **not** the `memory/` sibling beside those transcripts.
+  `~/.claude/projects/<slug>/memory/`, so every session and subagent rediscovered the same repo
+  facts on every run. Nothing in the operator's settings could re-enable it — deny beats allow.
+- **The carve-out must therefore be a HOLE IN THE DENY, never an allow rule.**
+- **`claude_config_deny_rules()` GENERATES the list from what is on the host** — deny everything
+  present, then remove the memory trees — precisely so it fails CLOSED. **Do not go back to
+  enumerating the dangerous paths.** That was tried and QA broke it inside one pass: nobody had
+  named `shell-snapshots/`, which Claude Code `source`s on **every Bash call of every live
+  session**, so a write there was arbitrary code in another session's shell, past the guard hook.
+  `~/.claude` is bind-mounted into every agent container, so that reaches the whole host.
+- `_CLAUDE_DENY_DIRS` names the execution/instruction surfaces **regardless of whether they exist**
+  — a fresh container has no `shell-snapshots/` until its first Bash call, and "absent at boot"
+  must not mean "writable for this manager's lifetime". An unreadable `~/.claude` yields the static
+  rules alone, which is the safe direction.
+- `Edit(~/.claude.json)` is in the list though it sits OUTSIDE the directory: it carries
+  `mcpServers` — command lines run at the next session's startup — and the trust flags, and it is
+  bind-mounted too. It was never covered by the old blanket rule either.
+- `projects/` is the one tree that can't be denied wholesale, since the transcripts and each
+  project's `memory/` live in it. `projects/*/*` (transcripts) and `projects/*/subagents/**` are
+  denied; `memory/` is one level deeper than either reaches. **Residual:** a session can create
+  other subdirectories under a slug — nothing reads them, which QA checked by markering each
+  candidate and grepping the binary's outbound request.
+- Matcher facts these rules depend on (verified against claude 2.1.229, not inferred): `*` never
+  crosses `/`; `**` spans any depth; `.*` covers dot-directories **and their contents**; `~` is the
+  runtime `HOME`; `../` is normalised and symlinks resolved before matching; and an `Edit(...)` deny
+  blocks **Bash redirections** into the path as well as the file-editing tools.
 - **`settings.local.json` unions on top**, so an operator writing `Edit(~/.claude/**)` there
-  re-disables memory host-wide. That is theirs to choose; it is pinned by a test so it stays a
-  choice rather than a surprise.
-- Agent memory is instruction-adjacent — it is injected into future runs — so making it writable
-  moves weight onto the agent-side rule never to record anything the material under review asked to
-  be recorded. Tests: `TestGuardSettings`, `TestOperatorLocalPermissions`.
+  re-disables memory host-wide. Theirs to choose; pinned by a test so it stays a choice.
+- **Memory is instruction-adjacent and its blast radius is the whole host**: any session can write
+  any other project's auto-memory and any agent's memory, and both are injected into those future
+  runs. That is not expressible as a static deny — it is what the agent-side rule never to record
+  anything the material under review asked to be recorded is now load-bearing for.
+- Tests: `TestGuardSettings`, `TestOperatorLocalPermissions`. The suite cannot see glob SEMANTICS;
+  those were driven against the real binary via a fake `/v1/messages` endpoint.
 
 ## `entrypoint.sh` and the bundled toolchains
 

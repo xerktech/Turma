@@ -6,6 +6,7 @@ the module is loaded by file path (its name has a dash)."""
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -34,6 +35,53 @@ class TestGuardSettings(unittest.TestCase):
         self.assertIn("Edit(~/.claude/.*)", deny)   # the shared login, .credentials.json
         self.assertIn("Edit(~/.aws/**)", deny)
 
+    def test_claude_deny_is_generated_from_what_is_there(self):
+        """The ~/.claude rules fail CLOSED: deny what exists, carve out memory.
+
+        Enumerating the DANGEROUS paths instead was tried and is wrong. It fails
+        open, and a QA pass proved it by writing `shell-snapshots/`, which Claude
+        Code sources on every Bash call of every live session — RCE in another
+        session's shell from a directory nobody had thought to name.
+        """
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        base = os.path.join(home, ".claude")
+        for d in ("agent-memory", "projects", "shell-snapshots", "brand-new-thing"):
+            os.makedirs(os.path.join(base, d))
+        open(os.path.join(base, "settings.json"), "w").close()
+        rules = ha.claude_config_deny_rules(home=home)
+
+        # A directory this build has never heard of is denied anyway. This is
+        # the whole property; if it regresses the list is back to fail-open.
+        self.assertIn("Edit(~/.claude/brand-new-thing/**)", rules)
+        # ...and the two memory trees survive it.
+        self.assertNotIn("Edit(~/.claude/agent-memory/**)", rules)
+        self.assertEqual([r for r in rules if "agent-memory" in r], [])
+        self.assertEqual([r for r in rules if "/memory/" in r], [])
+        self.assertNotIn("Edit(~/.claude/projects/**)", rules)
+        self.assertNotIn("Edit(~/.claude/**)", rules)
+
+    def test_claude_deny_names_the_execution_surfaces_even_when_absent(self):
+        # A fresh container has no shell-snapshots/ until its first Bash call.
+        # "Not there at boot" must not mean "writable for this manager's life".
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        os.makedirs(os.path.join(home, ".claude"))
+        rules = ha.claude_config_deny_rules(home=home)
+        for d in ("shell-snapshots", "sessions", "bin", "agents", "plugins",
+                  "hooks", "commands", "skills", "file-history", "backups",
+                  "session-env", "statsig"):
+            self.assertIn(f"Edit(~/.claude/{d}/**)", rules)
+        self.assertIn("Edit(~/.claude.json)", rules)   # mcpServers: startup exec
+        self.assertIn("Edit(~/.claude/*)", rules)      # every top-level file
+        self.assertIn("Edit(~/.claude/.*)", rules)     # .credentials.json
+
+    def test_claude_deny_unreadable_home_still_denies_the_dangerous_paths(self):
+        rules = ha.claude_config_deny_rules(home="/nonexistent-turma-qa")
+        self.assertIn("Edit(~/.claude/shell-snapshots/**)", rules)
+        self.assertIn("Edit(~/.claude/.*)", rules)
+        self.assertIn("Edit(~/.claude/projects/*/*)", rules)
+
     def test_claude_config_denied_piecewise_but_memory_stays_writable(self):
         """~/.claude is protected file-by-file so agent memory survives.
 
@@ -47,13 +95,15 @@ class TestGuardSettings(unittest.TestCase):
         self.assertNotIn("Edit(~/.claude/**)", deny)
         for rule in (
             "Edit(~/.claude/.*)",                    # the shared Claude login
-            "Edit(~/.claude/*.json)",                # settings.json: secrets + this list's source
-            "Edit(~/.claude/CLAUDE.md*)",            # injected into every session
+            "Edit(~/.claude/*)",                     # settings.json, CLAUDE.md, history.jsonl, *.bak-*
+            "Edit(~/.claude.json)",                  # mcpServers: executed at session startup
             "Edit(~/.claude/agents/**)",             # steers every future run
             "Edit(~/.claude/bin/**)",                # hooks auto-execute: RCE
+            "Edit(~/.claude/shell-snapshots/**)",    # sourced by every Bash call of every session
+            "Edit(~/.claude/sessions/**)",           # session keys + the remote-control registry
             "Edit(~/.claude/plugins/**)",
             "Edit(~/.claude/backups/**)",            # the restore path for all of the above
-            "Edit(~/.claude/projects/*/*.jsonl)",    # transcripts feed archive/usage/--resume
+            "Edit(~/.claude/projects/*/*)",          # transcripts feed archive/usage/--resume
             "Edit(~/.claude/projects/*/subagents/**)",
         ):
             self.assertIn(rule, deny)
@@ -198,7 +248,13 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # attached file never costs a permission prompt (XERK-234).
         s = ha.build_guard_settings(local_settings_path="/no/such/file.json")
         self.assertEqual(s["permissions"]["allow"], list(ha._GUARD_ALLOW_PATH_RULES))
-        self.assertEqual(s["permissions"]["deny"], list(ha._GUARD_DENY_PATH_RULES))
+        # The ~/.claude rules are GENERATED from what is on this host, so they
+        # are appended rather than listed — asserting a literal here would pin
+        # the tester's home directory instead of the app's behaviour.
+        self.assertEqual(
+            s["permissions"]["deny"],
+            list(ha._GUARD_DENY_PATH_RULES) + ha.claude_config_deny_rules(),
+        )
 
     def test_malformed_file_fails_open(self):
         fd, path = tempfile.mkstemp(suffix=".json")
