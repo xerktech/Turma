@@ -203,24 +203,76 @@ class TestGuardSettings(unittest.TestCase):
                      "Edit(~/.config/python*/**)"):
             self.assertIn(rule, deny)
 
-    def test_every_claude_backstop_rule_is_pinned(self):
-        """Three mutations deleting whole groups of these escaped the suite.
+    #: Every literal rule in `_GUARD_DENY_PATH_RULES`, pinned by EQUALITY.
+    #: Containment -- assertIn for the ones somebody remembered -- is what let
+    #: SIX rules be deleted one at a time with this suite AND the live oracle
+    #: green, including `settings.json*`, which is one of the oracle's own
+    #: targets: `*.json` still covered it, so nothing observed the loss.
+    #: Equality also fails when a rule is ADDED, which is deliberate: a new
+    #: backstop should not land without someone pinning it here.
+    EXPECTED_DENY_RULES = frozenset({
+        "Edit(~/.ssh/**)",
+        "Edit(~/.aws/**)",
+        "Edit(~/.azure/**)",
+        "Edit(~/.terraform.d/**)",
+        "Edit(~/.claude.json)",
+        "Edit(~/.claude/.*)",
+        "Edit(~/.claude/*.json)",
+        "Edit(~/.claude/*.jsonl)",
+        "Edit(~/.claude/settings.json*)",
+        "Edit(~/.claude/CLAUDE.md*)",
+        "Edit(~/.claude/agents/**)",
+        "Edit(~/.claude/bin/**)",
+        "Edit(~/.claude/hooks/**)",
+        "Edit(~/.claude/local/**)",
+        "Edit(~/.claude/plugins/**)",
+        "Edit(~/.claude/rules/**)",
+        "Edit(~/.claude/sessions/**)",
+        "Edit(~/.claude/shell-snapshots/**)",
+        "Edit(~/.claude/skills/**)",
+        "Edit(~/.claude/commands/**)",
+        "Edit(~/.claude/output-styles/**)",
+        "Edit(~/.claude/workflows/**)",
+        "Edit(~/.claude/routines/**)",
+        "Edit(~/.claude/cowork_plugins/**)",
+        "Edit(~/.claude/jobs/**)",
+        "Edit(~/.claude/daemon/**)",
+        "Edit(~/.claude/ide/**)",
+        "Edit(~/.claude/todos/**)",
+        "Edit(~/.claude/themes/**)",
+        "Edit(~/.claude/session-env/**)",
+        "Edit(~/.claude/worktrees/**)",
+        "Edit(~/.claude/plans/**)",
+        "Edit(~/.claude/backups/**)",
+        "Edit(~/.claude/statusline-command.sh)",
+        "Edit(~/.claude/projects/*/*.jsonl)",
+        "Edit(~/.claude/projects/*/subagents/**)",
+        "Edit(~/.config/gcloud/**)",
+        "Edit(~/.git-credentials)",
+        "Read(~/.turma/local-model.env)",
+        "Edit(~/.local/lib/python*/site-packages/**)",
+        "Edit(~/.local/lib/python*/site-packages/*.pth)",
+        "Edit(~/.config/python*/**)",
+        "Edit(~/.turma/guard-settings.json)",
+        "Edit(~/.turma/limits-settings.json)",
+        "Edit(~/.turma/local-model.env)",
+    })
 
-        `test_catastrophic_paths_keep_pattern_denies_as_defence_in_depth` pinned
-        only the rules that predated the widening, so the entire fix could be
-        deleted green. Pin the full set instead.
+    def test_every_claude_backstop_rule_is_pinned(self):
+        """Whole groups of these have been deleted green, twice.
+
+        First `test_catastrophic_paths_keep_pattern_denies_as_defence_in_depth`
+        pinned only the rules predating the widening; then the replacement
+        enumerated most of them and missed six. Compare the SET.
         """
+        self.assertEqual(set(ha._GUARD_DENY_PATH_RULES), self.EXPECTED_DENY_RULES,
+                         "a backstop rule was added or removed without being "
+                         "pinned here; if the change is intended, update "
+                         "EXPECTED_DENY_RULES in the same commit")
         deny = ha.build_guard_settings()["permissions"]["deny"]
-        for d in ("agents", "bin", "hooks", "local", "plugins", "rules", "sessions",
-                  "shell-snapshots", "skills", "commands", "output-styles", "workflows",
-                  "routines", "cowork_plugins", "jobs", "daemon", "ide", "todos",
-                  "themes", "backups", "session-env", "worktrees", "plans"):
-            self.assertIn(f"Edit(~/.claude/{d}/**)", deny, f"{d}/ lost its backstop")
-        for rule in ("Edit(~/.claude/statusline-command.sh)",
-                     "Edit(~/.claude/projects/*/*.jsonl)",
-                     "Edit(~/.claude/projects/*/subagents/**)"):
-            self.assertIn(rule, deny)
-        # …and none of them reaches a memory path. A rule matching a DIRECTORY
+        for rule in self.EXPECTED_DENY_RULES:
+            self.assertIn(rule, deny, f"{rule} never reaches the settings file")
+        # ...and none of them reaches a memory path. A rule matching a DIRECTORY
         # takes its whole subtree, which is how this broke twice.
         self.assertEqual([r for r in deny if "agent-memory" in r or "/memory/" in r], [])
 

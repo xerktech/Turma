@@ -194,6 +194,19 @@ class TestMatcherSemantics(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self._n = 0
 
+    def _drive(self, work, sp, target):
+        """One attempt, with INCONCLUSIVE ruled out before it can be misread.
+
+        `_case` does this for the rule-string cases; anything calling `_attempt`
+        directly needs it too, or a run where the model simply never called the
+        tool gets reported as whatever the assertion happened to be about.
+        """
+        got = _attempt(work, sp, target, env=dict(os.environ, HOME=_fake_home(work)))
+        self.assertNotEqual(got, INCONCLUSIVE,
+                            f"model never attempted the write at {target}; "
+                            "inconclusive is not a verdict about the rules")
+        return got
+
     def _case(self, deny, target_rel):
         # A plain counter, not hash(): PYTHONHASHSEED is randomised per process,
         # and a collision would silently share a directory between two cases.
@@ -282,16 +295,14 @@ class TestMatcherSemantics(unittest.TestCase):
                                                repos_root=os.path.join(self.tmp, "no-repos"))
             self.assertTrue(rules, f"no rule emitted for {dirname!r}")
             sp = _settings(os.path.join(work, "cfg"), {"permissions": {"deny": rules}})
-            got = _attempt(work, sp, os.path.join(install, "hub-agent.py"),
-                           env=dict(os.environ, HOME=_fake_home(work)))
-            self.assertEqual(got, DENIED,
+            self.assertEqual(self._drive(work, sp, os.path.join(install, "hub-agent.py")),
+                             DENIED,
                              f"{rules} does not protect the directory it names")
             # ...and ONLY the directory it names. Asserting the deny alone would
             # pass just as happily for a rule that denied the whole filesystem.
             neighbour = os.path.join(work, dirname + "-other")
             os.makedirs(neighbour, exist_ok=True)
-            self.assertEqual(_attempt(work, sp, os.path.join(neighbour, "f.py"),
-                                      env=dict(os.environ, HOME=_fake_home(work))),
+            self.assertEqual(self._drive(work, sp, os.path.join(neighbour, "f.py")),
                              ALLOWED, f"{rules} over-reaches onto {neighbour}")
 
     def test_write_rules_are_inert_and_edit_rules_cover_write(self):
