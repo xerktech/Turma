@@ -280,17 +280,18 @@ function renderViewbar() {
 function fmtTokens(n) {
   n = Number(n);
   if (!Number.isFinite(n)) return "–";
+  // Rounded BEFORE the unit test, not after: a token count is a whole number,
+  // and rounding on the way out instead let 999.6 escape the k scale and then
+  // round across it, rendering "1000" beside "1.0k" for 1000.
+  n = Math.round(n);
   if (!n) return "0";
   for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
     if (n >= unit) return scaleTokens(n, unit) + suffix;
   }
-  // Below the smallest unit, and still owed digits. Two shapes reach here that
-  // String() would write in exponent form: a negative count (which never
-  // scales, so that Android — whose Long.toString cannot go exponential —
-  // renders the same thing) and a denormal. Rounding settles both, and a
-  // fractional count is not a real token figure anyway.
-  const whole = Math.round(n);
-  return Math.abs(whole) >= 1e21 ? BigInt(whole).toString() : String(whole);
+  // Below the smallest unit, and still owed digits: String() writes a
+  // negative-huge count in exponent form. Negatives never scale here, so
+  // Android — whose Long.toString cannot go exponential — renders the same.
+  return Math.abs(n) >= 1e21 ? BigInt(n).toString() : String(n);
 }
 
 // One decimal place, rounded HALF-UP on the exact value — which `(n /
@@ -1183,11 +1184,16 @@ function cacheHitRate(b) {
 // string is interpolated into innerHTML by cacheSubLine below, so it is never a
 // place to start passing text through.
 function cacheLineText(b) {
-  const read = b.cacheRead || 0, write = b.cacheWrite || 0;
-  if (!read && !write) return "";
+  const read = fmtTokens(b.cacheRead || 0), write = fmtTokens(b.cacheWrite || 0);
+  // Presence is judged on the DISPLAYED figures, not the raw ones. A fractional
+  // count formats to "0", and "0 cached · 0 written · 40% hit" states that
+  // caching is broken and then quotes a rate for it — the exact contradiction
+  // the omission above exists to avoid. A value that is not a number formats to
+  // "–", which is present: it says the arithmetic was poisoned, not that
+  // nothing was cached.
+  if (read === "0" && write === "0") return "";
   const hit = cacheHitRate(b);
-  return `${fmtTokens(read)} cached · ${fmtTokens(write)} written` +
-    (hit === null ? "" : ` · ${hit}% hit`);
+  return `${read} cached · ${write} written` + (hit === null ? "" : ` · ${hit}% hit`);
 }
 
 // The markup form, hung under a token figure in the tables. One definition of
@@ -1328,7 +1334,8 @@ function subagentCard(list) {
           `<td class="total-col${share === null ? " zero" : ""}"><span class="tok">${
             share === null ? "–" : share.toFixed(1) + "%"}</span>${
             share === null ? "" : `<span class="sub-tok">of ${fmtTokens(spent)}</span>`}${
-            gap > 0 ? `<span class="sub-tok">${fmtTokens(gap)} not covered</span>` : ""}</td></tr>`;
+            gap > 0 && fmtTokens(gap) !== "0"
+              ? `<span class="sub-tok">${fmtTokens(gap)} not covered</span>` : ""}</td></tr>`;
       }).join("")}</tbody>
   </table>`;
   card.append(scroll);

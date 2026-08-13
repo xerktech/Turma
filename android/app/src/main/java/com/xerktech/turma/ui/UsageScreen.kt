@@ -476,15 +476,6 @@ private fun CacheLine(cache: UsageViewModel.CacheSummary) {
 }
 
 /**
- * The delegated share of the figures above (web usage.html `subagentCard`,
- * XERK-302). Says "of" rather than "plus" on purpose: these tokens are already
- * inside every total on this screen, and a reader who adds them back
- * double-counts.
- *
- * Omitted entirely when no host in view reports the split — an agent predating
- * the field can't answer, and "0% delegated" would be an answer.
- */
-/**
  * The web card's three windows, in the one line the screen has room for. A
  * window with no spend has no share to take, so it is dropped rather than drawn
  * as 0% — the same distinction the card makes with a dash.
@@ -500,6 +491,15 @@ internal fun subagentWindows(sub: UsageViewModel.SubagentSplit): List<String> = 
     sub.totalPct?.let { String.format(Locale.US, "all-time %.1f%%", it) },
 )
 
+/**
+ * The delegated share of the figures above (web usage.html `subagentCard`,
+ * XERK-302). Says "of" rather than "plus" on purpose: these tokens are already
+ * inside every total on this screen, and a reader who adds them back
+ * double-counts.
+ *
+ * Omitted entirely when no host in view reports the split — an agent predating
+ * the field can't answer, and "0% delegated" would be an answer.
+ */
 @Composable
 private fun SubagentLine(sub: UsageViewModel.SubagentSplit) {
     if (!sub.any) return

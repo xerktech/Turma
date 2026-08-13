@@ -137,6 +137,14 @@ test("cacheHitRate states no rate rather than a nonsense one", () => {
 // `v || 0` swallow NaN, and the second checked `cacheRead` alone, so a negative
 // `cacheWrite` or `input` shrank the denominator below the numerator and put
 // "101% hit", "200% hit" and "Infinity% hit" in the page's headline.
+//
+// It is a RANGE-AND-REFUSAL test and nothing more. It does not pin the
+// numerator, the denominator, the rounding, or refusing-vs-clamping: reporting
+// the miss rate, putting `output` in the denominator, truncating instead of
+// rounding, clamping the nonsense to 0..100 instead of refusing it, and
+// returning a constant 50 all satisfy it. The value tests ABOVE are what pin
+// those, so they are load-bearing — do not delete them as "covered by the
+// property test".
 test("cacheHitRate is ALWAYS null or a percentage in 0..100, over every shape", () => {
   const values = [
     0, 1, -1, 100, -100, 999, 0.5, -0.5, 5e-324, -5e-324, 1e308, -1e308,
@@ -206,6 +214,28 @@ test("cacheSubLine shows read, write and hit rate once there is cache traffic", 
   assert.match(out, /9\.0k cached/);
   assert.match(out, /0 written/);
   assert.match(out, /90% hit/);
+});
+
+test("the cache line never says '0 cached · 0 written' and then quotes a rate", () => {
+  // A fractional count formats to "0" while the rate is taken off the true
+  // values, so judging presence on the RAW figures produced a line that says
+  // caching is broken and then states 40% hit.
+  assert.equal(H.cacheLineText({ cacheRead: 0.4, cacheWrite: 0, input: 0.6 }), "");
+  // A poisoned value is still PRESENT — it formats to "–", which says the
+  // arithmetic was poisoned rather than that nothing was cached.
+  assert.match(H.cacheLineText({ cacheRead: "0poison", cacheWrite: 5e6, input: 0 }), /^– cached/);
+});
+
+test("the coverage caveat never says '0 not covered'", () => {
+  // It is shown BECAUSE spend is missing from the denominator, so rendering it
+  // as zero contradicts its own reason for being on screen.
+  const card = H.subagentCard([
+    { usage: { totals: bucket({ input: 1000 }), today: bucket({}), week: bucket({}),
+               subagent: { totals: bucket({ input: 100 }), today: bucket({}), week: bucket({}) },
+               subagentOf: { totals: bucket({ input: 999.6 }), today: bucket({}), week: bucket({}) } } },
+  ]);
+  const html = card.children.map((c) => c._html || "").join("");
+  assert.equal(html.includes("0 not covered"), false);
 });
 
 test("cacheSubLine survives a write-only bucket (first session on a prefix)", () => {
@@ -294,6 +324,15 @@ test("fmtTokens never goes exponential, however absurd the count", () => {
   assert.equal(H.fmtTokens(-1e21), "-1000000000000000000000");
   assert.equal(H.fmtTokens(5e-324), "0");
   assert.equal(H.fmtTokens(-1500), "-1500");   // parity: Kotlin gives "-1500"
+});
+
+test("fmtTokens rounds BEFORE it picks a scale, so nothing rounds across one", () => {
+  // 999.6 rounds to 1000, which is 1.0k. Rounding on the way out instead let it
+  // escape the k scale and then land on "1000" — beside "1.0k" for 1000 itself.
+  assert.equal(H.fmtTokens(999.6), "1.0k");
+  assert.equal(H.fmtTokens(999_999.6), "1.0M");
+  assert.equal(H.fmtTokens(999_999_999.6), "1.0B");
+  assert.equal(H.fmtTokens(999.4), "999");
 });
 
 // The shape is a contract with the callers that interpolate this into markup,

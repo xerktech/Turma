@@ -566,6 +566,9 @@ function fmtTokens(n) {
   if (n == null) return "–";
   n = Number(n);
   if (!Number.isFinite(n)) return "–";
+  // Rounded before the unit test — see usage.html; rounding after let 999.6
+  // render as "1000" beside "1.0k" for 1000.
+  n = Math.round(n);
   for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
     if (n >= unit) {
       let whole = Math.floor(n / unit);
@@ -576,10 +579,9 @@ function fmtTokens(n) {
       return (whole >= 1e21 ? BigInt(whole).toString() : String(whole)) + "." + tenths + suffix;
     }
   }
-  // Below the smallest unit: String() writes a negative-huge or a denormal in
-  // exponent form, which is not the shape this promises. See usage.html.
-  const whole = Math.round(n);
-  return Math.abs(whole) >= 1e21 ? BigInt(whole).toString() : String(whole);
+  // Below the smallest unit: String() writes a negative-huge count in exponent
+  // form, which is not the shape this promises. See usage.html.
+  return Math.abs(n) >= 1e21 ? BigInt(n).toString() : String(n);
 }
 function fmtBytes(b) {
   if (b == null) return "–";
