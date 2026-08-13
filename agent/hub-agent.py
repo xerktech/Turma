@@ -986,6 +986,27 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.claude/sessions/**)",      # session keys + the remote-control registry
     "Edit(~/.claude/shell-snapshots/**)",  # sourced by every Bash call, every session
     "Edit(~/.claude/skills/**)",
+    # Executed or loaded as instructions when the hook is not in force. QA
+    # measured each of these writable with the hook crashed, where the blanket
+    # rule had denied them, so the backstop has to name them for the
+    # "catastrophic subset" claim above to be true.
+    "Edit(~/.claude/commands/**)",
+    "Edit(~/.claude/output-styles/**)",
+    "Edit(~/.claude/workflows/**)",
+    "Edit(~/.claude/routines/**)",
+    "Edit(~/.claude/cowork_plugins/**)",
+    "Edit(~/.claude/jobs/**)",
+    "Edit(~/.claude/daemon/**)",
+    "Edit(~/.claude/ide/**)",              # lock files publish a port + token
+    "Edit(~/.claude/todos/**)",
+    "Edit(~/.claude/themes/**)",
+    "Edit(~/.claude/backups/**)",          # the restore path for all of the above
+    "Edit(~/.claude/statusline-command.sh)",  # run when settings.json sets statusLine
+    # Transcripts: replayed into a resumed session and pushed to the hub's
+    # archive. Files only — `projects/*/*` would match the `memory` DIRECTORY
+    # beside them and take its whole subtree.
+    "Edit(~/.claude/projects/*/*.jsonl)",
+    "Edit(~/.claude/projects/*/subagents/**)",
     "Edit(~/.config/gcloud/**)",
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
@@ -1060,6 +1081,34 @@ def ask_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
 
 
+def runtime_code_deny_rules(script_dir=None, repos_root=None):
+    """Deny writes to the agent's OWN installed code — the hooks above all.
+
+    `fileguard.py` refuses writes under ~/.claude, and nothing was stopping a
+    session overwriting `fileguard.py` itself: two Writes (neutralise the hook,
+    then write anywhere) re-opened the whole config directory. The blanket
+    pattern this hook replaced had no such dependency, so the hook's own
+    integrity has to be protected explicitly. Covers `guard.py` and `ask.py`
+    beside it, and `hub-agent.py`/`tunnel-agent.js` in the parent — a session
+    rewriting the manager owns the host.
+
+    **Skipped when the code lives inside REPOS_ROOT**, i.e. a developer checkout
+    of this repo: sessions working on Turma must be able to edit Turma. That is
+    exactly the case where the files are NOT the running agent's — the container
+    and native installs both put the runtime at a prefix outside the git root.
+    """
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    repos_root = repos_root if repos_root is not None else REPOS_ROOT
+    try:
+        real_dir = os.path.realpath(script_dir)
+        real_root = os.path.realpath(repos_root)
+    except OSError:
+        return []
+    if real_dir == real_root or real_dir.startswith(real_root + os.sep):
+        return []                          # a checkout, not the installed agent
+    return [f"Edit({real_dir}/**)"]
+
+
 def fileguard_script_path():
     """Absolute path to the bundled file-write guard hook
     (``hooks/fileguard.py``), resolved the same way as ``guard_script_path``."""
@@ -1102,7 +1151,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     ask_command = f'"{python_exe}" "{ask_path}"'
     fileguard_command = f'"{python_exe}" "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
-    perms = {"deny": list(_GUARD_DENY_PATH_RULES)}
+    perms = {"deny": list(_GUARD_DENY_PATH_RULES) + runtime_code_deny_rules()}
     for rule in deny:  # operator deny unions on top of the guard's own rules
         if rule not in perms["deny"]:
             perms["deny"].append(rule)
@@ -1110,31 +1159,36 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     for rule in allow:  # operator allow unions on top of the app's own rules
         if rule not in perms["allow"]:
             perms["allow"].append(rule)
-    return {
-        "permissions": perms,
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": guard_command}],
-                },
-                {
-                    # ~/.claude is "everything except the two memory trees",
-                    # which is a predicate and not a glob. See fileguard.py.
-                    "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-                    "hooks": [{"type": "command", "command": fileguard_command}],
-                },
-                {
-                    "matcher": "AskUserQuestion",
-                    "hooks": [{
-                        "type": "command",
-                        "command": ask_command,
-                        "timeout": ASK_HOOK_TIMEOUT_SEC,
-                    }],
-                },
-            ]
-        },
-    }
+    pre = [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": guard_command}],
+    }]
+    # A hook whose script EXITS NONZERO fails open; a hook whose script is
+    # MISSING fails closed, and Claude Code then refuses every file edit in
+    # every session on the host — a version-skewed install would present as an
+    # unexplainable permissions bug. So wire it only when it is actually there,
+    # and say so loudly: patterns-only is degraded, not broken.
+    if os.path.exists(fileguard_path):
+        pre.append({
+            # ~/.claude is "everything except the two memory trees", which is a
+            # predicate and not a glob. See hooks/fileguard.py for why.
+            # MultiEdit does not exist in Claude Code 2.1.229; it is listed so
+            # the matcher does not silently stop covering it if it returns.
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+            "hooks": [{"type": "command", "command": fileguard_command}],
+        })
+    else:
+        log(f"fileguard hook missing at {fileguard_path}; ~/.claude is protected "
+            f"by deny patterns only (see .claude/rules/agent-hooks.md)")
+    pre.append({
+        "matcher": "AskUserQuestion",
+        "hooks": [{
+            "type": "command",
+            "command": ask_command,
+            "timeout": ASK_HOOK_TIMEOUT_SEC,
+        }],
+    })
+    return {"permissions": perms, "hooks": {"PreToolUse": pre}}
 
 
 def build_limits_settings(python_exe=None, statusline_path=None):

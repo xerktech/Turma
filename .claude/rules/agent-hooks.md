@@ -38,7 +38,25 @@ implementation contract.
     directory impossible to create, permanently disabling another project's or agent's memory.
   - **Fails open on malformed input**, like `guard.py` — a hook that blocked every edit because it
     could not parse its own input would take the fleet down, and the catastrophic paths hold on
-    patterns regardless.
+    patterns regardless. **A hook that exits nonzero fails open; a hook whose SCRIPT IS MISSING
+    fails closed**, refusing every file edit on the host, so `build_guard_settings` wires the
+    matcher only when the script exists and logs when it doesn't.
+  - **The hook's own file is denied** (`runtime_code_deny_rules`): without that, two Writes —
+    neutralise `fileguard.py`, then write anywhere — re-opened the whole config directory, an
+    exposure the blanket pattern did not have. It denies the agent's installed code directory,
+    covering `guard.py`/`ask.py`/`hub-agent.py`/`tunnel-agent.js` too, and is **skipped when that
+    directory is inside `REPOS_ROOT`** so sessions working on Turma can still edit Turma.
+  - **The carve-out is FLEET-WIDE, not session-scoped**, and that is a real cost, not an oversight:
+    any session may write any project's `memory/` and any agent's store, and both are injected into
+    those future runs (measured — a marker planted in another slug's `MEMORY.md` appears verbatim in
+    that session's model request). It is what the agent-side rule never to record anything the
+    material under review asked to be recorded is load-bearing for.
+  - **Bash is NOT covered by either layer.** The matcher does not include it, and Claude Code
+    applies `Edit()` denies only to redirect targets it can statically parse — `python3 -c
+    "open(...)"` defeats that. Under `bypassPermissions` a session can write anywhere in
+    `~/.claude`; the other modes prompt. This predates the hook (the blanket pattern never covered
+    Bash either) and is not fixable at the shell-string level. **So do not describe `~/.claude` as
+    protected without qualifying it: it is protected against the file-editing tools.**
   - Tests: `test_fileguard.py` (behavioural — resolved paths, not rule strings; three glob attempts
     passed their string assertions while the feature was wholly broken), `test_guard_settings.py`.
 - **AskUserQuestion bridge** (`hooks/ask.py`, same shape) — Claude's own picker is a TUI affordance

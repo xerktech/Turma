@@ -97,6 +97,42 @@ class TestGuardSettings(unittest.TestCase):
             self.assertIn(rule, deny)
         self.assertEqual([r for r in deny if "agent-memory" in r], [])
 
+    def test_a_missing_fileguard_degrades_to_patterns_rather_than_bricking(self):
+        """A hook that EXITS nonzero fails open; a MISSING one fails closed.
+
+        Claude Code then refuses every file edit in every session on the host,
+        presenting as an unexplainable permissions bug. A version-skewed install
+        must degrade to patterns-only, not stop the fleet editing files.
+        """
+        s = ha.build_guard_settings(fileguard_path="/nonexistent/fileguard.py")
+        matchers = [e["matcher"] for e in s["hooks"]["PreToolUse"]]
+        self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
+        # …and the pattern backstop is still in force.
+        self.assertIn("Edit(~/.claude/shell-snapshots/**)", s["permissions"]["deny"])
+
+    def test_the_agents_own_installed_code_is_denied(self):
+        # fileguard.py refuses writes under ~/.claude, and nothing stopped a
+        # session overwriting fileguard.py itself: two Writes re-opened the whole
+        # config directory. Proven, so the hook's own integrity is pinned.
+        self.assertEqual(ha.runtime_code_deny_rules(script_dir="/usr/local/bin",
+                                                    repos_root="/mnt/data/Docker/git"),
+                         ["Edit(/usr/local/bin/**)"])
+
+    def test_a_developer_checkout_of_this_repo_stays_editable(self):
+        # The same rule must NOT fire for a checkout under REPOS_ROOT: sessions
+        # working on Turma have to be able to edit Turma, and those files are
+        # not the running agent's — both installs put the runtime at a prefix
+        # outside the git root.
+        self.assertEqual(ha.runtime_code_deny_rules(
+            script_dir="/mnt/data/Docker/git/Turma/agent",
+            repos_root="/mnt/data/Docker/git"), [])
+        self.assertEqual(ha.runtime_code_deny_rules(
+            script_dir="/mnt/data/Docker/git", repos_root="/mnt/data/Docker/git"), [])
+        # A path that merely shares a prefix is not inside it.
+        self.assertNotEqual(ha.runtime_code_deny_rules(
+            script_dir="/mnt/data/Docker/gitx/agent",
+            repos_root="/mnt/data/Docker/git"), [])
+
     def test_fileguard_script_path_points_at_bundled_hook(self):
         path = ha.fileguard_script_path()
         self.assertTrue(path.endswith(os.path.join("hooks", "fileguard.py")))

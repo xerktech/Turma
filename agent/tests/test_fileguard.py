@@ -75,6 +75,20 @@ class TestMemoryTreesAreWritable(FileGuardBase):
             self.assertAllowed(p, tool=tool)
         self.assertAllowed(p, tool="NotebookEdit", key="notebook_path")
 
+    def test_every_file_editing_tool_is_actually_GUARDED(self):
+        """An allow-only per-tool test passes when the tool isn't guarded at all.
+
+        Exactly that let three mutations through — dropping `Edit` or
+        `NotebookEdit` from FILE_TOOLS, or `notebook_path` from PATH_KEYS — while
+        the suite stayed green. Every tool and every path key needs a REFUSAL.
+        """
+        denied = os.path.join(self.claude, "settings.json")
+        for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            self.assertRefused(denied, tool=tool)
+        for key in ("file_path", "notebook_path", "path"):
+            self.assertRefused(denied, tool="NotebookEdit", key=key)
+            self.assertRefused(denied, tool="Write", key=key)
+
 
 class TestClaudeConfigIsProtected(FileGuardBase):
     def test_credentials_and_settings(self):
