@@ -1782,9 +1782,12 @@ test("the history caches are bounded in BYTES, fleet-wide (XERK-258)", () => {
   mod.agents.byteHost = host;
   try {
     const big = (n) => [{ uuid: `u${n}`, role: "user", text: "x".repeat(1 << 20) }];
-    // Six deliveries of ~1 MiB each, well inside HISTORY_MAX_SESSIONS...
+    // Six deliveries of ~1 MiB each, well inside HISTORY_MAX_SESSIONS. The sweep is
+    // the BEAT's, not the ingest's (one pass over both caches — see the one-sweep
+    // case), so it is called the way the route calls it.
     for (let i = 0; i < 6; i++) {
-      mod.ingestHistory(host, [{ sessionId: `s${i}`, entries: big(i) }]);
+      const landed = mod.ingestHistory(host, [{ sessionId: `s${i}`, entries: big(i) }]);
+      mod.sweepHistoryBytes([landed]);
     }
     const held = Object.values(host.history).reduce((n, h) => n + h.bytes, 0);
     assert.ok(held <= (4 << 20), `history caches must stay under the byte ceiling (held ${held})`);
@@ -1797,30 +1800,198 @@ test("the history caches are bounded in BYTES, fleet-wide (XERK-258)", () => {
   }
 });
 
-test("the heartbeat cap is a SIXTEENTH of the container, floored at BODY_MAX (XERK-258)", () => {
-  // HEARTBEAT_MAX is the documented ceiling for a legitimate delivery; this is what
-  // the container can afford to PARSE (~5x the body, and V8 sizes its heap from the
-  // cgroup, so it grows into the container and lets the kernel decide). Deleting the
-  // derivation left the suite green while eight 25 MiB beats pegged a 256 MiB
-  // container one beat from death — so it is pinned here.
+test("every ceiling is derived through the hold factor, so concurrency fits (XERK-258)", () => {
+  // The ceilings were fractions picked by eye, and four concurrent beats at exactly
+  // the size the hub ADVERTISES then OOM-killed a 64 MiB container: the bytes summed
+  // to a quarter of it, which is more than the whole container once parsed at ~5x.
+  // Sequential beats of the same size were fine, which is why eyeballing survived a
+  // round of testing. Each limit is checked against the arithmetic, not a constant.
+  for (const mb of [64, 96, 128, 256, 1024]) {
+    const m = freshServerModule((env) => {
+      env.HUB_MEM_LIMIT_BYTES = String(mb << 20);
+      delete env.BODY_INFLIGHT_MAX_BYTES;
+      delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+      delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
+      delete env.UPLOAD_TOTAL_MAX_BYTES;
+      delete env.HISTORY_TOTAL_MAX_BYTES;
+    });
+    const limit = mb << 20;
+    // The factor is HARD-CODED here on purpose. Deriving it from the module's own
+    // BODY_HOLD_FACTOR made this a tautology: lowering the constant lowered both
+    // sides and the suite stayed green while the ceilings grew past the container.
+    // 5x is the measured cost of holding a JSON body; if that measurement changes,
+    // this number changes WITH a fresh measurement, not to make a test pass.
+    const MEASURED_HOLD_FACTOR = 5;
+    assert.equal(m.BODY_HOLD_FACTOR, MEASURED_HOLD_FACTOR,
+                 "the source's factor must match what was measured");
+    const held = m.BODY_INFLIGHT_TOTAL_MAX * MEASURED_HOLD_FACTOR;
+    assert.ok(
+      held <= limit * 0.55,
+      `${mb}m: in-flight bytes must fit the container once HELD (${held} vs ${limit})`
+    );
+    // A second at-cap body must not be able to join the first.
+    assert.ok(
+      m.heartbeatAcceptMax() * 2 - m.BODY_INFLIGHT_FREE > m.BODY_INFLIGHT_MAX,
+      `${mb}m: two at-cap bodies must not both fit the charged ceiling`
+    );
+    // And everything that can be held AT ONCE still leaves the hub room to run.
+    assert.ok(
+      held + m.UPLOAD_TOTAL_MAX_BYTES < limit,
+      `${mb}m: in-flight (held) + retained uploads must fit (${held + m.UPLOAD_TOTAL_MAX_BYTES})`
+    );
+    // A second attachment always fits beside the first.
+    assert.ok(m.UPLOAD_MAX_BYTES * 2 <= m.UPLOAD_TOTAL_MAX_BYTES,
+              `${mb}m: the per-file cap must leave room for another file`);
+  }
+});
+
+test("retainedBytes counts staged uploads and NOT spooled migration bundles (XERK-258)", () => {
+  // XERK-263 spools a bundle to disk and streams it back out, so it is not competing
+  // for the heap these ceilings protect. Counting it made two in-flight moves refuse
+  // every large beat for as long as they lasted — a lockout, not a bound; the disk
+  // burst is bounded by MIGRATE_INFLIGHT_MAX instead.
+  assert.equal(hub.retainedBytes(), 0, "nothing held to start");
+  hub.migrations.set("mig-ret", { id: "mig-ret", phase: "importing",
+                                  blobPath: "/data/migrations/mig-ret", blobSize: 65 << 20 });
+  try {
+    assert.equal(hub.retainedBytes(), 0, "a spooled bundle is disk, not heap");
+  } finally {
+    hub.migrations.delete("mig-ret");
+  }
+  hub.uploads.set("up-ret", { id: "up-ret", size: 1234, bytes: Buffer.alloc(0) });
+  try {
+    assert.equal(hub.retainedBytes(), 1234, "a staged upload IS heap");
+  } finally {
+    hub.uploads.delete("up-ret");
+  }
+});
+
+test("the record-size 413 is labelled kind:record, so the agent does not shed for it", async () => {
+  // Measured with the on-demand results already stripped, so shedding them can never
+  // satisfy it. Unlabelled, the agent sheds on this refusal too and destroys one
+  // delivery per beat while the host is offline for an unrelated reason.
+  const res = await request("POST", "/api/heartbeat", {
+    headers: { ...agentHeaders, connection: "close" },
+    body: { device: "kind-host", sessions: "A".repeat(AGENT_RECORD_MAX + 1024) },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(res.body.kind, "record");
+  assert.equal(res.body.limit, AGENT_RECORD_MAX);
+});
+
+test("http: a beat's own history delivery survives the beat that carried it (XERK-258)", async () => {
+  // Driven through the ROUTE, not the ingest functions: the guard lives in how the
+  // heartbeat handler calls the sweep (once, over both deliveries), so a test that
+  // calls sweepHistoryBytes itself cannot see the route's call site being wrong —
+  // and it was wrong, sweeping with nothing protected on the second pass.
+  const mod = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(256 << 20);
+    env.HISTORY_TOTAL_MAX_BYTES = String(200000); // below the delivery below
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+  });
+  await new Promise((r) => mod.server.listen(0, "127.0.0.1", r));
+  const port = mod.server.address().port;
+  const call = (method, pathName, body) =>
+    new Promise((resolve, reject) => {
+      const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+      const req = http.request(
+        `http://127.0.0.1:${port}${pathName}`,
+        { method, headers: { authorization: method === "GET" ? basic("hubuser", "hubpass")
+                                                             : "Bearer agenttok",
+                             "content-type": "application/json",
+                             ...(payload ? { "content-length": String(payload.length) } : {}) } },
+        (res) => {
+          let d = "";
+          res.on("data", (c) => (d += c));
+          res.on("end", () => resolve({ status: res.statusCode, raw: d }));
+        }
+      );
+      req.on("error", reject);
+      if (payload) req.write(payload);
+      req.end();
+    });
+  try {
+    // ONE beat carrying a big history delivery AND a small subagent one.
+    const beat = await call("POST", "/api/heartbeat", {
+      device: "sweepRoute",
+      sessions: [{ id: "s1", repo: "R", status: "running" }],
+      historyResults: [{ sessionId: "s1",
+                         entries: [{ uuid: "u", role: "user", text: "x".repeat(1 << 20) }] }],
+      subagentHistoryResults: [{ sessionId: "s1", type: "agent", label: "l",
+                                 entries: [{ uuid: "v", role: "user", text: "tiny" }] }],
+    });
+    assert.equal(beat.status, 200);
+    // 200 = served from cache. 202 = evicted, and the client re-queues a `history`
+    // command on every open — an unbounded fetch/deliver/evict loop.
+    const got = await call("GET", "/api/agents/sweepRoute/sessions/s1/history");
+    assert.equal(got.status, 200, "the delivery this beat carried must be readable");
+  } finally {
+    await new Promise((r) => mod.server.close(r));
+  }
+});
+
+test("one history sweep per beat, so a delivery is not evicted by the NEXT ingest", () => {
+  // The just-landed guard was defeated within the same beat: the sweep ran inside
+  // each ingest, so the second pass had nothing protected and evicted what the first
+  // had just taken in.
+  const mod = freshServerModule((env) => {
+    env.HUB_MEM_LIMIT_BYTES = String(256 << 20);
+    env.HISTORY_TOTAL_MAX_BYTES = String(200000); // smaller than the delivery below
+    delete env.BODY_INFLIGHT_MAX_BYTES;
+    delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
+  });
+  const host = { history: {}, subagentHistory: {} };
+  mod.agents.sweepHost = host;
+  try {
+    const landed = [
+      mod.ingestHistory(host, [{ sessionId: "s1",
+                                 entries: [{ uuid: "u", text: "x".repeat(1 << 20) }] }]),
+      mod.ingestSubagentHistory(host, [{ sessionId: "s1", type: "agent", label: "l",
+                                         entries: [{ uuid: "v", text: "tiny" }] }]),
+    ];
+    mod.sweepHistoryBytes(landed);
+    assert.ok(host.history.s1, "the big delivery that just landed must survive the beat");
+    assert.equal(Object.keys(host.subagentHistory).length, 1, "and so must the small one");
+  } finally {
+    delete mod.agents.sweepHost;
+  }
+});
+
+test("the heartbeat cap comes out of USABLE memory, not the whole container (XERK-258)", () => {
+  // The cap used to be a bare fraction of the container, which silently assumes the
+  // container is all ours — nearly true at 1 GiB, nearly false at 64 MiB, where the
+  // interpreter's own ~20-40 MiB is most of it. A 64 MiB hub then survived a
+  // concurrent burst and died on the sequence after it, every ceiling respected.
   const at = (bytes) => freshServerModule((env) => {
     env.HUB_MEM_LIMIT_BYTES = String(bytes);
     delete env.BODY_INFLIGHT_MAX_BYTES;
     delete env.BODY_INFLIGHT_TOTAL_MAX_BYTES;
     delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
+    delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
-  const m256 = at(256 << 20);
-  assert.equal(m256.heartbeatAcceptMax(), 16 << 20, "a sixteenth at the deployed limit");
-  assert.ok(m256.heartbeatAcceptMax() < m256.HEARTBEAT_MAX, "below the documented ceiling");
-  // A ROOMY floor is what re-created the OOM: at -m 64m an 8 MiB floor overrode the
-  // derivation, the hub advertised 8 MiB, took one beat that size and died on the
-  // next. The floor must be small enough that the container can still parse it.
-  const m64 = at(64 << 20);
-  assert.ok(m64.heartbeatAcceptMax() <= (64 << 20) / 16,
-            `64m must not advertise more than a sixteenth (got ${m64.heartbeatAcceptMax()})`);
-  assert.ok(m64.heartbeatAcceptMax() >= m64.BODY_INFLIGHT_FREE, "but at least one free floor");
-  // A big container keeps the documented ceiling rather than scaling past it.
-  assert.equal(at(4096 << 20).heartbeatAcceptMax(), m256.HEARTBEAT_MAX);
+  let last = 0;
+  for (const mb of [64, 96, 128, 256, 1024]) {
+    const m = at(mb << 20);
+    const cap = m.heartbeatAcceptMax();
+    // Below the documented ceiling wherever the container cannot afford it...
+    assert.ok(cap <= m.HEARTBEAT_MAX, `${mb}m: never above the documented ceiling`);
+    // ...and always at least a whole free floor, or no beat could get through.
+    assert.ok(cap >= m.BODY_INFLIGHT_FREE, `${mb}m: a beat must still fit (${cap})`);
+    // The baseline is subtracted BEFORE any share: at 64m a bare sixteenth would be
+    // 4 MiB, which is what died.
+    assert.ok(cap < (mb << 20) / 16 || mb >= 1024,
+              `${mb}m: must be tighter than a bare sixteenth (${cap})`);
+    // One body may take most of the in-flight capacity but never all of it, or an
+    // ordinary beat is refused while a big delivery is in flight — a fleet-wide
+    // outage rather than a bounded one.
+    assert.ok(cap < m.BODY_INFLIGHT_TOTAL_MAX,
+              `${mb}m: an ordinary beat must fit beside an at-cap one`);
+    assert.ok(cap > last || mb === 1024, `${mb}m: more memory must not mean a smaller cap`);
+    last = cap;
+  }
+  assert.equal(at(4096 << 20).heartbeatAcceptMax(), (32 << 20),
+               "a big container keeps the documented ceiling rather than scaling past it");
 });
 
 test("http: a body declaring more than the ROUTE CAP is refused on its headers (XERK-258)", async () => {
@@ -2167,8 +2338,18 @@ test("the memory ceilings are derived from the container limit, not from constan
     delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
     delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
-  assert.equal(at256.BODY_INFLIGHT_MAX, 32 << 20, "charged: an eighth of the container");
-  assert.equal(at256.BODY_INFLIGHT_TOTAL_MAX, 64 << 20, "total in flight: a quarter");
+  // The charged ceiling tracks ONE at-cap body, so a second cannot join it; the
+  // total is what fits the container once held at BODY_HOLD_FACTOR; uploads are raw
+  // Buffers, so they get a larger share than in-flight JSON does.
+  assert.equal(at256.BODY_INFLIGHT_MAX, at256.heartbeatAcceptMax(), "charged: one at-cap body");
+  // What fits once parsed, out of USABLE memory (the container minus the
+  // interpreter's own footprint) — not a share of the whole container.
+  assert.equal(
+    at256.BODY_INFLIGHT_TOTAL_MAX,
+    Math.floor((((256 << 20) - at256.HUB_BASELINE_BYTES) * at256.BODY_HOLD_SHARE)
+               / at256.BODY_HOLD_FACTOR),
+    "total in flight: what USABLE memory can hold once parsed"
+  );
   assert.equal(at256.UPLOAD_TOTAL_MAX_BYTES, 32 << 20, "retained relay blobs: an eighth");
   assert.equal(at256.BODY_INFLIGHT_ESCAPE_MAX, 128 << 20, "a lone body's escape: half");
   // The numbers only mean something if the things they bound can be held AT ONCE:
@@ -2176,8 +2357,9 @@ test("the memory ceilings are derived from the container limit, not from constan
   // in. Deriving each ceiling separately and never checking the sum is how the
   // first version of this passed its own tests and still OOM'd.
   assert.ok(
-    at256.BODY_INFLIGHT_TOTAL_MAX + at256.UPLOAD_TOTAL_MAX_BYTES <= (256 << 20) / 2,
-    "in-flight + retained must leave at least half the container for the hub itself"
+    at256.BODY_INFLIGHT_TOTAL_MAX * at256.BODY_HOLD_FACTOR + at256.UPLOAD_TOTAL_MAX_BYTES
+      < (256 << 20),
+    "everything holdable at once must still fit the container"
   );
   // A file the relay could accept but has no room to hold would be a 200 the hub
   // cannot honour.
@@ -2190,7 +2372,8 @@ test("the memory ceilings are derived from the container limit, not from constan
     delete env.BODY_INFLIGHT_ESCAPE_MAX_BYTES;
     delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
-  assert.equal(at1g.BODY_INFLIGHT_MAX, 128 << 20, "raising mem_limit raises the budget with it");
+  assert.ok(at1g.BODY_INFLIGHT_MAX > at256.BODY_INFLIGHT_MAX,
+            "raising mem_limit raises the budget with it");
 
   // A tiny container must still admit one whole attachment, or the composer's 📎
   // would be dead on arrival rather than merely limited.
@@ -2202,7 +2385,12 @@ test("the memory ceilings are derived from the container limit, not from constan
     delete env.UPLOAD_TOTAL_MAX_BYTES;
   });
   assert.ok(tiny.UPLOAD_TOTAL_MAX_BYTES >= tiny.UPLOAD_MAX_BYTES);
-  assert.ok(tiny.BODY_INFLIGHT_MAX >= (8 << 20), "and never a budget too small to beat through");
+  // The floor is "one at-cap body fits", not a flat number of megabytes. A roomy
+  // constant here was the defect: an 8 MiB floor overrode the derivation at -m 64m
+  // and the hub advertised — then died on — a size the container could not parse.
+  assert.ok(tiny.BODY_INFLIGHT_MAX >= tiny.heartbeatAcceptMax(),
+            "a legitimate at-cap beat must still fit the charged ceiling");
+  assert.ok(tiny.BODY_INFLIGHT_MAX < (8 << 20), "and 64m must not be given an 8 MiB budget");
 
   // With no override the budget comes off whatever the cgroup says — a real
   // limit here, nothing on a native install — and either way it stays finite.

@@ -249,18 +249,24 @@ function checkSpawnModelSource(cmd, hostKey) {
 // kernel kills on is not a ceiling (XERK-258). Also counted against the
 // in-flight ceilings while it is held (see retainedBytes), since a relay blob and
 // a request body are the same RAM.
-// An eighth, not a quarter: held blobs and in-flight bodies are summed by the
-// kernel, so this has to leave room for BODY_INFLIGHT_TOTAL_MAX beside it.
+// An eighth of the container. These are raw Buffers, held for up to UPLOAD_TTL_MS
+// and never parsed, so they cost their own size and no more — but they are RETAINED
+// while in-flight bodies are transient, and measurement says that is what decides
+// the ceiling: sustained at-cap beats alone peaked at 150 MiB of 256, a full pool
+// alone at 146, and the two TOGETHER at 249 — additive, 97% of the container. A
+// quarter here is a per-file cap an operator would enjoy and a control plane the
+// whole fleet depends on; the fleet wins.
 const UPLOAD_TOTAL_MAX_BYTES =
   Number(process.env.UPLOAD_TOTAL_MAX_BYTES) ||
   (HUB_MEM_LIMIT ? Math.floor(HUB_MEM_LIMIT / 8) : 1 << 27); // 128 MiB uncapped
-// Per file, and never MORE than the whole pool: deriving the pool from the
-// container while leaving this a flat 32 MiB made the per-file cap twice the
-// pool — and half the container — on a small hub, so one attachment could be
-// accepted that the relay had no room to hold.
+// Per file, and never more than HALF the pool, so a second attachment always fits
+// beside the first. A per-file cap EQUAL to the pool is advertised as a limit the
+// relay can only honour when nothing else is pending: a file at exactly the
+// advertised size then 503s "try again shortly" until the other attachments are
+// collected or their 20-minute TTL expires, which is not shortly.
 const UPLOAD_MAX_BYTES = Math.min(
   Number(process.env.UPLOAD_MAX_BYTES) || (1 << 25), // 32 MiB per file
-  UPLOAD_TOTAL_MAX_BYTES
+  Math.floor(UPLOAD_TOTAL_MAX_BYTES / 2)
 );
 // How long a staged blob waits to be collected. Generous, because the operator
 // attaches files and then keeps typing before pressing Send — the clock starts
@@ -1465,7 +1471,7 @@ function ingestHistory(agent, historyResults) {
       .slice(0, over)
       .forEach(([sessionId]) => delete agent.history[sessionId]);
   }
-  sweepHistoryBytes(newest);
+  return newest;
 }
 
 // The serialized size of one cached delivery, measured ONCE at ingest so the
@@ -1489,20 +1495,23 @@ function cacheEntryBytes(entries) {
 // count and age caps above cannot see size, and 8 sessions x tens of MiB is over
 // any container this runs in (XERK-258).
 function sweepHistoryBytes(keep) {
+  const spared = (Array.isArray(keep) ? keep : [keep]).filter(Boolean);
+  const isSpared = (cache, key) =>
+    spared.some((k) => k.cache === cache && k.key === key);
   const held = [];
   let total = 0;
   for (const a of Object.values(agents)) {
     for (const [key, h] of Object.entries(a.history || {})) {
       const bytes = Number(h.bytes) || 0;
       total += bytes;
-      if (!(keep && keep.cache === a.history && keep.key === key)) {
+      if (!isSpared(a.history, key)) {
         held.push({ cache: a.history, key, bytes, at: h.fetchedAt || 0 });
       }
     }
     for (const [key, h] of Object.entries(a.subagentHistory || {})) {
       const bytes = Number(h.bytes) || 0;
       total += bytes;
-      if (!(keep && keep.cache === a.subagentHistory && keep.key === key)) {
+      if (!isSpared(a.subagentHistory, key)) {
         held.push({ cache: a.subagentHistory, key, bytes, at: h.fetchedAt || 0 });
       }
     }
@@ -1514,9 +1523,9 @@ function sweepHistoryBytes(keep) {
     delete h.cache[h.key];
     total -= h.bytes;
   }
-  // `keep` — the delivery that just landed — is excluded from the sweep above, so
-  // a single delivery larger than the whole ceiling is not evicted the instant it
-  // arrives. Evicting it made the view unloadable AND unbounded: every open
+  // `keep` — every delivery that just landed, from BOTH caches — is excluded from
+  // the sweep above, so a single delivery larger than the whole ceiling is not
+  // evicted the instant it arrives. Evicting it made the view unloadable AND unbounded: every open
   // re-queued a `history` command, costing the victim host a transcript read per
   // turn, forever.
 }
@@ -1552,7 +1561,7 @@ function ingestSubagentHistory(agent, results) {
       .slice(0, over)
       .forEach(([k]) => delete agent.subagentHistory[k]);
   }
-  sweepHistoryBytes(newest); // the byte bound is fleet-wide — see ingestHistory
+  return newest;
 }
 
 // Merge the agent's on-demand Jira issue deliveries (heartbeat
@@ -2154,9 +2163,8 @@ const HEARTBEAT_MAX = 32 << 20; // 32 MiB
 // back — at `-m 64m` the hub advertised 8 MiB, accepted one beat of exactly that
 // size and was killed by the second. A floor here must be small enough that the
 // container can still parse it, and only the derivation knows that.
-const HEARTBEAT_ACCEPT_MAX_RAW = HUB_MEM_LIMIT
-  ? Math.min(HEARTBEAT_MAX, Math.max(BODY_MAX, Math.floor(HUB_MEM_LIMIT / 16)))
-  : HEARTBEAT_MAX;
+// Set below, once the in-flight capacity it derives from exists.
+let HEARTBEAT_ACCEPT_MAX_RAW = HEARTBEAT_MAX;
 
 // ---- the fleet-wide in-flight body budget (XERK-258) ------------------------
 // HEARTBEAT_MAX bounds ONE body and says nothing about how many arrive at once,
@@ -2175,16 +2183,61 @@ const HEARTBEAT_ACCEPT_MAX_RAW = HUB_MEM_LIMIT
 // bodies is defeated by many small bodies, and a budget that doesn't exempt them
 // turns one host's big delivery into a fleet-wide outage. See the pair below.
 
+// **Every ceiling below is derived through this factor, not from a bare fraction
+// of the container.** A JSON body costs roughly five times its own size to hold —
+// the accumulated string, the object graph JSON.parse builds from it, then
+// sanitizeHeartbeat re-serializing any key this hub does not know — and picking
+// fractions by eye instead of dividing by it is how four concurrent beats, each at
+// exactly the size the hub ADVERTISES, OOM-killed a 64 MiB container: the ceilings
+// summed to a quarter of the container in bytes, which is more than the whole
+// container once parsed. Sequential beats of the same size were fine, which is
+// exactly why eyeballing survived a round of testing.
+const BODY_HOLD_FACTOR = 5;
+// How much of the container all in-flight bodies may occupy ONCE HELD, leaving the
+// rest for the hub's own state, the relay's staged uploads, and headroom. Measured
+// at the deployed 256m under sustained at-cap traffic PLUS a full upload pool: 0.5
+// peaked at 250 MiB of 256, 0.4 at 234, and 0.3 bought nothing further — past that
+// the retained pool dominates, so it is sized below.
+const BODY_HOLD_SHARE = 0.4;
+// What the interpreter itself occupies before this hub holds anything: node plus the
+// hub's own state measured ~20 MiB idle, and its heap grows from there. It is
+// SUBTRACTED before any share is taken, because a fraction of the whole container
+// silently assumes the container is all ours — which is nearly true at 1 GiB and
+// nearly false at 64 MiB, where a bare fraction handed out more than the free space.
+// A 64 MiB hub survived a concurrent burst and then died on the sequence after it,
+// with every ceiling respected, because of exactly that.
+const HUB_BASELINE_BYTES = 40 * 1024 * 1024;
+// The bytes this container can actually afford to hold in flight, once parsed.
+const BODY_INFLIGHT_CAPACITY = HUB_MEM_LIMIT
+  ? Math.max(BODY_MAX, Math.floor(
+      (Math.max(BODY_MAX, HUB_MEM_LIMIT - HUB_BASELINE_BYTES) * BODY_HOLD_SHARE)
+        / BODY_HOLD_FACTOR))
+  : 0;
+// One body may take most of that capacity, but not all of it: the remainder is what
+// keeps ORDINARY beats from being refused while a big delivery is in flight, which
+// is a fleet-wide outage rather than a bounded one.
+const BODY_ONE_BODY_SHARE = 0.7;
+
 // The budget counts BODY BYTES, but a body costs several times its own size to
 // hold: a 30 MiB JSON beat measured ~93 MiB above idle (the accumulated string,
 // then the object graph JSON.parse builds from it). An eighth of the container
 // is therefore what one full-size body can safely occupy — not half.
 // Uncapped, a fixed 64 MiB still bounds the pathological case.
+if (HUB_MEM_LIMIT) {
+  HEARTBEAT_ACCEPT_MAX_RAW = Math.min(
+    HEARTBEAT_MAX,
+    Math.max(BODY_MAX, Math.floor(BODY_INFLIGHT_CAPACITY * BODY_ONE_BODY_SHARE))
+  );
+}
+
 const BODY_INFLIGHT_MAX = (() => {
   const explicit = Number(process.env.BODY_INFLIGHT_MAX_BYTES);
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
   if (!HUB_MEM_LIMIT) return 64 << 20;
-  return Math.max(8 << 20, Math.floor(HUB_MEM_LIMIT / 8));
+  // One at-cap body's worth: the point of this ceiling is that a SECOND large body
+  // cannot join the first, so it tracks the accept cap rather than a fraction of
+  // its own.
+  return Math.max(BODY_MAX, HEARTBEAT_ACCEPT_MAX_RAW);
 })();
 
 // A body's first BODY_MAX is FREE of the budget above — so an ordinary beat is
@@ -2203,7 +2256,7 @@ const BODY_INFLIGHT_TOTAL_MAX = (() => {
   const explicit = Number(process.env.BODY_INFLIGHT_TOTAL_MAX_BYTES);
   if (Number.isFinite(explicit) && explicit > 0) return Math.max(BODY_INFLIGHT_MAX, explicit);
   if (!HUB_MEM_LIMIT) return Math.max(BODY_INFLIGHT_MAX, 128 << 20);
-  return Math.max(BODY_INFLIGHT_MAX, 16 << 20, Math.floor(HUB_MEM_LIMIT / 4));
+  return Math.max(BODY_INFLIGHT_MAX, BODY_INFLIGHT_CAPACITY);
 })();
 
 // The hard ceiling on a LONE body's escape (see bodyBudget): a single read is
@@ -2827,6 +2880,16 @@ function readRawBody(req, cap) {
  */
 function refuse(res, code, obj) {
   if (res.writableEnded) return;
+  // LOG it. A body-cap 413 reaches the sender as a broken pipe more often than as a
+  // status (see below), so if it is not written here the one refusal that can leave
+  // a host beating into a wall forever is invisible from both ends — which is
+  // XERK-235's "silently vanishes with nothing logged" in a narrower form.
+  if (code === 413) {
+    console.error(
+      `refused ${res.req ? `${res.req.method} ${res.req.url}` : "a request"}: ` +
+        `${obj && obj.error}${obj && obj.limit ? ` (limit ${obj.limit})` : ""}`
+    );
+  }
   res.writeHead(code, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
@@ -4870,8 +4933,13 @@ const server = http.createServer(async (req, res) => {
       }
       recordSizeWarned.set(key, overHalf);
       if (recordSize > AGENT_RECORD_MAX) return refuseOversized(recordSize);
-      ingestHistory(next, historyResults);
-      ingestSubagentHistory(next, subagentHistoryResults);
+      // ONE sweep for the whole beat, over BOTH deliveries. Sweeping inside each
+      // ingest ran the second pass with nothing protected, so a beat carrying a
+      // history result and a subagent result evicted the history one on arrival —
+      // the guard defeated within the same beat it was added for.
+      const landed = [ingestHistory(next, historyResults),
+                      ingestSubagentHistory(next, subagentHistoryResults)];
+      sweepHistoryBytes(landed);
       ingestJiraIssues(next, jiraIssueResults);
       ingestStatusResults(next, ticketStatusResults);
       ingestCreateMeta(next, createMetaResults);
@@ -5495,7 +5563,8 @@ const server = http.createServer(async (req, res) => {
         // someone is still composing, and dropping one of those would fail a
         // send that looked ready.
         if (uploadsHeldBytes() + bytes.length > UPLOAD_TOTAL_MAX_BYTES)
-          return json(res, 503, { error: "the hub is holding too many pending uploads — try again shortly" });
+          return json(res, 503, { error:
+            "the hub is holding too many pending attachments — send or remove the others first" });
         const id = crypto.randomBytes(12).toString("hex");
         const name = safeUploadName(url.searchParams.get("name") || "");
         uploads.set(id, {
@@ -6672,7 +6741,8 @@ if (process.env.TURMA_TEST) {
     // show up as a hub that has stopped taking heartbeats.
     detectMemoryLimit, HUB_MEM_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_FREE,
     BODY_INFLIGHT_TOTAL_MAX, BODY_INFLIGHT_ESCAPE_MAX, retainedBytes, HEARTBEAT_MAX,
-    effectiveCap, heartbeatAcceptMax, ingestHistory, sweepHistoryBytes,
+    effectiveCap, heartbeatAcceptMax, ingestHistory, ingestSubagentHistory,
+    sweepHistoryBytes, BODY_HOLD_FACTOR, BODY_HOLD_SHARE, HUB_BASELINE_BYTES,
     HISTORY_TOTAL_MAX_BYTES,
     UPLOAD_MAX_BYTES, UPLOAD_TOTAL_MAX_BYTES,
     inFlightBodyBytes: () => inFlightBodyBytes,
@@ -6810,13 +6880,18 @@ if (process.env.TURMA_TEST) {
     //   raw byte bodies ~2x (the chunk list, then Buffer.concat of it)
     // Understating this is how the first version of this warning stayed silent at
     // the deployed limit while a lone bundle could still take the hub out.
-    const worstString = heartbeatAcceptMax() * 5;
-    const worstRaw = Math.max(MIGRATE_BLOB_MAX, UPLOAD_MAX_BYTES) * 2;
-    const worst = Math.max(worstString, worstRaw) + (32 << 20); // + the hub's own footprint
+    const worstString = heartbeatAcceptMax() * BODY_HOLD_FACTOR;
+    // The migration bundle is deliberately NOT in here: XERK-263 spools it to disk
+    // and streams it back out, so it never occupies the heap this warning is about —
+    // measured, a full 65 MiB relay peaks a 64 MiB hub at 34 MiB. Charging it printed
+    // "raise the memory limit" at every small limit on a false premise, which is
+    // costly advice and contradicts retainedBytes() in the same file.
+    const worstRaw = UPLOAD_MAX_BYTES * 2;
+    const worst = Math.max(worstString, worstRaw) + HUB_BASELINE_BYTES;
     console.log(
-      `largest single body: ${mib(heartbeatAcceptMax())} json / ` +
-        `${mib(Math.max(MIGRATE_BLOB_MAX, UPLOAD_MAX_BYTES))} raw ` +
-        `(admitted even over the ceilings; ~${mib(worst)} peak to hold)`
+      `largest single body: ${mib(heartbeatAcceptMax())} json / ${mib(UPLOAD_MAX_BYTES)} raw ` +
+        `(admitted even over the ceilings; ~${mib(worst)} peak to hold), ` +
+        `migration bundles ${mib(MIGRATE_BLOB_MAX)} spooled to disk`
     );
     if (HUB_MEM_LIMIT && worst > HUB_MEM_LIMIT) {
       console.warn(

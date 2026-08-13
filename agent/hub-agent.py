@@ -8528,6 +8528,10 @@ class SessionManager:
         # 413 backstop applies. See _fit_to_hub_cap for why the 413 alone isn't
         # enough to rely on.
         self.heartbeat_max_bytes = None
+        # Set by _fit_to_hub_cap when it proves that shedding cannot get this beat
+        # under the cap, and read by the 413 handler so the backstop does not shed
+        # anyway (XERK-258).
+        self._shed_would_not_help = False
         # Staged `history` command results awaiting the next heartbeat payload
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
@@ -14772,6 +14776,7 @@ class SessionManager:
         post and let the 413 backstop apply."""
         body = json.dumps(payload).encode()
         cap = self.heartbeat_max_bytes
+        self._shed_would_not_help = False
         if not cap or len(body) <= cap:
             return body
         # Would shedding even help? If the payload is over the cap with EVERY staged
@@ -14790,6 +14795,10 @@ class SessionManager:
             log(f"heartbeat is {len(body)} bytes, over the hub's {cap} cap, and is still "
                 f"{floor} bytes with every staged result dropped — sending it anyway, but "
                 f"expect it to be refused")
+            # Remember the verdict for the 413 that follows. Without it the backstop
+            # shed fires anyway and destroys the operator's history EVERY BEAT for a
+            # size gain this branch has already proved does not exist.
+            self._shed_would_not_help = True
             return body
         while len(body) > cap:
             # Sheds ONE tier, from the payload and the staging list together — see
@@ -14876,6 +14885,10 @@ class SessionManager:
                         f"({_http_error_detail(e, raw)}) — staged results are not counted in "
                         f"it, so nothing is dropped; reduce what this host reports "
                         f"(sessions/repos)")
+                elif self._shed_would_not_help:
+                    log("heartbeat refused as too large (413), and the pre-flight check "
+                        "already showed dropping every staged result would not get under "
+                        "the cap — keeping them; the base payload itself is too big")
                 else:
                     # No payload to keep in step here: this one has already gone out
                     # and is discarded, so clearing the staging lists alone is right.

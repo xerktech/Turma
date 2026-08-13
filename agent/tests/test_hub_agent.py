@@ -9468,6 +9468,73 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
                  if "/api/heartbeat" in r.full_url]
         self.assertEqual(len(beats), 1, "the oversized beat still goes out")
 
+    def test_a_shed_never_takes_spawn_failures(self):
+        # A spawn refusal is a few bytes and it is what stops the Sessions page
+        # spinning on a session that will never come up (XERK-265), so it is in
+        # STAGED_RESULTS (cleared when delivered) and in NO shed tier. Putting it in
+        # one destroys the refusal silently and the operator waits out the timeout.
+        sm = self.make_manager()
+        sm.spawn_failures.append({"cmdId": "c1", "error": "the host is at MAX_SESSIONS (0)"})
+        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 5000}]})
+        sm.jira_issue_results.append({"key": "ENG-1"})
+        # Both tiers shed, one call each.
+        self.assertIsNotNone(sm._shed_staged_results())
+        self.assertIsNotNone(sm._shed_staged_results())
+        self.assertIsNone(sm._shed_staged_results(), "nothing left that MAY be shed")
+        self.assertEqual(len(sm.spawn_failures), 1, "a spawn refusal is never shed")
+        # And it is still clearable, or it would ride every beat forever.
+        self.assertIn("spawn_failures", dict(sm.STAGED_RESULTS))
+
+    def test_every_staged_result_is_declared_and_clearable(self):
+        # STAGED_RESULTS is what "delivered" means. A staged list missing from it is
+        # never cleared, so it re-rides every beat for the life of the process.
+        sm = self.make_manager()
+        for attr, key in sm.STAGED_RESULTS:
+            self.assertTrue(hasattr(sm, attr), f"{attr} must exist")
+            getattr(sm, attr).append({"probe": key})
+        payload = sm.build_payload(0)
+        for attr, key in sm.STAGED_RESULTS:
+            self.assertIn(key, payload, f"{attr} must ride the beat as {key}")
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                return_value=self._fake_resp()):
+            sm.post(payload)
+        for attr, _ in sm.STAGED_RESULTS:
+            self.assertEqual(getattr(sm, attr), [], f"{attr} must clear on delivery")
+
+    def test_a_refusal_body_is_read_once_and_serves_both_readers(self):
+        # urllib's HTTPError is a STREAM: the second reader gets nothing. Both the
+        # 413's `kind` and the operator-facing detail come out of that body, so
+        # reading it twice silently emptied one of them (XERK-268's helper is the
+        # whole reason the hub's own words reach the log).
+        sm = self.make_manager()
+        logged = []
+        err = ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", 413, "too large", {},
+            io.BytesIO(json.dumps(
+                {"error": "agent record too large", "limit": 8388608, "kind": "record"}
+            ).encode()))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err), \
+             mock.patch.object(ha, "log", lambda m: logged.append(m)):
+            sm.post(sm.build_payload(0))
+        joined = " ".join(logged)
+        self.assertIn("RECORD is too large", joined, "the kind was read")
+        self.assertIn("agent record too large", joined, "AND the hub's own words survived")
+
+    def test_the_413_backstop_does_not_shed_when_pre_flight_proved_it_useless(self):
+        # The pre-flight check already established that dropping every staged result
+        # leaves the beat over the cap. Shedding anyway on the 413 that follows
+        # destroys the operator's history every beat, forever, for no size gain.
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [{"text": "x" * 3000}]})
+        sm.heartbeat_max_bytes = 8  # nothing can get under this
+        err = ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", 413, "too large", {},
+            io.BytesIO(b'{"error":"body too large","limit":8,"kind":"body"}'))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+            self.assertIsNone(sm.post(sm.build_payload(0)))
+        self.assertEqual(len(sm.history_results), 1,
+                          "kept: the pre-flight check proved shedding cannot help")
+
     def test_a_record_size_413_sheds_NOTHING(self):
         # The hub measures its record ceiling AFTER stripping the on-demand results
         # from the payload, so shedding them can never satisfy it. Shedding anyway

@@ -213,30 +213,26 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
     above `BODY_INFLIGHT_ESCAPE_MAX` would be advertised, enforced, and then refused with 503
     ("retry") for a permanently impossible request — measured at `-m 32m`: 32 MiB advertised, a
     20 MiB beat 503'd forever with zero bytes held. Every cap a client is told goes through there.
-  - **`HEARTBEAT_MAX` is the documented ceiling; `heartbeatAcceptMax()` is what the container can
-    PARSE**, a sixteenth of the limit (16 MiB at the deployed 256m). A body costs ~5x its size to
-    hold and V8 sizes its heap from the cgroup, so it grows into the container and lets the kernel
-    decide: eight sequential 25 MiB deliveries, each legal under `HEARTBEAT_MAX` and each answered
-    200, pegged a 256 MiB container at its ceiling (254 of 256 MiB). Refused on the headers instead,
-    the same sequence peaks in the low tens of MiB. **The floor is `BODY_MAX`, not something
-    roomier** — an 8 MiB floor overrode the derivation at `-m 64m`, where the hub then advertised
-    8 MiB, accepted one beat that size and was killed by the next. Never restore a flat constant.
-  - **There are TWO 413s and they are not interchangeable**, so each carries a `kind`. `kind:"body"`
-    is the transport cap — shedding staged results fixes it, and it is the one a mid-upload refusal
-    may fail to deliver. `kind:"record"` is `AGENT_RECORD_MAX`, measured with the on-demand results
-    already STRIPPED from the payload, so **shedding can never satisfy it**; the agent must log and
-    keep them, or it destroys one delivery per beat forever while the host is offline for an
-    unrelated reason (too much to report). This one is delivered reliably — the body finished, so
-    `json()` answers on a healthy socket — which is what makes reading `kind` worthwhile.
-- **`release()` must run on every exit path**, which is why it is idempotent and guarded on `close`
-  as well as `error`/`end`: a leaked reservation is never recovered, and enough of them refuse every
-  large body for the life of the process.
-- **A body's bytes understate what it costs to hold** — measured ~5x for a JSON body (accumulated
-  string, parsed object graph, then `sanitizeHeartbeat` re-serializing keys this hub doesn't know) and
-  ~2x for raw bytes (chunk list, then `Buffer.concat`). The startup banner warns when one lone body
-  could exceed the container on that basis; understating it is how the first version stayed silent at
-  the deployed limit. **`readRawBody` deliberately does NOT preallocate from `Content-Length`** — that
-  would size an allocation from a claim, one byte behind a 65 MiB header.
+  - **`HEARTBEAT_MAX` is the documented ceiling; `heartbeatAcceptMax()` is what this container can
+    afford to PARSE.** Every ceiling is derived the same way and **through the numbers, never by eye**
+    (`BODY_HOLD_FACTOR`, `BODY_HOLD_SHARE`, `HUB_BASELINE_BYTES`, `BODY_ONE_BODY_SHARE`):
+    - A JSON body costs ~**5x** its size to hold (string, then object graph, then `sanitizeHeartbeat`
+      re-serializing unknown keys). Fractions chosen by eye instead of divided by that let four beats
+      at exactly the ADVERTISED size OOM-kill a 64 MiB container — while the same beats sent
+      sequentially were fine, which is why eyeballing survived a round of testing.
+    - The interpreter's own ~20-40 MiB is **subtracted before any share is taken**. A share of the
+      whole container assumes the container is all ours: nearly true at 1 GiB, nearly false at 64 MiB,
+      where a 64 MiB hub survived a concurrent burst and then died on the sequence after it.
+    - One body may take most of the in-flight capacity (`BODY_ONE_BODY_SHARE`) but **never all of it**,
+      or an ordinary beat is refused while a big delivery is in flight — a fleet-wide outage rather
+      than a bounded one.
+    - Retained upload blobs get their own eighth, sized by measurement rather than preference:
+      at-cap beats alone peaked at 150 MiB of 256, a full pool alone at 146, and the two TOGETHER at
+      249 — additive, 97% of the container. That per-file cap is an operator's convenience and the
+      control plane is the whole fleet's; the fleet wins.
+    - Measured at the deployed 256m after all of it: a concurrent burst followed by a sequential run
+      peaks at 131 MiB, the full adversarial mix at ~198 MiB. 64m/96m/128m survive the same shapes.
+
 - **The on-demand history caches are bounded in BYTES too** (`sweepHistoryBytes`,
   `HISTORY_TOTAL_MAX_BYTES`, fleet-wide, oldest delivery evicted first). Two consequences worth
   knowing: the budget is **shared across hosts**, so an operator's open history view can go stale
