@@ -137,9 +137,9 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   refuses rather than reroutes.
 - `findTicketHost` chooses among the org's **ONLINE** hosts: **prefers one with the repo cloned**,
   and — within that group, or across all when none has it — picks the **most available**
-  (`hostAvailability`). Under `requireFree` (every ticket spawn — XERK-296 above) a **full host is
-  not a target at all**: with none free the TICKET queues hub-side instead, and is routed on a later
-  pass.
+  (`hostAvailability`). Under `requireFree` (every ticket spawn — see the ticket queue below) a
+  **full host is not a target at all**: with none free the TICKET queues hub-side instead, and is
+  routed on a later pass.
 - `hostAvailability(a)` = `capacity.free` **minus `capacity.queued` and the spawn/spawnTicket
   commands still queued** since its last heartbeat — subtracting in-flight commands is what makes
   rapid clicks split. An agent predating `capacity` scores below one that reports it.

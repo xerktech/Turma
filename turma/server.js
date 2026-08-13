@@ -3801,6 +3801,9 @@ const TICKET_QUEUE_MAX_WAIT_MS = 4 * 60 * 60 * 1000;
 // class of thing this whole ticket is about: work that goes missing quietly. A
 // terminal entry never dispatches and never counts against a line's length.
 const TICKET_QUEUE_EXPIRED_TTL_MS = 60 * 60 * 1000;
+// How many notes may be held at once. They count against no line, so this is the
+// only thing bounding them.
+const TICKET_QUEUE_NOTES_MAX = TICKET_QUEUE_MAX;
 // How long a dispatch is remembered, so a cancel that LOST to it can say so
 // rather than 404ing as if the ticket had never been queued.
 const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
@@ -3842,6 +3845,34 @@ function queuedTicket(siteKey, issueKey) {
     (e) => e.siteKey === siteKey && e.issueKey === issueKey) || null;
 }
 
+// The same lookup, but only for an entry that is actually WAITING. A terminal
+// note answers `queuedTicket` and must not stand in for a place in line —
+// treating one as "already queued" is what made a note block its own ticket's
+// auto-start for the whole hour it was on screen.
+function liveQueuedTicket(siteKey, issueKey) {
+  const e = queuedTicket(siteKey, issueKey);
+  return e && !e.expiredAt ? e : null;
+}
+
+function liveQueueCount() {
+  return ticketQueue.reduce((n, e) => n + (e.expiredAt ? 0 : 1), 0);
+}
+
+// Terminal notes are bounded on their own, since they count against no line: a
+// fleet that saturates for hours can mint one per expired entry, and each lives
+// TICKET_QUEUE_EXPIRED_TTL_MS. Oldest notes go first — they are the ones most
+// likely to have been read, and none of them is work.
+function sweepExpiredNotes() {
+  const notes = ticketQueue.filter((e) => e.expiredAt);
+  const over = notes.length - TICKET_QUEUE_NOTES_MAX;
+  if (over <= 0) return;
+  notes.sort((x, y) => x.expiredAt - y.expiredAt);
+  for (const e of notes.slice(0, over)) {
+    const i = ticketQueue.indexOf(e);
+    if (i >= 0) ticketQueue.splice(i, 1);
+  }
+}
+
 // May this ticket join the line, and if not, WHY not — the wording an operator
 // gets and, just as importantly, what the sweep should do about it. The three
 // refusals are different facts and were once all reported as "the queue is
@@ -3865,7 +3896,11 @@ function ticketQueueAdmission(siteKey, issueKey, source) {
     return "org-auto-full";
   }
   if (mine.length >= TICKET_QUEUE_PER_ORG_MAX) return "org-full";
-  if (ticketQueue.length >= TICKET_QUEUE_MAX) return "fleet-full";
+  // The fleet cap is a LINE'S LENGTH, and a terminal note is not in the line —
+  // counting it let dead notes 429 a live click from an unrelated org, which is
+  // the refusal this ticket exists to remove. Notes are bounded separately, by
+  // sweepExpiredNotes below.
+  if (liveQueueCount() >= TICKET_QUEUE_MAX) return "fleet-full";
   return "ok";
 }
 
@@ -3952,6 +3987,7 @@ function enqueueTicketStart(siteKey, issueKey, source) {
   const e = { siteKey, issueKey, source: source === "manual" ? "manual" : "auto",
     at: Date.now(), reason: null, error: null, blockedSince: 0, unknownSince: 0 };
   ticketQueue.push(e);
+  sweepExpiredNotes();
   publishTicketQueue();
   return e;
 }
@@ -4217,7 +4253,7 @@ function autoStartSweep() {
       if (started.has(k)) { autoStarted.delete(k); continue; }
       // Already waiting in the hub queue — its place in line IS the pending
       // attempt, and drainTicketQueue owns everything from here (XERK-296).
-      if (queuedTicket(siteKey, t.key)) continue;
+      if (liveQueuedTicket(siteKey, t.key)) continue;
       // A spawnTicket already riding some org host's queue: the agent hasn't
       // taken it yet, so there is nothing to conclude about it either way.
       const inFlight = Object.values(agents).some((a) =>
@@ -7271,6 +7307,9 @@ if (process.env.TURMA_TEST) {
     dropAutoQueuedTickets,
     drainTicketQueue,
     queuedTicket,
+    liveQueuedTicket,
+    liveQueueCount,
+    TICKET_QUEUE_NOTES_MAX,
     ticketDispatchedAt,
     holdQueued,
     ticketQueueAdmission,

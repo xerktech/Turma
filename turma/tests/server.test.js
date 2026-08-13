@@ -139,7 +139,7 @@ const {
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
   dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot, holdQueued,
   TICKET_QUEUE_PER_ORG_MAX, TICKET_QUEUE_PER_ORG_AUTO_MAX, TICKET_QUEUE_MAX_WAIT_MS,
-  TICKET_QUEUE_EXPIRED_TTL_MS, logQueueState,
+  TICKET_QUEUE_EXPIRED_TTL_MS, logQueueState, TICKET_QUEUE_NOTES_MAX,
   ticketQueueAdmission, TICKET_QUEUE_MAX, TICKET_QUEUE_ERROR_MAX, TICKET_QUEUE_STALE_MS,
   TICKET_QUEUE_BLOCKED_MAX_MS,
   orgColors, setOrgColor,
@@ -5243,24 +5243,77 @@ test("XERK-296: when two hosts of one org report the same ticket, the FRESHER ro
   // is silent: which host's row decides a queued ticket's status would otherwise
   // depend on the agents map's iteration order.
   resetAutoStart();
-  const site = "tq30.atlassian.net";
   const todo = [{ key: "ENG-5", statusCategory: "todo",
     repoGuess: { repo: "Turma", cloned: true } }];
   const done = [{ key: "ENG-5", statusCategory: "done",
     repoGuess: { repo: "Turma", cloned: true } }];
-  // Stale host says Done, fresh host says To Do: the entry lives.
-  await asBeat("tqOldSaysDone", site, { autoStart: false, capacity: FULL,
-    fetchedAt: "2026-07-14T12:00:00Z", tickets: done });
-  await asBeat("tqNewSaysTodo", site, { autoStart: false, capacity: FULL,
-    fetchedAt: "2026-07-14T12:05:00Z", tickets: todo });
-  await startTicket(site, "ENG-5");
-  drainTicketQueue();
-  assert.ok(queuedTicket(site, "ENG-5"), "a stale Done must not retire it");
-  // Now the FRESH host reports Done: it goes.
-  await asBeat("tqNewSaysTodo", site, { autoStart: false, capacity: FULL,
-    fetchedAt: "2026-07-14T12:10:00Z", tickets: done });
-  drainTicketQueue();
-  assert.equal(queuedTicket(site, "ENG-5"), null);
+  // BOTH REGISTRATION ORDERS, because `Object.values(agents)` iterates in
+  // insertion order: with only the stale-host-first fixture, a plain
+  // last-writer-wins would produce the same answer and the rule would be
+  // pinned by coincidence rather than by the compare.
+  for (const [n, freshFirst] of [[0, true], [1, false]]) {
+    const site = `tq30-${n}.atlassian.net`;
+    const stale = { autoStart: false, capacity: FULL,
+      fetchedAt: "2026-07-14T12:00:00Z", tickets: done };
+    const fresh = { autoStart: false, capacity: FULL,
+      fetchedAt: "2026-07-14T12:05:00Z", tickets: todo };
+    if (freshFirst) {
+      await asBeat(`tqFresh${n}`, site, fresh);
+      await asBeat(`tqStale${n}`, site, stale);
+    } else {
+      await asBeat(`tqStale${n}`, site, stale);
+      await asBeat(`tqFresh${n}`, site, fresh);
+    }
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.ok(queuedTicket(site, "ENG-5"),
+      `a stale Done must not retire it (fresh host registered ${freshFirst ? "first" : "last"})`);
+    // Now the FRESH host reports Done too: it goes.
+    await asBeat(`tqFresh${n}`, site, { ...fresh, fetchedAt: "2026-07-14T12:10:00Z",
+      tickets: done });
+    drainTicketQueue();
+    assert.equal(queuedTicket(site, "ENG-5"), null);
+  }
+});
+
+test("XERK-296: a terminal note counts against NO line — per org or fleet-wide", async () => {
+  // A note is a message about work that ended, not work. Counting one is how
+  // dead notes came to 429 a live click from an unrelated org.
+  resetAutoStart();
+  await asBeat("tqNotes", "tq31.atlassian.net", { autoStart: false, capacity: FULL });
+  await asBeat("tqNotesB", "tq32.atlassian.net", { autoStart: false, capacity: FULL });
+  const note = (site, i) => {
+    const e = enqueueTicketStart(site, `NOTE-${i}`, "manual");
+    e.expiredAt = Date.now();
+    e.reason = "expired";
+    return e;
+  };
+  for (let i = 0; i < TICKET_QUEUE_PER_ORG_MAX; i++) note("tq31.atlassian.net", i);
+  // Its own org can still queue past a line's worth of notes…
+  assert.equal(ticketQueueAdmission("tq31.atlassian.net", "ENG-5", "manual"), "ok");
+  // …and so can everyone else, even at a fleet cap's worth of them.
+  for (let i = 0; i < TICKET_QUEUE_MAX; i++) note("tq32.atlassian.net", 1000 + i);
+  const r = await startTicket("tq31.atlassian.net", "ENG-5");
+  assert.equal(r.body.queued, true, "dead notes must not refuse live work");
+  // The notes are still bounded — nothing else counts them.
+  assert.ok(ticketQueue.filter((e) => e.expiredAt).length <= TICKET_QUEUE_NOTES_MAX);
+  ticketQueue.length = 0;
+});
+
+test("XERK-296: a terminal note doesn't block its own ticket's auto-start", async () => {
+  // The sweep's "already queued" guard read a note as a place in line, so an
+  // auto ticket that waited out its hours then sat inert for the note's whole
+  // TTL — hours more — before auto-start could try again.
+  resetAutoStart();
+  await asBeat("tqNoteAuto", "tq33.atlassian.net", { capacity: FULL });
+  autoStartSweep();
+  const e = queuedTicket("tq33.atlassian.net", "ENG-5");
+  e.expiredAt = Date.now();
+  e.reason = "expired";
+  autoStartSweep();
+  const again = queuedTicket("tq33.atlassian.net", "ENG-5");
+  assert.equal(again.expiredAt, undefined, "the sweep replaces the note with a real place");
+  assert.equal(again.reason, null);
 });
 
 test("XERK-296: a state log line is throttled — it describes a condition, not an event", async () => {

@@ -75,6 +75,12 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
   mid-restart, a `closedSessions` eviction) swallowed it with no new session at all. **A second
   session on a ticket is what the `+` button asks for**, so the queue cannot read the ask off a
   number the fleet owns; the max wait is what bounds it instead.
+- **A terminal note counts against NO line and blocks nothing.** It is a message about work that
+  ended, not work: excluded from the per-org count, from the fleet cap (counting it let dead notes
+  429 a live click from an ANOTHER org — the refusal this ticket exists to remove), and from the
+  sweep's "already queued" guard (`liveQueuedTicket`, or an auto ticket sat inert for the note's
+  whole TTL before auto-start could retry it). Notes are bounded on their own by
+  `TICKET_QUEUE_NOTES_MAX`, oldest first, since nothing else counts them.
 - **Giving up is VISIBLE.** When `TICKET_QUEUE_MAX_WAIT_MS` fires the entry does not vanish: it goes
   TERMINAL (`reason:"expired"`, `expiredAt`) and stays on the payload for `TICKET_QUEUE_EXPIRED_TTL_MS`
   as a note the card renders — "⌛ gave up waiting", the hub's reason as the tooltip, a ✕ to dismiss
