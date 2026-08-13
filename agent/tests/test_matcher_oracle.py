@@ -37,12 +37,25 @@ matcher semantics into a red test instead of a silently unprotected fleet.
               written can be the model declining, not a policy decision. That
               is INCONCLUSIVE, it is retried, and it FAILS if it persists. It
               must never read as a deny.
+  ATTRIBUTION `bypassPermissions`, not `acceptEdits`, for anything under
+              ~/.claude -- see TestGuardedClaudeDir. An earlier version of that
+              class passed 6/6 with the whole feature stubbed out, because the
+              binary's own gate refused every case for us.
+  ISOLATION   stdin=DEVNULL. `claude -p` reads stdin when it is not a tty, so a
+              harness run from a heredoc fed its own source to the model, which
+              then refused writes as prompt injection.
+  INNOCUOUS   Target filenames the model will not balk at: with `evil.md` under
+              `agents/` it declines on its own and the case stops measuring the
+              permission layer at all.
 
 **Cost and gating.** Each case is one haiku turn against the live API, so this
 is not a per-PR CI test. It is gated on TURMA_MATCHER_ORACLE=1 and is the test
 to run when changing any rule spelling, any hook invocation, or when moving to
-a new Claude Code version. It never writes to the real ~/.claude: cases that
-need a config dir get a fake HOME with the login symlinked in read-only.
+a new Claude Code version. EVERY case runs under a throwaway HOME with the
+login symlinked in read-only, so none of them writes to the real ~/.claude --
+including the ones whose target is an ordinary temp directory, because any run
+with the real HOME leaves a session transcript behind in ~/.claude/projects/
+and merges the operator's real settings.json into the permission context.
 """
 
 import importlib.util
@@ -70,7 +83,7 @@ HAVE_CLAUDE = shutil.which("claude") is not None
 ALLOWED, DENIED, INCONCLUSIVE = "ALLOWED", "DENIED", "INCONCLUSIVE"
 
 
-def _attempt(workdir, settings_path, target, env=None, tries=3):
+def _attempt(workdir, settings_path, target, env=None, tries=3, mode="acceptEdits"):
     """Have the model attempt one Write at `target`; report what the gate did.
 
     Returns ALLOWED (the content arrived), DENIED (the tool was refused), or
@@ -87,14 +100,23 @@ def _attempt(workdir, settings_path, target, env=None, tries=3):
              f"Use the Write tool to create the file {target} containing exactly "
              f"the word {marker}. Do not ask for confirmation; call the tool once.",
              "--settings", settings_path, "--model", MODEL,
-             # acceptEdits + a target inside cwd: otherwise the approval gate,
-             # not the deny rules, is what the case measures.
-             "--permission-mode", "acceptEdits",
+             # The mode decides WHAT the case can measure, so it is an argument
+             # rather than a constant. `acceptEdits` needs the target inside cwd
+             # or the approval gate is what gets measured; and anywhere under
+             # ~/.claude it refuses everything on its own, which makes a deny
+             # there unattributable -- see TestGuardedClaudeDir.
+             "--permission-mode", mode,
              "--debug", "permissions", "--debug-file", dbg],
             cwd=workdir, capture_output=True, text=True, timeout=300,
             # Not optional: the fake-HOME cases pass HOME here, and dropping it
             # would point them at the REAL ~/.claude.
-            env=env or os.environ.copy())
+            env=env or os.environ.copy(),
+            # `claude -p` READS STDIN when it is not a tty and folds it into the
+            # turn. Inheriting this process's stdin fed the harness's own source
+            # to the model, which then refused the write as a prompt-injection
+            # attempt -- scoring INCONCLUSIVE for reasons that have nothing to do
+            # with the permission layer. Every measurement must be isolated.
+            stdin=subprocess.DEVNULL)
         if os.path.exists(target):
             try:
                 with open(target, errors="replace") as fh:
@@ -107,9 +129,16 @@ def _attempt(workdir, settings_path, target, env=None, tries=3):
             with open(dbg, errors="replace") as fh:
                 log = fh.read()
         said = log + (proc.stdout or "")
-        if ("denied by your permission" in said
-                or "shared Claude configuration" in said
-                or "Write tool permission denied" in said):
+        # Every marker is either Write-specific or our own hook's wording, so a
+        # deny logged for some unrelated tool call cannot be read as a deny of
+        # this write. Matching on a bare "denied" substring could, and that is a
+        # false pass in the same direction as every defect this file exists to
+        # catch. Requiring the TARGET PATH would be stronger still and does not
+        # work: the refusal is generic and never names the file -- measured, and
+        # asserting on it turned genuine denies into INCONCLUSIVE.
+        if ("Write tool validation error" in said        # a permissions.deny rule
+                or "Write tool permission denied" in said  # the binary's own gate
+                or "shared Claude configuration" in said):  # fileguard.py's REASON
             return DENIED
     return INCONCLUSIVE
 
@@ -120,6 +149,33 @@ def _settings(dirpath, payload):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     return path
+
+
+def _fake_home(base, trust_cwd=None):
+    """A throwaway HOME, so no case ever touches the real ~/.claude.
+
+    EVERY case needs this, not just the ones targeting ~/.claude: a run with the
+    real HOME leaves a session transcript in ~/.claude/projects/ (40 of them
+    accumulated before this was fixed) and, worse, merges the operator's real
+    ~/.claude/settings.json into the resolved permission context -- so an
+    unrelated deny rule there could turn an assertion green on one host and not
+    another. The login is symlinked in read-only so the binary can authenticate.
+
+    `trust_cwd` pre-answers what `bypassPermissions` refuses to start without:
+    onboarding, the mode's own acceptance flag, and the working directory's
+    trust dialog.
+    """
+    home = os.path.join(base, "home")
+    os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+    link = os.path.join(home, ".claude", ".credentials.json")
+    if os.path.exists(CREDS) and not os.path.lexists(link):
+        os.symlink(CREDS, link)
+    if trust_cwd:
+        with open(os.path.join(home, ".claude.json"), "w", encoding="utf-8") as fh:
+            json.dump({"hasCompletedOnboarding": True,
+                       "bypassPermissionsModeAccepted": True,
+                       "projects": {trust_cwd: {"hasTrustDialogAccepted": True}}}, fh)
+    return home
 
 
 @unittest.skipUnless(ENABLED and HAVE_CLAUDE,
@@ -136,16 +192,21 @@ class TestMatcherSemantics(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="oracle-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._n = 0
 
     def _case(self, deny, target_rel):
-        base = os.path.join(self.tmp, str(abs(hash((tuple(deny), target_rel)))))
+        # A plain counter, not hash(): PYTHONHASHSEED is randomised per process,
+        # and a collision would silently share a directory between two cases.
+        self._n += 1
+        base = os.path.join(self.tmp, f"case{self._n}")
         target = os.path.join(base, target_rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         # The settings file lives in a SUBDIRECTORY of the working directory so
         # a single-leading-slash rule has somewhere wrong to resolve to.
         sp = _settings(os.path.join(base, "cfg"),
                        {"permissions": {"deny": [d.replace("{B}", base) for d in deny]}})
-        got = _attempt(base, sp, target)
+        got = _attempt(base, sp, target,
+                       env=dict(os.environ, HOME=_fake_home(base)))
         self.assertNotEqual(got, INCONCLUSIVE,
                             f"model never attempted the write for deny={deny}; "
                             "inconclusive is not a deny")
@@ -221,7 +282,8 @@ class TestMatcherSemantics(unittest.TestCase):
                                                repos_root=os.path.join(self.tmp, "no-repos"))
             self.assertTrue(rules, f"no rule emitted for {dirname!r}")
             sp = _settings(os.path.join(work, "cfg"), {"permissions": {"deny": rules}})
-            got = _attempt(work, sp, os.path.join(install, "hub-agent.py"))
+            got = _attempt(work, sp, os.path.join(install, "hub-agent.py"),
+                           env=dict(os.environ, HOME=_fake_home(work)))
             self.assertEqual(got, DENIED,
                              f"{rules} does not protect the directory it names")
 
@@ -239,72 +301,112 @@ class TestGuardedClaudeDir(unittest.TestCase):
     """The feature itself, driven through the real binary.
 
     HOME points at a sandbox, so `~` in a rule and `~/.claude` in the hook both
-    resolve there and the real config directory is never written. The login is
-    symlinked in read-only so the binary can still authenticate.
+    resolve there and the real config directory is never written.
+
+    **Why `bypassPermissions` and not `acceptEdits`.** Under every other mode
+    Claude Code refuses ALL writes under ~/.claude on its own, so a refusal here
+    proves nothing about our layer: an earlier version of this class passed
+    6/6 with `build_guard_settings()` stubbed out to `{}` -- the entire change
+    deleted -- which is the same false pass, one level up, that the string
+    assertions used to give. `bypassPermissions` drops the binary's own gate,
+    so what is left to refuse a write is the deny rules and the hook.
+
+    That is why every case here carries a BASELINE arm asserting the write
+    LANDS with empty settings. Without it a refusal is unattributable, and the
+    test would go green over a deleted feature again.
     """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="oracle-home-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._n = 0
 
-    def _case(self, target_rel, baseline=False):
-        base = os.path.join(self.tmp, ("base_" if baseline else "real_")
-                            + target_rel.replace("/", "_"))
-        home = os.path.join(base, "home")
-        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
-        os.symlink(CREDS, os.path.join(home, ".claude", ".credentials.json"))
+    #: settings payloads each case can be driven under
+    REAL, EMPTY, BLANKET = "real", "empty", "blanket"
+
+    def _case(self, target_rel, arm=REAL, mode="bypassPermissions"):
+        self._n += 1
+        base = os.path.join(self.tmp, f"{arm}{self._n}")
+        # cwd is HOME so the target sits inside it, and the trust seed names it.
+        home = _fake_home(base, trust_cwd=os.path.join(base, "home"))
         target = os.path.join(home, target_rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        # `baseline` is EMPTY settings: it measures what Claude Code does on its
-        # own, so a deny can be attributed to our layer rather than to the
-        # binary's own gate on its config directory.
-        sp = _settings(os.path.join(base, "turma"),
-                       {} if baseline else ha.build_guard_settings())
-        return _attempt(home, sp, target, env=dict(os.environ, HOME=home))
+        payload = {self.REAL: ha.build_guard_settings,
+                   self.EMPTY: dict,
+                   # The rule this whole change removed. An arm asserting it
+                   # still DENIES is what proves a positive case can detect the
+                   # old broken behaviour rather than passing for free.
+                   self.BLANKET: lambda: {"permissions":
+                                          {"deny": ["Edit(~/.claude/**)"]}}}[arm]()
+        sp = _settings(os.path.join(base, "turma"), payload)
+        return _attempt(home, sp, target, mode=mode,
+                        env=dict(os.environ, HOME=home, IS_SANDBOX="1"))
+
+    def _refuses(self, target_rel):
+        """Our layer refuses it, and the binary on its own would not have."""
+        self.assertEqual(self._case(target_rel, self.EMPTY), ALLOWED,
+                         "baseline: nothing refused this with empty settings, so "
+                         "the assertion below cannot be attributed to our layer")
+        self.assertEqual(self._case(target_rel, self.REAL), DENIED)
 
     def test_a_subagent_memory_store_is_writable(self):
         """THE FEATURE. This is what the whole carve-out exists to permit.
 
         With the old blanket `Edit(~/.claude/**)` this was refused, which is why
-        no Turma session or subagent has ever recorded a memory.
+        no Turma session or subagent has ever recorded a memory -- and the
+        BLANKET arm holds that behaviour where the test can see it, so a
+        regression to it fails here instead of silently switching memory off.
         """
-        self.assertEqual(self._case(".claude/agent-memory/qa/note.md"), ALLOWED)
+        rel = ".claude/agent-memory/qa/note.md"
+        self.assertEqual(self._case(rel, self.REAL), ALLOWED)
+        self.assertEqual(self._case(rel, self.BLANKET), DENIED,
+                         "the rule this change removed no longer refuses this, so "
+                         "the ALLOWED above proves nothing")
 
     def test_the_agent_definitions_are_still_refused(self):
-        self.assertEqual(self._case(".claude/agents/evil.md"), DENIED)
+        # A neutral filename on purpose: with an alarming one the model
+        # refuses the write on its own and the case measures its
+        # judgement instead of the permission layer.
+        self._refuses(".claude/agents/note.md")
 
     def test_the_shell_snapshots_are_still_refused(self):
         # Sourced by every Bash call of every live session: a write here is RCE
         # across sessions, and it is the hole the enumerated-pattern attempt had.
-        self.assertEqual(self._case(".claude/shell-snapshots/x.sh"), DENIED)
+        self._refuses(".claude/shell-snapshots/snapshot.sh")
 
     def test_paths_no_pattern_names_are_refused_by_the_hook(self):
         # The hook is what makes coverage complete: no backstop pattern names
         # settings.json, and ~/.claude.json is a SIBLING of the directory.
-        self.assertEqual(self._case(".claude/settings.json"), DENIED)
-        self.assertEqual(self._case(".claude.json"), DENIED)
+        self._refuses(".claude/settings.json")
+
+    def test_the_claude_json_sibling_is_refused(self):
+        # Carries mcpServers -- command lines run at the next session's startup.
+        self._refuses(".claude.json")
+
+    def test_the_memory_directory_entry_itself_is_not_writable(self):
+        # A FILE planted at this name makes the directory impossible to create,
+        # permanently disabling that agent's memory.
+        self._refuses(".claude/agent-memory/qa")
 
     def test_project_auto_memory_is_gated_by_the_binary_not_by_us(self):
         """A limit the carve-out cannot lift, pinned so a future release shows up.
 
         `~/.claude/projects/<slug>/memory/` is where a SESSION's own auto-memory
-        goes, and Claude Code refuses a Write there in `auto` and `acceptEdits`
-        with NO settings at all -- the baseline arm below is the proof. No allow
-        rule pre-grants it either (literal-slug and whole-tree allows were both
-        measured), and only `bypassPermissions` lands it. So dropping the
-        blanket deny is NECESSARY BUT NOT SUFFICIENT for session auto-memory:
-        the subagent store is what this change actually delivers.
+        goes. Claude Code refuses a Write there in `acceptEdits` with NO settings
+        at all, and no allow rule pre-grants it (literal-slug and whole-tree
+        allows were both measured); only `bypassPermissions` lands it. So
+        dropping the blanket deny is NECESSARY BUT NOT SUFFICIENT for session
+        auto-memory -- the subagent store is what this change delivers.
+
+        Both arms are needed to say that precisely: the binary refuses it, and
+        OUR layer does not. Tracked in XERK-315.
         """
         rel = ".claude/projects/slug/memory/MEMORY.md"
-        self.assertEqual(self._case(rel), DENIED)
-        self.assertEqual(self._case(rel, baseline=True), DENIED,
+        self.assertEqual(self._case(rel, self.EMPTY, mode="acceptEdits"), DENIED,
                          "no longer gated by the binary itself -- re-measure "
                          "whether our layer is now what blocks session memory")
-
-    def test_the_memory_directory_entry_itself_is_not_writable(self):
-        # A FILE planted at this name makes the directory impossible to create,
-        # permanently disabling that agent's memory.
-        self.assertEqual(self._case(".claude/agent-memory/qa"), DENIED)
+        self.assertEqual(self._case(rel, self.REAL), ALLOWED,
+                         "our own rules refuse it, which the carve-out must not")
 
 
 if __name__ == "__main__":

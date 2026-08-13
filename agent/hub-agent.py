@@ -1029,10 +1029,11 @@ _GUARD_DENY_PATH_RULES = [
     # change that. Do not treat this line as containment. Keeping the token out
     # of child environments would need Claude Code's apiKeyHelper.
     "Read(~/.turma/local-model.env)",
-    # The files that WIRE the guard. `_ensure_guard_settings` writes this once
-    # per manager and thereafter reuses it whenever it merely EXISTS — content is
-    # never re-validated — so one Write disables both hooks and rewrites the deny
-    # list for every session that manager launches until it restarts. Denying the
+    # The files that WIRE the guard. `_ensure_guard_settings` caches the path on
+    # the manager INSTANCE and rewrites the file from build_guard_settings() on a
+    # fresh process, so one Write disables both hooks and rewrites the deny list
+    # for every session that manager launches for the rest of its lifetime —
+    # managers here run for days — and only a restart repairs it. Denying the
     # agent's installed code (runtime_code_deny_rules) without this just moves
     # the attack one directory over. NOT all of ~/.turma: the agent stages
     # uploads and question files there and sessions legitimately write it.
@@ -1111,11 +1112,16 @@ def _glob_literal(path):
     directory it names goes UNPROTECTED while an unrelated `t1` is wrongly
     denied.
 
-    MEASURED against claude 2.1.229 — do not "simplify" from intuition:
-    **backslash escapes `[` and `*`; the `[c]` character-class spelling escapes
-    NOTHING** (a rule built with it denies nothing at all, which shipped once);
-    and a literal `?` has no working escape — only the `?` wildcard matches it,
-    and that over-reaches onto unrelated names.
+    MEASURED against claude 2.1.231 — do not "simplify" from intuition:
+    **backslash escapes `[` and `*`**, and the escaped form does not over-reach
+    onto a neighbouring name; a literal `?` has no working escape — only the `?`
+    wildcard matches it, and that over-reaches onto unrelated names.
+
+    The spelling that shipped broken applied `[c]` to EVERY metacharacter, so
+    `t[1]` became `t[[]1[]]`, which denies nothing. `[[]` on its own does escape
+    `[` correctly — the earlier note here that the character-class spelling
+    "escapes NOTHING" was wrong. tests/test_matcher_oracle.py pins both against
+    the real binary; a string assertion cannot, which is how it shipped.
 
     So a `?` in the install prefix cannot be expressed. Rather than emit a rule
     that silently protects the wrong thing, `runtime_code_deny_rules` refuses to
