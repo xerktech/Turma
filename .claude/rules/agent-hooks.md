@@ -46,6 +46,17 @@ implementation contract.
     exposure the blanket pattern did not have. It denies the agent's installed code directory,
     covering `guard.py`/`ask.py`/`hub-agent.py`/`tunnel-agent.js` too, and is **skipped when that
     directory is inside `REPOS_ROOT`** so sessions working on Turma can still edit Turma.
+    - **The DOUBLED leading slash in that rule is load-bearing.** Claude Code reads a single `/` as
+      relative to the directory holding the `--settings` file, so `Edit(/root/.local/share/…)`
+      resolves against `~/.turma/` and matches nothing. Measured: one slash and the two-Write
+      attack succeeds; two and it is refused. The rule reads correctly and does nothing, and a test
+      asserting the rule's STRING was green over it — assert the anchor, not the presence.
+    - The path is **glob-escaped** (`_glob_literal`), or an install prefix containing `[` is read
+      as a character class: the directory it names goes unprotected and an unrelated one is denied.
+    - **`~/.turma/guard-settings.json` is denied too**, and that is not optional: it is the file
+      that WIRES both hooks, `_ensure_guard_settings` reuses it whenever it merely exists without
+      re-validating its content, and denying the code without it just moves the attack one
+      directory over. Not all of `~/.turma` — the agent stages uploads and question files there.
   - **The carve-out is FLEET-WIDE, not session-scoped**, and that is a real cost, not an oversight:
     any session may write any project's `memory/` and any agent's store, and both are injected into
     those future runs (measured — a marker planted in another slug's `MEMORY.md` appears verbatim in

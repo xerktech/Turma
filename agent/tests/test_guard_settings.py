@@ -116,7 +116,62 @@ class TestGuardSettings(unittest.TestCase):
         # config directory. Proven, so the hook's own integrity is pinned.
         self.assertEqual(ha.runtime_code_deny_rules(script_dir="/usr/local/bin",
                                                     repos_root="/mnt/data/Docker/git"),
-                         ["Edit(/usr/local/bin/**)"])
+                         ["Edit(//usr/local/bin/**)"])
+
+    def test_an_absolute_rule_needs_a_DOUBLED_leading_slash(self):
+        """The rule must be anchored at `/`, not at the settings file.
+
+        Claude Code reads a single leading `/` as relative to the directory
+        holding the `--settings` file, so `Edit(/root/.local/share/turma-agent/**)`
+        resolves against `~/.turma/guard-settings.json` and means
+        `~/.turma/root/.local/...` — nothing. Measured: with one slash the
+        two-Write hook-neutralisation attack succeeds, with two it is refused.
+        The rule READ correctly and did nothing, and a test asserting only that
+        the rule existed was green over it.
+        """
+        for d in ("/usr/local/bin", "/root/.local/share/turma-agent"):
+            rule, = ha.runtime_code_deny_rules(script_dir=d, repos_root="/mnt/data/Docker/git")
+            self.assertTrue(rule.startswith("Edit(//"),
+                            f"{rule} is anchored at the settings file, so it matches nothing")
+
+    def test_glob_metacharacters_in_the_install_path_are_escaped(self):
+        # The path is interpolated into a glob, so a prefix containing `[` would
+        # be read as a character class: the directory it names goes unprotected
+        # while an unrelated one is wrongly denied.
+        rule, = ha.runtime_code_deny_rules(script_dir="/opt/t[1]/agent",
+                                           repos_root="/mnt/data/Docker/git")
+        self.assertEqual(rule, "Edit(//opt/t[[]1[]]/agent/**)")
+        self.assertEqual(ha._glob_literal("/plain/path"), "/plain/path")
+
+    def test_the_files_that_wire_the_guard_are_denied(self):
+        # Denying the agent's installed code without these just moves the
+        # two-Write attack one directory over: _ensure_guard_settings reuses
+        # this file whenever it merely EXISTS, never re-validating its content,
+        # so one Write disables both hooks for every session that manager starts.
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        self.assertIn("Edit(~/.turma/guard-settings.json)", deny)
+        self.assertIn("Edit(~/.turma/limits-settings.json)", deny)
+
+    def test_every_claude_backstop_rule_is_pinned(self):
+        """Three mutations deleting whole groups of these escaped the suite.
+
+        `test_catastrophic_paths_keep_pattern_denies_as_defence_in_depth` pinned
+        only the rules that predated the widening, so the entire fix could be
+        deleted green. Pin the full set instead.
+        """
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        for d in ("agents", "bin", "hooks", "local", "plugins", "rules", "sessions",
+                  "shell-snapshots", "skills", "commands", "output-styles", "workflows",
+                  "routines", "cowork_plugins", "jobs", "daemon", "ide", "todos",
+                  "themes", "backups", "session-env", "worktrees", "plans"):
+            self.assertIn(f"Edit(~/.claude/{d}/**)", deny, f"{d}/ lost its backstop")
+        for rule in ("Edit(~/.claude/statusline-command.sh)",
+                     "Edit(~/.claude/projects/*/*.jsonl)",
+                     "Edit(~/.claude/projects/*/subagents/**)"):
+            self.assertIn(rule, deny)
+        # …and none of them reaches a memory path. A rule matching a DIRECTORY
+        # takes its whole subtree, which is how this broke twice.
+        self.assertEqual([r for r in deny if "agent-memory" in r or "/memory/" in r], [])
 
     def test_a_developer_checkout_of_this_repo_stays_editable(self):
         # The same rule must NOT fire for a checkout under REPOS_ROOT: sessions
@@ -227,7 +282,12 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # attached file never costs a permission prompt (XERK-234).
         s = ha.build_guard_settings(local_settings_path="/no/such/file.json")
         self.assertEqual(s["permissions"]["allow"], list(ha._GUARD_ALLOW_PATH_RULES))
-        self.assertEqual(s["permissions"]["deny"], list(ha._GUARD_DENY_PATH_RULES))
+        # The runtime-code rule is GENERATED from where this module sits, and is
+        # emitted whenever that is outside REPOS_ROOT — which is exactly how CI
+        # checks out. Asserting the static list alone passed only when the tree
+        # happened to live under /mnt/data/Docker/git.
+        self.assertEqual(s["permissions"]["deny"],
+                         list(ha._GUARD_DENY_PATH_RULES) + ha.runtime_code_deny_rules())
 
     def test_malformed_file_fails_open(self):
         fd, path = tempfile.mkstemp(suffix=".json")

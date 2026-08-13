@@ -1000,6 +1000,12 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.claude/ide/**)",              # lock files publish a port + token
     "Edit(~/.claude/todos/**)",
     "Edit(~/.claude/themes/**)",
+    # In Claude Code's own integrity walk beside shell-snapshots and hooks, and
+    # where the successful post-neutralisation write actually landed when QA
+    # re-ran the attack — so it belongs here at least as much as themes/ does.
+    "Edit(~/.claude/session-env/**)",
+    "Edit(~/.claude/worktrees/**)",
+    "Edit(~/.claude/plans/**)",
     "Edit(~/.claude/backups/**)",          # the restore path for all of the above
     "Edit(~/.claude/statusline-command.sh)",  # run when settings.json sets statusLine
     # Transcripts: replayed into a resumed session and pushed to the hub's
@@ -1023,6 +1029,15 @@ _GUARD_DENY_PATH_RULES = [
     # change that. Do not treat this line as containment. Keeping the token out
     # of child environments would need Claude Code's apiKeyHelper.
     "Read(~/.turma/local-model.env)",
+    # The files that WIRE the guard. `_ensure_guard_settings` writes this once
+    # per manager and thereafter reuses it whenever it merely EXISTS — content is
+    # never re-validated — so one Write disables both hooks and rewrites the deny
+    # list for every session that manager launches until it restarts. Denying the
+    # agent's installed code (runtime_code_deny_rules) without this just moves
+    # the attack one directory over. NOT all of ~/.turma: the agent stages
+    # uploads and question files there and sessions legitimately write it.
+    "Edit(~/.turma/guard-settings.json)",
+    "Edit(~/.turma/limits-settings.json)",
     "Edit(~/.turma/local-model.env)",
 ]
 
@@ -1081,6 +1096,21 @@ def ask_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
 
 
+def _glob_literal(path):
+    """Escape glob metacharacters so a path is matched as literal text.
+
+    `runtime_code_deny_rules` interpolates a filesystem path into a glob. An
+    install prefix containing `[`, `*` or `?` would otherwise be read as a
+    pattern: a directory literally named `t[1]` yields a character class, so the
+    directory it names goes UNPROTECTED while an unrelated `t1` is wrongly
+    denied. `[c]` is the standard glob spelling for a literal `c`.
+    """
+    out = []
+    for ch in path:
+        out.append(f"[{ch}]" if ch in "*?[]" else ch)
+    return "".join(out)
+
+
 def runtime_code_deny_rules(script_dir=None, repos_root=None):
     """Deny writes to the agent's OWN installed code — the hooks above all.
 
@@ -1106,7 +1136,15 @@ def runtime_code_deny_rules(script_dir=None, repos_root=None):
         return []
     if real_dir == real_root or real_dir.startswith(real_root + os.sep):
         return []                          # a checkout, not the installed agent
-    return [f"Edit({real_dir}/**)"]
+    # The DOUBLED leading slash is load-bearing. Claude Code reads a single `/`
+    # as relative to the directory holding the `--settings` file, so
+    # `Edit(/root/.local/share/turma-agent/**)` resolves against
+    # `~/.turma/guard-settings.json` and means `~/.turma/root/.local/...` — a
+    # path that exists nowhere, so the rule binds to NOTHING. Measured: with one
+    # slash the two-Write hook-neutralisation attack succeeds; with two it is
+    # refused. The rule read fine and did nothing, which is why the test
+    # asserting its STRING was green over a rule with no effect.
+    return [f"Edit(/{_glob_literal(real_dir)}/**)"]
 
 
 def fileguard_script_path():
