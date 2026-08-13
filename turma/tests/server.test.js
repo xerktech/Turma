@@ -139,6 +139,7 @@ const {
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
   dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot, holdQueued,
   TICKET_QUEUE_PER_ORG_MAX, TICKET_QUEUE_PER_ORG_AUTO_MAX, TICKET_QUEUE_MAX_WAIT_MS,
+  TICKET_QUEUE_EXPIRED_TTL_MS, logQueueState,
   ticketQueueAdmission, TICKET_QUEUE_MAX, TICKET_QUEUE_ERROR_MAX, TICKET_QUEUE_STALE_MS,
   TICKET_QUEUE_BLOCKED_MAX_MS,
   orgColors, setOrgColor,
@@ -5198,11 +5199,83 @@ test("XERK-296: a manual entry is NOT retired by a session it didn't ask for", a
   drainTicketQueue();
   assert.equal(ticketQueue.length, 1, "someone else's session is not the one asked for");
   // It ends the way an operator's ask should: on a dispatch, their cancel, Done,
-  // or — the backstop — having waited too long to still be what anyone wants.
+  // or — the backstop — having waited too long to still be what anyone wants,
+  // which it says out loud rather than vanishing (see the give-up case above).
   queuedTicket("tq24.atlassian.net", "ENG-5").at = Date.now() - TICKET_QUEUE_MAX_WAIT_MS - 1;
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0);
+  assert.equal(queuedTicket("tq24.atlassian.net", "ENG-5").reason, "expired");
   assert.equal((agents.tqForeign.commands || []).length, 0, "and it starts nothing on the way out");
+});
+
+test("XERK-296: giving up is VISIBLE — the entry goes terminal, it doesn't vanish", async () => {
+  // A queued click that disappeared after its hours were up read exactly like
+  // someone else cancelling it: the chip went, the button came back, nothing
+  // said why. Work going quietly missing is the failure this ticket is about.
+  resetAutoStart();
+  await asBeat("tqGiveUp", "tq29.atlassian.net", { autoStart: false, capacity: FULL });
+  await startTicket("tq29.atlassian.net", "ENG-5");
+  queuedTicket("tq29.atlassian.net", "ENG-5").at = Date.now() - TICKET_QUEUE_MAX_WAIT_MS - 1;
+  drainTicketQueue();
+  const e = queuedTicket("tq29.atlassian.net", "ENG-5");
+  assert.ok(e, "it stays on the payload as a note");
+  assert.equal(e.reason, "expired");
+  assert.match(e.error, /stopped waiting/);
+  // A terminal entry is not IN the line: it takes no place and dispatches never.
+  assert.equal(ticketQueuePayload().find((q) => q.issueKey === "ENG-5").position, 0);
+  agents.tqGiveUp.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.equal((agents.tqGiveUp.commands || []).length, 0, "a note never starts a session");
+  // Asking again replaces the note with a real place in line.
+  agents.tqGiveUp.capacity = { ...FULL };
+  await startTicket("tq29.atlassian.net", "ENG-5");
+  const again = queuedTicket("tq29.atlassian.net", "ENG-5");
+  assert.equal(again.expiredAt, undefined);
+  assert.equal(again.reason, null);
+  // And the note itself is swept once it has been on screen long enough.
+  again.expiredAt = Date.now() - TICKET_QUEUE_EXPIRED_TTL_MS - 1;
+  again.reason = "expired";
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-296: when two hosts of one org report the same ticket, the FRESHER row decides", async () => {
+  // Both hosts legitimately report — this is the tie-break, and its failure mode
+  // is silent: which host's row decides a queued ticket's status would otherwise
+  // depend on the agents map's iteration order.
+  resetAutoStart();
+  const site = "tq30.atlassian.net";
+  const todo = [{ key: "ENG-5", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true } }];
+  const done = [{ key: "ENG-5", statusCategory: "done",
+    repoGuess: { repo: "Turma", cloned: true } }];
+  // Stale host says Done, fresh host says To Do: the entry lives.
+  await asBeat("tqOldSaysDone", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:00:00Z", tickets: done });
+  await asBeat("tqNewSaysTodo", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:05:00Z", tickets: todo });
+  await startTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.ok(queuedTicket(site, "ENG-5"), "a stale Done must not retire it");
+  // Now the FRESH host reports Done: it goes.
+  await asBeat("tqNewSaysTodo", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:10:00Z", tickets: done });
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5"), null);
+});
+
+test("XERK-296: a state log line is throttled — it describes a condition, not an event", async () => {
+  // The sweep re-derives every verdict every 15s, so an unthrottled line about a
+  // STATE buries the log in exactly the situation it exists to explain.
+  const lines = [];
+  const real = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try {
+    for (let i = 0; i < 5; i++) logQueueState("throttle-test", "the same condition");
+    logQueueState("another-key", "a different condition");
+  } finally {
+    console.log = real;
+  }
+  assert.deepEqual(lines, ["the same condition", "a different condition"]);
 });
 
 test("XERK-296: a ticket only ONE host of a multi-host org reports still routes", async () => {

@@ -21,6 +21,7 @@ that component's files.
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
+| `.claude/rules/turma-ticket-queue.md` | `turma/public/board.*`, `turma/server.js` | the hub's ticket queue: admission, drain, expiries, caps |
 | `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
@@ -118,7 +119,7 @@ One agent container per host, multiplexing sessions across every repo it scans.
   oldest waiting ticket. A queued ticket has no session id, no worktree and no host.
 - It rides `/api/agents` as top-level `ticketQueue` + its own SSE event, the ONLY place a waiting
   ticket exists; `DELETE /api/jira/<siteKey>/<issueKey>/session` cancels one and can never touch a
-  running session. Mechanics and the routing rules are in `.claude/rules/turma-board.md`.
+  running session. Mechanics and the routing rules are in `.claude/rules/turma-ticket-queue.md`.
 
 ### Repos-root sessions
 

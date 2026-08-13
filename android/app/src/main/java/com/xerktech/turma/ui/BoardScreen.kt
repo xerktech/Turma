@@ -579,8 +579,12 @@ private fun TicketStartControl(
                 )
             }
             Text(
-                if (c.blocked) "⏳ queued · blocked"
-                else "⏳ queued" + if (c.position > 1) " · #${c.position}" else "",
+                when {
+                    c.expired -> "⌛ gave up waiting"
+                    c.blocked -> "⏳ queued · blocked"
+                    c.position > 1 -> "⏳ queued · #${c.position}"
+                    else -> "⏳ queued"
+                },
                 style = MaterialTheme.typography.labelMedium,
                 color = if (c.blocked) MaterialTheme.colorScheme.error
                 else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -594,6 +598,8 @@ private fun TicketStartControl(
                 )
             }
             GhostButton("✕", onClick = onCancelQueued)
+            // "It gave up" is only useful next to the way to ask again.
+            if (c.expired) GhostButton("☐ Start session", onClick = onStart)
         }
         is StartControl.Busy -> Text(
             "⏳ starting…",

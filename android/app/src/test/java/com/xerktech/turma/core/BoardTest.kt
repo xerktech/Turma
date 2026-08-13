@@ -695,6 +695,14 @@ class BoardTest {
             StartControl.Queued(position = 1, blocked = false, reason = null, error = "boom"),
             ticketStartControl(guessed(true), 0, StartState(error = "boom"), queued()),
         )
+        // Terminal: it waited as long as the hub allows and gave up, which the
+        // card must SAY — a click that vanished reads like someone cancelling it.
+        assertEquals(
+            StartControl.Queued(position = 0, blocked = true,
+                reason = "no agent had a free slot", error = null, expired = true),
+            ticketStartControl(guessed(true), 0, null,
+                queued(position = 0, reason = "expired", error = "no agent had a free slot")),
+        )
         // Still nothing to start against without a triaged repo.
         assertEquals(null, ticketStartControl(JiraTicket(key = "X-1"), 0, null, queued()))
     }

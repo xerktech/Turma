@@ -3794,11 +3794,18 @@ const TICKET_QUEUE_BLOCKED_MAX_MS = 30 * 60 * 1000;
 // after a while. Long enough that an org busy all afternoon still starts the
 // work; short enough that nobody is surprised by a session tomorrow.
 const TICKET_QUEUE_MAX_WAIT_MS = 4 * 60 * 60 * 1000;
+// …and when it does end that way, the entry does NOT silently vanish. It goes
+// TERMINAL — `reason:"expired"`, still on the payload, rendered as "gave up
+// waiting" with the ✕ to dismiss — for this long. A queued click disappearing
+// without a word reads exactly like someone else cancelling it, which is the
+// class of thing this whole ticket is about: work that goes missing quietly. A
+// terminal entry never dispatches and never counts against a line's length.
+const TICKET_QUEUE_EXPIRED_TTL_MS = 60 * 60 * 1000;
 // How long a dispatch is remembered, so a cancel that LOST to it can say so
 // rather than 404ing as if the ticket had never been queued.
 const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
 // FIFO. Entries: {siteKey, issueKey, source:"auto"|"manual", at, reason, error,
-// blockedSince, unknownSince}. `reason` is why it is STILL waiting, as of the
+// blockedSince, unknownSince, expiredAt}. `reason` is why it is STILL waiting, as of the
 // last drain: "capacity" (some host will free up), "blocked" (something the
 // operator has to fix — the text is in `error`), or null before the first drain
 // has judged it.
@@ -3848,8 +3855,11 @@ function ticketQueueAdmission(siteKey, issueKey, source) {
       || !isIssueKey(issueKey)) {
     return "invalid";
   }
-  if (queuedTicket(siteKey, issueKey)) return "ok";     // already in line
-  const mine = ticketQueue.filter((e) => e.siteKey === siteKey);
+  const cur = queuedTicket(siteKey, issueKey);
+  if (cur && !cur.expiredAt) return "ok";               // already in line
+  // A terminal entry holds no place, so it neither blocks its own re-queue nor
+  // counts toward the lines below.
+  const mine = ticketQueue.filter((e) => e.siteKey === siteKey && !e.expiredAt);
   if (source === "auto"
       && mine.filter((e) => e.source === "auto").length >= TICKET_QUEUE_PER_ORG_AUTO_MAX) {
     return "org-auto-full";
@@ -3865,8 +3875,10 @@ function ticketQueueAdmission(siteKey, issueKey, source) {
 function ticketQueuePayload() {
   const seen = new Map();
   return ticketQueue.map((e) => {
-    const n = (seen.get(e.siteKey) || 0) + 1;
-    seen.set(e.siteKey, n);
+    // A terminal entry is not IN the line — it is a note about one that ended —
+    // so it takes no place and doesn't push the tickets behind it down.
+    const n = e.expiredAt ? 0 : (seen.get(e.siteKey) || 0) + 1;
+    if (!e.expiredAt) seen.set(e.siteKey, n);
     return { siteKey: e.siteKey, issueKey: e.issueKey, source: e.source,
       queuedAt: e.at, position: n, reason: e.reason || null,
       error: e.error || null };
@@ -3927,13 +3939,16 @@ function dispatchedRecently(siteKey, issueKey) {
 function enqueueTicketStart(siteKey, issueKey, source) {
   if (ticketQueueAdmission(siteKey, issueKey, source) !== "ok") return null;
   const existing = queuedTicket(siteKey, issueKey);
-  if (existing) {
+  if (existing && !existing.expiredAt) {
     if (source === "manual" && existing.source !== "manual") {
       existing.source = "manual";
       publishTicketQueue();
     }
     return existing;
   }
+  // Asking again after it gave up REPLACES the note with a fresh place in line,
+  // rather than handing back the dead entry.
+  if (existing) dropQueuedTicket(siteKey, issueKey, null);
   const e = { siteKey, issueKey, source: source === "manual" ? "manual" : "auto",
     at: Date.now(), reason: null, error: null, blockedSince: 0, unknownSince: 0 };
   ticketQueue.push(e);
@@ -4059,10 +4074,25 @@ function drainTicketQueue() {
       changed = true;
       if (why) console.log(`ticket queue: dropped ${logName(e.issueKey)} — ${why}`);
     };
+    // A terminal entry is a message to the operator, not work: it holds nothing,
+    // dispatches nothing, and leaves once it has been on screen long enough to
+    // be read (or the moment they dismiss it with the ✕).
+    if (e.expiredAt) {
+      if (now - e.expiredAt > TICKET_QUEUE_EXPIRED_TTL_MS) drop(null);
+      continue;
+    }
     // The backstop under every hold below: nothing waits here indefinitely
-    // except a slot that is coming, and even that has an end.
+    // except a slot that is coming, and even that has an end. It ends VISIBLY —
+    // see TICKET_QUEUE_EXPIRED_TTL_MS.
     if (now - e.at > TICKET_QUEUE_MAX_WAIT_MS) {
-      drop(`it waited ${Math.round((now - e.at) / 60000)} minutes without a free slot`);
+      const mins = Math.round((now - e.at) / 60000);
+      e.expiredAt = now;
+      e.reason = "expired";
+      e.error = `no agent had a free slot for ${Math.round(mins / 60)} hours, `
+        + "so it stopped waiting — start it again when the fleet is quieter";
+      changed = true;
+      console.log(`ticket queue: ${logName(e.issueKey)} gave up after ${mins} minutes`
+        + " without a free slot");
       continue;
     }
     const hit = rows.get(k);
@@ -4212,12 +4242,14 @@ function autoStartSweep() {
       // problem, and only the fleet cap ends the sweep outright.
       const verdict = ticketQueueAdmission(siteKey, t.key, "auto");
       if (verdict === "invalid") {
-        logQueueState(`bad\x00${siteKey}\x00${t.key}`,
+        // Keyed on the SANITISED name: t.key is agent-supplied and this map
+        // outlives the call, so an unbounded key would be an unbounded entry.
+        logQueueState(`bad\x00${siteKey}\x00${logName(t.key)}`,
           `auto-start: ${logName(t.key)} isn't a key this hub can queue — skipped`);
         continue;
       }
       if (verdict === "org-auto-full" || verdict === "org-full") {
-        logQueueState(`share\x00${siteKey}`,
+        logQueueState(`share\x00${logName(siteKey)}`,
           `auto-start: ${logName(siteKey)} already has its share of the queue `
           + `(${TICKET_QUEUE_PER_ORG_AUTO_MAX} auto); the rest wait for a free slot`);
         break;                       // this ORG is full; other orgs still sweep
@@ -7247,6 +7279,9 @@ if (process.env.TURMA_TEST) {
     TICKET_QUEUE_PER_ORG_MAX,
     TICKET_QUEUE_PER_ORG_AUTO_MAX,
     TICKET_QUEUE_MAX_WAIT_MS,
+    TICKET_QUEUE_EXPIRED_TTL_MS,
+    logQueueState,
+    TICKET_LOG_THROTTLE_MS,
     TICKET_QUEUE_ERROR_MAX,
     TICKET_QUEUE_STALE_MS,
     TICKET_QUEUE_BLOCKED_MAX_MS,

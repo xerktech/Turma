@@ -569,12 +569,19 @@
   // itself — same text either way, but it says which.
   function queuedLabel(q) {
     if (!q) return "";
+    // Terminal: it waited as long as the hub allows and gave up. Said out loud,
+    // because a queued click that simply vanished reads like someone cancelling
+    // it — the ✕ beside this dismisses the note.
+    if (q.reason === "expired") return "⌛ gave up waiting";
     if (q.reason === "blocked") return "⏳ queued · blocked";
     return "⏳ queued" + (q.position > 1 ? " · #" + q.position : "");
   }
 
   function queuedTip(q, issueKey) {
     if (!q) return "";
+    if (q.reason === "expired") {
+      return `${issueKey} ${q.error || "waited too long for a free slot and stopped waiting"}`;
+    }
     if (q.reason === "blocked") {
       return `${issueKey} is waiting: ${q.error || "the hub can't route it right now"}`;
     }
@@ -599,10 +606,19 @@
       const qerr = st.error
         ? `<span class="kc-start-err" title="${esc(st.error)}">⚠ ${esc(st.error)}</span>`
         : "";
-      return chips + qerr + `<span class="kc-queued${queued.reason === "blocked" ? " kc-queued-blocked" : ""}"
+      const gone = queued.reason === "expired";
+      const cls = gone ? " kc-queued-blocked"
+        : queued.reason === "blocked" ? " kc-queued-blocked" : "";
+      // A terminal note is dismissed, not cancelled — and it keeps a LIVE start
+      // button beside it, because "it gave up" is only useful next to the way to
+      // ask again.
+      const act = gone ? "Dismiss" : "Take";
+      return chips + qerr + `<span class="kc-queued${cls}"
         title="${esc(tip)}">${esc(queuedLabel(queued))}</span><button class="kc-unqueue" type="button"
-        data-unqueue="${esc(t.key)}" title="Take ${esc(t.key)} out of the queue"
-        aria-label="Take ${esc(t.key)} out of the queue">✕</button>`;
+        data-unqueue="${esc(t.key)}" title="${act} ${esc(t.key)} ${gone ? "note" : "out of the queue"}"
+        aria-label="${act} ${esc(t.key)} ${gone ? "note" : "out of the queue"}">✕</button>`
+        + (gone ? `<button class="kc-start" type="button" data-start="${esc(t.key)}"
+             title="Start a session on ${esc(t.key)} again">☐ Start session</button>` : "");
     }
     if (st.pending) {
       return chips + `<span class="kc-start kc-start-busy"

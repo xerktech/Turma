@@ -1581,6 +1581,19 @@ test("ticketStartHtml: a failed CANCEL shows its reason on the still-queued card
   assert.ok(html.includes("data-unqueue"), "and the cancel stays available");
 });
 
+test("ticketStartHtml: an expired wait SAYS SO, and offers the way to ask again", () => {
+  // A queued click that simply vanished after its 4 hours reads exactly like
+  // someone else cancelling it — the failure mode this whole ticket is about.
+  const html = ticketStartHtml(ticket("X-1", guess()), [], null, {
+    siteKey: "a.net", issueKey: "X-1", position: 0, reason: "expired",
+    error: "no agent had a free slot for 4 hours, so it stopped waiting",
+  });
+  assert.ok(html.includes("gave up waiting"));
+  assert.ok(html.includes("no agent had a free slot"), "the hub's reason is the tooltip");
+  assert.ok(html.includes("data-unqueue"), "the ✕ dismisses the note");
+  assert.ok(html.includes("data-start"), "and a live button is right beside it");
+});
+
 test("ticketStartHtml: a queued ticket still shows the sessions it already has", () => {
   const html = ticketStartHtml(ticket("X-1", guess()), [tsess("s1", "X-1")],
     null, { siteKey: "a.net", issueKey: "X-1", position: 1 });

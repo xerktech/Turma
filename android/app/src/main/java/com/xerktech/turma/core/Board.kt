@@ -688,6 +688,12 @@ sealed interface StartControl {
         val blocked: Boolean,
         val reason: String?,
         val error: String? = null,
+        /**
+         * Terminal: it waited as long as the hub allows and gave up. Said out
+         * loud, because a queued click that simply vanished reads like someone
+         * cancelling it. The ✕ dismisses the note and a live start sits beside it.
+         */
+        val expired: Boolean = false,
     ) : StartControl
     /**
      * A live start button. [clone] marks the repo as not cloned anywhere (the
@@ -714,9 +720,10 @@ fun ticketStartControl(
     if (g?.repo == null) return null
     if (queued != null) return StartControl.Queued(
         position = queued.position,
-        blocked = queued.reason == "blocked",
+        blocked = queued.reason == "blocked" || queued.reason == "expired",
         reason = queued.error,
         error = start?.error,
+        expired = queued.reason == "expired",
     )
     if (start?.pending == true) return StartControl.Busy
     return StartControl.Button(
