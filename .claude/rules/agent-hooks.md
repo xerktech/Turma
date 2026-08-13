@@ -32,6 +32,18 @@ implementation contract.
     rule again), too small (an enumerated danger list missed `shell-snapshots/`, which Claude Code
     sources on every Bash call of every live session — RCE across sessions), and unable to track a
     vendor directory set that grows each release. Do not go back to patterns for this.
+  - **The rule list is pinned by EQUALITY** (`EXPECTED_DENY_RULES` in `test_guard_settings.py`),
+    because containment lost six rules: each was deletable with the whole suite *and* the live
+    oracle green, `settings.json*` among them — the oracle asks whether the TARGET is refused, and
+    `Edit(~/.claude/*.json)` still refused it. Only a rule-level assertion sees that.
+    - Two measured limits, so nobody mistakes the pin for more than it is. **19 of 45 rules have a
+      second signal** elsewhere in the suite; **the other 26 do not**, so an editor who updates the
+      frozenset to match a deletion without thinking is green — the failure message tells them to
+      make that call deliberately, and no cheap check distinguishes intent.
+    - **An over-broad ADDITION pinned in both places is invisible to the unit suite.** Adding
+      `Edit(~/.claude/projects/**)` swallows the auto-memory tree and still passes 1386 tests; only
+      the oracle's two memory tests catch it, and they run in **31s**. Run them after any edit to
+      the rule list — that is the concrete reason the oracle is not optional.
   - **The `permissions.deny` rules still name the catastrophic subset** — the login, `agents/`,
     `bin/`, `hooks/`, `local/`, `rules/`, `plugins/`, `sessions/`, `shell-snapshots/`,
     `~/.claude.json`. That is deliberate defence in depth for when the hook is misconfigured or

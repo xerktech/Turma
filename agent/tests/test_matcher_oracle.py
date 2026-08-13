@@ -91,10 +91,18 @@ def _attempt(workdir, settings_path, target, env=None, tries=3, mode="acceptEdit
     last as a failure, never as a deny.
     """
     marker = "hello-oracle"
-    for _ in range(tries):
+    for attempt in range(tries):
         if os.path.exists(target):
             os.unlink(target)
-        dbg = os.path.join(workdir, "dbg.log")
+        # A FRESH log per try. `claude --debug-file` APPENDS across invocations
+        # -- measured, the file exactly doubles -- so a try that logged a refusal
+        # and THEN timed out would leave that marker behind for the next try to
+        # read as its own verdict. Before the retry path existed this was
+        # unreachable, because a try that logged a deny always returned in the
+        # same iteration; adding `continue` on timeout is what opened it. It is
+        # the same shape as the bug that path was added to fix: a harness
+        # failure reported as a measurement.
+        dbg = os.path.join(workdir, f"dbg-{attempt}.log")
         try:
             proc = subprocess.run(
                 ["claude", "-p",
@@ -389,8 +397,16 @@ class TestGuardedClaudeDir(unittest.TestCase):
         target = os.path.join(home, target_rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         sp = _settings(os.path.join(base, "turma"), self._payload(arm, base))
-        return _attempt(home, sp, target, mode=mode,
-                        env=dict(os.environ, HOME=home, IS_SANDBOX="1"))
+        got = _attempt(home, sp, target, mode=mode,
+                       env=dict(os.environ, HOME=home, IS_SANDBOX="1"))
+        # Same guard as TestMatcherSemantics._drive. Without it a run where the
+        # model never called the tool fails against whichever arm came first --
+        # reporting a confident claim about ATTRIBUTION when nothing was
+        # measured at all.
+        self.assertNotEqual(got, INCONCLUSIVE,
+                            f"model never attempted the write at {target_rel} "
+                            f"({arm} arm); inconclusive is not a verdict")
+        return got
 
     def _refuses(self, target_rel, named_by_pattern=True):
         """Refused, the binary alone would not have, and BY WHICH LAYER.
@@ -481,6 +497,95 @@ class TestGuardedClaudeDir(unittest.TestCase):
                          "whether our layer is now what blocks session memory")
         self.assertEqual(self._case(rel, self.REAL), ALLOWED,
                          "our own rules refuse it, which the carve-out must not")
+
+
+class TestAttemptRetryLogic(unittest.TestCase):
+    """`_attempt`'s own logic, with the child process faked.
+
+    NOT gated: no API calls, so this runs in CI on every PR. The live cases
+    above cannot cover this -- a timeout or a stale log is exactly what does not
+    happen on a good run -- and every defect in this harness so far has been a
+    way for it to report a verdict it never measured. So the harness gets the
+    same treatment it exists to apply: a test that fails when it lies.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="oracle-unit-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.target = os.path.join(self.tmp, "t.txt")
+        self.sp = _settings(self.tmp, {})
+
+    def _drive(self, behaviours):
+        """Run _attempt with one fake child per try, described by `behaviours`."""
+        calls = []
+
+        def fake_run(cmd, **kw):
+            dbg = cmd[cmd.index("--debug-file") + 1]
+            calls.append(dbg)
+            what = behaviours[len(calls) - 1]
+            if what.get("log"):
+                with open(dbg, "a") as fh:      # append: the real binary does
+                    fh.write(what["log"] + "\n")
+            if what.get("write"):
+                with open(self.target, "w") as fh:
+                    fh.write(what["write"])
+            if what.get("timeout"):
+                raise subprocess.TimeoutExpired(cmd, 300)
+            return subprocess.CompletedProcess(cmd, 0, what.get("stdout", ""), "")
+
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            return _attempt(self.tmp, self.sp, self.target, tries=len(behaviours)), calls
+        finally:
+            subprocess.run = real
+
+    def test_a_stale_deny_from_a_timed_out_try_is_not_the_next_trys_verdict(self):
+        """The defect the retry path introduced.
+
+        `claude --debug-file` APPENDS across invocations, so try 1 logging a
+        refusal and then hanging left that marker for try 2 -- which called no
+        tool at all -- to report as DENIED. A hung harness, presented as a
+        measurement of the permission layer.
+        """
+        verdict, logs = self._drive([
+            {"log": "Write tool validation error: denied", "timeout": True},
+            {"stdout": "I did not call any tool."},
+        ])
+        self.assertEqual(verdict, INCONCLUSIVE)
+        self.assertNotEqual(logs[0], logs[1], "both tries shared one debug log")
+
+    def test_every_try_timing_out_is_inconclusive_not_a_deny(self):
+        verdict, _ = self._drive([{"timeout": True}] * 3)
+        self.assertEqual(verdict, INCONCLUSIVE)
+
+    def test_a_timeout_then_a_real_refusal_is_denied(self):
+        # `proc` is unbound after a timeout; reading it would NameError here.
+        verdict, _ = self._drive([
+            {"timeout": True},
+            {"log": "Write tool validation error: denied"},
+        ])
+        self.assertEqual(verdict, DENIED)
+
+    def test_a_timeout_then_a_real_write_is_allowed(self):
+        verdict, _ = self._drive([
+            {"timeout": True},
+            {"write": "hello-oracle"},
+        ])
+        self.assertEqual(verdict, ALLOWED)
+
+    def test_a_file_written_by_something_else_is_not_an_allow(self):
+        # The binary creates ~/.claude.json itself; existence read as a false
+        # ALLOW until this was keyed on CONTENT.
+        verdict, _ = self._drive([{"write": "not the marker"}])
+        self.assertEqual(verdict, INCONCLUSIVE)
+
+    def test_a_write_landing_during_a_timed_out_try_is_discarded(self):
+        verdict, _ = self._drive([
+            {"write": "hello-oracle", "timeout": True},
+            {"stdout": "no tool call"},
+        ])
+        self.assertEqual(verdict, INCONCLUSIVE)
 
 
 if __name__ == "__main__":
