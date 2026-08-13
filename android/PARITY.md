@@ -501,8 +501,14 @@ those are marked `[MODEL]`.
   company on every `.x5` boundary, ~1% of values), and Java's `format` following the **device
   locale** (`1,2k` in de_DE, `١٫٢k` in ar_EG). Both sides now do integer arithmetic and build the
   string by hand. The web copies must also never return a non-numeric input verbatim — `tokenCell`
-  interpolates the result into `innerHTML`. Tests: `fmtTokens` cases in `turma/tests/usage.test.js`
-  ↔ `ui/FmtTokensTest.kt`, sharing vectors.
+  interpolates the result into `innerHTML` — and their "can't state a figure" sentinel is **`–`,
+  never `0`**, since `0` asserts a measurement an idle fleet would show too. Agreement holds up to
+  2^53: past that `JSON.parse` cannot hold the count exactly and the two can differ by a tenth
+  (`9007411349999999` → `9007411.3B` on the phone, `9007411.4B` in the browser). Only BigInt
+  parsing would close that, and no real fleet reaches it. Tests: `fmtTokens` cases in
+  `turma/tests/usage.test.js` and `turma/tests/dashboard-livestate.test.js` ↔ `ui/FmtTokensTest.kt`,
+  sharing vectors. The same locale trap lives in every `String.format`/`.format` on a user-facing
+  figure — `Locale.US` explicitly, or the phone disagrees with the browser about one value.
 - The **headline totals** (Today / This week / All-time, with the all-time cache split under them)
   are at parity. Android had them first and the web page did not; `fleetTotals`/`renderTotals` in
   `usage.html` are the port of `UsageViewModel.compute`'s window sums, tested against the SAME

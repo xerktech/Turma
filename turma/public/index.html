@@ -571,7 +571,9 @@ function fmtTokens(n) {
       let whole = Math.floor(n / unit);
       let tenths = Math.round((n % unit) * 10 / unit);
       if (tenths === 10) { whole += 1; tenths = 0; }
-      return whole + "." + tenths + suffix;
+      // String(whole) goes exponential at 1e21, which is not the shape this
+      // promises. Reachable: the hub serves token counts raw.
+      return (whole >= 1e21 ? BigInt(whole).toString() : String(whole)) + "." + tenths + suffix;
     }
   }
   return String(n);

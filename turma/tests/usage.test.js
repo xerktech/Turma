@@ -120,6 +120,32 @@ test("cacheHitRate is null when there is no prompt traffic to take a ratio of", 
   assert.equal(H.cacheHitRate(null), null);
 });
 
+test("cacheHitRate states no rate rather than a nonsense one", () => {
+  // Its result is interpolated into the headline strip's cache line, so a
+  // figure the arithmetic can't produce honestly has to become "no rate", not
+  // "NaN% hit" or "-20% hit". Negatives are reachable from a stock agent, which
+  // passes a negative token count straight through; NaN arrives when a host
+  // reports a count as a JSON string and poisons the accumulator.
+  assert.equal(H.cacheHitRate(bucket({ input: NaN, cacheRead: 100 })), null);
+  assert.equal(H.cacheHitRate({ input: "oops", cacheRead: 100, cacheWrite: 0 }), null);
+  assert.equal(H.cacheHitRate(bucket({ input: -100, cacheRead: -300, cacheWrite: -400 })), null);
+  assert.equal(H.cacheHitRate(bucket({ input: 100, cacheRead: -50 })), null);
+});
+
+test("the strip's cache line carries no rate it cannot stand behind", () => {
+  // The end-to-end version: renderTotals puts this string at the top of the
+  // page, where "NaN% hit" was rendering.
+  H.renderTotals([{ key: "h1", usage: {
+    today: bucket({}), week: bucket({}),
+    totals: bucket({ input: -100, cacheRead: -300, cacheWrite: -400 }),
+  } }]);
+  const cache = H.els.totals.children.find((c) => c.className === "cache");
+  if (cache) {
+    assert.equal(/NaN|-?[0-9]+% hit/.test(cache.textContent) && cache.textContent.includes("NaN"), false);
+    assert.equal(cache.textContent.includes("% hit"), false);
+  }
+});
+
 test("cacheHitRate rounds rather than truncating", () => {
   // 2/3 -> 67, not 66.
   assert.equal(H.cacheHitRate(bucket({ input: 1000, cacheRead: 2000 })), 67);
@@ -191,9 +217,35 @@ test("fmtTokens NEVER returns markup, whatever the heartbeat put in the field", 
     '<img src=x onerror="window.__pwned=1">',
     "javascript:alert(1)", {}, [], NaN, Infinity, -Infinity, undefined, null, "abc",
   ]) {
-    assert.match(H.fmtTokens(hostile), /^-?[0-9]+(\.[0-9])?[kMB]?$/,
+    assert.match(H.fmtTokens(hostile), /^(–|-?[0-9]+(\.[0-9])?[kMB]?)$/,
       `fmtTokens(${JSON.stringify(hostile)}) escaped its numeric shape`);
   }
+});
+
+test("fmtTokens says '–' for a figure it cannot believe, never '0'", () => {
+  // A host reporting a token count as a JSON string makes addBucket concatenate
+  // rather than add, and the accumulator is a string from that host onward —
+  // arriving here as NaN. "0" would assert a measurement, so an idle fleet and
+  // one whose arithmetic was poisoned would read identically at the top of the
+  // page. Both clients' formatters use "–" for "can't tell you".
+  assert.equal(H.fmtTokens(NaN), "–");
+  assert.equal(H.fmtTokens("00500-100"), "–");   // what the concatenation makes
+  assert.equal(H.fmtTokens(Infinity), "–");      // a JSON literal past ~1e308
+  assert.equal(H.fmtTokens(0), "0");             // a real zero is still zero
+});
+
+test("fmtTokens reads a numeric STRING as the number it is", () => {
+  // Narrowing with Number() is what closes the markup hole; it also means a
+  // field a host quoted still counts rather than reading as nothing.
+  assert.equal(H.fmtTokens("1500"), "1.5k");
+  assert.equal(H.fmtTokens("850"), "850");
+});
+
+test("fmtTokens never goes exponential, however absurd the count", () => {
+  // Math.floor(n / unit) passes 1e21 and String() switches to "1e+21", which is
+  // not the shape this function promises the callers that build markup from it.
+  assert.match(H.fmtTokens(1e30), /^[0-9]+\.[0-9]B$/);
+  assert.equal(H.fmtTokens(1e30).includes("e+"), false);
 });
 
 test("a hostile token field cannot reach the table cell as markup", () => {
@@ -261,6 +313,22 @@ test("fleetTotals takes a host's own block and NEITHER adds nor prefers its repo
   assert.equal(t.today.input, 10);
   assert.equal(t.week.input, 70);
   assert.equal(t.totals.input, 500);
+});
+
+test("fleetTotals falls back to the repos when a host's usage block is NULL", () => {
+  // Not just when the key is absent: the agent initialises its host aggregate
+  // to None and beats it unconditionally, so `usage: null` is a shape the wire
+  // really carries. Keying the choice on the key's PRESENCE rather than its
+  // value drops that host's spend to zero.
+  const t = H.fleetTotals([
+    { key: "h1", usage: null, repoUsage: [
+      { repo: "A", usage: hostUsage(3, 30, 300) },
+      { repo: "B", usage: hostUsage(4, 40, 400) },
+    ] },
+  ]);
+  assert.equal(t.today.input, 7);
+  assert.equal(t.week.input, 70);
+  assert.equal(t.totals.input, 700);
 });
 
 test("fleetTotals is empty-safe: no agents, a null agent, a host with neither block", () => {

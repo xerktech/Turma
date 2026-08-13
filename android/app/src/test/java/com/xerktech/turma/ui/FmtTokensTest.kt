@@ -50,6 +50,16 @@ class FmtTokensTest {
         }
     }
 
+    @Test fun `the unit boundary is inclusive, as it is on the web`() {
+        // `>` instead of `>=` here renders 1000 as "1000" against the browser's
+        // "1.0k" — a divergence at exactly the value most looked at, and one no
+        // other assertion in this class would notice.
+        assertEquals("1.0k", fmtTokens(1_000))
+        assertEquals("1.0M", fmtTokens(1_000_000))
+        assertEquals("1.0B", fmtTokens(1_000_000_000))
+        assertEquals("999", fmtTokens(999))
+    }
+
     @Test fun `an absurd count off the wire neither overflows nor throws`() {
         // The hub serves most of the agent payload raw, so a nonsense figure
         // has to render as a big number rather than wrap to a negative one.

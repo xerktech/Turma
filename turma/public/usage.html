@@ -264,14 +264,22 @@ function renderViewbar() {
 
 // Compact token count: 1.2M / 3.4k / 850.
 //
-// NEVER returns anything but digits, a minus, a dot and a unit letter. Several
-// callers interpolate the result into innerHTML (tokenCell → tableView and the
-// by-model card), so a value that isn't a number has to be turned into one
-// HERE — returning it verbatim made any token field on the heartbeat a stored
-// XSS sink, and the hub serves most of the agent payload raw.
+// NEVER returns anything but digits, a minus, a dot, a unit letter, or the "–"
+// sentinel. Several callers interpolate the result into innerHTML (tokenCell →
+// tableView and the by-model card), so a value that isn't a number has to be
+// narrowed HERE — returning it verbatim made any token field on the heartbeat a
+// stored XSS sink, and the hub serves most of the agent payload raw.
+//
+// A value that isn't a finite number renders "–", NOT "0". It reaches here as
+// NaN when a host reports a token count as a JSON string: addBucket's `+=` then
+// concatenates rather than adds, and the accumulator is a string from that host
+// onward. "0" would assert a measurement — an idle fleet and a fleet whose
+// arithmetic was poisoned would read identically, and this figure is now the
+// page's headline. "–" is what every client already reads as "can't tell you",
+// and what index.html's copy has always returned for the same case.
 function fmtTokens(n) {
   n = Number(n);
-  if (!Number.isFinite(n)) return "0";
+  if (!Number.isFinite(n)) return "–";
   if (!n) return "0";
   for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
     if (n >= unit) return scaleTokens(n, unit) + suffix;
@@ -289,7 +297,11 @@ function scaleTokens(n, unit) {
   let whole = Math.floor(n / unit);
   let tenths = Math.round((n % unit) * 10 / unit);
   if (tenths === 10) { whole += 1; tenths = 0; }
-  return whole + "." + tenths;
+  // `String(whole)` switches to exponent form at 1e21 ("1e+21.6B"), which is
+  // not the shape this function promises its callers. Absurd, but the hub
+  // serves token counts raw, so it is reachable.
+  const digits = whole >= 1e21 ? BigInt(whole).toString() : String(whole);
+  return digits + "." + tenths;
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
@@ -1123,20 +1135,35 @@ function tableView(list, dates) {
 // Share of the PROMPT served from cache, as a percent. The denominator is the
 // input side only (fresh input + cache write + cache read = the whole prompt);
 // output never caches, so folding it in would understate the rate.
-// `null` when there is no input-side traffic to take a ratio of.
+//
+// `null` — "no rate to state" — whenever the arithmetic can't produce a real
+// one: no input-side traffic, a field that isn't a finite number (a token count
+// reported as a JSON string poisons the accumulator into NaN), or a negative
+// prompt. Each of those otherwise reaches the page as a percentage: "NaN% hit"
+// and "-20% hit" both rendered in the headline strip's cache line, which is the
+// last place a nonsense figure should appear.
 function cacheHitRate(b) {
   if (!b) return null;
-  const read = b.cacheRead || 0;
-  const prompt = read + (b.cacheWrite || 0) + (b.input || 0);
-  return prompt ? Math.round((read / prompt) * 100) : null;
+  // `v || 0` would be wrong here: it turns NaN into 0, which is exactly the
+  // value this has to notice. A field that is simply absent IS 0.
+  const num = (v) => {
+    if (v === null || v === undefined) return 0;
+    const x = Number(v);
+    return Number.isFinite(x) ? x : NaN;
+  };
+  const read = num(b.cacheRead);
+  const prompt = read + num(b.cacheWrite) + num(b.input);
+  if (!Number.isFinite(prompt) || prompt <= 0 || read < 0) return null;
+  return Math.round((read / prompt) * 100);
 }
 
 // The cache half of a bucket, as text. Empty when the bucket carries no cache
 // traffic at all — an older agent reports none, and a bare "0 cached · 0
 // written" would read as caching being broken rather than unreported.
-// Safe as markup ONLY because fmtTokens and cacheHitRate both narrow their
-// input to a number first; this string is interpolated into innerHTML by
-// cacheSubLine below, so it is never a place to start passing text through.
+// Safe as markup only because every part of it is produced by fmtTokens or by
+// cacheHitRate, each of which narrows to a number before it formats; this
+// string is interpolated into innerHTML by cacheSubLine below, so it is never a
+// place to start passing text through.
 function cacheLineText(b) {
   const read = b.cacheRead || 0, write = b.cacheWrite || 0;
   if (!read && !write) return "";
