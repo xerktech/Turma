@@ -161,6 +161,16 @@ test("dashboard fmtTokens: same digits as the Usage page and Android", () => {
   assert.equal(fmtTokens(-1e21), "-1000000000000000000000");
   assert.equal(fmtTokens(5e-324), "0");
   assert.equal(fmtTokens(-1500), "-1500");
+  // Rounded BEFORE the scale is picked, like the Usage page: rounding after
+  // lets 999.6 escape the k scale and then land on "1000". Pinned here as well
+  // as there, because this copy's rounding was otherwise held only by the
+  // 5e-324 vector — which truncation satisfies too, leaving the two pages free
+  // to disagree at exactly the value this is about.
+  assert.equal(fmtTokens(999.6), "1.0k");
+  assert.equal(fmtTokens(999_999.6), "1.0M");
+  assert.equal(fmtTokens(999_999_999.6), "1.0B");
+  assert.equal(fmtTokens(999.4), "999");
+  assert.equal(fmtTokens(0.6), "1");
 });
 
 test("dashboard fmtTokens: the unit boundary is inclusive, as everywhere else", () => {
