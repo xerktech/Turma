@@ -95,28 +95,36 @@ def _attempt(workdir, settings_path, target, env=None, tries=3, mode="acceptEdit
         if os.path.exists(target):
             os.unlink(target)
         dbg = os.path.join(workdir, "dbg.log")
-        proc = subprocess.run(
-            ["claude", "-p",
-             f"Use the Write tool to create the file {target} containing exactly "
-             f"the word {marker}. Do not ask for confirmation; call the tool once.",
-             "--settings", settings_path, "--model", MODEL,
-             # The mode decides WHAT the case can measure, so it is an argument
-             # rather than a constant. `acceptEdits` needs the target inside cwd
-             # or the approval gate is what gets measured; and anywhere under
-             # ~/.claude it refuses everything on its own, which makes a deny
-             # there unattributable -- see TestGuardedClaudeDir.
-             "--permission-mode", mode,
-             "--debug", "permissions", "--debug-file", dbg],
-            cwd=workdir, capture_output=True, text=True, timeout=300,
-            # Not optional: the fake-HOME cases pass HOME here, and dropping it
-            # would point them at the REAL ~/.claude.
-            env=env or os.environ.copy(),
-            # `claude -p` READS STDIN when it is not a tty and folds it into the
-            # turn. Inheriting this process's stdin fed the harness's own source
-            # to the model, which then refused the write as a prompt-injection
-            # attempt -- scoring INCONCLUSIVE for reasons that have nothing to do
-            # with the permission layer. Every measurement must be isolated.
-            stdin=subprocess.DEVNULL)
+        try:
+            proc = subprocess.run(
+                ["claude", "-p",
+                 f"Use the Write tool to create the file {target} containing exactly "
+                 f"the word {marker}. Do not ask for confirmation; call the tool once.",
+                 "--settings", settings_path, "--model", MODEL,
+                 # The mode decides WHAT the case can measure, so it is an argument
+                 # rather than a constant. `acceptEdits` needs the target inside cwd
+                 # or the approval gate is what gets measured; and anywhere under
+                 # ~/.claude it refuses everything on its own, which makes a deny
+                 # there unattributable -- see TestGuardedClaudeDir.
+                 "--permission-mode", mode,
+                 "--debug", "permissions", "--debug-file", dbg],
+                cwd=workdir, capture_output=True, text=True, timeout=300,
+                # Not optional: the fake-HOME cases pass HOME here, and dropping it
+                # would point them at the REAL ~/.claude.
+                env=env or os.environ.copy(),
+                # `claude -p` READS STDIN when it is not a tty and folds it into the
+                # turn. Inheriting this process's stdin fed the harness's own source
+                # to the model, which then refused the write as a prompt-injection
+                # attempt -- scoring INCONCLUSIVE for reasons that have nothing to do
+                # with the permission layer. Every measurement must be isolated.
+                stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            # A hung or very slow invocation is a failed ATTEMPT, not a verdict.
+            # Uncaught, it raised out of the test as an ERROR, which reports the
+            # harness crashing as though the permission layer had been measured.
+            # Retry; if every try times out the caller gets INCONCLUSIVE, which
+            # fails loudly and correctly.
+            continue
         if os.path.exists(target):
             try:
                 with open(target, errors="replace") as fh:
