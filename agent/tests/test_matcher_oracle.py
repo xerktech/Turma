@@ -91,6 +91,14 @@ def _attempt(workdir, settings_path, target, env=None, tries=3, mode="acceptEdit
     last as a failure, never as a deny.
     """
     marker = "hello-oracle"
+    # A fresh directory per CALL, and a fresh file per TRY inside it. `attempt`
+    # alone is not enough: it restarts at 0 on every call, so two calls sharing
+    # one workdir both wrote dbg-0.log -- and `--debug-file` APPENDS. A refusal
+    # logged by the first call was then read as the second call's verdict,
+    # turning an INCONCLUSIVE into a confident DENIED and short-circuiting the
+    # retry loop. The target is checked before the log, so an ALLOW is never
+    # flipped; what is flipped is "the model declined" into "the layer refused".
+    logdir = tempfile.mkdtemp(prefix="oracle-dbg-", dir=workdir)
     for attempt in range(tries):
         if os.path.exists(target):
             os.unlink(target)
@@ -102,7 +110,7 @@ def _attempt(workdir, settings_path, target, env=None, tries=3, mode="acceptEdit
         # same iteration; adding `continue` on timeout is what opened it. It is
         # the same shape as the bug that path was added to fix: a harness
         # failure reported as a measurement.
-        dbg = os.path.join(workdir, f"dbg-{attempt}.log")
+        dbg = os.path.join(logdir, f"dbg-{attempt}.log")
         try:
             proc = subprocess.run(
                 ["claude", "-p",
@@ -515,11 +523,25 @@ class TestAttemptRetryLogic(unittest.TestCase):
         self.target = os.path.join(self.tmp, "t.txt")
         self.sp = _settings(self.tmp, {})
 
-    def _drive(self, behaviours):
+    def _drive(self, behaviours, mode="acceptEdits"):
         """Run _attempt with one fake child per try, described by `behaviours`."""
         calls = []
+        self.mode = mode
 
         def fake_run(cmd, **kw):
+            # The fake used to discard every kwarg, so the class pinned the
+            # verdict loop and NOTHING about how the child is invoked: dropping
+            # env= (which points every fake-HOME case at the real ~/.claude),
+            # dropping stdin=DEVNULL, hardcoding the mode and shrinking the
+            # timeout were all deletable with the whole suite green.
+            self.assertIsNotNone(kw.get("env"),
+                                 "env= dropped: fake-HOME cases would run "
+                                 "against the REAL ~/.claude")
+            self.assertIs(kw.get("stdin"), subprocess.DEVNULL,
+                          "stdin= dropped: the child reads the harness's own "
+                          "source and refuses as prompt injection")
+            self.assertEqual(kw.get("timeout"), 300, "per-call timeout changed")
+            self.assertIn(self.mode, cmd, "--permission-mode does not reach argv")
             dbg = cmd[cmd.index("--debug-file") + 1]
             calls.append(dbg)
             what = behaviours[len(calls) - 1]
@@ -536,7 +558,8 @@ class TestAttemptRetryLogic(unittest.TestCase):
         real = subprocess.run
         subprocess.run = fake_run
         try:
-            return _attempt(self.tmp, self.sp, self.target, tries=len(behaviours)), calls
+            return _attempt(self.tmp, self.sp, self.target,
+                            tries=len(behaviours), mode=mode), calls
         finally:
             subprocess.run = real
 
@@ -579,6 +602,49 @@ class TestAttemptRetryLogic(unittest.TestCase):
         # ALLOW until this was keyed on CONTENT.
         verdict, _ = self._drive([{"write": "not the marker"}])
         self.assertEqual(verdict, INCONCLUSIVE)
+
+    def test_every_deny_marker_is_recognised(self):
+        """One per marker, so none can be deleted with the suite green.
+
+        Only one of the three was pinned. The fileguard hook's own REASON string
+        is the sharp one: delete it and every hook-only refusal -- the coverage
+        no pattern can provide -- reads as INCONCLUSIVE.
+        """
+        for marker in ("Write tool validation error: File is in a directory",
+                       "Write tool permission denied",
+                       "Refused: x is inside the shared Claude configuration"):
+            with self.subTest(marker=marker):
+                verdict, _ = self._drive([{"log": marker}])
+                self.assertEqual(verdict, DENIED, marker)
+
+    def test_a_refusal_of_some_other_tool_is_not_our_verdict(self):
+        # Why the markers are Write-specific rather than a bare "denied": the
+        # source calls that "a false pass in the same direction as every defect
+        # this file exists to catch", and nothing pinned it.
+        verdict, _ = self._drive([
+            {"stdout": "The Bash tool was denied by your permission settings."}])
+        self.assertEqual(verdict, INCONCLUSIVE)
+
+    def test_two_calls_sharing_a_workdir_do_not_share_a_log(self):
+        """The D11 fix was scoped to one call; `attempt` restarts at 0.
+
+        `TestMatcherSemantics._drive` passes the same `work` twice in the
+        generated-rule case, so call 1's refusal became call 2's verdict --
+        surfacing live as a false "over-reaches onto ..." product claim from a
+        run where the model simply declined.
+        """
+        first, _ = self._drive([{"log": "Write tool validation error: denied"}])
+        self.assertEqual(first, DENIED)
+        second, _ = self._drive([{"stdout": "I did not call any tool."}])
+        self.assertEqual(second, INCONCLUSIVE,
+                         "a marker from the previous _attempt call survived")
+
+    def test_the_permission_mode_reaches_the_child(self):
+        # bypassPermissions is what makes ~/.claude denials attributable at all;
+        # hardcoding the mode would silently return the class to measuring the
+        # binary's own gate.
+        verdict, _ = self._drive([{"write": "hello-oracle"}], mode="bypassPermissions")
+        self.assertEqual(verdict, ALLOWED)
 
     def test_a_write_landing_during_a_timed_out_try_is_discarded(self):
         verdict, _ = self._drive([
