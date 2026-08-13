@@ -1543,7 +1543,9 @@ def _add_tokens(bucket, tok):
         bucket[k] += n
 
 
-def _model_acc():
+def _window_acc():
+    """A totals bucket plus its per-day buckets — the shape both the per-model
+    breakdown and the sub-agent split accumulate into."""
     return {"totals": _usage_bucket(), "days": {}}
 
 
@@ -1563,16 +1565,29 @@ class _UsageAcc:
         # breakdown costs a few scalars per model on the wire rather than a
         # whole second days matrix.
         self.models = {}
+        # The sub-agent SLICE of everything above (XERK-302), same totals+days
+        # shape and the same day-bucket economy as `models`. Tokens a background
+        # agent spent are folded into `totals`/`days`/`models` like any other —
+        # they are real spend on the same subscription — and counted here a
+        # second time so the report can say how much of the whole is delegated
+        # work. Never a bucket of its own beside the totals: that would read as
+        # "sub-agents are extra", and the two would then have to be added to get
+        # what the host actually spent.
+        self.subagent = _window_acc()
         self.seen = set()   # (message id, requestId) dedup keys
         self.last_ts = ""
         self.sessions = 0   # transcript files folded in
 
 
-def _accumulate_usage(lines, acc):
+def _accumulate_usage(lines, acc, subagent=False):
     """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
     usage block count for anything; each message is deduped on
     (message id, requestId) via acc.seen, so a message re-seen across files or
-    across incremental beats counts exactly once."""
+    across incremental beats counts exactly once.
+
+    `subagent` marks the lines as a background agent's own transcript, which
+    counts toward the totals exactly like a session's own turns AND is tallied
+    into acc.subagent so the report can name the delegated share."""
     for line in lines:
         if '"usage"' not in line:
             continue
@@ -1614,18 +1629,71 @@ def _accumulate_usage(lines, acc):
         # model" table doesn't list a phantom "<synthetic>" model that consumed
         # nothing. Mirrors _scan_model_entry's same guard.
         if not model.startswith("<"):
-            m = acc.models.setdefault(model, _model_acc())
+            m = acc.models.setdefault(model, _window_acc())
             buckets.append(m["totals"])
             if day:
                 buckets.append(m["days"].setdefault(day, _usage_bucket()))
+        if subagent:
+            buckets.append(acc.subagent["totals"])
+            if day:
+                buckets.append(acc.subagent["days"].setdefault(day, _usage_bucket()))
         for b in buckets:
             _add_tokens(b, tok)
+
+
+def _project_transcripts(proj):
+    """Every transcript under one Claude project dir, as [(relpath, subagent)].
+
+    TWO kinds of transcript live under a slug, and both are real spend on the
+    same login (XERK-302):
+      - the sessions' own conversations, `<slug>/<id>.jsonl`; and
+      - the transcripts of the background agents those sessions delegate to,
+        which Claude Code writes into a dir keyed on the parent's id —
+        `<slug>/<id>/subagents/agent-<x>.jsonl`, one level deeper for a Workflow
+        run (`<slug>/<id>/subagents/workflows/wf_<run>/agent-<x>.jsonl`).
+    Only the flat listing was ever read, so **every delegated token went
+    uncounted** — measured at 19% of one host's real total, and rising with how
+    much work the fleet delegates.
+
+    The nesting under `subagents/` is Claude Code's and has already grown a
+    level, so it is WALKED rather than either depth hard-coded; a shape added
+    later folds in with no change here. The walk is anchored on a `subagents`
+    dir rather than on its parent transcript still existing — the tokens were
+    spent whether or not that conversation has since been pruned.
+
+    Keys are RELATIVE PATHS, never bare filenames: the two namespaces share one
+    offsets map, and `agent-<x>.jsonl` under two different parents would
+    otherwise collide and silently skip one of them.
+
+    Returns None (not []) when the dir can't be listed, so the caller can tell
+    an unreadable project from an empty one."""
+    try:
+        with os.scandir(proj) as it:
+            entries = sorted(it, key=lambda e: e.name)
+    except OSError:
+        return None
+    out = []
+    for entry in entries:
+        if entry.name.endswith(".jsonl"):
+            out.append((entry.name, False))
+            continue
+        sub = os.path.join(entry.path, "subagents")
+        if not os.path.isdir(sub):
+            continue
+        # followlinks stays off (the default): these dirs are written by Claude
+        # Code, but a walk that follows a symlink can be made to loop.
+        for dirpath, _dirs, files in os.walk(sub):
+            for name in sorted(files):
+                if name.endswith(".jsonl"):
+                    out.append(
+                        (os.path.relpath(os.path.join(dirpath, name), proj), True))
+    return out
 
 
 def _aggregate_project(proj, acc, offsets=None):
     """Fold one Claude project dir's transcript token usage into `acc`.
 
-    With an `offsets` dict {filename: byte-offset} this parses INCREMENTALLY:
+    With an `offsets` dict {relpath: byte-offset} this parses INCREMENTALLY:
     only bytes appended since the last call are read, and each offset advances
     only to a newline boundary, so an entry still mid-write at a beat boundary
     is re-read whole next beat rather than split. Returns False — without
@@ -1634,14 +1702,13 @@ def _aggregate_project(proj, acc, offsets=None):
     from a fresh acc. With `offsets=None` it does a plain full read (tests /
     one-shot callers) and always returns True. Silently no-ops on a
     missing/unreadable dir (the source of truth is best-effort)."""
-    try:
-        files = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
-    except OSError:
+    files = _project_transcripts(proj)
+    if files is None:
         return True
     if offsets is not None:
         # A tracked transcript that shrank/disappeared can't be reconciled
         # incrementally — tell the caller to start this slug's acc over.
-        present = set(files)
+        present = {rel for rel, _sub in files}
         for f, off in offsets.items():
             path = os.path.join(proj, f)
             try:
@@ -1650,12 +1717,12 @@ def _aggregate_project(proj, acc, offsets=None):
                 size = -1
             if f not in present or size < off:
                 return False
-    for fname in files:
-        path = os.path.join(proj, fname)
+    for rel, subagent in files:
+        path = os.path.join(proj, rel)
         if offsets is None:
             try:
                 with open(path, errors="replace") as fh:
-                    _accumulate_usage(fh, acc)
+                    _accumulate_usage(fh, acc, subagent)
             except OSError:
                 continue
             continue
@@ -1663,9 +1730,9 @@ def _aggregate_project(proj, acc, offsets=None):
             size = os.stat(path).st_size
         except OSError:
             continue
-        start = offsets.get(fname, 0)
+        start = offsets.get(rel, 0)
         if size <= start:
-            offsets[fname] = size
+            offsets[rel] = size
             continue
         try:
             with open(path, "rb") as fh:
@@ -1679,16 +1746,19 @@ def _aggregate_project(proj, acc, offsets=None):
         if nl < 0:
             continue
         _accumulate_usage(
-            chunk[:nl + 1].decode(errors="replace").splitlines(), acc)
-        offsets[fname] = start + nl + 1
-    # `sessions` is a display stat (transcript files folded in). A persistent
-    # per-slug acc holds just its own slug's file count (set, since the acc
-    # outlives the call); the full-read path accumulates across the several dirs
-    # a caller may fold into one acc.
+            chunk[:nl + 1].decode(errors="replace").splitlines(), acc, subagent)
+        offsets[rel] = start + nl + 1
+    # `sessions` is a display stat (CONVERSATIONS folded in), so a delegated
+    # agent's transcript is not one — it belongs to a session already counted,
+    # and counting it would inflate the figure by however much that session
+    # delegated. A persistent per-slug acc holds just its own slug's file count
+    # (set, since the acc outlives the call); the full-read path accumulates
+    # across the several dirs a caller may fold into one acc.
+    n = sum(1 for _rel, sub in files if not sub)
     if offsets is None:
-        acc.sessions += len(files)
+        acc.sessions += n
     else:
-        acc.sessions = len(files)
+        acc.sessions = n
     return True
 
 
@@ -1759,6 +1829,15 @@ def _finalize_usage(acc):
             key=lambda m: _total_tokens(m["totals"]),
             reverse=True,
         ),
+        # How much of the block above was spent by background agents (XERK-302).
+        # A SLICE of the totals, never an addend — see _UsageAcc.subagent. Its
+        # day buckets stay agent-side for the same reason the per-model ones do:
+        # only the three windows the UI shows travel.
+        "subagent": {
+            "totals": dict(acc.subagent["totals"]),
+            "today": dict(acc.subagent["days"].get(window[-1]) or _usage_bucket()),
+            "week": _sum_days(acc.subagent["days"], window),
+        },
     }
 
 
@@ -1788,10 +1867,13 @@ def _merge_acc(dst, src):
     for d, b in src.days.items():
         _merge_bucket(dst.days.setdefault(d, _usage_bucket()), b)
     for name, m in src.models.items():
-        tgt = dst.models.setdefault(name, _model_acc())
+        tgt = dst.models.setdefault(name, _window_acc())
         _merge_bucket(tgt["totals"], m["totals"])
         for d, b in m["days"].items():
             _merge_bucket(tgt["days"].setdefault(d, _usage_bucket()), b)
+    _merge_bucket(dst.subagent["totals"], src.subagent["totals"])
+    for d, b in src.subagent["days"].items():
+        _merge_bucket(dst.subagent["days"].setdefault(d, _usage_bucket()), b)
     dst.seen |= src.seen
     dst.sessions += src.sessions
     if src.last_ts > dst.last_ts:

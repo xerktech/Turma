@@ -82,7 +82,8 @@ function loadHelpers() {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheHitRate, blankBucket,
-    limitEntries, limitWindowView, fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC };`;
+    limitEntries, limitWindowView, fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC,
+    blankUsage, mergeUsageInto, subagentCard };`;
   return new Function(...keys, body)(...keys.map((k) => stubs[k]));
 }
 
@@ -259,4 +260,87 @@ test("fmtDuration reads as an age or a countdown at every scale", () => {
   assert.equal(H.fmtDuration(50 * 3600), "2d 2h");
   // A clock skew that puts the snapshot in the future must not print "-3m ago".
   assert.equal(H.fmtDuration(-90), "0s");
+});
+
+// --- the sub-agent split (XERK-302) ------------------------------------------
+// Delegated tokens are a SLICE of every other figure on the page. The two things
+// worth guarding are that a host which can't report the split is EXCLUDED from
+// the share rather than counted as a zero, and that the card never asserts a
+// percentage nobody reported.
+
+const bucketOf = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+// A usage block as an agent reports one: `spent` total, `delegated` of it.
+const usage = (spent, delegated) => ({
+  totals: bucketOf(spent), today: bucketOf(spent), week: bucketOf(spent),
+  days: {}, models: [],
+  ...(delegated === undefined ? {} : {
+    subagent: {
+      totals: bucketOf(delegated), today: bucketOf(delegated), week: bucketOf(delegated),
+    },
+  }),
+});
+// The series shape the card consumes: one or more blocks merged together.
+function series(...blocks) {
+  const u = H.blankUsage();
+  for (const b of blocks) H.mergeUsageInto(u, b);
+  return { usage: u };
+}
+// The card renders its table through innerHTML on a shim element.
+const cardHtml = (list) => H.subagentCard(list).children.map(c => c._html || c.textContent).join(" ");
+
+test("mergeUsageInto leaves subagent null until something reports one", () => {
+  const u = H.blankUsage();
+  H.mergeUsageInto(u, usage(1000));
+  assert.equal(u.subagent, null, "an older agent means 'can't tell you', not 'delegated nothing'");
+});
+
+test("mergeUsageInto tracks the reporting spend separately from the total", () => {
+  // One host reports a split, another is too old to. The denominator must be
+  // the reporting host's 1000 alone — not the merged 3000.
+  const u = H.blankUsage();
+  H.mergeUsageInto(u, usage(1000, 250));
+  H.mergeUsageInto(u, usage(2000));
+  assert.equal(u.totals.input, 3000);
+  assert.equal(u.subagent.totals.input, 250);
+  assert.equal(u.subagentOf.totals.input, 1000);
+});
+
+test("subagentCard takes the share against reporting spend only", () => {
+  // 250 of the 1000 that CAN be split is 25%; against the 3000 the fleet spent
+  // it would read 8.3% and understate every delegating host.
+  const html = cardHtml([series(usage(1000, 250)), series(usage(2000))]);
+  assert.match(html, /25\.0%/);
+  assert.doesNotMatch(html, /8\.3%/);
+});
+
+test("subagentCard says so when only some series can answer", () => {
+  const html = cardHtml([series(usage(1000, 250)), series(usage(2000))]);
+  assert.match(html, /1 of 2 series report the split/);
+});
+
+test("subagentCard stays quiet about coverage when every series answers", () => {
+  const html = cardHtml([series(usage(1000, 250)), series(usage(2000, 500))]);
+  assert.doesNotMatch(html, /report the split/);
+  assert.match(html, /25\.0%/);   // 750 of 3000
+});
+
+test("subagentCard shows no percentage at all when nothing reports a split", () => {
+  const html = cardHtml([series(usage(1000)), series(usage(2000))]);
+  assert.match(html, /older agents don't separate delegated work/);
+  assert.doesNotMatch(html, /%/);
+});
+
+test("subagentCard distinguishes an empty window from a zero share", () => {
+  // A window with no spend has nothing to take a ratio of, so it draws "–";
+  // a window with spend and no delegation is a real 0.0%.
+  const quiet = { ...usage(0, 0), totals: bucketOf(500), subagent: {
+    totals: bucketOf(0), today: bucketOf(0), week: bucketOf(0) } };
+  const html = cardHtml([series(quiet)]);
+  assert.match(html, /–/);       // today/week: nothing spent
+  assert.match(html, /0\.0%/);   // all-time: 500 spent, none delegated
+});
+
+test("subagentCard reads as a share of the page, never as an addition to it", () => {
+  const html = cardHtml([series(usage(1000, 250))]);
+  assert.match(html, /Already counted in every figure above/);
 });

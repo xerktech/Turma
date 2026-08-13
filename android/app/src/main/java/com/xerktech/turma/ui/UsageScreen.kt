@@ -112,6 +112,9 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
             // Fleet-wide cache split: how much of the all-time prompt traffic was
             // served from cache rather than paid for fresh.
             CacheLine(ui.cache)
+            // …and how much of it went to background agents rather than to the
+            // sessions' own turns.
+            SubagentLine(ui.subagent)
         }
         TabRow(selectedTabIndex = tab, containerColor = MaterialTheme.colorScheme.background) {
             Tab(selected = tab == 0, onClick = { setTab(0) }, text = { Text("By repo") })
@@ -426,6 +429,35 @@ private fun CacheLine(cache: UsageViewModel.CacheSummary) {
     Text(
         "${fmtTokens(cache.read)} cached · ${fmtTokens(cache.write)} written" +
             (if (hit == null) "" else " · $hit% hit"),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/**
+ * The delegated share of the figures above (web usage.html `subagentCard`,
+ * XERK-302). Says "of" rather than "plus" on purpose: these tokens are already
+ * inside every total on this screen, and a reader who adds them back
+ * double-counts.
+ *
+ * Omitted entirely when no host in view reports the split — an agent predating
+ * the field can't answer, and "0% delegated" would be an answer.
+ */
+@Composable
+private fun SubagentLine(sub: UsageViewModel.SubagentSplit) {
+    if (!sub.any) return
+    // The web card's three windows, in the one line this screen has room for. A
+    // window with no spend has no share to take, so it is dropped rather than
+    // drawn as 0% — same distinction the card makes with a dash.
+    val windows = listOfNotNull(
+        sub.todayPct?.let { "today %.1f%%".format(it) },
+        sub.weekPct?.let { "7d %.1f%%".format(it) },
+        sub.totalPct?.let { "all-time %.1f%%".format(it) },
+    )
+    if (windows.isEmpty()) return
+    Text(
+        "${fmtTokens(sub.total)} delegated to sub-agents · " + windows.joinToString(" · ") +
+            (if (sub.partial) " (${sub.reporting} of ${sub.hosts} hosts report it)" else ""),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )

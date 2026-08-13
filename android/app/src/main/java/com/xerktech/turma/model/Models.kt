@@ -657,6 +657,22 @@ data class UsageInfo(
     val lastActivity: String = "",
     /** Per-model token counts, biggest consumer first. */
     val models: List<ModelUsage> = emptyList(),
+    /**
+     * The part of this block spent by background agents its sessions delegated
+     * to (XERK-302) — a SLICE of [totals]/[today]/[week], never an addend, so
+     * nothing adds it back. Null from an agent predating the field, which means
+     * "this host can't tell you" and not "it delegated nothing": a host that
+     * can't answer is left OUT of the share rather than counted as a zero.
+     */
+    val subagent: SubagentUsage? = null,
+)
+
+/** The three windows of [UsageInfo.subagent]. */
+@Serializable
+data class SubagentUsage(
+    val today: UsageBucket = UsageBucket(),
+    val week: UsageBucket = UsageBucket(),
+    val totals: UsageBucket = UsageBucket(),
 )
 
 /**

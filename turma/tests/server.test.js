@@ -1994,6 +1994,67 @@ test("http: a current agent's per-model usage is left exactly as reported", asyn
   assert.deepEqual(rec.usage.models, models);
 });
 
+test("http: the sub-agent split is carried on every usage block, and coerced", async () => {
+  // XERK-302: `subagent` is the share of a usage block spent by the background
+  // agents its sessions delegated to. Android TYPES it, so one host's garbage
+  // would fail the decode of the WHOLE /api/agents array — hence the coercion
+  // here rather than in each of the three clients.
+  const split = {
+    totals: { input: 10, output: 20, cacheWrite: 30, cacheRead: 40 },
+    today: { input: 1, output: 2, cacheWrite: 3, cacheRead: 4 },
+    week: { input: 5, output: 6, cacheWrite: 7, cacheRead: 8 },
+  };
+  const read = async (key) =>
+    (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === key);
+
+  assert.equal((await request("POST", "/api/heartbeat", {
+    body: {
+      device: "split-host",
+      usage: { totals: { input: 100 }, subagent: split },
+      repoUsage: [{ repo: "Turma", usage: { subagent: split } }],
+      sessions: [{ id: "s1", repo: "Turma", status: "running", usage: { subagent: split } }],
+    },
+    headers: agentHeaders,
+  })).status, 200);
+  const rec = await read("split-host");
+  assert.deepEqual(rec.usage.subagent, split);
+  assert.deepEqual(rec.repoUsage[0].usage.subagent, split);
+  assert.deepEqual(rec.sessions[0].usage.subagent, split);
+});
+
+test("http: a malformed sub-agent split is DROPPED, never zeroed", async () => {
+  // Absent is what every client already reads as "this host can't tell you" (an
+  // agent predating the field sends none), and the Usage page divides by these:
+  // a fabricated zero would keep the host in the denominator and quietly
+  // understate the fleet's delegated share instead of excluding it.
+  const read = async (key) =>
+    (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === key);
+
+  await request("POST", "/api/heartbeat", {
+    body: { device: "junk-split-host", usage: { totals: { input: 1 }, subagent: "lots" } },
+    headers: agentHeaders,
+  });
+  assert.equal((await read("junk-split-host")).usage.subagent, undefined);
+
+  // A block that IS an object keeps its shape, with each figure coerced to a
+  // usable number — a partial answer is still an answer, unlike the above.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "junk-split-host",
+      usage: { totals: { input: 1 }, subagent: { totals: { input: "8", output: -5, cacheRead: 3 } } },
+    },
+    headers: agentHeaders,
+  });
+  const zero = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  assert.deepEqual((await read("junk-split-host")).usage.subagent, {
+    totals: { ...zero, cacheRead: 3 },   // "8" and -5 are not usable counts
+    today: zero,
+    week: zero,
+  });
+});
+
 test("http: an agent's subscription limits reach the clients, and clear again", async () => {
   // XERK-247: the 5h/7d windows are a snapshot the agent captures out of Claude
   // Code itself, so the hub is pure carriage — but it has to be carriage that

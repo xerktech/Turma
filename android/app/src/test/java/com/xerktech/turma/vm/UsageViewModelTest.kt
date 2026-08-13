@@ -325,6 +325,77 @@ class UsageViewModelTest {
         assertEquals(null, UsageViewModel.limitView(null, now))
     }
 
+    // --- the sub-agent split (XERK-302) ---------------------------------
+    // Delegated tokens are a SLICE of the totals above, not an addend. The rule
+    // worth guarding is that a host which cannot report the split is left OUT of
+    // the share rather than counted as one that delegated nothing.
+
+    private fun split(all: Long) =
+        com.xerktech.turma.model.SubagentUsage(
+            today = bucket(all), week = bucket(all), totals = bucket(all))
+
+    @Test fun `the delegated share is taken against reporting hosts only`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "new", usage = usage(today = 250, week = 250, all = 1000)
+                .copy(subagent = split(250))),
+            // Too old to break its usage down — its 2000 must not dilute the share.
+            AgentInfo(key = "old", usage = usage(today = 2000, week = 2000, all = 2000)),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(250L, sub.total)
+        assertEquals(1000L, sub.ofTotal)
+        assertEquals(25.0, sub.totalPct!!, 0.001)
+        assertEquals(1, sub.reporting)
+        assertEquals(2, sub.hosts)
+        assertEquals(true, sub.partial)
+    }
+
+    @Test fun `no host reporting a split means no answer, not a zero share`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", usage = usage(today = 1, week = 1, all = 500)),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(false, sub.any)
+        assertEquals(null, sub.totalPct)
+    }
+
+    @Test fun `a host that delegated nothing is a real zero percent`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "new", usage = usage(today = 1, week = 1, all = 500)
+                .copy(subagent = split(0))),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(true, sub.any)
+        assertEquals(false, sub.partial)
+        assertEquals(0.0, sub.totalPct!!, 0.001)
+    }
+
+    @Test fun `a window with no spend has no share to take`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "new", usage = UsageInfo(totals = bucket(500))
+                .copy(subagent = split(0))),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(null, sub.todayPct)      // nothing spent today
+        assertEquals(0.0, sub.totalPct!!, 0.001)
+    }
+
+    @Test fun `a host with no usage block takes its split from its repos`() {
+        // Same host-block-then-repos fallback as the totals: an older aggregate
+        // shape must not drop this host out of the share.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", usage = null, repoUsage = listOf(
+                RepoUsage("A", "k/a", usage(today = 4, week = 4, all = 40)
+                    .copy(subagent = split(10))),
+                RepoUsage("B", "k/b", usage(today = 6, week = 6, all = 60)),  // no split
+            )),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(10L, sub.total)
+        assertEquals(40L, sub.ofTotal)   // only the repo that reported one
+        assertEquals(25.0, sub.totalPct!!, 0.001)
+    }
+
     @Test fun `fmtDuration reads as an age or a countdown at every scale`() {
         assertEquals("0s", UsageViewModel.fmtDuration(0))
         assertEquals("45s", UsageViewModel.fmtDuration(45))

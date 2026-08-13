@@ -1678,11 +1678,48 @@ function normalizeModelUsage(usage) {
     .filter((m) => m && typeof m.model === "string" && m.model);
 }
 
+// The sub-agent split (XERK-302): what share of a usage block was spent by the
+// background agents its sessions delegated to. Coerced here for exactly the
+// reason the model lists above are — Android TYPES it, so one host's
+// `subagent: "lots"` would fail the decode of the WHOLE /api/agents array and
+// silently empty every other host from that phone's fleet.
+//
+// Anything unusable becomes ABSENT, never a zeroed block: absent is what every
+// client already reads as "this agent can't tell you" (an agent predating the
+// field reports none), while a zeroed one asserts that nothing was delegated —
+// and the Usage page divides by these, so a fabricated zero would quietly
+// understate the fleet's delegated share instead of excluding the host.
+function normalizeSubagentUsage(usage) {
+  if (!usage || typeof usage !== "object") return;
+  const s = usage.subagent;
+  if (!s || typeof s !== "object" || Array.isArray(s)) {
+    if ("subagent" in usage) delete usage.subagent;
+    return;
+  }
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+  const out = {};
+  for (const w of ["totals", "today", "week"]) {
+    const b = s[w];
+    const clean = {};
+    for (const k of ["input", "output", "cacheWrite", "cacheRead"]) {
+      clean[k] = b && typeof b === "object" ? num(b[k]) : 0;
+    }
+    out[w] = clean;
+  }
+  usage.subagent = out;
+}
+
+// Every coercion a usage block needs, wherever one rides the heartbeat.
+function normalizeUsageBlock(usage) {
+  normalizeModelUsage(usage);
+  normalizeSubagentUsage(usage);
+}
+
 // Every place a usage block rides the heartbeat: the host-wide aggregate, the
 // per-repo ones, and each live session's own.
 function normalizeUsage(payload) {
   if (!payload || typeof payload !== "object") return;
-  normalizeModelUsage(payload.usage);
+  normalizeUsageBlock(payload.usage);
   // `Array.isArray`, not `|| []`: a non-iterable `repoUsage`/`sessions` (an
   // OBJECT, say) makes a bare `for…of` THROW, and a throw here is uniquely
   // costly — on the restore path it lands in a silent `catch {}` and abandons
@@ -1694,10 +1731,10 @@ function normalizeUsage(payload) {
   if (!Array.isArray(payload.repoUsage)) {
     if ("repoUsage" in payload) payload.repoUsage = [];
   } else {
-    for (const r of payload.repoUsage) normalizeModelUsage(r && r.usage);
+    for (const r of payload.repoUsage) normalizeUsageBlock(r && r.usage);
   }
   if (Array.isArray(payload.sessions)) {
-    for (const s of payload.sessions) normalizeModelUsage(s && s.usage);
+    for (const s of payload.sessions) normalizeUsageBlock(s && s.usage);
   }
 }
 

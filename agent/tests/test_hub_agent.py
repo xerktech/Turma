@@ -890,6 +890,137 @@ class TestAggregateProjectIncremental(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(fresh.totals["input"], 5)
 
 
+class TestSubagentUsage(ProjectDirMixin, unittest.TestCase):
+    """Background agents' transcripts are real spend on the same login, and were
+    never counted at all (XERK-302) — the walk only ever read the flat listing.
+    They now fold into the totals like any other turn AND are reported as a
+    named slice of them."""
+
+    def _entry(self, ts, mid, inp, out=0):
+        return usage_entry(ts, mid, mid, "claude-opus-4-20250514", inp, out)
+
+    def _sub(self, transcript_id, *parts):
+        """A subagent transcript path under `<id>/subagents/<parts…>`."""
+        path = os.path.join(self.proj, transcript_id, "subagents", *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def _report(self):
+        acc = ha._UsageAcc()
+        ha._aggregate_project(self.proj, acc)
+        return ha._finalize_usage(acc)
+
+    def test_counts_flat_and_workflow_nested_subagent_transcripts(self):
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        write_jsonl(self._sub("main", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        # A Workflow run nests one level deeper; the shape has already grown
+        # once, which is why the walk is a walk and not two hard-coded depths.
+        write_jsonl(self._sub("main", "workflows", "wf_x", "agent-def.jsonl"),
+                    [self._entry("2026-07-01T10:06:00Z", "s2", 3)])
+
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 123)          # all of it
+        self.assertEqual(rep["subagent"]["totals"]["input"], 23)  # the delegated part
+
+    def test_subagent_tokens_are_a_slice_not_an_addend(self):
+        # The per-model breakdown and the day buckets count a delegated turn
+        # exactly like a session's own — only the `subagent` block separates it.
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        write_jsonl(self._sub("main", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        rep = self._report()
+        self.assertEqual(rep["days"]["2026-07-01"]["input"], 120)
+        self.assertEqual([m["totals"]["input"] for m in rep["models"]], [120])
+
+    def test_a_subagents_dir_is_counted_without_its_parent_transcript(self):
+        # The parent conversation can be archived or pruned away; the tokens the
+        # agents it launched spent were still spent.
+        write_jsonl(self._sub("gone", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 20)
+        self.assertEqual(rep["subagent"]["totals"]["input"], 20)
+
+    def test_sessions_counts_conversations_only(self):
+        # `sessions` is a display stat meaning conversations. Counting delegated
+        # transcripts would inflate it by however much a session delegated.
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 1)])
+        for i in range(3):
+            write_jsonl(self._sub("main", f"agent-{i}.jsonl"),
+                        [self._entry("2026-07-01T10:05:00Z", f"s{i}", 1)])
+        self.assertEqual(self._report()["sessions"], 1)
+
+    def test_offsets_key_on_the_relative_path_so_names_cannot_collide(self):
+        # Two parents' agents can share a filename; keyed on the bare name, one
+        # would take the other's offset and be skipped.
+        write_jsonl(self._sub("one", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 11)])
+        write_jsonl(self._sub("two", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:01:00Z", "s2", 22)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+        self.assertEqual(acc.totals["input"], 33)
+        self.assertEqual(
+            sorted(offsets),
+            [os.path.join("one", "subagents", "agent-abc.jsonl"),
+             os.path.join("two", "subagents", "agent-abc.jsonl")])
+
+    def test_incremental_matches_a_full_parse_for_subagents_too(self):
+        main = os.path.join(self.proj, "main.jsonl")
+        sub = self._sub("main", "agent-abc.jsonl")
+        write_jsonl(main, [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        write_jsonl(sub, [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+        # A later beat: the agent wrote more, and a NEW agent was launched.
+        write_jsonl(sub, [self._entry("2026-07-02T10:00:00Z", "s2", 5)])
+        write_jsonl(self._sub("main", "agent-xyz.jsonl"),
+                    [self._entry("2026-07-02T10:01:00Z", "s3", 7)])
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+
+        full = ha._UsageAcc()
+        ha._aggregate_project(self.proj, full)
+        self.assertEqual(acc.totals, full.totals)
+        self.assertEqual(acc.subagent["totals"], full.subagent["totals"])
+        self.assertEqual(acc.subagent["totals"]["input"], 32)
+
+    def test_a_vanished_subagent_transcript_signals_a_rebuild(self):
+        sub = self._sub("main", "agent-abc.jsonl")
+        write_jsonl(sub, [self._entry("2026-07-01T10:00:00Z", "s1", 20)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+        os.remove(sub)
+        # Already-counted bytes can't be un-counted incrementally, so the caller
+        # is told to start this slug over — same contract as a main transcript.
+        self.assertFalse(ha._aggregate_project(self.proj, acc, offsets))
+
+    def test_windows_and_merge_carry_the_split(self):
+        today = ha._utc_today()
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry(today + "T10:00:00Z", "m1", 100)])
+        write_jsonl(self._sub("main", "agent-abc.jsonl"),
+                    [self._entry(today + "T10:05:00Z", "s1", 20)])
+        acc = ha._UsageAcc()
+        ha._aggregate_project(self.proj, acc)
+        merged = ha._UsageAcc()
+        ha._merge_acc(merged, acc)
+        rep = ha._finalize_usage(merged)
+        self.assertEqual(rep["subagent"]["today"]["input"], 20)
+        self.assertEqual(rep["subagent"]["week"]["input"], 20)
+        self.assertEqual(rep["subagent"]["totals"]["input"], 20)
+
+    def test_a_project_with_no_subagents_reports_a_zeroed_split(self):
+        # Zeroed, not absent: this agent CAN answer, and the answer is "none".
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        rep = self._report()
+        self.assertEqual(rep["subagent"]["totals"], ha._usage_bucket())
+
+
 class TestLastEntry(ProjectDirMixin, unittest.TestCase):
     def test_skips_truncated_tail(self):
         path = os.path.join(self.proj, "t.jsonl")

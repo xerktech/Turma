@@ -134,6 +134,13 @@ which makes an `android/` change part of the same PR) live there.
   across every host it runs on (matched by `remoteKey`); **By host** shows per-host totals.
 - The usage page renders `(root)` as **Root**, folding older agents' `(other)`/`?` in
   (`normRepo`/`repoLabel`).
+- **"Delegated to sub-agents"** (`subagentCard`, XERK-302) names the share of those figures spent by
+  background agents. It is a slice of every other number on the page and says so — a reader who adds
+  it back double-counts.
+  - **The share's denominator is `subagentOf`, not the fleet total**: only the series that reported a
+    split contribute to it, so one older host can't dilute the answer. A host reporting none is left
+    out entirely, and with no series reporting one the card shows no percentage at all.
+  - Android's `SubagentLine` is the one-line rendering of the same three windows.
 - Above the chart it shows the **Claude subscription's 5h/7d windows** (XERK-247) from each agent's
   `limits` block — the numbers exist only inside Claude Code (see `.claude/rules/agent-usage.md` for
   how they're captured).
