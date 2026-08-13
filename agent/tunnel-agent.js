@@ -1376,10 +1376,24 @@ const HOSTNAME_PLACEHOLDERS = new Set([
   "docker-desktop",
 ]);
 const CONTAINER_ID_RE = /^[0-9a-f]{12}$|^[0-9a-f]{64}$/;
+// Mirrors hub-agent.py's _DOT_SEGMENT_NAMES. A name that is a URL dot segment is
+// unaddressable: the manager's /api/agents/<host>/... routes collapse it away
+// (XERK-269). The tunnel registers by QUERY PARAM, which no URL parser collapses,
+// so "." works here — but only here, and the two MUST agree: openChannel() keys
+// controlChannels by the name, so a tunnel under "." and a manager under its
+// fallback name is a host with working commands and a dead terminal + live tail.
+const DOT_SEGMENT_NAMES = new Set([".", ".."]);
 
 function usableHostname(name) {
   const n = (name || "").trim();
   if (HOSTNAME_PLACEHOLDERS.has(n.toLowerCase())) return "";
+  if (DOT_SEGMENT_NAMES.has(n)) {
+    log(
+      `ignoring device name ${JSON.stringify(n)}: a URL dot segment is ` +
+        "unaddressable on /api/agents/<host>/... routes",
+    );
+    return "";
+  }
   if (CONTAINER_ID_RE.test(n)) return "";
   return n;
 }
@@ -1400,9 +1414,21 @@ function dockerHostName() {
 }
 
 function deviceName() {
+  // The env override outranks the placeholder rules (an operator naming a host
+  // "localhost" means it), but a dot segment is unaddressable no matter who
+  // chose it — and entrypoint.sh exports an operator-set DEVICE_NAME to BOTH
+  // processes unvalidated, so this is the path that would split the identity.
   for (const env of ["DEVICE_NAME", "COMPUTERNAME"]) {
     const v = (process.env[env] || "").trim();
-    if (v) return v;
+    if (!v) continue;
+    if (DOT_SEGMENT_NAMES.has(v)) {
+      log(
+        `ignoring $${env}=${JSON.stringify(v)}: a URL dot segment is ` +
+          "unaddressable on /api/agents/<host>/... routes",
+      );
+      continue;
+    }
+    return v;
   }
   try {
     const n = usableHostname(fs.readFileSync("/host/etc/hostname", "utf8"));
@@ -1563,5 +1589,6 @@ if (require.main === module) {
   connectControl();
 } else {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport,
-    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE,
+    usableHostname, deviceName };
 }

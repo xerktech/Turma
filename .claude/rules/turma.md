@@ -371,6 +371,81 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
     working. It is hub-derived and **stripped from the fleet payload** — putting it on the wire
     would make it a client contract.
   - Tests: the `XERK-268:` cases in `server.test.js`.
+
+### The agent registry's ceiling (XERK-272)
+
+- **`agents` is bounded as an AGGREGATE, not just per record.** `AGENT_RECORD_MAX` (8 MiB) bounds
+  ONE record and `prune()` only reclaims at 7 days, so an unbounded NUMBER of `device` names was an
+  unbounded amount of retained memory — 512 beats of 0.9 MiB under 512 names OOM-killed a 256 MiB
+  hub, while the same 512 beats under ONE name peaked at 169 MiB.
+  - **XERK-268 shrank who can do this; it did not bound it.** `device` is now PROVED by the
+    credential, so this is no longer any-token-holder — but a compromised or buggy host still mints
+    names under its own token, the `legacy` master a mid-rollover fleet accepts is not yet retired,
+    and a host deriving its name from something unstable grows records with no attacker at all.
+    Per-agent tokens and this cap are complementary, not alternatives.
+- Two budgets, bounding different things: **`AGENTS_TOTAL_MAX`** (aggregate record bytes, defaulting
+  to an eighth of the container's own cgroup limit, clamped 8–64 MiB) and **`AGENTS_MAX`** (record
+  count, default 64). The count cap is not redundant — the byte budget measures what
+  `agentRecordSize` measures, which EXCLUDES the on-demand caches, so it bounds their MULTIPLE and
+  nothing bounds their SIZE. A ceiling above the limit the kernel kills on is not a ceiling: size it
+  from the container, never pick a number.
+- **A newcomer never displaces a host that is still around.** Past the cap a record is reclaimed
+  only if it has been unseen for `AGENT_EVICT_IDLE_MS` (1h, ≫ `OFFLINE_AFTER_MS`) — a record holds
+  an offline host's last known sessions, PR chips and usage, so a host rebooting or updating keeps
+  its slot and the new `device` gets a 429 instead. Nothing is evicted when eviction could not
+  satisfy the request anyway. The accepted cost is that a flood of names can squat slots and block
+  onboarding a genuinely new host until it stops or `AGENTS_MAX` is raised.
+- A host **already in the registry is always admitted** — turning the cap into a wall for the fleet's
+  own hosts is the same outage from the other side.
+- **The aggregate refuses only a host OVER its share** (`AGENT_FAIR_SHARE` = total/count, floored at
+  64 KiB; 512 KiB deployed, against a measured largest-real-record of 0.30 MiB). Refusing a KNOWN
+  host rolls it back to its previous record — `lastSeen` included — so a host refused every beat
+  ages past `OFFLINE_AFTER_MS` and **reads offline while it is up**, indistinguishable from a
+  network failure and invisible to the operator. A host inside its share is not why the registry is
+  full, so it never pays; the refusal lands on the host the operator needs named. An OVER-share host
+  is still refused silently — it freezes and ages to offline, or (if new) never appears at all, with
+  only the throttled log to say why. That is the accepted cost, and the headroom is 1.7× the largest
+  measured real record.
+- **The cost of the exemption is a bounded overshoot, and the bound is an identity**: worst-case
+  retained is `AGENTS_TOTAL_MAX + AGENTS_MAX × AGENT_FAIR_SHARE`. **So the share is DERIVED and
+  never floored** — a floor makes the second term unbounded in `AGENTS_MAX`, and raising
+  `AGENTS_MAX` is exactly what an operator with a growing fleet is told to do (at 2000 hosts a
+  64 KiB floor was 3.9× the budget and OOM-killed the hub). **Raising the count means raising the
+  budget with it**; a share under `AGENT_SHARE_SANE_MIN` warns at load rather than letting the two
+  contradict silently. The flood path cannot reach the exemption at all — a new device is admitted
+  only while the registry is inside the budget, so only an already-seated host can overshoot.
+- **The state.json restore enforces the same budget** (`trimRestoredAgents`, keep-newest), and the
+  file is **measured with `statSync` before it is opened** (`STATE_FILE_MAX`, container/4): the trim
+  cannot protect a restore it never reaches, and `readFileSync` + `JSON.parse` of a flooded file
+  killed the hub at init with no log line, every boot, forever. An oversized file is moved to
+  `.oversized` and the hub boots empty — losing that cache is documented as harmless; not booting
+  is not.
+- **Every log line naming a host goes through `logName`** — `device` is agent-supplied and validated
+  only for length and prototype keys, so a newline in it forged a line reading exactly like the
+  hub's own. It strips C0, DEL **and C1** (`JSON.stringify` escapes none of the C1 block). All FIVE
+  sites go through it: converting only the new ones left the two cheapest to reach — the 413, which
+  is one request needing no registry pressure, and the unknown-field drop, which rides a 200.
+  Refusal logs are throttled to one a minute with the suppressed count, because the flood the cap
+  exists to survive is precisely the traffic that writes them.
+- **A host is warned on the crossing into half its share** (`shareWarned`, the `recordSizeWarned`
+  pattern). Without it the first signal is the host vanishing: the per-record ceiling's warning is at
+  4 MiB and a share is 512 KiB, so a record drifts past its share — and starts being refused — with
+  that warning still eight times away. This is what makes the eighth-of-the-container default safe;
+  a record grows over weeks, which is ample notice provided somebody is told. If real records ever
+  approach the share, raise `AGENTS_TOTAL_MAX` in the DockerOps compose beside `mem_limit` rather
+  than moving the derived default for every deployment at once.
+- Byte accounting is a side map (`recordBytes`), never a field on the record — anything on a record
+  is served to every client — and `registryBytes()` re-measures unknown keys and forgets dead ones,
+  so the many places that `delete agents[key]` need not remember it.
+- New env knobs go through `positiveEnv`: a silently-obeyed negative cap refuses the whole fleet on
+  its first beat, so a bad value is announced and ignored. The effective budget is printed at boot
+  because it is DERIVED, not configured.
+- Tests: `registry-cap.test.js` (small caps) and `registry-restore.test.js` (the restore, plus the
+  DEGENERATE `AGENTS_MAX=2000` config — the overshoot bound only breaks when the derived share falls
+  below what a floor would impose, which the small-cap rig never does). Each needs its own process
+  because the caps are read at require time; `server.test.js` lifts `AGENTS_MAX` because ~100
+  synthetic host names is not a fleet, so the cap's interaction with other routes lives only in
+  those two files.
 - The hub also serves the `glasses/` client: a CORS'd `/api/*` surface for that cross-origin
   WebView; per-session `input`/`history` endpoints; `GET /api/ws-token` for short-lived WebSocket
   auth; an `/audio` STT WebSocket (G2-mic PCM to the LiteLLM instance's transcription endpoint); and

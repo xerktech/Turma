@@ -159,6 +159,32 @@ class TestDeviceName(unittest.TestCase):
         for good in ("truenas", "WIN-DESK01", "host.lab", "server-1"):
             self.assertEqual(ha._usable_hostname(good), good, good)
 
+    def test_usable_hostname_rejects_url_dot_segments(self):
+        # "." / ".." survive percent-encoding untouched and are then collapsed by
+        # the URL parser resolving /api/agents/<host>/..., so such a host looks
+        # online while every route against it 404s (XERK-269).
+        for bad in (".", "..", " . ", "\t..\n"):
+            self.assertEqual(ha._usable_hostname(bad), "", bad)
+        # Only the bare segments are unaddressable — names that merely contain or
+        # start with dots percent-encode and route fine.
+        for good in ("...", ".hidden", "a.b", "HOST.local.", "..host"):
+            self.assertEqual(ha._usable_hostname(good), good, good)
+
+    def test_dot_segment_name_falls_through_to_next_source(self):
+        # The whole point of rejecting it: the agent registers under the next
+        # usable source rather than under a name the hub cannot address.
+        self.assertEqual(
+            self._run(host_file=".\n", docker_name="..", smb_name="truenas"),
+            "truenas")
+
+    def test_dot_segment_env_override_is_refused(self):
+        # DEVICE_NAME otherwise outranks every detection source, but a dot
+        # segment is unaddressable no matter who chose it.
+        for bad in (".", ".."):
+            self.assertEqual(
+                self._run(env={"DEVICE_NAME": bad}, host_file="truenas\n"),
+                "truenas", bad)
+
     def test_env_wins_first(self):
         # entrypoint.sh exports DEVICE_NAME after resolving once; it (or an
         # explicit operator override) is checked before any auto-detection.
