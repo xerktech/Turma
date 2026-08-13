@@ -201,6 +201,30 @@ class TestMatcherSemantics(unittest.TestCase):
         self.assertEqual(self._case([r"Edit(/{B}/q\?k/**)"], "q?k/x.txt"), ALLOWED)
         self.assertEqual(self._case(["Edit(/{B}/q?k/**)"], "qXk/x.txt"), DENIED)
 
+    def test_the_generated_runtime_rule_actually_denies_its_directory(self):
+        """Closes the loop the string tests leave open.
+
+        Everything above uses hand-written rules, which still cannot catch
+        `runtime_code_deny_rules` emitting the wrong one -- and BOTH escaping
+        defects lived exactly there. This asks the only question that matters:
+        does the rule the function emits stop a write to the directory it
+        names, including when that path carries a glob metacharacter?
+        """
+        for n, dirname in enumerate(("plain", "t[1]", "st*r")):
+            # cwd must CONTAIN the install dir, or a rule that denies nothing
+            # comes back INCONCLUSIVE (blocked by the approval gate) instead of
+            # failing cleanly as ALLOWED.
+            work = os.path.join(self.tmp, f"gen{n}")
+            install = os.path.join(work, dirname)
+            os.makedirs(install, exist_ok=True)
+            rules = ha.runtime_code_deny_rules(script_dir=install,
+                                               repos_root=os.path.join(self.tmp, "no-repos"))
+            self.assertTrue(rules, f"no rule emitted for {dirname!r}")
+            sp = _settings(os.path.join(work, "cfg"), {"permissions": {"deny": rules}})
+            got = _attempt(work, sp, os.path.join(install, "hub-agent.py"))
+            self.assertEqual(got, DENIED,
+                             f"{rules} does not protect the directory it names")
+
     def test_write_rules_are_inert_and_edit_rules_cover_write(self):
         # Claude Code warns about this at startup and it is easy to re-introduce:
         # only Edit(path) rules are matched by file permission checks.
