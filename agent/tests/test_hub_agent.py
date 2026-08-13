@@ -5557,11 +5557,13 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
         )
-        # The guard settings file was written and wires the Bash guard hook plus
-        # the AskUserQuestion → glasses bridge, both as PreToolUse matchers.
+        # The guard settings file was written and wires three PreToolUse
+        # matchers: the Bash guard, the ~/.claude file guard, and the
+        # AskUserQuestion → glasses bridge.
         loaded = json.loads(open(settings).read())
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
-        self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
+        self.assertEqual(matchers, ["Bash", "Write|Edit|MultiEdit|NotebookEdit",
+                                    "AskUserQuestion"])
 
     def test_spawn_exports_gitlab_host_for_glab(self):
         """A GitLab-configured host tells every session's glab WHERE to auth:

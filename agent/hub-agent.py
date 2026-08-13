@@ -958,7 +958,34 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.aws/**)",
     "Edit(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
-    "Edit(~/.claude/**)",
+    # ~/.claude is covered by `hooks/fileguard.py`, NOT by a pattern, because the
+    # rule is "everything under ~/.claude except the two agent-memory trees" and
+    # a glob list cannot express it: deny beats allow, so the exception must be a
+    # hole in the deny, and every hole is either too big (a deny matching the
+    # `agent-memory` DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is
+    # the blanket rule again) or too small (an enumerated danger list missed
+    # `shell-snapshots/`, which is arbitrary code in every live session's shell).
+    #
+    # These rules stay as DEFENCE IN DEPTH for the subset where being wrong is
+    # catastrophic: if the hook is ever misconfigured or crashes, the login, the
+    # agent definitions, the hook scripts and the shell snapshots are still
+    # protected. Every pattern here is anchored on a dot, a name or a suffix, so
+    # none can match the `agent-memory` or `projects` directory entries.
+    "Edit(~/.claude.json)",             # mcpServers: command lines run at startup
+    "Edit(~/.claude/.*)",               # .credentials.json — the fleet's login
+    "Edit(~/.claude/*.json)",
+    "Edit(~/.claude/*.jsonl)",
+    "Edit(~/.claude/settings.json*)",   # …and its .bak-* siblings
+    "Edit(~/.claude/CLAUDE.md*)",       # injected into every session on this host
+    "Edit(~/.claude/agents/**)",        # steers every future run
+    "Edit(~/.claude/bin/**)",           # hook scripts auto-execute: RCE
+    "Edit(~/.claude/hooks/**)",
+    "Edit(~/.claude/local/**)",         # the alternate install: the claude binary
+    "Edit(~/.claude/plugins/**)",
+    "Edit(~/.claude/rules/**)",         # loaded into sessions as instructions
+    "Edit(~/.claude/sessions/**)",      # session keys + the remote-control registry
+    "Edit(~/.claude/shell-snapshots/**)",  # sourced by every Bash call, every session
+    "Edit(~/.claude/skills/**)",
     "Edit(~/.config/gcloud/**)",
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
@@ -1033,6 +1060,12 @@ def ask_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
 
 
+def fileguard_script_path():
+    """Absolute path to the bundled file-write guard hook
+    (``hooks/fileguard.py``), resolved the same way as ``guard_script_path``."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
+
+
 def statusline_script_path():
     """Absolute path to the bundled subscription-limits statusLine hook
     (``hooks/statusline.py``), resolved the same way as ``guard_script_path``."""
@@ -1048,9 +1081,10 @@ ASK_HOOK_TIMEOUT_SEC = 660
 
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
-                         local_settings_path=None):
+                         local_settings_path=None, fileguard_path=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
-    Bash (the safety guard) and AskUserQuestion (the glasses answer bridge),
+    Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
+    and AskUserQuestion (the glasses answer bridge),
     plus deny rules protecting the host credential stores. The bypass-mode
     session runs freely except for what the guard blocks (see ``hooks/guard.py``);
     the ask bridge routes interactive questions to the glasses (see
@@ -1064,7 +1098,9 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
     guard_command = f'"{python_exe}" "{guard_path}"'
+    fileguard_path = fileguard_path or fileguard_script_path()
     ask_command = f'"{python_exe}" "{ask_path}"'
+    fileguard_command = f'"{python_exe}" "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
     perms = {"deny": list(_GUARD_DENY_PATH_RULES)}
     for rule in deny:  # operator deny unions on top of the guard's own rules
@@ -1081,6 +1117,12 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
                 {
                     "matcher": "Bash",
                     "hooks": [{"type": "command", "command": guard_command}],
+                },
+                {
+                    # ~/.claude is "everything except the two memory trees",
+                    # which is a predicate and not a glob. See fileguard.py.
+                    "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+                    "hooks": [{"type": "command", "command": fileguard_command}],
                 },
                 {
                     "matcher": "AskUserQuestion",

@@ -31,7 +31,7 @@ class TestGuardSettings(unittest.TestCase):
     def test_denies_credential_writes(self):
         deny = ha.build_guard_settings()["permissions"]["deny"]
         self.assertIn("Edit(~/.ssh/**)", deny)
-        self.assertIn("Edit(~/.claude/**)", deny)
+        self.assertIn("Edit(~/.claude/.*)", deny)   # the fleet's shared Claude login
         self.assertIn("Edit(~/.aws/**)", deny)
 
     def test_denies_cloud_cli_credential_writes(self):
@@ -60,6 +60,47 @@ class TestGuardSettings(unittest.TestCase):
         """
         deny = ha.build_guard_settings()["permissions"]["deny"]
         self.assertEqual([r for r in deny if r.startswith("Write(")], [])
+
+    def test_wires_the_claude_file_guard(self):
+        """~/.claude is guarded by a HOOK, not by a deny pattern.
+
+        The rule is "everything under ~/.claude except the two agent-memory
+        trees", which no glob list can express — deny beats allow, so the
+        exception must be a hole, and three attempts each cut one too big or too
+        small. The predicate lives in hooks/fileguard.py.
+        """
+        s = ha.build_guard_settings(python_exe="/usr/bin/python3")
+        entry = [e for e in s["hooks"]["PreToolUse"]
+                 if e["matcher"] == "Write|Edit|MultiEdit|NotebookEdit"]
+        self.assertEqual(len(entry), 1)
+        cmd = entry[0]["hooks"][0]["command"]
+        self.assertIn("fileguard.py", cmd)
+        self.assertIn("/usr/bin/python3", cmd)
+        # The blanket pattern must NOT come back: it denies the memory trees.
+        self.assertNotIn("Edit(~/.claude/**)", s["permissions"]["deny"])
+        self.assertNotIn("Edit(~/.claude/*)", s["permissions"]["deny"])
+
+    def test_catastrophic_paths_keep_pattern_denies_as_defence_in_depth(self):
+        # The hook is the complete rule; these patterns are what still stands if
+        # it is ever misconfigured or crashes. Each is anchored on a dot, a name
+        # or a suffix, so none can match the agent-memory/projects DIRECTORY
+        # entries — a deny that matches a directory takes its whole subtree.
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        for rule in ("Edit(~/.claude/.*)",                  # the shared login
+                     "Edit(~/.claude.json)",                # mcpServers: startup exec
+                     "Edit(~/.claude/agents/**)",
+                     "Edit(~/.claude/bin/**)",
+                     "Edit(~/.claude/shell-snapshots/**)",  # RCE into every session
+                     "Edit(~/.claude/sessions/**)",
+                     "Edit(~/.claude/local/**)",            # the claude binary
+                     "Edit(~/.claude/rules/**)"):
+            self.assertIn(rule, deny)
+        self.assertEqual([r for r in deny if "agent-memory" in r], [])
+
+    def test_fileguard_script_path_points_at_bundled_hook(self):
+        path = ha.fileguard_script_path()
+        self.assertTrue(path.endswith(os.path.join("hooks", "fileguard.py")))
+        self.assertTrue(os.path.exists(path))
 
     def test_guard_script_path_points_at_bundled_hook(self):
         path = ha.guard_script_path()
@@ -114,7 +155,7 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         self.assertIn("Bash(ping *)", s["permissions"]["allow"])
         # operator deny unions on top of the guard's own credential rules
         self.assertIn("Bash(curl evil.example)", s["permissions"]["deny"])
-        self.assertIn("Edit(~/.claude/**)", s["permissions"]["deny"])
+        self.assertIn("Edit(~/.claude/.*)", s["permissions"]["deny"])
 
     def test_guard_deny_precedes_and_survives(self):
         # An operator can ADD deny rules but never drops the guard's own, which
