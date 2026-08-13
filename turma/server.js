@@ -4223,7 +4223,12 @@ function drainTicketQueue() {
     }
     drop(null);
   }
-  if (changed) publishTicketQueue();
+  if (changed) {
+    // The drain is where notes are MINTED, so the bound belongs here too —
+    // applied only on enqueue it held at 2x until the next click.
+    sweepExpiredNotes();
+    publishTicketQueue();
+  }
 }
 
 function autoStartSweep() {

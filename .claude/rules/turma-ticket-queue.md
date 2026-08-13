@@ -80,7 +80,15 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
   429 a live click from an ANOTHER org — the refusal this ticket exists to remove), and from the
   sweep's "already queued" guard (`liveQueuedTicket`, or an auto ticket sat inert for the note's
   whole TTL before auto-start could retry it). Notes are bounded on their own by
-  `TICKET_QUEUE_NOTES_MAX`, oldest first, since nothing else counts them.
+  `TICKET_QUEUE_NOTES_MAX`, since nothing else counts them, and `sweepExpiredNotes` runs where they
+  are MINTED (the drain) as well as on enqueue — applied only on enqueue the bound held at 2×.
+  - **Eviction is OLDEST-first, and that ordering is the part with user impact**: past the bound the
+    operator whose ticket gave up FIRST loses their note without dismissing it — the very signal the
+    note exists to show. Accepted, because it needs >`TICKET_QUEUE_NOTES_MAX` simultaneous notes and
+    unbounded growth is the worse trade; newest-first would drop the ones nobody has read yet.
+  - **In practice the note is a message to a PERSON who clicked.** An auto entry that expires is
+    re-queued by the next sweep (15s), so its note is replaced almost immediately — correct, since
+    auto-start never gives up (XERK-109), and it means the visible expiry is effectively manual-only.
 - **Giving up is VISIBLE.** When `TICKET_QUEUE_MAX_WAIT_MS` fires the entry does not vanish: it goes
   TERMINAL (`reason:"expired"`, `expiredAt`) and stays on the payload for `TICKET_QUEUE_EXPIRED_TTL_MS`
   as a note the card renders — "⌛ gave up waiting", the hub's reason as the tooltip, a ✕ to dismiss

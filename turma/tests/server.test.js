@@ -5300,6 +5300,28 @@ test("XERK-296: a terminal note counts against NO line — per org or fleet-wide
   ticketQueue.length = 0;
 });
 
+test("XERK-296: notes are bounded, and the OLDEST go first", async () => {
+  // Which one is evicted is the half with user impact: a note is a message
+  // somebody is meant to read, so the newest — least likely to have been seen —
+  // must be the one that survives.
+  resetAutoStart();
+  const site = "tq34.atlassian.net";
+  await asBeat("tqEvict", site, { autoStart: false, capacity: FULL });
+  for (let i = 0; i < TICKET_QUEUE_NOTES_MAX + 10; i++) {
+    const e = enqueueTicketStart(site, `OLD-${1000 + i}`, "manual");
+    if (!e) break;
+    e.expiredAt = 1000 + i;          // ascending: OLD-1000 is the oldest note
+    e.reason = "expired";
+  }
+  enqueueTicketStart(site, "NEW-1", "manual");   // the enqueue that trims
+  const notes = ticketQueue.filter((e) => e.expiredAt);
+  assert.ok(notes.length <= TICKET_QUEUE_NOTES_MAX, "the bound holds");
+  assert.ok(!notes.some((e) => e.issueKey === "OLD-1000"), "the oldest note went");
+  assert.ok(notes.some((e) => e.issueKey === `OLD-${1000 + TICKET_QUEUE_NOTES_MAX + 9}`),
+    "and the newest survived");
+  ticketQueue.length = 0;
+});
+
 test("XERK-296: a terminal note doesn't block its own ticket's auto-start", async () => {
   // The sweep's "already queued" guard read a note as a place in line, so an
   // auto ticket that waited out its hours then sat inert for the note's whole
