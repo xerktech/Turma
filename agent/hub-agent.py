@@ -958,7 +958,38 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.aws/**)",
     "Edit(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
-    "Edit(~/.claude/**)",
+    # ~/.claude is denied PIECEWISE rather than wholesale, so that the two agent
+    # memory trees below stay writable. A blanket `Edit(~/.claude/**)` is what
+    # this replaced, and it silently disabled Claude Code's memory feature for
+    # every Turma session and every subagent they spawn: `memory: user` resolves
+    # to ~/.claude/agent-memory/<agent>/, a session's own auto-memory to
+    # ~/.claude/projects/<slug>/memory/, and deny beats allow, so no rule in the
+    # operator's own settings could re-enable it. Sessions rediscovered the same
+    # repo facts on every run instead.
+    #
+    # DENY WINS OVER ALLOW, so the carve-out cannot be an allow rule — the deny
+    # has to not cover the exception in the first place. That inverts the failure
+    # mode of this list and is the cost of the feature: a NEW sensitive file or
+    # directory appearing under ~/.claude is writable until someone adds it here.
+    # Anything holding a credential, executing, or steering a future session
+    # belongs below. When in doubt, deny it — a session that cannot write a file
+    # asks; one that can rewrite the agent definitions does not.
+    "Edit(~/.claude/.*)",              # .credentials.json (the shared login), .claude.json, …
+    "Edit(~/.claude/*.json)",          # settings.json — secrets, and this list's own source
+    "Edit(~/.claude/*.jsonl)",         # history.jsonl
+    "Edit(~/.claude/CLAUDE.md*)",      # injected into every session on this host
+    "Edit(~/.claude/agents/**)",       # agent definitions: a write here steers every future run
+    "Edit(~/.claude/bin/**)",          # hook scripts auto-execute; a write here is RCE
+    "Edit(~/.claude/hooks/**)",
+    "Edit(~/.claude/commands/**)",
+    "Edit(~/.claude/skills/**)",
+    "Edit(~/.claude/plugins/**)",
+    "Edit(~/.claude/backups/**)",      # the restore path for everything above
+    # Transcripts, not the `memory/` sibling beside them: they feed the hub's
+    # archive, the usage aggregates and `--resume`, so a session editing its own
+    # history rewrites what the operator later reads back.
+    "Edit(~/.claude/projects/*/*.jsonl)",
+    "Edit(~/.claude/projects/*/subagents/**)",
     "Edit(~/.config/gcloud/**)",
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.

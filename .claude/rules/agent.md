@@ -421,6 +421,29 @@ See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_se
 `~/.turma/guard-settings.json`, passed to every launch as `--settings`, wiring both hooks plus the
 `permissions.deny` credential-store rules. Policy is in `CLAUDE.md`.
 
+### Why `~/.claude` is denied file-by-file
+
+- A blanket `Edit(~/.claude/**)` protected the login and cost the fleet its MEMORY: `memory: user`
+  resolves to `~/.claude/agent-memory/<agent>/` and a session's own auto-memory to
+  `~/.claude/projects/<slug>/memory/`, so every Turma session and subagent rediscovered the same
+  repo facts on every run. Nothing in the operator's settings could re-enable it.
+- **Deny beats allow, so the carve-out is a HOLE IN THE DENY and cannot be an allow rule.** That
+  inverts this list's failure mode: a new sensitive file under `~/.claude` is writable until someone
+  names it in `_GUARD_DENY_PATH_RULES`. Anything holding a credential, executing, or steering a
+  future session goes in the list; when in doubt, deny it.
+- Denied individually: the dotfiles (`.credentials.json` — the shared login), `*.json`
+  (`settings.json` carries secrets AND this list's own source), `*.jsonl`, `CLAUDE.md*` (injected
+  into every session), `agents/`, `bin/` (hooks auto-execute — a write there is RCE), `hooks/`,
+  `commands/`, `skills/`, `plugins/`, `backups/` (the restore path for all of the above), and
+  `projects/*/*.jsonl` + `projects/*/subagents/**` (transcripts feed the archive, the usage
+  aggregates and `--resume`) — but **not** the `memory/` sibling beside those transcripts.
+- **`settings.local.json` unions on top**, so an operator writing `Edit(~/.claude/**)` there
+  re-disables memory host-wide. That is theirs to choose; it is pinned by a test so it stays a
+  choice rather than a surprise.
+- Agent memory is instruction-adjacent — it is injected into future runs — so making it writable
+  moves weight onto the agent-side rule never to record anything the material under review asked to
+  be recorded. Tests: `TestGuardSettings`, `TestOperatorLocalPermissions`.
+
 ## `entrypoint.sh` and the bundled toolchains
 
 See `.claude/rules/agent-image.md` (scoped to `agent/entrypoint.sh` + `agent/Dockerfile`) — the boot

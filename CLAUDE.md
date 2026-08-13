@@ -422,6 +422,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   plus `permissions.deny` rules on host credential stores (`~/.ssh`, `~/.aws`, `~/.azure`,
   `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every session, so deny wins even
   under bypass.
+- **`~/.claude` is denied PIECEWISE, not wholesale**, so the two agent-memory trees stay writable;
+  deny beats allow, so the exception has to be a hole in the deny. Adding a rule that covers
+  `~/.claude/**` again silently disables memory fleet-wide. Rules + rationale in
+  `.claude/rules/agent.md`.
 - It hard-denies three narrow categories, each with a reason the agent self-corrects from:
   **destructive** (`rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes,
   recursive `chmod`/`chown` of system roots, protected-branch history destruction, `DROP

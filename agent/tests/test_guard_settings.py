@@ -31,8 +31,43 @@ class TestGuardSettings(unittest.TestCase):
     def test_denies_credential_writes(self):
         deny = ha.build_guard_settings()["permissions"]["deny"]
         self.assertIn("Edit(~/.ssh/**)", deny)
-        self.assertIn("Edit(~/.claude/**)", deny)
+        self.assertIn("Edit(~/.claude/.*)", deny)   # the shared login, .credentials.json
         self.assertIn("Edit(~/.aws/**)", deny)
+
+    def test_claude_config_denied_piecewise_but_memory_stays_writable(self):
+        """~/.claude is protected file-by-file so agent memory survives.
+
+        A blanket `Edit(~/.claude/**)` disabled Claude Code's memory feature for
+        every session and subagent on the host — deny beats allow, so nothing in
+        the operator's settings could re-enable it. The exception has to be a
+        HOLE IN THE DENY, not an allow rule, which is why each dangerous path is
+        named individually.
+        """
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        self.assertNotIn("Edit(~/.claude/**)", deny)
+        for rule in (
+            "Edit(~/.claude/.*)",                    # the shared Claude login
+            "Edit(~/.claude/*.json)",                # settings.json: secrets + this list's source
+            "Edit(~/.claude/CLAUDE.md*)",            # injected into every session
+            "Edit(~/.claude/agents/**)",             # steers every future run
+            "Edit(~/.claude/bin/**)",                # hooks auto-execute: RCE
+            "Edit(~/.claude/plugins/**)",
+            "Edit(~/.claude/backups/**)",            # the restore path for all of the above
+            "Edit(~/.claude/projects/*/*.jsonl)",    # transcripts feed archive/usage/--resume
+            "Edit(~/.claude/projects/*/subagents/**)",
+        ):
+            self.assertIn(rule, deny)
+        # Nothing may cover either memory tree, however it is spelled. A rule
+        # ending `~/.claude/**` re-breaks the feature silently.
+        for rule in deny:
+            self.assertFalse(
+                rule.startswith("Edit(~/.claude/**") or rule.startswith("Edit(~/.claude)"),
+                f"{rule} swallows the memory trees",
+            )
+        self.assertEqual(
+            [r for r in deny if "agent-memory" in r or "/memory/" in r], [],
+            "agent memory must not be denied — that is the whole point of the carve-out",
+        )
 
     def test_denies_cloud_cli_credential_writes(self):
         # The cloud CLIs the image bundles authenticate off the HOST's mounted
@@ -114,7 +149,7 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         self.assertIn("Bash(ping *)", s["permissions"]["allow"])
         # operator deny unions on top of the guard's own credential rules
         self.assertIn("Bash(curl evil.example)", s["permissions"]["deny"])
-        self.assertIn("Edit(~/.claude/**)", s["permissions"]["deny"])
+        self.assertIn("Edit(~/.claude/.*)", s["permissions"]["deny"])
 
     def test_guard_deny_precedes_and_survives(self):
         # An operator can ADD deny rules but never drops the guard's own, which
@@ -140,9 +175,22 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         self.assertEqual(allow.count("Read(~/.turma/uploads/**)"), 1)
 
     def test_operator_deny_duplicate_is_not_repeated(self):
+        path = self._write({"permissions": {"deny": ["Edit(~/.ssh/**)"]}})
+        deny = ha.build_guard_settings(local_settings_path=path)["permissions"]["deny"]
+        self.assertEqual(deny.count("Edit(~/.ssh/**)"), 1)
+
+    def test_operator_can_re_deny_all_of_claude_and_lose_memory(self):
+        """An operator's own blanket rule still wins, and still costs memory.
+
+        Pinned so the trade-off is visible rather than surprising: the guard no
+        longer denies all of ~/.claude, but `settings.local.json` unions on top,
+        so an operator who writes `Edit(~/.claude/**)` there re-disables agent
+        memory for every session on the host. That is their call to make — the
+        point of the test is that it is a CHOICE, not the default.
+        """
         path = self._write({"permissions": {"deny": ["Edit(~/.claude/**)"]}})
         deny = ha.build_guard_settings(local_settings_path=path)["permissions"]["deny"]
-        self.assertEqual(deny.count("Edit(~/.claude/**)"), 1)
+        self.assertIn("Edit(~/.claude/**)", deny)
 
     def test_missing_file_is_noop(self):
         # No operator file: the settings carry exactly the app's own rules —
