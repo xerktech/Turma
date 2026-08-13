@@ -251,6 +251,17 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
   be expensive.
 - Android routes `money_with_wings` to its own `CH_SPEND` channel (mutable independently of host
   status); a build predating it falls through to `CH_ALERTS`, so the alert still arrives.
+- **The stage-2 `priority: "high"` does not make the phone buzz harder, and nothing here should be
+  written as though it does.** `Notifications.kt` never reads `data["priority"]` — on Android 8+
+  urgency is the CHANNEL's `IMPORTANCE`, and `push.js` already sets the FCM *transport* priority
+  high for every message (delivery/doze, not presentation). The field rides the documented data
+  payload for non-Android clients and matches what the login alerts send; it is not the escalation.
+- So the escalation the operator actually sees is **textual and replacing**: a higher token figure
+  in the title, a different body, and the stage-1 notice replaced under the shared `notifKey`.
+  `CH_SPEND` is `IMPORTANCE_DEFAULT` deliberately — the warn stage fires several times on a busy
+  day, and a channel that buzzes for it would be muted outright. Raising the urgency is the
+  operator's own channel setting, which is the reason this alert has a channel of its own rather
+  than folding into `CH_HOST`. Give stage 2 a second channel only if that knob proves insufficient.
 - Tests: the `spend:` cases in `server.test.js`.
 - **A session gets ONE alert per piece of work** (XERK-224): "is ready for review", fired when it
   enters the Sessions page's Ready-for-review group (`readyForReview`, the hub's mirror of the
