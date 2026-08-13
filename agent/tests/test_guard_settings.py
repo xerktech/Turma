@@ -138,10 +138,42 @@ class TestGuardSettings(unittest.TestCase):
         # The path is interpolated into a glob, so a prefix containing `[` would
         # be read as a character class: the directory it names goes unprotected
         # while an unrelated one is wrongly denied.
+        # MEASURED against the real binary: backslash escapes `[` and `*`; the
+        # `[c]` character-class spelling escapes NOTHING — a rule built with it
+        # denies nothing at all, which shipped once and was green over a string
+        # assertion exactly like this one. Keep the spelling pinned, and keep
+        # the note that only the binary can confirm it.
         rule, = ha.runtime_code_deny_rules(script_dir="/opt/t[1]/agent",
                                            repos_root="/mnt/data/Docker/git")
-        self.assertEqual(rule, "Edit(//opt/t[[]1[]]/agent/**)")
+        self.assertEqual(rule, r"Edit(//opt/t\[1]/agent/**)")
+        rule, = ha.runtime_code_deny_rules(script_dir="/opt/st*r/agent",
+                                           repos_root="/mnt/data/Docker/git")
+        self.assertEqual(rule, r"Edit(//opt/st\*r/agent/**)")
         self.assertEqual(ha._glob_literal("/plain/path"), "/plain/path")
+
+    def test_an_unexpressable_install_path_is_reported_not_faked(self):
+        # A literal `?` has no working escape in this matcher, so any rule built
+        # for such a path protects the wrong thing. An unprotected prefix the
+        # operator is TOLD about beats a rule everyone believes in.
+        self.assertEqual(ha.runtime_code_deny_rules(script_dir="/opt/q?k/agent",
+                                                    repos_root="/mnt/data/Docker/git"), [])
+
+    def test_hooks_run_with_user_site_and_env_disabled(self):
+        """`-sE` is the fix for the usercustomize hook-neutralisation.
+
+        A plain interpreter start imports user-site `usercustomize` before the
+        hook's own code, so ONE Write to
+        ~/.local/lib/pythonX/site-packages/usercustomize.py disabled every hook
+        on the host — measured: the Bash guard then allowed `rm -rf /`,
+        `git push --force origin main` and `chmod -R 777 /`, and it persisted
+        into every future python3 run as that user.
+        """
+        s = ha.build_guard_settings(python_exe="/usr/bin/python3")
+        for entry in s["hooks"]["PreToolUse"]:
+            cmd = entry["hooks"][0]["command"]
+            self.assertIn("-sE", cmd, f"{entry['matcher']} hook is neutralisable")
+        limits = ha.build_limits_settings(python_exe="/usr/bin/python3")
+        self.assertIn("-sE", limits["statusLine"]["command"])
 
     def test_the_files_that_wire_the_guard_are_denied(self):
         # Denying the agent's installed code without these just moves the
@@ -201,7 +233,7 @@ class TestGuardSettings(unittest.TestCase):
     def test_explicit_guard_path_is_used(self):
         s = ha.build_guard_settings(python_exe="py", guard_path="/x/hooks/guard.py")
         cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        self.assertEqual(cmd, '"py" "/x/hooks/guard.py"')
+        self.assertEqual(cmd, '"py" -sE "/x/hooks/guard.py"')
 
     def test_registers_askuserquestion_bridge_hook(self):
         s = ha.build_guard_settings(python_exe="/usr/bin/python3")
@@ -217,7 +249,7 @@ class TestGuardSettings(unittest.TestCase):
     def test_explicit_ask_path_is_used(self):
         s = ha.build_guard_settings(python_exe="py", ask_path="/x/hooks/ask.py")
         ask = next(e for e in s["hooks"]["PreToolUse"] if e["matcher"] == "AskUserQuestion")
-        self.assertEqual(ask["hooks"][0]["command"], '"py" "/x/hooks/ask.py"')
+        self.assertEqual(ask["hooks"][0]["command"], '"py" -sE "/x/hooks/ask.py"')
 
     def test_ask_script_path_points_at_bundled_hook(self):
         path = ha.ask_script_path()

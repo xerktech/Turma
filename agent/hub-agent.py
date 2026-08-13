@@ -1036,6 +1036,12 @@ _GUARD_DENY_PATH_RULES = [
     # agent's installed code (runtime_code_deny_rules) without this just moves
     # the attack one directory over. NOT all of ~/.turma: the agent stages
     # uploads and question files there and sessions legitimately write it.
+    # The interpreter injection points the -sE flags close. Kept as defence in
+    # depth: a hook invoked without the flags (an older settings file still on
+    # disk, a path this module does not build) is neutralised by one Write here.
+    "Edit(~/.local/lib/python*/site-packages/**)",
+    "Edit(~/.local/lib/python*/site-packages/*.pth)",
+    "Edit(~/.config/python*/**)",
     "Edit(~/.turma/guard-settings.json)",
     "Edit(~/.turma/limits-settings.json)",
     "Edit(~/.turma/local-model.env)",
@@ -1103,12 +1109,20 @@ def _glob_literal(path):
     install prefix containing `[`, `*` or `?` would otherwise be read as a
     pattern: a directory literally named `t[1]` yields a character class, so the
     directory it names goes UNPROTECTED while an unrelated `t1` is wrongly
-    denied. `[c]` is the standard glob spelling for a literal `c`.
+    denied.
+
+    MEASURED against claude 2.1.229 — do not "simplify" from intuition:
+    **backslash escapes `[` and `*`; the `[c]` character-class spelling escapes
+    NOTHING** (a rule built with it denies nothing at all, which shipped once);
+    and a literal `?` has no working escape — only the `?` wildcard matches it,
+    and that over-reaches onto unrelated names.
+
+    So a `?` in the install prefix cannot be expressed. Rather than emit a rule
+    that silently protects the wrong thing, `runtime_code_deny_rules` refuses to
+    emit one and says so — an unprotected prefix the operator is told about
+    beats a rule everyone believes in.
     """
-    out = []
-    for ch in path:
-        out.append(f"[{ch}]" if ch in "*?[]" else ch)
-    return "".join(out)
+    return "".join("\\" + ch if ch in "*[" else ch for ch in path)
 
 
 def runtime_code_deny_rules(script_dir=None, repos_root=None):
@@ -1144,6 +1158,13 @@ def runtime_code_deny_rules(script_dir=None, repos_root=None):
     # slash the two-Write hook-neutralisation attack succeeds; with two it is
     # refused. The rule read fine and did nothing, which is why the test
     # asserting its STRING was green over a rule with no effect.
+    if "?" in real_dir:
+        # No escape for a literal `?` exists in this matcher, so any rule built
+        # here would protect the wrong paths. Say so rather than emit one.
+        log(f"WARNING: agent install path {real_dir!r} contains '?', which cannot be "
+            f"expressed as a literal in a permission rule — the agent's own code is "
+            f"NOT protected from session writes. Reinstall to a path without it.")
+        return []
     return [f"Edit(/{_glob_literal(real_dir)}/**)"]
 
 
@@ -1184,10 +1205,20 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
-    guard_command = f'"{python_exe}" "{guard_path}"'
+    # `-sE` is a SECURITY flag here, not tidiness. A plain interpreter start
+    # imports user-site `usercustomize` before the hook's own code, so one Write
+    # to ~/.local/lib/pythonX/site-packages/usercustomize.py neutralises EVERY
+    # hook on the host — measured: with such a payload the Bash guard allowed
+    # `rm -rf /`, `git push --force origin main` and `chmod -R 777 /`, and it
+    # persists into every future python3 run as that user. `-s` drops user site,
+    # `-E` drops PYTHON* env (PYTHONSTARTUP/PYTHONPATH are the same class).
+    # A deny pattern for ~/.local/lib is added beside this, but the flag is what
+    # closes the class — the pattern list is a blocklist race.
+    # The hooks are stdlib-only by contract, so neither flag can break them.
+    guard_command = f'"{python_exe}" -sE "{guard_path}"'
     fileguard_path = fileguard_path or fileguard_script_path()
-    ask_command = f'"{python_exe}" "{ask_path}"'
-    fileguard_command = f'"{python_exe}" "{fileguard_path}"'
+    ask_command = f'"{python_exe}" -sE "{ask_path}"'
+    fileguard_command = f'"{python_exe}" -sE "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
     perms = {"deny": list(_GUARD_DENY_PATH_RULES) + runtime_code_deny_rules()}
     for rule in deny:  # operator deny unions on top of the guard's own rules
@@ -1252,7 +1283,7 @@ def build_limits_settings(python_exe=None, statusline_path=None):
     return {
         "statusLine": {
             "type": "command",
-            "command": f'"{python_exe}" "{statusline_path}"',
+            "command": f'"{python_exe}" -sE "{statusline_path}"',
             "padding": 0,
         },
     }

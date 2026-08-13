@@ -51,8 +51,19 @@ implementation contract.
       resolves against `~/.turma/` and matches nothing. Measured: one slash and the two-Write
       attack succeeds; two and it is refused. The rule reads correctly and does nothing, and a test
       asserting the rule's STRING was green over it — assert the anchor, not the presence.
-    - The path is **glob-escaped** (`_glob_literal`), or an install prefix containing `[` is read
-      as a character class: the directory it names goes unprotected and an unrelated one is denied.
+    - The path is **glob-escaped with a BACKSLASH** (`_glob_literal`) — measured: `\\` escapes `[`
+      and `*`, the `[c]` character-class spelling escapes **nothing** (a rule built that way denies
+      nothing at all, and shipped once), and a literal `?` has no working escape, so
+      `runtime_code_deny_rules` refuses to emit a rule for such a path and warns instead. An
+      unprotected prefix the operator is told about beats a rule everyone believes in.
+    - **Every hook is invoked `python3 -sE`, and that is a SECURITY flag.** A plain interpreter
+      start imports user-site `usercustomize` before the hook's own code, so one Write to
+      `~/.local/lib/pythonX/site-packages/usercustomize.py` disabled every hook on the host —
+      measured: the Bash guard then allowed `rm -rf /`, `git push --force origin main` and
+      `chmod -R 777 /`, and it persisted into every future `python3` run as that user. `-s` drops
+      user site, `-E` drops `PYTHON*` env. The site-packages deny patterns beside it are defence in
+      depth for a settings file generated before this; the flag is what closes the class. The hooks
+      are stdlib-only by contract, so neither flag can break them.
     - **`~/.turma/guard-settings.json` is denied too**, and that is not optional: it is the file
       that WIRES both hooks, `_ensure_guard_settings` reuses it whenever it merely exists without
       re-validating its content, and denying the code without it just moves the attack one
