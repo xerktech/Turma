@@ -1788,6 +1788,38 @@ function normalizeLimits(payload) {
   payload.limits = out;
 }
 
+// The subscription grouping key (XERK-301), coerced for the same reason
+// normalizeLimits above is: it fans out to web, Android and glasses, and
+// Android decodes it into TYPED fields. Anything unusable becomes null — the
+// "that host can't tell you" value every client already handles by leaving the
+// host on a card of its own, never a plausible default, since a bogus shared
+// key would fold two unrelated subscriptions into one set of bars.
+//
+// The bounds are LITERALS here, exactly as normalizeLimits' are. Every
+// normalize* is reached from `loadState`'s restore loop, which runs far above
+// this line and is only legal because function declarations hoist — a module
+// `const` up here would be in its TDZ there, and the ReferenceError lands in
+// the restore's catch, which empties the whole registry. 128 bounds the key:
+// the agent emits 16 hex chars, so this is the boundary's bound rather than
+// that length, and it exists because the key is a MAP KEY on every client, so
+// an unbounded one is a per-beat amplification of the XERK-235 kind.
+function normalizeSubscription(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const sub = payload.subscription;
+  if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+    if ("subscription" in payload) payload.subscription = null;
+    return;
+  }
+  const key = typeof sub.key === "string" ? sub.key.trim() : "";
+  if (!key) {
+    payload.subscription = null;
+    return;
+  }
+  const out = { key: key.slice(0, 128) };
+  if (typeof sub.source === "string") out.source = sub.source.slice(0, 32);
+  payload.subscription = out;
+}
+
 // Coerce the local-model block at ingest, for exactly the reason normalizeLimits
 // above does it (XERK-246): this fans out to web, Android and glasses, and
 // Android decodes it into TYPED fields — `available: Boolean`, `contextTokens:
@@ -2508,7 +2540,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
   "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
-  "sessions", "startedAt", "uploadMaxBytes", "usage",
+  "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "spawnFailures",
@@ -2696,6 +2728,7 @@ function normalizeRecord(a) {
   normalizeSessions(a);
   normalizeUsage(a);
   normalizeLimits(a);
+  normalizeSubscription(a);
   normalizeLocalModel(a);
 }
 

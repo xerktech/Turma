@@ -111,6 +111,14 @@ data class AgentInfo(
      * tell you", never "0% used".
      */
     val limits: LimitsInfo? = null,
+    /**
+     * Which Claude subscription this host's login is on (XERK-301), so hosts
+     * sharing an account share one set of limit bars. Null on an agent
+     * predating the field or one that can't read its own login — which means
+     * "can't tell you", and keeps that host on a card of its own rather than
+     * folded in with every other host that also can't say.
+     */
+    val subscription: SubscriptionInfo? = null,
     val github: GithubInfo? = null,
     // Extra clone sources beside GitHub (XERK-155): the agent's Azure DevOps /
     // GitLab listings. Empty on an agent predating the block.
@@ -712,6 +720,19 @@ data class LimitsInfo(
     val sevenDay: LimitWindow? = null,
     /** Epoch seconds the snapshot was taken. 0 from a malformed block. */
     val capturedAt: Long = 0,
+    val source: String = "",
+)
+
+/**
+ * The subscription a host's login belongs to (XERK-301). [key] is opaque on
+ * purpose — the agent hashes the account identity, since grouping only ever
+ * asks whether two hosts are equal. Blank means the same as a null block: this
+ * host can't say.
+ */
+@Serializable
+data class SubscriptionInfo(
+    val key: String = "",
+    /** "login" (read from the host's Claude config) or "env" (pinned by hand). */
     val source: String = "",
 )
 
