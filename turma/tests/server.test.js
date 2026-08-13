@@ -7940,9 +7940,22 @@ test("a non-origin-form target is not rewritten into a working terminal", async 
   // backslash targets too. Those reach ttyd as a 404 today, and restoring a
   // slash must not quietly turn them into a served terminal — hence the rewrite
   // only fires when the target actually STARTS with that pathname.
+  //
+  // All three spellings are pinned, because they fail differently: a guard that
+  // merely CONTAINED the pathname leaves the backslash case correct while
+  // splicing a slash into the middle of the other two, so pinning one of them
+  // lets that regression ship green.
   assert.equal(
     await forwardedRequestLine("slashF", "sl6", 7806, "/term\\sl6"),
     "GET /term\\sl6 HTTP/1.1",
+  );
+  assert.equal(
+    await forwardedRequestLine("slashG", "sl7", 7807, "http://evil.example/term/sl7"),
+    "GET http://evil.example/term/sl7 HTTP/1.1",
+  );
+  assert.equal(
+    await forwardedRequestLine("slashH", "sl8", 7808, "//evil/term/sl8"),
+    "GET //evil/term/sl8 HTTP/1.1",
   );
 });
 
