@@ -149,6 +149,12 @@ class TestGuardSettings(unittest.TestCase):
         rule, = ha.runtime_code_deny_rules(script_dir="/opt/st*r/agent",
                                            repos_root="/mnt/data/Docker/git")
         self.assertEqual(rule, r"Edit(//opt/st\*r/agent/**)")
+        # Backslash must be escaped FIRST. A literal `\` in the path had its
+        # next character read as escaped, leaving the real install unprotected
+        # and denying an unrelated one — D16's defect, one character over.
+        rule, = ha.runtime_code_deny_rules(script_dir="/opt/bs" + chr(92) + "k/agent",
+                                           repos_root="/mnt/data/Docker/git")
+        self.assertEqual(rule, "Edit(//opt/bs" + chr(92) * 2 + "k/agent/**)")
         self.assertEqual(ha._glob_literal("/plain/path"), "/plain/path")
 
     def test_an_unexpressable_install_path_is_reported_not_faked(self):
@@ -171,9 +177,9 @@ class TestGuardSettings(unittest.TestCase):
         s = ha.build_guard_settings(python_exe="/usr/bin/python3")
         for entry in s["hooks"]["PreToolUse"]:
             cmd = entry["hooks"][0]["command"]
-            self.assertIn("-sE", cmd, f"{entry['matcher']} hook is neutralisable")
+            self.assertIn("-SsE", cmd, f"{entry['matcher']} hook is neutralisable")
         limits = ha.build_limits_settings(python_exe="/usr/bin/python3")
-        self.assertIn("-sE", limits["statusLine"]["command"])
+        self.assertIn("-SsE", limits["statusLine"]["command"])
 
     def test_the_files_that_wire_the_guard_are_denied(self):
         # Denying the agent's installed code without these just moves the
@@ -183,6 +189,14 @@ class TestGuardSettings(unittest.TestCase):
         deny = ha.build_guard_settings()["permissions"]["deny"]
         self.assertIn("Edit(~/.turma/guard-settings.json)", deny)
         self.assertIn("Edit(~/.turma/limits-settings.json)", deny)
+        # The interpreter injection points. A partial reduction only — they stop
+        # a plant via the file-editing tools, and Bash walks past them like it
+        # walks past every pattern (XERK-309). The -SsE flags are the real fix;
+        # these are pinned so they are not deleted silently.
+        for rule in ("Edit(~/.local/lib/python*/site-packages/**)",
+                     "Edit(~/.local/lib/python*/site-packages/*.pth)",
+                     "Edit(~/.config/python*/**)"):
+            self.assertIn(rule, deny)
 
     def test_every_claude_backstop_rule_is_pinned(self):
         """Three mutations deleting whole groups of these escaped the suite.
@@ -233,7 +247,7 @@ class TestGuardSettings(unittest.TestCase):
     def test_explicit_guard_path_is_used(self):
         s = ha.build_guard_settings(python_exe="py", guard_path="/x/hooks/guard.py")
         cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        self.assertEqual(cmd, '"py" -sE "/x/hooks/guard.py"')
+        self.assertEqual(cmd, '"py" -SsE "/x/hooks/guard.py"')
 
     def test_registers_askuserquestion_bridge_hook(self):
         s = ha.build_guard_settings(python_exe="/usr/bin/python3")
@@ -249,7 +263,7 @@ class TestGuardSettings(unittest.TestCase):
     def test_explicit_ask_path_is_used(self):
         s = ha.build_guard_settings(python_exe="py", ask_path="/x/hooks/ask.py")
         ask = next(e for e in s["hooks"]["PreToolUse"] if e["matcher"] == "AskUserQuestion")
-        self.assertEqual(ask["hooks"][0]["command"], '"py" -sE "/x/hooks/ask.py"')
+        self.assertEqual(ask["hooks"][0]["command"], '"py" -SsE "/x/hooks/ask.py"')
 
     def test_ask_script_path_points_at_bundled_hook(self):
         path = ha.ask_script_path()

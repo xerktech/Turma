@@ -56,14 +56,23 @@ implementation contract.
       nothing at all, and shipped once), and a literal `?` has no working escape, so
       `runtime_code_deny_rules` refuses to emit a rule for such a path and warns instead. An
       unprotected prefix the operator is told about beats a rule everyone believes in.
-    - **Every hook is invoked `python3 -sE`, and that is a SECURITY flag.** A plain interpreter
-      start imports user-site `usercustomize` before the hook's own code, so one Write to
-      `~/.local/lib/pythonX/site-packages/usercustomize.py` disabled every hook on the host —
-      measured: the Bash guard then allowed `rm -rf /`, `git push --force origin main` and
-      `chmod -R 777 /`, and it persisted into every future `python3` run as that user. `-s` drops
-      user site, `-E` drops `PYTHON*` env. The site-packages deny patterns beside it are defence in
-      depth for a settings file generated before this; the flag is what closes the class. The hooks
-      are stdlib-only by contract, so neither flag can break them.
+    - **Every hook is invoked `python3 -SsE`, and those are SECURITY flags.** A plain interpreter
+      start runs `site` before the hook's own code, so planting a file it imports disables the hook
+      — measured against the real `guard.py`, which then allowed `rm -rf /`, `git push --force
+      origin main` and `chmod -R 777 /`, and it persists into every future `python3` run as that
+      user.
+      - **`-S` is the one that closes the CLASS.** `-s` drops only the USER site dir; the
+        interpreter's OWN site-packages is still scanned, so a `.pth` or `sitecustomize.py` there
+        runs inside every hook process. Measured end to end, and reachable in the **container**,
+        whose final stage sets no `USER` and so runs sessions as root over a writable `/usr`.
+      - `-s` and `-E` stay for the user-site and `PYTHON*` env halves (`PYTHONPATH`/`PYTHONHOME`/
+        `PYTHONSTARTUP` are all dead under `-E`, measured). PATH shadowing is already closed: the
+        command bakes an absolute `sys.executable`.
+      - The `~/.local` deny patterns beside them stop a plant via the **file-editing tools only** —
+        Bash walks past them as it walks past every pattern (XERK-309), so they are a partial
+        reduction, not the fix. **The flags are the fix.**
+      - The hooks are stdlib-only by contract, so none of the flags can break them; all four were
+        driven under them, output byte-identical, `TURMA_*` env still read.
     - **`~/.turma/guard-settings.json` is denied too**, and that is not optional: it is the file
       that WIRES both hooks, `_ensure_guard_settings` reuses it whenever it merely exists without
       re-validating its content, and denying the code without it just moves the attack one

@@ -1122,7 +1122,11 @@ def _glob_literal(path):
     emit one and says so — an unprotected prefix the operator is told about
     beats a rule everyone believes in.
     """
-    return "".join("\\" + ch if ch in "*[" else ch for ch in path)
+    # Backslash FIRST, or escaping the others re-introduces the bug: an install
+    # path containing a literal `\` had its next character read as escaped, so
+    # the real directory went unprotected while an unrelated one was denied —
+    # the exact defect this function exists to fix, one character over.
+    return "".join("\\" + ch if ch in "\\*[" else ch for ch in path)
 
 
 def runtime_code_deny_rules(script_dir=None, repos_root=None):
@@ -1205,20 +1209,27 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
-    # `-sE` is a SECURITY flag here, not tidiness. A plain interpreter start
+    # `-SsE` are SECURITY flags here, not tidiness. A plain interpreter start
     # imports user-site `usercustomize` before the hook's own code, so one Write
     # to ~/.local/lib/pythonX/site-packages/usercustomize.py neutralises EVERY
     # hook on the host — measured: with such a payload the Bash guard allowed
     # `rm -rf /`, `git push --force origin main` and `chmod -R 777 /`, and it
-    # persists into every future python3 run as that user. `-s` drops user site,
-    # `-E` drops PYTHON* env (PYTHONSTARTUP/PYTHONPATH are the same class).
-    # A deny pattern for ~/.local/lib is added beside this, but the flag is what
-    # closes the class — the pattern list is a blocklist race.
+    # persists into every future python3 run as that user.
+    #
+    # `-S` is the one that closes the CLASS: `-s` drops only the USER site dir,
+    # while the interpreter's OWN site-packages is still scanned, so a `.pth` or
+    # `sitecustomize.py` there runs inside every hook process — measured, end to
+    # end, and reachable in the container, whose final stage sets no USER and so
+    # runs sessions as root over a writable /usr. `-s` and `-E` stay for the
+    # user-site and PYTHON* env halves. The ~/.local deny patterns beside this
+    # stop a plant via the file-editing TOOLS only; Bash walks past them like it
+    # walks past every pattern (XERK-309), so they are a partial reduction, not
+    # the fix. The flags are the fix.
     # The hooks are stdlib-only by contract, so neither flag can break them.
-    guard_command = f'"{python_exe}" -sE "{guard_path}"'
+    guard_command = f'"{python_exe}" -SsE "{guard_path}"'
     fileguard_path = fileguard_path or fileguard_script_path()
-    ask_command = f'"{python_exe}" -sE "{ask_path}"'
-    fileguard_command = f'"{python_exe}" -sE "{fileguard_path}"'
+    ask_command = f'"{python_exe}" -SsE "{ask_path}"'
+    fileguard_command = f'"{python_exe}" -SsE "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
     perms = {"deny": list(_GUARD_DENY_PATH_RULES) + runtime_code_deny_rules()}
     for rule in deny:  # operator deny unions on top of the guard's own rules
@@ -1283,7 +1294,7 @@ def build_limits_settings(python_exe=None, statusline_path=None):
     return {
         "statusLine": {
             "type": "command",
-            "command": f'"{python_exe}" -sE "{statusline_path}"',
+            "command": f'"{python_exe}" -SsE "{statusline_path}"',
             "padding": 0,
         },
     }
