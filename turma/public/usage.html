@@ -19,9 +19,25 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 14px 16px 10px; position: relative;
   }
-  /* Claude subscription limits (XERK-247): the 5h/7d windows, one card per host
-     that reports them. Sits above the token chart because it answers a
-     different question — how much headroom is left, not what was spent. */
+  /* The headline token figures, at the very top: what the scoped fleet has
+     spent, before any of the breakdowns below take it apart. Laid out as a
+     plain stat row rather than the dashboard's tile grid — this page is a
+     breakdown, so the totals are its heading, not six cards of their own. */
+  .totals { display: flex; flex-wrap: wrap; gap: 4px 28px; margin: 2px 0 4px; }
+  .totals .stat { min-width: 88px; }
+  .totals .label { color: var(--ink-2); font-size: 12px; margin-bottom: 2px; }
+  .totals .value {
+    font-family: var(--font-display); font-size: 26px; font-weight: 600; letter-spacing: -0.01em;
+  }
+  .totals .cache { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+  @media (max-width: 600px) {
+    .totals { gap: 4px 20px; }
+    .totals .value { font-size: 21px; }
+  }
+  /* Claude subscription limits (XERK-247): the 5h/7d windows, one card per
+     SUBSCRIPTION reporting them (XERK-301). Sits above the token chart because
+     it answers a different question — how much headroom is left, not what was
+     spent. */
   .limits { margin: 2px 0 16px; }
   .limits h2 {
     font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 8px;
@@ -180,11 +196,12 @@
 <body>
 <header class="site-header" id="siteHeader" data-page="usage" data-sub="Subscription limits · token usage"></header>
 <div class="wrap">
+  <div class="totals" id="totals"></div>
   <div class="limits" id="limits"></div>
   <div class="viewbar" id="viewbar"></div>
   <div id="chart"></div>
   <div id="models"></div>
-  <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. There is <b>one card per subscription</b>, not per host: hosts logged into the same Claude account are reading and spending the same pool, so they fold into one card listing them all, and each window shows the freshest reading any of them took. A host whose agent is too old to say which account it's on stays on a card of its own. Token figures below are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
+  <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. There is <b>one card per subscription</b>, not per host: hosts logged into the same Claude account are reading and spending the same pool, so they fold into one card listing them all, and each window shows the freshest reading any of them took. A host whose agent is too old to say which account it's on stays on a card of its own. The <b>token figures</b> — the Today / This week / All-time totals above the limits, and every breakdown of them below — are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
@@ -605,6 +622,59 @@ function paintSwatch(el, paint) {
   if (paint.texture !== "solid") el.classList.add("tx-" + paint.texture);
 }
 
+// --- the headline totals ----------------------------------------------------
+// What the scoped fleet has spent in each window, above every breakdown of it.
+// A port of the Android Usage screen's stat row (`UsageViewModel.compute`),
+// which had it first; the two must keep agreeing, since an operator reading one
+// figure on the phone and another in the browser can't tell which is wrong.
+//
+// Per host it PREFERS the host-level `usage` block — the agent aggregates that
+// from every transcript on the box, including sessions long since killed — and
+// sums that host's per-repo blocks ONLY when it reports no aggregate. Never
+// both: the repo blocks are a partition of the same spend, so adding them to
+// the host block counts every token twice.
+function fleetTotals(agents) {
+  const out = blankSplit();
+  for (const a of agents || []) {
+    if (!a) continue;
+    if (a.usage) { addSplit(out, a.usage); continue; }
+    for (const ru of a.repoUsage || []) addSplit(out, ru && ru.usage);
+  }
+  return out;
+}
+
+// The strip itself. Rendered from the ORG-SCOPED agent list and before the
+// chart's empty-state returns, exactly like the limits below it: the totals are
+// the one thing on this page that should be readable the instant it loads, and
+// a fleet whose day series hasn't been built yet has still spent tokens.
+function renderTotals(agents) {
+  const $totals = document.getElementById("totals");
+  const totals = fleetTotals(agents);
+  $totals.replaceChildren();
+  for (const [label, w] of [["Today", "today"], ["This week", "week"], ["All-time", "totals"]]) {
+    const stat = document.createElement("div");
+    stat.className = "stat";
+    const name = document.createElement("div");
+    name.className = "label";
+    name.textContent = label;
+    const value = document.createElement("div");
+    value.className = "value";
+    value.textContent = fmtTokens(dayTokens(totals[w]));
+    stat.append(name, value);
+    $totals.append(stat);
+  }
+  // The all-time cache split, under the row: a total alone can't say what it
+  // cost, since a cache read is ~0.1x fresh input and a write ~1.25x. Absent
+  // when nothing reports cache traffic, rather than shown as zeroes.
+  const cache = cacheLineText(totals.totals);
+  if (cache) {
+    const line = document.createElement("div");
+    line.className = "cache";
+    line.textContent = cache;
+    $totals.append(line);
+  }
+}
+
 // The limits section: one card per reporting SUBSCRIPTION, or a single line
 // saying why there's nothing to show. Rendered before the chart's own
 // empty-state returns, so a fleet that has spent no tokens yet still shows its
@@ -752,8 +822,10 @@ function renderInner(data) {
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
-  // Before the series work, and before its empty-state returns below: limit
-  // headroom is worth showing on a fleet that has charted nothing yet.
+  // Before the series work, and before its empty-state returns below: the
+  // headline totals and the limit headroom are both worth showing on a fleet
+  // that has charted nothing yet.
+  renderTotals(agents);
   renderLimits(agents);
   const series = toSeries(agents);
   if (!series.length) {
@@ -1037,15 +1109,24 @@ function cacheHitRate(b) {
   return prompt ? Math.round((read / prompt) * 100) : null;
 }
 
-// The cache half of a bucket. Omitted entirely when a bucket carries no cache
+// The cache half of a bucket, as text. Empty when the bucket carries no cache
 // traffic at all — an older agent reports none, and a bare "0 cached · 0
 // written" would read as caching being broken rather than unreported.
-function cacheSubLine(b) {
+// Composed of formatted numbers only, so it is safe as textContent or as markup.
+function cacheLineText(b) {
   const read = b.cacheRead || 0, write = b.cacheWrite || 0;
   if (!read && !write) return "";
   const hit = cacheHitRate(b);
-  return `<span class="sub-tok">${fmtTokens(read)} cached · ${fmtTokens(write)} written` +
-    (hit === null ? "" : ` · ${hit}% hit`) + `</span>`;
+  return `${fmtTokens(read)} cached · ${fmtTokens(write)} written` +
+    (hit === null ? "" : ` · ${hit}% hit`);
+}
+
+// The markup form, hung under a token figure in the tables. One definition of
+// the wording between here and the headline strip's own cache line, so the two
+// can't drift into saying the same thing differently.
+function cacheSubLine(b) {
+  const text = cacheLineText(b);
+  return text ? `<span class="sub-tok">${text}</span>` : "";
 }
 
 // One token figure: the bucket's total, with the in/out split and the cache

@@ -81,11 +81,13 @@ function loadHelpers() {
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
-  const body = `${script}\n;return { tokenCell, cacheSubLine, cacheHitRate, blankBucket,
-    limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView, fmtDuration,
-    LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC,
-    blankUsage, mergeUsageInto, subagentCard };`;
-  return new Function(...keys, body)(...keys.map((k) => stubs[k]));
+  const body = `${script}\n;return { tokenCell, cacheSubLine, cacheLineText, cacheHitRate,
+    blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView,
+    fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC,
+    blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals };`;
+  // `els` rides along so the render-level tests can reach the containers the
+  // page paints INTO — the strip is written to #totals rather than returned.
+  return Object.assign(new Function(...keys, body)(...keys.map((k) => stubs[k])), { els });
 }
 
 const H = loadHelpers();
@@ -137,6 +139,125 @@ test("cacheSubLine survives a write-only bucket (first session on a prefix)", ()
   assert.match(out, /0 cached/);
   assert.match(out, /4\.0k written/);
   assert.match(out, /0% hit/);
+});
+
+// --- the headline totals strip ----------------------------------------------
+// A port of the Android Usage screen's stat row, so the vectors below are the
+// ones `UsageViewModelTest` asserts against `UsageViewModel.compute` — same
+// numbers, same answers. A change here that isn't carried there (or the other
+// way) shows the operator a different fleet total on the phone than in the
+// browser, with nothing to say which is right.
+
+const hostUsage = (today, week, all) => ({
+  today: bucket({ input: today }), week: bucket({ input: week }), totals: bucket({ input: all }),
+});
+
+test("fleetTotals sums the host-level block across hosts", () => {
+  // UsageViewModelTest: "fleet windows sum the host-level block, not the live sessions".
+  const t = H.fleetTotals([
+    { key: "h1", usage: hostUsage(10, 70, 500) },
+    { key: "h2", usage: hostUsage(5, 30, 100) },
+  ]);
+  assert.equal(t.today.input, 15);
+  assert.equal(t.week.input, 100);
+  assert.equal(t.totals.input, 600);
+});
+
+test("fleetTotals falls back to a host's repos when it reports no aggregate", () => {
+  // UsageViewModelTest: "a host with no usage block falls back to summing its
+  // repos". An older agent's work must reach the headline rather than read zero.
+  const t = H.fleetTotals([
+    { key: "old", repoUsage: [
+      { repo: "A", usage: hostUsage(1, 7, 10) },
+      { repo: "B", usage: hostUsage(2, 14, 20) },
+    ] },
+  ]);
+  assert.equal(t.today.input, 3);
+  assert.equal(t.week.input, 21);
+  assert.equal(t.totals.input, 30);
+});
+
+test("fleetTotals never counts a host's repos ON TOP of its host block", () => {
+  // The repo blocks are a partition of the same spend, so a host reporting both
+  // must contribute its aggregate ONCE. Adding them doubles every token on the
+  // page's headline while every breakdown below it stays right — the kind of
+  // disagreement that reads as the breakdown being broken.
+  const t = H.fleetTotals([
+    { key: "h1", usage: hostUsage(10, 70, 500), repoUsage: [
+      { repo: "A", usage: hostUsage(4, 30, 200) },
+      { repo: "B", usage: hostUsage(6, 40, 300) },
+    ] },
+  ]);
+  assert.equal(t.today.input, 10);
+  assert.equal(t.week.input, 70);
+  assert.equal(t.totals.input, 500);
+});
+
+test("fleetTotals is empty-safe: no agents, a null agent, a host with neither block", () => {
+  for (const agents of [[], null, undefined, [null], [{ key: "bare" }]]) {
+    const t = H.fleetTotals(agents);
+    assert.equal(t.today.input, 0);
+    assert.equal(t.totals.input, 0);
+  }
+});
+
+test("fleetTotals counts every token field, cache included", () => {
+  // UsageViewModelTest: "bucket total sums every token field, cache included" —
+  // the strip's figure is dayTokens() over the whole bucket, not just input.
+  const t = H.fleetTotals([{ key: "h1", usage: {
+    today: bucket({ input: 1, output: 2, cacheWrite: 4, cacheRead: 8 }),
+    week: bucket({}), totals: bucket({}),
+  } }]);
+  assert.equal(t.today.input + t.today.output + t.today.cacheWrite + t.today.cacheRead, 15);
+});
+
+test("renderTotals paints the three windows in Android's order and wording", () => {
+  H.renderTotals([{ key: "h1", usage: {
+    today: bucket({ input: 272_500_000 }),
+    week: bucket({ input: 4_800_000_000 }),
+    totals: bucket({ input: 11_300_000_000 }),
+  } }]);
+  const stats = H.els.totals.children.filter((c) => c.className === "stat");
+  assert.deepEqual(stats.map((s) => s.children[0].textContent),
+    ["Today", "This week", "All-time"]);
+  assert.deepEqual(stats.map((s) => s.children[1].textContent), ["272.5M", "4.8B", "11.3B"]);
+});
+
+test("renderTotals hangs the all-time cache split under the row", () => {
+  H.renderTotals([{ key: "h1", usage: {
+    today: bucket({}), week: bucket({}),
+    totals: bucket({ input: 1000, cacheRead: 9000, cacheWrite: 0 }),
+  } }]);
+  const cache = H.els.totals.children.find((c) => c.className === "cache");
+  assert.equal(cache.textContent, "9.0k cached · 0 written · 90% hit");
+});
+
+test("renderTotals omits the cache line when nothing reports cache traffic", () => {
+  // Same rule as cacheSubLine: an older agent reports no cache fields, and
+  // "0 cached · 0 written" would read as caching being broken, not unreported.
+  H.renderTotals([{ key: "h1", usage: {
+    today: bucket({ input: 5 }), week: bucket({ input: 5 }), totals: bucket({ input: 5 }),
+  } }]);
+  assert.equal(H.els.totals.children.some((c) => c.className === "cache"), false);
+});
+
+test("renderTotals REPLACES the strip rather than appending to it", () => {
+  // It repaints on every SSE beat, so an append would stack a fresh row of
+  // stats under the last one every few seconds.
+  const agents = [{ key: "h1", usage: hostUsage(1, 1, 1) }];
+  H.renderTotals(agents);
+  const first = H.els.totals.children.length;
+  H.renderTotals(agents);
+  assert.equal(H.els.totals.children.length, first);
+});
+
+test("renderTotals shows zeroes for a fleet scoped to nothing, never a stale figure", () => {
+  // The org filter can scope the page to no hosts at all; the strip has to say
+  // zero rather than keep whatever the previous selection spent.
+  H.renderTotals([{ key: "h1", usage: hostUsage(10, 70, 500) }]);
+  H.renderTotals([]);
+  const stats = H.els.totals.children.filter((c) => c.className === "stat");
+  assert.deepEqual(stats.map((s) => s.children[1].textContent), ["0", "0", "0"]);
 });
 
 // --- tokenCell ---------------------------------------------------------------

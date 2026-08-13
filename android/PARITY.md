@@ -492,15 +492,23 @@ those are marked `[MODEL]`.
   rescoping.~~ Both done (XERK-78, see Done above); series colors are the categorical palette now.
 - P1 Move "By model" out of the grouping tabs into a standalone "Tokens by model" card (Today / Last
   7 days / All-time). Add a collapsible table view with the in/out and cache splits.
+- The **headline totals** (Today / This week / All-time, with the all-time cache split under them)
+  are at parity. Android had them first and the web page did not; `fleetTotals`/`renderTotals` in
+  `usage.html` are the port of `UsageViewModel.compute`'s window sums, tested against the SAME
+  vectors (`turma/tests/usage.test.js` ↔ `UsageViewModelTest`). Both prefer a host's aggregate
+  `usage` block and fall back to summing its `repoUsage` only when it reports none — never both,
+  which would double-count. Platform difference: Android puts the row above the grouping tabs, the
+  web above the limits section, since its grouping bar sits lower.
 - The **cache split** (`N cached · N written · N% hit`) is at parity, laid out platform-idiomatically:
   the web hangs it under every token figure in the table view and by-model card, Android under each
   `UsageRow` and the headline stat row, since Android has no table view yet (the P1 above). The
   `CacheSummary` reducer is `UsageViewModel`'s, tested against the same vectors as the web's
   `cacheHitRate` (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`).
-- The **subscription limits section** (XERK-247) is at parity: one card per host reporting the 5h/7d
+- The **subscription limits section** (XERK-247, XERK-301) is at parity: one card per SUBSCRIPTION
+  reporting the 5h/7d
   windows, each with the percentage used, a headroom-coloured bar, the countdown to reset, and the
   "captured <age> ago" stamp that goes amber once stale. `limitCards`/`limitView`/`fmtDuration` are
-  ports of the web's `limitEntries`/`limitWindowView`/`fmtDuration`, tested case for case
+  ports of the web's `limitGroups`/`limitWindowView`/`fmtDuration`, tested case for case
   (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`). Platform difference: the web lays the cards
   out in a wrapping flex row, Android stacks them at the top of the usage list.
 - The **sub-agent split** (XERK-302) is at parity in substance: both surfaces name the delegated
