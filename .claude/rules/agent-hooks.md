@@ -18,6 +18,13 @@ implementation contract.
 - **File guard** (`hooks/fileguard.py`, same shape) — a `PreToolUse` hook over
   `Write|Edit|MultiEdit|NotebookEdit`. It refuses any write under `~/.claude` except the two agent
   memory trees: `agent-memory/<agent>/**` and `projects/<slug>/memory/**`.
+  - **Only the `agent-memory` half is actually usable, and that is not our layer's doing.** Measured
+    through the real binary: `~/.claude/projects/<slug>/memory/**` is refused in `auto` and
+    `acceptEdits` with **no settings at all**, and no allow rule pre-grants it (literal-slug and
+    whole-tree allows both tried); only `bypassPermissions` lands it. So removing the blanket deny
+    is necessary but NOT sufficient for a session's own auto-memory — subagent stores are what the
+    carve-out delivers. Keep the `projects/` hole open anyway: it costs nothing and a future release
+    may lift that gate, which `test_matcher_oracle.py` will report as a failure.
   - **It is a hook and not a `permissions.deny` pattern because the rule is "everything under X
     except Y", which a glob list cannot express.** Deny beats allow, so the exception must be a hole
     in the deny, and three attempts each cut one wrong: too big (**a deny matching a DIRECTORY takes
@@ -52,10 +59,14 @@ implementation contract.
       attack succeeds; two and it is refused. The rule reads correctly and does nothing, and a test
       asserting the rule's STRING was green over it — assert the anchor, not the presence.
     - The path is **glob-escaped with a BACKSLASH** (`_glob_literal`) — measured: `\\` escapes `[`
-      and `*`, the `[c]` character-class spelling escapes **nothing** (a rule built that way denies
-      nothing at all, and shipped once), and a literal `?` has no working escape, so
+      and `*`, and the escaped form does not overreach onto a neighbouring directory. A literal `?`
+      has **no** working escape (escaped it matches nothing, unescaped it swallows `qXk`), so
       `runtime_code_deny_rules` refuses to emit a rule for such a path and warns instead. An
       unprotected prefix the operator is told about beats a rule everyone believes in.
+      - The spelling that shipped broken was `[c]` applied to **every** metacharacter, so `t[1]`
+        became `t[[]1[]]` — that denies nothing. **`[[]` alone does escape `[` correctly**, so the
+        earlier note here that "the character-class spelling escapes nothing" was wrong; don't
+        repeat it. Backslash is what we rely on, and `test_matcher_oracle.py` pins both.
     - **Every hook is invoked `python3 -SsE`, and those are SECURITY flags.** A plain interpreter
       start runs `site` before the hook's own code, so planting a file it imports disables the hook
       — measured against the real `guard.py`, which then allowed `rm -rf /`, `git push --force
@@ -74,9 +85,13 @@ implementation contract.
       - The hooks are stdlib-only by contract, so none of the flags can break them; all four were
         driven under them, output byte-identical, `TURMA_*` env still read.
     - **`~/.turma/guard-settings.json` is denied too**, and that is not optional: it is the file
-      that WIRES both hooks, `_ensure_guard_settings` reuses it whenever it merely exists without
-      re-validating its content, and denying the code without it just moves the attack one
-      directory over. Not all of `~/.turma` — the agent stages uploads and question files there.
+      that WIRES both hooks, and denying the code without it just moves the attack one directory
+      over. Not all of `~/.turma` — the agent stages uploads and question files there.
+      - The exposure is bounded by the MANAGER PROCESS, not by the file: `_ensure_guard_settings`
+        caches the path on the manager instance and rewrites the file from `build_guard_settings()`
+        on a fresh process. So a tampered file is handed to every session that manager launches for
+        the rest of its lifetime — managers here run for days — and a restart repairs it. An earlier
+        note claiming the file is reused "whenever it merely exists" was wrong.
   - **The carve-out is FLEET-WIDE, not session-scoped**, and that is a real cost, not an oversight:
     any session may write any project's `memory/` and any agent's store, and both are injected into
     those future runs (measured — a marker planted in another slug's `MEMORY.md` appears verbatim in
@@ -90,6 +105,22 @@ implementation contract.
     protected without qualifying it: it is protected against the file-editing tools.**
   - Tests: `test_fileguard.py` (behavioural — resolved paths, not rule strings; three glob attempts
     passed their string assertions while the feature was wholly broken), `test_guard_settings.py`.
+  - **A rule's STRING is not an oracle — run `test_matcher_oracle.py` when you change one.** Four
+    controls shipped that read correctly and did nothing (single leading slash, the `[c]` spelling,
+    an unescaped `\\`, `-sE`), each green under a test asserting the string the code meant to emit:
+    a test written from the same belief as the code cannot falsify that belief. Over the same period
+    the `fileguard.py` predicate had **zero** defects, because its tests call `decide()` and assert
+    allow/deny. The oracle gives this layer the same footing by driving the real binary, and it is
+    gated on `TURMA_MATCHER_ORACLE=1` because each case costs an API call.
+    - Its structure is load-bearing, not ceremony: a **control** case with no rules that must be
+      ALLOWED (without it a harness that cannot observe a write reports DENIED for everything and
+      looks like a pass), a **baseline** arm with empty settings for anything under `~/.claude`
+      (the binary gates its own config dir, so a deny there is unattributable without it), a
+      **content** check rather than existence (the binary writes `~/.claude.json` itself, which read
+      as a false ALLOW), the target **inside cwd** (`acceptEdits` only auto-approves there, and
+      outside it the approval gate masks every ALLOW), and **retries** because the model layer is
+      nondeterministic — a run that wrote nothing may be the model declining, which is INCONCLUSIVE
+      and fails, never a deny.
 - **AskUserQuestion bridge** (`hooks/ask.py`, same shape) — Claude's own picker is a TUI affordance
   the glasses client isn't attached to, so this hook writes
   `~/.turma/questions/<sessionId>.req.json` (session id from

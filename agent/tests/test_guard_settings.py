@@ -138,11 +138,14 @@ class TestGuardSettings(unittest.TestCase):
         # The path is interpolated into a glob, so a prefix containing `[` would
         # be read as a character class: the directory it names goes unprotected
         # while an unrelated one is wrongly denied.
-        # MEASURED against the real binary: backslash escapes `[` and `*`; the
-        # `[c]` character-class spelling escapes NOTHING — a rule built with it
-        # denies nothing at all, which shipped once and was green over a string
-        # assertion exactly like this one. Keep the spelling pinned, and keep
-        # the note that only the binary can confirm it.
+        # This asserts the STRING, which is exactly the oracle that let the
+        # broken spelling ship. What the matcher does with these rules is
+        # measured in test_matcher_oracle.py; run it when changing the spelling.
+        # Measured there: backslash escapes `[` and `*` and does not overreach.
+        # The spelling that shipped broken wrapped EVERY metacharacter as `[c]`,
+        # so `t[1]` became `t[[]1[]]`, which denies nothing — but `[[]` alone
+        # does escape `[` correctly, so the old claim that the character-class
+        # spelling "escapes nothing" was wrong. Don't repeat it.
         rule, = ha.runtime_code_deny_rules(script_dir="/opt/t[1]/agent",
                                            repos_root="/mnt/data/Docker/git")
         self.assertEqual(rule, r"Edit(//opt/t\[1]/agent/**)")
@@ -183,9 +186,11 @@ class TestGuardSettings(unittest.TestCase):
 
     def test_the_files_that_wire_the_guard_are_denied(self):
         # Denying the agent's installed code without these just moves the
-        # two-Write attack one directory over: _ensure_guard_settings reuses
-        # this file whenever it merely EXISTS, never re-validating its content,
-        # so one Write disables both hooks for every session that manager starts.
+        # two-Write attack one directory over: this file is what WIRES both
+        # hooks. _ensure_guard_settings caches the path on the manager instance
+        # and rewrites the file on a fresh process, so a tampered copy is handed
+        # to every session that manager launches for the rest of its lifetime
+        # (managers here run for days) and is repaired only by a restart.
         deny = ha.build_guard_settings()["permissions"]["deny"]
         self.assertIn("Edit(~/.turma/guard-settings.json)", deny)
         self.assertIn("Edit(~/.turma/limits-settings.json)", deny)

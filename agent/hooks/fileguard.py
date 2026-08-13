@@ -14,6 +14,14 @@ this hook exists:
 Those two make Claude Code's memory feature work, and without them every session
 on the fleet rediscovers the same repo facts on every run.
 
+Caveat, measured through the real binary (``tests/test_matcher_oracle.py``):
+only the ``agent-memory`` half is reachable today. Claude Code gates writes
+under ``~/.claude/projects/`` itself -- refused in ``auto`` and ``acceptEdits``
+with NO settings at all, and no allow rule pre-grants it -- so a session's own
+auto-memory needs ``bypassPermissions`` regardless of what this hook permits.
+The hole stays open because it costs nothing and a later release may lift that
+gate; the oracle fails if it does, so the note gets corrected rather than rotting.
+
 **Why a hook and not `permissions.deny` patterns.** The rule wanted here is
 "everything under X except Y". Deny beats allow, so the exception cannot be an
 allow rule — it has to be a hole in the deny, and a glob list cannot cut that
