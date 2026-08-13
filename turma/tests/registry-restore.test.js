@@ -168,3 +168,47 @@ test("it says so, and keeps the file rather than deleting it", () => {
   assert.equal(fs.statSync(ASIDE).size, WROTE);
   assert.equal(fs.existsSync(process.env.STATE_FILE), false, "and moved out of the way");
 });
+
+test("every field the restore coerces is reachable from the restore's own line", () => {
+  // The restore loop lives near the top of server.js and reaches each
+  // normalize* only because FUNCTION DECLARATIONS hoist. Anything one of them
+  // closes over that is a module `const` declared further down is in its TDZ
+  // there, and the ReferenceError lands in the restore's catch — which empties
+  // the WHOLE registry. Every host that was offline at that moment is then gone
+  // from disk 30s later, when the save timer rewrites state.json from the
+  // hosts that have re-beaten.
+  //
+  // XERK-301 shipped exactly that (a `const SUBSCRIPTION_KEY_MAX` above
+  // `normalizeSubscription`), so this boots a hub over a record carrying every
+  // coerced block at once. It is a BOOT test on purpose: server.test.js walks
+  // the loader's body directly and cannot see a TDZ that only exists at
+  // require time.
+  const populated = tmp("state-populated");
+  fs.writeFileSync(populated, JSON.stringify({
+    solo: {
+      key: "solo", device: "solo", lastSeen: Date.now(), repos: [],
+      sessions: [{ id: "s1", usage: { models: [{ model: "m", totals: {} }] } }],
+      usage: { models: [{ model: "m", totals: {} }] },
+      limits: { fiveHour: { usedPct: 12 }, capturedAt: 1_786_400_000 },
+      subscription: { key: "abc123", source: "login" },
+      localModel: { available: true, model: "qwen", contextTokens: 128000 },
+    },
+  }));
+  // A successful restore logs its own "loaded N agents" line to stdout, so the
+  // probe's answer is fenced rather than being the whole stream.
+  const probe = `
+    const hub = require(${JSON.stringify(path.join(__dirname, "..", "server.js"))});
+    process.stdout.write("<<" + JSON.stringify({
+      keys: Object.keys(hub.agents), sub: hub.agents.solo && hub.agents.solo.subscription,
+    }) + ">>");
+  `;
+  const r = require("child_process").spawnSync(process.execPath, ["-e", probe], {
+    env: { ...process.env, STATE_FILE: populated }, encoding: "utf8",
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stderr.includes("state restore skipped"), false,
+    `the restore must survive a fully-populated record:\n${r.stderr}`);
+  const out = JSON.parse(r.stdout.match(/<<([\s\S]*)>>/)[1]);
+  assert.deepEqual(out.keys, ["solo"]);
+  assert.deepEqual(out.sub, { key: "abc123", source: "login" });
+});

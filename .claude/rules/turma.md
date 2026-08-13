@@ -163,10 +163,23 @@ which makes an `android/` change part of the same PR) live there.
     - Each window takes its **FRESHEST** reading, not an average or a maximum: every host reads the
       same counter, and across a window's reset the newest read is the only right answer where a
       maximum would keep the pre-reset figure alive. Per window, since the freshest snapshot need
-      not carry both.
+      not carry both — so a window sourced from an older host **discloses its own read age**, the
+      head's stamp being the group's freshest rather than that row's.
+    - **Both clients sort freshest-first before folding and replace only on a STRICTLY newer read.**
+      Fold in fleet order, or accept an equal `capturedAt`, and two hosts whose snapshots tie to the
+      second resolve to a different host on each client — one subscription showing two different
+      percentages. Tests: the tie cases in `usage.test.js` and `UsageViewModelTest`.
     - `normalizeSubscription` coerces the block at ingest for the same reason `normalizeLimits`
       does, and because the key is a MAP KEY on every client: anything unusable becomes null, never
-      a plausible default that would fold two subscriptions into one set of bars.
+      a plausible default that would fold two subscriptions into one set of bars. Its bounds are
+      **literals, not module `const`s** — see the restore-TDZ rule below.
+  - **Anything a `normalize*` closes over must be reachable from `loadState`'s line.** That loop
+    sits near the top of `server.js` and reaches each one only because function declarations hoist;
+    a module `const` declared below is in its TDZ there, the `ReferenceError` lands in the restore's
+    catch, and the WHOLE registry is emptied — then the 30s save timer rewrites `state.json` from
+    only the hosts that have re-beaten, losing every host offline at that moment. XERK-301 shipped
+    exactly that and it is invisible to `server.test.js`, which walks the loader's body rather than
+    booting; `registry-restore.test.js` boots a hub over a fully-populated record instead.
   - Tests: `usage.test.js`, the `limits` and subscription-key heartbeat cases in `server.test.js`,
     android `UsageViewModelTest`.
 

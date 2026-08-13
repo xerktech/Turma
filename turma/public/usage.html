@@ -680,6 +680,17 @@ function limitCard(group, nowSec) {
       reset.textContent = " · " + view.reset;
       right.append(reset);
     }
+    // The head's stamp is the group's FRESHEST capture, so on a consolidated
+    // card a window sourced from an older host would otherwise be presented
+    // under an age that isn't its own. Each window discloses its own read when
+    // the two differ.
+    if (held.capturedAt < group.capturedAt) {
+      const from = document.createElement("span");
+      from.className = "lim-reset";
+      from.textContent = " · read " + fmtDuration(nowSec - held.capturedAt) + " ago";
+      from.title = "This window's freshest reading came from " + held.host + ".";
+      right.append(from);
+    }
     line.append(name, right);
 
     const track = document.createElement("div");

@@ -248,13 +248,21 @@ private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        LimitRow("Session (5h)", card.fiveHour)
-        LimitRow("Weekly (7d)", card.sevenDay)
+        LimitRow("Session (5h)", card.fiveHour,
+            (nowSec - card.fiveHourAt).takeIf { card.fiveHourAt < card.capturedAt })
+        LimitRow("Weekly (7d)", card.sevenDay,
+            (nowSec - card.sevenDayAt).takeIf { card.sevenDayAt < card.capturedAt })
     }
 }
 
+/**
+ * One window's row. [readAgeSec] is this window's OWN age, passed only when the
+ * reading is older than the card's stamp — which happens on a consolidated card
+ * whose freshest host didn't report this window, where showing the figure under
+ * the head's age would be presenting somebody else's freshness as its own.
+ */
 @Composable
-private fun LimitRow(label: String, view: UsageViewModel.LimitView?) {
+private fun LimitRow(label: String, view: UsageViewModel.LimitView?, readAgeSec: Long? = null) {
     if (view == null) return
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val color = when {
@@ -267,7 +275,8 @@ private fun LimitRow(label: String, view: UsageViewModel.LimitView?) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(label, style = MaterialTheme.typography.bodySmall, color = muted)
             Text(
-                view.pctLabel + (if (view.reset.isEmpty()) "" else " · ${view.reset}"),
+                view.pctLabel + (if (view.reset.isEmpty()) "" else " · ${view.reset}") +
+                    (readAgeSec?.let { " · read ${UsageViewModel.fmtDuration(it)} ago" } ?: ""),
                 style = MaterialTheme.typography.bodySmall,
                 color = if (view.expired) muted else MaterialTheme.colorScheme.onSurface,
             )

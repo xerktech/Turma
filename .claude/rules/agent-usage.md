@@ -124,6 +124,9 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
   both real layouts (`CLAUDE_CONFIG_PATHS`: inside the config dir, then beside it). The credentials
   file next to it cannot answer this — its tokens rotate, and `subscriptionType` names a PLAN, which
   two different accounts share.
+  - **Every path is tried until one ANSWERS**, not until one EXISTS: `~/.claude/` sits beside
+    `~/.claude.json`, so falling through only on a missing path lets an accountless first file
+    permanently suppress the layout holding the login.
 - **What rides the wire is a hash, never the uuid, org uuid or email.** The hub persists every beat
   into `state.json` and fans it out to web, Android and glasses, and grouping only ever asks whether
   two hosts are equal.
@@ -131,7 +134,11 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
   — two hosts that both report nothing are not thereby on one plan. `TURMA_SUBSCRIPTION_KEY` pins a
   group by hand for a host whose config this can't read; it is hashed the same way, so two hosts
   given one string group.
-- `subscription_identity` **never raises** (beat critical path, over a file Claude Code rewrites
-  constantly) and is **cached on the file's `(mtime, size)`** — it is ~120 KiB of caches, so
-  re-parsing it every beat would be pure waste, while a re-login still wins.
+- `subscription_identity` **never raises and never blocks** — it runs inline on the beat over a path
+  the agent does not own, so `_subscription_from_config` takes **regular files ONLY** (a FIFO there
+  blocks `open()` until somebody writes, and the host would simply stop heartbeating with nothing
+  anywhere to say why) and bounds the **READ**, never `st_size` (a char device reports 0 and then
+  hands over bytes forever — the trap `read_limits_snapshot` spells out).
+- Cached on the file's `(mtime, size)`, per path — it is ~120 KiB of caches, so re-parsing it every
+  beat would be pure waste, while a re-login still wins.
 - Tests: `TestSubscriptionIdentity`.

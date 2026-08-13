@@ -367,6 +367,37 @@ class UsageViewModelTest {
             UsageViewModel.compute(fleet, now).limits.single().hosts.map { it.host })
     }
 
+    @Test fun `a capturedAt tie breaks the same way the web does`() {
+        // Two hosts whose snapshots tie to the second: fold in fleet order (or
+        // accept an equal capturedAt as newer) and this client shows a DIFFERENT
+        // percentage from the web for one subscription — the parity rule. Both
+        // sort freshest-first stably and replace only on a strictly newer read.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "first", device = "first", subscription = sub("k1"), limits = limits(
+                now - 5, five = LimitWindow(usedPct = 11.0), seven = LimitWindow(usedPct = 21.0))),
+            AgentInfo(key = "second", device = "second", subscription = sub("k1"), limits = limits(
+                now - 5, five = LimitWindow(usedPct = 99.0), seven = LimitWindow(usedPct = 91.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(11.0, card.fiveHour!!.pct, 0.001)
+        assertEquals(21.0, card.sevenDay!!.pct, 0.001)
+    }
+
+    @Test fun `a window read before the card's stamp carries its own read time`() {
+        // The head shows the group's FRESHEST capture, so a window the freshest
+        // host didn't report must not be presented under it.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", device = "old", subscription = sub("k1"),
+                limits = limits(now - 900, seven = LimitWindow(usedPct = 44.0))),
+            AgentInfo(key = "new", device = "new", subscription = sub("k1"),
+                limits = limits(now - 30, five = LimitWindow(usedPct = 3.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(now - 30, card.capturedAt)
+        assertEquals(now - 30, card.fiveHourAt)   // same as the head: nothing to disclose
+        assertEquals(now - 900, card.sevenDayAt)  // older, so the row says so
+    }
+
     @Test fun `a long host list gives way to a count`() {
         val fleet = FleetState(agents = (1..5).map {
             AgentInfo(key = "h$it", device = "h$it", subscription = sub("k1"),

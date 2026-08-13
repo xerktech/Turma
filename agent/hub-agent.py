@@ -54,6 +54,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -1554,17 +1555,16 @@ def claude_auth_status(path=None, now_ms=None):
 # are equal — so there is nothing to gain by shipping the identifier itself.
 SUBSCRIPTION_KEY_ENV = "TURMA_SUBSCRIPTION_KEY"
 # The config file is ~120 KiB of caches on a real host and grows; this is the
-# "that is not the file I think it is" bound (a path aimed at /dev/zero is an
-# unbounded allocation), not a size anyone should approach.
+# "that is not the file I think it is" bound, not a size anyone should approach.
 SUBSCRIPTION_CONFIG_MAX_BYTES = 8 << 20
 # Truncated: this is a grouping key, not a credential, and 64 bits makes a
 # collision between two of one operator's logins a non-event.
 SUBSCRIPTION_KEY_CHARS = 16
 
-# (stat signature, block) for the config path last read. That file is big and
+# path -> ((mtime, size), block) for each config path read. That file is big and
 # almost never changes, so re-parsing it every beat would be pure waste; a
 # changed mtime/size is what invalidates this, so a re-login is picked up.
-_subscription_cache = None
+_subscription_cache = {}
 _subscription_last_problem = None
 
 
@@ -1599,42 +1599,70 @@ def subscription_identity(paths=None, env=None):
     two hosts given the same string land in the same group and neither source
     leaks its input.
 
-    Never raises. It runs on the beat's critical path over a file Claude Code
-    owns and rewrites constantly, so a truncated write or a shape a release
-    changed must cost the grouping, not the beat.
+    Every candidate path is tried until one ANSWERS — a path that exists but
+    carries no account must not suppress the layout that does, since the two are
+    routinely both present (`~/.claude/` is a directory beside `~/.claude.json`).
     """
     env = os.environ if env is None else env
     pinned = (env.get(SUBSCRIPTION_KEY_ENV) or "").strip()
     if pinned:
         return {"key": _subscription_key("env:" + pinned), "source": "env"}
-    global _subscription_cache
     for path in (paths if paths is not None else CLAUDE_CONFIG_PATHS):
-        try:
-            st = os.stat(path)
-        except OSError:
-            continue                    # not this layout; try the next
-        sig = (path, st.st_mtime_ns, st.st_size)
-        if _subscription_cache and _subscription_cache[0] == sig:
-            return _subscription_cache[1]
-        block = None
-        try:
-            if st.st_size > SUBSCRIPTION_CONFIG_MAX_BYTES:
-                _log_subscription_problem(
-                    f"claude config at {path} is implausibly large; not reading it")
-            else:
-                with open(path, encoding="utf-8") as fh:
-                    account = (json.load(fh) or {}).get("oauthAccount") or {}
-                account_uuid = account.get("accountUuid")
-                if isinstance(account_uuid, str) and account_uuid.strip():
-                    block = {"key": _subscription_key("account:" + account_uuid.strip()),
-                             "source": "login"}
-        except Exception as e:
-            _log_subscription_problem(
-                f"claude config at {path} unreadable ({e}); "
-                "this host will not be grouped by subscription")
-        _subscription_cache = (sig, block)
-        return block
+        block = _subscription_from_config(path)
+        if block:
+            return block
     return None
+
+
+def _subscription_from_config(path):
+    """One config path's subscription block, or None — missing, not a regular
+    file, implausibly large, unreadable, or simply carrying no account.
+
+    Never raises, and never BLOCKS. It runs on the beat's critical path over a
+    path this agent does not own, so a truncated write, a shape a release
+    changed, or something at that path that isn't the config file at all must
+    cost the grouping and nothing else.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None                     # not this layout; the caller tries the next
+    # Regular files ONLY. A FIFO here blocks `open()` for as long as nobody
+    # writes to it, and this call is inline in the beat — the host would simply
+    # stop heartbeating, with no error anywhere to say why. A directory or a
+    # device at that path is equally not the file being looked for.
+    if not stat.S_ISREG(st.st_mode):
+        _log_subscription_problem(
+            f"claude config at {path} is not a regular file; ignoring it")
+        return None
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _subscription_cache.get(path)
+    if cached and cached[0] == sig:
+        return cached[1]
+    block = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            # Bounded by the READ, never by `st_size`: a char device reports a
+            # size of 0 and then hands over bytes forever, so a stat-only check
+            # is not a check at all (the same trap read_limits_snapshot spells
+            # out). S_ISREG above already excludes /dev/zero itself; this is
+            # what makes the bound true for anything that merely looks regular.
+            text = fh.read(SUBSCRIPTION_CONFIG_MAX_BYTES + 1)
+        if len(text) > SUBSCRIPTION_CONFIG_MAX_BYTES:
+            _log_subscription_problem(
+                f"claude config at {path} is implausibly large; not reading it")
+        else:
+            account = (json.loads(text) or {}).get("oauthAccount") or {}
+            account_uuid = account.get("accountUuid")
+            if isinstance(account_uuid, str) and account_uuid.strip():
+                block = {"key": _subscription_key("account:" + account_uuid.strip()),
+                         "source": "login"}
+    except Exception as e:
+        _log_subscription_problem(
+            f"claude config at {path} unreadable ({e}); "
+            "this host will not be grouped by subscription")
+    _subscription_cache[path] = (sig, block)
+    return block
 
 
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)

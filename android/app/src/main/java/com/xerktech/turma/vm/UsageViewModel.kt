@@ -94,6 +94,14 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val capturedAt: Long,
         val fiveHour: LimitView? = null,
         val sevenDay: LimitView? = null,
+        /**
+         * When each window's reading was actually taken. [capturedAt] is the
+         * group's FRESHEST capture, so on a consolidated card a window sourced
+         * from an older host would otherwise be presented under an age that is
+         * not its own; the screen discloses these when they differ.
+         */
+        val fiveHourAt: Long = capturedAt,
+        val sevenDayAt: Long = capturedAt,
     ) {
         /**
          * The card's heading. There is no better name for a subscription — the
@@ -324,14 +332,26 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
          * where a maximum would keep the pre-reset figure alive.
          */
         fun limitCards(fleet: FleetState, nowSec: Long): List<LimitCard> {
+            // Freshest-first BEFORE folding, and a strict `>` when a window is
+            // replaced, exactly as the web's limitEntries → limitGroups pair
+            // does. Both halves matter for the parity rule: fold in fleet order
+            // (or accept an equal capturedAt) and two hosts whose snapshots tie
+            // to the second resolve to a different host on each client, showing
+            // two different percentages for one subscription. Kotlin's sort is
+            // stable and so is the browser's, so a tie keeps fleet order on
+            // both.
+            val ranked = fleet.agents.mapNotNull { a ->
+                val lim = a.limits ?: return@mapNotNull null
+                if (nowSec - lim.capturedAt > LIMIT_MAX_AGE_SEC) return@mapNotNull null
+                if (lim.fiveHour?.usedPct == null && lim.sevenDay?.usedPct == null) return@mapNotNull null
+                a to lim
+            }.sortedByDescending { (_, lim) -> lim.capturedAt }
+
             // Insertion-ordered so ungrouped hosts keep their place among the
             // groups; the sort at the end is what actually orders the cards.
             val groups = mutableListOf<MutableLimitGroup>()
             val byKey = mutableMapOf<String, MutableLimitGroup>()
-            for (a in fleet.agents) {
-                val lim = a.limits ?: continue
-                if (nowSec - lim.capturedAt > LIMIT_MAX_AGE_SEC) continue
-                if (lim.fiveHour?.usedPct == null && lim.sevenDay?.usedPct == null) continue
+            for ((a, lim) in ranked) {
                 val subKey = a.subscription?.key?.takeIf { it.isNotBlank() }
                 val group = subKey?.let { byKey[it] } ?: MutableLimitGroup().also {
                     groups.add(it)
@@ -339,21 +359,23 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 group.hosts.add(LimitHost(a.device.ifBlank { a.key }, lim.capturedAt))
                 group.capturedAt = maxOf(group.capturedAt, lim.capturedAt)
-                if (lim.fiveHour?.usedPct != null && lim.capturedAt >= group.fiveHourAt) {
+                if (lim.fiveHour?.usedPct != null && lim.capturedAt > group.fiveHourAt) {
                     group.fiveHour = lim.fiveHour
                     group.fiveHourAt = lim.capturedAt
                 }
-                if (lim.sevenDay?.usedPct != null && lim.capturedAt >= group.sevenDayAt) {
+                if (lim.sevenDay?.usedPct != null && lim.capturedAt > group.sevenDayAt) {
                     group.sevenDay = lim.sevenDay
                     group.sevenDayAt = lim.capturedAt
                 }
             }
             return groups.map { g ->
                 LimitCard(
-                    hosts = g.hosts.sortedByDescending { it.capturedAt },
+                    hosts = g.hosts,
                     capturedAt = g.capturedAt,
                     fiveHour = limitView(g.fiveHour, nowSec),
                     sevenDay = limitView(g.sevenDay, nowSec),
+                    fiveHourAt = if (g.fiveHour != null) g.fiveHourAt else g.capturedAt,
+                    sevenDayAt = if (g.sevenDay != null) g.sevenDayAt else g.capturedAt,
                 )
             }.sortedByDescending { it.capturedAt }
         }

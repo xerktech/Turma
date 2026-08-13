@@ -82,7 +82,7 @@ function loadHelpers() {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheHitRate, blankBucket,
-    limitEntries, limitGroups, limitHostLabel, limitWindowView, fmtDuration,
+    limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView, fmtDuration,
     LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC };`;
   return new Function(...keys, body)(...keys.map((k) => stubs[k]));
 }
@@ -287,6 +287,52 @@ test("limitGroups leads with the freshest card", () => {
     { device: "fresh", ...sub("k2"), limits: { capturedAt: NOW - 60, sevenDay: { usedPct: 2 } } },
   ], NOW);
   assert.deepEqual(groups.map((g) => g.hosts[0].host), ["fresh", "stale"]);
+});
+
+test("limitGroups breaks a capturedAt TIE the same way the Android port does", () => {
+  // Two hosts whose snapshots tie to the second: fold in a different order, or
+  // accept an equal capturedAt as newer, and each client shows a DIFFERENT
+  // percentage for one subscription. Both sort freshest-first (stably) and both
+  // replace only on a strictly newer read, so a tie keeps fleet order on both.
+  const groups = H.limitGroups([
+    { device: "first", ...sub("k1"),
+      limits: { capturedAt: NOW - 5, fiveHour: { usedPct: 11 }, sevenDay: { usedPct: 21 } } },
+    { device: "second", ...sub("k1"),
+      limits: { capturedAt: NOW - 5, fiveHour: { usedPct: 99 }, sevenDay: { usedPct: 91 } } },
+  ], NOW);
+  assert.equal(groups[0].windows.fiveHour.win.usedPct, 11);
+  assert.equal(groups[0].windows.sevenDay.win.usedPct, 21);
+});
+
+test("a window read earlier than the card's stamp says so on its own row", () => {
+  // The head shows the group's FRESHEST capture. A window the freshest host
+  // didn't report comes from an older read, and presenting it under that head
+  // would be showing somebody else's freshness as its own.
+  const card = H.limitCard(H.limitGroups([
+    { device: "old", ...sub("k1"),
+      limits: { capturedAt: NOW - 900, sevenDay: { usedPct: 44 } } },
+    { device: "new", ...sub("k1"),
+      limits: { capturedAt: NOW - 30, fiveHour: { usedPct: 3 } } },
+  ], NOW)[0], NOW);
+  const text = (el) => (el.children || []).map((c) => (c.textContent || "") + text(c)).join("");
+  assert.match(text(card), /captured 30s ago/);
+  assert.match(text(card), /read 15m ago/);      // the 7d row's own read
+  assert.equal(/read .* ago/.test(text(card).replace(/read 15m ago/, "")), false,
+    "only the window that is actually behind discloses an age");
+});
+
+test("a hostile device name lands as TEXT, never as markup", () => {
+  // The label concatenates several agent-supplied device names, and the tooltip
+  // repeats them — agents are authenticated but a host names itself.
+  const evil = '<img src=x onerror="window.__xss=1">';
+  const card = H.limitCard(H.limitGroups([
+    { device: evil, ...sub("k1"), limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
+    { device: "alpha", ...sub("k1"), limits: { capturedAt: NOW - 1, fiveHour: { usedPct: 5 } } },
+  ], NOW)[0], NOW);
+  const host = card.children[0].children[0];
+  assert.equal(host.textContent, `${evil} · alpha`);
+  assert.equal(host.innerHTML, "", "the name must never be assigned as markup");
+  assert.match(host.title, /alpha/);
 });
 
 test("limitHostLabel names the hosts, counting the tail past a few", () => {

@@ -3368,8 +3368,8 @@ class TestSubscriptionIdentity(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, ".claude.json")
-        ha._subscription_cache = None
-        self.addCleanup(setattr, ha, "_subscription_cache", None)
+        ha._subscription_cache = {}
+        self.addCleanup(setattr, ha, "_subscription_cache", {})
 
     def _write(self, data, path=None):
         with open(path or self.path, "w", encoding="utf-8") as fh:
@@ -3398,10 +3398,10 @@ class TestSubscriptionIdentity(unittest.TestCase):
     def test_the_same_account_gives_the_same_key_and_a_different_one_does_not(self):
         self._write({"oauthAccount": {"accountUuid": "acc-1"}})
         first = self._read()["key"]
-        ha._subscription_cache = None
+        ha._subscription_cache = {}
         self._write({"oauthAccount": {"accountUuid": "acc-1"}})
         self.assertEqual(self._read()["key"], first)
-        ha._subscription_cache = None
+        ha._subscription_cache = {}
         self._write({"oauthAccount": {"accountUuid": "acc-2"}})
         self.assertNotEqual(self._read()["key"], first)
 
@@ -3412,7 +3412,7 @@ class TestSubscriptionIdentity(unittest.TestCase):
         self.assertIsNone(self._read())                    # no file at all
         self._write({"numStartups": 3})                    # no oauthAccount
         self.assertIsNone(self._read())
-        ha._subscription_cache = None
+        ha._subscription_cache = {}
         self._write({"oauthAccount": {"accountUuid": ""}})  # blank uuid
         self.assertIsNone(self._read())
 
@@ -3422,7 +3422,7 @@ class TestSubscriptionIdentity(unittest.TestCase):
         with open(self.path, "w", encoding="utf-8") as fh:
             fh.write('{"oauthAccount": {"accountUu')
         self.assertIsNone(self._read())
-        ha._subscription_cache = None
+        ha._subscription_cache = {}
         self._write(["not", "an", "object"])
         self.assertIsNone(self._read())
 
@@ -3441,14 +3441,38 @@ class TestSubscriptionIdentity(unittest.TestCase):
         self.assertEqual(pinned, self._read({ha.SUBSCRIPTION_KEY_ENV: "team-max"}))
         self.assertNotEqual(pinned["key"], self._read()["key"])
 
-    def test_the_first_readable_layout_wins(self):
+    def test_every_layout_is_tried_until_one_ANSWERS(self):
         # CLAUDE_CONFIG_DIR puts the file INSIDE the config dir; the default puts
-        # it beside it. Both are real, so both are tried in order.
+        # it beside it. Both are routinely present, so falling through only on a
+        # MISSING path lets an accountless first file permanently suppress the
+        # one that actually holds the login.
         other = os.path.join(self.dir, "other.json")
         self._write({"oauthAccount": {"accountUuid": "acc-2"}}, path=other)
-        self.assertEqual(
-            ha.subscription_identity(paths=[os.path.join(self.dir, "nope.json"), other],
-                                     env={})["source"], "login")
+        self._write({"numStartups": 3})          # exists, but answers nothing
+        missing = os.path.join(self.dir, "nope.json")
+        for paths in ([missing, other], [self.path, other]):
+            self.assertEqual(
+                ha.subscription_identity(paths=paths, env={})["source"], "login", paths)
+
+    def test_something_that_is_not_a_regular_file_is_never_opened(self):
+        # A FIFO blocks open() until somebody writes, and this runs INLINE in the
+        # beat — the host would just stop heartbeating with nothing to say why.
+        # A directory and a device at that path are equally not the config file.
+        os.mkfifo(self.path)
+        self.assertIsNone(self._read())
+        os.unlink(self.path)
+        os.mkdir(self.path)
+        self.assertIsNone(self._read())
+
+    @unittest.skipUnless(os.path.exists("/dev/zero"), "needs /dev/zero")
+    def test_an_endless_device_is_refused_without_being_read(self):
+        # /dev/zero reports st_size 0 and then hands over bytes forever, so a
+        # ceiling read off stat alone is not a ceiling — the old shape allocated
+        # 16 GiB in 12 seconds against it. The regular-file gate is what refuses
+        # it; the read bound behind that is belt and braces.
+        started = time.monotonic()
+        self.assertIsNone(ha.subscription_identity(paths=["/dev/zero"], env={}))
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_a_re_login_is_picked_up_rather_than_cached_forever(self):
         # The config file is ~120 KiB and almost never changes, so it is read
