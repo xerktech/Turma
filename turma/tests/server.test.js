@@ -1104,6 +1104,89 @@ test("alerts: question fires on new text only, re-arms when cleared", () => {
   assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
 });
 
+// ---- runaway session spend ----------------------------------------------------
+
+const WARN = hub.SESSION_SPEND_WARN_TOKENS;
+const HIGH = hub.SESSION_SPEND_HIGH_TOKENS;
+// A usage bucket totalling `n`, spread the way a real one is: cacheRead is the
+// overwhelming majority of a long session's spend, so a sum that ignored it
+// would read as near-zero on exactly the sessions this alert exists for.
+const spendOf = (n) => ({
+  sessions: [{
+    id: "s1", rcName: "nas-repo-s1", status: "running", session: {},
+    usage: { totals: { input: 1, output: 1, cacheWrite: 1, cacheRead: Math.max(0, n - 3) } },
+  }],
+});
+
+test("spend: fires once per stage, on the crossing, and never retracts", () => {
+  const beat = makeHost();
+  notifications.length = 0;
+  beat(spendOf(WARN - 1)); // under: quiet
+  assert.deepEqual(titles(), []);
+  beat(spendOf(WARN)); // crossing warn fires once
+  assert.equal(titles().length, 1);
+  assert.match(titles()[0], /^nas-repo-s1 has spent \d+M tokens$/);
+  notifications.length = 0;
+  beat(spendOf(WARN + 5e6)); // still climbing inside stage 1: quiet
+  beat(spendOf(HIGH - 1));
+  assert.deepEqual(titles(), []);
+  beat(spendOf(HIGH)); // crossing high fires once more, urgently
+  assert.equal(titles().length, 1);
+  assert.equal(notifications[0].data.priority, "high");
+  notifications.length = 0;
+  beat(spendOf(HIGH * 3)); // nothing above stage 2 to say
+  assert.deepEqual(titles(), []);
+});
+
+test("spend: both stages share one notifKey so the second replaces the first", () => {
+  const beat = makeHost();
+  notifications.length = 0;
+  beat(spendOf(WARN));
+  beat(spendOf(HIGH));
+  const keys = notifications.map((n) => n.data.notifKey);
+  assert.equal(keys.length, 2);
+  assert.equal(keys[0], keys[1], "the escalation must replace the first notice, not stack beside it");
+  assert.equal(notifications[0].data.sessionId, "s1"); // routed so a tap opens it
+});
+
+test("spend: a session past both thresholds in one beat reports only the high stage", () => {
+  // The staggered per-session usage refresh means a session can jump both
+  // thresholds between two reads. It must not emit the stage it skipped.
+  const beat = makeHost();
+  notifications.length = 0;
+  beat(spendOf(HIGH + 1));
+  assert.equal(titles().length, 1);
+  assert.equal(notifications[0].data.priority, "high");
+  notifications.length = 0;
+  beat(spendOf(HIGH + 2));
+  assert.deepEqual(titles(), []);
+});
+
+test("spend: a stopped session's total is history; resuming it announces", () => {
+  const beat = makeHost();
+  const stopped = JSON.parse(JSON.stringify(spendOf(HIGH)));
+  stopped.sessions[0].status = "stopped";
+  notifications.length = 0;
+  beat(stopped); // its record keeps reporting usage, but the number can't move
+  assert.deepEqual(titles(), []);
+  beat(spendOf(HIGH)); // same spend, now running again
+  assert.equal(titles().length, 1);
+});
+
+test("spend: sessionSpendTokens sums the four counters and ignores junk", () => {
+  assert.equal(hub.sessionSpendTokens({ input: 1, output: 2, cacheWrite: 3, cacheRead: 4 }), 10);
+  assert.equal(hub.sessionSpendTokens(undefined), 0);
+  assert.equal(hub.sessionSpendTokens(null), 0);
+  assert.equal(hub.sessionSpendTokens("142M"), 0);
+  // A malformed bucket from one buggy host must not fabricate a spend figure.
+  assert.equal(hub.sessionSpendTokens({ input: "lots", output: NaN, cacheRead: -5, cacheWrite: 7 }), 7);
+  assert.equal(hub.sessionSpendStage(0), 0);
+  assert.equal(hub.sessionSpendStage(WARN), 1);
+  assert.equal(hub.sessionSpendStage(HIGH), 2);
+  assert.equal(hub.fmtSpendTokens(252_500_000), "253M");
+  assert.equal(hub.fmtSpendTokens(1_240_000_000), "1.2B");
+});
+
 test("alerts: a retraction is withheld from a build that lacks dismiss support (XERK-154)", () => {
   // An older app registered before it understood dismisses — it must still get
   // the alert, but a dismiss would show as a blank notification on it.
