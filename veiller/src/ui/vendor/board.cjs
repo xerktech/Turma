@@ -553,11 +553,57 @@
   // Once a ticket has sessions the button stays, compacted to a "+": a second
   // session on one ticket is supported (it gets the -1/-2 branch), just not the
   // common case, so it stops competing with the chips for the card's width.
-  function ticketStartHtml(t, sessions, start) {
+  // This ticket's entry in the hub's ticket queue (XERK-296), or null. The queue
+  // is hub-owned and rides /api/agents as `ticketQueue`, exactly like the agent
+  // pins — a waiting ticket has no host and no session, so this payload is the
+  // only place it exists.
+  function queuedTicketOf(ticketQueue, siteKey, issueKey) {
+    return (ticketQueue || []).find(
+      (q) => q && q.siteKey === siteKey && q.issueKey === issueKey) || null;
+  }
+
+  // How a waiting ticket reads on its card. `position` is its place in its own
+  // org's line, so it is only worth printing past the first. A "blocked" hold
+  // means the queue can't route it for a reason the operator has to clear (no
+  // triaged repo, a pinned agent that's offline) rather than one that clears
+  // itself — same text either way, but it says which.
+  function queuedLabel(q) {
+    if (!q) return "";
+    if (q.reason === "blocked") return "⏳ queued · blocked";
+    return "⏳ queued" + (q.position > 1 ? " · #" + q.position : "");
+  }
+
+  function queuedTip(q, issueKey) {
+    if (!q) return "";
+    if (q.reason === "blocked") {
+      return `${issueKey} is waiting: ${q.error || "the hub can't route it right now"}`;
+    }
+    return `${issueKey} is waiting for a free session slot on one of the org's `
+      + `agents — whichever frees up first takes it`
+      + (q.position > 1 ? ` (#${q.position} in line)` : "");
+  }
+
+  function ticketStartHtml(t, sessions, start, queued) {
     const g = t && t.repoGuess;
     const chips = (sessions || []).map(sessionChipHtml).join("");
     if (!g || !g.repo) return chips;
     const st = start || {};
+    // Waiting in the hub queue: no host has been chosen and no session exists, so
+    // the card offers the one thing that applies — take it back out of the line.
+    // The start button is replaced rather than kept beside it: a second press
+    // would only re-queue the ticket it is already queued for.
+    if (queued) {
+      const tip = queuedTip(queued, t.key);
+      // A failed CANCEL parks its reason here (the entry rolled back, so the card
+      // is still the queued one) — same inline convention as a failed start.
+      const qerr = st.error
+        ? `<span class="kc-start-err" title="${esc(st.error)}">⚠ ${esc(st.error)}</span>`
+        : "";
+      return chips + qerr + `<span class="kc-queued${queued.reason === "blocked" ? " kc-queued-blocked" : ""}"
+        title="${esc(tip)}">${esc(queuedLabel(queued))}</span><button class="kc-unqueue" type="button"
+        data-unqueue="${esc(t.key)}" title="Take ${esc(t.key)} out of the queue"
+        aria-label="Take ${esc(t.key)} out of the queue">✕</button>`;
+    }
     if (st.pending) {
       return chips + `<span class="kc-start kc-start-busy"
         title="Starting a session for ${esc(t.key)}…">⏳ starting…</span>`;
@@ -594,7 +640,7 @@
     }
     const repo = repoChipHtml(t);
     if (repo) bits.push(repo);
-    const start = ticketStartHtml(t, o.sessions, o.start);
+    const start = ticketStartHtml(t, o.sessions, o.start, o.queued);
     if (start) bits.push(start);
     // A drag in flight / just landed (XERK-141) shows a "moving…" chip; a failed
     // one shows why on the card (same inline convention as the start-error note).
@@ -1157,6 +1203,7 @@
             color: c.color, now: o.now,
             sessions: ticketSessionsOf(o.sessionIndex, c.site.siteKey, c.t.key),
             start: o.starts && o.starts.get((c.site.siteKey || "") + "\x00" + c.t.key),
+            queued: queuedTicketOf(o.ticketQueue, c.site.siteKey, c.t.key),
             moving: !!(c.mv && c.mv.pending && !c.mv.error),
             moveError: c.mv && c.mv.error,
           })).join("")
@@ -1397,6 +1444,7 @@
     statusFieldHtml, statusPickerHtml, statusPickerValue,
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+    queuedTicketOf, queuedLabel, queuedTip,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };
   if (typeof window !== "undefined") window.TurmaBoard = api;

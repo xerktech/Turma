@@ -30,6 +30,11 @@ data class AgentsResponse(
     // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
     // 1..8 (presence = pinned). Hub-owned and durable; absent on older hubs.
     val orgColors: Map<String, Int> = emptyMap(),
+    // Tickets waiting for a free session slot (XERK-296). A queued ticket has no
+    // host and no session — the hub picks the host when one can actually start
+    // it — so this payload is the only place it exists. Absent on older hubs,
+    // which is indistinguishable from "nothing waiting" and reads the same.
+    val ticketQueue: List<QueuedTicket> = emptyList(),
     // Whether the hub can deliver mobile push at all — FCM configured (XERK-152).
     // Hub-wide, not per-agent. When false, every alert is silently dropped, so
     // the Dashboard shows a "push is off" banner. Defaults true so an older hub
@@ -44,6 +49,26 @@ data class TicketAgentPin(val host: String = "", val at: Long = 0)
 /** One ticket->model pin (the web board's Model row; hub ticket-models store). */
 @Serializable
 data class TicketModelPin(val model: String = "", val at: Long = 0)
+
+/**
+ * One ticket waiting in the hub's queue for a free session slot (XERK-296).
+ * [position] is its place in its OWN org's line (capacity is per org, so that is
+ * the only line that means anything). [reason] is why it is still waiting as of
+ * the hub's last pass — "capacity" clears itself; "blocked" needs the operator,
+ * and [error] is the hub's own wording for what to fix. [source] is "auto" (the
+ * org's auto-start sweep queued it) or "manual" (an operator pressed Start);
+ * only auto entries are swept away when the org's Auto switch goes off.
+ */
+@Serializable
+data class QueuedTicket(
+    val siteKey: String = "",
+    val issueKey: String = "",
+    val source: String = "auto",
+    val queuedAt: Long = 0,
+    val position: Int = 1,
+    val reason: String? = null,
+    val error: String? = null,
+)
 
 /**
  * The host login's real model list, probed from the CLI (hub-agent models

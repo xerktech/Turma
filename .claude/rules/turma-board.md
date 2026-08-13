@@ -119,7 +119,9 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   demand); a "no repo" verdict and an untriaged ticket get none. A failed start renders its reason
   beside a LIVE button.
 - In-flight state clears on **evidence**, not a timer: a session reporting the spawn's `cmdId`, or
-  the command clearing from the host's queue (which covers a spawn the agent REFUSED).
+  the command clearing from the host's queue (which covers a spawn the agent REFUSED). A `{queued}`
+  reply has neither — nothing was handed to a host — so it clears the pending outright and the card
+  paints from `ticketQueue` (XERK-296).
 - The press is acknowledged **instantly and survives leaving the board** (XERK-18): the button acts
   on **`pointerdown`** (fired before any re-render — the board `innerHTML`-replaces every beat),
   `click` the keyboard path, both via `startFrom` whose pending guard no-ops a double-fire;
@@ -135,7 +137,9 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   refuses rather than reroutes.
 - `findTicketHost` chooses among the org's **ONLINE** hosts: **prefers one with the repo cloned**,
   and — within that group, or across all when none has it — picks the **most available**
-  (`hostAvailability`). A momentarily-full host is still valid: the session **queues** there.
+  (`hostAvailability`). Under `requireFree` (every ticket spawn — XERK-296 above) a **full host is
+  not a target at all**: with none free the TICKET queues hub-side instead, and is routed on a later
+  pass.
 - `hostAvailability(a)` = `capacity.free` **minus `capacity.queued` and the spawn/spawnTicket
   commands still queued** since its last heartbeat — subtracting in-flight commands is what makes
   rapid clicks split. An agent predating `capacity` scores below one that reports it.
@@ -143,6 +147,49 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   the most-available host; `spawn_ticket` clones it and queues behind the clone — never a refusal.
 - The **multi-host-per-org limits still apply**: the triage/branch state is per-host, so a
   clone-on-demand routed to a host that didn't triage the ticket has no ledger entry to clone from.
+
+#### The hub's ticket queue (XERK-296)
+
+The rule ("waiting work is a queued TICKET, and its host is chosen at dispatch") is in `CLAUDE.md`;
+this is how it works. Read it before touching `findTicketHost`, the `/session` routes or the sweeps.
+
+- **Every ticket spawn goes through it** — the Start button and the auto-start sweep alike. Both
+  reach `findTicketHost(..., {requireFree:true})`; a host with a free slot is used at once, and only
+  a fleet with none queues. The agent-side session queue (XERK-14) keeps the cases where the host IS
+  the decision: "+ New session", and a ticket session waiting on its clone.
+- `drainTicketQueue()` runs on **every heartbeat** (the beat IS the capacity report, so a freed slot
+  is claimed within a beat) and on the 15s sweep after `autoStartSweep`/`autoStopSweep`.
+  **At most one dispatch per host per pass**, mirroring the agent's one-per-beat drain — the shared
+  `~/.claude` login is what limits both. The dispatch itself rides the NEXT beat's reply.
+- **`requireFree` filters the pool BEFORE the cloned-repo preference**, so a full cloned host never
+  holds a ticket back from a free one that can clone on demand (the accepted cost is a clone the old
+  ordering would have avoided). `hostHasFreeSlot` reads an absent `capacity` as **"can't tell"** and
+  keeps that host dispatchable — the heartbeat contract's rule, and what keeps a mixed fleet routing
+  — never as "full"; `hostAvailability` already ranks it below every host with real free slots.
+- **Only capacity queues.** A hard refusal (no host reports the org, every host offline, a pinned
+  agent that is gone) still answers with a status and `{error}` — queuing fixes none of them. A
+  pinned host that is merely FULL is waited for, never routed around; `{full:true}` is what tells
+  the two apart.
+- An entry is `{siteKey, issueKey, source, at, reason, error}`. `reason` is why it is STILL waiting
+  as of the last drain — `capacity` (clears itself) or `blocked` (the operator has to clear it, with
+  the hub's wording in `error`) — and the card says which.
+- **`source` decides what may sweep an entry away.** Turning an org's Auto switch off drops its
+  `auto` entries and NOTHING else: not its manual ones, not another org's, and no session (there is
+  none to touch). A manual click on an auto-queued ticket **upgrades** it to `manual` so it survives
+  that. The auto-only guards are the sweep's own — already-has-a-session and spawn-in-flight — and
+  they must NOT be applied to a manual entry: a second session on a ticket is a thing an operator
+  can ask for (it gets the -1/-2 branch), so dropping their click for the first one swallows it.
+  Both sources drop on Done, and an auto entry also drops when its ticket leaves To Do.
+- **Queuing spends no auto-start attempt**: `autoStarted`'s backoff is stamped at DISPATCH, since it
+  exists for a spawn an agent ACKED that left no session (XERK-61/109). Sitting in line commits
+  nothing, so a full org must not burn retries.
+- **In-memory**, like the migration records: a hub restart drops the queue rather than replaying
+  stale intent as a burst of sessions. Auto entries return on the next sweep; a manual one is lost
+  and must be clicked again.
+- Clients paint from the payload, with a short-lived local overlay for the round trip of a click
+  only (`queueView` in `board.html` and `core/Board.kt`, retired the moment the hub agrees). The
+  card replaces its Start button with the wait + a ✕ — a second press could only re-queue what is
+  queued. Tests: the `XERK-296:` cases in `server.test.js`, `board.test.js`, `BoardTest.kt`.
 
 #### Auto-starting To Do tickets (XERK-32)
 
@@ -154,9 +201,10 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   riding the fleet payload as top-level `autoStartOrgs` plus an SSE event. **No agent-side flag**,
   so toggling never needs an agent redeploy.
 - **The decision and routing live on the HUB** (only it sees the whole fleet). `autoStartSweep()` (a
-  15s `setInterval`, boot-grace-gated) walks each org in `orgsWithAutoStart` and routes a
-  `spawnTicket` through the **same `findTicketHost`** the button uses, for each To Do ticket with a
-  `repoGuess.repo`.
+  15s `setInterval`, boot-grace-gated) walks each org in `orgsWithAutoStart` and **queues** each To
+  Do ticket with a `repoGuess.repo`; `drainTicketQueue` then routes it through the **same
+  `findTicketHost`** the button uses, at the moment a host can take it (XERK-296). The sweep decides
+  WHICH tickets run; it no longer decides WHERE.
 - Never opens a **second** session for work already started. Three guards, increasing in strength:
   `startedTicketKeys()` — durable, a ticket carrying a session on ANY channel (`a.sessions`,
   `a.closedSessions`, a repo's `resumable` scan) is handled, a **killed** session counting; an
@@ -172,9 +220,10 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     such a ticket for the hub's lifetime even after its condition clears. A **no-online-host**
     result likewise spends NO attempt, so it retries once a host returns.
   - The retry gate is **evidence, in the sweep's existing order**: a session on any channel ends the
-    attempts and drops the record; an in-flight command concludes nothing; only a still-session-less
-    ticket with nothing in flight, past its backoff, is retried. A queued session reports its
-    `ticket` from the first beat, so a slow spawn is never mistaken for a failed one.
+    attempts and drops the record; an in-flight command — or a place in the hub queue — concludes
+    nothing; only a still-session-less ticket with nothing pending, past its backoff, is re-queued.
+    A queued session reports its `ticket` from the first beat, so a slow spawn is never mistaken for
+    a failed one.
 - Nothing is written to Jira.
 
 #### Auto-stopping Done tickets (XERK-45, XERK-161)

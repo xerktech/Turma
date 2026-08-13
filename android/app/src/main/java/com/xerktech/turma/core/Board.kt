@@ -8,6 +8,7 @@ import com.xerktech.turma.model.CreateType
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
+import com.xerktech.turma.model.QueuedTicket
 import com.xerktech.turma.model.RepoOption
 
 /**
@@ -619,6 +620,31 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
     return idx
 }
 
+/**
+ * This ticket's entry in the hub's ticket queue (XERK-296), or null. Keyed on
+ * org AND key, like every other ticket lookup — two orgs can share an issue key.
+ */
+fun queuedTicketOf(
+    queue: List<QueuedTicket>?,
+    siteKey: String,
+    issueKey: String,
+): QueuedTicket? = queue?.firstOrNull { it.siteKey == siteKey && it.issueKey == issueKey }
+
+/**
+ * The ticket queue as the cards should render it: the hub's own list, plus a
+ * client's in-flight optimism over it — [adds] queued by a POST whose confirming
+ * beat hasn't landed, minus [drops] cancelled by a DELETE the payload still
+ * lists (both keyed like the board's start map). Pure; the ViewModel retires
+ * each overlay on the beat the hub agrees, so neither can outlive the truth.
+ * Mirrors board.html's queueView.
+ */
+fun queueView(
+    hub: List<QueuedTicket>,
+    adds: Map<String, QueuedTicket>,
+    drops: Set<String>,
+): List<QueuedTicket> =
+    hub.filterNot { ticketIndexKey(it.siteKey, it.issueKey) in drops } + adds.values
+
 fun ticketSessionsOf(
     idx: Map<String, List<TicketSession>>,
     siteKey: String,
@@ -648,6 +674,22 @@ sealed interface StartControl {
     /** A spawn is in flight: the "⏳ starting…" busy marker. */
     object Busy : StartControl
     /**
+     * The ticket is waiting in the HUB's queue for a free session slot
+     * (XERK-296) — no host chosen, no session created. [position] is its place
+     * in its org's line, worth showing past the first; [blocked] marks a hold
+     * the operator has to clear rather than one that clears itself, with the
+     * hub's wording in [reason]. The start button is REPLACED by this (a second
+     * press could only re-queue what is queued), leaving the cancel as the one
+     * thing that applies. [error] is a failed CANCEL's reason — the entry rolled
+     * back, so the card is still the queued one and it has to render here.
+     */
+    data class Queued(
+        val position: Int,
+        val blocked: Boolean,
+        val reason: String?,
+        val error: String? = null,
+    ) : StartControl
+    /**
      * A live start button. [clone] marks the repo as not cloned anywhere (the
      * host clones on demand first); [more] compacts the label to "+" once the
      * ticket already has sessions; [error] is a failed attempt's reason,
@@ -662,9 +704,20 @@ sealed interface StartControl {
  * An uncloned repo still gets a LIVE button — the hub clones on demand and
  * queues the session behind the clone (XERK-14).
  */
-fun ticketStartControl(t: JiraTicket, sessionCount: Int, start: StartState?): StartControl? {
+fun ticketStartControl(
+    t: JiraTicket,
+    sessionCount: Int,
+    start: StartState?,
+    queued: QueuedTicket? = null,
+): StartControl? {
     val g = t.repoGuess
     if (g?.repo == null) return null
+    if (queued != null) return StartControl.Queued(
+        position = queued.position,
+        blocked = queued.reason == "blocked",
+        reason = queued.error,
+        error = start?.error,
+    )
     if (start?.pending == true) return StartControl.Busy
     return StartControl.Button(
         clone = !g.cloned,

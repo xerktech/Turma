@@ -136,6 +136,9 @@ const {
   TERM_OSC52_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
+  ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
+  dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot,
+  TICKET_QUEUE_MAX,
   orgColors, setOrgColor,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
   dropMigrationBlob, migrationSpoolPath,
@@ -4643,13 +4646,23 @@ const asBeat = async (device, site, {
 // starts from a clean slate (no org left opted in by a prior test).
 const resetAutoStart = () => {
   autoStarted.clear();
+  ticketQueue.length = 0;
   for (const k of Object.keys(autoStartOrgs)) delete autoStartOrgs[k];
 };
+
+// XERK-296 split the sweep in two: it decides WHICH tickets should run and puts
+// them in the HUB's queue, and drainTicketQueue chooses the host and hands the
+// spawn over at the moment one can actually take it. A sweep on its own
+// therefore queues nothing onto a host, so every case below that asserts on a
+// host's commands runs both halves — which is exactly what the 15s interval
+// does. The queue's own behaviour (waiting, re-routing, cancelling) is covered
+// by the XERK-296 block further down.
+const autoStartRound = () => { autoStartSweep(); drainTicketQueue(); };
 
 test("auto-start: a To Do ticket with a repo is queued once the org opts in", async () => {
   resetAutoStart();
   await asBeat("asHost", "as1.atlassian.net");
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asHost.commands || []).map((c) => [c.type, c.issueKey]),
     [["spawnTicket", "ENG-5"]]);
 });
@@ -4657,7 +4670,7 @@ test("auto-start: a To Do ticket with a repo is queued once the org opts in", as
 test("auto-start: does nothing until the org is opted in (off by default)", async () => {
   resetAutoStart();
   await asBeat("asOff", "as2.atlassian.net", { autoStart: false });
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asOff.commands || []).length, 0);
 });
 
@@ -4674,7 +4687,7 @@ test("auto-start: only To Do tickets, and only ones with a repo assigned", async
         repoGuess: { repo: "Turma", cloned: true } },         // eligible
     ],
   });
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asFilter.commands || []).map((c) => c.issueKey), ["ENG-4"]);
 });
 
@@ -4686,7 +4699,7 @@ test("auto-start: skips a ticket that already has a session (started manually or
     sessions: [{ id: "s1", transcriptId: "t-live",
                  ticket: { key: "ENG-5", siteKey: "as4.atlassian.net" } }],
   });
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asDup.commands || []).length, 0);
 
   // Same for a ticket whose only session was killed (in closedSessions): a
@@ -4696,7 +4709,7 @@ test("auto-start: skips a ticket that already has a session (started manually or
     closedSessions: [{ id: "s2", transcriptId: "t-killed",
                        ticket: { key: "ENG-5", siteKey: "as5.atlassian.net" } }],
   });
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asDup2.commands || []).length, 0);
 });
 
@@ -4710,7 +4723,7 @@ test("auto-start: a resumable-only session (durable, survives restart) still cou
   agents.asResume.repos[0].resumable = [
     { transcriptId: "t-old", ticket: { key: "ENG-5", siteKey: "as6.atlassian.net" } },
   ];
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asResume.commands || []).length, 0);
 });
 
@@ -4721,19 +4734,19 @@ test("auto-start: a resumable-only session (durable, survives restart) still cou
 test("auto-start: an acked spawn that left no session is retried, not dropped", async () => {
   resetAutoStart();
   await asBeat("asRetry", "as7.atlassian.net");
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asRetry.commands || []).length, 1);
 
   // The agent took the command and produced nothing (a refusal, or a Jira fetch
   // that blew up). Immediately after, the backoff holds the retry off.
   agents.asRetry.commands = [];
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asRetry.commands || []).length, 0,
     "the retry waits out its backoff rather than re-queuing every 15s");
 
   // Once the backoff has elapsed, the ticket is tried again.
   autoStarted.get("as7.atlassian.net\x00ENG-5").nextAt = 0;
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asRetry.commands || []).map((c) => c.issueKey), ["ENG-5"]);
   assert.equal(autoStarted.get("as7.atlassian.net\x00ENG-5").attempts, 2);
 });
@@ -4753,7 +4766,7 @@ test("auto-start: retries never give up — a ticket keeps being tried, backing 
     agents.asBudget.commands = [];
     const e = autoStarted.get(k);
     if (e) e.nextAt = 0;      // pretend the backoff has elapsed
-    autoStartSweep();
+    autoStartRound();
     assert.deepEqual((agents.asBudget.commands || []).map((c) => c.issueKey),
       ["ENG-5"], "the ticket is retried on every eligible sweep, never abandoned");
   }
@@ -4762,7 +4775,7 @@ test("auto-start: retries never give up — a ticket keeps being tried, backing 
   // The steady-state retry is spaced by the max backoff, so a still-stuck ticket
   // re-queues at most once per ceiling interval rather than every sweep.
   agents.asBudget.commands = [];
-  autoStartSweep();  // nextAt is now ~10min out, so this sweep must NOT re-queue
+  autoStartRound();  // nextAt is now ~10min out, so this sweep must NOT re-queue
   assert.equal((agents.asBudget.commands || []).length, 0,
     "within the ceiling backoff the retry holds off");
 });
@@ -4770,14 +4783,14 @@ test("auto-start: retries never give up — a ticket keeps being tried, backing 
 test("auto-start: a session appearing ends the retries and forgets the attempts", async () => {
   resetAutoStart();
   await asBeat("asWon", "as7c.atlassian.net");
-  autoStartSweep();
+  autoStartRound();
   const k = "as7c.atlassian.net\x00ENG-5";
   assert.equal(autoStarted.get(k).attempts, 1);
   // The spawn worked: the session (queued or running) reports its ticket back.
   agents.asWon.commands = [];
   agents.asWon.sessions = [{ id: "s1", status: "queued", transcriptId: "t1",
     ticket: { key: "ENG-5", siteKey: "as7c.atlassian.net" } }];
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asWon.commands || []).length, 0);
   assert.ok(!autoStarted.has(k), "the attempt record is dropped, not left to grow");
 });
@@ -4792,7 +4805,7 @@ test("auto-start: a ticket that flaked past the old budget still self-heals once
     agents.asHeal.commands = [];
     const e = autoStarted.get(k);
     if (e) e.nextAt = 0;
-    autoStartSweep();
+    autoStartRound();
   }
   assert.ok((agents.asHeal.commands || []).some((c) => c.issueKey === "ENG-5"),
     "still retrying after the old budget would have blacklisted it");
@@ -4801,7 +4814,7 @@ test("auto-start: a ticket that flaked past the old budget still self-heals once
   agents.asHeal.commands = [];
   agents.asHeal.sessions = [{ id: "s1", status: "running", transcriptId: "t1",
     ticket: { key: "ENG-5", siteKey: "as7e.atlassian.net" } }];
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asHeal.commands || []).length, 0);
   assert.ok(!autoStarted.has(k), "the attempt record is dropped once it starts");
 });
@@ -4810,13 +4823,13 @@ test("auto-start: an offline org spends no attempt (the failure isn't the ticket
   resetAutoStart();
   await asBeat("asDown", "as7d.atlassian.net");
   agents.asDown.lastSeen = Date.now() - 10 * 60 * 1000;  // offline
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asDown.commands || []).length, 0);
   assert.ok(!autoStarted.has("as7d.atlassian.net\x00ENG-5"));
   // The host returns: the ticket starts on the very next sweep, with its full
   // budget intact rather than sitting out a backoff it never earned.
   agents.asDown.lastSeen = Date.now();
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asDown.commands || []).map((c) => c.issueKey), ["ENG-5"]);
 });
 
@@ -4825,7 +4838,7 @@ test("auto-start: an in-flight spawnTicket (e.g. a manual click) is not doubled"
   await asBeat("asInflight", "as8.atlassian.net");
   // A spawnTicket already queued by the /session route sits on the host.
   queueCommand("asInflight", { type: "spawnTicket", issueKey: "ENG-5" });
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asInflight.commands || []).filter(
     (c) => c.type === "spawnTicket").length, 1);
 });
@@ -4838,7 +4851,7 @@ test("auto-start: work spreads across ALL the org's agents (routes by availabili
     capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });   // opts as9 in
   await asBeat("asFree", "as9.atlassian.net", {
     autoStart: false, capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 } });
-  autoStartSweep();
+  autoStartRound();
   // Routed to the most-available host, proving auto-start uses the same
   // fleet-wide splitting as the manual button.
   assert.deepEqual((agents.asFree.commands || []).map((c) => c.issueKey), ["ENG-5"]);
@@ -4852,7 +4865,7 @@ test("auto-start: honors a ticket's pinned agent over availability", async () =>
   await asBeat("asPinFree", "asPin.atlassian.net",
     { capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 } });
   await setAgent("asPin.atlassian.net", "ENG-5", { host: "asPinBusy" });
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asPinBusy.commands || []).map((c) => c.issueKey), ["ENG-5"]);
   assert.equal((agents.asPinFree.commands || []).length, 0);
 });
@@ -4863,14 +4876,14 @@ test("auto-start: a pinned agent that's offline retries later, never reroutes", 
   await asBeat("asPinOffB", "asPinOff.atlassian.net");
   await setAgent("asPinOff.atlassian.net", "ENG-5", { host: "asPinOffB" });
   agents.asPinOffB.lastSeen = Date.now() - 10 * 60 * 1000;
-  autoStartSweep();
+  autoStartRound();
   // Not rerouted around the pin, and left UNrecorded so a later sweep retries.
   assert.equal((agents.asPinOffA.commands || []).length, 0);
   assert.equal((agents.asPinOffB.commands || []).length, 0);
   assert.ok(!autoStarted.has("asPinOff.atlassian.net\x00ENG-5"));
   // The pinned host comes back — the next sweep spawns there.
   agents.asPinOffB.lastSeen = Date.now();
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asPinOffB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
 });
 
@@ -4881,11 +4894,11 @@ test("auto-start: an org with every host offline queues nothing until one return
   // The opt-in is durable hub state, so the org stays "on"...
   assert.equal(orgsWithAutoStart().has("as10.atlassian.net"), true);
   // ...but with no online host to route to, the sweep queues nothing.
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asStale.commands || []).length, 0);
   // The host returns — the next sweep spawns there.
   agents.asStale.lastSeen = Date.now();
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asStale.commands || []).map((c) => c.issueKey), ["ENG-5"]);
 });
 
@@ -4896,12 +4909,12 @@ test("auto-start: the hub-side org toggle is the ONLY opt-in", async () => {
   // A reporting host is not enough — the org is off until the hub toggle is set.
   await asBeat("asHub", "ashub.atlassian.net", { autoStart: false });
   assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), false);
-  autoStartSweep();
+  autoStartRound();
   assert.equal((agents.asHub.commands || []).length, 0);
   // The toggle drives the sweep.
   setAutoStartOrg("ashub.atlassian.net", true);
   assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), true);
-  autoStartSweep();
+  autoStartRound();
   assert.deepEqual((agents.asHub.commands || []).map((c) => [c.type, c.issueKey]),
     [["spawnTicket", "ENG-5"]]);
   setAutoStartOrg("ashub.atlassian.net", false); // leave global state clean
@@ -4942,6 +4955,243 @@ test("POST /api/jira/<site>/autostart rejects a bad body and an unknown org", as
     { body: { enabled: true }, headers: userHeaders });
   assert.equal(r.status, 404);
   assert.equal("nobody.atlassian.net" in autoStartOrgs, false);
+});
+
+// ---- the hub-side ticket queue (XERK-296) -----------------------------------
+// Work waiting for a slot is a QUEUED TICKET on the hub, with no host chosen and
+// no session created. The host is picked at DISPATCH, so whichever agent frees a
+// slot first takes the oldest waiting ticket.
+
+// A full host: capacity reported with no free slot.
+const FULL = { maxSessions: 2, running: 2, queued: 0, free: 0 };
+const ROOMY = { maxSessions: 2, running: 0, queued: 0, free: 2 };
+
+const startTicket = (site, key) =>
+  request("POST", `/api/jira/${site}/${key}/session`, { headers: userHeaders });
+
+test("XERK-296: a full org queues the TICKET — no host chosen, no session created", async () => {
+  resetAutoStart();
+  await asBeat("tqFullA", "tq1.atlassian.net", { autoStart: false, capacity: FULL });
+  await asBeat("tqFullB", "tq1.atlassian.net", { autoStart: false, capacity: FULL });
+  const r = await startTicket("tq1.atlassian.net", "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.queued, true);
+  assert.equal(r.body.position, 1);
+  assert.ok(!r.body.cmdId, "nothing was handed to a host, so there is no cmdId");
+  assert.ok(!r.body.host, "no host is claimed while a ticket waits");
+  assert.equal((agents.tqFullA.commands || []).length, 0);
+  assert.equal((agents.tqFullB.commands || []).length, 0);
+  // Draining changes nothing while every host is still full.
+  drainTicketQueue();
+  assert.equal((agents.tqFullA.commands || []).length, 0);
+  assert.equal(queuedTicket("tq1.atlassian.net", "ENG-5").reason, "capacity");
+  // It rides the fleet payload, which is the only place a waiting ticket exists.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  const q = (list.body.ticketQueue || []).find((x) => x.issueKey === "ENG-5");
+  assert.deepEqual([q.siteKey, q.source, q.position], ["tq1.atlassian.net", "manual", 1]);
+});
+
+test("XERK-296: the host is chosen at DISPATCH — whichever agent frees up takes it", async () => {
+  // The complaint this ticket opens with: the old flow nailed the ticket to one
+  // host the moment it was queued, so a slot freeing on ANY other host couldn't
+  // take it. Here the ticket is queued while both are full, and the SECOND host
+  // — the one availability would not have picked at enqueue time — frees first.
+  resetAutoStart();
+  await asBeat("tqRaceA", "tq2.atlassian.net", { autoStart: false, capacity: FULL });
+  await asBeat("tqRaceB", "tq2.atlassian.net", { autoStart: false, capacity: FULL });
+  await startTicket("tq2.atlassian.net", "ENG-5");
+  drainTicketQueue();
+  assert.equal((agents.tqRaceA.commands || []).length, 0);
+  assert.equal((agents.tqRaceB.commands || []).length, 0);
+  // B finishes a session.
+  agents.tqRaceB.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.tqRaceB.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]]);
+  assert.equal((agents.tqRaceA.commands || []).length, 0, "A never got it");
+  assert.equal(queuedTicket("tq2.atlassian.net", "ENG-5"), null,
+    "dispatched, so it leaves the queue");
+});
+
+test("XERK-296: a host with a free slot is used straight away (nothing queues needlessly)", async () => {
+  resetAutoStart();
+  await asBeat("tqOpen", "tq3.atlassian.net", { autoStart: false, capacity: ROOMY });
+  const r = await startTicket("tq3.atlassian.net", "ENG-5");
+  assert.equal(r.body.queued, undefined);
+  assert.equal(r.body.host, "tqOpen");
+  assert.deepEqual((agents.tqOpen.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-296: one dispatch per host per pass (the shared login is what limits it)", async () => {
+  resetAutoStart();
+  await asBeat("tqOne", "tq4.atlassian.net", { autoStart: false, capacity: FULL,
+    tickets: [
+      { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+      { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    ] });
+  await startTicket("tq4.atlassian.net", "ENG-1");
+  await startTicket("tq4.atlassian.net", "ENG-2");
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-1", "ENG-2"]);
+  agents.tqOne.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.tqOne.commands || []).map((c) => c.issueKey), ["ENG-1"],
+    "the oldest goes first, and only one per pass");
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-2"]);
+  // The next pass takes the next one (its predecessor's spawn has been acked).
+  agents.tqOne.commands = [];
+  drainTicketQueue();
+  assert.deepEqual((agents.tqOne.commands || []).map((c) => c.issueKey), ["ENG-2"]);
+});
+
+test("XERK-296: an agent that reports no capacity is 'can't tell', never 'full'", async () => {
+  // The heartbeat contract: an absent capability degrades, it doesn't block. Such
+  // a host still takes the spawn and queues it itself, exactly as before.
+  resetAutoStart();
+  await asBeat("tqOld", "tq5.atlassian.net", { autoStart: false });   // no capacity block
+  assert.equal(hostHasFreeSlot(agents.tqOld), true);
+  const r = await startTicket("tq5.atlassian.net", "ENG-5");
+  assert.equal(r.body.host, "tqOld");
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-296: a hard failure still refuses — only capacity queues", async () => {
+  resetAutoStart();
+  await asBeat("tqDown", "tq6.atlassian.net", { autoStart: false, capacity: FULL });
+  agents.tqDown.lastSeen = Date.now() - 10 * 60 * 1000;             // offline
+  const r = await startTicket("tq6.atlassian.net", "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /offline/);
+  assert.equal(ticketQueue.length, 0, "queuing can't fix an offline org");
+});
+
+test("XERK-296: a pinned agent that's full is waited for, not routed around", async () => {
+  resetAutoStart();
+  await asBeat("tqPinFull", "tq7.atlassian.net", { autoStart: false, capacity: FULL });
+  await asBeat("tqPinFree", "tq7.atlassian.net", { autoStart: false, capacity: ROOMY });
+  await setAgent("tq7.atlassian.net", "ENG-5", { host: "tqPinFull" });
+  const r = await startTicket("tq7.atlassian.net", "ENG-5");
+  assert.equal(r.body.queued, true);
+  drainTicketQueue();
+  assert.equal((agents.tqPinFree.commands || []).length, 0, "the pin is not worked around");
+  agents.tqPinFull.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.tqPinFull.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-296: turning Auto off clears that org's auto-queued tickets and nothing else", async () => {
+  resetAutoStart();
+  await asBeat("tqAuto", "tq8.atlassian.net", { capacity: FULL, tickets: [
+    { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  await asBeat("tqOther", "tq9.atlassian.net", { capacity: FULL });
+  // A live session on the same host, to prove nothing here touches one.
+  agents.tqAuto.sessions = [{ id: "live1", status: "running", transcriptId: "t-live" }];
+  autoStartSweep();
+  drainTicketQueue();                       // both orgs full: everything waits
+  // One of tq8's tickets is ALSO clicked by hand, which upgrades its entry.
+  await startTicket("tq8.atlassian.net", "ENG-2");
+  assert.deepEqual(ticketQueue.map((e) => [e.siteKey, e.issueKey, e.source]), [
+    ["tq8.atlassian.net", "ENG-1", "auto"],
+    ["tq8.atlassian.net", "ENG-2", "manual"],
+    ["tq9.atlassian.net", "ENG-5", "auto"],
+  ]);
+  setAutoStartOrg("tq8.atlassian.net", false);
+  assert.deepEqual(ticketQueue.map((e) => [e.siteKey, e.issueKey]), [
+    ["tq8.atlassian.net", "ENG-2"],         // an operator asked for this one
+    ["tq9.atlassian.net", "ENG-5"],         // a different org is untouched
+  ]);
+  assert.deepEqual(agents.tqAuto.sessions.map((s) => s.status), ["running"],
+    "no session was killed, interrupted or otherwise touched");
+  assert.equal((agents.tqAuto.commands || []).length, 0, "and no command was sent");
+});
+
+test("XERK-296: DELETE takes a waiting ticket out of the queue", async () => {
+  resetAutoStart();
+  await asBeat("tqCancel", "tq10.atlassian.net", { autoStart: false, capacity: FULL });
+  await startTicket("tq10.atlassian.net", "ENG-5");
+  assert.equal(ticketQueue.length, 1);
+  let r = await request("DELETE", "/api/jira/tq10.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(ticketQueue.length, 0);
+  // A second cancel says so rather than pretending: it isn't queued any more.
+  r = await request("DELETE", "/api/jira/tq10.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(r.status, 404);
+  // The route validates the key like its POST twin, and needs the user login.
+  r = await request("DELETE", "/api/jira/tq10.atlassian.net/12ab/session",
+    { headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("DELETE", "/api/jira/tq10.atlassian.net/ENG-5/session");
+  assert.equal(r.status, 401);
+});
+
+test("XERK-296: an auto-queued ticket leaves the queue once the work has started", async () => {
+  resetAutoStart();
+  await asBeat("tqGone", "tq11.atlassian.net", { capacity: FULL });
+  autoStartSweep();
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 1);
+  // Someone started it by hand while it waited: the session is the evidence, and
+  // auto-start's whole job is never to open a SECOND session for started work.
+  agents.tqGone.sessions = [{ id: "s1", status: "running", transcriptId: "t1",
+    ticket: { key: "ENG-5", siteKey: "tq11.atlassian.net" } }];
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-296: a MANUAL entry is not dropped for an existing session (the + is a second session)", async () => {
+  resetAutoStart();
+  await asBeat("tqSecond", "tq11b.atlassian.net", { autoStart: false, capacity: FULL });
+  agents.tqSecond.sessions = [{ id: "s1", status: "running", transcriptId: "t1",
+    ticket: { key: "ENG-5", siteKey: "tq11b.atlassian.net" } }];
+  await startTicket("tq11b.atlassian.net", "ENG-5");
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 1, "the operator asked for another one");
+  agents.tqSecond.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.deepEqual((agents.tqSecond.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-296: a ticket a human moves to Done while it waits is dropped, not started", async () => {
+  resetAutoStart();
+  await asBeat("tqDone", "tq11c.atlassian.net", { autoStart: false, capacity: FULL });
+  await startTicket("tq11c.atlassian.net", "ENG-5");
+  assert.equal(ticketQueue.length, 1);
+  agents.tqDone.jira.tickets = [{ key: "ENG-5", statusCategory: "done",
+    repoGuess: { repo: "Turma", cloned: true } }];
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0);
+  assert.equal((agents.tqDone.commands || []).length, 0);
+});
+
+test("XERK-296: waiting in the queue spends no auto-start attempt", async () => {
+  // Queuing commits nothing, so it must not burn a retry — the backoff exists
+  // for a spawn an agent ACKED and left no session (XERK-61/109).
+  resetAutoStart();
+  await asBeat("tqAttempt", "tq12.atlassian.net", { capacity: FULL });
+  const k = "tq12.atlassian.net\x00ENG-5";
+  for (let i = 0; i < 3; i++) { autoStartSweep(); drainTicketQueue(); }
+  assert.equal(ticketQueue.length, 1);
+  assert.ok(!autoStarted.has(k), "no attempt is spent while it waits");
+  agents.tqAttempt.capacity = { ...ROOMY };
+  drainTicketQueue();
+  assert.equal(autoStarted.get(k).attempts, 1, "the attempt is spent at dispatch");
+});
+
+test("XERK-296: the queue is bounded, and a full queue is refused in the hub's own words", async () => {
+  resetAutoStart();
+  await asBeat("tqCap", "tq13.atlassian.net", { autoStart: false, capacity: FULL });
+  for (let i = 0; i < TICKET_QUEUE_MAX; i++) {
+    assert.ok(enqueueTicketStart("tq13.atlassian.net", `ENG-${1000 + i}`, "auto"));
+  }
+  assert.equal(enqueueTicketStart("tq13.atlassian.net", "ENG-9999", "auto"), null);
+  const r = await startTicket("tq13.atlassian.net", "ENG-5");
+  assert.equal(r.status, 429);
+  assert.match(r.body.error, /queue is full/);
+  ticketQueue.length = 0;
 });
 
 // ---- manual org colors (XERK-145) -------------------------------------------

@@ -18,6 +18,7 @@ const {
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+  queuedTicketOf,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
 } = require("../public/board.js");
@@ -1526,6 +1527,65 @@ test("ticketStartHtml: an in-flight start shows busy, not a second button", () =
   assert.ok(html.includes("kc-start-busy"));
   assert.ok(html.includes("starting"));
   assert.ok(!html.includes("data-start"), "no re-click while a spawn is in flight");
+});
+
+// ---- a ticket waiting in the hub's queue (XERK-296) --------------------------
+
+test("queuedTicketOf: finds this ticket's entry, keyed by org AND key", () => {
+  const q = [
+    { siteKey: "a.net", issueKey: "X-1", position: 1 },
+    { siteKey: "b.net", issueKey: "X-2", position: 1 },
+  ];
+  assert.equal(queuedTicketOf(q, "a.net", "X-1").position, 1);
+  assert.equal(queuedTicketOf(q, "b.net", "X-1"), null, "same key, other org");
+  assert.equal(queuedTicketOf(null, "a.net", "X-1"), null);
+});
+
+test("ticketStartHtml: a queued ticket shows the wait and a cancel, not a start button", () => {
+  // Nothing has been handed to a host, so the only thing to offer is taking it
+  // back out of the line; a second press could only re-queue what is queued.
+  const html = ticketStartHtml(ticket("X-1", guess()), [],
+    null, { siteKey: "a.net", issueKey: "X-1", position: 1, source: "manual" });
+  assert.ok(html.includes("kc-queued"));
+  assert.ok(html.includes("queued"));
+  assert.ok(html.includes(`data-unqueue="X-1"`), "the ✕ routes off data-unqueue");
+  assert.ok(!html.includes("data-start"), "no start button while it's queued");
+});
+
+test("ticketStartHtml: a queued ticket past the first says where it is in line", () => {
+  const html = ticketStartHtml(ticket("X-1", guess()), [],
+    null, { siteKey: "a.net", issueKey: "X-1", position: 3 });
+  assert.ok(html.includes("#3"));
+  assert.ok(html.includes("in line"), "the tooltip explains what it's waiting for");
+});
+
+test("ticketStartHtml: a BLOCKED wait says so and carries the hub's reason", () => {
+  // "capacity" clears itself; "blocked" needs the operator, so the two must not
+  // read the same — the reason is the hub's own words, escaped like everything.
+  const html = ticketStartHtml(ticket("X-1", guess()), [], null, {
+    siteKey: "a.net", issueKey: "X-1", position: 1, reason: "blocked",
+    error: `no repo <img src=x>`,
+  });
+  assert.ok(html.includes("kc-queued-blocked"));
+  assert.ok(!html.includes("<img"));
+  assert.ok(html.includes("&lt;img"));
+});
+
+test("ticketStartHtml: a failed CANCEL shows its reason on the still-queued card", () => {
+  // The entry rolled back, so the card is still the queued one — the reason has
+  // to render HERE or it is invisible.
+  const html = ticketStartHtml(ticket("X-1", guess()), [], { error: "the hub is unreachable" },
+    { siteKey: "a.net", issueKey: "X-1", position: 1 });
+  assert.ok(html.includes("kc-start-err"));
+  assert.ok(html.includes("the hub is unreachable"));
+  assert.ok(html.includes("data-unqueue"), "and the cancel stays available");
+});
+
+test("ticketStartHtml: a queued ticket still shows the sessions it already has", () => {
+  const html = ticketStartHtml(ticket("X-1", guess()), [tsess("s1", "X-1")],
+    null, { siteKey: "a.net", issueKey: "X-1", position: 1 });
+  assert.ok(html.includes(`href="/sessions?session=s1"`));
+  assert.ok(html.includes("kc-queued"));
 });
 
 test("ticketStartHtml: a failed start shows the reason AND keeps the button", () => {
