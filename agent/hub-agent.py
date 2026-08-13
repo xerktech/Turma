@@ -1683,18 +1683,23 @@ def _project_transcripts(proj):
         try:
             if entry.name.endswith(".jsonl") and entry.is_file():
                 out.append((entry.name, False))
-            if not entry.is_dir():
-                continue          # a *.jsonl dir still gets its subagents read
+            # A *.jsonl dir still gets its subagents read; a SYMLINKED dir never
+            # does (see below).
+            if not entry.is_dir() or entry.is_symlink():
+                continue
             sub = os.path.join(entry.path, "subagents")
             if not os.path.isdir(sub) or os.path.islink(sub):
                 continue
             # `followlinks=False` only stops os.walk following links it finds
-            # BELOW its top; it always descends the top itself. So the `islink`
-            # above is what refuses a `subagents` SYMLINK — pointed at
-            # PROJECTS_ROOT it drags every transcript on the host into one slug,
-            # and pointed at an ancestor it re-reads the slug's own conversations
-            # flagged as delegated. No writer creates one (the guard denies
-            # ~/.claude), so this is hardening, not a live path.
+            # BELOW its top; it always descends the top itself. So NEITHER of
+            # the two link checks above is redundant — one refuses a `subagents`
+            # symlink, the other a symlinked PARENT that reaches a real one.
+            # Pointed at PROJECTS_ROOT such a link drags every transcript on the
+            # host into a single slug; pointed at an ancestor it re-reads the
+            # slug's own conversations flagged as delegated. No writer creates
+            # one (the guard denies ~/.claude), so this is hardening rather than
+            # a live path — but the whole class is cheaper to refuse than to
+            # reason about one shape at a time.
             for dirpath, _dirs, files in os.walk(sub):
                 for name in sorted(files):
                     path = os.path.join(dirpath, name)

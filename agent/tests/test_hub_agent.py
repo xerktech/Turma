@@ -1069,6 +1069,21 @@ class TestSubagentUsage(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["totals"]["input"], 100)   # the foreign 999 stays out
         self.assertEqual(rep["subagent"]["totals"], ha._usage_bucket())
 
+    def test_a_symlinked_PARENT_reaching_a_real_subagents_is_refused_too(self):
+        # `islink` on the `subagents` component alone checks the FINAL one, so a
+        # symlinked parent still reached a real subagents/ through the link. Both
+        # checks are needed; refusing the class beats reasoning about each shape.
+        other = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(os.path.join(other, "subagents"))
+        write_jsonl(os.path.join(other, "subagents", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 999)])
+        os.symlink(other, os.path.join(self.proj, "main"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 100)
+        self.assertEqual(rep["subagent"]["totals"], ha._usage_bucket())
+
     def test_a_symlink_loop_under_subagents_does_not_hang_or_raise(self):
         sub = os.path.join(self.proj, "main", "subagents")
         os.makedirs(sub)
