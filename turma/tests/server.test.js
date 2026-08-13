@@ -7849,6 +7849,78 @@ test("XERK-268: a data channel can only be answered by the host it was opened fo
   }
 });
 
+// Drive one terminal request through the tunnel and hand back the request line
+// the hub actually wrote to ttyd. The test IS the wire: a fake ttyd that never
+// answers is enough, because what's asserted is the path we sent, not a reply.
+async function forwardedRequestLine(host, sessionId, port, pathAndQuery) {
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: host,
+      sessions: [{ id: sessionId, repo: "Turma", status: "running", ttydPort: port,
+        worktreePath: `/git/.turma/worktrees/Turma/${sessionId}`, transcriptId: `t-${sessionId}` }],
+    },
+    headers: agentHeaders,
+  });
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=${hostAgentToken(host)}`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  try {
+    // Never resolves — our fake ttyd sends no response — so it is not awaited.
+    request("GET", pathAndQuery, { headers: userHeaders }).catch(() => {});
+    await waitFor(() => ctrlFrames.some((f) => {
+      try { return JSON.parse(f.payload).open; } catch { return false; }
+    }));
+    const ch = ctrlFrames
+      .map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
+      .find(Boolean);
+    const data = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken(host)}`, 1500);
+    const dataFrames = collectFrames(data.socket, data.leftover);
+    try {
+      await waitFor(() => dataFrames.some((f) => f.payload.includes("HTTP/1.1")));
+      const sent = Buffer.concat(dataFrames.map((f) => f.payload)).toString("utf8");
+      return sent.split("\r\n")[0];
+    } finally {
+      data.socket.destroy();
+    }
+  } finally {
+    ctrl.socket.destroy();
+  }
+}
+
+test("the terminal document is fetched at ttyd's base path, slash or no slash", async () => {
+  // ttyd runs with `-b /term/<id>` and 302s the bare base path to the slash
+  // form, so a hop that strips the trailing slash makes that redirect point at
+  // itself and the browser gives up (cloudflared 2026.8.0 stripped it via
+  // path.Clean, and every terminal on the fleet died while the agents stayed
+  // connected). The hub must not depend on the slash reaching it.
+  assert.equal(
+    await forwardedRequestLine("slashA", "sl1", 7801, "/term/sl1"),
+    "GET /term/sl1/ HTTP/1.1",
+  );
+});
+
+test("a terminal request that kept its trailing slash is forwarded unchanged", async () => {
+  assert.equal(
+    await forwardedRequestLine("slashB", "sl2", 7802, "/term/sl2/"),
+    "GET /term/sl2/ HTTP/1.1",
+  );
+});
+
+test("the terminal base path keeps its query string when the slash is restored", async () => {
+  assert.equal(
+    await forwardedRequestLine("slashC", "sl3", 7803, "/term/sl3?arg=1"),
+    "GET /term/sl3/?arg=1 HTTP/1.1",
+  );
+});
+
+test("assets below the terminal base path are never rewritten", async () => {
+  // Only the base path gets a slash: ttyd's own asset and WS URLs already sit
+  // below it, and appending one there would 404 them.
+  assert.equal(
+    await forwardedRequestLine("slashD", "sl4", 7804, "/term/sl4/token"),
+    "GET /term/sl4/token HTTP/1.1",
+  );
+});
+
 test("XERK-268: the tunnel maps are null-prototype", () => {
   // Asserted on the maps THEMSELVES, not through a socket: on a plain object a
   // `ch` of `__proto__` read back as Object.prototype — truthy, so it sailed

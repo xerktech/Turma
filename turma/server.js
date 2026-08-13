@@ -7539,6 +7539,18 @@ const server = http.createServer(async (req, res) => {
       const sessionId = decodeURIComponent(parts[1]);
       const loc = findSession(sessionId);
       if (!loc) return json(res, 404, { error: "unknown session" });
+      // ttyd runs with `-b /term/<id>`, so it answers the BARE base path with a
+      // 302 to that same path plus a trailing slash. A hop that normalizes the
+      // slash away therefore turns the terminal into a redirect to itself, and
+      // the browser gives up: cloudflared 2026.8.0 did exactly that (path.Clean
+      // in canonicalizeRequestPath, restored a release later), taking out every
+      // terminal on the fleet while the agents stayed connected. Every client
+      // asks for the slash form, so serve the document at the base path here
+      // rather than depending on the slash surviving every hop to us. Only the
+      // base path — assets and the WS below it never end in one.
+      if (parts.length === 2 && !url.pathname.endsWith("/")) {
+        req.url = `${url.pathname}/${url.search}`;
+      }
       return proxyTerm(req, res, loc.host, loc.port);
     }
 
