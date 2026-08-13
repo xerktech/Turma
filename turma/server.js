@@ -496,6 +496,24 @@ const PR_ALERT_MAX_WAIT_MS = 30 * 60 * 1000;
 // Per-session ceiling on both PR bookkeeping lists (newest kept).
 const PR_ALERT_MAX_TRACKED = 20;
 
+// Token ceilings at which a single session's spend is worth interrupting the
+// operator for. A session's cost is otherwise invisible until somebody opens
+// /usage and adds it up, so a run that goes away with the fleet's whole day is
+// only ever found afterwards — one measured session spent 252M tokens on one
+// ticket, 31% of that day across every host. The heartbeat already carries
+// per-session usage, so the check costs nothing.
+//
+// ABSOLUTE, not a multiple of any rolling median: a threshold that drifts up
+// with spend stops firing exactly as spend gets worse. Two stages, so a session
+// still climbing after the first notice says so; the second is the one that
+// says "this is not going to stop on its own".
+//
+// These are notification thresholds ONLY. Nothing here throttles, interrupts or
+// kills a session — the operator decides what to do, and a session mid-repro on
+// a genuinely expensive bug is allowed to be expensive.
+const SESSION_SPEND_WARN_TOKENS = positiveEnv("SESSION_SPEND_WARN_TOKENS", 100_000_000);
+const SESSION_SPEND_HIGH_TOKENS = positiveEnv("SESSION_SPEND_HIGH_TOKENS", 200_000_000);
+
 // Keyed by the host name (`device`), value = last heartbeat payload +
 // bookkeeping. One container per host, so the host name is the stable identity.
 let agents = {};
@@ -3942,6 +3960,41 @@ function readyForReview(session, working) {
   return s.lastRole === "assistant" && !s.lastHasToolUse;
 }
 
+// The four token counters the agent reports, summed. Deliberately the SAME
+// four `usage.html` totals (`TOKEN_KEYS` there), so the number in an alert and
+// the number on the usage page can never disagree — cacheRead included, which
+// is ~97% of real spend and the whole reason a long session gets expensive.
+function sessionSpendTokens(bucket) {
+  if (!bucket || typeof bucket !== "object") return 0;
+  let n = 0;
+  for (const k of ["input", "output", "cacheWrite", "cacheRead"]) {
+    const v = bucket[k];
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) n += v;
+  }
+  return n;
+}
+
+// Tokens as a short human figure for an alert body ("142M"). Whole millions:
+// this is a "come and look" number, and a decimal implies a precision the
+// staggered per-session usage refresh does not have.
+function fmtSpendTokens(n) {
+  if (n >= 1e9) return `${Math.round(n / 1e8) / 10}B`;
+  if (n >= 1e6) return `${Math.round(n / 1e6)}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+  return String(n);
+}
+
+// Which spend stage a session has reached: 0 none, 1 warn, 2 high. Ordered
+// ascending and counted, so a session that blows straight past both thresholds
+// between two beats lands on 2 and never emits the stage it skipped.
+function sessionSpendStage(tokens) {
+  let stage = 0;
+  for (const t of [SESSION_SPEND_WARN_TOKENS, SESSION_SPEND_HIGH_TOKENS]) {
+    if (t > 0 && tokens >= t) stage += 1;
+  }
+  return stage;
+}
+
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
 // bookkeeping carried across beats (and persisted, so hub restarts don't
 // re-fire or drop edges).
@@ -4165,6 +4218,47 @@ function heartbeatAlerts(key, prev, next) {
     if (working && sa.turnAlerted) {
       dismiss(`turn:${key}:${session.id}`);
       delete sa.turnAlerted;
+    }
+
+    // Runaway spend. Two absolute stages, each fired once, on the crossing.
+    //
+    // This is the one session alert that is NOT about the work being ready, so
+    // it deliberately sits outside the XERK-224 one-alert-per-piece-of-work
+    // rule: a session can be both mid-turn and far too expensive, and the
+    // review alert would not be the thing to say. Both stages ride ONE
+    // `notifKey`, so the escalation REPLACES the first notice on the phone
+    // instead of stacking beside it.
+    //
+    // Never retracted: spend only ever grows, so unlike a question or a landed
+    // PR there is no addressed edge a dismiss could fire on. `spendStage` is on
+    // `sa`, which is persisted, so a hub restart doesn't re-announce every
+    // expensive session it already flagged — and is dropped with the rest of
+    // `sa` when the host stops reporting the session at all.
+    //
+    // Gated on `running`: a stopped session's total is history, and its record
+    // keeps reporting `usage` for as long as it is listed. A session that
+    // crossed while stopped is announced if it resumes, which is when the
+    // number can still change.
+    if (session.status === "running") {
+      const spent = sessionSpendTokens(session.usage?.totals);
+      const stage = sessionSpendStage(spent);
+      if (stage > (sa.spendStage || 0)) {
+        sa.spendStage = stage;
+        const repo = session.git?.repoName
+          ? ` · ${session.git.repoName}@${session.git.branch}` : "";
+        notify(
+          `${label} has spent ${fmtSpendTokens(spent)} tokens`,
+          stage >= 2
+            ? `Still climbing past ${fmtSpendTokens(SESSION_SPEND_HIGH_TOKENS)}${repo}`
+            : `Past ${fmtSpendTokens(SESSION_SPEND_WARN_TOKENS)}${repo}`,
+          {
+            tags: "money_with_wings",
+            ...(stage >= 2 ? { priority: "high" } : {}),
+            route,
+            notifKey: `spend:${key}:${session.id}`,
+          },
+        );
+      }
     }
     sa.wasWorking = working;
   }
@@ -7327,6 +7421,11 @@ if (process.env.TURMA_TEST) {
     heartbeatAlerts,
     prAlertDecision,
     readyForReview,
+    sessionSpendTokens,
+    sessionSpendStage,
+    fmtSpendTokens,
+    SESSION_SPEND_WARN_TOKENS,
+    SESSION_SPEND_HIGH_TOKENS,
     sessionWorking,
     hasLiveAgents,
     sanitizeLiveAgents,

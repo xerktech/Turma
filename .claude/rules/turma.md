@@ -223,8 +223,35 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 ## Notifications
 
 - The hub pushes edge-triggered alerts to the **Android client via FCM**, the sole transport: host
-  offline/recovered, restart loop, per-session ready-for-review / question waiting, Claude login
-  required/expiring/restored.
+  offline/recovered, restart loop, per-session ready-for-review / question waiting / runaway spend,
+  Claude login required/expiring/restored.
+
+### Runaway session spend
+
+- A session's cost is invisible until somebody opens `/usage` and adds it up, so a run that takes
+  the fleet's whole day is only ever found afterwards. The heartbeat already carries per-session
+  usage, so `heartbeatAlerts` checks it for free.
+- **Two ABSOLUTE stages** (`SESSION_SPEND_WARN_TOKENS` 100M, `SESSION_SPEND_HIGH_TOKENS` 200M, both
+  `positiveEnv`), each fired once on the crossing. Deliberately not a multiple of a rolling median:
+  a threshold that drifts up with spend stops firing exactly as spend gets worse.
+- **`sessionSpendTokens` sums the same four counters `usage.html` does**, `cacheRead` included —
+  that is ~97% of real spend and the whole reason a long session gets expensive. A malformed bucket
+  contributes 0 rather than a plausible figure.
+- Stages are **counted, not matched**, so a session crossing both between two of the staggered usage
+  refreshes lands on stage 2 and never emits the one it skipped.
+- **Both stages ride ONE `notifKey`** (`spend:<host>:<id>`), so the escalation replaces the first
+  notice rather than stacking beside it. **Never retracted** — spend only grows, so there is no
+  addressed edge a `dismiss` could fire on. `spendStage` lives on the persisted `sa`, so a hub
+  restart doesn't re-announce what it already flagged.
+- **It is the one session alert outside the XERK-224 one-alert-per-piece-of-work rule**: a session
+  can be both mid-turn and far too expensive, and the review alert would not be the thing to say.
+- Gated on `running` — a stopped session's total is history and its record keeps reporting `usage`;
+  it announces if resumed, which is when the number can move again. **Notification only**: nothing
+  here throttles, interrupts or kills, since a session mid-repro on an expensive bug is allowed to
+  be expensive.
+- Android routes `money_with_wings` to its own `CH_SPEND` channel (mutable independently of host
+  status); a build predating it falls through to `CH_ALERTS`, so the alert still arrives.
+- Tests: the `spend:` cases in `server.test.js`.
 - **A session gets ONE alert per piece of work** (XERK-224): "is ready for review", fired when it
   enters the Sessions page's Ready-for-review group (`readyForReview`, the hub's mirror of the
   page's rule) and replacing the separate "finished its turn" and "created a PR" notices; retracted

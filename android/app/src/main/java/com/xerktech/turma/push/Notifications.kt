@@ -23,6 +23,7 @@ object Notifications {
     const val CH_TURN = "turma_turn"
     const val CH_PR = "turma_pr"
     const val CH_HOST = "turma_host"
+    const val CH_SPEND = "turma_spend"
 
     fun createChannels(context: Context) {
         val mgr = context.getSystemService(NotificationManager::class.java) ?: return
@@ -34,6 +35,10 @@ object Notifications {
             Triple(CH_TURN, "Ready for review", NotificationManager.IMPORTANCE_DEFAULT),
             Triple(CH_PR, "Pull requests", NotificationManager.IMPORTANCE_DEFAULT),
             Triple(CH_HOST, "Host status", NotificationManager.IMPORTANCE_HIGH),
+            // Runaway session spend. Its own channel rather than folding into
+            // host status: this fires rarely and is worth muting or promoting
+            // independently of whether a host went offline.
+            Triple(CH_SPEND, "Session spend", NotificationManager.IMPORTANCE_DEFAULT),
             Triple(CH_ALERTS, "General alerts", NotificationManager.IMPORTANCE_DEFAULT),
         )
         for ((id, name, importance) in channels) {
@@ -50,6 +55,11 @@ object Notifications {
         tags.contains("rocket") -> CH_PR
         // "key" is the Claude-login alert (XERK-98); "circle" also catches the
         // green_circle "login restored" notification. Both are host-level.
+        // Runaway per-session spend. Checked BEFORE the host row, which already
+        // claims "moneybag" — an older hub's host-level cost alert keeps that
+        // channel, this per-session one gets its own. A build predating this
+        // channel falls through to CH_ALERTS, so the alert still arrives.
+        tags.contains("money_with_wings") -> CH_SPEND
         tags.contains("circle") || tags.contains("rotating_light") || tags.contains("moneybag") || tags.contains("key") -> CH_HOST
         else -> CH_ALERTS
     }
