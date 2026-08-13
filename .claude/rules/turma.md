@@ -288,6 +288,25 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 - Tests: `push.test.js`, `prAlertDecision`/`readyForReview`/`XERK-154`/`pushEnabled` in
   `server.test.js`.
 
+## Terminal proxy (`/term/<sessionId>/`)
+
+- Each session's ttyd runs with `-b /term/<id>`, so it answers the BARE base path with a 302 to the
+  slash form. **The hub adds that slash itself before proxying**, rather than letting ttyd redirect:
+  a hop that normalizes the slash away makes ttyd's redirect point at itself, and the browser gives
+  up with ERR_TOO_MANY_REDIRECTS. One cloudflared release did exactly that (`path.Clean` in
+  `canonicalizeRequestPath`), which killed every terminal on the fleet while the agents stayed
+  connected and `terminalOnline` stayed true — so the symptom reads as a Turma bug and is not one.
+- **Only the base path is rewritten.** Assets and the WS below it never end in a slash, and
+  appending one there would 404 them.
+- Every client (`sessions.html`, android `TerminalScreen`, `glasses/src/hub-client.ts`,
+  `veiller/src/core/hub-client.ts`) asks for the slash form, so this is belt-and-braces for the
+  wire, not a client contract.
+- The slash is **inserted into the original request target**, not rebuilt from the parsed URL, and
+  only for origin-form requests — so the query reaches ttyd byte-for-byte and an absolute-form or
+  backslash target still 404s there rather than newly resolving to a terminal.
+- Tests: `the terminal document is fetched at ttyd's base path`, `assets below the terminal base
+  path are never rewritten` in `server.test.js`.
+
 ## Auth and the glasses surface
 
 - UI, API, and the click-to-attach live terminal (`/term/<sessionId>/`, reverse-tunneled to that

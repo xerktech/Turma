@@ -7539,6 +7539,23 @@ const server = http.createServer(async (req, res) => {
       const sessionId = decodeURIComponent(parts[1]);
       const loc = findSession(sessionId);
       if (!loc) return json(res, 404, { error: "unknown session" });
+      // ttyd runs with `-b /term/<id>`, so it answers the BARE base path with a
+      // 302 to that same path plus a trailing slash. A hop that normalizes the
+      // slash away therefore turns the terminal into a redirect to itself, and
+      // the browser gives up: cloudflared 2026.8.0 did exactly that (path.Clean
+      // in canonicalizeRequestPath, restored a release later), taking out every
+      // terminal on the fleet while the agents stayed connected. Every client
+      // asks for the slash form, so serve the document at the base path here
+      // rather than depending on the slash surviving every hop to us. Only the
+      // base path — assets and the WS below it never end in one.
+      // The slash is INSERTED into the original target, never rebuilt from the
+      // parsed URL: rebuilding re-encodes the query and would newly accept
+      // absolute-form, protocol-relative and backslash targets that reach ttyd
+      // as a 404 today. `startsWith` is what holds this to origin-form requests,
+      // so the only difference on the wire is the one character.
+      if (parts.length === 2 && !url.pathname.endsWith("/") && req.url.startsWith(url.pathname)) {
+        req.url = `${url.pathname}/${req.url.slice(url.pathname.length)}`;
+      }
       return proxyTerm(req, res, loc.host, loc.port);
     }
 

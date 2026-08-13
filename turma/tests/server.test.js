@@ -7849,6 +7849,125 @@ test("XERK-268: a data channel can only be answered by the host it was opened fo
   }
 });
 
+// Drive one terminal request through the tunnel and hand back the request line
+// the hub actually wrote to ttyd. The test IS the wire: a fake ttyd that never
+// answers is enough, because what's asserted is the path we sent, not a reply.
+async function forwardedRequestLine(host, sessionId, port, pathAndQuery) {
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: host,
+      sessions: [{ id: sessionId, repo: "Turma", status: "running", ttydPort: port,
+        worktreePath: `/git/.turma/worktrees/Turma/${sessionId}`, transcriptId: `t-${sessionId}` }],
+    },
+    headers: agentHeaders,
+  });
+  const ctrl = await wsConnect(`/agent/control?name=${host}&token=${hostAgentToken(host)}`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  let client = null;
+  try {
+    // Written to a raw socket rather than through http.request: the client
+    // normalizes the target it is given (percent-encoding, backslashes), and
+    // what is asserted here is the exact bytes the hub received and passed on.
+    // Nothing answers — our fake ttyd sends no response — so it is not awaited.
+    client = net.connect(server.address().port, "127.0.0.1", () => {
+      client.write(
+        `GET ${pathAndQuery} HTTP/1.1\r\n` +
+          "Host: x\r\n" +
+          `Authorization: ${userHeaders.authorization}\r\n\r\n`
+      );
+    });
+    client.on("error", () => {});
+    await waitFor(() => ctrlFrames.some((f) => {
+      try { return JSON.parse(f.payload).open; } catch { return false; }
+    }));
+    const ch = ctrlFrames
+      .map((f) => { try { return JSON.parse(f.payload).open; } catch { return null; } })
+      .find(Boolean);
+    const data = await wsConnect(`/agent/data?ch=${ch}&token=${hostAgentToken(host)}`, 1500);
+    const dataFrames = collectFrames(data.socket, data.leftover);
+    try {
+      await waitFor(() => dataFrames.some((f) => f.payload.includes("HTTP/1.1")));
+      const sent = Buffer.concat(dataFrames.map((f) => f.payload)).toString("utf8");
+      return sent.split("\r\n")[0];
+    } finally {
+      data.socket.destroy();
+    }
+  } finally {
+    if (client) client.destroy();
+    ctrl.socket.destroy();
+  }
+}
+
+test("the terminal document is fetched at ttyd's base path, slash or no slash", async () => {
+  // ttyd runs with `-b /term/<id>` and 302s the bare base path to the slash
+  // form, so a hop that strips the trailing slash makes that redirect point at
+  // itself and the browser gives up (cloudflared 2026.8.0 stripped it via
+  // path.Clean, and every terminal on the fleet died while the agents stayed
+  // connected). The hub must not depend on the slash reaching it.
+  assert.equal(
+    await forwardedRequestLine("slashA", "sl1", 7801, "/term/sl1"),
+    "GET /term/sl1/ HTTP/1.1",
+  );
+});
+
+test("a terminal request that kept its trailing slash is forwarded unchanged", async () => {
+  assert.equal(
+    await forwardedRequestLine("slashB", "sl2", 7802, "/term/sl2/"),
+    "GET /term/sl2/ HTTP/1.1",
+  );
+});
+
+test("the terminal base path keeps its query string when the slash is restored", async () => {
+  assert.equal(
+    await forwardedRequestLine("slashC", "sl3", 7803, "/term/sl3?arg=1"),
+    "GET /term/sl3/?arg=1 HTTP/1.1",
+  );
+});
+
+test("restoring the slash does not re-encode the query on its way to ttyd", async () => {
+  // The slash is inserted into the original target rather than rebuilt from the
+  // parsed URL, so ttyd sees the query byte-for-byte. Rebuilding it would send
+  // WHATWG-normalized bytes on the bare path and raw bytes on the slash path —
+  // the same terminal reached two ways, arriving differently.
+  assert.equal(
+    await forwardedRequestLine("slashE", "sl5", 7805, "/term/sl5?a=<>\""),
+    "GET /term/sl5/?a=<>\" HTTP/1.1",
+  );
+});
+
+test("a non-origin-form target is not rewritten into a working terminal", async () => {
+  // `new URL` reads a pathname out of absolute-form, protocol-relative and
+  // backslash targets too. Those reach ttyd as a 404 today, and restoring a
+  // slash must not quietly turn them into a served terminal — hence the rewrite
+  // only fires when the target actually STARTS with that pathname.
+  //
+  // All three spellings are pinned, because they fail differently: a guard that
+  // merely CONTAINED the pathname leaves the backslash case correct while
+  // splicing a slash into the middle of the other two, so pinning one of them
+  // lets that regression ship green.
+  assert.equal(
+    await forwardedRequestLine("slashF", "sl6", 7806, "/term\\sl6"),
+    "GET /term\\sl6 HTTP/1.1",
+  );
+  assert.equal(
+    await forwardedRequestLine("slashG", "sl7", 7807, "http://evil.example/term/sl7"),
+    "GET http://evil.example/term/sl7 HTTP/1.1",
+  );
+  assert.equal(
+    await forwardedRequestLine("slashH", "sl8", 7808, "//evil/term/sl8"),
+    "GET //evil/term/sl8 HTTP/1.1",
+  );
+});
+
+test("assets below the terminal base path are never rewritten", async () => {
+  // Only the base path gets a slash: ttyd's own asset and WS URLs already sit
+  // below it, and appending one there would 404 them.
+  assert.equal(
+    await forwardedRequestLine("slashD", "sl4", 7804, "/term/sl4/token"),
+    "GET /term/sl4/token HTTP/1.1",
+  );
+});
+
 test("XERK-268: the tunnel maps are null-prototype", () => {
   // Asserted on the maps THEMSELVES, not through a socket: on a plain object a
   // `ch` of `__proto__` read back as Object.prototype — truthy, so it sailed
