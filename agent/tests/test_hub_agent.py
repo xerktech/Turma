@@ -1013,6 +1013,57 @@ class TestSubagentUsage(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["subagent"]["week"]["input"], 20)
         self.assertEqual(rep["subagent"]["totals"]["input"], 20)
 
+    def test_only_regular_files_count_on_either_branch(self):
+        # A DIRECTORY named *.jsonl would read as a conversation and, by taking
+        # the .jsonl branch, skip its own subagents/ tree entirely.
+        write_jsonl(self._sub("adir.jsonl", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 20)])
+        rep = self._report()
+        self.assertEqual(rep["sessions"], 0)
+        self.assertEqual(rep["subagent"]["totals"]["input"], 20)
+
+    def test_a_fifo_named_like_a_transcript_is_skipped_not_opened(self):
+        # A FIFO (or a symlink to /dev/zero) blocks a plain read forever, and
+        # this walk is the cheap place to refuse it — the usage parse runs on the
+        # heartbeat's critical path, where a block is a host that reads offline.
+        os.mkfifo(os.path.join(self.proj, "pipe.jsonl"))
+        os.mkfifo(self._sub("main", "agent-pipe.jsonl"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        rep = self._report()   # would hang forever if either were opened
+        self.assertEqual(rep["totals"]["input"], 100)
+        self.assertEqual(rep["sessions"], 1)
+
+    def test_a_symlink_loop_under_subagents_does_not_hang_or_raise(self):
+        sub = os.path.join(self.proj, "main", "subagents")
+        os.makedirs(sub)
+        os.symlink(sub, os.path.join(sub, "loop"))
+        write_jsonl(os.path.join(sub, "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 20)])
+        self.assertEqual(self._report()["subagent"]["totals"]["input"], 20)
+
+    def test_a_slug_holding_only_subagents_still_reports_a_host_block(self):
+        # `sessions` counts conversations, so it stopped being a proxy for "this
+        # host spent something": a pruned parent leaves a subagents/ tree with
+        # real tokens and no conversation, which reported per-repo usage beside
+        # a NULL host-level block.
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        proj = os.path.join(self.tmp, ha._project_slug(wt))
+        os.makedirs(os.path.join(proj, "gone", "subagents"))
+        write_jsonl(os.path.join(proj, "gone", "subagents", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 90)])
+
+        def fold(slug):
+            acc = ha._UsageAcc()
+            ha._aggregate_project(os.path.join(self.tmp, slug), acc)
+            return acc
+
+        repo_usage, host = ha.repo_usage_report(
+            {wt: {"repo": "Turma", "remote": "", "slug": ha._project_slug(wt)}}, fold)
+        self.assertEqual(repo_usage[0]["usage"]["totals"]["input"], 90)
+        self.assertIsNotNone(host)
+        self.assertEqual(host["totals"]["input"], 90)
+
     def test_a_project_with_no_subagents_reports_a_zeroed_split(self):
         # Zeroed, not absent: this agent CAN answer, and the answer is "none".
         write_jsonl(os.path.join(self.proj, "main.jsonl"),

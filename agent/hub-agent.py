@@ -1665,8 +1665,14 @@ def _project_transcripts(proj):
     offsets map, and `agent-<x>.jsonl` under two different parents would
     otherwise collide and silently skip one of them.
 
+    **Only regular files count, on both branches.** A `*.jsonl` DIRECTORY would
+    otherwise be counted as a conversation AND skip its own `subagents/` tree,
+    and a FIFO (or a symlink to `/dev/zero`) named `*.jsonl` blocks the full-read
+    path forever — this walk is the one place that can cheaply refuse both.
+
     Returns None (not []) when the dir can't be listed, so the caller can tell
-    an unreadable project from an empty one."""
+    an unreadable project from an empty one. Nothing below raises: this runs on
+    the heartbeat's critical path, where an escape is a host that reads offline."""
     try:
         with os.scandir(proj) as it:
             entries = sorted(it, key=lambda e: e.name)
@@ -1674,19 +1680,23 @@ def _project_transcripts(proj):
         return None
     out = []
     for entry in entries:
-        if entry.name.endswith(".jsonl"):
-            out.append((entry.name, False))
+        try:
+            if entry.name.endswith(".jsonl") and entry.is_file():
+                out.append((entry.name, False))
+            if not entry.is_dir():
+                continue          # a *.jsonl dir still gets its subagents read
+            sub = os.path.join(entry.path, "subagents")
+            if not os.path.isdir(sub):
+                continue
+            # followlinks stays off (the default): these dirs are written by
+            # Claude Code, but a walk that follows a symlink can be made to loop.
+            for dirpath, _dirs, files in os.walk(sub):
+                for name in sorted(files):
+                    path = os.path.join(dirpath, name)
+                    if name.endswith(".jsonl") and os.path.isfile(path):
+                        out.append((os.path.relpath(path, proj), True))
+        except OSError:
             continue
-        sub = os.path.join(entry.path, "subagents")
-        if not os.path.isdir(sub):
-            continue
-        # followlinks stays off (the default): these dirs are written by Claude
-        # Code, but a walk that follows a symlink can be made to loop.
-        for dirpath, _dirs, files in os.walk(sub):
-            for name in sorted(files):
-                if name.endswith(".jsonl"):
-                    out.append(
-                        (os.path.relpath(os.path.join(dirpath, name), proj), True))
     return out
 
 
@@ -1974,7 +1984,12 @@ def repo_usage_report(ledger, fold_slug):
             "usage": report,
         })
 
-    host_usage = _finalize_usage(host) if host.sessions else None
+    # `sessions` counts CONVERSATIONS, so it is no longer a proxy for "this host
+    # spent something" (XERK-302): a slug left holding only a pruned session's
+    # subagents/ tree has real tokens and zero conversations, and gating on the
+    # count alone reported per-repo usage beside a null host block.
+    host_usage = (_finalize_usage(host)
+                  if host.sessions or _total_tokens(host.totals) else None)
     repo_usage.sort(key=lambda r: _total_tokens(r["usage"]["totals"]), reverse=True)
     return repo_usage, host_usage
 

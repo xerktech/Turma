@@ -32,9 +32,20 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
   - Delegated tokens fold into `totals`/`days`/`models` like any other turn and are counted a second
     time into **`usage.subagent`** ({totals, today, week}) — a **SLICE**, never an addend, so no
     client adds it back. `sessions` still counts CONVERSATIONS only, else it inflates by the fan-out.
-  - Absent `subagent` = "that agent can't tell you"; a zeroed one asserts nothing was delegated. The
-    Usage page divides by these, so the hub's `normalizeSubagentUsage` **drops** an unusable block
-    rather than zeroing it, which would keep the host in the denominator.
+  - Absent `subagent` = "that agent can't tell you"; a zeroed one asserts nothing was delegated —
+    and a genuine all-zero report must survive, or a non-delegating host is excluded and the share
+    OVER-states. The Usage page divides by these, so `normalizeSubagentUsage` **validates and drops,
+    never repairs**: a repaired block is indistinguishable from that genuine zero, so `{}` or
+    `{totals:{input:"9"}}` would land in the denominator with a fabricated 0 on top. Figures must be
+    non-negative SAFE INTEGERS — a float or a `1e308` decodes into a Kotlin `Long` and fails the
+    whole `/api/agents` array.
+  - **Only REGULAR FILES are enumerated, on both branches.** A `*.jsonl` directory would read as a
+    conversation and skip its own `subagents/` tree; a FIFO named `*.jsonl` blocks a read forever,
+    on the heartbeat's critical path. Nothing in the walk raises — an escape there is a host that
+    reads offline.
+  - `repo_usage_report` gates the host block on **tokens OR conversations**: `sessions` counts
+    conversations, so a slug left holding only a pruned session's `subagents/` tree has real spend
+    and a zero count, and gating on the count alone reported per-repo usage beside a null host block.
   - Tests: `TestSubagentUsage`, `subagentCard` in `usage.test.js`, the split cases in
     `UsageViewModelTest`.
 - The per-model breakdown **excludes `<synthetic>`** (and any `<...>` model): Claude Code stamps

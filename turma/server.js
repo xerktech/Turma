@@ -1689,20 +1689,35 @@ function normalizeModelUsage(usage) {
 // field reports none), while a zeroed one asserts that nothing was delegated —
 // and the Usage page divides by these, so a fabricated zero would quietly
 // understate the fleet's delegated share instead of excluding the host.
+//
+// So this VALIDATES rather than repairs, which is the only way to keep that
+// promise: repairing junk into a well-formed all-zero block is indistinguishable
+// from a host that genuinely delegated nothing, and both `{}` and
+// `{totals:{input:"9"}}` would land in the denominator with a fabricated 0 on
+// top. A real agent always sends all three windows (`_finalize_usage` builds
+// them unconditionally), so strictness costs a working host nothing.
+//
+// A figure must be a NON-NEGATIVE SAFE INTEGER, not merely a finite number: this
+// is decoded into a Kotlin `Long`, and a float or a 1e308 serialized back out
+// fails the decode of the WHOLE /api/agents array — killing the fleet list on
+// every phone over one host's bad figure. A MISSING key is 0 (a newer agent may
+// add fields; silence is not a false claim), but a key that is present and
+// unusable invalidates the block.
 function normalizeSubagentUsage(usage) {
   if (!usage || typeof usage !== "object") return;
   const s = usage.subagent;
-  if (!s || typeof s !== "object" || Array.isArray(s)) {
-    if ("subagent" in usage) delete usage.subagent;
-    return;
-  }
-  const num = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+  const drop = () => { if ("subagent" in usage) delete usage.subagent; };
+  if (!s || typeof s !== "object" || Array.isArray(s)) return drop();
   const out = {};
   for (const w of ["totals", "today", "week"]) {
     const b = s[w];
+    if (!b || typeof b !== "object" || Array.isArray(b)) return drop();
     const clean = {};
     for (const k of ["input", "output", "cacheWrite", "cacheRead"]) {
-      clean[k] = b && typeof b === "object" ? num(b[k]) : 0;
+      const v = b[k];
+      if (v === undefined || v === null) { clean[k] = 0; continue; }
+      if (!Number.isSafeInteger(v) || v < 0) return drop();
+      clean[k] = v;
     }
     out[w] = clean;
   }

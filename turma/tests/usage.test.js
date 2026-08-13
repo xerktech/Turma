@@ -313,14 +313,28 @@ test("subagentCard takes the share against reporting spend only", () => {
   assert.doesNotMatch(html, /8\.3%/);
 });
 
-test("subagentCard says so when only some series can answer", () => {
-  const html = cardHtml([series(usage(1000, 250)), series(usage(2000))]);
-  assert.match(html, /1 of 2 series report the split/);
+test("subagentCard takes the share against reporting spend WITHIN one series", () => {
+  // The case a per-series split misses entirely: ONE series (a repo unified
+  // across hosts by remoteKey) fed by a reporting host AND an older one. Every
+  // series "reports", so a series-level check sees full coverage — but 3000 of
+  // the series' 4000 tokens have no split behind them. Taking the share against
+  // the series total reads 6.3%; against the reporting spend it is 25%.
+  const html = cardHtml([series(usage(1000, 250), usage(3000))]);
+  assert.match(html, /25\.0%/);
+  assert.doesNotMatch(html, /6\.3%/);
+  assert.match(html, /of 1\.0k/);      // the denominator is disclosed on the row
 });
 
-test("subagentCard stays quiet about coverage when every series answers", () => {
+test("subagentCard measures its coverage caveat in SPEND, not in series", () => {
+  // Same mixed series: one series, so "N of M series" would say nothing at all.
+  const html = cardHtml([series(usage(1000, 250), usage(3000))]);
+  assert.match(html, /taken against the 1\.0k spent by hosts that report the split/);
+  assert.match(html, /a further 3\.0k is from hosts that can't/);
+});
+
+test("subagentCard stays quiet about coverage when every token is covered", () => {
   const html = cardHtml([series(usage(1000, 250)), series(usage(2000, 500))]);
-  assert.doesNotMatch(html, /report the split/);
+  assert.doesNotMatch(html, /hosts that can't/);
   assert.match(html, /25\.0%/);   // 750 of 3000
 });
 

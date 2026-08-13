@@ -137,9 +137,13 @@ which makes an `android/` change part of the same PR) live there.
 - **"Delegated to sub-agents"** (`subagentCard`, XERK-302) names the share of those figures spent by
   background agents. It is a slice of every other number on the page and says so — a reader who adds
   it back double-counts.
-  - **The share's denominator is `subagentOf`, not the fleet total**: only the series that reported a
-    split contribute to it, so one older host can't dilute the answer. A host reporting none is left
+  - **The share's denominator is `subagentOf`, not the fleet total**: only the spend that came with a
+    split contributes to it, so one older host can't dilute the answer. A host reporting none is left
     out entirely, and with no series reporting one the card shows no percentage at all.
+  - **`subagentOf` accumulates per CONTRIBUTION, not per series**, and the coverage caveat is
+    measured in SPEND for the same reason: a series merges every host that ran that repo, so a
+    series-level check reads full coverage on a series three quarters of whose tokens came from a
+    host that can't answer.
   - Android's `SubagentLine` is the one-line rendering of the same three windows.
 - Above the chart it shows the **Claude subscription's 5h/7d windows** (XERK-247) from each agent's
   `limits` block — the numbers exist only inside Claude Code (see `.claude/rules/agent-usage.md` for

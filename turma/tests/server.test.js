@@ -2023,36 +2023,46 @@ test("http: the sub-agent split is carried on every usage block, and coerced", a
   assert.deepEqual(rec.sessions[0].usage.subagent, split);
 });
 
-test("http: a malformed sub-agent split is DROPPED, never zeroed", async () => {
-  // Absent is what every client already reads as "this host can't tell you" (an
-  // agent predating the field sends none), and the Usage page divides by these:
-  // a fabricated zero would keep the host in the denominator and quietly
-  // understate the fleet's delegated share instead of excluding it.
+test("http: a malformed sub-agent split is DROPPED, never repaired into zeros", async () => {
+  // The coercion VALIDATES; it must not repair. A repaired block is a
+  // well-formed all-zero one, which is indistinguishable from a host that
+  // genuinely delegated nothing — so the host stays in the Usage page's
+  // denominator with a fabricated 0 on top, understating the fleet's delegated
+  // share. Absent is what every client already reads as "can't tell you".
   const read = async (key) =>
     (await request("GET", "/api/agents", { headers: userHeaders }))
       .body.agents.find((a) => a.key === key);
+  const beat = async (subagent) => {
+    await request("POST", "/api/heartbeat", {
+      body: { device: "junk-split-host", usage: { totals: { input: 1 }, subagent } },
+      headers: agentHeaders,
+    });
+    return (await read("junk-split-host")).usage.subagent;
+  };
+  const win = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
 
-  await request("POST", "/api/heartbeat", {
-    body: { device: "junk-split-host", usage: { totals: { input: 1 }, subagent: "lots" } },
-    headers: agentHeaders,
-  });
-  assert.equal((await read("junk-split-host")).usage.subagent, undefined);
+  for (const junk of [
+    "lots", 7, true, [], null,                        // not a block at all
+    {},                                               // no windows: not a report
+    { totals: { input: 5 } },                         // a partial shape is not a report
+    { totals: "x", today: 7, week: [] },              // windows that aren't buckets
+    { totals: { input: "9" }, today: {}, week: {} },  // a figure that isn't a number
+    { totals: { input: -5 }, today: {}, week: {} },   // a negative token count
+    { totals: { input: 1.5 }, today: {}, week: {} },  // a FLOAT is decode-fatal on Android
+    { totals: { input: 1e308 }, today: {}, week: {} },      // …and so is a huge one
+    { totals: { input: Number.MAX_SAFE_INTEGER + 2 }, today: {}, week: {} },
+  ]) {
+    assert.equal(await beat(junk), undefined, `not dropped: ${JSON.stringify(junk)}`);
+  }
 
-  // A block that IS an object keeps its shape, with each figure coerced to a
-  // usable number — a partial answer is still an answer, unlike the above.
-  await request("POST", "/api/heartbeat", {
-    body: {
-      device: "junk-split-host",
-      usage: { totals: { input: 1 }, subagent: { totals: { input: "8", output: -5, cacheRead: 3 } } },
-    },
-    headers: agentHeaders,
-  });
-  const zero = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
-  assert.deepEqual((await read("junk-split-host")).usage.subagent, {
-    totals: { ...zero, cacheRead: 3 },   // "8" and -5 are not usable counts
-    today: zero,
-    week: zero,
-  });
+  // A genuine all-zero report IS an answer — that host delegated nothing — and
+  // must survive, or a non-delegating host is wrongly excluded and the share
+  // over-states. A missing KEY inside a real window is 0, not a lie.
+  assert.deepEqual(
+    await beat({ totals: { ...win, input: 4 }, today: { ...win }, week: { ...win } }),
+    { totals: { ...win, input: 4 }, today: win, week: win });
+  assert.deepEqual(await beat({ totals: {}, today: {}, week: {} }),
+                   { totals: win, today: win, week: win });
 });
 
 test("http: an agent's subscription limits reach the clients, and clear again", async () => {
