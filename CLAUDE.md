@@ -20,6 +20,7 @@ that component's files.
 | `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | container boot, start-time Claude Code check, bundled toolchains |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
+| `.claude/rules/turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
 | `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
@@ -311,6 +312,27 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
     `.claude/rules/turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
+- **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers**
+  (XERK-258, XERK-273). It runs at `mem_limit: 256m`, so a flat constant larger than that can never
+  refuse anything before the OOM killer fires — which is how a flat 128 MiB upload ceiling and an
+  unbounded socket count each killed the fleet's whole control plane, `restart: unless-stopped`
+  looping the outage. `containerMemoryLimit()` reads the cgroup; everything derives from it and is
+  logged at boot. Raising `mem_limit` in DockerOps widens them with no code change. The mechanics
+  are in `.claude/rules/turma-limits.md`; what spans components is here:
+  - **413 and 503 mean opposite things and must not be collapsed**: 413 is "your body is too big,
+    send less", 503 is "the hub is momentarily full, send it again". Every `readRawBody` caller has
+    to draw the distinction itself — both did answer a flat 413 once. On a 503 the migration relay
+    HOLDS the migration in `exporting`, and `_migration_upload` retries (5xx only, never 4xx);
+    nothing else would, and a lost bundle strands the move.
+  - **An OVERSIZE body is deliberately NOT refused on its declaration.** Refusing early makes Node
+    close the connection under a request still being written, and a client that writes before
+    reading — python urllib, which is what `hub-agent.py` posts with — loses the response and sees a
+    socket error. That is exactly XERK-235's offline loop, so this is an agent-facing contract, not
+    a hub detail: test agent refusals with urllib, never with fetch.
+  - **Known gap (XERK-287): held UPLOADS are a budget of their own, outside the in-flight ceiling**,
+    so the true worst case is `in-flight + uploads` — 192 MiB of a 256 MiB container — and the flood
+    row OOMs once attachments are staged beside it. Closing it is a sizing decision with
+    user-visible cost (the upload relay, `HEARTBEAT_MAX`, or `mem_limit`), not a code fix.
 - **A carried-forward feature needs its Android port or a `PARITY.md` line**; `android/PARITY.md` is
   the living gap tracker, updated whenever a gap closes or knowingly opens.
 

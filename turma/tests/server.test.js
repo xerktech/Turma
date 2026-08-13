@@ -36,6 +36,11 @@ process.env.CONTROL_DEAD_AFTER_MS = "400";
 // Same trick for the create single-flight's expiry (XERK-241): the fleet gives
 // an unresolved create 60s to rejoin a retry, which is only testable wound down.
 process.env.CREATE_INFLIGHT_TTL_MS = "300";
+// Same trick for the stalled-body reclaim (XERK-258): the fleet gives a body
+// holding budget 20s of silence, which is only testable wound down.
+process.env.BODY_IDLE_TIMEOUT_MS = "400";
+// And the exclusive-lane occupancy ceiling, which the fleet gives 10 minutes.
+process.env.BIG_LANE_MAX_HOLD_MS = "3000";
 // The registry cap (XERK-272) is sized for a FLEET — the deployed one is a
 // handful of hosts. This suite is not a fleet: it invents ~100 synthetic host
 // names in one process and never removes them, so it is lifted here rather than
@@ -7537,6 +7542,582 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
   // It is the capability flag the hub and every composer gate on. Dropping it
   // from HEARTBEAT_KNOWN_KEYS would make the control vanish fleet-wide.
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
+});
+
+
+// ---- XERK-273: the concurrent-connection cap ---------------------------------
+
+test("connections: the cap is applied to the listening server", async () => {
+  // Unset, `maxConnections` is Infinity and nothing bounds concurrent sockets —
+  // which is the whole bug: 1024 overlapping heartbeats OOM-kill the hub at the
+  // deployed 256m regardless of how small each body is, because the cost is per
+  // CONNECTION. A regression here is silent (every test still passes, the hub
+  // just dies under load), so the value is pinned rather than merely non-zero.
+  assert.equal(server.maxConnections, 256);
+});
+
+test("connections: a connection over the cap is refused, and says so", async () => {
+  const open = [];
+  const connections = () =>
+    new Promise((res, rej) =>
+      server.getConnections((e, n) => (e ? rej(e) : res(n)))
+    );
+  const connect = () =>
+    new Promise((res, rej) => {
+      const s = net.connect(server.address().port, "127.0.0.1");
+      s.once("connect", () => res(s));
+      s.once("error", rej);
+      open.push(s);
+    });
+
+  const before = server.maxConnections;
+  try {
+    // Relative to what is already open: earlier tests leave keep-alive sockets
+    // behind, so an absolute cap here would refuse the probe's own two sockets.
+    const base = await connections();
+    server.maxConnections = base + 2;
+    await connect();
+    await connect();
+    while ((await connections()) < base + 2) await new Promise((r) => setImmediate(r));
+
+    // The refusal is observable ONLY as the `drop` event: Node destroys the
+    // socket before parsing, so there is no request to answer with a 503 and
+    // nothing but this event (and the log it drives) to diagnose it by.
+    const dropped = new Promise((res) => server.once("drop", () => res(true)));
+    const extra = await connect();
+    // ...and the client just gets closed on, with no HTTP response at all.
+    const closed = new Promise((res) => extra.once("close", () => res(true)));
+    extra.write("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n");
+    let answered = "";
+    extra.on("data", (c) => (answered += c));
+
+    assert.equal(await dropped, true);
+    assert.equal(await closed, true);
+    assert.equal(answered, "");
+  } finally {
+    server.maxConnections = before;
+    for (const s of open) s.destroy();
+  }
+});
+
+// ---- XERK-258: the in-flight body budget ------------------------------------
+// The most a single real body can charge: the per-request wire cap at full
+// parse cost. Strictly below the ceiling by design, so a body holding the
+// exclusive lane always leaves room beside it — staging anything larger models
+// a body that cannot exist.
+const bigMax = () => hub.BODY_INFLIGHT_MAX * hub.BODY_PARSE_COST;
+
+// Mirrors BODY_PARSE_COST in server.js: a JSON body is charged a multiple of
+// its wire size, because the string and JSON.parse's object graph are the real
+// bill. Held here so a test can assert the exact charge rather than "> 0".
+const BODY_PARSE_COST_EXPECTED = 3;
+
+test("budget: the ceilings are derived from the container limit, and only tighten", async () => {
+  // Fixed numbers are what made this a bug: UPLOAD_TOTAL_MAX_BYTES was a flat
+  // 128 MiB, DOUBLE the 256m the hub is deployed with, so it could never refuse
+  // anything before the OOM killer fired. Every ceiling is now a fraction of the
+  // limit -- and capped, so a big host can't hand one request the whole machine.
+  assert.ok(hub.MEMORY_LIMIT > 0);
+  assert.ok(hub.BODY_INFLIGHT_TOTAL_MAX <= Math.floor(hub.MEMORY_LIMIT / 2));
+  assert.ok(hub.BODY_INFLIGHT_MAX <= Math.floor(hub.MEMORY_LIMIT / 8));
+  assert.ok(hub.BODY_INFLIGHT_MAX <= 32 << 20, "one body may never exceed the sanity bound");
+  assert.ok(hub.UPLOAD_TOTAL_MAX_BYTES <= Math.floor(hub.MEMORY_LIMIT / 4));
+  // The load-bearing relationship: ONE max-size body, at its full parse cost,
+  // must leave room beside it. Otherwise a body holding the exclusive lane
+  // starves ordinary traffic outright -- the total outage that separating the
+  // lanes was meant to end -- and the worst case stops fitting the container.
+  assert.ok(
+    hub.BODY_INFLIGHT_MAX * hub.BODY_PARSE_COST < hub.BODY_INFLIGHT_TOTAL_MAX,
+    "a max-size body must not be able to consume the whole ceiling"
+  );
+});
+
+test("budget: one big body may exceed the room left, and exactly one", async () => {
+  assert.equal(hub.bodyInflightHeld(), 0, "no request should be in flight here");
+  // Leave less room than one big body needs, so the big lane is the only way in.
+  // (With the hub quiet a max-size body simply fits the shared lane -- the
+  // exclusive lane exists for when it does not.)
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - Math.floor(bigMax() / 2);
+  try {
+    hub.chargeBody(stage, "shared");
+    // Keyed on the hub being bit-for-bit IDLE instead, this was unusable: one
+    // trickling request defeated it, and a real 65 MiB migration bundle was
+    // refused with 3 KB in flight -- stranding the move -- while HEARTBEAT_MAX
+    // went on advertising a 32 MiB beat no concurrent moment would accept.
+    assert.equal(hub.bodyLaneFor(bigMax()), "big",
+      "a big body is admitted even though the hub is not idle");
+    hub.chargeBody(bigMax(), "big");
+    assert.equal(hub.bodyLaneFor(bigMax()), null, "a second big body must be refused");
+    hub.releaseBody(bigMax(), "big");
+    assert.equal(hub.bodyLaneFor(bigMax()), "big", "the lane frees for the next one");
+  } finally {
+    hub.releaseBody(stage, "shared");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0, "every charge must be given back");
+});
+
+test("budget: ordinary bodies share the budget until it is full", async () => {
+  const total = hub.BODY_INFLIGHT_TOTAL_MAX;
+  try {
+    assert.equal(hub.bodyLaneFor(Math.floor(total / 2)), "shared");
+    hub.chargeBody(Math.floor(total / 2), "shared");
+    assert.equal(hub.bodyLaneFor(Math.floor(total / 2)), "shared");
+    hub.chargeBody(Math.floor(total / 2), "shared");
+    // Full: the next ordinary body falls through to the big lane rather than
+    // being admitted over budget.
+    assert.equal(hub.bodyLaneFor(total), "big");
+    assert.ok(hub.bodyInflightHeld() <= total, "the shared lane never exceeds the budget");
+  } finally {
+    hub.releaseBody(hub.bodyInflightHeld(), "shared");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("budget: a leaked big lane would refuse every large body forever", async () => {
+  // The one bookkeeping slip that is silent AND permanent: the bytes come back
+  // but the lane does not, and from then on nothing large is ever admitted.
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - Math.floor(bigMax() / 2);
+  try {
+    hub.chargeBody(stage, "shared");
+    hub.chargeBody(bigMax(), "big");
+    hub.releaseBody(bigMax(), "big");
+    assert.equal(hub.bodyLaneFor(bigMax()), "big", "the lane must be free again");
+  } finally {
+    hub.releaseBody(stage, "shared");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("budget: a release can never drive the held total negative", async () => {
+  // A double release would read as "idle" and silently disable the budget --
+  // the same OOM again, only with the guard apparently in place.
+  hub.releaseBody(1 << 30, "shared");
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("http: a request over the budget is refused 503, not 413", async () => {
+  // The two refusals mean opposite things to the caller: 413 says "your body is
+  // too big, send less", 503 says "the hub is momentarily full, send it again".
+  // Collapsing them would tell an agent to shrink a beat that was fine.
+  try {
+    // BOTH lanes have to be occupied for a refusal: the shared budget full, and
+    // the one big-body lane taken. With the big lane free, a body that does not
+    // fit the shared budget is admitted there -- that is the point of it.
+    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX, "shared");
+    hub.chargeBody(1, "big");
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "budget-host" },
+      headers: { ...agentHeaders, connection: "close" },
+    });
+    assert.equal(res.status, 503);
+    assert.match(res.body.error, /busy/i);
+    assert.equal(res.body.limit, hub.BODY_INFLIGHT_TOTAL_MAX);
+  } finally {
+    hub.releaseBody(hub.BODY_INFLIGHT_TOTAL_MAX, "shared");
+    hub.releaseBody(1, "big");
+  }
+  // And with the budget clear again the very same beat succeeds -- the refusal
+  // was transient, which is exactly what the 503 promised.
+  const ok = await request("POST", "/api/heartbeat", {
+    body: { device: "budget-host" }, headers: agentHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test("budget: a body that completes gives its charge back", async () => {
+  // The leak that would matter most: a charge outliving its buffer ratchets the
+  // budget shut, and the hub 503s everything forever with nothing logged.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  for (let i = 0; i < 5; i++) {
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "leak-host", pad: "z".repeat(64 * 1024) }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200);
+  }
+  assert.equal(hub.bodyInflightHeld(), 0, "nothing may still be charged once the beats are answered");
+});
+
+test("budget: a body refused for being too large also gives its charge back", async () => {
+  // The 413 path releases on a DIFFERENT branch to the success path, so it is
+  // its own way for the budget to leak.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "big-host", pad: "y".repeat((33 << 20)) },
+    headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(hub.bodyInflightHeld(), 0, "a refused body must not stay charged");
+});
+
+test("budget: a declared Content-Length reserves NOTHING until the bytes arrive", async () => {
+  // Charging the declared length turned the budget into a cheap DoS: one socket
+  // that declares a huge body and then sends nothing held the whole budget for
+  // the request timeout, and every other body on the hub was refused 503. It
+  // needs no credentials (/api/login reads a body before any auth gate), no
+  // bandwidth, and is renewable -- a worse outage than the OOM this prevents.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/login HTTP/1.1\r\nHost: x\r\n" +
+        "Content-Type: application/json\r\nContent-Length: 33554432\r\n\r\n{"
+    );
+    // Give the hub every chance to have charged something for the 32 MiB the
+    // socket claims it is about to send.
+    await new Promise((r) => setTimeout(r, 150));
+    // Charging the declaration would hold 32 MiB x BODY_PARSE_COST here. Only
+    // what genuinely arrived may be charged, which is at most the single byte.
+    assert.ok(
+      hub.bodyInflightHeld() <= 1 * BODY_PARSE_COST_EXPECTED,
+      `nothing may be reserved for bytes that never came (held ${hub.bodyInflightHeld()})`
+    );
+
+    // ...and the hub is still fully serving everyone else meanwhile.
+    const beat = await request("POST", "/api/heartbeat", {
+      body: { device: "unwedged-host" }, headers: agentHeaders,
+    });
+    assert.equal(beat.status, 200);
+  } finally {
+    sock.destroy();
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(hub.bodyInflightHeld(), 0, "the abandoned read must give its charge back");
+});
+
+test("budget: a lone oversized body still completes once it has started", async () => {
+  // The flip side of charging only real bytes: a body admitted into an idle hub
+  // must not be refused mid-stream by its OWN accumulated charge. This is what
+  // keeps a single 65 MiB migration bundle -- larger than the whole budget at
+  // 256m -- working.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const pad = "q".repeat(Math.min(4 << 20, hub.BODY_INFLIGHT_MAX - (1 << 16)));
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "lone-big-host", pad }, headers: agentHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("http: a large LEGAL body is admitted while other traffic is in flight", async () => {
+  // The rule this replaced was keyed on the hub being bit-for-bit idle, so a few
+  // KB in flight refused a body the hub itself advertises as legal: a real
+  // 65 MiB migration bundle 503'd with 3 KB held, stranding the move, and
+  // HEARTBEAT_MAX promised a 32 MiB beat that no concurrent moment accepted.
+  // A ceiling only reachable on a perfectly idle hub is not a ceiling.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  try {
+    // Leave the shared lane with almost nothing free, so a modest and plainly
+    // legal body cannot fit it. Expressed against the budget rather than in
+    // absolute bytes, because the ceilings scale with the container and the
+    // suite does not run in one.
+    hub.chargeBody(hub.BODY_INFLIGHT_TOTAL_MAX - 1024, "shared");
+    const wire = 64 * 1024; // costs 192 KiB, far past the 1 KiB left
+    assert.ok(wire <= hub.BODY_INFLIGHT_MAX, "the probe must still be a LEGAL body");
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "big-legal-host", pad: "w".repeat(wire) }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200, "a body within HEARTBEAT_MAX must not be refused");
+  } finally {
+    hub.releaseBody(hub.bodyInflightHeld(), "shared");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("http: an oversize body is NOT refused on its declaration", async () => {
+  // XERK-235 in one assertion. Refusing at header time makes Node close the
+  // connection under a request still being written, and a client that writes its
+  // whole body before reading -- python urllib, which is what hub-agent.py posts
+  // with -- loses the response and sees a socket error instead of its LIMIT.
+  // That is the loop XERK-235 fixed: the agent re-sends the same oversized body
+  // every beat forever, host offline, nothing logged. Proven end to end against
+  // a real container with real urllib; held here as the cheap guard.
+  //
+  // What keeps this bounded is the BUDGET, not an early size check: those bytes
+  // are charged like any other, so a flood is refused 503 before buffering and
+  // only what the hub can afford ever buffers its way to a 413.
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "declared-oversize", pad: "y".repeat(33 << 20) },
+    headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413, "the caller must get a status, not a reset");
+  assert.equal(res.body.limit, hub.BODY_INFLIGHT_MAX,
+    "and the limit it needs to resize against");
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("drain: only so many refused bodies may drain at once", async () => {
+  // Draining lets a refused request still read its 413 (XERK-235), but it is not
+  // free: Node allocates for every read, and 256 sockets streaming past an
+  // oversize refusal out-allocated the collector and OOM-killed the hub --
+  // unauthenticated, through /api/login's 1 MiB cap.
+  assert.ok(hub.DRAIN_CONCURRENCY_MAX >= 1);
+  // The one oversize body a healthy fleet produces still drains and still gets
+  // its status back, which is the whole reason the cap is a count and not zero.
+  const res = await request("POST", "/api/heartbeat", {
+    body: { device: "oversize-host", pad: "y".repeat((33 << 20)) },
+    headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413);
+  assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
+});
+
+// Reclaim only fires under CONTENTION, so these hold the big lane to create it.
+// The suite does not run in a container, where the ceilings are container-sized;
+// here they are host-RAM-sized, so pressure has to be staged rather than assumed.
+function withBudgetPressure(fn) {
+  return async () => {
+    // Contend the SHARED budget, since the lanes are accounted separately now:
+    // occupying the big lane no longer pressures shared-lane reads (that
+    // separation is what stopped one big body from refusing every tiny one).
+    // Just over half, so the body under test is still admitted.
+    const stage = Math.floor(hub.BODY_INFLIGHT_TOTAL_MAX / 2) + 1;
+    hub.chargeBody(stage, "shared");
+    try { await fn(); } finally { hub.releaseBody(stage, "shared"); }
+  };
+}
+
+test("budget: under pressure, a body that goes SILENT is taken back", withBudgetPressure(async () => {
+  // The budget bounds how MUCH may be held; this bounds how LONG. One socket
+  // that streamed 22 MiB and then stopped took the big lane and refused every
+  // other body on the hub -- tiny heartbeats and the operator's own login --
+  // until the 300s request timeout, renewably, for ~0.6 kbit/s.
+  const held0 = hub.bodyInflightHeld();
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    const pad = "z".repeat(256 * 1024);
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        `{"device":"staller","pad":"${pad}`
+    );
+    // ...and then nothing. Wait for the charge to land, then for it to be taken.
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(hub.bodyInflightHeld() > held0, "the bytes it DID send are charged");
+
+    const deadline = Date.now() + hub.BODY_IDLE_TIMEOUT_MS + 5000;
+    while (hub.bodyInflightHeld() > held0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(hub.bodyInflightHeld(), held0,
+      "a hold with no progress must not be permanent");
+  } finally {
+    sock.destroy();
+  }
+}));
+
+test("budget: under pressure, a DRIBBLE cannot hold its charge open", withBudgetPressure(async () => {
+  // The idle window alone was not enough. Reset by any byte, it is a liveness
+  // check an attacker can forge: one byte per window is neither silence nor
+  // slowness, and it held the big lane -- refusing every POST on the hub,
+  // operator login included -- indefinitely, for ~0.5 bit/s after a one-time
+  // warmup, without ever having to re-stream. The window must therefore reopen
+  // on real PROGRESS, not on a sign of life.
+  const held0 = hub.bodyInflightHeld();
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  let dribbler = null;
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        `{"device":"dribbler","pad":"${"d".repeat(256 * 1024)}`
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    assert.ok(hub.bodyInflightHeld() > held0, "the warmup is charged");
+
+    // One byte per window -- under BODY_MIN_PROGRESS_BYTES, and often enough
+    // that a reset-on-any-byte rule would never expire.
+    dribbler = setInterval(() => { try { sock.write("d"); } catch {} },
+      Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 3)));
+
+    const deadline = Date.now() + hub.BODY_IDLE_TIMEOUT_MS * 4 + 2000;
+    while (hub.bodyInflightHeld() > held0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(hub.bodyInflightHeld(), held0, "dribbling must not renew the hold");
+  } finally {
+    if (dribbler) clearInterval(dribbler);
+    sock.destroy();
+  }
+}));
+
+test("budget: under pressure, a body making REAL progress is never reclaimed",
+  withBudgetPressure(async () => {
+  // The other half: the rule is a minimum RATE, and anything clearing it must be
+  // left alone however long it takes. A real slow migration lives here.
+  const held0 = hub.bodyInflightHeld();
+  const chunk = Math.max(hub.BODY_MIN_PROGRESS_BYTES * 2, 128 * 1024);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  let pump = null;
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        '{"device":"steady","pad":"'
+    );
+    pump = setInterval(() => { try { sock.write("s".repeat(chunk)); } catch {} },
+      Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 2)));
+    await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
+    assert.ok(hub.bodyInflightHeld() > held0,
+      "a body meeting the progress floor must not be reclaimed");
+  } finally {
+    if (pump) clearInterval(pump);
+    sock.destroy();
+  }
+}));
+
+test("budget: with room to spare, a slow body is NOT reclaimed", async () => {
+  // The false positive the pressure gate exists to prevent. A small request over
+  // a bad link holds a few hundred KB of a 64 MiB budget -- it monopolizes
+  // nothing, and dropping it would break a legitimate call to protect capacity
+  // that was never scarce. Reclaiming is for contention, not for slowness.
+  // The previous test's socket teardown is asynchronous, so settle first —
+  // this case is specifically about an idle hub and must actually start on one.
+  for (let i = 0; i < 50 && hub.bodyInflightHeld() > 0; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(hub.bodyInflightHeld(), 0, "this one runs on an UNcontended hub");
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${8 << 20}\r\n\r\n` +
+        `{"device":"slowpoke","pad":"${"p".repeat(32 * 1024)}`
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    const held = hub.bodyInflightHeld();
+    assert.ok(held > 0, "it is holding a charge");
+    // Silent for several windows -- and still alive, because nobody is waiting.
+    await new Promise((r) => setTimeout(r, hub.BODY_IDLE_TIMEOUT_MS * 3));
+    assert.equal(hub.bodyInflightHeld(), held,
+      "an uncontended hub must not drop a slow caller");
+  } finally {
+    sock.destroy();
+  }
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("budget: holding the big lane does not starve ordinary traffic", async () => {
+  // Billed to the shared budget, merely OCCUPYING the exclusive lane was a total
+  // outage: the big body's own charge exceeds the budget, so a 200-byte
+  // heartbeat and the operator's own login were refused 503 behind it -- one
+  // authenticated socket holding the fleet's control plane down for ~29 kbit/s.
+  // Accounted separately, it delays only other LARGE bodies.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  try {
+    // The largest body that can exist, holding the exclusive lane. The ceiling
+    // is set above it on purpose, so what it leaves behind is real room.
+    hub.chargeBody(bigMax(), "big");
+    assert.equal(hub.bodyLaneFor(1), "shared", "a tiny body still has its lane");
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "unstarved" }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200, "ordinary traffic must flow past a held big lane");
+    // Another body needing the LANE is what legitimately waits.
+    assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX), null);
+  } finally {
+    hub.releaseBody(bigMax(), "big");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0);
+});
+
+test("budget: the big lane cannot be held past its occupancy ceiling", async () => {
+  // The progress floor cannot close this on its own: a body dribbling AT the
+  // floor is byte-for-byte indistinguishable from a legitimate slow migration at
+  // the same rate, so no rate threshold separates them. This is the orthogonal
+  // bound -- not "are you making progress" but "you have had the lane long
+  // enough" -- and it is what stops an indefinite hold.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const sock = net.connect(server.address().port, "127.0.0.1");
+  let pump = null;
+  // Fill the shared lane so a modest body is pushed into the big one. The suite
+  // does not run in a container, where the budget is container-sized; here it is
+  // host-RAM-sized and nothing reasonable would reach the lane on its own.
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - (1 << 20);
+  hub.chargeBody(stage, "shared");
+  try {
+    await new Promise((res, rej) => { sock.once("connect", res); sock.once("error", rej); });
+    const warm = 512 * 1024; // costs 1.5 MiB — past the 1 MiB left in shared
+    sock.write(
+      "POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agenttok\r\n" +
+        `Content-Type: application/json\r\nContent-Length: ${33 << 20}\r\n\r\n` +
+        `{"device":"lanehog","pad":"${"h".repeat(warm)}`
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(hub.bodyLaneFor(bigMax()), null,
+      "it is holding the lane");
+    pump = setInterval(() => {
+      try { sock.write("h".repeat(hub.BODY_MIN_PROGRESS_BYTES * 2)); } catch {}
+    }, Math.max(20, Math.floor(hub.BODY_IDLE_TIMEOUT_MS / 2)));
+
+    const deadline = Date.now() + hub.BIG_LANE_MAX_HOLD_MS + 4000;
+    while (hub.bodyLaneFor(bigMax()) === null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(hub.bodyLaneFor(bigMax()), "big",
+      "paying the floor rate must not buy the lane forever");
+  } finally {
+    if (pump) clearInterval(pump);
+    sock.destroy();
+    hub.releaseBody(stage, "shared");
+  }
+});
+
+test("budget: a body PROMOTED to the big lane leaks nothing", async () => {
+  // The leak this pins was not an attack: one legitimate 22 MiB heartbeat --
+  // inside HEARTBEAT_MAX, and the size XERK-235 exists because staged history
+  // reaches -- permanently consumed the whole shared budget, after which every
+  // non-trivial body was refused for the life of the process.
+  //
+  // Cause: a large body starts in the shared lane (its first chunks are small),
+  // is promoted when it outgrows the budget, and then release() can only name
+  // the lane it ENDED in -- so the pre-promotion charge was never given back.
+  // A body's charge has to live entirely in the lane it currently occupies.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  // Force promotion by leaving almost no shared room, then sending a body that
+  // starts small enough to be admitted there and grows past what is left.
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - (2 << 20);
+  hub.chargeBody(stage, "shared");
+  try {
+    const res = await request("POST", "/api/heartbeat", {
+      body: { device: "promoted", pad: "m".repeat(4 << 20) }, headers: agentHeaders,
+    });
+    assert.equal(res.status, 200, "a legal body must still be served");
+  } finally {
+    hub.releaseBody(stage, "shared");
+  }
+  assert.equal(hub.bodyInflightHeld(), 0, "the promoted body's whole charge came back");
+  // And the shared lane is genuinely usable again, not merely reading as zero.
+  assert.equal(hub.bodyLaneFor(hub.BODY_INFLIGHT_TOTAL_MAX), "shared");
+  assert.equal(hub.budgetUnderPressure("shared"), false);
+});
+
+test("budget: a big-lane holder leaves the shared budget to everyone else", async () => {
+  // The other half of the same bug. While a promoted body held the lane, its
+  // pre-promotion charge stayed billed to shared, so a holder occupied ~the
+  // entire shared budget: a 0.5 MiB beat, a 4 MiB attachment upload and a
+  // 65 MiB migration bundle were all refused behind it. "Ordinary traffic is
+  // unaffected" has to mean more than the few hundred KB that fit in the sliver.
+  assert.equal(hub.bodyInflightHeld(), 0);
+  const stage = hub.BODY_INFLIGHT_TOTAL_MAX - (2 << 20);
+  hub.chargeBody(stage, "shared");
+  let promoted = 0;
+  try {
+    // Drive a body through promotion and measure what it leaves behind.
+    await request("POST", "/api/heartbeat", {
+      body: { device: "holder", pad: "h".repeat(4 << 20) }, headers: agentHeaders,
+    });
+    promoted = hub.bodyInflightHeld();
+  } finally {
+    hub.releaseBody(stage, "shared");
+  }
+  assert.equal(promoted - stage, 0,
+    "a promoted body must not go on holding shared budget after it completes");
 });
 
 test("normalizeLocalModel coerces the block so one host cannot hide the fleet", () => {
