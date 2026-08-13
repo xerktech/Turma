@@ -2784,9 +2784,11 @@ let bigLaneBytes = 0;
  *    advertised per-request ceilings are unreachable under any concurrent
  *    traffic: `HEARTBEAT_MAX` says a 32 MiB beat is legal, but at 3x parse cost
  *    it needs 96 of the 64 MiB budget, so it would be refused whenever ANY other
- *    body was being read — and a real 65 MiB migration bundle was refused with 3
- *    KB in flight, stranding the move. A rule keyed on the hub being bit-for-bit
- *    idle is not a rule anyone can rely on; one trickling request defeats it.
+ *    body was being read. A rule keyed on the hub being bit-for-bit idle is not
+ *    a rule anyone can rely on: one trickling request defeats it, and it also
+ *    refused a real 65 MiB migration bundle with 3 KB in flight — back when the
+ *    relay buffered one. It spools to disk now (XERK-263) and never reaches this
+ *    budget, so large HEARTBEATS are what the lane carries.
  *
  * The lane bounds the hub because only one body can hold it and every body is
  * still capped per-request. Worst case is therefore one max-size body plus the
@@ -3159,9 +3161,10 @@ const BODY_MIN_PROGRESS_BYTES =
 // only moves the price. This is the orthogonal bound — not "are you making
 // progress" but "you have had the lane long enough".
 //
-// Generous on purpose: a 65 MiB migration bundle (MIGRATE_BLOB_MAX, the largest
-// legitimate body) clears this at ~110 KiB/s, far below what a LAN or the tunnel
-// does, and the agent retries a reset anyway. What it denies is the indefinite
+// Generous on purpose: the largest body that reaches this budget is a
+// BODY_INFLIGHT_MAX heartbeat, which clears the window at a few dozen KiB/s —
+// far below what a LAN or the tunnel does. (The 65 MiB migration bundle spools
+// to disk and is not charged here at all.) What this denies is the indefinite
 // hold — an attacker must re-establish rather than sit there forever.
 const BIG_LANE_MAX_HOLD_MS =
   Number(process.env.BIG_LANE_MAX_HOLD_MS) || 10 * 60 * 1000;

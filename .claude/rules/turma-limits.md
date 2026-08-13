@@ -49,10 +49,12 @@ ways that neither bound covers alone.
 ### Two lanes
 
 - **The shared budget, and ONE big body at a time** (`bodyLaneFor`). The big lane is what makes the
-  hub's own advertised ceilings reachable: keyed instead on the hub being bit-for-bit idle, one
-  trickling request refused a real 65 MiB migration bundle with 3 KB in flight, and `HEARTBEAT_MAX`
-  promised a 32 MiB beat that no concurrent moment accepted. A ceiling only reachable on a perfectly
-  idle hub is not a ceiling.
+  hub's own advertised ceilings reachable: keyed instead on the hub being bit-for-bit idle,
+  `HEARTBEAT_MAX` promised a 32 MiB beat that no concurrent moment accepted, and one trickling
+  request refused a real 65 MiB migration bundle with 3 KB in flight — back when the relay buffered
+  one. A ceiling only reachable on a perfectly idle hub is not a ceiling.
+  - **The migration bundle no longer reaches this budget at all**: it spools to disk (XERK-263), so
+    what the lane actually carries is large HEARTBEATS. Don't restore the bundle as its rationale.
 - **The lane is re-judged on every top-up, not latched.** A shared-lane body that stops fitting is
   promoted to the big lane if free, else refused. Deciding once and charging blindly is how two
   30 MiB beats grew past the ceiling together with the budget nominally in force.
@@ -95,7 +97,7 @@ ways that neither bound covers alone.
   The progress floor cannot close this: a body dribbling AT the floor is byte-for-byte
   indistinguishable from a legitimate slow migration at the same rate, so no rate threshold
   separates them. This is the orthogonal bound — not "are you progressing" but "you have had it long
-  enough" — sized well above a 65 MiB bundle at any sane rate.
+  enough" — sized well above the largest body that reaches this budget, at any sane rate.
 
 ### Refusing a body
 
