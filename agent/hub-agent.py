@@ -958,7 +958,61 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.aws/**)",
     "Edit(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
-    "Edit(~/.claude/**)",
+    # ~/.claude is covered by `hooks/fileguard.py`, NOT by a pattern, because the
+    # rule is "everything under ~/.claude except the two agent-memory trees" and
+    # a glob list cannot express it: deny beats allow, so the exception must be a
+    # hole in the deny, and every hole is either too big (a deny matching the
+    # `agent-memory` DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is
+    # the blanket rule again) or too small (an enumerated danger list missed
+    # `shell-snapshots/`, which is arbitrary code in every live session's shell).
+    #
+    # These rules stay as DEFENCE IN DEPTH for the subset where being wrong is
+    # catastrophic: if the hook is ever misconfigured or crashes, the login, the
+    # agent definitions, the hook scripts and the shell snapshots are still
+    # protected. Every pattern here is anchored on a dot, a name or a suffix, so
+    # none can match the `agent-memory` or `projects` directory entries.
+    "Edit(~/.claude.json)",             # mcpServers: command lines run at startup
+    "Edit(~/.claude/.*)",               # .credentials.json — the fleet's login
+    "Edit(~/.claude/*.json)",
+    "Edit(~/.claude/*.jsonl)",
+    "Edit(~/.claude/settings.json*)",   # …and its .bak-* siblings
+    "Edit(~/.claude/CLAUDE.md*)",       # injected into every session on this host
+    "Edit(~/.claude/agents/**)",        # steers every future run
+    "Edit(~/.claude/bin/**)",           # hook scripts auto-execute: RCE
+    "Edit(~/.claude/hooks/**)",
+    "Edit(~/.claude/local/**)",         # the alternate install: the claude binary
+    "Edit(~/.claude/plugins/**)",
+    "Edit(~/.claude/rules/**)",         # loaded into sessions as instructions
+    "Edit(~/.claude/sessions/**)",      # session keys + the remote-control registry
+    "Edit(~/.claude/shell-snapshots/**)",  # sourced by every Bash call, every session
+    "Edit(~/.claude/skills/**)",
+    # Executed or loaded as instructions when the hook is not in force. QA
+    # measured each of these writable with the hook crashed, where the blanket
+    # rule had denied them, so the backstop has to name them for the
+    # "catastrophic subset" claim above to be true.
+    "Edit(~/.claude/commands/**)",
+    "Edit(~/.claude/output-styles/**)",
+    "Edit(~/.claude/workflows/**)",
+    "Edit(~/.claude/routines/**)",
+    "Edit(~/.claude/cowork_plugins/**)",
+    "Edit(~/.claude/jobs/**)",
+    "Edit(~/.claude/daemon/**)",
+    "Edit(~/.claude/ide/**)",              # lock files publish a port + token
+    "Edit(~/.claude/todos/**)",
+    "Edit(~/.claude/themes/**)",
+    # In Claude Code's own integrity walk beside shell-snapshots and hooks, and
+    # where the successful post-neutralisation write actually landed when QA
+    # re-ran the attack — so it belongs here at least as much as themes/ does.
+    "Edit(~/.claude/session-env/**)",
+    "Edit(~/.claude/worktrees/**)",
+    "Edit(~/.claude/plans/**)",
+    "Edit(~/.claude/backups/**)",          # the restore path for all of the above
+    "Edit(~/.claude/statusline-command.sh)",  # run when settings.json sets statusLine
+    # Transcripts: replayed into a resumed session and pushed to the hub's
+    # archive. Files only — `projects/*/*` would match the `memory` DIRECTORY
+    # beside them and take its whole subtree.
+    "Edit(~/.claude/projects/*/*.jsonl)",
+    "Edit(~/.claude/projects/*/subagents/**)",
     "Edit(~/.config/gcloud/**)",
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
@@ -975,6 +1029,22 @@ _GUARD_DENY_PATH_RULES = [
     # change that. Do not treat this line as containment. Keeping the token out
     # of child environments would need Claude Code's apiKeyHelper.
     "Read(~/.turma/local-model.env)",
+    # The files that WIRE the guard. `_ensure_guard_settings` caches the path on
+    # the manager INSTANCE and rewrites the file from build_guard_settings() on a
+    # fresh process, so one Write disables both hooks and rewrites the deny list
+    # for every session that manager launches for the rest of its lifetime —
+    # managers here run for days — and only a restart repairs it. Denying the
+    # agent's installed code (runtime_code_deny_rules) without this just moves
+    # the attack one directory over. NOT all of ~/.turma: the agent stages
+    # uploads and question files there and sessions legitimately write it.
+    # The interpreter injection points the -sE flags close. Kept as defence in
+    # depth: a hook invoked without the flags (an older settings file still on
+    # disk, a path this module does not build) is neutralised by one Write here.
+    "Edit(~/.local/lib/python*/site-packages/**)",
+    "Edit(~/.local/lib/python*/site-packages/*.pth)",
+    "Edit(~/.config/python*/**)",
+    "Edit(~/.turma/guard-settings.json)",
+    "Edit(~/.turma/limits-settings.json)",
     "Edit(~/.turma/local-model.env)",
 ]
 
@@ -1033,6 +1103,87 @@ def ask_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
 
 
+def _glob_literal(path):
+    """Escape glob metacharacters so a path is matched as literal text.
+
+    `runtime_code_deny_rules` interpolates a filesystem path into a glob. An
+    install prefix containing `[`, `*` or `?` would otherwise be read as a
+    pattern: a directory literally named `t[1]` yields a character class, so the
+    directory it names goes UNPROTECTED while an unrelated `t1` is wrongly
+    denied.
+
+    MEASURED against claude 2.1.231 — do not "simplify" from intuition:
+    **backslash escapes `[` and `*`**, and the escaped form does not over-reach
+    onto a neighbouring name; a literal `?` has no working escape — only the `?`
+    wildcard matches it, and that over-reaches onto unrelated names.
+
+    The spelling that shipped broken applied `[c]` to EVERY metacharacter, so
+    `t[1]` became `t[[]1[]]`, which denies nothing. `[[]` on its own does escape
+    `[` correctly — the earlier note here that the character-class spelling
+    "escapes NOTHING" was wrong. tests/test_matcher_oracle.py pins both against
+    the real binary; a string assertion cannot, which is how it shipped.
+
+    So a `?` in the install prefix cannot be expressed. Rather than emit a rule
+    that silently protects the wrong thing, `runtime_code_deny_rules` refuses to
+    emit one and says so — an unprotected prefix the operator is told about
+    beats a rule everyone believes in.
+    """
+    # Backslash FIRST, or escaping the others re-introduces the bug: an install
+    # path containing a literal `\` had its next character read as escaped, so
+    # the real directory went unprotected while an unrelated one was denied —
+    # the exact defect this function exists to fix, one character over.
+    return "".join("\\" + ch if ch in "\\*[" else ch for ch in path)
+
+
+def runtime_code_deny_rules(script_dir=None, repos_root=None):
+    """Deny writes to the agent's OWN installed code — the hooks above all.
+
+    `fileguard.py` refuses writes under ~/.claude, and nothing was stopping a
+    session overwriting `fileguard.py` itself: two Writes (neutralise the hook,
+    then write anywhere) re-opened the whole config directory. The blanket
+    pattern this hook replaced had no such dependency, so the hook's own
+    integrity has to be protected explicitly. Covers `guard.py` and `ask.py`
+    beside it, and `hub-agent.py`/`tunnel-agent.js` in the parent — a session
+    rewriting the manager owns the host.
+
+    **Skipped when the code lives inside REPOS_ROOT**, i.e. a developer checkout
+    of this repo: sessions working on Turma must be able to edit Turma. That is
+    exactly the case where the files are NOT the running agent's — the container
+    and native installs both put the runtime at a prefix outside the git root.
+    """
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    repos_root = repos_root if repos_root is not None else REPOS_ROOT
+    try:
+        real_dir = os.path.realpath(script_dir)
+        real_root = os.path.realpath(repos_root)
+    except OSError:
+        return []
+    if real_dir == real_root or real_dir.startswith(real_root + os.sep):
+        return []                          # a checkout, not the installed agent
+    # The DOUBLED leading slash is load-bearing. Claude Code reads a single `/`
+    # as relative to the directory holding the `--settings` file, so
+    # `Edit(/root/.local/share/turma-agent/**)` resolves against
+    # `~/.turma/guard-settings.json` and means `~/.turma/root/.local/...` — a
+    # path that exists nowhere, so the rule binds to NOTHING. Measured: with one
+    # slash the two-Write hook-neutralisation attack succeeds; with two it is
+    # refused. The rule read fine and did nothing, which is why the test
+    # asserting its STRING was green over a rule with no effect.
+    if "?" in real_dir:
+        # No escape for a literal `?` exists in this matcher, so any rule built
+        # here would protect the wrong paths. Say so rather than emit one.
+        log(f"WARNING: agent install path {real_dir!r} contains '?', which cannot be "
+            f"expressed as a literal in a permission rule — the agent's own code is "
+            f"NOT protected from session writes. Reinstall to a path without it.")
+        return []
+    return [f"Edit(/{_glob_literal(real_dir)}/**)"]
+
+
+def fileguard_script_path():
+    """Absolute path to the bundled file-write guard hook
+    (``hooks/fileguard.py``), resolved the same way as ``guard_script_path``."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
+
+
 def statusline_script_path():
     """Absolute path to the bundled subscription-limits statusLine hook
     (``hooks/statusline.py``), resolved the same way as ``guard_script_path``."""
@@ -1048,9 +1199,10 @@ ASK_HOOK_TIMEOUT_SEC = 660
 
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
-                         local_settings_path=None):
+                         local_settings_path=None, fileguard_path=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
-    Bash (the safety guard) and AskUserQuestion (the glasses answer bridge),
+    Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
+    and AskUserQuestion (the glasses answer bridge),
     plus deny rules protecting the host credential stores. The bypass-mode
     session runs freely except for what the guard blocks (see ``hooks/guard.py``);
     the ask bridge routes interactive questions to the glasses (see
@@ -1063,10 +1215,29 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
-    guard_command = f'"{python_exe}" "{guard_path}"'
-    ask_command = f'"{python_exe}" "{ask_path}"'
+    # `-SsE` are SECURITY flags here, not tidiness. A plain interpreter start
+    # imports user-site `usercustomize` before the hook's own code, so one Write
+    # to ~/.local/lib/pythonX/site-packages/usercustomize.py neutralises EVERY
+    # hook on the host — measured: with such a payload the Bash guard allowed
+    # `rm -rf /`, `git push --force origin main` and `chmod -R 777 /`, and it
+    # persists into every future python3 run as that user.
+    #
+    # `-S` is the one that closes the CLASS: `-s` drops only the USER site dir,
+    # while the interpreter's OWN site-packages is still scanned, so a `.pth` or
+    # `sitecustomize.py` there runs inside every hook process — measured, end to
+    # end, and reachable in the container, whose final stage sets no USER and so
+    # runs sessions as root over a writable /usr. `-s` and `-E` stay for the
+    # user-site and PYTHON* env halves. The ~/.local deny patterns beside this
+    # stop a plant via the file-editing TOOLS only; Bash walks past them like it
+    # walks past every pattern (XERK-309), so they are a partial reduction, not
+    # the fix. The flags are the fix.
+    # The hooks are stdlib-only by contract, so neither flag can break them.
+    guard_command = f'"{python_exe}" -SsE "{guard_path}"'
+    fileguard_path = fileguard_path or fileguard_script_path()
+    ask_command = f'"{python_exe}" -SsE "{ask_path}"'
+    fileguard_command = f'"{python_exe}" -SsE "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
-    perms = {"deny": list(_GUARD_DENY_PATH_RULES)}
+    perms = {"deny": list(_GUARD_DENY_PATH_RULES) + runtime_code_deny_rules()}
     for rule in deny:  # operator deny unions on top of the guard's own rules
         if rule not in perms["deny"]:
             perms["deny"].append(rule)
@@ -1074,25 +1245,36 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     for rule in allow:  # operator allow unions on top of the app's own rules
         if rule not in perms["allow"]:
             perms["allow"].append(rule)
-    return {
-        "permissions": perms,
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": guard_command}],
-                },
-                {
-                    "matcher": "AskUserQuestion",
-                    "hooks": [{
-                        "type": "command",
-                        "command": ask_command,
-                        "timeout": ASK_HOOK_TIMEOUT_SEC,
-                    }],
-                },
-            ]
-        },
-    }
+    pre = [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": guard_command}],
+    }]
+    # A hook whose script EXITS NONZERO fails open; a hook whose script is
+    # MISSING fails closed, and Claude Code then refuses every file edit in
+    # every session on the host — a version-skewed install would present as an
+    # unexplainable permissions bug. So wire it only when it is actually there,
+    # and say so loudly: patterns-only is degraded, not broken.
+    if os.path.exists(fileguard_path):
+        pre.append({
+            # ~/.claude is "everything except the two memory trees", which is a
+            # predicate and not a glob. See hooks/fileguard.py for why.
+            # MultiEdit does not exist in Claude Code 2.1.229; it is listed so
+            # the matcher does not silently stop covering it if it returns.
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+            "hooks": [{"type": "command", "command": fileguard_command}],
+        })
+    else:
+        log(f"fileguard hook missing at {fileguard_path}; ~/.claude is protected "
+            f"by deny patterns only (see .claude/rules/agent-hooks.md)")
+    pre.append({
+        "matcher": "AskUserQuestion",
+        "hooks": [{
+            "type": "command",
+            "command": ask_command,
+            "timeout": ASK_HOOK_TIMEOUT_SEC,
+        }],
+    })
+    return {"permissions": perms, "hooks": {"PreToolUse": pre}}
 
 
 def build_limits_settings(python_exe=None, statusline_path=None):
@@ -1118,7 +1300,7 @@ def build_limits_settings(python_exe=None, statusline_path=None):
     return {
         "statusLine": {
             "type": "command",
-            "command": f'"{python_exe}" "{statusline_path}"',
+            "command": f'"{python_exe}" -SsE "{statusline_path}"',
             "padding": 0,
         },
     }

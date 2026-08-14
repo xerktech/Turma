@@ -7,3 +7,8 @@ __pycache__/
 # Packed glasses app — built by `glasses` npm run pack, published to the Even
 # Hub portal (not committed, not a release asset).
 /turma.ehpk
+
+# Ephemeral git worktrees created by Claude Code subagents running with
+# `isolation: "worktree"`. They are real nested checkouts, so a `git add -A`
+# stages them as embedded repositories. Nothing here is ever committed.
+/.claude/worktrees/

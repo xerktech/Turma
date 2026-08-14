@@ -431,10 +431,15 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 ### Safety guard
 
 - Sessions run hands-off, so every launch passes `--settings` a generated file
-  (`build_guard_settings()` → `~/.turma/guard-settings.json`) wiring a `PreToolUse` hook over Bash
-  plus `permissions.deny` rules on host credential stores (`~/.ssh`, `~/.aws`, `~/.azure`,
-  `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every session, so deny wins even
-  under bypass.
+  (`build_guard_settings()` → `~/.turma/guard-settings.json`) wiring `PreToolUse` hooks over Bash
+  and the file-editing tools, plus `permissions.deny` rules on host credential stores (`~/.ssh`,
+  `~/.aws`, `~/.azure`, `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every
+  session, so deny wins even under bypass.
+- **`~/.claude` is guarded by `hooks/fileguard.py`, not by a pattern**: the rule is "everything
+  under it except the two agent-memory trees", and a glob list cannot express that — deny beats
+  allow, and **a deny matching a DIRECTORY takes its whole subtree**, so `Edit(~/.claude/*)` is the
+  blanket rule. Patterns still cover the catastrophic subset as defence in depth. See
+  `.claude/rules/agent-hooks.md`.
 - It hard-denies three narrow categories, each with a reason the agent self-corrects from:
   **destructive** (`rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes,
   recursive `chmod`/`chown` of system roots, protected-branch history destruction, `DROP
