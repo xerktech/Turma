@@ -5845,7 +5845,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Login form (public). Already-authenticated visitors skip straight in.
-    if (req.method === "GET" && (url.pathname === "/login" || url.pathname === "/login.html")) {
+    // HEAD as well as GET, for the same reason the asset routes take it: this is
+    // the one unauthenticated HTML surface, so it is what a CDN or an uptime
+    // check probes, and a HEAD used to fall through to a 404.
+    if (isAssetRead && (url.pathname === "/login" || url.pathname === "/login.html")) {
       if (userAuthorized(req)) {
         res.writeHead(302, { Location: "/", "Cache-Control": "no-store" });
         return res.end();

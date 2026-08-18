@@ -132,7 +132,8 @@ test("assets: a page's prose naming a file is left alone by the rewrite", async 
 test("assets: the shells revalidate and answer a conditional GET with 304", async () => {
   for (const page of ["/", "/usage", "/sessions", "/board"]) {
     const first = await request(page, userHeaders);
-    assert.equal(first.headers["cache-control"], HTML_CACHE, page);
+    assert.equal(first.headers["cache-control"], "private, no-cache", page);
+    assert.equal(HTML_CACHE, "private, no-cache");
     assert.ok(first.headers.etag, `${page} sent no ETag`);
     const again = await request(page, { ...userHeaders, "if-none-match": first.headers.etag });
     assert.equal(again.status, 304, `${page} re-sent a body it already holds`);
@@ -144,12 +145,15 @@ test("assets: the shells revalidate and answer a conditional GET with 304", asyn
 test("assets: a fingerprinted URL is immutable; the bare one revalidates", async () => {
   const hashed = await request(ASSET_URLS["/app.css"]);
   assert.equal(hashed.status, 200);
-  assert.equal(hashed.headers["cache-control"], IMMUTABLE_CACHE);
+  // Literals here too, for the reason spelled out on the superseded case below.
+  assert.equal(hashed.headers["cache-control"], "public, max-age=31536000, immutable");
+  assert.equal(IMMUTABLE_CACHE, "public, max-age=31536000, immutable");
   assert.equal(hashed.headers["content-type"], "text/css; charset=utf-8");
 
   const bare = await request("/app.css");
   assert.equal(bare.status, 200);
-  assert.equal(bare.headers["cache-control"], REVALIDATE_CACHE);
+  assert.equal(bare.headers["cache-control"], "public, no-cache");
+  assert.equal(REVALIDATE_CACHE, "public, no-cache");
   assert.equal(bare.raw, hashed.raw, "the two URLs must serve the same bytes");
 
   // Both are unauthenticated: the login page renders before any cookie exists.
@@ -185,9 +189,12 @@ test("assets: a superseded fingerprint serves the current body, never a 404", as
   // A 404 there is a fully unstyled page — the exact failure being fixed.
   const stale = await request("/app.000000000000.css");
   assert.equal(stale.status, 200);
-  // `private`: a caller can mint 2^48 of these, and a shared cache in front of
-  // the hub must not store an entry for each guess.
-  assert.equal(stale.headers["cache-control"], SUPERSEDED_CACHE);
+  // Asserted as a LITERAL, not against the imported constant: `private` is the
+  // whole point — a caller can mint 2^48 of these and a shared cache must not
+  // store an entry per guess — and a test that reads the value out of the
+  // module stays green when someone changes it back to `public`.
+  assert.equal(stale.headers["cache-control"], "private, no-cache");
+  assert.equal(SUPERSEDED_CACHE, "private, no-cache");
   assert.equal(stale.raw, (await request(ASSET_URLS["/app.css"])).raw);
   assert.equal((await request("/nav.abcdef123456.js")).status, 200);
 });
@@ -232,4 +239,14 @@ test("assets: the login page is served, and links hashed URLs, without an ETag",
   assert.equal(res.headers["cache-control"], "no-store");
   assert.equal(res.headers.etag, undefined);
   assert.ok(res.raw.includes(`="${ASSET_URLS["/app.css"]}"`));
+});
+
+test("assets: HEAD /login is answered, like the assets it links", async () => {
+  // Same CDN/uptime-monitor case as the assets: the login page is the one
+  // unauthenticated HTML surface, and a HEAD of it fell through to a 404.
+  const head = await request("/login", {}, "HEAD");
+  const get = await request("/login");
+  assert.equal(head.status, 200);
+  assert.equal(head.raw, "", "a HEAD must not carry the page");
+  assert.equal(head.headers["cache-control"], get.headers["cache-control"]);
 });
