@@ -300,6 +300,18 @@ describe("HubClient", () => {
     });
   });
 
+  // Pins the LENGTH boundary as well as the surrogate one: without this, moving
+  // the cut to `<= MAX + 1` lets a 301-char refusal through unclamped and with
+  // no ellipsis, and every other clamp test still passes.
+  it("clamps the first refusal that is one character over the limit", async () => {
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: "c".repeat(301) }, 413) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({
+      status: 413,
+      message: `${"c".repeat(300)}…`,
+    });
+  });
+
   it("leaves a refusal that already fits completely alone", async () => {
     const said = "the target agent is in a different org";
     const client = new HubClient({ config, fetchFn: fakeFetch({ error: said }, 409) });
@@ -351,7 +363,7 @@ describe("HubClient", () => {
   // A polyfilled Response may not have `json` as a function at all, so the call
   // itself sits inside readJson's promise chain. Covered here rather than only
   // through refusal(), whose own try/catch would mask a regression.
-  it("turns a synchronously-throwing json() into a rejection, not a raised throw", async () => {
+  it("surfaces a broken json() as a rejected promise, never a raised throw", async () => {
     const fetchFn = vi.fn(async () => ({
       ok: true,
       status: 200,
