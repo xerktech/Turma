@@ -5951,6 +5951,82 @@ test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead hos
   ticketQueue.length = 0;
 });
 
+test("XERK-325: auto-STOP does not kill a session over a Done only a dead host reports", async () => {
+  // The sweep KILLS, so ranking it differently from the board is the most
+  // damaging divergence of the set: the operator's running session ended for a
+  // status no card anywhere displayed, with nothing on screen saying why.
+  resetAutoStart();
+  const site = "tq325k.atlassian.net";
+  const sess = { id: "s-live", status: "running", repo: "Turma",
+                 ticket: { key: "ENG-5", siteKey: site } };
+  await asBeat("tq325kDown", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  agents.tq325kDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325kUp", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z", sessions: [sess],             // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325kUp.commands || []).map((c) => c.type), [],
+    "the board shows ENG-5 in To Do, so nothing may be killed for it");
+  // And the reverse still works: once the ONLINE host reports Done, it stops.
+  await asBeat("tq325kUp", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:40:00Z", sessions: [sess],
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325kUp.commands || []).map((c) => c.type), ["kill"]);
+});
+
+test("XERK-325: a queued click is not dropped over a Done only a dead host reports", async () => {
+  // `fleetTicketRows` feeds the drainer's "its ticket moved to Done" check, so
+  // ranking it on freshness alone accepted the click with `{queued:true,
+  // position:1}` and discarded it within one beat — silently, since the drop is
+  // a log line and the entry simply vanishes from the payload.
+  resetAutoStart();
+  const site = "tq325l.atlassian.net";
+  await asBeat("tq325lDown", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  agents.tq325lDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325lUp", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.queued, true);
+  drainTicketQueue();
+  assert.ok(queuedTicket(site, "ENG-5"),
+    "the board still shows it in To Do, so the click survives the drain");
+  // A Done from the ONLINE host still retires it, as it always did.
+  await asBeat("tq325lUp", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:40:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5"), null);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: every cross-host block resolution goes through ONE compare", async () => {
+  // The ranking diverged twice because each site wrote the tie-break out again.
+  // Pin the shared helper as the only definition: a new site with its own
+  // compare is the defect, and it is invisible to any behavioural test until
+  // some fleet shape happens to exercise it.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  // Every place that ranks a tracker block across hosts calls it...
+  assert.ok(src.match(/blockOutranks\(/g).length >= 5,
+    "ticketRepo, fleetTicketRows, autoStartSweep, autoStopSweep + the definition");
+  // ...and nothing outside its body compares blocks by hand any more, which is
+  // how autoStopSweep and fleetTicketRows drifted. (`lastFetched`-style maxima —
+  // "has a refresh landed" — are a different question and are not this compare.)
+  const defAt = src.indexOf("function blockOutranks(");
+  assert.ok(defAt > -1, "the shared compare must be locatable");
+  const defEnd = src.indexOf("\n}", defAt);
+  const outsideDef = src.slice(0, defAt) + src.slice(defEnd);
+  assert.deepEqual(outsideDef.match(/at > (?:cur|best)\.at/g) || [], [],
+    "rank blocks through blockOutranks, never with a fresh copy of the tie-break");
+});
+
 test("XERK-325: the drainer re-checks triage, so a decision landing later dispatches", async () => {
   // The common case is a race, not a permanent disagreement: a new ticket is
   // untriaged on a host for the few minutes its batch takes. The queue must pick

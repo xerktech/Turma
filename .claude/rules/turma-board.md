@@ -155,9 +155,11 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     host that answered a different repo would spawn against THAT one, giving the operator a session
     on a repo the card never showed. Candidate sets differ per host (cloned repos + that host's `gh`
     reach), so hosts legitimately disagree.
-  - **ONLINE-first is a FIVE-MIRROR rule**: `ticketRepo` (hub), `autoStartSweep`'s own block pick,
-    `mergeSites` in `board.js` and its two vendored copies, and `mergeSites` in android's
-    `core/Board.kt`. All of them rank an online
+  - **ONLINE-first is the rule everywhere a tracker block is resolved ACROSS HOSTS.** Hub-side that
+    is now ONE function, `blockOutranks` — `ticketRepo`, `fleetTicketRows`, `autoStartSweep` and
+    `autoStopSweep` all call it, and a new site with its own copy of the tie-break is the defect
+    (guarded by a test). Client-side it is `mergeSites` in `board.js`, its two vendored copies, and
+    android's `core/Board.kt`. All of them rank an online
     host's block above any offline one, freshness deciding only within a tier. The hub and the card
     must resolve a ticket the same way — routing reaches only an online host that AGREES with the
     repo, so an offline host winning on freshness either stalls a ticket an online host could run
@@ -171,12 +173,19 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
       fields**. That is why the merge order, not the dedupe, carries this rule.
     - The queue tip mirrors it: a capacity hold says an agent **that can run it**, never "one of the
       org's agents" — a free host that answered a different repo will never take the ticket.
-    - **The auto-start sweep picks its ticket LIST the same way**, and that is the mirror easiest to
-      miss because it re-derives the block itself rather than calling `ticketRepo`. Ranked on
-      freshness alone while the others preferred online, it failed silently in both directions at
-      once: it queued tickets present only in an offline host's fresher block — which no card shows,
-      so the entry has no chip, no reason and no ✕, and it holds one of the org's auto slots until
-      the blocked timer drops it — while never starting the To Do tickets on screen.
+    - **Do not count the mirrors and call it done — this diverged twice that way**, each time
+      because a site re-derived the block itself instead of calling the shared resolver. What each
+      omission cost, all of it silent and all of it user-visible:
+      - `autoStartSweep` queued tickets present only in an offline host's fresher block — which no
+        card shows, so the entry has no chip, no reason and no ✕, and it holds one of the org's auto
+        slots until the blocked timer drops it — while never starting the To Do tickets on screen.
+      - `autoStopSweep` **KILLED a running session** over a Done status only an offline host
+        reported, while the card still showed the ticket in To Do. The most damaging of the set,
+        because it destroys work rather than withholding it, and it is ungated by the auto-start
+        opt-in so it reaches orgs that opted into nothing.
+      - `fleetTicketRows` feeds the drainer's Done check, so a manual Start click was answered
+        `{queued:true, position:1}` and discarded within one beat — the drop is a log line and the
+        entry just vanishes from the payload.
     - **The board's ticket LIST goes with the block**, not just the repo chip: where an org's hosts
       poll as one user, the winning block supplies the whole list, so a ticket only the offline
       host's fresher block carried stops being shown (the hub still resolves it, and `lastFetched`
