@@ -2426,10 +2426,12 @@ function rememberCreateInFlight(fields, cmdId, host) {
 function agentBlockOnline(a, now) {
   return now - ((a && a.lastSeen) || 0) < OFFLINE_AFTER_MS;
 }
+function compareBlocks(x, y) {   // rank order, best first
+  if (x.online !== y.online) return x.online ? -1 : 1;
+  return x.at > y.at ? -1 : x.at < y.at ? 1 : 0;
+}
 function blockOutranks(cand, best) {
-  if (!best) return true;
-  if (cand.online !== best.online) return cand.online;
-  return cand.at > best.at;
+  return !best || compareBlocks(cand, best) < 0;
 }
 
 // The repo an org's board says a ticket belongs in, as triaged by whichever host
@@ -4885,19 +4887,56 @@ function dropAutoQueuedTickets(siteKey) {
 // Jira user can see look like a ticket that no longer exists — dispatch-blocked
 // while it "waited", then aged out and deleted. Freshest-wins is only the
 // tie-break for a key two hosts BOTH report.
+// One org's rows out of `fleetTicketRows()`.
+function ticketRowsForSite(rows, siteKey) {
+  return [...rows.values()].filter((r) => r && r.siteKey === siteKey);
+}
+
+// The fleet's ticket rows, resolved the way the BOARD resolves them. This is a
+// port of `board.js::mergeSites`, and it is the hub's only ticket-row view —
+// everything that acts "on what the board shows" reads it rather than walking
+// `agents` itself.
+//
+// TWO stages, and getting either alone wrong has shipped a user-visible bug:
+//
+//  1. GROUP by (siteKey, user) and keep that group's best block. A host polls as
+//     `assignee = currentUser()`, so an org whose hosts authenticate as different
+//     Jira users legitimately reports different ticket lists. Collapsing an org to
+//     ONE block dropped every ticket belonging to the other user — they sat on the
+//     board in To Do and were never started, and a Done only the other user could
+//     see never stopped its session.
+//  2. UNION those winners, one row per ticket key. Unioning across raw HOSTS
+//     instead — skipping the grouping — resurrects the losing block of a
+//     same-user pair, so a ticket an offline host still lists but the board has
+//     dropped comes back to life and gets auto-started.
+//
+// Within a group, and between two groups reporting one key, `blockOutranks`
+// decides: online first, then freshest. Between two copies of a key the newer
+// `updated` wins outright, block rank only breaking that tie — which is
+// `mergeSites`' rule, and matters because the two hosts' copies of a ticket
+// normally carry an IDENTICAL `updated` (it is the tracker's own field).
 function fleetTicketRows() {
-  const rows = new Map();   // key -> {row, online, at}
   const now = Date.now();
+  const byUser = new Map();   // siteKey \x00 user -> winning block
   for (const a of Object.values(agents)) {
     const j = a && a.jira;
     if (!j || !j.siteKey) continue;
-    const online = agentBlockOnline(a, now);
-    const at = String(j.fetchedAt || "");
-    for (const t of j.tickets || []) {
+    const cand = { block: j, siteKey: j.siteKey, online: agentBlockOnline(a, now),
+                   at: String(j.fetchedAt || "") };
+    const k = j.siteKey + "\x00" + (j.user || "");
+    if (blockOutranks(cand, byUser.get(k))) byUser.set(k, cand);
+  }
+  const rows = new Map();     // ticketQueueKey -> {row, siteKey, key, online, at}
+  for (const w of [...byUser.values()].sort(compareBlocks)) {
+    for (const t of w.block.tickets || []) {
       if (!t || !t.key) continue;
-      const k = ticketQueueKey(j.siteKey, t.key);
-      const cand = { row: t, online, at };
-      if (blockOutranks(cand, rows.get(k))) rows.set(k, cand);
+      const k = ticketQueueKey(w.siteKey, t.key);
+      const cur = rows.get(k);
+      // Best-ranked group first, so first-wins IS block rank; a strictly newer
+      // `updated` still overrides it.
+      if (cur && String(t.updated || "") <= String(cur.row.updated || "")) continue;
+      rows.set(k, { row: t, siteKey: w.siteKey, key: t.key,
+                    online: w.online, at: w.at });
     }
   }
   return rows;
@@ -5087,25 +5126,12 @@ function autoStartSweep() {
   if (!orgs.size) return;
   const now = Date.now();
   const started = startedTicketKeys();
+  const rows = fleetTicketRows();
   for (const siteKey of orgs) {
-    // The winning block by `blockOutranks` owns the ticket list and its repo
-    // guesses, so the hub auto-starts on what the board would show rather than a
-    // lagging host's older view.
-    //
-    // Ranking on freshness alone here was two silent failures at once: the sweep
-    // queued tickets present only in an offline host's fresher block — which no
-    // card shows, so the entry has no chip, no reason and no way to cancel it,
-    // and it holds one of the org's auto slots until the blocked timer drops it —
-    // while never starting the To Do tickets the operator can actually see.
-    let best = null;
-    for (const a of Object.values(agents)) {
-      if (!a.jira || a.jira.siteKey !== siteKey) continue;
-      const cand = { block: a.jira, online: agentBlockOnline(a, now),
-                     at: String(a.jira.fetchedAt || "") };
-      if (blockOutranks(cand, best)) best = cand;
-    }
-    const block = best && best.block;
-    for (const t of (block && block.tickets) || []) {
+    // The board's own view of this org's tickets — see `fleetTicketRows`. Never
+    // walk `agents` for a ticket list here: this sweep STARTS work, so acting on
+    // a copy the operator was not shown is a session nobody asked for.
+    for (const { row: t } of ticketRowsForSite(rows, siteKey)) {
       if (!t || !t.key) continue;
       if (t.statusCategory !== "todo") continue;      // only "To Do" tickets
       const repo = ticketRepo(siteKey, t.key);         // a repo must be assigned
@@ -5199,26 +5225,20 @@ const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
 
 function autoStopSweep() {
   // The set of now-Done tickets across EVERY reporting org — no opt-in gate —
-  // each taken from that org's winning block by `blockOutranks`, the same copy
-  // the board renders, so the hub stops on what the board shows rather than a
-  // lagging host's view. Ranked on freshness alone it KILLED a running session
-  // for a Done status only an offline host reported, while the card still showed
-  // the ticket in To Do and nothing said why.
-  const freshest = new Map(); // siteKey -> { block, online, at }
-  const now = Date.now();
-  for (const a of Object.values(agents)) {
-    const j = a && a.jira;
-    if (!j || !j.siteKey) continue;
-    const cand = { block: j, online: agentBlockOnline(a, now),
-                   at: String(j.fetchedAt || "") };
-    if (blockOutranks(cand, freshest.get(j.siteKey))) freshest.set(j.siteKey, cand);
-  }
+  // read off `fleetTicketRows()`, the same union-and-rank the board renders, so
+  // the hub stops on what the board shows rather than on one host's view.
+  //
+  // This sweep KILLS, so both halves of that agreement are load-bearing and each
+  // has already broken once. Ranked on freshness alone it ended a live session
+  // over a Done only an OFFLINE host reported, while the card still showed the
+  // ticket in To Do. Grouped one-block-per-ORG it did the opposite, missing a
+  // Done the board plainly displayed whenever an org's hosts poll as different
+  // Jira users. Withholding a stop is the better failure of the two, but neither
+  // is correct.
   const doneKeys = new Set(); // "<siteKey>\x00<issueKey>"
-  for (const { block } of freshest.values()) {
-    for (const t of block.tickets || []) {
-      if (t && t.key && t.statusCategory === "done") {
-        doneKeys.add(block.siteKey + "\x00" + t.key);
-      }
+  for (const { row: t, siteKey } of fleetTicketRows().values()) {
+    if (t && t.key && t.statusCategory === "done") {
+      doneKeys.add(ticketQueueKey(siteKey, t.key));
     }
   }
   if (!doneKeys.size) return;

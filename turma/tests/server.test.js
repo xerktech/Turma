@@ -4728,7 +4728,7 @@ test("http: starting a ticket session requires the user login", async () => {
 // is a To Do ticket already triaged to Turma. `autoStart:true` (the default)
 // also flips the org's HUB toggle on, since the opt-in is hub-only now.
 const asBeat = async (device, site, {
-  autoStart = true, repos = ["Turma"], capacity,
+  autoStart = true, repos = ["Turma"], capacity, user,
   sessions = [], closedSessions = [],
   tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
                repoGuess: { repo: "Turma", cloned: true } }],
@@ -4741,7 +4741,7 @@ const asBeat = async (device, site, {
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
       jira: { available: true, configured: true, siteKey: site,
-              user: `${device}@x.com`, fetchedAt, tickets },
+              user: user || `${device}@x.com`, fetchedAt, tickets },
     },
     headers: agentHeaders,
   });
@@ -5931,14 +5931,18 @@ test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead hos
   // alone it failed twice over: it queued tickets present only in an OFFLINE
   // host's fresher block — which no card shows, so the entry has no chip and no
   // way to cancel it — while never starting the To Do tickets on screen.
+  // SAME Jira user on both hosts — the documented common case (an org's agents
+  // share one token), where the board keeps ONE winning block rather than
+  // unioning. The other user's case is the test below.
   resetAutoStart();
   const site = "tq325j.atlassian.net";
-  await asBeat("tq325jDown", site, { autoStart: false, capacity: ROOMY,
+  const user = "shared@x.com";
+  await asBeat("tq325jDown", site, { autoStart: false, capacity: ROOMY, user,
     fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
     tickets: [{ key: "GHOST-1", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
   agents.tq325jDown.lastSeen = Date.now() - 10 * 60 * 1000;
-  await asBeat("tq325jUp", site, { autoStart: false, capacity: ROOMY,
+  await asBeat("tq325jUp", site, { autoStart: false, capacity: ROOMY, user,
     fetchedAt: "2026-07-14T12:00:00Z",                                // staler
     tickets: [{ key: "SEEN-1", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
@@ -5949,6 +5953,47 @@ test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead hos
   drainTicketQueue();
   assert.deepEqual((agents.tq325jUp.commands || []).map((c) => c.issueKey), ["SEEN-1"]);
   ticketQueue.length = 0;
+});
+
+test("XERK-325: auto-start sees BOTH Jira users' tickets, as the board does", async () => {
+  // A host polls as `assignee = currentUser()`, so an org whose hosts
+  // authenticate as different users reports different lists and the board UNIONS
+  // them. Resolving the org to one block left the other user's tickets sitting
+  // on the board in To Do, never started, with nothing to say why.
+  resetAutoStart();
+  const site = "tq325m.atlassian.net";
+  await asBeat("tq325mA", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "AAA-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325mB", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "BBB-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(
+    ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey).sort(),
+    ["AAA-1", "BBB-1"]);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: auto-STOP sees the other Jira user's Done too", async () => {
+  // The same grouping bug on the sweep that KILLS: a Done the board plainly
+  // displayed never stopped its session, because the ticket belonged to the
+  // other user and the org resolved to one block.
+  resetAutoStart();
+  const site = "tq325n.atlassian.net";
+  const sess = { id: "s-other", status: "running", repo: "Turma",
+                 ticket: { key: "BBB-9", siteKey: site } };
+  await asBeat("tq325nA", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", sessions: [sess],
+    tickets: [{ key: "AAA-9", statusCategory: "todo" }] });
+  await asBeat("tq325nB", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "BBB-9", statusCategory: "done" }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325nA.commands || []).map((c) => c.type), ["kill"]);
 });
 
 test("XERK-325: auto-STOP does not kill a session over a Done only a dead host reports", async () => {
@@ -6007,24 +6052,43 @@ test("XERK-325: a queued click is not dropped over a Done only a dead host repor
   ticketQueue.length = 0;
 });
 
-test("XERK-325: every cross-host block resolution goes through ONE compare", async () => {
-  // The ranking diverged twice because each site wrote the tie-break out again.
-  // Pin the shared helper as the only definition: a new site with its own
-  // compare is the defect, and it is invisible to any behavioural test until
-  // some fleet shape happens to exercise it.
+test("XERK-325: only the shared resolvers may read a block's ticket list", () => {
+  // The ranking diverged twice, both times because a new site walked the agents
+  // map and wrote the tie-break out again. A behavioural test catches that only
+  // once some fleet shape happens to exercise the new site, so this is the
+  // structural half — and it is deliberately NOT a regex over comparison
+  // spellings, which an earlier version of this test was: a QA pass escaped that
+  // by renaming a local, and it also flagged unrelated recency logic elsewhere.
+  //
+  // The invariant instead is the thing every such site must do to exist at all:
+  // read a tracker block's `tickets`. Three functions may, and a fourth is the
+  // defect — `ticketRepo` (which repo, ranked by blockOutranks),
+  // `hostTriagedTicket` (can THIS host run it — a per-host question, no ranking),
+  // and `fleetTicketRows` (the board's own view, which everything else reads).
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  // Every place that ranks a tracker block across hosts calls it...
-  assert.ok(src.match(/blockOutranks\(/g).length >= 5,
-    "ticketRepo, fleetTicketRows, autoStartSweep, autoStopSweep + the definition");
-  // ...and nothing outside its body compares blocks by hand any more, which is
-  // how autoStopSweep and fleetTicketRows drifted. (`lastFetched`-style maxima —
-  // "has a refresh landed" — are a different question and are not this compare.)
-  const defAt = src.indexOf("function blockOutranks(");
-  assert.ok(defAt > -1, "the shared compare must be locatable");
-  const defEnd = src.indexOf("\n}", defAt);
-  const outsideDef = src.slice(0, defAt) + src.slice(defEnd);
-  assert.deepEqual(outsideDef.match(/at > (?:cur|best)\.at/g) || [], [],
-    "rank blocks through blockOutranks, never with a fresh copy of the tie-break");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+  const readers = [];
+  for (const m of code.matchAll(/\.tickets\b/g)) {
+    // The enclosing function is the nearest `function <name>(` above the hit.
+    const before = code.slice(0, m.index);
+    const decl = [...before.matchAll(/function (\w+)\s*\(/g)].pop();
+    readers.push(decl ? decl[1] : "(top level)");
+  }
+  assert.deepEqual([...new Set(readers)].sort(),
+    ["fleetTicketRows", "hostTriagedTicket", "ticketRepo"],
+    "a new reader of a block's ticket list is a new ranking site — route it "
+    + "through fleetTicketRows instead");
+
+  // The other half of agreeing with the board is the GROUPING, not just the
+  // tie-break, and it is the one that broke most recently: both sweeps must read
+  // the board's view rather than resolving an org to a block of their own.
+  for (const fn of ["function autoStartSweep(", "function autoStopSweep("]) {
+    const at = code.indexOf(fn);
+    assert.ok(at > -1, `${fn} must be locatable`);
+    const body = code.slice(at, code.indexOf("\n}", at));
+    assert.match(body, /fleetTicketRows\(\)|ticketRowsForSite\(/,
+      `${fn} must resolve tickets through fleetTicketRows, not its own walk`);
+  }
 });
 
 test("XERK-325: the drainer re-checks triage, so a decision landing later dispatches", async () => {

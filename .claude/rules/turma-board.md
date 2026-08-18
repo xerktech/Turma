@@ -173,8 +173,18 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
       fields**. That is why the merge order, not the dedupe, carries this rule.
     - The queue tip mirrors it: a capacity hold says an agent **that can run it**, never "one of the
       org's agents" — a free host that answered a different repo will never take the ticket.
-    - **Do not count the mirrors and call it done — this diverged twice that way**, each time
-      because a site re-derived the block itself instead of calling the shared resolver. What each
+    - **Agreeing with the board is TWO things — the grouping AND the tie-break — and each has broken
+      on its own.** `fleetTicketRows` is the hub's port of `mergeSites` and the only ticket-row view:
+      group by (siteKey, **user**) keeping that group's best block, then UNION the winners, one row
+      per key. A host polls as `assignee = currentUser()`, so an org whose hosts authenticate as
+      different Jira users reports different lists and the board unions them; collapsing an org to
+      one block loses the other user's tickets entirely. Unioning across raw HOSTS instead — the
+      grouping skipped — resurrects the losing block of a same-user pair, so a ticket the board has
+      dropped comes back and gets auto-started. Only three functions may read a block's `tickets`
+      (`ticketRepo`, `hostTriagedTicket`, `fleetTicketRows`); a fourth is a new ranking site, and a
+      test pins that, because a behavioural test only catches one once some fleet shape exercises it.
+  - **Do not count the mirrors and call it done — this diverged three times that way**, each time
+      because a site re-derived the view itself instead of calling the shared resolver. What each
       omission cost, all of it silent and all of it user-visible:
       - `autoStartSweep` queued tickets present only in an offline host's fresher block — which no
         card shows, so the entry has no chip, no reason and no ✕, and it holds one of the org's auto
@@ -186,6 +196,9 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
       - `fleetTicketRows` feeds the drainer's Done check, so a manual Start click was answered
         `{queued:true, position:1}` and discarded within one beat — the drop is a log line and the
         entry just vanishes from the payload.
+      - Both sweeps resolving an org to ONE block missed everything belonging to an org's second
+        Jira user: their To Do tickets were never auto-started, and auto-stop never ended a session
+        for a Done the board plainly displayed.
     - **The board's ticket LIST goes with the block**, not just the repo chip: where an org's hosts
       poll as one user, the winning block supplies the whole list, so a ticket only the offline
       host's fresher block carried stops being shown (the hub still resolves it, and `lastFetched`
