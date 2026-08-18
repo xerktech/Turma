@@ -10660,25 +10660,36 @@ class SessionManager:
 
         The repo NOT being cloned here is no longer a refusal: this host was
         chosen precisely because it could clone it, so we start the clone and
-        queue the session behind it (see spawn's await_clone). Refusals that
-        remain log and return — a bad key, no creds, no triaged repo, or a repo
-        with no known owner to clone — each one the board's button already
-        prevents. A fetch that fails raises to handle_commands, which logs and
-        acks."""
+        queue the session behind it (see spawn's await_clone). The refusals that
+        remain — a bad key, no creds, no triaged repo, or a repo with no known
+        owner to clone — all go through `_refuse_start` (XERK-265): the command is
+        ACKed either way, so one that only logged was indistinguishable from a
+        slow spawn and left the board's button spinning out its follow window with
+        nothing to show. A fetch that fails raises to handle_commands, which logs
+        and acks."""
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd_id, context="spawnTicket")
+
         key = (issue_key or "").strip()
         if not valid_issue_key(key):
-            log(f"spawnTicket refused: {key[:50]!r} is not a valid issue key")
+            refuse(f"{key[:50]!r} is not a valid issue key")
             return
         # Re-checked here (the hub already targets a host reporting this org) to
         # keep "unset creds = zero board HTTP, ever" a property of the agent rather
         # than of hub-side targeting — same stance as refreshJira.
         if not board_configured():
-            log(f"spawnTicket refused: no board credentials on this host ({key})")
+            refuse(f"no board credentials on this host ({key})")
             return
         site_key = board_site_key()
         entry = self.triage_ledger.get(_triage_key(site_key, key))
         if not isinstance(entry, dict) or not entry.get("decided") or not entry.get("repo"):
-            log(f"spawnTicket refused: {key} has no triaged repo on this host")
+            # The hub now filters the pool by each host's own published repoGuess
+            # (findTicketHost's hostTriagedTicket), which is this same condition,
+            # so reaching here means the two disagreed — a triage that landed or
+            # moved between the beat the hub routed from and this command. Worth
+            # reporting rather than logging: it is the operator's whole answer for
+            # why the click did nothing.
+            refuse(f"{key} has no triaged repo on this host")
             return
         repo_name = entry["repo"]
         # The ledger's `cloned` is as of triage time; scan_repos() is now.
@@ -10694,8 +10705,8 @@ class SessionManager:
             # clone, so refuse before spending a Jira fetch.
             nwo = entry.get("nameWithOwner")
             if not nwo:
-                log(f"spawnTicket refused: {key}'s repo {repo_name!r} is not "
-                    "cloned here and no owner is known to clone it")
+                refuse(f"{key}'s repo {repo_name!r} is not cloned here and no "
+                       "owner is known to clone it")
                 return
             job = self.clones.get(repo_name)
             if not job or job.get("status") == "error":

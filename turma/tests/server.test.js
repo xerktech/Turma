@@ -4823,7 +4823,7 @@ test("http: starting a ticket session requires the user login", async () => {
 // is a To Do ticket already triaged to Turma. `autoStart:true` (the default)
 // also flips the org's HUB toggle on, since the opt-in is hub-only now.
 const asBeat = async (device, site, {
-  autoStart = true, repos = ["Turma"], capacity,
+  autoStart = true, repos = ["Turma"], capacity, user,
   sessions = [], closedSessions = [],
   tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
                repoGuess: { repo: "Turma", cloned: true } }],
@@ -4836,7 +4836,7 @@ const asBeat = async (device, site, {
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
       jira: { available: true, configured: true, siteKey: site,
-              user: `${device}@x.com`, fetchedAt, tickets },
+              user: user || `${device}@x.com`, fetchedAt, tickets },
     },
     headers: agentHeaders,
   });
@@ -5796,6 +5796,715 @@ test("XERK-296: a hold reason from the hub is length-capped on the entry", async
   holdQueued(e, "blocked", "x".repeat(TICKET_QUEUE_ERROR_MAX + 500));
   assert.equal(e.error.length, TICKET_QUEUE_ERROR_MAX);
   ticketQueue.length = 0;
+});
+
+// ---- routing only to a host that has TRIAGED the ticket (XERK-325) ----------
+// Triage is per-host (each agent's own ledger, its own model run, its own
+// candidate repos), while `ticketRepo` publishes the freshest host's answer
+// fleet-wide. `spawn_ticket` re-derives from the LOCAL ledger and refuses what it
+// has no decision for, so a host that has not triaged the ticket cannot run the
+// spawn — routing to one is a session that never starts.
+
+test("XERK-325: a host that has not triaged the ticket is not dispatched to", async () => {
+  // The reported bug: host B has the ticket triaged, host A is free and does not.
+  // The old pool ranked purely on availability, so the free untriaged host won and
+  // its agent refused the spawn with nothing on screen to say so.
+  resetAutoStart();
+  const site = "tq325a.atlassian.net";
+  await asBeat("tq325aUntriaged", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });          // no repoGuess
+  // Fresher, so this is the copy the card renders — the board shows Turma.
+  await asBeat("tq325aTriaged", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.deepEqual((agents.tq325aUntriaged.commands || []).map((c) => c.issueKey), [],
+    "the untriaged host must never be handed a spawn it will refuse");
+  assert.deepEqual((agents.tq325aTriaged.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a host that triaged the ticket ELSEWHERE is not dispatched to either", async () => {
+  // It would spawn against its OWN answer, so the operator would get a session on
+  // a repo the card never showed. Agreement with the published repo is the test,
+  // not merely having some decision.
+  resetAutoStart();
+  const site = "tq325b.atlassian.net";
+  await asBeat("tq325bOther", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  // Fresher, so ticketRepo publishes "Turma" — which is what the card shows.
+  await asBeat("tq325bTurma", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await startTicket(site, "ENG-5");
+  assert.deepEqual((agents.tq325bOther.commands || []).map((c) => c.issueKey), []);
+  assert.deepEqual((agents.tq325bTurma.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a 'nothing fits' verdict is not a triage decision", async () => {
+  // _apply_triage publishes a declined ticket as repoGuess.repo = null, and
+  // spawn_ticket refuses it exactly as it refuses an absent one. This host is
+  // permanently that way (_triage_stale never re-triages a decided entry), which
+  // is what made the symptom look host-specific rather than like a race.
+  resetAutoStart();
+  const site = "tq325c.atlassian.net";
+  await asBeat("tq325cNull", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo", repoGuess: { repo: null } }] });
+  await asBeat("tq325cReal", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:30:00Z",                    // the copy the card shows
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  // The only host that can run it is full, so this waits on capacity — it does
+  // NOT fall through to the host holding a null verdict.
+  assert.equal(r.body.queued, true);
+  assert.deepEqual((agents.tq325cNull.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: no online host having triaged it HOLDS as blocked, not as capacity", async () => {
+  // A freed slot does not give a host a triage decision, so reporting this as
+  // "waiting for a slot" would promise a wait that clears itself. It holds on the
+  // blocked timer instead, which is bounded and says what is wrong.
+  resetAutoStart();
+  const site = "tq325d.atlassian.net";
+  // The offline host is the only one whose Jira user is assigned ENG-5, so its
+  // row IS what the card renders — the chip is there and Start is live. The
+  // online host is in the org but has never seen the ticket.
+  await asBeat("tq325dOff", site, { autoStart: false, capacity: ROOMY,
+    user: "off@x.com",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325dOff.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325dOn", site, { autoStart: false, capacity: ROOMY,
+    user: "on@x.com", tickets: [] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /has triaged that ticket to Turma/);
+  assert.equal(r.body.queued, undefined, "a hard refusal reaches the operator, it doesn't queue");
+  assert.deepEqual((agents.tq325dOn.commands || []).map((c) => c.issueKey), []);
+});
+
+test("XERK-325: an agent PIN to a host that hasn't triaged it is refused, not routed around", async () => {
+  // The pin says which host, never that the host can run it — and the one thing a
+  // pin asserts is that no other host is chosen, so this reports rather than
+  // silently picking the host that did triage it.
+  resetAutoStart();
+  const site = "tq325e.atlassian.net";
+  await asBeat("tq325ePinned", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });
+  await asBeat("tq325eOther", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                    // the copy the card shows
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const pin = await setAgent(site, "ENG-5", { host: "tq325ePinned" });
+  assert.equal(pin.status, 200);
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /pinned to agent "tq325ePinned", which has not triaged it/);
+  assert.deepEqual((agents.tq325eOther.commands || []).map((c) => c.issueKey), [],
+    "the pin still forbids routing elsewhere");
+});
+
+test("XERK-325: an OFFLINE host's fresher triage never dictates the repo", async () => {
+  // ticketRepo and findTicketHost have to resolve against the SAME pool. The
+  // freshest block routinely belongs to a host that is down (hosts poll Jira
+  // ~10 min apart), and routing can only reach an online host that AGREES — so
+  // ranking on freshness alone named a repo nothing could be dispatched against
+  // and stalled a ticket an online host had triaged and could run.
+  resetAutoStart();
+  const site = "tq325g.atlassian.net";
+  await asBeat("tq325gDown", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  agents.tq325gDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325gUp", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.queued, undefined, "it starts — it does not stall as blocked");
+  assert.equal(r.body.repo, "Turma", "the online host's answer is the one routed on");
+  assert.deepEqual((agents.tq325gUp.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a wholly OFFLINE org still resolves a repo, so the ticket can wait", async () => {
+  // The online tier is a preference, not a filter: with nothing online the
+  // offline answer still stands, so the queue holds the ticket instead of the
+  // sweep dropping it for having no triaged repo at all.
+  resetAutoStart();
+  const site = "tq325h.atlassian.net";
+  await asBeat("tq325hDown", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325hDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /offline/,
+    "the refusal is about the org being down, not about triage");
+});
+
+test("XERK-325: 'slots full' names the hosts that can actually run it", async () => {
+  // The pool is the hosts that triaged this ticket to this repo, so reporting
+  // the ORG as full while a host with four free slots sits idle sends the
+  // operator to look at capacity they do not have a problem with.
+  resetAutoStart();
+  const site = "tq325i.atlassian.net";
+  await asBeat("tq325iAgreesFull", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325iDisagreesFree", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  // Still a capacity wait — the one host that can run it really is full, and
+  // that reason clears itself — but worded truthfully.
+  assert.equal(r.body.queued, true);
+  const e = queuedTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.ok(e, "it waits on the agreeing host rather than being refused");
+  assert.deepEqual((agents.tq325iDisagreesFree.commands || []).map((c) => c.issueKey), []);
+  // And the wording says WHICH hosts are full.
+  const { error, full } = hub.findTicketHost(site, "Turma", "ENG-5", { requireFree: true });
+  assert.equal(full, true);
+  assert.match(error, /has triaged that ticket to Turma has its session slots full/);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: spawnRefusals is coerced, since Android types it", async () => {
+  // A full /api/agents decode is atomic on Android, so one bad entry from the
+  // state.json restore (served before any host re-beats, and NOT stripped from
+  // the payload like the other caches) would fail the whole fleet array.
+  // Driven through normalizeRecord, not the leaf: the wiring is the half that
+  // can go missing, and calling the coercion directly passes with it unhooked.
+  const bad = { device: "old", spawnRefusals: "not-a-map" };
+  hub.normalizeRecord(bad);
+  assert.deepEqual(bad.spawnRefusals, {});
+
+  const mixed = { device: "old", spawnRefusals: {
+    ok: { error: "no triaged repo", at: 123 },
+    numericError: { error: 12345, at: 5 },        // reason unusable, refusal real
+    badAt: { error: "x", at: "yesterday" },       // cannot be aged out — dropped
+    notAnObject: 7,
+  } };
+  hub.normalizeRecord(mixed);
+  assert.deepEqual(Object.keys(mixed.spawnRefusals).sort(), ["numericError", "ok"]);
+  assert.deepEqual(mixed.spawnRefusals.ok, { error: "no triaged repo", at: 123 });
+  // Coerced to the default the ingest uses, never to a fabricated reason.
+  assert.equal(mixed.spawnRefusals.numericError.error, "the agent refused it");
+  // A dangerous key name never becomes an entry, and never re-points the
+  // record's prototype — the keys come off a file this coercion exists to
+  // distrust, and JSON can express any of them.
+  const proto = { device: "old", spawnRefusals: JSON.parse(
+    '{"__proto__":{"error":"x","at":1},"constructor":{"error":"y","at":1},' +
+    '"c9":{"error":"real","at":2}}') };
+  hub.normalizeRecord(proto);
+  assert.deepEqual(Object.keys(proto.spawnRefusals), ["c9"]);
+  assert.equal(Object.getPrototypeOf(proto.spawnRefusals), Object.prototype,
+    "same shape as the ingest path builds, not a null-prototype special case");
+  assert.equal(typeof ({}).error, "undefined", "Object.prototype is untouched");
+  // The COUNT is bounded here too, not just at the ingest. The restore is the
+  // one path this coercion exists for, and a map it serves is served on every
+  // /api/agents until that host next beats — a host that never beats again
+  // serves it forever. Oldest go first, like the ingest's own eviction.
+  const flood = { device: "old", spawnRefusals: {} };
+  for (let i = 0; i < 3000; i++) flood.spawnRefusals["c" + i] = { error: "x", at: i };
+  hub.normalizeRecord(flood);
+  const kept = Object.keys(flood.spawnRefusals);
+  assert.equal(kept.length, 40);
+  assert.equal(kept.includes("c2999"), true, "the newest survive");
+  assert.equal(kept.includes("c0"), false, "the oldest are evicted");
+  // The reason is length-capped here as well as at the ingest.
+  const long = { device: "old", spawnRefusals: { c: { error: "x".repeat(5000), at: 1 } } };
+  hub.normalizeRecord(long);
+  assert.equal(long.spawnRefusals.c.error.length, 500);
+});
+
+test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead host's", async () => {
+  // The sweep is the FIFTH reader of the online-first ranking. Left on freshness
+  // alone it failed twice over: it queued tickets present only in an OFFLINE
+  // host's fresher block — which no card shows, so the entry has no chip and no
+  // way to cancel it — while never starting the To Do tickets on screen.
+  // SAME Jira user on both hosts — the documented common case (an org's agents
+  // share one token), where the board keeps ONE winning block rather than
+  // unioning. The other user's case is the test below.
+  resetAutoStart();
+  const site = "tq325j.atlassian.net";
+  const user = "shared@x.com";
+  await asBeat("tq325jDown", site, { autoStart: false, capacity: ROOMY, user,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "GHOST-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325jDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325jUp", site, { autoStart: false, capacity: ROOMY, user,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "SEEN-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey),
+    ["SEEN-1"], "the visible ticket is queued, and the invisible one is not");
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325jUp.commands || []).map((c) => c.issueKey), ["SEEN-1"]);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: a strictly newer `updated` beats block rank, as mergeSites does", async () => {
+  // The two hosts' copies of a ticket normally carry an IDENTICAL `updated` (it
+  // is the tracker's own field), so this override only fires when the fleet is
+  // mid-poll — and it was the one piece of mergeSites parity with no test, which
+  // meant it could be deleted outright with the suite still green.
+  resetAutoStart();
+  const site = "tq325o.atlassian.net";
+  // Fresher BLOCK, older copy of the ticket.
+  await asBeat("tq325oFreshBlock", site, { autoStart: false, capacity: ROOMY,
+    user: "a@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "Stale", cloned: true } }] });
+  // Staler block, but a strictly newer copy of the ticket — what the board shows.
+  await asBeat("tq325oNewTicket", site, { autoStart: false, capacity: ROOMY,
+    user: "b@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Fresh", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Fresh",
+    "the newer ticket copy decides the repo, not the fresher block");
+});
+
+test("XERK-325: the SWEEP resolves the repo off the row too, not a rank of its own", async () => {
+  // `ticketRepo` feeds three routes and only the POST was pinned: a divergent
+  // freshness-only resolver wired into the sweep and the drain passed the whole
+  // suite while auto-starting a ticket the board shows UNTRIAGED. This is the
+  // sweep half — the winning copy carries no repoGuess, so the card shows no
+  // chip and no Start button, and the hub must not invent one from a losing block.
+  resetAutoStart();
+  const site = "tq325p.atlassian.net";
+  await asBeat("tq325pWinner", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });        // no repoGuess
+  await asBeat("tq325pLoser", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey), [],
+    "the board shows it untriaged, so the sweep must not start it");
+  drainTicketQueue();
+  for (const h of ["tq325pWinner", "tq325pLoser"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [], h);
+  }
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: the DRAIN resolves the repo off the row too", async () => {
+  // The third route, and it needs a fixture where the two resolvers genuinely
+  // DISAGREE — an earlier version of this test used one where they happened to
+  // agree, so it pinned nothing. Here the winning copy carries no repoGuess (the
+  // card shows the ticket untriaged), so a rank of its own resurrects a losing
+  // block's guess and dispatches a session against a repo nobody was shown; the
+  // row says untriaged, and the entry must hold as blocked instead.
+  resetAutoStart();
+  const site = "tq325q.atlassian.net";
+  await asBeat("tq325qWinner", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });        // no repoGuess
+  await asBeat("tq325qLoser", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Queued directly: the POST would refuse it (409, no triaged repo), which is
+  // the same rule from the other end — this exercises the DRAIN's own read.
+  assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
+  drainTicketQueue();
+  for (const h of ["tq325qWinner", "tq325qLoser"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [],
+      `${h} must not be dispatched a spawn for a ticket the card shows untriaged`);
+  }
+  const e = queuedTicket(site, "ENG-5");
+  assert.equal(e && e.reason, "blocked");
+  assert.match(e.error, /no triaged repo/);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: the sweep and drain honour the newer `updated` too, not just the winner", async () => {
+  // The two route tests above pin "winning copy untriaged -> invent nothing".
+  // They do NOT pin "winning copy triaged DIFFERENTLY -> don't use the other
+  // one", which is the other way the row and a block rank disagree — and a
+  // resolver dropping only the `updated` override passed the whole suite while
+  // dispatching a repo the card never showed.
+  resetAutoStart();
+  const site = "tq325r.atlassian.net";
+  // Staler BLOCK, but a strictly newer copy of the ticket — this is the row.
+  await asBeat("tq325rRow", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Fresher block, older copy — the answer a block rank would give.
+  await asBeat("tq325rRank", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  // The DRAIN route.
+  assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325rRow.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "routed to the host holding the repo the card shows");
+  assert.deepEqual((agents.tq325rRank.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+  agents.tq325rRow.commands = [];
+
+  // The SWEEP route, same fixture.
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325rRow.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.deepEqual((agents.tq325rRank.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: an UNTRIAGED copy winning on `updated` is still untriaged", async () => {
+  // The third divergence class, and the intersection of the two above: the
+  // pinned cases are untriaged-winner-by-BLOCK-RANK and triaged-differently-by-
+  // `updated`. A resolver preferring a triaged older copy over an untriaged newer
+  // one satisfies both and still dispatches a repo the card shows as untriaged.
+  //
+  // Ordinary fleet shape, not an edge case: a ticket is edited in Jira, the host
+  // that re-polled first has not triaged the new copy yet, and the other still
+  // holds the older triaged one.
+  resetAutoStart();
+  const site = "tq325t.atlassian.net";
+  await asBeat("tq325tFresh", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T11:00:00Z",
+    tickets: [{ key: "ENG-9", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000+0000" }] });   // newer, untriaged
+  await asBeat("tq325tStale", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-9", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "RepoOld", cloned: true } }] });
+  // The POST refuses it, because the card shows no chip.
+  const r = await startTicket(site, "ENG-9");
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /no triaged repo/);
+  // And the DRAIN holds it rather than reviving the older triaged copy.
+  assert.ok(enqueueTicketStart(site, "ENG-9", "manual"));
+  drainTicketQueue();
+  for (const h of ["tq325tFresh", "tq325tStale"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [], h);
+  }
+  const e = queuedTicket(site, "ENG-9");
+  assert.equal(e && e.reason, "blocked");
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: `updated` is compared as a STRING, like both client mirrors", async () => {
+  // `Date.parse` is the plausible "compare timestamps properly" edit and it
+  // escapes every other test here: it disagrees on mixed `+0000`/`Z` spellings,
+  // and on an absent `updated` it yields NaN, so every comparison goes false and
+  // the override silently stops firing. Both client mirrors string-compare.
+  resetAutoStart();
+  const site = "tq325u.atlassian.net";
+  // Same instant, two spellings. As strings "2026-07-14T12:00:00.000+0000" sorts
+  // BELOW "2026-07-14T12:00:00.000Z" ('+' < 'Z'), so the Z copy is the row;
+  // Date.parse calls them equal and first-wins by block rank would give Offset.
+  await asBeat("tq325uZ", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T11:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000Z",
+                repoGuess: { repo: "Zulu", cloned: true } }] });
+  await asBeat("tq325uOffset", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",                       // fresher block
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000+0000",
+                repoGuess: { repo: "Offset", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Zulu",
+    "string order decides, not Date.parse — which would call these equal");
+});
+
+test("XERK-325: a copy with NO `updated` never overrides one that has it", async () => {
+  // The fourth divergence class, and the one the rules paragraph predicted.
+  // Dropping the `|| ""` fallback — the most plausible "that's redundant" edit —
+  // makes `String(null)`/`String(undefined)` sort ABOVE every ISO date, so a copy
+  // with no `updated` wins outright. It is a real shape, not a contrived one:
+  // `hub-agent.py` writes `fields.get("updated")` and `System.ChangedDate`
+  // straight through, both of which can be null, and the hub coerces neither.
+  resetAutoStart();
+  const site = "tq325v.atlassian.net";
+  // Fresher block, so it is seen FIRST: untriaged, and carrying no `updated`.
+  await asBeat("tq325vNull", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo", updated: null }] });
+  await asBeat("tq325vReal", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Withheld work: without the fallback this 409s while the card shows Turma.
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.repo, "Turma");
+
+  // And the wrong-repo half: both copies triaged, the null one in the fresher
+  // block. The copy that HAS an `updated` is still the row.
+  const site2 = "tq325w.atlassian.net";
+  await asBeat("tq325wNull", site2, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo", updated: null,
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  await asBeat("tq325wReal", site2, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r2 = await startTicket(site2, "ENG-5");
+  assert.equal(r2.body.repo, "Turma", "the copy carrying an `updated` is the row");
+});
+
+test("XERK-325: `fetchedAt` is compared with `>`, and the board agrees", async () => {
+  // Nothing pinned the OPERATOR, so reverting either side to localeCompare
+  // passed every test and silently re-opened the divergence. The two disagree on
+  // a trailing `Z` vs `z`: `>` makes the lowercase copy win (0x7a > 0x5a),
+  // ICU collation makes the uppercase one. Asserting the `>` outcome pins the
+  // hub; `board.test.js` pins the same fixture on the client side.
+  resetAutoStart();
+  const site = "tq325s.atlassian.net";
+  await asBeat("tq325sUpper", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Upper", cloned: true } }] });
+  await asBeat("tq325sLower", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Lower", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Lower",
+    "code-unit order, not ICU collation — the mirrors all use `>`");
+});
+
+test("XERK-325: auto-start sees BOTH Jira users' tickets, as the board does", async () => {
+  // A host polls as `assignee = currentUser()`, so an org whose hosts
+  // authenticate as different users reports different lists and the board UNIONS
+  // them. Resolving the org to one block left the other user's tickets sitting
+  // on the board in To Do, never started, with nothing to say why.
+  resetAutoStart();
+  const site = "tq325m.atlassian.net";
+  await asBeat("tq325mA", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "AAA-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325mB", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "BBB-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(
+    ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey).sort(),
+    ["AAA-1", "BBB-1"]);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: auto-STOP sees the other Jira user's Done too", async () => {
+  // The same grouping bug on the sweep that KILLS: a Done the board plainly
+  // displayed never stopped its session, because the ticket belonged to the
+  // other user and the org resolved to one block.
+  resetAutoStart();
+  const site = "tq325n.atlassian.net";
+  const sess = { id: "s-other", status: "running", repo: "Turma",
+                 ticket: { key: "BBB-9", siteKey: site } };
+  await asBeat("tq325nA", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", sessions: [sess],
+    tickets: [{ key: "AAA-9", statusCategory: "todo" }] });
+  await asBeat("tq325nB", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "BBB-9", statusCategory: "done" }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325nA.commands || []).map((c) => c.type), ["kill"]);
+});
+
+test("XERK-325: auto-STOP does not kill a session over a Done only a dead host reports", async () => {
+  // The sweep KILLS, so ranking it differently from the board is the most
+  // damaging divergence of the set: the operator's running session ended for a
+  // status no card anywhere displayed, with nothing on screen saying why.
+  resetAutoStart();
+  const site = "tq325k.atlassian.net";
+  const sess = { id: "s-live", status: "running", repo: "Turma",
+                 ticket: { key: "ENG-5", siteKey: site } };
+  await asBeat("tq325kDown", site, { autoStart: false, capacity: ROOMY, user: "shared@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  agents.tq325kDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325kUp", site, { user: "shared@x.com", autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z", sessions: [sess],             // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325kUp.commands || []).map((c) => c.type), [],
+    "the board shows ENG-5 in To Do, so nothing may be killed for it");
+  // And the reverse still works: once the ONLINE host reports Done, it stops.
+  await asBeat("tq325kUp", site, { user: "shared@x.com", autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:40:00Z", sessions: [sess],
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325kUp.commands || []).map((c) => c.type), ["kill"]);
+});
+
+test("XERK-325: a queued click is not dropped over a Done only a dead host reports", async () => {
+  // `fleetTicketRows` feeds the drainer's "its ticket moved to Done" check, so
+  // ranking it on freshness alone accepted the click with `{queued:true,
+  // position:1}` and discarded it within one beat — silently, since the drop is
+  // a log line and the entry simply vanishes from the payload.
+  resetAutoStart();
+  const site = "tq325l.atlassian.net";
+  await asBeat("tq325lDown", site, { autoStart: false, capacity: ROOMY, user: "shared@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  agents.tq325lDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325lUp", site, { user: "shared@x.com", autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.queued, true);
+  drainTicketQueue();
+  assert.ok(queuedTicket(site, "ENG-5"),
+    "the board still shows it in To Do, so the click survives the drain");
+  // A Done from the ONLINE host still retires it, as it always did.
+  await asBeat("tq325lUp", site, { user: "shared@x.com", autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:40:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5"), null);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: only the shared resolvers may read a block's ticket list", () => {
+  // A TRIPWIRE, not a proof — read the limits below before trusting it.
+  //
+  // The ranking diverged three times, every time because a new site walked the
+  // agents map and re-derived the board's view instead of calling the shared
+  // resolver. A behavioural test catches that only once some fleet shape happens
+  // to exercise the new site, so this is the structural half: the thing such a
+  // site must do to exist at all is read a tracker block's `tickets`. Two
+  // functions may — `fleetTicketRows` (the board's own view, which everything
+  // else reads, `ticketRepo` included) and `hostTriagedTicket` (can THIS host run
+  // it: a per-host question with no ranking in it) — and a third is the defect.
+  //
+  // WHAT IT DOES NOT CATCH, measured rather than guessed — QA escaped earlier
+  // versions eight ways. Now covered: bracket notation, destructuring, an
+  // arrow-`const`, an `async`/`export`/indented `function` (each of which used to
+  // be invisible to the declaration scan and got its read blamed on the previous
+  // declaration), a divergent walk added BESIDE a legitimate `fleetTicketRows()`
+  // call.
+  //
+  // Still open, stated as the CLASS rather than a list of instances — the list
+  // was enumerated twice and was incomplete both times, so it will age again:
+  //   - a COMPUTED key (`j["tick" + "ets"]`), which escapes in EVERY position;
+  //   - a resolver in ANOTHER FILE, since this greps `server.js` alone;
+  //   - **any declaration form `DECL` does not match, sitting directly after an
+  //     allow-listed declaration** so the attribution lands on that name.
+  //     Measured examples: an object-literal method, a class method, an
+  //     object-literal arrow property, a bare `x = function …` assignment, an
+  //     IIFE, and a getter. All are caught in any other position;
+  //   - a divergent re-rank written INSIDE an allow-listed function, where the
+  //     attribution is correct and simply permissive. Not a `DECL` miss, so no
+  //     amount of pattern work reaches it. Measured on two shapes — a
+  //     freshest-block-wins re-rank inside `fleetTicketRows`, and a
+  //     grouping-kept freshness-only one — this test passes both while 8-9
+  //     behavioural tests fail. The same re-rank inside a NON-allow-listed
+  //     function does trip it, so the boundary is the allow-list, not the read.
+  //
+  // So it is a tripwire for the honest edit, not a proof. **The guarantee lives
+  // in the behavioural tests above** — the two-user, ghost, auto-stop,
+  // queued-click, and the sweep/drain repo-resolution cases, which do catch the
+  // computed-key version on every route. A change that keeps those green while
+  // making this fail is a naming problem, not a bug; say so here rather than
+  // widening the pattern until it means nothing.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+  // Dot, bracket and destructured reads alike.
+  const READ = /\.tickets\b|\[\s*["']tickets["']\s*\]|\{[^{}]*\btickets\b[^{}]*\}\s*=/g;
+  // Named functions AND `const x = (…) =>` / `= function`, so an arrow is
+  // attributed to itself rather than to whatever declaration sits above it.
+  // Anchored at the START of a line, tolerating leading whitespace and `async`/
+  // `export` — without the anchor an inner `const t = (…)` claims the
+  // attribution, and with too STRICT an anchor (`^function` alone) an
+  // `async function` or a one-space-indented one is invisible and its read is
+  // blamed on whatever declaration precedes it.
+  // The two forms are anchored DIFFERENTLY on purpose. A `function` declaration
+  // may be indented and may be `async`/`export`/generator — a one-space indent or
+  // a bare `async` was an escape, since the read then got blamed on whatever
+  // declaration preceded it. An arrow-`const` must be at column 0, because inner
+  // ones are always indented and would otherwise claim their enclosing
+  // function's reads (`hostTriagedTicket`'s own `const t = (…)` is the case).
+  const DECL = new RegExp(
+    "^[ \\t]*(?:export\\s+)?(?:async\\s+)?function\\s*\\*?\\s*(\\w+)\\s*\\("
+    + "|^(?:export\\s+)?(?:const|let|var)\\s+(\\w+)\\s*=\\s*(?:async\\s+)?(?:function\\b|\\()",
+    "gm");
+  const readers = [];
+  for (const m of code.matchAll(READ)) {
+    const decls = [...code.slice(0, m.index).matchAll(DECL)];
+    const last = decls[decls.length - 1];
+    readers.push(last ? (last[1] || last[2]) : "(top level)");
+  }
+  assert.deepEqual([...new Set(readers)].sort(),
+    ["fleetTicketRows", "hostTriagedTicket"],
+    "a new reader of a block's ticket list is a new ranking site — route it "
+    + "through fleetTicketRows instead. (If this is an unrelated `tickets` "
+    + "field, say so here rather than widening the pattern.)");
+
+  // The other half of agreeing with the board is the GROUPING, not just the
+  // tie-break, and it is the one that broke most recently: both sweeps must read
+  // the board's view rather than resolving an org to a block of their own.
+  for (const fn of ["function autoStartSweep(", "function autoStopSweep("]) {
+    const at = code.indexOf(fn);
+    assert.ok(at > -1, `${fn} must be locatable`);
+    const body = code.slice(at, code.indexOf("\n}", at));
+    assert.match(body, /fleetTicketRows\(\)|ticketRowsForSite\(/,
+      `${fn} must resolve tickets through fleetTicketRows, not its own walk`);
+  }
+});
+
+test("XERK-325: the drainer re-checks triage, so a decision landing later dispatches", async () => {
+  // The common case is a race, not a permanent disagreement: a new ticket is
+  // untriaged on a host for the few minutes its batch takes. The queue must pick
+  // it up on the beat the decision lands rather than having given up.
+  resetAutoStart();
+  const site = "tq325f.atlassian.net";
+  await asBeat("tq325fLate", site, { autoStart: false, capacity: FULL,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325fFree", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });          // untriaged
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.queued, true, "the only triaged host is full, so it waits");
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325fFree.commands || []).map((c) => c.issueKey), []);
+  // Its triage batch comes back and it publishes the same repo.
+  await asBeat("tq325fFree", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325fFree.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(queuedTicket(site, "ENG-5"), null, "and the entry retires with the dispatch");
 });
 
 // ---- manual org colors (XERK-145) -------------------------------------------

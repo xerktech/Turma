@@ -145,8 +145,10 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   rapid clicks split. An agent predating `capacity` scores below one that reports it.
 - **No host has the repo → clone on demand.** `findTicketHost` returns `{host, needsClone:true}` for
   the most-available host; `spawn_ticket` clones it and queues behind the clone — never a refusal.
-- The **multi-host-per-org limits still apply**: the triage/branch state is per-host, so a
-  clone-on-demand routed to a host that didn't triage the ticket has no ledger entry to clone from.
+- **Only a host that has TRIAGED the ticket is eligible, and the hub resolves a ticket exactly as
+  the board does** (XERK-325). Both rules, and everything that follows from them, are in
+  `.claude/rules/board-ticket-view.md` — it loads on the same files this does, plus the vendored
+  board copies and android's `core/Board.kt`, because the rule spans all of them.
 
 #### The hub's ticket queue (XERK-296)
 

@@ -16422,6 +16422,62 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertIn("Work Azure DevOps work item #1234", cmd)
         self.assertIn("Name the branch you create for it exactly: Proj-1234", cmd)
 
+    # --- refusals are REPORTED, not just logged (XERK-325 / XERK-265) --------
+
+    def test_an_untriaged_ticket_is_reported_to_the_hub_not_only_logged(self):
+        """The bug this class of refusal caused: the command is ACKed either way,
+        so a refusal that only log()s is indistinguishable from a slow spawn — the
+        board's start button spun out its follow window and then cleared, exactly
+        as it does for a spawn that WORKED, and the operator clicked again."""
+        sm = self.make_ticket_manager(decided=False)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c1")
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c1"])
+        # Operator-facing: it has to say WHY, since it is the whole answer for a
+        # click that did nothing.
+        self.assertIn("no triaged repo", sm.spawn_failures[0]["error"])
+
+    def test_a_decided_but_repo_less_verdict_refuses_the_same_way(self):
+        """_apply_triage publishes a declined ticket as repoGuess.repo = None, and
+        the entry stays that way (_triage_stale never re-triages a decided one).
+        That is the PERMANENT half of the divergence, so it must report too."""
+        sm = self.make_ticket_manager(decided=False)
+        sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")] = {
+            "decided": True, "repo": None, "cloned": False, "reason": ""}
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c2")
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c2"])
+
+    def test_a_bad_key_reports_without_spending_a_board_fetch(self):
+        fetched = []
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: fetched.append(k)):
+            sm.spawn_ticket("not a key", cmd_id="c3")
+        self.assertEqual(fetched, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c3"])
+
+    def test_an_uncloneable_repo_reports_which_repo_and_why(self):
+        """Not cloned here AND no owner recorded to clone it from — the one
+        clone-path refusal that is terminal rather than queued behind a clone."""
+        sm = self.make_ticket_manager(repo="Elsewhere")
+        sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")]["nameWithOwner"] = None
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c4")
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c4"])
+        self.assertIn("Elsewhere", sm.spawn_failures[0]["error"])
+
+    def test_a_refusal_with_no_cmd_id_stays_a_log_line(self):
+        """The cmdId IS the correlation, so a refusal with nothing to report
+        against is logged only — the auto-start sweep's own path, and the rule
+        _refuse_start already applies to every other caller."""
+        sm = self.make_ticket_manager(decided=False)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.spawn_failures, [])
+
 
 class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):
     """XERK-29: before the manager restarts for an update it can't heartbeat

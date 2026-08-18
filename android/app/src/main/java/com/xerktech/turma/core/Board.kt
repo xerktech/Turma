@@ -305,14 +305,27 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
         }
         val k = j.siteKey + "\u0000" + j.user
         val prev = byUser[k]
-        if (prev == null || j.fetchedAt > prev.j.fetchedAt) byUser[k] = Block(j, a.online)
+        // An ONLINE host's block outranks any offline one, freshness deciding
+        // only within a tier — the same rule `ticketRepo` applies hub-side
+        // (XERK-325). The hub routes only to an online host that agrees with the
+        // repo it resolved, so an offline host winning on freshness put a repo on
+        // the chip that Start would never spawn against.
+        if (prev == null || (a.online && !prev.online) ||
+            (a.online == prev.online && j.fetchedAt > prev.j.fetchedAt)) {
+            byUser[k] = Block(j, a.online)
+        }
     }
-    // Step 2: union users within a site, dedupe tickets by key (freshest first).
+    // Step 2: union users within a site, dedupe tickets by key (online, then
+    // freshest, first — mirroring board.js).
     val bySite = LinkedHashMap<String, MutableList<Block>>()
     for (b in byUser.values) bySite.getOrPut(b.j.siteKey) { mutableListOf() }.add(b)
     val out = ArrayList<BoardSite>()
     for ((site, blocks) in bySite) {
-        val sorted = blocks.sortedByDescending { it.j.fetchedAt }
+        // Ticket dedupe below is by the ticket's own `updated`, which two hosts
+        // polling one tracker report IDENTICALLY — so ties are the norm and this
+        // order is what really decides a card's fields.
+        val sorted = blocks.sortedWith(
+            compareByDescending<Block> { it.online }.thenByDescending { it.j.fetchedAt })
         // Dedupe by the ticket's OWN `updated`, not by which block was fetched
         // more recently (board.js mergeSites). Two users polling one site can
         // each carry a different copy, and the freshest BLOCK is not
@@ -325,7 +338,15 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
             if (seen == null || t.updated > seen.updated) byKey[t.key] = t
         }
         val tickets = ArrayList(byKey.values)
+        // The winning block for every single-valued field: online first, then
+        // freshest — `sorted`'s own order.
         val newest = sorted.first().j
+        // ...EXCEPT `fetchedAt`, which board.js takes as the MAX across the
+        // winner blocks, not off the winner. The two were the same thing only
+        // while the sort was freshest-first; once online outranks freshness
+        // (XERK-325) the winner can be the OLDER block, and reporting its stamp
+        // as the site's last-fetched understates how current the board is.
+        val lastFetched = sorted.maxOfOrNull { it.j.fetchedAt }.orEmpty()
         // Unioned over every reporting host in the first loop above — see
         // repoOptsBySite for why it cannot be collected here.
         val repoOpts = repoOptsBySite[site] ?: LinkedHashMap()
@@ -337,7 +358,7 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                 source = newest.source.ifBlank { "jira" },
                 online = reporterOnline[site] ?: false,
                 error = sorted.firstNotNullOfOrNull { it.j.error },
-                fetchedAt = newest.fetchedAt,
+                fetchedAt = lastFetched,
                 tickets = tickets,
                 // Cloned repos first (the ones you can work in today), then by
                 // name — the picker's own order, so it doesn't inherit the
@@ -733,7 +754,7 @@ fun ticketStartControl(
     )
 }
 
-enum class SweepVerdict { HOLD, CLEAR, ERROR }
+enum class SweepVerdict { HOLD, CLEAR, REFUSED, ERROR }
 
 /**
  * What a start-in-flight should become, given the current fleet — a pure port
@@ -744,6 +765,15 @@ enum class SweepVerdict { HOLD, CLEAR, ERROR }
  * A cmdId-less pending (POST not back yet) always holds; its own request
  * resolves it. Returns the verdict plus the state to keep on HOLD (which is
  * where a newly-seen command sets `sawCmd`).
+ *
+ * [refusal] is this cmdId's entry in the host's `spawnRefusals` (XERK-265), the
+ * agent's own word that it declined the spawn. Checked AFTER the landed-session
+ * test, so a spawn that actually came up always wins the tie, and BEFORE the
+ * sawCmd/timeout rules, which only ever guess at what a drained command meant:
+ * without it a refused start CLEARED silently, which is byte-for-byte what a
+ * start that worked looks like, and the operator simply pressed it again
+ * (XERK-325). Null means "can't tell" — an older hub serves no refusals and an
+ * older agent stages none — so the timing rules below stay exactly as they were.
  */
 fun startSweepVerdict(
     p: StartState,
@@ -752,9 +782,11 @@ fun startSweepVerdict(
     hostKnown: Boolean,
     ageMs: Long,
     timeoutMs: Long,
+    refusal: String? = null,
 ): Pair<SweepVerdict, StartState> {
     val cmdId = p.cmdId ?: return SweepVerdict.HOLD to p
     if (sessions.any { it.spawnCmdId == cmdId }) return SweepVerdict.CLEAR to p
+    if (refusal != null) return SweepVerdict.REFUSED to p
     if (!hostKnown) return (if (ageMs > timeoutMs) SweepVerdict.ERROR else SweepVerdict.HOLD) to p
     if (cmdPresent) return SweepVerdict.HOLD to p.copy(sawCmd = true) // command still queued
     if (p.sawCmd) return SweepVerdict.CLEAR to p                      // watched it land, now drained

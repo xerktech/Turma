@@ -150,6 +150,18 @@ data class AgentInfo(
     val gitSources: List<GitSourceInfo> = emptyList(),
     val clones: List<CloneInfo> = emptyList(),
     val commands: List<CommandInfo> = emptyList(),
+    /**
+     * Session-creating commands this host DECLINED, keyed by the cmdId the hub
+     * issued (XERK-265). A command is ACKed whether the agent ran it or refused
+     * it, so without this a refused spawn is indistinguishable from a slow one —
+     * which is what left a refused ticket start clearing silently (XERK-325).
+     * Hub-BUILT, not agent-supplied: `ingestSpawnFailures` checks the cmdId
+     * against the queue that host was actually given and substitutes a default
+     * for a missing reason, so both fields are always present and typed.
+     * Empty from an older hub, which means "can't tell", never "nothing was
+     * refused".
+     */
+    val spawnRefusals: Map<String, SpawnRefusal> = emptyMap(),
     val jira: JiraBlock? = null,
     // Killed-but-resumable sessions (hub-agent _closed_payload) — the web's
     // "Ended sessions" list.
@@ -532,6 +544,18 @@ data class CommandInfo(
     val cmdId: String = "",
     val sessionId: String = "",
     val repo: String = "",
+)
+
+/**
+ * One declined session-creating command (XERK-265), the value side of
+ * [AgentInfo.spawnRefusals]. [error] is operator-facing and is what the UI
+ * shows — the hub caps its length and substitutes a default, so it is never
+ * empty. [at] is when the hub ingested it, which is what ages the entry out.
+ */
+@Serializable
+data class SpawnRefusal(
+    val error: String = "",
+    val at: Long = 0,
 )
 
 @Serializable
