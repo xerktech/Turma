@@ -100,6 +100,34 @@ process model and the command table.
   **directive rather than manager-side enforcement** because only the agent knows when "new work"
   begins. Tests: `TestSessionLifecycle`.
 
+## Cross-session messaging (XERK-339)
+
+- Every Turma session is an ordinary Claude Code session, so the fleet gets peer messaging
+  (`ListAgents`/`SendMessage` over a per-session inbox socket) for free — but only once three
+  launch-time facts are fixed, none of which defaults usefully here. All three live in
+  `_launch_tmux` and `build_guard_settings`; the reasoning is in `PEERS_FILE`'s comment.
+- **`--name` pins the peer name to the RC name**, so a session is addressed identically whether a
+  peer reaches it over the local socket or across hosts through Remote Control. Claude's own default
+  is the working directory's folder name — for a Turma session the random worktree dir (`b0d0d-a0`),
+  which names nothing. Never drop the flag from a launch path: an anonymous session is unreachable.
+- **`crossSessionInbound: accept` on the `--settings` file** — see `.claude/rules/agent-hooks.md`
+  for why the default is actively harmful here rather than merely unhelpful.
+- **Sessions read `PEERS_FILE` (`~/.turma/peers.tsv`), not `ListAgents`.** `ListAgents` answers with
+  the operator's WHOLE fleet — measured at 291 rows / 18.4 KB on this fleet, truncated past that,
+  at which point `SendMessage` warns it could not check every session for the name it is addressing.
+  Nearly all of it is dead Remote Control rows the agent cannot prune, and **reusing an `rcName`
+  does not help**: a `--remote-control` launch registers a NEW server-side session whatever name it
+  is given (verified — two launches under one name produced two session ids), so reuse bounds the
+  names in that roster and not the rows. Don't propose it again.
+- `_write_peers_file` publishes the roster off the heartbeat payload each beat: **running sessions
+  only** (a queued one has no claude and a stopped one's socket is gone, so either would only absorb
+  messages), atomic whole-file, best-effort. It carries **no busy/idle column** — a peer message
+  enqueues and drains at the receiver's next tool round whatever it is doing, and "working" is a
+  five-mirror contract (`CLAUDE.md`) that a convenience file must not become the sixth mirror of.
+- A ticket-backed session's `rcName` falls back to the ticket **key** rather than the session id, so
+  the name an operator and a sibling session both see says what the session is. Tests:
+  `TestPeerCell`, the cross-session cases in `TestSessionLifecycle`.
+
 ## Local-model failover (XERK-246)
 
 - **Running out of Claude usage stops every session on a host at once**, which is what this exists to

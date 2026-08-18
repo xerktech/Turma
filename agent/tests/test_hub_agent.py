@@ -427,6 +427,28 @@ class TestSmbHostName(unittest.TestCase):
         self.assertEqual(len(ha._smb2_header(0, 0)), 64)
 
 
+class TestPeerCell(unittest.TestCase):
+    """One cell of the peers roster (XERK-339). The file is read by a model
+    against a one-line format description and no parser, so a value carrying the
+    field or row separator would shift every later column under the wrong
+    heading."""
+
+    def test_flattens_tabs_and_newlines(self):
+        self.assertEqual(ha._peer_cell("two\tcols\nand a row"),
+                         "two cols and a row")
+
+    def test_empty_and_none_become_a_placeholder(self):
+        # An empty cell would collapse two adjacent separators into one.
+        self.assertEqual(ha._peer_cell(""), "-")
+        self.assertEqual(ha._peer_cell(None), "-")
+        self.assertEqual(ha._peer_cell("   "), "-")
+
+    def test_caps_an_operator_written_summary(self):
+        # Unbounded, and the roster is read whole by every session that consults
+        # it, so one long cell is charged to all of them.
+        self.assertEqual(len(ha._peer_cell("x" * 500)), ha.PEER_CELL_MAX_CHARS)
+
+
 class TestSpawnOptionHelpers(unittest.TestCase):
     """Validation for the composer's spawn options (#11/#12/#13) — everything
     that gets interpolated into a git/tmux command line is allowlist-checked."""
@@ -3118,6 +3140,9 @@ class ManagerMixin:
             # limits snapshot in ~/.turma can't make the heartbeat tests depend
             # on its subscription (XERK-247).
             ("LIMITS_PATH", os.path.join(self.tmp, "limits.json")),
+            # Derived at import too. Every beat rewrites it (XERK-339), so
+            # without this the suite would clobber the real host's peer roster.
+            ("PEERS_FILE", os.path.join(self.tmp, "peers.tsv")),
             ("LIMITS_SETTINGS_PATH", os.path.join(self.tmp, "limits-settings.json")),
             # The limits probe is OFF for the suite at large. A beat with no
             # snapshot considers one due and starts a real background thread
@@ -5769,6 +5794,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
         sess = sm.registry[0]
+        peers = ha.PEERS_SYSTEM_PROMPT.format(path=ha.PEERS_FILE, sid=sess["id"])
         self.assertEqual(sess["status"], "running")
         wt = self._worktree_add_cmd()
         self.assertIn("--detach", wt)
@@ -5781,8 +5807,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
             f"claude --session-id {sess['claudeSessionId']} "
             f"--remote-control '{sess['rcName']}' "
+            f"--name {sess['rcName']} "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
-            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
+            f"--append-system-prompt "
+            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + peers)}",
         )
         # The guard settings file was written and wires three PreToolUse
         # matchers: the Bash guard, the ~/.claude file guard, and the
@@ -5908,8 +5936,11 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
         cmd = self._claude_cmd()
+        peers = ha.PEERS_SYSTEM_PROMPT.format(
+            path=ha.PEERS_FILE, sid=sm.registry[0]["id"])
         self.assertIn(
-            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
+            "--append-system-prompt "
+            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + peers),
             cmd,
         )
 
@@ -5937,6 +5968,150 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sess = sm.registry[0]
         sm._launch_tmux(sess, resume=True)
         self.assertIn("--append-system-prompt", self._claude_cmd())
+
+    # --- cross-session messaging (XERK-339) --------------------------------
+
+    def test_launch_names_the_session_for_its_peers(self):
+        """--name pins the PEER name (ListAgents/SendMessage) to the same string
+        as the RC name. Without it claude names the session after its working
+        directory — the random worktree dir — so no peer and no operator can
+        tell one session from another."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        self.assertIn(f"--name {sess['rcName']}", self._claude_cmd())
+
+    def test_resume_relaunch_keeps_the_peer_name(self):
+        """The name is the session's identity to its peers, so a resume must not
+        drop it — a resumed session that went anonymous would be unreachable."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sm._launch_tmux(sess, resume=True)
+        self.assertIn(f"--name {sess['rcName']}", self._claude_cmd())
+
+    def test_ticket_session_is_named_for_its_ticket(self):
+        """A ticket-backed session's RC/peer name carries the KEY rather than the
+        random id, so `truenas-Turma-XERK-339` tells an operator (and a sibling
+        picking a message target) what it is."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", ticket={"key": "XERK-339", "summary": "Cross session"})
+        sess = sm.registry[0]
+        self.assertTrue(sess["rcName"].endswith("-Turma-XERK-339"),
+                        sess["rcName"])
+        self.assertNotIn(sess["id"], sess["rcName"])
+
+    def test_operator_label_still_beats_the_ticket_key(self):
+        """An explicitly typed label is the operator's own name for the session
+        and outranks the key we would otherwise derive."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", label="hotfix", ticket={"key": "XERK-339"})
+        self.assertTrue(sm.registry[0]["rcName"].endswith("-Turma-hotfix"))
+
+    def test_bare_spawn_still_falls_back_to_the_session_id(self):
+        """No label and no ticket: the id remains the last resort, so a bare
+        spawn's name is unchanged from before this ticket."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        self.assertTrue(sess["rcName"].endswith(f"-Turma-{sess['id']}"))
+
+    def test_launch_points_the_session_at_the_peers_file(self):
+        """The directive names the roster's path and the reader's OWN id (the
+        file is shared, so a session can only skip itself by id), and says to
+        read it rather than call ListAgents."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        cmd = self._claude_cmd()
+        self.assertIn(ha.PEERS_FILE, cmd)
+        self.assertIn(f"the row whose `id` is {sess['id']} is you", cmd)
+        self.assertIn("rather than calling\nListAgents", cmd)
+
+    def test_peers_file_lists_running_sessions_only(self):
+        """A queued session has no claude to receive anything and a stopped one's
+        inbox socket is gone, so listing either would only yield messages that
+        vanish."""
+        sm = self.make_manager()
+        sm._write_peers_file([
+            {"id": "aaaaa", "rcName": "nas-Turma-XERK-1", "repo": "Turma",
+             "status": "running", "summary": "live one",
+             "git": {"liveBranch": "XERK-1"}},
+            {"id": "bbbbb", "rcName": "nas-Turma-q", "repo": "Turma",
+             "status": "queued", "summary": "waiting"},
+            {"id": "ccccc", "rcName": "nas-Turma-s", "repo": "Turma",
+             "status": "stopped", "summary": "gone"},
+        ])
+        body = open(ha.PEERS_FILE).read()
+        rows = [r for r in body.splitlines() if not r.startswith("#")]
+        self.assertEqual(rows,
+                         ["aaaaa\tnas-Turma-XERK-1\tTurma\tXERK-1\tlive one"])
+
+    def test_peers_file_prefers_the_ticket_and_says_detached(self):
+        """The task column names the ticket where there is one, and a session
+        that has not cut its branch yet reads `detached` rather than blank."""
+        sm = self.make_manager()
+        sm._write_peers_file([
+            {"id": "aaaaa", "rcName": "nas-Turma-XERK-9", "repo": "Turma",
+             "status": "running", "summary": "seeded name",
+             "ticket": {"key": "XERK-9", "summary": "Do the thing"},
+             "git": {"liveBranch": None}},
+        ])
+        row = [r for r in open(ha.PEERS_FILE).read().splitlines()
+               if not r.startswith("#")][0]
+        self.assertEqual(row.split("\t")[3], "detached")
+        self.assertEqual(row.split("\t")[4], "XERK-9 Do the thing")
+
+    def test_a_beat_publishes_the_roster(self):
+        """The wiring, not just the writer: a heartbeat leaves the roster on disk
+        naming this host's running sessions, since that file is the only thing a
+        session is told to read to find a peer."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sm.build_payload(1)
+        rows = [r for r in open(ha.PEERS_FILE).read().splitlines()
+                if not r.startswith("#")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].split("\t")[:2], [sess["id"], sess["rcName"]])
+
+    def test_peers_file_write_failure_never_reaches_the_beat(self):
+        """Best-effort by contract: the roster is a convenience, and a heartbeat
+        must not die because a disk is full."""
+        sm = self.make_manager()
+        with mock.patch.object(ha, "PEERS_FILE", "/does/not/exist/peers.tsv"):
+            sm._write_peers_file([{"id": "a", "rcName": "n", "repo": "r",
+                                   "status": "running"}])  # must not raise
+
+    def test_migrated_ticket_session_keeps_its_ticket_name(self):
+        """A session that moves host carries its ticket, so it must keep being
+        called after its key — reverting to a hash on arrival would rename the
+        thing peers address and the operator recognises."""
+        sm = self.make_spawn_ready_manager([])
+        sm._launch_tmux = mock.Mock()
+        sm.device = "hostA"
+        p = mock.patch.object(ha, "REPOS_ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        os.makedirs(os.path.join(self.tmp, "Turma"), exist_ok=True)
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "zzzzz")
+        os.makedirs(cwd, exist_ok=True)
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "trans1.jsonl"), "w") as f:
+            f.write("{}\n")
+        sess = sm._resume_at_cwd("trans1", cwd,
+                                 extra={"ticket": {"key": "XERK-339"}})
+        self.assertIsNotNone(sess, sm.spawn_failures)
+        self.assertTrue(sess["rcName"].endswith("-Turma-XERK-339"),
+                        sess["rcName"])
 
     def test_spawn_rejects_missing_base_ref(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}

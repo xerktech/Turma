@@ -429,6 +429,22 @@ class TestLimitsSettings(unittest.TestCase):
         # settings files would trade every session's status for a usage widget.
         self.assertNotIn("statusLine", ha.build_guard_settings())
 
+    def test_sessions_accept_peer_messages(self):
+        # XERK-339. Claude Code's default HOLDS a cross-session message whenever
+        # the two sessions' permission-mode classes differ — and bypassPermissions
+        # is a class of its own — by opening an approval dialog in the RECEIVING
+        # session's pane. Nothing in Turma answers that dialog (it is not an
+        # AskUserQuestion, so the glasses bridge never sees it), and meanwhile it
+        # owns the input line the chat composer types into.
+        self.assertEqual(ha.build_guard_settings()["crossSessionInbound"],
+                         "accept")
+
+    def test_probe_settings_carry_no_inbound_policy(self):
+        # The probe binds an inbox like any session but runs one no-op turn and
+        # is killed; a message delivered there would go to a session about to
+        # die, and its sender would never learn that.
+        self.assertNotIn("crossSessionInbound", ha.build_limits_settings())
+
     def test_probe_settings_carry_no_hooks_or_permissions(self):
         # The probe runs one no-op turn in ~/.turma and is killed; the guard has
         # nothing to guard there, and inheriting it would be a second place the
