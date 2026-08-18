@@ -12,14 +12,16 @@ that component's files.
 |------|---------------------------|--------|
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
 | `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
+| `.claude/rules/agent-sessions.md` | `agent/hub-agent.py` | how a session is launched, repos-root sessions, the agent-side session queue, kill/resume/delete, the new-work directive, local-model failover |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
-| `.claude/rules/agent-hooks.md` | `agent/hooks/**` | guard hook, AskUserQuestion bridge |
-| `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | container boot, start-time Claude Code check, bundled toolchains |
+| `.claude/rules/agent-hooks.md` | `agent/hooks/**`, `agent/hub-agent.py` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
+| `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | run-as identity, container boot, start-time Claude Code check, bundled toolchains |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
-| `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
+| `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, notifications, auth |
+| `.claude/rules/turma-archive.md` | `turma/archive.js` + its tests | the durable archive: layers, the two size ceilings, how the total is measured |
 | `.claude/rules/turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
 | `.claude/rules/turma-ticket-queue.md` | `turma/public/board.*`, `turma/server.js` | the hub's ticket queue: admission, drain, expiries, caps |
@@ -41,7 +43,7 @@ that component's files.
     A ceiling stated as a truncation cliff was wrong; do not restore that framing.
   - **When a file approaches the ceiling, split it by path into another rules file** — that is the
     remedy, not raising the number and not deleting rationale. `agent-board.md`, `agent-prs.md`,
-    `turma-board.md` and `turma-sessions.md` exist for exactly that reason.
+    `agent-sessions.md`, `turma-board.md` and `turma-sessions.md` exist for exactly that reason.
 - **Put a fact in the narrowest file that always sees it.** Component detail → that component's
   rules file. A rule spanning two components → "Cross-cutting contracts" below, since a
   `paths:`-scoped file does not load when Claude works on the other side of the contract.
@@ -69,7 +71,9 @@ repo (`compose/turma-truenas.yaml`, via Portainer GitOps).
 
 ## Session Model
 
-One agent container per host, multiplexing sessions across every repo it scans.
+One agent container per host, multiplexing sessions across every repo it scans. What follows is the
+part that spans components; the agent-side runtime behind it — launch flags, repos-root sessions,
+the session queue, kill/resume/delete — is in `.claude/rules/agent-sessions.md`.
 
 ### Hosts, repos, spawning
 
@@ -89,31 +93,6 @@ One agent container per host, multiplexing sessions across every repo it scans.
   so nothing free-form reaches the shell. The worktree dir and `agent-<id>` tmux are the canonical
   internal keys; a label is presentational only.
 
-### The session queue (XERK-14)
-
-- A spawn that can't run RIGHT NOW is **queued, not refused** — an ordinary registry record with
-  `status:"queued"` and no worktree/tmux/ttyd yet. `spawn()` splits into the record-build and
-  `_provision_session()`, which a queued session later runs unchanged. Prompt/base-ref stash as
-  `_pendingPrompt`/`_pendingBaseRef` for it to consume.
-- Three orthogonal `queuedReason`s, each re-checked by the drainer: **capacity**,
-  **awaiting-clone**, **root-busy**. Surfaced as `session.queuedReason`/`queuedAt`.
-- The queue/run decision is made BEFORE the record is appended, so counts exclude the session being
-  added (else a root sees itself as root-busy and capacity is off by one).
-- `_drain_queue()` runs every heartbeat, oldest-first, **at most one per beat** (provisioning
-  launches claude against the one shared `~/.claude` login), head-of-line skipped not blocking. A
-  failed on-demand clone fails the session; a clone job lost to a restart re-triggers from
-  `awaitCloneOwner`.
-- Capacity rides the heartbeat as `capacity` = {maxSessions, running, queued, free, rootRunning}
-  (`_capacity_payload`); `free` never goes negative.
-- Queued sessions are killable (nothing to tear down); resume-on-boot skips them (the drainer picks
-  them up), as do archival/usage/PR scans.
-- **The agent queue is for spawns whose HOST is already the decision** — an explicit "+ New session"
-  on the host whose card was clicked, and a ticket session waiting on its repo to finish cloning.
-  **A ticket spawn waiting for a SLOT is not one of those**: it waits in the hub's ticket queue
-  (below), so a host takes one only when it can start it. One can still land here if a host fills
-  between the hub's capacity read and its next beat — a race, not the normal path.
-- Tests: `TestSessionLifecycle`, `TestSpawnTicket` in `test_hub_agent.py`; `sessions.test.js`.
-
 ### The hub's ticket queue (XERK-296)
 
 - **Work waiting for a slot is a QUEUED TICKET on the hub, never a created session on a host**, and
@@ -122,16 +101,6 @@ One agent container per host, multiplexing sessions across every repo it scans.
 - It rides `/api/agents` as top-level `ticketQueue` + its own SSE event, the ONLY place a waiting
   ticket exists; `DELETE /api/jira/<siteKey>/<issueKey>/session` cancels one and can never touch a
   running session. Mechanics and the routing rules are in `.claude/rules/turma-ticket-queue.md`.
-
-### Repos-root sessions
-
-- Run `claude` directly in `REPOS_ROOT` — spanning every repo — with **no worktree and no branch**,
-  so the base-branch option doesn't apply. Kill/delete tear down only the processes; `REPOS_ROOT` is
-  never touched.
-- All root sessions share that one cwd (hence one claude project slug + Remote Control bridge
-  pointer), so **at most one root session runs per host at a time** (enforced on
-  spawn/start/resume).
-- That ONE slug dir accumulates EVERY root session's transcript, which is why the pin below exists.
 
 ### Which transcript is a session's
 
@@ -153,27 +122,6 @@ One agent container per host, multiplexing sessions across every repo it scans.
   (`_session_meta_by_slug`).
 - Tests: `TestRootSessionIsolation`, `sessionTranscript` in `tunnel-agent.test.js`,
   `server.test.js`.
-
-### Kill, resume, delete
-
-- **Killing** drops the registry record but KEEPS its worktree (uncommitted work survives),
-  conversation and token-usage history, moving it to the Sessions page's **Ended sessions** list.
-- `_remember_closed` **snapshots onto the closed record** the `prUrls` this session opened and its
-  `transcriptId`; `_forget_session_caches` drops both moments later, so that snapshot is the only
-  thing keeping an ended session's PR chips reachable.
-- The closed history is a **cache of what a kill knew, not the record that it happened**, capped at
-  `CLOSED_PER_REPO` per repo. **Anything that must survive belongs on the durable side** — the
-  transcripts under `~/.claude` (which `_resumable_report()` re-derives from), the hub's archive,
-  and `~/.turma`.
-- **`~/.turma`'s durability is the HOST's to provide, and no code here may assume it.** A container
-  must bind-mount it or it is the image's writable layer, recreated on update; every ledger still
-  reconciles from disk rather than trusting itself.
-- Resuming relaunches `claude --resume <transcript id>` **cwd'd at that transcript's origin path**,
-  re-creating a deleted/pruned worktree there first: Claude scopes id lookup to a repo's live
-  worktrees + repo dir, so the origin must exist for `--resume` to resolve. A dev-machine session
-  synced through the shared `~/.claude` has a foreign cwd and stays view-only.
-- **Delete** (on a stopped session) also removes the worktree; since the app owns no branch, any the
-  agent committed survives.
 
 ### Migrating a session to another agent (XERK-101)
 
@@ -307,7 +255,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
     pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
     a refusal, and folding them together burned 60s and then said nothing.
-  - Both fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
+  - Glasses + veiller's fork (XERK-270): `hub-client.ts`'s `refusal()` reads the body BEFORE it
+    throws, so the `HttpError` carries the hub's words — and `app.ts`'s `failureFlash` is what puts
+    them on the display. Both halves or neither: the client throwing good text is invisible while
+    every `.catch` flashes a flat "hub unreachable", which is also wrong (the hub answered, it said
+    no). `FLASH_HUB_UNREACHABLE` is now only for a failure with **no status** — a dead socket or the
+    fetch timeout. A one-line header clips a long refusal with "…" (`headerLine`); the session
+    screen wraps it whole.
+  - All three fall back to "the hub answered HTTP `<n>`", worded identically on purpose.
 - **An agent's HOST is proved by its credential, never by what it types** (XERK-268). Every
   agent-authed surface names the host it acts as — the `<host>` segment, the heartbeat's `device`,
   the tunnel's `?name=` — and each agent runs on its OWN token,
@@ -357,101 +312,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - All credentials are inline in environment variables (no Docker secrets mechanism), set in
   DockerOps' `compose/turma-truenas.yaml`, never here.
 
-### Run-as identity (host permission parity)
+### Agent-side conventions, elsewhere
 
-- The container writes into bind-mounted HOST dirs — the git root and the Claude login (`~/.claude`)
-  — so the uid it runs as is the uid those files end up owned by on the host.
-- `entrypoint.sh` resolves an identity BEFORE anything starts and `setpriv`s down to it: **`PUID`/
-  `PGID` if set, else auto-detected from the owner of `REPOS_ROOT`**. A root-owned git root
-  (TrueNAS) resolves to `0:0`; a user-owned one (WSL/desktop) drops to that uid, so nothing lands
-  root-owned in the operator's repo or `~/.claude`. `PUID=0` forces always-root.
-- Because it drops, the entrypoint also reuses an existing passwd/group entry for the id (the node
-  base image ships `node` at `1000:1000`); `chown`s `/root` **non-recursively** (its children are
-  the host's own bind mounts) since **HOME stays `/root`**, which every mount target and
-  `PROJECTS_ROOT`/`~/.turma` path depends on; joins the group owning `/var/run/docker.sock`; and
-  **self-heals on boot**, `chown`ing leftover uid-0 paths under `REPOS_ROOT`/`~/.claude`.
-- That heal only ever touches uid-0 paths, so a mis-set `PUID` can misplace root-owned files but
-  never take the host user's own files away.
-- Verified by building the entrypoint on the real base image against root-owned / user-owned /
-  `PUID`-override / `PUID=0` roots (`test_entrypoint.sh`).
-
-### How a session runs
-
-- Each session runs as that identity as an interactive `claude --remote-control`, defaulting to
-  `--permission-mode auto`; the composer can pick
-  `bypassPermissions`/`acceptEdits`/`plan`/`default`. `bypassPermissions` is refused **under root**
-  unless `IS_SANDBOX` is set (in the compose env).
-- Deliberately the interactive form, **not** `claude remote-control` server mode, whose terminal is
-  a QR/status lobby with no conversation.
-- Sessions are independent processes inside the one container, so a session ending doesn't restart
-  the container — the manager marks it stopped. "Restart (clear context)" relaunches a single
-  session's Claude in place.
-- All of a host's sessions share the one mounted `~/.claude` login; distinct worktree paths give
-  each its own project slug and Remote Control bridge pointer. `MAX_SESSIONS` caps concurrency; the
-  manager staggers launches on boot.
-- Agents connect purely outbound to the public `TURMA_URL` (the Cloudflare tunnel), so they work
-  from any host/network.
-
-### New-work branching policy
-
-- A session's checkout is only as fresh as spawn (`default_base_ref`'s short-bounded `git fetch`
-  falls back to a stale local ref; a repos-root session works on whatever branch the host last left
-  checked out).
-- So every launch (spawn AND resume) passes **`--append-system-prompt`** a fixed directive
-  (`NEW_WORK_SYSTEM_PROMPT`) telling the agent to refresh the base ITSELF when it starts new work:
-  `git fetch origin`, resolve the default via `refs/remotes/origin/HEAD`, cut its branch from that
-  **remote** ref rather than the current HEAD, carrying uncommitted work across and flagging a stale
-  base when the fetch fails.
-- It's `--append-system-prompt` because settings.json has no field carrying instructions, and a
-  **directive rather than manager-side enforcement** because only the agent knows when "new work"
-  begins. Tests: `TestSessionLifecycle`.
-
-### Local-model failover (XERK-246)
-
-- **Running out of Claude usage stops every session on a host at once**, which is what this exists to
-  stop. A session's `modelSource` is `subscription` (the mounted `~/.claude` login) or `local` (this
-  host's self-hosted model), settable at spawn and switchable on a running session.
-- `local` is the **same `claude` binary** with `ANTHROPIC_BASE_URL` and friends repointed at a
-  gateway serving the Anthropic Messages API. Never a second coding agent: a separate harness loses
-  the transcript format every surface parses, `--resume`, Remote Control, the AskUserQuestion bridge
-  and **the `--settings` safety guard**. `docs/local-model-failover.md` has the six-harness bake-off
-  that settled this, including why `opencode.json` was deleted rather than fixed.
-- The switch **relaunches with `--resume <that session's transcript id>`**, never `restart` — failing
-  over is the moment you least want to clear the context. Read off the record on EVERY launch, so a
-  resume/restart of a failed-over session stays failed over instead of silently returning to the
-  exhausted subscription.
-- `LOCAL_MODEL_CONTEXT` must match what the server really serves: Claude Code assumes 200k for a
-  model it doesn't recognise and would compact far too late, truncating server-side instead. The
-  default tracks the cue LLM's per-slot window, which DockerOps sizes — when that moves, this moves.
-- **It is a fallback, not a peer** — the local model solved 4/8 of the bench Claude would be expected
-  to clear. The UI marks a `local` session so nobody has to wonder which model wrote a turn.
-- **Automatic delegation to the local model is deliberately NOT shipped**; the token arithmetic
-  doesn't obviously work (diagnosis dominates, and Claude must diagnose before it can delegate). See
-  the doc before building it.
-
-### Safety guard
-
-- Sessions run hands-off, so every launch passes `--settings` a generated file
-  (`build_guard_settings()` → `~/.turma/guard-settings.json`) wiring `PreToolUse` hooks over Bash
-  and the file-editing tools, plus `permissions.deny` rules on host credential stores (`~/.ssh`,
-  `~/.aws`, `~/.azure`, `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every
-  session, so deny wins even under bypass.
-- **`~/.claude` is guarded by `hooks/fileguard.py`, not by a pattern**: the rule is "everything
-  under it except the two agent-memory trees", and a glob list cannot express that — deny beats
-  allow, and **a deny matching a DIRECTORY takes its whole subtree**, so `Edit(~/.claude/*)` is the
-  blanket rule. Patterns still cover the catastrophic subset as defence in depth. See
+- **Run-as identity** (host permission parity, `PUID`/`PGID`, the boot heal) —
+  `.claude/rules/agent-image.md`.
+- **How a session runs**, the **new-work branching directive** and **local-model failover** —
+  `.claude/rules/agent-sessions.md`.
+- **The safety guard** — what it denies and why, and the `--settings` file every launch passes —
   `.claude/rules/agent-hooks.md`.
-- It hard-denies three narrow categories, each with a reason the agent self-corrects from:
-  **destructive** (`rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes,
-  recursive `chmod`/`chown` of system roots, protected-branch history destruction, `DROP
-  DATABASE|TABLE`); **policy** (push to / delete `main`/`master`, or self-merging a PR/MR — work
-  lands via a PR a human merges); **attribution** (AI self-attribution trailers in commit/PR
-  messages).
-- Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) is untouched. Allowlist a
-  command via `$TURMA_TOOL_GRANTS` (CSV of `Bash(<cmd>)`), attribution via
-  `$TURMA_NO_ATTRIBUTION=0`.
-- It classifies what the SHELL runs, **never the raw string** — `qa.md` §6.1 is the rule and its
-  limits. Implementation detail in `.claude/rules/agent.md`.
 
 ## Deployment (DockerOps, not here)
 
@@ -466,9 +334,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
-  - It also carries the migration spool (`MIGRATE_SPOOL_DIR`), which is transient by design and
-    shares that volume's SPACE with the archive — hence `MIGRATE_INFLIGHT_MAX`. No compose change:
-    both default under `/data`.
+  - **Three things share that volume's SPACE**, and each is bounded separately: the archive by
+    `ARCHIVE_TOTAL_MAX_BYTES` (`.claude/rules/turma.md`), the migration spool
+    (`MIGRATE_SPOOL_DIR`, transient by design) by `MIGRATE_INFLIGHT_MAX`, and `state.json` by
+    nothing at all — which is why the other two have ceilings. No compose change: all default
+    under `/data`.
+  - `ARCHIVE_TRANSCRIPT_MAX_BYTES` bounds one transcript rather than the store. Neither archive
+    ceiling counts `index.db`, which lives on the same volume and is unbounded across fill/wipe
+    cycles (XERK-332) — size the volume for that too.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
   `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
   the agent reports `localModel.available:false` so clients hide the control.

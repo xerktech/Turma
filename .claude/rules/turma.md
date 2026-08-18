@@ -42,9 +42,30 @@ which makes an `android/` change part of the same PR) live there.
     transcript `repaint` (stick-to-bottom vs hold-place + selection-guard), and `sessions.html`'s
     sidebar (its `scrollTop` restore is ordered against a focus/caret restore that can itself
     scroll). New recurring repaints without such a special case should use `preserveScroll`.
-- **Any new shared `/*.js` must be in `server.js`'s `STATIC_ASSETS`** (an allowlist, not a directory
+- **Any new shared `/*.js` must be in `server.js`'s `HASHED_ASSETS`** (an allowlist, not a directory
   serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module, and
   every page's render, down. Guarded by `newticket.test.js`.
+- **The shared stylesheet and scripts are served under a CONTENT-HASHED name, and the pages are
+  rewritten at boot to link it** (XERK-312) — under any TTL a warm browser pairs the new HTML with
+  the old `app.css` and the site renders unstyled for that whole window after every deploy. So:
+  - `HASHED_ASSETS` is the mutable set; `STATIC_ASSETS` is the served map, holding BOTH the hashed
+    name (immutable, 1y) and the bare one. **The bare name must keep being served** — a page a cache
+    handed back from before the deploy still links it — and must stay `no-cache`, never a TTL.
+  - **A fingerprint a PREVIOUS release minted still serves the current body** (`supersededAsset`),
+    revalidating — a 404 there is a fully unstyled page, i.e. worse than the stale sheet this
+    replaced. It reconstructs the bare name and looks it up in the same allowlist, so it serves
+    nothing new. Its cache line is **`private`**, unlike the bare names': a caller can mint 2^48 of
+    those URLs, and a shared cache must not keep an entry per guess.
+  - **The asset routes answer HEAD as well as GET.** They are public, so a HEAD falling through to
+    the auth gate 401s the very stylesheet the login page renders with — which is what a CDN or an
+    uptime check asks for.
+  - `withHashedAssets` rewrites only `="/app.css"`-shaped attribute references, so the pages' prose
+    naming these files is untouched. A page that builds an asset URL in JS would be missed.
+  - The HTML shells therefore revalidate too (`private, no-cache` + ETag → 304): a shell held
+    without asking keeps pointing at the previous release's hashed URLs.
+  - Every static asset carries an ETag and answers a conditional GET with 304; `etagMatches` handles
+    the weak (`W/"…"`), list and `*` forms a CDN is entitled to send.
+  - Tests: `assets.test.js`.
 - Tests: `nav.test.js`.
 
 ## The org filter (`turma/public/org.js`, XERK-62)
@@ -216,16 +237,8 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 
 ## Durable archive
 
-- The hub hosts a **durable, searchable archive of ended sessions** (`turma/archive.js`): agents
-  push each inactive transcript in, landing as **organized files on `/data`** — one folder per repo,
-  each renamed + dated `/data/archive/<repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl` (+ a
-  `.meta` sidecar), indexed in a **`node:sqlite` FTS5** DB (`/data/archive/index.db`, Node-core, no
-  npm), rebuildable from the files.
-- The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
-  `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
-  browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest
-  is agent-token-authed; the manifest cursors ride the heartbeat reply.
-- Tests: `archive.test.js`, `server.test.js`.
+See `.claude/rules/turma-archive.md` (scoped to `turma/archive.js` + its tests) — the store's two
+layers, the size ceilings, and the rules about how the total is measured.
 
 ## `POST /api/trigger` — external automation
 

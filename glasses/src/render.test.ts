@@ -154,6 +154,23 @@ describe("render: home", () => {
     expect(asLines(render(state))[0]).toBe("hub unreachable");
   });
 
+  // XERK-270: a refusal now arrives in the hub's own words, which can outrun the
+  // ~55 characters a header line holds. Clip it rather than letting it run off
+  // the canvas edge with nothing saying the tail was cut.
+  it("clips a flash too long for the one-line header, marking the cut", () => {
+    const long =
+      "✗ message too long — 12,345 characters, the agent accepts at most 10,000 per message";
+    const line = asLines(render(base({ flash: long, flashUntil: NOW + 1000 })))[0] ?? "";
+    expect(line.endsWith("…")).toBe(true);
+    expect(line.length).toBeLessThan(long.length);
+    expect(line.startsWith("✗ message too long")).toBe(true);
+  });
+
+  it("leaves a flash that already fits untouched", () => {
+    const state = base({ flash: "✗ that host is offline", flashUntil: NOW + 1000 });
+    expect(asLines(render(state))[0]).toBe("✗ that host is offline");
+  });
+
   it("does not show an expired flash", () => {
     const state = base({ flash: "hub unreachable", flashUntil: NOW - 1000 });
     expect(asLines(render(state))[0]).toBe("TURMA 0 run · 0 ask");
