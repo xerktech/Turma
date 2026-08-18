@@ -1684,7 +1684,13 @@ function dropQueuedCommand(key, cmdId, kind) {
 // this, so two hosts of one Jira org can trade sessions but no session ever
 // leaves its org (or leaks between an org host and an org-less one).
 function siteKeyOf(a) {
-  return (a && a.jira && a.jira.siteKey) || "";
+  const v = a && a.jira && a.jira.siteKey;
+  // STRINGS only. `jira` is agent-supplied and nothing coerces `siteKey`, so an
+  // object or array would be compared by reference: a host declaring the same
+  // `{...}` every beat compares unequal to the one stored in `orgBound`, reads
+  // as permanently drifted, silently loses every peer and warns on every beat.
+  // Anything that is not a string is "no org", which is the narrow answer.
+  return typeof v === "string" ? v : "";
 }
 
 // --- the org-scoped peer roster (XERK-348) --------------------------------
@@ -1737,18 +1743,26 @@ function boundOrgOf(a) {
 // Warned once per host per drift, so a permanently misconfigured host does not
 // bury the log — but the operator has to be able to SEE this: from the host's
 // own side a drift is indistinguishable from "my org has no other hosts up".
+// De-duped on WHETHER the host is drifting, not on the value it declared: a host
+// alternating two site keys defeats a value-keyed check and warns every beat
+// (~10,800 lines a day at an 8s interval). The declared key is also interpolated
+// under a cap — it is agent-supplied and uncapped upstream, and a 100 KB siteKey
+// wrote a 100 KB log line. One warn per drift episode, bounded in size.
 const orgDriftWarned = new Map();
+const ORG_KEY_LOG_MAX = 80;
 function warnOrgDrift(key, a) {
   const drifted = orgDrifted(a);
-  if (drifted && orgDriftWarned.get(key) !== siteKeyOf(a)) {
+  if (drifted && !orgDriftWarned.get(key)) {
+    const claimed = siteKeyOf(a).slice(0, ORG_KEY_LOG_MAX);
     console.warn(
-      `heartbeat from ${logName(key)}: declares org ${JSON.stringify(siteKeyOf(a))} ` +
-        `but is bound to ${JSON.stringify(boundOrgOf(a))} — serving it no peers ` +
-        `beyond its own sessions. If this host really moved org, remove it ` +
-        `(DELETE /api/agents/<host>) and let it re-register.`
+      `heartbeat from ${logName(key)}: declares org ${JSON.stringify(claimed)} ` +
+        `but is bound to ${JSON.stringify(boundOrgOf(a).slice(0, ORG_KEY_LOG_MAX))} ` +
+        `— serving it no peers beyond its own sessions, and no migrations. If ` +
+        `this host really moved org, remove it (DELETE /api/agents/<host>) and ` +
+        `let it re-register.`
     );
   }
-  orgDriftWarned.set(key, drifted ? siteKeyOf(a) : null);
+  orgDriftWarned.set(key, drifted);
 }
 
 // A host declaring a different org than the one it is bound to. Either it was
@@ -1760,6 +1774,31 @@ function orgDrifted(a) {
   return !!bound && siteKeyOf(a) !== bound;
 }
 
+// One host's running sessions, appended until the roster is FULL. The cap has to
+// bound what is BUILT, not what is returned: capping cell width alone left the
+// row COUNT unbounded, and nothing limits how many running sessions a heartbeat
+// may declare — a ~3.8 MB record buys ~60,000 of them, and materialising four
+// such hosts' rows before slicing to 120 OOM-killed a 256 MiB hub 3/3 while a
+// pre-roster hub served the identical load at 156 MB. Build 120 rows, never
+// 240,000 and then 120.
+function pushPeerRows(rows, host, a) {
+  for (const s of a.sessions || []) {
+    if (rows.length >= PEERS_MAX_ROWS) return;
+    if (!s || s.status !== "running") continue;
+    const t = s.ticket || {};
+    const task = t.key ? `${t.key} ${t.summary || ""}` : (s.summary || s.label || "");
+    rows.push({
+      id: peerCell(s.id),
+      name: peerCell(s.rcName),
+      host: peerCell(host),
+      repo: peerCell(s.repo),
+      // The branch the agent named for itself; "" reads as detached agent-side.
+      branch: peerCell((s.git && s.git.liveBranch) || ""),
+      task: peerCell(task),
+    });
+  }
+}
+
 function orgPeers(key) {
   const me = agents[key];
   if (!me) return [];
@@ -1767,36 +1806,24 @@ function orgPeers(key) {
   // sessions, which it already knows, and nothing else.
   const org = orgDrifted(me) ? "" : boundOrgOf(me);
   const now = Date.now();
-  const mine = [], theirs = [];
+  const rows = [];
+  // This host FIRST, so its own rows are the ones that survive a full roster:
+  // the peer in the next worktree is likelier to be worth a message than one
+  // two hosts away.
+  pushPeerRows(rows, key, me);
+  if (!org) return rows;
   for (const [host, a] of Object.entries(agents)) {
-    if (!a) continue;
-    const self = host === key;
-    if (!self) {
-      // No org of its own means no peers of its own: an org-less host gets its
-      // own sessions and nothing else.
-      if (!org || boundOrgOf(a) !== org || orgDrifted(a)) continue;
-      // An offline host's sessions cannot take delivery, and a name that only
-      // absorbs a message is worse than no name at all.
-      if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
-    }
-    for (const s of a.sessions || []) {
-      if (!s || s.status !== "running") continue;
-      const t = s.ticket || {};
-      const task = t.key ? `${t.key} ${t.summary || ""}` : (s.summary || s.label || "");
-      (self ? mine : theirs).push({
-        id: peerCell(s.id),
-        name: peerCell(s.rcName),
-        host: peerCell(host),
-        repo: peerCell(s.repo),
-        // The branch the agent named for itself; "" reads as detached agent-side.
-        branch: peerCell((s.git && s.git.liveBranch) || ""),
-        task: peerCell(task),
-      });
-    }
+    if (rows.length >= PEERS_MAX_ROWS) break;
+    if (!a || host === key) continue;
+    // No org of its own means no peers of its own; a drifted host is excluded
+    // from everyone else's roster as well as getting none of its own.
+    if (boundOrgOf(a) !== org || orgDrifted(a)) continue;
+    // An offline host's sessions cannot take delivery, and a name that only
+    // absorbs a message is worse than no name at all.
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    pushPeerRows(rows, host, a);
   }
-  // Same-host rows survive the cap FIRST: the peer in the next worktree is the
-  // one most likely to be worth a message, and every session reads this file.
-  return mine.concat(theirs).slice(0, PEERS_MAX_ROWS);
+  return rows;
 }
 
 // Begin a migration: queue exportSession on the source and record the pending
@@ -7805,7 +7832,15 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "a different target host is required" });
         const tgt = agents[target];
         if (!tgt) return json(res, 404, { error: "unknown target host" });
-        if (siteKeyOf(src) !== siteKeyOf(tgt))
+        // The BOUND org on both sides, never the claimed one, and the same
+        // predicate the peer roster uses (XERK-348). This route relays a
+        // session's raw transcript bytes to the target, so trusting a
+        // self-asserted `jira.siteKey` here would hand them to a host the hub
+        // has already decided is lying about its org — a strictly larger
+        // disclosure than the roster's. An unbound host has no org to match, so
+        // it can neither send nor receive a migration.
+        if (!boundOrgOf(src) || orgDrifted(src) || orgDrifted(tgt) ||
+            boundOrgOf(src) !== boundOrgOf(tgt))
           return json(res, 409, { error: "the target agent is in a different org" });
         if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
           return json(res, 503, { error: "the target agent is offline" });
@@ -9319,6 +9354,7 @@ if (process.env.TURMA_TEST) {
     boundOrgOf,
     orgDrifted,
     orgDriftWarned,
+    warnOrgDrift,
   };
 } else if (process.argv[2] === "--agent-token") {
   // `node turma/server.js --agent-token <host>` prints the token that host's

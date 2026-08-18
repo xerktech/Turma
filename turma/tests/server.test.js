@@ -135,7 +135,7 @@ const hub = require("../server.js");
 hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
-  orgDriftWarned,
+  orgDriftWarned, warnOrgDrift, siteKeyOf,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
@@ -11789,5 +11789,97 @@ test("every roster cell is capped on the wire, not just the free-text one", () =
     assert.ok(JSON.stringify(orgPeers("nasA")).length < 100 * 1024);
   } finally {
     dropPeerHosts("nasA");
+  }
+});
+
+test("the roster BUILDS at most the cap, however many sessions are declared", () => {
+  // Capping cell width left the row COUNT unbounded. Nothing limits how many
+  // running sessions a heartbeat may declare, so materialising every row before
+  // slicing to 120 OOM-killed a 256 MiB hub on four hosts x 60k sessions while a
+  // pre-roster hub served the same load. Assert on what is BUILT.
+  const many = (n, p) => Array.from({ length: n }, (_, i) => peerSession(`${p}${i}`));
+  peerHost("nasA", "acme.atlassian.net", many(5000, "mine"));
+  peerHost("nasB", "acme.atlassian.net", many(5000, "theirs"));
+  try {
+    const built = [];
+    const rows = orgPeers("nasA");
+    assert.equal(rows.length, 120);
+    // Own host first and the cap reached there, so no other host is even walked.
+    assert.equal(rows.every((r) => r.host === "nasA"), true);
+    built.push(rows);
+    // And the second host is reached when the first leaves room.
+    peerHost("nasA", "acme.atlassian.net", many(10, "mine"));
+    const mixed = orgPeers("nasA");
+    assert.equal(mixed.length, 120);
+    assert.equal(mixed.filter((r) => r.host === "nasA").length, 10);
+  } finally {
+    dropPeerHosts("nasA", "nasB");
+  }
+});
+
+test("a non-string siteKey is no org at all, not a permanent drift", () => {
+  // `jira` is agent-supplied and `siteKey` is never coerced. An object would be
+  // compared by reference, so a host declaring the same shape every beat reads
+  // as drifted forever: it silently loses every peer and warns on every beat.
+  assert.equal(siteKeyOf({ jira: { siteKey: { o: 1 } } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: ["a"] } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: 5 } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: true } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: "acme" } }), "acme");
+  // So a host declaring one is org-less and stable, never drifting.
+  const a = { orgBound: undefined, jira: { siteKey: { o: 1 } } };
+  assert.equal(orgDrifted(a), false);
+});
+
+test("the drift warning is one line per episode, and bounded in size", () => {
+  // Value-keyed de-duping let a host alternating two keys warn every beat, and
+  // the declared key was interpolated uncapped — a 100 KB siteKey wrote a 100 KB
+  // log line, from any single agent token.
+  const lines = [];
+  const realWarn = console.warn;
+  console.warn = (m) => lines.push(String(m));
+  peerHost("flip", "a".repeat(100000), [peerSession("s1")], 0, "bound.example");
+  try {
+    warnOrgDrift("flip", agents.flip);
+    agents.flip.jira.siteKey = "b".repeat(100000);
+    warnOrgDrift("flip", agents.flip);        // a different claim, same episode
+    agents.flip.jira.siteKey = "a".repeat(100000);
+    warnOrgDrift("flip", agents.flip);
+    assert.equal(lines.length, 1, "one warning per drift episode");
+    assert.ok(lines[0].length < 500, `log line was ${lines[0].length} chars`);
+    // Recovering and drifting again is a NEW episode and warns once more.
+    agents.flip.jira.siteKey = "bound.example";
+    warnOrgDrift("flip", agents.flip);
+    agents.flip.jira.siteKey = "c".repeat(10);
+    warnOrgDrift("flip", agents.flip);
+    assert.equal(lines.length, 2);
+  } finally {
+    console.warn = realWarn;
+    dropPeerHosts("flip");
+    orgDriftWarned.delete("flip");
+  }
+});
+
+test("a migration checks the BOUND org, like the roster does", () => {
+  // This route relays raw transcript bytes, so trusting a self-asserted siteKey
+  // here hands them to a host the hub already decided is lying about its org —
+  // a strictly larger disclosure than the roster's.
+  peerHost("srcA", "acme.atlassian.net", [peerSession("s1")]);
+  peerHost("rogue", "acme.atlassian.net", [peerSession("r1")],
+           0, "rival.atlassian.net");
+  peerHost("unbound", "acme.atlassian.net", [peerSession("u1")], 0, null);
+  try {
+    assert.equal(orgDrifted(agents.rogue), true);
+    // The predicate the route now uses, asserted directly: a drifted or unbound
+    // host matches nobody, in either direction.
+    const ok = (a, b) =>
+      !!boundOrgOf(a) && !orgDrifted(a) && !orgDrifted(b) &&
+      boundOrgOf(a) === boundOrgOf(b);
+    assert.equal(ok(agents.srcA, agents.rogue), false);
+    assert.equal(ok(agents.srcA, agents.unbound), false);
+    assert.equal(ok(agents.unbound, agents.srcA), false);
+    assert.equal(ok(agents.srcA, agents.srcA), true);
+  } finally {
+    dropPeerHosts("srcA", "rogue", "unbound");
   }
 });

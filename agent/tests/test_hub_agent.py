@@ -10282,14 +10282,22 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
 
             # Real HTTPResponse.read takes an optional size, and post() now
             # passes one (HEARTBEAT_REPLY_MAX) — a no-arg double stops standing
-            # in for the thing it fakes.
+            # in for the thing it fakes. RECORDED, not just tolerated: a widened
+            # double that ignores its argument let the bound be deleted with
+            # both suites still green.
             def read(self, *a):
+                FakeResp.read_args = a
                 return b"{}"
 
         with mock.patch.object(ha.urllib.request, "urlopen",
                                 return_value=FakeResp()):
             reply = sm.post(payload2)
         self.assertEqual(reply, {})
+        # The heartbeat reply is BOUNDED (XERK-348): it now carries a peer
+        # roster, so an unbounded read makes the hub's reply size this process's
+        # memory ceiling. Asserted here because deleting the bound is otherwise
+        # invisible to every test.
+        self.assertEqual(FakeResp.read_args, (ha.HEARTBEAT_REPLY_MAX,))
         self.assertEqual(sm.history_results, [])
         self.assertNotIn("historyResults", sm.build_payload(2))
 
