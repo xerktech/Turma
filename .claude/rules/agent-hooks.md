@@ -18,6 +18,16 @@ implementation contract behind it.
   and the file-editing tools, plus `permissions.deny` rules on host credential stores (`~/.ssh`,
   `~/.aws`, `~/.azure`, `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every
   session, so deny wins even under bypass.
+- **That same file carries `crossSessionInbound: accept`** (XERK-339), and it is a fix rather than
+  a convenience. Claude Code's default HOLDS a peer message whenever the sending and receiving
+  sessions' permission-mode classes differ — and `bypassPermissions` is a class of its own — by
+  opening an approval dialog in the RECEIVING session's pane. Nothing here can answer it: it is not
+  an `AskUserQuestion`, so `hooks/ask.py` never sees it; it owns the input line the chat composer
+  types into, so the operator's next message answers the dialog instead of reaching claude; and
+  `_busy_from_capture`/`_pane_prompt` do not know it is there. It then expires after `dialogExpiry`
+  and drops the message. Verified both ways on a real pane. It sits on `--settings` rather than user
+  settings so it covers exactly this agent's sessions, and a project that wants none can still say
+  `refuse` in its own settings, which outranks it.
 - **`~/.claude` is guarded by `hooks/fileguard.py`, not by a pattern**: the rule is "everything
   under it except the two agent-memory trees", and a glob list cannot express that — deny beats
   allow, and **a deny matching a DIRECTORY takes its whole subtree**, so `Edit(~/.claude/*)` is the

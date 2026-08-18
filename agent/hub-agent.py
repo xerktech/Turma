@@ -1044,6 +1044,71 @@ Everything above still applies: cut that branch from the REFRESHED remote defaul
 branch, not from this checkout.
 """
 
+# --- cross-session messaging (XERK-339) --------------------------------------
+#
+# Claude Code sessions on one machine can message each other (ListAgents /
+# SendMessage over a per-session inbox socket). Every Turma session IS such a
+# session, so the fleet gets peer messaging for free — but three launch-time
+# facts have to be fixed first, none of which defaults usefully here:
+#
+#   1. A session's PEER NAME defaults to its working directory's folder name,
+#      which for a Turma session is the random worktree dir ("b0d0d-a0").
+#      Neither the operator nor a peer can tell one from another, so _launch_tmux
+#      pins --name to the RC display name and the two agree.
+#   2. Inbound messages are HELD whenever the two sessions' permission-mode
+#      classes differ, and `bypassPermissions` is a class of its own — so an
+#      ordinary `auto` session messaging a bypass one parks an approval dialog in
+#      the receiver's PANE. build_guard_settings sets `crossSessionInbound` to
+#      make that dialog impossible; see the comment there for why it matters.
+#   3. `ListAgents` answers with the operator's WHOLE fleet rather than this
+#      host: measured at 291 rows / 18.4 KB, truncated past that, at which point
+#      SendMessage warns it could not check every session for the name it is
+#      addressing. Nearly all of it is dead Remote Control rows that this agent
+#      cannot prune — a `--remote-control` launch registers a NEW server-side
+#      session whatever name it is given, so REUSING an rcName bounds the names
+#      in that roster and not the rows, which is why no such reuse is attempted.
+#      What Turma can do is make the call unnecessary: the manager already knows
+#      every session on this host, so it publishes them to PEERS_FILE each beat
+#      and the directive below sends sessions there instead.
+PEERS_FILE = os.path.join(REGISTRY_DIR, "peers.tsv")
+
+# Rides --append-system-prompt beside NEW_WORK_SYSTEM_PROMPT on every launch, so
+# it reaches resumed sessions too. Kept deliberately short: every session pays it
+# on every launch, and its whole job is to trade an 18 KB tool call for a file
+# read of a few hundred bytes.
+PEERS_SYSTEM_PROMPT = """
+Other Claude Code sessions run beside you on this host — one per Turma session,
+each in its own worktree, often on a different ticket in the same repo. You can
+send one a message with SendMessage.
+
+To find them read {path} (TSV: id, name, repo, branch, task) rather than calling
+ListAgents. ListAgents answers with this whole account's fleet: hundreds of rows,
+nearly all of them dead sessions, large enough that the listing is truncated and
+addressing by name stops being reliable. That file is only this host's live
+sessions and is rewritten every heartbeat. Address a peer by its `name` column;
+the row whose `id` is {sid} is you.
+
+Message one when it saves real work: you are about to touch an area their ticket
+also covers, you landed something on the default branch they are based on, or
+they already know a fact you would otherwise re-derive. Keep it to a sentence or
+two of fact — it costs the receiver a turn, so send no unsolicited status.
+"""
+
+
+# A ticket summary is operator-written and unbounded; the roster is read whole by
+# every session that consults it, so one long cell is charged to all of them.
+PEER_CELL_MAX_CHARS = 120
+
+
+def _peer_cell(value):
+    """One PEERS_FILE cell: never empty, never carrying the field or row
+    separator. The file is read by a model with a one-line format description
+    and no parser, so a repo named with a tab, or a ticket summary spanning
+    lines, has to become one flat cell rather than shifting every column after
+    it into the wrong heading."""
+    text = re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
+    return text[:PEER_CELL_MAX_CHARS] or "-"
+
 
 # --- agent safety guard (--settings wiring) ------------------------------
 
@@ -1385,7 +1450,26 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
             "timeout": ASK_HOOK_TIMEOUT_SEC,
         }],
     })
-    return {"permissions": perms, "hooks": {"PreToolUse": pre}}
+    return {
+        "permissions": perms,
+        "hooks": {"PreToolUse": pre},
+        # Peer messages are DELIVERED rather than held (XERK-339). Claude Code's
+        # default holds one whenever the sending and receiving sessions'
+        # permission-mode classes differ — and `bypassPermissions` is a class of
+        # its own — by opening an approval dialog in the RECEIVING session's
+        # pane. Nothing in Turma can answer that dialog: it is not an
+        # AskUserQuestion, so the glasses bridge never sees it; it owns the input
+        # line the chat composer types into, so the next operator message answers
+        # it instead of reaching claude; and _busy_from_capture / _pane_prompt do
+        # not know it is there. It then expires after `dialogExpiry` and drops
+        # the message. Verified both ways on a real pane before this was set.
+        #
+        # It goes on the --settings file rather than user settings so it covers
+        # every session this agent launches and nothing else, and so a repo that
+        # wants no peer messages can still say `refuse` in its own project
+        # settings, which outranks this.
+        "crossSessionInbound": "accept",
+    }
 
 
 def build_limits_settings(python_exe=None, statusline_path=None):
@@ -10126,6 +10210,57 @@ class SessionManager:
         except OSError as e:
             log(f"usage ledger save failed: {e}")
 
+    def _write_peers_file(self, sessions):
+        """Publish this host's live sessions where the sessions can read them
+        (XERK-339), so one that wants to message a sibling never pays a
+        `ListAgents` call to find it — see PEERS_FILE for what that call costs.
+
+        Written whole and atomically on every beat: a session may read it at any
+        moment, and half a roster is worse than a slightly stale one. Only
+        RUNNING sessions are listed — a queued one has no claude to receive
+        anything and a stopped one's inbox socket is gone, so naming either would
+        only produce messages that vanish. The reading session is listed too and
+        told its own id in the directive, since the file is shared and cannot be
+        written per-reader.
+
+        Deliberately NOT a busy/idle column: a peer's message enqueues and drains
+        at its next tool round whatever it is doing, so the answer would change
+        nothing, and "working" is a five-mirror contract (see CLAUDE.md) that a
+        convenience file has no business becoming the sixth mirror of.
+
+        Best-effort. A roster that cannot be written must never cost the
+        heartbeat, and a session that finds the file missing degrades to having
+        no peers rather than to an error."""
+        rows = ["# Live Claude Code sessions on this host, rewritten every Turma "
+                "heartbeat. See PEERS_FILE in hub-agent.py.",
+                "# id\tname\trepo\tbranch\ttask"]
+        for s in sessions:
+            if s.get("status") != "running":
+                continue
+            ticket = s.get("ticket") or {}
+            if ticket.get("key"):
+                task = f"{ticket['key']} {ticket.get('summary') or ''}"
+            else:
+                task = s.get("summary") or s.get("label") or ""
+            rows.append("\t".join(_peer_cell(v) for v in (
+                s.get("id"),
+                s.get("rcName"),
+                s.get("repo"),
+                # The branch the agent named for itself, not the record's
+                # `branch` (always None — the app owns no branch). "detached" is
+                # the honest answer before it has cut one.
+                (s.get("git") or {}).get("liveBranch") or "detached",
+                task,
+            )))
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = PEERS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("\n".join(rows) + "\n")
+            os.replace(tmp, PEERS_FILE)
+        except OSError as e:
+            log(f"peers file write failed: {e}")
+
     # --- ticket attribution ledger -----------------------------------------
 
     def _load_ticket_ledger(self):
@@ -10649,6 +10784,15 @@ class SessionManager:
         # board should chip both. No-op unless this session has a ticket.
         self._remember_ticket(sess)
         parts.append(f"--remote-control '{sess['rcName']}'")
+        # The session's PEER name (XERK-339) — what `ListAgents` shows a sibling
+        # session and what `SendMessage` addresses. Deliberately the SAME string
+        # as the RC name: a session is then addressed identically whether a peer
+        # reaches it locally over its inbox socket or across hosts through Remote
+        # Control, and the operator reading a peer roster sees the name already on
+        # the session card. Without the flag the peer name is claude's own default
+        # — the working directory's folder name, i.e. the random worktree dir,
+        # which names nothing and is what made peer messaging unusable here.
+        parts.append(f"--name {shlex.quote(sess['rcName'])}")
         # Failover (XERK-246): a session moved onto the self-hosted model runs the
         # SAME claude with its endpoint repointed. Read off the record on EVERY
         # launch, so a resume/restart of a failed-over session stays failed over
@@ -10720,6 +10864,11 @@ class SessionManager:
             policy += TICKET_BRANCH_PROMPT.format(
                 key=ticket.get("key") or "this session's ticket",
                 branch=ticket["branch"])
+        # And tell it about the sessions running beside it (XERK-339), pointing
+        # at the roster this manager publishes rather than at ListAgents. Same
+        # flag again, and unconditional: peers are a property of the host, so a
+        # resumed or migrated session needs it exactly as much as a fresh one.
+        policy += PEERS_SYSTEM_PROMPT.format(path=PEERS_FILE, sid=sess["id"])
         parts.append(f"--append-system-prompt {shlex.quote(policy)}")
         claude_cmd = " ".join(parts)
         if prompt:
@@ -10951,8 +11100,18 @@ class SessionManager:
             reason = "awaiting-clone"
         sid = self._new_id()
         label = (label or "").strip() or None
-        # Prefer a slugged label in the RC display name; fall back to the id.
+        # Prefer a slugged label in the RC display name; a ticket-backed session
+        # falls back to its KEY rather than the random session id. That name is
+        # now also the session's PEER name (XERK-339), so `truenas-Turma-XERK-339`
+        # tells an operator scanning claude.ai/code — and a sibling session
+        # choosing who to message — what the session is, where a hash told either
+        # of them nothing. Two sessions on one ticket would share it; Claude Code
+        # resolves a duplicate peer name itself by renaming the later session to a
+        # variant, and the RC roster keys on its own ids rather than the name.
+        # The id stays the last resort, for a bare spawn that has nothing better.
         rc_slug = slugify(label) if label else ""
+        if not rc_slug and ticket and ticket.get("key"):
+            rc_slug = slugify(ticket["key"])
         # A ticket-backed session already HAS a good name — the ticket's key and
         # summary, which is what an operator scanning cards is looking for — so it
         # is named here rather than paying a `claude -p` to derive a worse one from
@@ -11614,7 +11773,13 @@ class SessionManager:
             "summaryManual": extra.get("summaryManual"),
             "ticket": extra.get("ticket"),
             "migratedFrom": extra.get("migratedFrom"),
-            "rcName": f"{slugify(self.device)}-{slugify(repo)}-{sid}",
+            # Named like a spawn (XERK-339): a MIGRATED ticket session carried
+            # its ticket here, so it keeps being called after its key rather
+            # than reverting to a hash the moment it changes host — the name is
+            # what a peer addresses and what the operator recognises.
+            "rcName": (f"{slugify(self.device)}-{slugify(repo)}-"
+                       + (slugify((extra.get("ticket") or {}).get("key") or "")
+                          or sid)),
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
             "model": extra.get("model"),
@@ -16173,6 +16338,12 @@ class SessionManager:
             self._archive_pending = {m["transcriptId"]: m for m in manifest}
             if manifest:
                 payload["archiveManifest"] = manifest
+        # Publish the peer roster the sessions themselves read (XERK-339). Off
+        # the payload just assembled, so it adds no git or transcript work of its
+        # own, and on the light beat too — a session spawned by the command that
+        # beat is reporting should find itself listed without waiting a full
+        # interval for the next one.
+        self._write_peers_file(payload["sessions"])
         return payload
 
     def _clear_pending_prs(self):
