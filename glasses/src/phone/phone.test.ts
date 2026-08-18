@@ -154,6 +154,42 @@ describe("phone controller", () => {
     expect(root.querySelector<HTMLTextAreaElement>("#ph-input")!.value).toBe("");
   });
 
+  // XERK-270: the hub's 413 names the actual character count and cap; the
+  // hand-written line here can't. Its words win when it sent them, and the
+  // fallbacks (XERK-235) still cover a refusal it sent no body with.
+  it("a refused Send shows the hub's own words and gives the text back", async () => {
+    client.sendInput = vi.fn(async () => {
+      throw Object.assign(new Error("message too long — 12,345 characters, the agent accepts at most 10,000"), {
+        name: "HttpError",
+        status: 413,
+      });
+    });
+    root.querySelector<HTMLElement>('[data-enter="s1"]')!.click();
+    const inp = root.querySelector<HTMLTextAreaElement>("#ph-input")!;
+    inp.value = "war and peace";
+    root.querySelector<HTMLElement>("[data-send]")!.click();
+    await Promise.resolve(); await Promise.resolve();
+
+    const err = root.querySelector<HTMLElement>("#ph-senderr")!;
+    expect(err.hidden).toBe(false);
+    expect(err.textContent).toContain("12,345 characters");
+    expect(root.querySelector<HTMLTextAreaElement>("#ph-input")!.value).toBe("war and peace");
+  });
+
+  it("a refusal the hub sent no words with keeps the hand-written line", async () => {
+    client.sendInput = vi.fn(async () => {
+      throw Object.assign(new Error(""), { name: "HttpError", status: 413 });
+    });
+    root.querySelector<HTMLElement>('[data-enter="s1"]')!.click();
+    root.querySelector<HTMLTextAreaElement>("#ph-input")!.value = "hi";
+    root.querySelector<HTMLElement>("[data-send]")!.click();
+    await Promise.resolve(); await Promise.resolve();
+
+    expect(root.querySelector<HTMLElement>("#ph-senderr")!.textContent).toBe(
+      "Too long — shorten the message and try again",
+    );
+  });
+
   it("answering a pending question routes to HubClient.answerQuestion", () => {
     state = { ...sessionState("s1", "host-a"),
       agents: [agent({ key: "host-a", sessions: [session({ id: "s1", session: signals({ question: "Go?", questionOptions: ["Yes", "No"] }) })] })] };

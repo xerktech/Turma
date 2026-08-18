@@ -29,6 +29,110 @@ export class HttpError extends Error {
   }
 }
 
+// What a refused hub call reads as: the hub's OWN `{error}` text when it sent
+// one, and the bare status only when it didn't (XERK-270).
+//
+// The hub explains every refusal it makes — "the target agent is in a different
+// org" (409), "the host is offline" (503), the character cap (413), the queue
+// limit (429) — and this client used to throw all of them away as "hub request
+// failed: <status> <path>". On a display this small the message IS the whole
+// feedback, so a status number tells the wearer nothing they can act on.
+//
+// Worded to match the other two clients — `TurmaNav.refusalText` in
+// `turma/public/nav.js` and `hubErrorMessage` in `android/.../net/HubApi.kt` —
+// so the same refusal reads the same on all three.
+export function refusalText(status: number, body: unknown): string {
+  const said = (body as { error?: unknown } | null)?.error;
+  const words = typeof said === "string" ? clamp(said.trim()) : "";
+  return words || `the hub answered HTTP ${status}`;
+}
+
+// A refusal is a sentence for a 10-line display, so it is clamped HERE, at the
+// point the hub's text becomes ours, rather than at each surface that shows it.
+//
+// This text now reaches `render.ts`'s `wrapText`, which is quadratic in an
+// unbroken word: 50k chars measured at 263ms and 200k at 4s, i.e. a hub or an
+// edge that answers a refusal with a megabyte of text would stall the render
+// loop rather than the socket. The clamp also bounds the session screen, where
+// the same string wraps in full.
+const REFUSAL_TEXT_MAX = 300;
+
+function clamp(words: string): string {
+  if (words.length <= REFUSAL_TEXT_MAX) return words;
+  // Never cut BETWEEN the halves of a surrogate pair: `slice` counts UTF-16
+  // code units, so an emoji straddling the boundary would leave a lone
+  // surrogate on the display, which renders as a replacement box.
+  const last = words.charCodeAt(REFUSAL_TEXT_MAX - 1);
+  const straddles = last >= 0xd800 && last <= 0xdbff;
+  return `${words.slice(0, straddles ? REFUSAL_TEXT_MAX - 1 : REFUSAL_TEXT_MAX)}…`;
+}
+
+// How long the refusal path waits for the error body itself.
+//
+// `timeoutFetch` below bounds the RESPONSE, not the body that follows it. A hub
+// that sends headers and then stalls mid-body leaves this read pending forever,
+// and because App.poll() re-arms only in its `finally`, ONE stalled error body
+// would kill the poll loop permanently — precisely the freeze `timeoutFetch`
+// exists to prevent, reintroduced on the failure path.
+//
+// A refusal body is a few bytes of JSON, so this ceiling can only fire on a
+// stall. When it does the wearer gets the bare status instead of the hub's
+// words: a worse message, but a far better outcome than a frozen display.
+export const REFUSAL_BODY_TIMEOUT_MS = 5_000;
+
+// The same ceiling for a SUCCESS body, which stalls exactly the same way and is
+// the likelier route: `listAgents` runs every poll, and a 200 whose body never
+// arrives froze the display just as dead as a refused one.
+//
+// Generous rather than sharp, because unlike a refusal a success body can be
+// genuinely large (a session's history) on a genuinely slow link — this is the
+// "the socket is gone" ceiling, not a latency budget.
+export const BODY_TIMEOUT_MS = 30_000;
+
+/** Settle `work` or give up after `ms`, so one stalled read can't hang a caller. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  const settled = Promise.resolve(work);
+  if (!ms || ms <= 0) return settled;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`hub body read timed out after ${ms}ms`));
+    }, ms);
+    settled.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
+// EVERY body read in this file goes through here. `timeoutFetch` bounds the
+// RESPONSE and cannot reach the body that follows it, so an unwrapped
+// `res.json()` is an unbounded await on a live socket — and since App.poll()
+// re-arms only in its `finally`, one such await freezes the glasses on stale
+// content permanently. That deadline is what this exists for.
+//
+// The `Promise.resolve().then()` is only belt-and-braces for a polyfilled
+// Response whose `json` isn't a function: every caller today is `async`, so the
+// async boundary already turns such a synchronous throw into a rejection. Keep
+// it for a future non-async caller, but don't credit it with the behaviour —
+// removing it changes nothing observable.
+function readJson<T = unknown>(res: Response, ms: number): Promise<T> {
+  return withDeadline(Promise.resolve().then(() => res.json() as Promise<T>), ms);
+}
+
+/** The same reading for a response whose body hasn't been consumed yet. */
+export async function refusal(res: Response): Promise<HttpError> {
+  // The body may be empty, HTML from an edge, unreadable on a torn socket, or
+  // never arrive at all. Every one of those means "the hub sent no words",
+  // never a failure of its own, so none of them may escape as a throw.
+  let body: unknown = {};
+  try {
+    body = await readJson(res, REFUSAL_BODY_TIMEOUT_MS);
+  } catch {
+    body = {};
+  }
+  return new HttpError(res.status, refusalText(res.status, body));
+}
+
 export interface HubClientOptions {
   config: Config;
   fetchFn?: typeof fetch;
@@ -71,8 +175,9 @@ export function timeoutFetch(
 
 // Typed REST client for the hub API (`turma/server.js`). Every method
 // sends the Basic auth header, JSON in/out; every non-2xx response throws an
-// HttpError carrying its status — except getHistory's 202 ("still fetching"),
-// which is a normal, non-throwing return per the brief's 202-pending pattern.
+// HttpError carrying its status AND the hub's own `{error}` words (see
+// `refusal`) — except getHistory's 202 ("still fetching"), which is a normal,
+// non-throwing return per the brief's 202-pending pattern.
 export class HubClient {
   private readonly config: Config;
   private readonly fetchFn: typeof fetch;
@@ -128,10 +233,8 @@ export class HubClient {
       ...init,
       headers: { ...this.headers(), ...(init.headers as Record<string, string> | undefined) },
     });
-    if (!res.ok) {
-      throw new HttpError(res.status, `hub request failed: ${res.status} ${path}`);
-    }
-    return (await res.json()) as T;
+    if (!res.ok) throw await refusal(res);
+    return (await readJson(res, BODY_TIMEOUT_MS)) as T;
   }
 
   listAgents(): Promise<AgentsResponse> {
@@ -206,10 +309,8 @@ export class HubClient {
   ): Promise<{ status: 200; body: HistoryResponse } | { status: 202; body: HistoryPending }> {
     const path = `/api/agents/${encodeURIComponent(host)}/sessions/${encodeURIComponent(id)}/history`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    if (!res.ok) {
-      throw new HttpError(res.status, `hub request failed: ${res.status} ${path}`);
-    }
-    const body = await res.json();
+    if (!res.ok) throw await refusal(res);
+    const body = await readJson(res, BODY_TIMEOUT_MS);
     if (res.status === 202) return { status: 202, body: body as HistoryPending };
     return { status: 200, body: body as HistoryResponse };
   }
@@ -228,8 +329,8 @@ export class HubClient {
   ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: { pending: true; cmdId: string } }> {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    if (!res.ok) throw new HttpError(res.status, `hub request failed: ${res.status} ${path}`);
-    const body = await res.json();
+    if (!res.ok) throw await refusal(res);
+    const body = await readJson<Record<string, unknown> & { pending: true; cmdId: string }>(res, BODY_TIMEOUT_MS);
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
 
@@ -284,8 +385,12 @@ export class HubClient {
     const q = project ? `?project=${encodeURIComponent(project)}` : "";
     const path = `/api/jira/${encodeURIComponent(siteKey)}/create-meta${q}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok && res.status !== 202) throw new HttpError(res.status, (body as { error?: string }).error || `HTTP ${res.status}`);
+    // Refuse through the same door as every other call: a swallowed body used
+    // to resolve `{}`, which `createResult`'s caller renders as a ticket created
+    // with no key — a false success on a write, for a request whose real fate
+    // is unknown. 202 is a normal "still fetching" return, not a refusal.
+    if (!res.ok) throw await refusal(res);
+    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS);
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
   createTicket(siteKey: string, body: { project: string; issueType: string; summary: string; description?: string; labels?: string[] }): Promise<QueuedResponse> {
@@ -301,8 +406,12 @@ export class HubClient {
   ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: Record<string, unknown> }> {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/tickets/${encodeURIComponent(cmdId)}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok && res.status !== 202) throw new HttpError(res.status, (body as { error?: string }).error || `HTTP ${res.status}`);
+    // Refuse through the same door as every other call: a swallowed body used
+    // to resolve `{}`, which `createResult`'s caller renders as a ticket created
+    // with no key — a false success on a write, for a request whose real fate
+    // is unknown. 202 is a normal "still fetching" return, not a refusal.
+    if (!res.ok) throw await refusal(res);
+    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS);
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
 

@@ -103,8 +103,20 @@ function activeFlash(state: AppState): string | null {
   return state.flash && state.now < state.flashUntil ? state.flash : null;
 }
 
+// A screen whose header is ONE line still has to show a flash, and a hub
+// refusal now arrives in the hub's own words (XERK-270) — which can be longer
+// than the ~55 characters a line holds. Clip it to the first wrapped line with
+// an ellipsis rather than letting it run off the canvas edge, where the wearer
+// would lose the tail with nothing saying it had been cut. The session screen
+// wraps the flash in full (see the flashLines path) and is unaffected.
 function headerLine(state: AppState, fallback: string): string {
-  return activeFlash(state) ?? fallback;
+  const flash = activeFlash(state);
+  if (flash === null) return fallback;
+  // Wrapped to a width that already reserves the ellipsis, so the clipped line
+  // plus its "…" still fits inside LINE_WIDTH_PX.
+  const lines = wrapText(flash, LINE_WIDTH_PX - measureDefault("…"));
+  if (lines.length <= 1) return flash;
+  return `${lines[0]}…`;
 }
 
 function findSessionLocal(state: AppState, hostKey: string, sessionId: string): SessionInfo | undefined {

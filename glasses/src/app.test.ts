@@ -958,6 +958,106 @@ describe("App", () => {
     expect(app.getState().pending["s1"]).toBeUndefined();
   });
 
+  // XERK-270: the hub explains every refusal it makes — "the target agent is in
+  // a different org", the queue limit, the character cap — and the flash is the
+  // wearer's ONLY feedback. Every catch used to drop those words for a flat
+  // "hub unreachable", which is also wrong: the hub answered, it just said no.
+  describe("a refused command flashes the hub's own words", () => {
+    function refused(status: number, message: string): Error {
+      return Object.assign(new Error(message), { name: "HttpError", status });
+    }
+
+    async function toKillConfirm(app: App): Promise<void> {
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      display.emit({ type: "tap" }); // home -> session
+      display.emit({ type: "tap" }); // -> focus "bottom"
+      display.emit({ type: "doubleTap" }); // -> actions
+      display.emit({ type: "scrollDown" }); // 1 = Kill
+      display.emit({ type: "tap" }); // -> confirm
+      display.emit({ type: "scrollDown" }); // cursor -> Confirm
+      display.emit({ type: "tap" }); // executes kill
+    }
+
+    it("a session action refused by the hub shows what the hub said", async () => {
+      const running = agent({ sessions: [session({ status: "running" })] });
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({ now: Date.now(), agents: [running] })),
+        sessionAction: vi.fn(async () => { throw refused(503, "that host is offline"); }),
+      });
+      const app = makeApp(client, 10_000);
+      await toKillConfirm(app);
+
+      await vi.advanceTimersByTimeAsync(0); // flush the rejection
+      expect(app.getState().flash).toBe("✗ that host is offline");
+      expect(display.lines.some((l) => l.includes("that host is offline"))).toBe(true);
+    });
+
+    it("a spawn refusal lands on the home screen the spawn returned to", async () => {
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [] })] })),
+        spawnSession: vi.fn(async () => { throw refused(429, "too many queued commands"); }),
+      });
+      const app = makeApp(client, 10_000);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      display.emit({ type: "tap" }); // home's "+ New session" -> choose host
+      display.emit({ type: "tap" }); // pick host-a -> choose repo
+      display.emit({ type: "tap" }); // pick myrepo -> dictate initial prompt?
+      display.emit({ type: "scrollDown" }); // -> "Skip (spawn now)"
+      display.emit({ type: "tap" }); // spawn
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.spawnSession).toHaveBeenCalled();
+      expect(app.getState().screen).toBe("home");
+      expect(app.getState().flash).toBe("✗ too many queued commands");
+    });
+
+    it("a transport failure still reads 'hub unreachable' — nothing answered", async () => {
+      const running = agent({ sessions: [session({ status: "running" })] });
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({ now: Date.now(), agents: [running] })),
+        sessionAction: vi.fn(async () => { throw new Error("Failed to fetch"); }),
+      });
+      const app = makeApp(client, 10_000);
+      await toKillConfirm(app);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(app.getState().flash).toBe(FLASH_HUB_UNREACHABLE);
+    });
+
+    it("a refused history pull says why instead of looking like 'no more history'", async () => {
+      const running = agent({ sessions: [session({ session: signals({ transcriptAgeSec: 1 }) })] });
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({ now: Date.now(), agents: [running] })),
+        getHistory: vi.fn(async () => { throw refused(503, "that host is offline"); }),
+      });
+      const app = makeApp(client, 10_000);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      display.emit({ type: "tap" }); // -> session screen
+      display.emit({ type: "scrollUp" }); // triggers the history load
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(app.getState().loadingHistory["s1"]).toBe(false);
+      expect(app.getState().flash).toBe("✗ that host is offline");
+    });
+
+    it("a REFUSED poll says so instead of blaming the network", async () => {
+      const client = fakeClient({
+        listAgents: vi.fn(async () => { throw refused(401, "the hub answered HTTP 401"); }),
+      });
+      const app = makeApp(client, 10_000);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(app.getState().pollErrorActive).toBe(true);
+      expect(app.getState().flash).toBe("✗ the hub answered HTTP 401");
+    });
+  });
+
   it("flashes 'hub unreachable' once on a poll error and clears it on the next success", async () => {
     const client = fakeClient({
       listAgents: vi

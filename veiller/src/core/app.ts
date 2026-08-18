@@ -52,6 +52,20 @@ export const POLL_GRACE_MS = 60 * 1000;
 export const FLASH_DURATION_MS = 4000;
 export const FLASH_QUEUED = "✓ queued — agent picks up in ~20s";
 export const FLASH_HUB_UNREACHABLE = "hub unreachable";
+// What a failed hub call flashes (XERK-270). The flash is the ONLY feedback a
+// wearer gets, so a refusal must arrive in the hub's own words — the client
+// puts them on the HttpError (see hub-client's `refusal`), and every catch used
+// to drop them for a flat "hub unreachable", which is both useless and wrong:
+// the hub answered, it just said no.
+//
+// Duck-typed on `status` rather than `instanceof HttpError`, matching
+// phone.ts's sendFailed — a refusal is anything that came back with a status;
+// everything else (a dead socket, the fetch timeout) really is unreachable.
+export function failureFlash(err: unknown): string {
+  const e = err as { status?: unknown; message?: unknown } | null;
+  if (typeof e?.status !== "number") return FLASH_HUB_UNREACHABLE;
+  return typeof e.message === "string" && e.message ? `✗ ${e.message}` : FLASH_HUB_UNREACHABLE;
+}
 export const FLASH_SESSION_GONE = "session ended";
 // How many consecutive polls may report the focused session's host WITHOUT
 // that session before the session screen gives up on it. One beat is not
@@ -668,10 +682,13 @@ export class App {
         }
       }
       this.repaint();
-    } catch {
+    } catch (err: unknown) {
       if (!this.state.pollErrorActive) {
         this.state = { ...this.state, now, pollErrorActive: true };
-        this.flash(FLASH_HUB_UNREACHABLE);
+        // A poll can be REFUSED too — a wrong password 401s every beat, and
+        // "hub unreachable" sent the wearer looking for a network fault that
+        // isn't there. failureFlash still says exactly that for a real one.
+        this.flash(failureFlash(err));
       } else {
         this.state = { ...this.state, now };
       }
@@ -1002,8 +1019,8 @@ export class App {
             this.flash(FLASH_QUEUED);
             this.repaint();
           })
-          .catch(() => {
-            this.flash(FLASH_HUB_UNREACHABLE);
+          .catch((err: unknown) => {
+            this.flash(failureFlash(err));
             this.repaint();
           });
         this.setState({ session: { ...s, focus: "transcript" } });
@@ -1150,12 +1167,17 @@ export class App {
         loadingHistory: { ...this.state.loadingHistory, [sessionId]: false },
       };
       this.repaint();
-    } catch {
+    } catch (err: unknown) {
+      // Pulling older turns can be REFUSED too (an offline host, a session the
+      // hub no longer knows). Dropping the spinner and saying nothing looked
+      // like "there is no more history"; say why, on the screen the pull was
+      // made from (XERK-270).
       this.state = {
         ...this.state,
         now: this.now(),
         loadingHistory: { ...this.state.loadingHistory, [sessionId]: false },
       };
+      this.flash(failureFlash(err));
       this.repaint();
     }
   }
@@ -1195,8 +1217,8 @@ export class App {
             this.flash(FLASH_QUEUED);
             this.repaint();
           })
-          .catch(() => {
-            this.flash(FLASH_HUB_UNREACHABLE);
+          .catch((err: unknown) => {
+            this.flash(failureFlash(err));
             this.repaint();
           });
         this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
@@ -1257,8 +1279,8 @@ export class App {
         this.nudgePoll();
         this.repaint();
       })
-      .catch(() => {
-        this.flash(FLASH_HUB_UNREACHABLE);
+      .catch((err: unknown) => {
+        this.flash(failureFlash(err));
         this.repaint();
       });
     this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
@@ -1354,8 +1376,8 @@ export class App {
           this.flash(FLASH_QUEUED);
           this.repaint();
         })
-        .catch(() => {
-          this.flash(FLASH_HUB_UNREACHABLE);
+        .catch((err: unknown) => {
+          this.flash(failureFlash(err));
           this.repaint();
         });
       this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
@@ -1370,8 +1392,8 @@ export class App {
         this.nudgePoll();
         this.repaint();
       })
-      .catch(() => {
-        this.flash(FLASH_HUB_UNREACHABLE);
+      .catch((err: unknown) => {
+        this.flash(failureFlash(err));
         this.repaint();
       });
     this.goHome();
@@ -1489,8 +1511,8 @@ export class App {
             this.nudgePoll();
             this.repaint();
           })
-          .catch(() => {
-            this.flash(FLASH_HUB_UNREACHABLE);
+          .catch((err: unknown) => {
+            this.flash(failureFlash(err));
             this.repaint();
           });
         this.goHome();
