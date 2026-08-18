@@ -4623,7 +4623,7 @@ def _session_transcript_path(sess):
     return _newest_transcript_path(wt)
 
 
-def _first_user_text(path, max_lines=500):
+def _first_user_text(path, max_lines=500, max_bytes=None):
     """The first genuine human prompt from the START of a transcript, or None.
 
     Reads forward from the top and returns the first `user` entry that carries
@@ -4638,36 +4638,47 @@ def _first_user_text(path, max_lines=500):
     the original attempt saw, however many turns later it runs. Bounded to the
     first max_lines lines so an already-long resumed transcript can't make this
     walk expensive (the real first prompt sits within the first handful of entries
-    anyway)."""
+    anyway).
+
+    `max_bytes` additionally bounds the READ ITSELF rather than the line count.
+    Line iteration holds one whole line in memory, so a transcript whose first
+    line is enormous costs that much RSS however low max_lines is — which the
+    workflow picker cannot afford, calling this once per agent in a run on a
+    memory-limited container."""
+    def _scan(lines):
+        for i, line in enumerate(lines):
+            if i >= max_lines:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "user" or entry.get("isMeta"):
+                continue
+            if entry.get("promptSource") == "system":
+                continue  # injected turn (e.g. a task-notification), not human
+            if entry.get("isCompactSummary"):
+                continue  # the model's own summary, injected as a user turn
+            if _entry_local_command(entry):
+                continue  # slash-command plumbing, not a real prompt
+            text = _entry_text(entry)
+            if not text:
+                continue  # tool_result-only turn, or empty after stripping
+            return text
+        return None
+
     try:
+        if max_bytes is not None:
+            return _scan(_read_head_lines(path, max_bytes))
         with open(path, errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("type") != "user" or entry.get("isMeta"):
-                    continue
-                if entry.get("promptSource") == "system":
-                    continue  # injected turn (e.g. a task-notification), not human
-                if entry.get("isCompactSummary"):
-                    continue  # the model's own summary, injected as a user turn
-                if _entry_local_command(entry):
-                    continue  # slash-command plumbing, not a real prompt
-                text = _entry_text(entry)
-                if not text:
-                    continue  # tool_result-only turn, or empty after stripping
-                return text
+            return _scan(f)
     except OSError:
         return None
-    return None
 
 
 def _first_command_name(path, max_lines=50):
@@ -4966,6 +4977,19 @@ def _strip_pane_ellipsis(cell):
     return cell, False
 
 
+def _row_label_matches(want_label, have_label):
+    """Does a pane agent-list row's label name this launch?
+
+    An empty want matches anything; otherwise EITHER side may be the prefix —
+    the TUI ellipsizes a long cell on a narrow window (XERK-130), and the
+    launch's own description can itself be the shorter string. Shared by the
+    Task/Agent lookup and the workflow-run lookup so a row resolves the same way
+    whichever kind of background work it names."""
+    if not want_label or have_label == want_label:
+        return True
+    return have_label.startswith(want_label) or want_label.startswith(have_label)
+
+
 def _resolve_subagent(main_path, agent_type, label):
     """Map a pane agent-list row (its `type` + short `label`/description) to the
     background agent's transcript file, via the main transcript's Task calls.
@@ -5017,13 +5041,8 @@ def _resolve_subagent(main_path, agent_type, label):
                 if m and block.get("tool_use_id"):
                     agent_ids[block["tool_use_id"]] = m.group(1)
 
-    def _matches(desc):
-        if not want_label or desc == want_label:
-            return True
-        return desc.startswith(want_label) or want_label.startswith(desc)
-
     for tool_id, desc in reversed(tasks):  # newest matching call wins
-        if not _matches(desc):
+        if not _row_label_matches(want_label, desc):
             continue
         aid = agent_ids.get(tool_id)
         if not aid:
@@ -5032,6 +5051,448 @@ def _resolve_subagent(main_path, agent_type, label):
         if os.path.isfile(path):
             return path
     return None
+
+
+# ---- workflow runs (XERK-304) ----------------------------------------------
+# A Workflow launch is N agents and writes NO transcript of its own, so a
+# clicked `workflow` row resolves to a RUN — a list of agents to pick from —
+# rather than to one conversation. Its agents live one level deeper than an
+# ordinary background agent's:
+#   <stem>/subagents/workflows/<runId>/agent-<x>.jsonl
+WORKFLOW_RUNS_SUBDIR = "workflows"
+# Both of these are joined onto a path and both originate in a clicked row that
+# reaches us over HTTP, so neither is ever trusted: the id before it names a
+# file, the run id before it names a directory.
+VALID_WORKFLOW_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+VALID_WORKFLOW_RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]{1,64}$")
+# One run may legally spawn up to a thousand agents. The list is a picker, so it
+# is capped and flagged rather than served whole.
+WORKFLOW_AGENTS_MAX = 200
+# The run record embeds the whole script plus a preview per agent, so it grows
+# with the run. Bounded because it is read whole (json.load) on a memory-limited
+# container; past this the picker falls back to the transcripts.
+WORKFLOW_RECORD_MAX_BYTES = 1 << 24
+# What the whole workflows/ tree may add to a MIGRATION bundle. Nothing prunes
+# that tree, so a long-lived session accumulates one record per run — and the
+# bundle has its own ceiling that a refusal strands the move on.
+WORKFLOW_PACK_MAX_BYTES = 1 << 24
+WORKFLOW_AGENT_LABEL_CHARS = 160
+# A workflow agent's transcript opens with its prompt, so the label read never
+# has to walk far in; these only bound a pathological one. The BYTE bound is the
+# load-bearing half: the picker reads a label per agent, and line-count alone
+# would still hold one enormous first line in the container's memory.
+#
+# The bound TRUNCATES rather than degrading: a prompt larger than it leaves the
+# line unparseable and the label empty, and the picker then shows the agent's id.
+# That is the accepted trade — a nameless row against an unbounded read on a
+# memory-limited container — and the reason the number is generous rather than
+# tight. Both clients already fall back to the id, so nothing breaks; it reads
+# worse. Raise this before reaching for the id fallback as a fix.
+WORKFLOW_LABEL_MAX_LINES = 50
+WORKFLOW_LABEL_MAX_BYTES = 1 << 20
+
+
+def _read_head_lines(path, max_bytes):
+    """Non-empty raw lines from roughly the FIRST max_bytes of a file, in file
+    order. The TRAILING line may be a fragment (the window landed mid-line) —
+    callers that json.loads() it get a ValueError and skip it, exactly like
+    _read_tail_lines' leading one."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(max_bytes)
+    except OSError:
+        return []
+    return [line.strip() for line in raw.split(b"\n") if line.strip()]
+
+
+def _dir_size(root, limit):
+    """Total bytes of the regular files under `root`, or None as soon as the
+    running total passes `limit` — the caller only ever needs "does this fit",
+    so a tree far over the bound costs a walk rather than a full measure.
+    Symlinks are not followed and unreadable entries are skipped."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            fp = os.path.join(dirpath, name)
+            try:
+                if os.path.islink(fp) or not os.path.isfile(fp):
+                    continue
+                total += os.path.getsize(fp)
+            except OSError:
+                continue
+            if total > limit:
+                return None
+    return total
+
+
+def _workflow_runs_dir(main_path):
+    """The dir Claude Code writes a session's workflow runs into, one level
+    below the flat subagents/ tree: <stem>/subagents/workflows/."""
+    return os.path.join(_subagents_dir(main_path), WORKFLOW_RUNS_SUBDIR)
+
+
+def _resolve_workflow_run(main_path, label):
+    """Directory holding the agent transcripts of the workflow run a clicked
+    `workflow` row names, or None when nothing matches / the dir is absent.
+
+    A Workflow launch records `{taskType:"local_workflow", workflowName, taskId,
+    runId, transcriptDir}` beside its tool_result, and the run dir is named after
+    the **runId** — NOT the `taskId`, which is a different and shorter handle
+    (`we1gtmfyd` against `wf_86e01141-7bc`) and is what _async_launch keys the
+    ROW on. Reading taskId as the directory name resolves nothing at all.
+
+    The record's own absolute `transcriptDir` is deliberately NOT used. It is
+    untrusted input on a path join, and it is wrong for a session that has since
+    MIGRATED (XERK-101) to a host mounting REPOS_ROOT somewhere else — where the
+    run id still resolves, because the dir is rebuilt under THIS transcript's own
+    subagents/ tree.
+
+    Newest matching launch wins, matching _resolve_subagent: one workflow name
+    can be run any number of times in a session. A miss must not raise — the
+    caller stages an empty result."""
+    want_label, _ = _strip_pane_ellipsis((label or "").strip())
+    runs = []
+    for raw in _read_tail_lines(main_path, 1 << 23):  # last 8 MiB, as _resolve_subagent
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        tur = entry.get("toolUseResult") if isinstance(entry, dict) else None
+        if not isinstance(tur, dict) or tur.get("taskType") != "local_workflow":
+            continue
+        # The same name _async_launch put on the row, or the row can never match.
+        name = str(tur.get("workflowName") or tur.get("summary") or "").strip()
+        if not _row_label_matches(want_label, name):
+            continue
+        run_id = str(tur.get("runId") or "").strip()
+        if VALID_WORKFLOW_RUN_ID_RE.match(run_id):
+            runs.append(run_id)
+    for run_id in reversed(runs):  # newest matching launch wins
+        path = os.path.join(_workflow_runs_dir(main_path), run_id)
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _workflow_agent_files(run_dir):
+    """Every `agent-<id>.jsonl` under a workflow run, as {id: path}.
+
+    WALKED rather than listed: a script may call workflow() to run a child
+    workflow inline, and that child's agents — one dir deeper — are as much a
+    part of this run as the top-level ones. Agent ids are unique within a run, so
+    a flat map is enough to address one without ever handing the client a path."""
+    out = {}
+    for dirpath, _dirs, files in os.walk(run_dir):
+        for name in sorted(files):
+            if not (name.startswith("agent-") and name.endswith(".jsonl")):
+                continue
+            aid = name[len("agent-"):-len(".jsonl")]
+            if not VALID_WORKFLOW_AGENT_ID_RE.match(aid) or aid in out:
+                continue
+            path = os.path.join(dirpath, name)
+            # islink as well as isfile: isfile FOLLOWS, so a symlinked
+            # `agent-<id>.jsonl` would appear as a phantom agent whose "transcript"
+            # is whatever it points at. os.walk already refuses to descend
+            # directory symlinks; this is the file half of the same rule.
+            if os.path.isfile(path) and not os.path.islink(path):
+                out[aid] = path
+    return out
+
+
+# A journal `result` line carries the agent's RETURN VALUE, so its size is
+# unbounded in principle. Lines up to this are parsed exactly; a longer one is
+# matched by its head instead of being buffered whole.
+JOURNAL_LINE_MAX = 1 << 18
+JOURNAL_HEAD_BYTES = 1024
+# Only a runaway backstop, not a working limit: memory is bounded per LINE, so
+# the whole file is affordable and the cap exists solely to stop an endless one.
+# Reading forward means hitting it drops the NEWEST results, so the agents it
+# loses read as still running — the safe direction, and the same one a miss
+# takes everywhere else here.
+JOURNAL_READ_MAX = 1 << 29
+# ANCHORED at the start of the record on purpose. A `result` marker found
+# anywhere in the line would also match one sitting inside a corrupt or
+# half-written line's text, and that is the only way this fallback could retire
+# an agent that has not finished.
+JOURNAL_RESULT_RE = re.compile(rb'^\s*\{\s*"type"\s*:\s*"result"')
+JOURNAL_AGENT_ID_RE = re.compile(rb'"agentId"\s*:\s*"([A-Za-z0-9_-]{1,64})"')
+
+
+def _fold_journal_line(line, done):
+    """Fold one journal line into `done` (the ids that have finished).
+
+    Parsed as JSON when it fits, which is exact and independent of field order.
+    An over-long line is matched by REGEX over its first JOURNAL_HEAD_BYTES
+    instead, so a single unbounded record costs a bounded scan.
+
+    **What stops an agent that merely RETURNED the text of a journal record from
+    retiring some other agent is JSON escaping, not this head bound**: inside a
+    JSON string the nested record's quotes are backslash-escaped, so the
+    unescaped `"agentId":"…"` this matches cannot occur there. The head bound is
+    a cost limit; the ANCHOR on JOURNAL_RESULT_RE is the correctness half,
+    covering the one case escaping does not — a corrupt or half-written line
+    that is not valid JSON at all and carries a raw record inside it. Its cost is
+    that a record with REORDERED fields is refused rather than risked.
+
+    A line that fails either check is a miss, i.e. the agent reads as still
+    running: the safe direction, since the alternative is calling a live agent
+    finished."""
+    if len(line) <= JOURNAL_LINE_MAX:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return
+        if isinstance(rec, dict) and rec.get("type") == "result" and rec.get("agentId"):
+            done.add(str(rec["agentId"]))
+        return
+    head = line[:JOURNAL_HEAD_BYTES]
+    if not JOURNAL_RESULT_RE.match(head):
+        return
+    m = JOURNAL_AGENT_ID_RE.search(head)
+    if m:
+        done.add(m.group(1).decode("ascii", "replace"))
+
+
+def _journal_finished(path):
+    """The agent ids one journal records a RESULT for, or None if it can't be read.
+
+    Streamed WHOLE rather than through a tail window. A `result` line carries the
+    agent's return value, so a few dozen agents routinely push the journal past
+    any fixed tail — and the records a tail drops are the OLDEST, which after the
+    picker's launch-order sort are exactly the agents at the TOP of the list. A
+    dropped result reads as "still running" permanently, so the window has to go.
+
+    Memory stays bounded regardless: lines are folded as they complete, and a
+    single absurdly long one is matched by its head and then skipped rather than
+    accumulated (see _fold_journal_line)."""
+    done = set()
+    try:
+        with open(path, "rb") as f:
+            buf = b""
+            read = 0
+            dropping = False   # inside an over-long line, waiting for its newline
+            while read < JOURNAL_READ_MAX:
+                chunk = f.read(1 << 16)
+                if not chunk:
+                    break
+                read += len(chunk)
+                if dropping:
+                    nl = chunk.find(b"\n")
+                    if nl < 0:
+                        continue
+                    dropping = False
+                    chunk = chunk[nl + 1:]
+                buf += chunk
+                parts = buf.split(b"\n")
+                buf = parts.pop()
+                for line in parts:
+                    if line.strip():
+                        _fold_journal_line(line, done)
+                if len(buf) > JOURNAL_LINE_MAX:
+                    _fold_journal_line(buf, done)
+                    buf, dropping = b"", True
+            if buf.strip() and not dropping:
+                _fold_journal_line(buf, done)
+    except OSError:
+        return None
+    return done
+
+
+def _workflow_finished_agents(run_dir):
+    """The ids this run's journal records a RESULT for — the agents that have
+    finished — or None when any journal could not be read.
+
+    journal.jsonl is the workflow runtime's own ledger, one
+    `{"type":"result","agentId":…}` line per completed agent. **An unreadable
+    journal must return None, not an empty set**: None means "this run cannot
+    say" and the rows then carry no status at all, whereas an empty set claims
+    every agent is still running — which is what a permission error, an IO
+    error, or an ordinary walk/read race would otherwise paint on a run that
+    finished hours ago. One unreadable journal disowns the whole run's status
+    for the same reason: a partial answer here is indistinguishable from a
+    complete one."""
+    seen_journal = False
+    done = set()
+    for dirpath, _dirs, files in os.walk(run_dir):
+        if "journal.jsonl" not in files:
+            continue
+        ids = _journal_finished(os.path.join(dirpath, "journal.jsonl"))
+        if ids is None:
+            return None
+        seen_journal = True
+        done |= ids
+    return done if seen_journal else None
+
+
+def _workflow_agent_label(path):
+    """The name to show for one workflow agent, or "".
+
+    The FALLBACK path only — the run record's `workflowProgress` carries the
+    script's own `label:` and is tried first (see _workflow_agents). This is what
+    a run whose record is missing gets instead.
+
+    A workflow agent's `agent-<id>.meta.json` carries only
+    `{"agentType":"workflow-subagent","spawnDepth":1}`, with no description, so
+    there is nothing to read there and the row falls back to the agent's FIRST
+    PROMPT. A meta `description` still wins when there is one, so an ordinary
+    subagent (whose meta does carry it) keeps naming itself."""
+    meta = path[:-len(".jsonl")] + ".meta.json"
+    try:
+        with open(meta, errors="replace") as f:
+            desc = str((json.load(f) or {}).get("description") or "").strip()
+        if desc:
+            return desc[:WORKFLOW_AGENT_LABEL_CHARS]
+    except (OSError, ValueError, AttributeError):
+        pass
+    text = _first_user_text(path, max_lines=WORKFLOW_LABEL_MAX_LINES,
+                            max_bytes=WORKFLOW_LABEL_MAX_BYTES) or ""
+    return " ".join(text.split())[:WORKFLOW_AGENT_LABEL_CHARS]
+
+
+def _workflow_agent_started(path):
+    """ISO timestamp of a workflow agent's first entry, or "" — its launch time,
+    which is the order the operator watched the run happen in."""
+    for raw in _read_head_lines(path, 1 << 16):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("timestamp"):
+            return str(entry["timestamp"])
+    return ""
+
+
+def _epoch_ms_iso(ms):
+    """An epoch-milliseconds number as an ISO timestamp, or "" — the run record
+    times its agents in epoch ms while everything on this wire is ISO, and a
+    field that is a string on one path and a number on the other is exactly the
+    shape that breaks a typed client's decode."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ms) / 1000.0))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _workflow_progress_rows(record):
+    """{agentId: {label, state, index, startedAt}} from a run record's
+    `workflowProgress`, or {} — the run's OWN account of the agents it launched.
+
+    Phase rows and any entry without an agentId are skipped."""
+    out = {}
+    for row in (record or {}).get("workflowProgress") or []:
+        if not isinstance(row, dict) or row.get("type") != "workflow_agent":
+            continue
+        aid = str(row.get("agentId") or "").strip()
+        if not aid:
+            continue
+        out[aid] = {
+            "label": str(row.get("label") or "").strip(),
+            "state": str(row.get("state") or "").strip(),
+            "index": row.get("index"),
+            "startedAt": _epoch_ms_iso(row.get("startedAt")),
+        }
+    return out
+
+
+def _workflow_agents(run_dir, record=None):
+    """(rows, truncated) for a workflow run's agent picker, launch order first:
+    ([{id, label, startedAt, status?}], bool).
+
+    Named from the RUN RECORD wherever it covers an agent: its `workflowProgress`
+    carries the script's own `label:` (`review:bugs`, `essay:compilers`) and a
+    real per-agent `state`. **Nothing else on disk has that label**, so without
+    the record every row of a fan-out over one prompt template renders
+    IDENTICALLY — a picker you cannot pick from, which is the whole point of the
+    row. The fallbacks below are for a run whose record is missing.
+
+    Covering an agent from the record also means NOT READING ITS TRANSCRIPT AT
+    ALL, which is what keeps a large fan-out off the beat loop: `handle_commands`
+    runs synchronously in the heartbeat, so per-agent head reads are beat latency.
+
+    Order is the record's own `index` — launch order, which is what the operator
+    watched happen. Anything the record doesn't cover sorts after it by the
+    transcript's first timestamp (never mtime, which reorders live as agents
+    write), so a partially-recorded run stays deterministic.
+
+    `status` is omitted entirely when neither the record nor the run's journal
+    can answer; an absent field means "can't tell", exactly as on the heartbeat."""
+    files = _workflow_agent_files(run_dir)
+    progress = _workflow_progress_rows(record)
+    # The journal is folded for whatever the record does not cover — NOT skipped
+    # whenever a record exists at all. A record covering some agents used to
+    # suppress it for the rest, so a partially-recorded run served rows with no
+    # status beside rows that had one, while the journal on disk knew the answer
+    # for every one of them. Still lazy: a record that covers everything (the
+    # normal case) never pays for the fold.
+    done = _MISSING = object()
+
+    def _journal():
+        nonlocal done
+        if done is _MISSING:
+            done = _workflow_finished_agents(run_dir)
+        return done
+
+    rows = []
+    for aid, path in files.items():
+        known = progress.get(aid) or {}
+        label = known.get("label") or ""
+        row = {"id": aid,
+               "label": label[:WORKFLOW_AGENT_LABEL_CHARS] if label
+               else _workflow_agent_label(path),
+               "startedAt": known.get("startedAt") or _workflow_agent_started(path)}
+        if known.get("state"):
+            # Passed through as the run recorded it — "failed" and "skipped" are
+            # worth seeing, and flattening them to done/running hides an agent
+            # that never produced anything.
+            row["status"] = known["state"][:WORKFLOW_AGENT_LABEL_CHARS]
+        else:
+            folded = _journal()
+            if folded is not None:
+                row["status"] = "done" if aid in folded else "running"
+        idx = known.get("index")
+        rows.append((idx if isinstance(idx, int) else None, row))
+    rows.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0,
+                             t[1]["startedAt"], t[1]["id"]))
+    out = [r for _i, r in rows]
+    return out[:WORKFLOW_AGENTS_MAX], len(out) > WORKFLOW_AGENTS_MAX
+
+
+def _workflow_run_record(main_path, run_id):
+    """The run's own record, `<stem>/workflows/<runId>.json`, or None.
+
+    A SIBLING of `subagents/`, not a child of it — the workflow runtime keeps the
+    run's account (script, phases, `workflowProgress`, status) here while the
+    agents' transcripts go under `subagents/workflows/<runId>/`. Best-effort:
+    every fallback in _workflow_agents exists because this can be absent."""
+    if not VALID_WORKFLOW_RUN_ID_RE.match(run_id or ""):
+        return None
+    stem = main_path[:-len(".jsonl")] if main_path.endswith(".jsonl") else main_path
+    path = os.path.join(stem, WORKFLOW_RUNS_SUBDIR, run_id + ".json")
+    try:
+        if os.path.getsize(path) > WORKFLOW_RECORD_MAX_BYTES:
+            return None      # the script and every result preview live in here
+        with open(path, errors="replace") as f:
+            rec = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        # RecursionError is NOT hypothetical: json.load blows the stack on a
+        # deeply nested file, and it is not a ValueError. Escaping here leaves
+        # handle_commands' blanket catch to keep the beat alive while staging
+        # NOTHING, so the client's drill-down poll spins to its timeout instead
+        # of getting the "unavailable" this returns.
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _workflow_agent_path(run_dir, agent_id):
+    """One workflow agent's transcript inside an already-resolved run, or None.
+
+    The id arrives from a clicked row over HTTP and is about to name a file, so
+    it is pattern-checked first and then matched against the run's OWN walk —
+    never string-joined onto the run dir, which is what would let `..` out of it."""
+    aid = (agent_id or "").strip()
+    if not VALID_WORKFLOW_AGENT_ID_RE.match(aid):
+        return None
+    return _workflow_agent_files(run_dir).get(aid)
 
 
 # A req file only marks a *live* pending question while the ask.py bridge is
@@ -11245,12 +11706,10 @@ class SessionManager:
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
                             extra=extra, migration_id=migration_id)
 
-    def _pack_transcript(self, path):
-        """Bundle a transcript file (+ its subagents/ dir, if any) into gzipped
-        tar bytes, laid out relative to the project-slug dir so the target
-        unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and, when
-        present, `<id>/subagents/...`. The main file is truncated to its last
-        complete line."""
+    def _pack_bytes(self, path, runs):
+        """The bundle itself: `<id>.jsonl` (truncated to its last complete line),
+        plus `<id>/subagents/...` when present, plus the `runs` dir as
+        `<id>/workflows/...` when one is given. See _pack_transcript."""
         tid = os.path.basename(path)[:-len(".jsonl")]
         with open(path, "rb") as f:
             raw = f.read()
@@ -11264,7 +11723,70 @@ class SessionManager:
             sub = _subagents_dir(path)
             if os.path.isdir(sub):
                 tar.add(sub, arcname=os.path.join(tid, "subagents"))
+            if runs:
+                tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
         return buf.getvalue()
+
+    def _pack_transcript(self, path):
+        """Bundle a transcript file (+ its subagents/ and workflows/ dirs, if
+        any) into gzipped tar bytes, laid out relative to the project-slug dir so
+        the target unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and,
+        when present, `<id>/subagents/...` and `<id>/workflows/...`.
+
+        `workflows/` is the SIBLING tree holding each run's record — the only
+        place the picker's row labels exist (XERK-304). Without it a moved
+        session's workflow rows fall back to prompt text on the target.
+
+        **The records can never cost a migration.** They are a nicety; the move
+        is the product. So the bundle is built WITH them and, if the finished
+        blob is over MIGRATION_BLOB_MAX or the tree could not be read, rebuilt
+        WITHOUT them — the fallback being exactly the bundle that shipped before
+        the tree was carried at all.
+
+        Measuring the tree against a constant is NOT enough and was the first
+        attempt: the ceiling applies to the whole bundle, so any records tree,
+        however small, can push a near-ceiling transcript over it. Only the
+        finished size can answer that, which is why this checks the blob rather
+        than estimating. `WORKFLOW_PACK_MAX_BYTES` survives as a cheap
+        pre-filter, so an obviously huge tree is skipped without being tarred
+        into memory first — it is not the guarantee."""
+        tid = os.path.basename(path)[:-len(".jsonl")]
+        runs = os.path.join(path[:-len(".jsonl")], WORKFLOW_RUNS_SUBDIR)
+        if os.path.isdir(runs):
+            if _dir_size(runs, WORKFLOW_PACK_MAX_BYTES) is None:
+                log(f"migration: workflow records for {tid} exceed "
+                    f"{WORKFLOW_PACK_MAX_BYTES} bytes; not carrying them")
+            else:
+                try:
+                    blob = self._pack_bytes(path, runs)
+                except OSError as e:
+                    # An unreadable file in the RECORDS tree (a leftover
+                    # root-owned one after a PUID change, say) must not refuse
+                    # the move — drop the records, keep the session. A failure
+                    # anywhere ELSE is the session's own data and is re-raised
+                    # to refuse loudly: losing a conversation silently is worse
+                    # than a failed move, which is the opposite of the trade the
+                    # records get. Blaming the records for it would also have
+                    # cost a second full pack before the retry raised anyway.
+                    # UNATTRIBUTABLE ERRORS REFUSE. tarfile only sets
+                    # `filename` for path operations — its own short-read
+                    # ("unexpected end of data", from a file that shrank
+                    # mid-pack) carries none — and dropping on that would ship a
+                    # TRUNCATED subagent transcript with a log line blaming the
+                    # records. Wrongly refusing costs a visible, retryable failed
+                    # move; wrongly dropping loses conversation data silently, so
+                    # "can't tell which tree" resolves to refuse.
+                    fn = str(getattr(e, "filename", "") or "")
+                    if not fn or (fn != runs and not fn.startswith(runs + os.sep)):
+                        raise
+                    log(f"migration: workflow records for {tid} unreadable "
+                        f"({e}); not carrying them")
+                else:
+                    if len(blob) <= MIGRATION_BLOB_MAX:
+                        return blob
+                    log(f"migration: workflow records for {tid} would put the "
+                        f"bundle over {MIGRATION_BLOB_MAX} bytes; not carrying them")
+        return self._pack_bytes(path, None)
 
     def _unpack_transcript(self, blob, dest_dir):
         """Extract a _pack_transcript bundle into dest_dir. A bundle crosses a
@@ -12240,19 +12762,46 @@ class SessionManager:
             "queued": queued,
         })
 
-    def _stage_subagent_history(self, sid, agent_type, label):
+    def _stage_subagent_history(self, sid, agent_type, label, agent_id=None):
         """Handle a {type:"subagentHistory"} command: resolve the clicked pane
-        agent-list row (type + label) to its background-agent transcript and
-        stage a bounded read for the next heartbeat (subagentHistoryResults).
-        The row key (sessionId+type+label) is echoed back so the hub can match
-        the delivery to the outstanding request. Any miss (unknown session,
-        unresolved agent, absent file) stages an empty result rather than
-        raising — a poison row must not take down the heartbeat loop."""
+        agent-list row (type + label, plus `agentId` on the workflow drill-down)
+        and stage a bounded read for the next heartbeat
+        (subagentHistoryResults). The row key (sessionId+type+label+agentId) is
+        echoed back so the hub can match the delivery to the outstanding
+        request. Any miss (unknown session, unresolved agent, absent file) stages
+        an empty result rather than raising — a poison row must not take down the
+        heartbeat loop.
+
+        A `workflow` row answers with an agent LIST, not a conversation (XERK-304).
+        A workflow is N agents and writes no transcript of its own, so there is no
+        single thing "its history" could be; the row resolves to the run, the run
+        answers `agents`, and a second request naming one of those ids returns
+        that agent's transcript. **`agents` present — even empty — is what tells
+        the client this is a list**, so a run with nothing written yet says "no
+        agents yet" rather than the "unavailable" an unresolved row gets."""
         result = {"sessionId": sid, "type": agent_type or "",
-                  "label": label or "", "entries": [], "truncated": False}
+                  "label": label or "", "agentId": agent_id or "",
+                  "entries": [], "truncated": False}
         sess = self._find(sid)
         main = _session_transcript_path(sess) if sess else None
-        path = _resolve_subagent(main, agent_type, label) if main else None
+        if not main:
+            self.subagent_history_results.append(result)
+            return
+        if (agent_type or "").strip() == "workflow":
+            run_dir = _resolve_workflow_run(main, label)
+            if not run_dir:
+                self.subagent_history_results.append(result)
+                return
+            if not (agent_id or "").strip():
+                agents, agents_truncated = _workflow_agents(
+                    run_dir, _workflow_run_record(main, os.path.basename(run_dir)))
+                result["agents"] = agents
+                result["agentsTruncated"] = agents_truncated
+                self.subagent_history_results.append(result)
+                return
+            path = _workflow_agent_path(run_dir, agent_id)
+        else:
+            path = _resolve_subagent(main, agent_type, label)
         if not path:
             self.subagent_history_results.append(result)
             return
@@ -14357,7 +14906,8 @@ class SessionManager:
                     self._stage_history(cmd.get("sessionId"))
                 elif ctype == "subagentHistory":
                     self._stage_subagent_history(
-                        cmd.get("sessionId"), cmd.get("agentType"), cmd.get("label"))
+                        cmd.get("sessionId"), cmd.get("agentType"),
+                        cmd.get("label"), cmd.get("agentId"))
                 elif ctype == "jiraIssue":
                     self._stage_jira_issue(cmd.get("issueKey"))
                 elif ctype == "setTicketStatus":

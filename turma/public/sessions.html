@@ -437,6 +437,21 @@
   }
   .tr-msg.assistant.hit { border-color: var(--accent); }
   .tr-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
+  /* A workflow run's agent picker (XERK-304): one row per agent in the run,
+     each opening that agent's own transcript in this same pane. */
+  .wf-agents { padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .wf-hd { color: var(--muted); font-size: 12px; text-transform: uppercase;
+           letter-spacing: .06em; padding: 0 4px 4px; }
+  .wf-agent { display: flex; align-items: center; gap: 8px; width: 100%;
+              text-align: left; padding: 9px 10px; border-radius: var(--radius-sm);
+              border: 1px solid var(--border); background: var(--surface);
+              color: inherit; font: inherit; cursor: pointer; }
+  .wf-agent:hover { border-color: var(--accent); }
+  .wf-agent .wf-label { flex: 1; min-width: 0; overflow: hidden;
+                        text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .wf-agent .wf-status { flex: none; font-size: 11px; color: var(--muted); }
+  .wf-agent .wf-status.running { color: var(--accent); }
+  .wf-note { color: var(--muted); font-size: 12px; padding: 6px 4px; }
 
   /* ---- Right stage: native chat view of a LIVE session --------------------- */
   .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
@@ -2178,6 +2193,12 @@ let viewMode = null; // "chat" | "terminal" | "transcript" | "subagent" | null �
 // this holds the live session id to return to, so the transcript pane's Back
 // button reopens the session rather than dropping to the list.
 let subagentReturn = null;
+// Set while a WORKFLOW AGENT's transcript is open, to the {type,label} of the
+// run's agent list it was picked from (XERK-304). Back is therefore three deep —
+// agent -> that run's agent list -> the session — and this is the middle rung;
+// null means the open view is not one agent of a run, so Back goes straight to
+// the session.
+let subagentListReturn = null;
 let viewPushed = false; // a history entry the back button will consume (mobile)
 // Deep link: the dashboard's "Attach" links here as /sessions?session=<id>. We
 // hold the requested id until that session shows up as running in a heartbeat,
@@ -2387,6 +2408,12 @@ function selectSession(id) {
   if (id === currentId && viewMode === "chat") { enterStage(); return; }
   currentId = id;
   viewMode = "chat";
+  // Landing on a chat retires both subagent rungs. They are only reachable
+  // through the transcript pane, so a leftover pair is latent rather than live
+  // today — but it points at the session we just left, and the next route that
+  // reveals that pane would follow it there.
+  subagentReturn = null;
+  subagentListReturn = null;
   resetEndedBar();   // leaving any ended-session view (incl. one just resumed)
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
@@ -2514,6 +2541,7 @@ function clearStage() {
   stageTunnelReset();
   currentTranscriptId = null;
   subagentReturn = null;
+  subagentListReturn = null;
   resetEndedBar();
   navFrame("about:blank"); // tear down any live session's WebSocket
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
@@ -2771,6 +2799,7 @@ async function openEndedSession(id) {
   stageTunnelReset();   // this view isn't a live session's; it has no tunnel
   currentTranscriptId = null;
   subagentReturn = null;
+  subagentListReturn = null;
   trHighlight = null;
   viewMode = "ended";
   document.getElementById("trBackLabel").textContent = " Sessions";
@@ -2843,6 +2872,7 @@ async function openTranscript(id, title, hi) {
   currentTranscriptId = id;
   trHighlight = hi || null;
   subagentReturn = null; // an archive open -> Back goes to the list
+  subagentListReturn = null;
   document.getElementById("trBackLabel").textContent = " Sessions";
   currentId = null;
   currentHostKey = null;
@@ -2876,22 +2906,63 @@ async function openTranscript(id, title, hi) {
   renderTranscript(t);
 }
 
+// Render a workflow run's agent picker into the transcript pane (XERK-304). A
+// Workflow row is N agents and has no conversation of its own, so it resolves to
+// this list and each row drills into one agent's transcript. An empty list is a
+// real answer — the run exists but has written nothing yet — and is deliberately
+// worded differently from the "unavailable" an unresolved row gets.
+function renderWorkflowAgents(type, label, t) {
+  const list = Array.isArray(t.agents) ? t.agents : [];
+  const scroll = document.getElementById("trScroll");
+  if (!list.length) {
+    scroll.innerHTML = `<div class="tr-empty">This workflow hasn't started any agents yet.</div>`;
+    return;
+  }
+  const rows = list.map((a) => {
+    const st = a && a.status
+      ? `<span class="wf-status ${a.status === "running" ? "running" : ""}">` +
+        esc(a.status) + "</span>"
+      : "";
+    const name = (a && a.label) || (a && a.id) || "agent";
+    return `<button type="button" class="wf-agent" data-wfid="${esc((a && a.id) || "")}">` +
+      `<span class="wf-label">${esc(name)}</span>${st}</button>`;
+  });
+  const note = t.agentsTruncated
+    ? `<div class="wf-note">Showing the first ${list.length} agents of this run.</div>`
+    : "";
+  scroll.innerHTML = `<div class="wf-agents"><div class="wf-hd">Agents in this run</div>` +
+    rows.join("") + note + `</div>`;
+  scroll.querySelectorAll(".wf-agent[data-wfid]").forEach((b) => {
+    b.addEventListener("click", () => {
+      openSubagentView(type, label, b.getAttribute("data-wfid"));
+    });
+  });
+}
+
 // Open one live background agent's transcript in the read-only transcript pane,
 // clicked from the current session's pane agent-list (chat.js -> here). Reuses
 // the archive viewer's stage + chat engine; Back returns to the live session
 // (subagentReturn) rather than the sessions list. type+label identify the row
 // (see the /subagents/history endpoint); a virtual id keeps verbosity scoped.
-async function openSubagentView(type, label) {
+//
+// `agentId` is the workflow drill-down: a `workflow` row opened WITHOUT one
+// answers with that run's agent list (renderWorkflowAgents), and each of those
+// rows re-enters here WITH one to open that agent's transcript. Back from an
+// agent then returns to the list rather than the session, which is what
+// subagentListReturn holds.
+async function openSubagentView(type, label, agentId) {
   const liveId = currentId;
   const key = liveId && hostKeyForSession(liveId);
   if (!key) return;
   resetEndedBar();
-  const vid = "subagent::" + liveId + "::" + type + "::" + label;
+  const aid = agentId || "";
+  const vid = "subagent::" + liveId + "::" + type + "::" + label + "::" + aid;
   currentTranscriptId = vid;
   trHighlight = null;
   subagentReturn = liveId;   // Back reopens the session, not the list
+  subagentListReturn = aid ? { type, label } : null;
   viewMode = "subagent";
-  document.getElementById("trBackLabel").textContent = " Session";
+  document.getElementById("trBackLabel").textContent = aid ? " Workflow" : " Session";
   document.getElementById("trTitle").textContent = type;
   document.getElementById("trPath").textContent = label || "background agent";
   document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading agent transcript…</div>`;
@@ -2902,7 +2973,7 @@ async function openSubagentView(type, label) {
   $transcriptPane.hidden = false;
   enterStage();
   renderSearch();
-  const qs = `type=${enc(type)}&label=${enc(label || "")}`;
+  const qs = `type=${enc(type)}&label=${enc(label || "")}&agentId=${enc(aid)}`;
   const url = `/api/agents/${enc(key)}/sessions/${enc(liveId)}/subagents/history?${qs}`;
   // The agent fetches on demand: a cache miss 202s until the next heartbeat
   // delivers it. Poll a bounded number of times, then give up gracefully.
@@ -2914,9 +2985,21 @@ async function openSubagentView(type, label) {
     if (r.status === 200) {
       let t; try { t = await r.json(); } catch { break; }
       if (currentTranscriptId !== vid) return;
+      // `agents` present — empty list included — is what says "this is a run,
+      // not a conversation"; anything else renders as a transcript.
+      if (t && Array.isArray(t.agents)) {
+        renderWorkflowAgents(type, label, t);
+        return;
+      }
+      // No `agents`, no entries: the row did not resolve. Rendering that as a
+      // transcript paints the chat engine's "This session's transcript is
+      // empty." — the wording for a conversation that exists and is empty,
+      // which is a different thing and reads as if the agent did nothing. A
+      // background agent that HAS a transcript always has at least its prompt.
+      if (!(t.entries || []).length) break;
       if (window.TurmaChat && TurmaChat.renderStatic) {
         TurmaChat.renderStatic({
-          entries: t.entries || [],
+          entries: t.entries,
           scrollEl: document.getElementById("trScroll"),
           verbHost: document.getElementById("trVerbosity"),
           transcriptId: vid,
@@ -2937,6 +3020,19 @@ window.openSubagentView = openSubagentView;
 // The transcript pane's Back button: return to the live session it was opened
 // from (a subagent view), else fall back to the sessions list (archive view).
 function transcriptBack() {
+  // One workflow agent's transcript goes back to its RUN's agent list first —
+  // the middle rung — and only from there to the session.
+  const toList = subagentListReturn;
+  subagentListReturn = null;
+  // Only if that list can still be FETCHED. It is read from the session's host,
+  // so once the session leaves the cache there is no list to return to, and
+  // openSubagentView would early-return on the missing host key — eating the
+  // press and leaving the pane exactly as it was, still labelled "Workflow".
+  // Falling through hands it to the session rung, which handles a gone session.
+  if (toList != null && currentId && hostKeyForSession(currentId)) {
+    openSubagentView(toList.type, toList.label);
+    return;
+  }
   const back = subagentReturn;
   subagentReturn = null;
   document.getElementById("trBackLabel").textContent = " Sessions";

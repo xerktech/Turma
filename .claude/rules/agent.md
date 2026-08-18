@@ -239,6 +239,9 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     alone left every real launch unnamed (and `_resolve_subagent` had the same bug, so no clicked
     row resolved). A background launch carries no `subagent_type`, so the row's type falls back to
     `agent` and `_resolve_subagent` treats that as a wildcard, matching on the description.
+  - **A `workflow` row resolves to a RUN, not a conversation** (XERK-304) — a workflow writes no
+    transcript of its own, so the row opens that run's agent picker. Mechanics, the layout on disk
+    and the traps in reading it are in `.claude/rules/agent-workflows.md`.
   - **A stop already seen beats a later-read launch** (`stoppedAgents`): the queued copy of a
     notification can sit at an EARLIER file offset than the launch it refers to.
   - **An ASSISTANT turn is never a notification carrier** (real ones ride `queue-operation`/`user`),

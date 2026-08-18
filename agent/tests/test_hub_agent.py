@@ -4453,6 +4453,197 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
 
+    def test_pack_carries_the_workflow_run_records(self):
+        # The SIBLING workflows/ tree holds each run's record, which is the only
+        # place a workflow picker's row labels exist (XERK-304). Left behind, a
+        # moved session's rows fall back to prompt text on the target only.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfmig")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(os.path.join(runs, "scripts"))
+        # Deliberately a REALISTIC size (a record embeds the script and a
+        # preview per agent). With a toy fixture, shrinking the bound to 1 KiB —
+        # which silently stops every real session carrying its records — passed
+        # the entire suite. The fixture is what pins the bound from below.
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123", "script": "x" * 200000,
+                       "workflowProgress": [
+                           {"type": "workflow_agent", "index": 1, "agentId": "x",
+                            "label": "review:bugs", "state": "done",
+                            "promptPreview": "p" * 2000}]}, f)
+        with open(os.path.join(runs, "scripts", "s-wf_abc123.js"), "w") as f:
+            f.write("export const meta = {}\n" + "// pad\n" * 20000)
+        self.assertGreater(
+            sum(os.path.getsize(os.path.join(dp, n))
+                for dp, _d, fs in os.walk(runs) for n in fs),
+            300000, "a toy fixture cannot pin the pack bound from below")
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-wf")
+        os.makedirs(dest)
+        sm._unpack_transcript(sm._pack_transcript(path), dest)
+        rec = os.path.join(dest, "trans1", "workflows", "wf_abc123.json")
+        self.assertTrue(os.path.isfile(rec))
+        with open(rec) as f:
+            self.assertEqual(json.load(f)["workflowProgress"][0]["label"], "review:bugs")
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "workflows", "scripts", "s-wf_abc123.js")))
+
+    def test_a_fat_workflows_tree_is_LEFT_BEHIND_rather_than_failing_the_move(self):
+        # The records are a nicety (row labels); the move is the product. An
+        # accumulated tree pushing the bundle past MIGRATION_BLOB_MAX would
+        # refuse a migration that used to succeed — trading a working move for
+        # prettier labels. Past the bound it degrades to the old behaviour.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wffat")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_big.json"), "w") as f:
+            f.write("x" * (ha.WORKFLOW_PACK_MAX_BYTES + 1))
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-fat")
+        os.makedirs(dest)
+        blob = sm._pack_transcript(path)
+        sm._unpack_transcript(blob, dest)
+        # The move still happens, and the transcript still travels whole.
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+        self.assertFalse(os.path.isdir(os.path.join(dest, "trans1", "workflows")))
+        self.assertLess(len(blob), ha.MIGRATION_BLOB_MAX)
+
+    def test_records_are_dropped_when_they_would_put_the_bundle_over(self):
+        # Bounding the TREE against a constant is not enough: the ceiling is on
+        # the whole bundle, so any records tree — however small, however legal —
+        # can push a near-ceiling transcript over it and refuse a move that used
+        # to succeed. Only the finished blob can answer that.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfhead")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        # Incompressible, so the gzipped blob really does approach the ceiling.
+        with open(path, "ab") as f:
+            f.write(os.urandom(200000))
+            f.write(b"\n")
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "wb") as f:
+            f.write(os.urandom(120000))
+        sm = self._manager()
+        with mock.patch.object(ha, "MIGRATION_BLOB_MAX", 260000):
+            blob = sm._pack_transcript(path)
+        self.assertLessEqual(len(blob), 260000, "the move must still be possible")
+        dest = os.path.join(self.tmp, "dest-head")
+        os.makedirs(dest)
+        sm._unpack_transcript(blob, dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertFalse(os.path.isdir(os.path.join(dest, "trans1", "workflows")),
+                         "the records are what gets dropped, not the session")
+
+    def test_an_unreadable_record_drops_the_records_not_the_move(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfperm")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        bad = os.path.join(runs, "wf_abc123.json")
+        with open(bad, "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        os.chmod(bad, 0)
+        self.addCleanup(os.chmod, bad, 0o644)
+        if os.access(bad, os.R_OK):
+            self.skipTest("running as root — an unreadable file cannot be staged")
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-perm")
+        os.makedirs(dest)
+        sm._unpack_transcript(sm._pack_transcript(path), dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+
+    def test_an_unreadable_SUBAGENT_still_refuses_the_move_loudly(self):
+        # The opposite trade from the records: a subagent transcript is
+        # conversation data, and losing one silently is worse than a failed
+        # move. It must not be mistaken for a records failure and swallowed.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfsubperm")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        bad = os.path.join(path[:-len(".jsonl")], "subagents", "agent-x.jsonl")
+        os.chmod(bad, 0)
+        self.addCleanup(os.chmod, bad, 0o644)
+        if os.access(bad, os.R_OK):
+            self.skipTest("running as root — an unreadable file cannot be staged")
+        sm = self._manager()
+        with mock.patch.object(sm, "_pack_bytes",
+                               side_effect=sm._pack_bytes) as packed:
+            with self.assertRaises(OSError):
+                sm._pack_transcript(path)
+        self.assertEqual(packed.call_count, 1,
+                         "a failure outside the records must not buy a second pack")
+
+    def test_an_unreadable_records_DIR_drops_the_records_too(self):
+        # The error's filename is then the tree ITSELF, not something under it —
+        # the shape a vanished-mid-pack tree also produces. Without the equality
+        # clause both invert into refusing the move.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfdirperm")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        os.chmod(runs, 0)
+        self.addCleanup(os.chmod, runs, 0o755)
+        if os.access(runs, os.R_OK):
+            self.skipTest("running as root — an unreadable dir cannot be staged")
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-dirperm")
+        os.makedirs(dest)
+        sm._unpack_transcript(sm._pack_transcript(path), dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+        self.assertFalse(os.path.isdir(os.path.join(dest, "trans1", "workflows")))
+
+    def test_an_UNATTRIBUTABLE_pack_error_refuses_rather_than_dropping(self):
+        # tarfile sets `filename` only for path operations; its own short read
+        # ("unexpected end of data", from a file that shrank mid-pack) carries
+        # none. Treating that as a records fault ships a TRUNCATED subagent
+        # transcript with a log line blaming the records — so "can't tell which
+        # tree" has to resolve to refuse: a failed move is visible and
+        # retryable, silent conversation-data loss is neither.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfnofn")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        sm = self._manager()
+        with mock.patch.object(sm, "_pack_bytes",
+                               side_effect=OSError("unexpected end of data")) as packed:
+            with self.assertRaises(OSError):
+                sm._pack_transcript(path)
+        self.assertEqual(packed.call_count, 1, "and it does not buy a second pack")
+
+    def test_dir_size_skips_what_it_cannot_read_rather_than_raising(self):
+        # A walk/delete race, or a leftover root-owned file, must not raise out
+        # of the measure — which would refuse the move it is meant to protect.
+        d = os.path.join(self.tmp, "unreadable")
+        os.makedirs(d)
+        with open(os.path.join(d, "a"), "w") as f:
+            f.write("y" * 100)
+        with mock.patch.object(ha.os.path, "getsize", side_effect=OSError("boom")):
+            self.assertEqual(ha._dir_size(d, 1000), 0)
+
+    def test_dir_size_bails_out_once_it_is_over_the_bound(self):
+        d = os.path.join(self.tmp, "sizeme")
+        os.makedirs(d)
+        with open(os.path.join(d, "a"), "w") as f:
+            f.write("y" * 100)
+        self.assertEqual(ha._dir_size(d, 1000), 100)
+        self.assertIsNone(ha._dir_size(d, 50))
+        # A symlink is not followed, so it cannot inflate (or leak) the measure.
+        os.symlink("/etc/passwd", os.path.join(d, "link"))
+        self.assertEqual(ha._dir_size(d, 1000), 100)
+
     def test_unpack_rejects_a_traversing_member(self):
         sm = self._manager()
         buf = io.BytesIO()
@@ -10466,6 +10657,533 @@ class TestResolveSubagent(unittest.TestCase):
         self.assertIsNone(ha._resolve_subagent(main, "main", ""))
 
 
+class TestResolveWorkflowRun(unittest.TestCase):
+    """XERK-304: a `workflow` row resolves to a RUN — a directory of agent
+    transcripts — not to one conversation, and the run is keyed on the launch
+    record's `runId`. Fixtures mirror the real shapes captured off a live
+    Claude Code 2.1 workflow run."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-wf-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.main = os.path.join(self.tmp, "main.jsonl")
+
+    def _launch(self, name, run_id, task_id="we1gtmfyd"):
+        """One Workflow launch as Claude Code records it: the tool_use, plus the
+        `local_workflow` toolUseResult carrying BOTH ids."""
+        return [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_" + run_id, "name": "Workflow",
+                 "input": {"script": "export const meta = {}"}}]}},
+            {"type": "user", "toolUseResult": {
+                "status": "async_launched", "taskId": task_id,
+                "taskType": "local_workflow", "workflowName": name,
+                "runId": run_id, "summary": name + " summary",
+                "transcriptDir": "/somewhere/else/entirely/" + run_id,
+            }, "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_" + run_id,
+                 "content": "Workflow launched in background."}]}},
+        ]
+
+    def _write_main(self, *launches):
+        with open(self.main, "w") as f:
+            for group in launches:
+                for e in group:
+                    f.write(json.dumps(e) + "\n")
+
+    def _run_dir(self, run_id):
+        d = os.path.join(self.tmp, "main", "subagents", "workflows", run_id)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _record(self, run_id, agents):
+        """The run's own record, a SIBLING of subagents/ at
+        <stem>/workflows/<runId>.json. `agents` is [(agentId, label, state)].
+        Shape taken from a real Claude Code 2.1 run record."""
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        progress = [{"type": "workflow_phase", "index": 1, "title": "Probe"}]
+        for i, (aid, label, state) in enumerate(agents, start=1):
+            progress.append({
+                "type": "workflow_agent", "index": i, "label": label,
+                "phaseIndex": 1, "phaseTitle": "Probe", "agentId": aid,
+                "state": state, "startedAt": 1787023867583 + i * 1000,
+                "promptPreview": "…", "attempt": 1,
+            })
+        with open(os.path.join(d, run_id + ".json"), "w") as f:
+            json.dump({"runId": run_id, "workflowName": "fixture",
+                       "status": "completed", "workflowProgress": progress}, f)
+        return os.path.join(self.tmp, "main.jsonl")
+
+    def _agent(self, run_dir, aid, prompt, ts, meta=None, done=False):
+        with open(os.path.join(run_dir, "agent-%s.jsonl" % aid), "w") as f:
+            f.write(json.dumps({"type": "user", "uuid": "u-" + aid,
+                                "agentId": aid, "isSidechain": True,
+                                "timestamp": ts,
+                                "message": {"role": "user", "content": prompt}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "a-" + aid,
+                                "agentId": aid, "isSidechain": True,
+                                "message": {"content": [
+                                    {"type": "text", "text": "answer from " + aid}]}}) + "\n")
+        # The real meta of a workflow agent: an agentType and a depth, and NO
+        # description — which is why the row is named off the first prompt.
+        with open(os.path.join(run_dir, "agent-%s.meta.json" % aid), "w") as f:
+            json.dump(meta if meta is not None
+                      else {"agentType": "workflow-subagent", "spawnDepth": 1}, f)
+        if done is not None:
+            with open(os.path.join(run_dir, "journal.jsonl"), "a") as f:
+                f.write(json.dumps({"type": "started", "agentId": aid}) + "\n")
+                if done:
+                    f.write(json.dumps({"type": "result", "agentId": aid,
+                                        "result": "ok"}) + "\n")
+
+    def test_the_run_dir_is_the_runId_not_the_taskId(self):
+        # The ROW is keyed on taskId (what _async_launch reads), but the DIR is
+        # named after runId — two different handles. Reading taskId as the
+        # directory name is what resolved nothing at all.
+        self._write_main(self._launch("code-review", "wf_86e01141-7bc",
+                                      task_id="we1gtmfyd"))
+        run = self._run_dir("wf_86e01141-7bc")
+        os.makedirs(os.path.join(self.tmp, "main", "subagents", "workflows",
+                                 "we1gtmfyd"), exist_ok=True)
+        self.assertEqual(ha._resolve_workflow_run(self.main, "code-review"), run)
+
+    def test_the_records_absolute_transcriptDir_is_never_followed(self):
+        # It is untrusted input on a path join AND wrong for a session that has
+        # since migrated to a host mounting REPOS_ROOT elsewhere. The run id is
+        # rebuilt under THIS transcript's own tree instead.
+        self._write_main(self._launch("code-review", "wf_aaa111"))
+        run = self._run_dir("wf_aaa111")
+        self.assertEqual(ha._resolve_workflow_run(self.main, "code-review"), run)
+        self.assertFalse(os.path.exists("/somewhere/else/entirely/wf_aaa111"))
+
+    def test_newest_matching_launch_wins(self):
+        self._write_main(self._launch("nightly", "wf_old111"),
+                         self._launch("nightly", "wf_new222"))
+        self._run_dir("wf_old111")
+        newest = self._run_dir("wf_new222")
+        self.assertEqual(ha._resolve_workflow_run(self.main, "nightly"), newest)
+
+    def test_a_pane_ellipsized_name_still_resolves(self):
+        self._write_main(self._launch("exhaustive-code-review", "wf_bbb222"))
+        run = self._run_dir("wf_bbb222")
+        self.assertEqual(
+            ha._resolve_workflow_run(self.main, "exhaustive-code-…"), run)
+
+    def test_an_unknown_name_or_missing_dir_resolves_to_nothing(self):
+        self._write_main(self._launch("code-review", "wf_ccc333"))
+        self.assertIsNone(ha._resolve_workflow_run(self.main, "some-other-flow"))
+        # The launch is recorded but the run wrote no dir yet.
+        self.assertIsNone(ha._resolve_workflow_run(self.main, "code-review"))
+
+    def test_a_forged_run_id_can_never_name_a_directory(self):
+        # runId comes off the transcript and is joined onto a path; a value that
+        # isn't a run id is dropped rather than escaping the workflows/ dir.
+        for forged in ("../../../../etc", "wf_../..", "", "nope"):
+            self._write_main(self._launch("evil", forged))
+            self.assertIsNone(ha._resolve_workflow_run(self.main, "evil"))
+
+    def test_agents_are_listed_in_launch_order_with_prompt_labels(self):
+        self._write_main(self._launch("fixture", "wf_ddd444"))
+        run = self._run_dir("wf_ddd444")
+        self._agent(run, "a6e2ac4a81e8d4ede", "Reply with exactly the word: beta.",
+                    "2026-08-18T03:31:09.349Z", done=True)
+        self._agent(run, "a7cee247530950375", "Reply with exactly the word: alpha.",
+                    "2026-08-18T03:31:07.583Z", done=False)
+        rows, truncated = ha._workflow_agents(run)
+        self.assertFalse(truncated)
+        # Ordered by first timestamp — launch order — not by name or mtime.
+        self.assertEqual([r["id"] for r in rows],
+                         ["a7cee247530950375", "a6e2ac4a81e8d4ede"])
+        self.assertEqual(rows[0]["label"], "Reply with exactly the word: alpha.")
+        self.assertEqual([r["status"] for r in rows], ["running", "done"])
+
+    def test_the_run_record_names_the_rows(self):
+        # The whole point of the picker: a fan-out over ONE prompt template
+        # renders every row identically unless the script's own `label:` is
+        # used, and the run record is the only place on disk that has it.
+        self._write_main(self._launch("fixture", "wf_rec111"))
+        run = self._run_dir("wf_rec111")
+        prompt = "Write a thorough essay of approximately 900 words on "
+        for aid in ("ag1", "ag2", "ag3"):
+            self._agent(run, aid, prompt, "2026-08-18T03:31:07.583Z", done=True)
+        self._record("wf_rec111", [("ag1", "essay:compilers", "done"),
+                                   ("ag2", "essay:filesystems", "done"),
+                                   ("ag3", "essay:networking", "running")])
+        rec = ha._workflow_run_record(self.main, "wf_rec111")
+        rows, _ = ha._workflow_agents(run, rec)
+        self.assertEqual([r["label"] for r in rows],
+                         ["essay:compilers", "essay:filesystems", "essay:networking"])
+        # Without it every row is the same string — a picker you cannot pick from.
+        plain, _ = ha._workflow_agents(run)
+        self.assertEqual(len({r["label"] for r in plain}), 1)
+
+    def test_a_recorded_state_is_passed_through_not_flattened(self):
+        # "failed"/"skipped" are worth seeing; collapsing them to done/running
+        # hides an agent that never produced anything.
+        self._write_main(self._launch("fixture", "wf_rec222"))
+        run = self._run_dir("wf_rec222")
+        for aid in ("ag1", "ag2"):
+            self._agent(run, aid, "work", "2026-08-18T03:31:07.583Z", done=True)
+        self._record("wf_rec222", [("ag1", "one", "failed"), ("ag2", "two", "skipped")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec222"))
+        self.assertEqual([r["status"] for r in rows], ["failed", "skipped"])
+
+    def test_the_record_orders_the_rows_by_launch_index(self):
+        self._write_main(self._launch("fixture", "wf_rec333"))
+        run = self._run_dir("wf_rec333")
+        # Written with timestamps in the OPPOSITE order to the record's index,
+        # so only the index can produce the expected sequence.
+        self._agent(run, "late", "b", "2026-08-18T03:31:01.000Z", done=True)
+        self._agent(run, "early", "a", "2026-08-18T03:31:09.000Z", done=True)
+        self._record("wf_rec333", [("early", "first", "done"), ("late", "second", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec333"))
+        self.assertEqual([r["id"] for r in rows], ["early", "late"])
+
+    def test_an_agent_the_record_misses_still_gets_a_row(self):
+        # A partially-recorded run must stay deterministic and complete: the
+        # uncovered agent falls back to its prompt and sorts after the rest.
+        self._write_main(self._launch("fixture", "wf_rec444"))
+        run = self._run_dir("wf_rec444")
+        self._agent(run, "known", "recorded work", "2026-08-18T03:31:07.000Z", done=True)
+        self._agent(run, "orphan", "unrecorded work", "2026-08-18T03:31:08.000Z", done=True)
+        self._record("wf_rec444", [("known", "the recorded one", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec444"))
+        self.assertEqual([r["id"] for r in rows], ["known", "orphan"])
+        self.assertEqual(rows[1]["label"], "unrecorded work")
+
+    def test_a_missing_or_oversized_record_falls_back_to_the_transcripts(self):
+        self._write_main(self._launch("fixture", "wf_rec555"))
+        run = self._run_dir("wf_rec555")
+        self._agent(run, "ag1", "the prompt", "2026-08-18T03:31:07.583Z", done=True)
+        self.assertIsNone(ha._workflow_run_record(self.main, "wf_rec555"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "wf_rec555.json"), "w") as f:
+            f.write("x" * (ha.WORKFLOW_RECORD_MAX_BYTES + 1))
+        self.assertIsNone(ha._workflow_run_record(self.main, "wf_rec555"))
+        rows, _ = ha._workflow_agents(run, None)
+        self.assertEqual(rows[0]["label"], "the prompt")
+
+    def test_a_forged_run_id_cannot_name_a_record_either(self):
+        self._write_main(self._launch("fixture", "wf_rec666"))
+        for forged in ("../../../../etc/passwd", "..", "", "wf_../x"):
+            self.assertIsNone(ha._workflow_run_record(self.main, forged))
+
+    def test_the_records_epoch_startedAt_is_normalised_to_ISO(self):
+        # It times agents in epoch ms while the rest of this wire is ISO, and a
+        # field that is a string on one path and a number on the other is what
+        # breaks a typed client's decode.
+        self._write_main(self._launch("fixture", "wf_rec777"))
+        run = self._run_dir("wf_rec777")
+        self._agent(run, "ag1", "work", "2026-08-18T03:31:07.583Z", done=True)
+        self._record("wf_rec777", [("ag1", "named", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec777"))
+        self.assertRegex(rows[0]["startedAt"], r"^\d{4}-\d{2}-\d{2}T[\d:]{8}Z$")
+        self.assertEqual(ha._epoch_ms_iso("not a number"), "")
+        self.assertEqual(ha._epoch_ms_iso(None), "")
+
+    def test_a_partially_recorded_run_still_gets_status_from_the_journal(self):
+        # A record covering SOME agents must not suppress the journal for the
+        # rest: the journal on disk knew the answer for every one of them, and
+        # the run served rows with no status beside rows that had one.
+        self._write_main(self._launch("fixture", "wf_par111"))
+        run = self._run_dir("wf_par111")
+        for aid in ("p1", "p2", "p3"):
+            self._agent(run, aid, "prompt for " + aid, "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_par111", [("p1", "one", "done"), ("p2", "two", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_par111"))
+        by_id = {r["id"]: r for r in rows}
+        self.assertEqual(by_id["p3"].get("status"), "done",
+                         "the uncovered agent's status comes from the journal")
+
+    def test_the_journal_is_folded_at_most_ONCE_however_many_rows_need_it(self):
+        # Two separate properties, and asserting only the first leaves the second
+        # free to regress: the fold is LAZY (a fully recorded run never reads the
+        # journal) and MEMOISED (a run with many uncovered agents reads it once,
+        # not once per row). It costs up to 5.7s on a large journal and runs on
+        # the synchronous beat loop, so per-row would be beat latency multiplied.
+        self._write_main(self._launch("fixture", "wf_par222"))
+
+        covered = self._run_dir("wf_par222")
+        self._agent(covered, "a1", "work", "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_par222", [("a1", "named", "done")])
+        rec = ha._workflow_run_record(self.main, "wf_par222")
+        with mock.patch.object(ha, "_workflow_finished_agents") as folded:
+            rows, _ = ha._workflow_agents(covered, rec)
+        folded.assert_not_called()
+        self.assertEqual(rows[0]["status"], "done")
+
+        # Now a run the record covers only partly, with SEVERAL uncovered agents.
+        self._write_main(self._launch("fixture", "wf_par333"))
+        partial = self._run_dir("wf_par333")
+        for aid in ("u1", "u2", "u3", "u4"):
+            self._agent(partial, aid, "work " + aid, "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_par333", [("u1", "named", "done")])
+        rec2 = ha._workflow_run_record(self.main, "wf_par333")
+        with mock.patch.object(ha, "_workflow_finished_agents",
+                               return_value={"u2", "u3", "u4"}) as folded:
+            rows, _ = ha._workflow_agents(partial, rec2)
+        self.assertEqual(folded.call_count, 1,
+                         "three uncovered rows must share ONE fold, not take one each")
+        self.assertEqual(sorted(r["status"] for r in rows),
+                         ["done", "done", "done", "done"])
+
+        # And a fold that answers None — an UNREADABLE journal — is memoised too.
+        # Memoising only a truthy result re-reads once per uncovered row in
+        # exactly the case where the read is most likely to be slow.
+        with mock.patch.object(ha, "_workflow_finished_agents",
+                               return_value=None) as folded:
+            rows, _ = ha._workflow_agents(partial, rec2)
+        self.assertEqual(folded.call_count, 1, "a None fold is memoised too")
+        self.assertEqual([r for r in rows if "status" in r][0]["label"], "named")
+
+    def test_a_record_that_is_not_an_object_is_refused(self):
+        # json.load happily returns a list; without the isinstance guard the
+        # progress read raises AttributeError and the drill-down never answers.
+        self._write_main(self._launch("fixture", "wf_bad111"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        for body in ("[1, 2, 3]", '"a string"', "null", "17"):
+            with open(os.path.join(d, "wf_bad111.json"), "w") as f:
+                f.write(body)
+            self.assertIsNone(ha._workflow_run_record(self.main, "wf_bad111"), body)
+
+    def test_a_deeply_nested_record_is_a_MISS_not_an_escape(self):
+        # json.load blows the stack on this, and RecursionError is not a
+        # ValueError — escaping leaves handle_commands' blanket catch to stage
+        # NOTHING, so the client polls to its timeout instead of being told.
+        self._write_main(self._launch("fixture", "wf_bad222"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "wf_bad222.json"), "w") as f:
+            f.write("[" * 100000 + "]" * 100000)
+        self.assertIsNone(ha._workflow_run_record(self.main, "wf_bad222"))
+
+    def test_a_forged_run_id_is_refused_by_the_record_read_ITSELF(self):
+        # Defence in depth: _resolve_workflow_run has already validated the id
+        # by the time this is called, so only a direct test pins the check here.
+        self._write_main(self._launch("fixture", "wf_bad333"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        # A real, readable file the forged id would otherwise reach.
+        with open(os.path.join(d, "secret.json"), "w") as f:
+            json.dump({"workflowProgress": []}, f)
+        for forged in ("../workflows/secret", "secret", "", "..", "wf_a/../b"):
+            self.assertIsNone(ha._workflow_run_record(self.main, forged), forged)
+
+    def test_record_derived_label_and_status_are_capped(self):
+        # They ride the heartbeat body, so their size is the agent's to bound —
+        # the hub's own 256-char cap is the second line of defence, not the first.
+        self._write_main(self._launch("fixture", "wf_cap111"))
+        run = self._run_dir("wf_cap111")
+        self._agent(run, "a1", "work", "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_cap111", [("a1", "L" * 5000, "S" * 5000)])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_cap111"))
+        self.assertEqual(len(rows[0]["label"]), ha.WORKFLOW_AGENT_LABEL_CHARS)
+        self.assertEqual(len(rows[0]["status"]), ha.WORKFLOW_AGENT_LABEL_CHARS)
+
+    def test_a_meta_description_beats_the_prompt_when_there_is_one(self):
+        self._write_main(self._launch("fixture", "wf_eee555"))
+        run = self._run_dir("wf_eee555")
+        self._agent(run, "ag1", "a very long prompt nobody wants as a title",
+                    "2026-08-18T03:31:07.583Z",
+                    meta={"agentType": "qa", "description": "review:bugs"})
+        rows, _ = ha._workflow_agents(run)
+        self.assertEqual(rows[0]["label"], "review:bugs")
+
+    def test_no_journal_means_no_status_rather_than_a_guess(self):
+        # An absent field is "this run can't say", never "nothing finished" —
+        # the same rule the heartbeat's capability flags follow.
+        self._write_main(self._launch("fixture", "wf_fff666"))
+        run = self._run_dir("wf_fff666")
+        self._agent(run, "ag1", "do a thing", "2026-08-18T03:31:07.583Z", done=None)
+        rows, _ = ha._workflow_agents(run)
+        self.assertNotIn("status", rows[0])
+
+    def test_a_nested_child_workflows_agents_belong_to_the_run(self):
+        # A script may call workflow() to run a child inline; its agents land one
+        # dir deeper and are as much part of this run as the top-level ones.
+        self._write_main(self._launch("parent", "wf_ggg777"))
+        run = self._run_dir("wf_ggg777")
+        self._agent(run, "ag1", "top level", "2026-08-18T03:31:07.000Z", done=True)
+        child = os.path.join(run, "wf_child888")
+        os.makedirs(child)
+        self._agent(child, "ag2", "nested", "2026-08-18T03:31:08.000Z", done=True)
+        rows, _ = ha._workflow_agents(run)
+        self.assertEqual([r["id"] for r in rows], ["ag1", "ag2"])
+        self.assertTrue(ha._workflow_agent_path(run, "ag2"))
+
+    def test_the_list_is_capped_and_says_so(self):
+        self._write_main(self._launch("big", "wf_hhh999"))
+        run = self._run_dir("wf_hhh999")
+        for i in range(ha.WORKFLOW_AGENTS_MAX + 5):
+            self._agent(run, "ag%04d" % i, "task %d" % i,
+                        "2026-08-18T03:%02d:00.000Z" % (i % 60), done=None)
+        rows, truncated = ha._workflow_agents(run)
+        self.assertEqual(len(rows), ha.WORKFLOW_AGENTS_MAX)
+        self.assertTrue(truncated)
+
+    def test_an_UNREADABLE_journal_says_nothing_rather_than_running(self):
+        # An OSError reading the journal used to be indistinguishable from an
+        # empty one, so every agent of a run that finished hours ago came back
+        # `running`. "Can't tell" is no status at all.
+        self._write_main(self._launch("fixture", "wf_jjj111"))
+        run = self._run_dir("wf_jjj111")
+        self._agent(run, "ag1", "do a thing", "2026-08-18T03:31:07.583Z", done=True)
+        journal = os.path.join(run, "journal.jsonl")
+        os.chmod(journal, 0)
+        self.addCleanup(os.chmod, journal, 0o644)
+        if os.access(journal, os.R_OK):
+            self.skipTest("running as root — an unreadable file cannot be staged")
+        self.assertIsNone(ha._workflow_finished_agents(run))
+        rows, _ = ha._workflow_agents(run)
+        self.assertNotIn("status", rows[0])
+
+    def test_a_journal_larger_than_any_tail_window_still_reports_every_result(self):
+        # A `result` line carries the agent's RETURN VALUE, so a few dozen agents
+        # push the journal past a fixed tail — and the records a tail drops are
+        # the OLDEST, which the launch-order sort puts at the TOP of the picker.
+        # They read as "still running" forever.
+        self._write_main(self._launch("big", "wf_kkk222"))
+        run = self._run_dir("wf_kkk222")
+        payload = "x" * 30000
+        with open(os.path.join(run, "journal.jsonl"), "w") as f:
+            for i in range(40):
+                aid = "ag%02d" % i
+                f.write(json.dumps({"type": "started", "agentId": aid}) + "\n")
+                f.write(json.dumps({"type": "result", "agentId": aid,
+                                    "result": payload}) + "\n")
+        self.assertGreater(os.path.getsize(os.path.join(run, "journal.jsonl")), 1 << 20)
+        done = ha._workflow_finished_agents(run)
+        self.assertEqual(len(done), 40)
+        self.assertIn("ag00", done, "the OLDEST result is the one a tail window drops")
+
+    def test_an_over_long_result_line_is_still_credited_to_its_own_agent(self):
+        # An agent whose RETURN VALUE contains the text of a journal record must
+        # not retire the agent that text names. JSON escaping is what does this —
+        # inside a string the nested record's quotes are backslash-escaped, so
+        # the unescaped pattern cannot match — and it holds at every length.
+        self._write_main(self._launch("big", "wf_lll333"))
+        run = self._run_dir("wf_lll333")
+        forged = json.dumps({"type": "result", "agentId": "victim"})
+        with open(os.path.join(run, "journal.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "result", "agentId": "real1",
+                                "result": forged + "y" * (1 << 19)}) + "\n")
+            # Same record with its fields REORDERED, so the forged text sits
+            # ahead of the real id. The anchored marker refuses this line rather
+            # than risk crediting the victim — the cost of the anchor, paid as a
+            # miss (the agent reads as still running), which is the safe way to
+            # be wrong. Real journals write `type` first, so this is the
+            # hypothetical half of the trade, not the live one.
+            f.write(json.dumps({"result": forged + "y" * (1 << 19),
+                                "type": "result", "agentId": "real2"}) + "\n")
+        done = ha._workflow_finished_agents(run)
+        self.assertEqual(done, {"real1"})
+        self.assertNotIn("victim", done, "never the agent named inside a return value")
+
+    def test_a_CORRUPT_over_long_line_cannot_retire_an_agent(self):
+        # The case JSON escaping does NOT cover: a half-written or corrupt line
+        # that is not valid JSON at all and carries a raw record inside it. The
+        # anchored marker is what refuses it — an unanchored search would find
+        # the record anywhere in the line and mark a live agent finished.
+        self._write_main(self._launch("big", "wf_ooo666"))
+        run = self._run_dir("wf_ooo666")
+        raw = b'{"type":"result","agentId":"victim"}'
+        with open(os.path.join(run, "journal.jsonl"), "wb") as f:
+            f.write(b'GARBAGE ' + raw + b'z' * (1 << 19) + b'\n')
+            f.write(json.dumps({"type": "result", "agentId": "real1"}).encode() + b'\n')
+        self.assertEqual(ha._workflow_finished_agents(run), {"real1"})
+
+    def test_a_journal_far_past_any_tail_reports_its_NEWEST_results_too(self):
+        # The read cap is a runaway backstop, not a working limit: reading
+        # forward means hitting it would drop the NEWEST results, so it has to
+        # sit far above any real journal.
+        self._write_main(self._launch("big", "wf_ppp777"))
+        run = self._run_dir("wf_ppp777")
+        payload = "x" * 500000
+        with open(os.path.join(run, "journal.jsonl"), "w") as f:
+            for i in range(200):
+                f.write(json.dumps({"type": "result", "agentId": "ag%03d" % i,
+                                    "result": payload}) + "\n")
+        self.assertGreater(os.path.getsize(os.path.join(run, "journal.jsonl")), 64 << 20)
+        done = ha._workflow_finished_agents(run)
+        self.assertEqual(len(done), 200)
+        self.assertIn("ag199", done, "the NEWEST result is the one a forward cap drops")
+
+    def test_a_prompt_past_the_label_bound_leaves_the_row_nameless_not_broken(self):
+        # The byte bound truncates rather than degrading, so an enormous first
+        # prompt yields no label at all. That is the accepted trade against an
+        # unbounded read on a memory-limited container — and the row must stay
+        # usable, which is why both clients fall back to the id.
+        self._write_main(self._launch("fixture", "wf_qqq888"))
+        run = self._run_dir("wf_qqq888")
+        self._agent(run, "huge", "P" * (ha.WORKFLOW_LABEL_MAX_BYTES + (1 << 16)),
+                    "2026-08-18T03:31:07.583Z", done=True)
+        rows, _ = ha._workflow_agents(run)
+        self.assertEqual(rows[0]["id"], "huge")
+        self.assertEqual(rows[0]["label"], "")
+
+    def test_a_realistically_large_prompt_is_still_named(self):
+        # The bound is generous on purpose: a prompt of a few hundred KB — a
+        # pasted diff, a long spec — is ordinary and must still name its row.
+        self._write_main(self._launch("fixture", "wf_rrr999"))
+        run = self._run_dir("wf_rrr999")
+        self._agent(run, "big1", "Review this diff: " + "d" * 300000,
+                    "2026-08-18T03:31:07.583Z", done=True)
+        rows, _ = ha._workflow_agents(run)
+        self.assertTrue(rows[0]["label"].startswith("Review this diff:"))
+
+    def test_a_SYMLINKED_agent_transcript_is_not_followed(self):
+        # isfile FOLLOWS links, so `agent-etc.jsonl -> /etc/passwd` showed up as a
+        # phantom agent whose "transcript" was whatever it pointed at.
+        self._write_main(self._launch("fixture", "wf_mmm444"))
+        run = self._run_dir("wf_mmm444")
+        self._agent(run, "real", "a real prompt", "2026-08-18T03:31:07.583Z", done=True)
+        outside = os.path.join(self.tmp, "elsewhere.jsonl")
+        with open(outside, "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "secret"}}) + "\n")
+        os.symlink(outside, os.path.join(run, "agent-linked.jsonl"))
+        self.assertEqual(sorted(ha._workflow_agent_files(run)), ["real"])
+        self.assertIsNone(ha._workflow_agent_path(run, "linked"))
+
+    def test_a_file_whose_id_is_not_an_id_is_skipped(self):
+        # Pins VALID_WORKFLOW_AGENT_ID_RE itself. The walk-map lookup already
+        # makes an escape impossible, so without this the pattern check can be
+        # deleted with the whole suite still green.
+        self._write_main(self._launch("fixture", "wf_nnn555"))
+        run = self._run_dir("wf_nnn555")
+        self._agent(run, "good1", "fine", "2026-08-18T03:31:07.583Z", done=True)
+        for bad in ("agent-.jsonl", "agent-with space.jsonl", "agent-" + "z" * 65 + ".jsonl"):
+            with open(os.path.join(run, bad), "w") as f:
+                f.write("{}\n")
+        self.assertEqual(sorted(ha._workflow_agent_files(run)), ["good1"])
+
+    def test_an_agent_id_can_never_escape_the_run_dir(self):
+        # The id arrives from a clicked row over HTTP and is about to name a
+        # file, so it is matched against the run's own walk, never joined on.
+        self._write_main(self._launch("fixture", "wf_iii000"))
+        run = self._run_dir("wf_iii000")
+        self._agent(run, "ag1", "do a thing", "2026-08-18T03:31:07.583Z", done=True)
+        outside = os.path.join(self.tmp, "agent-secret.jsonl")
+        with open(outside, "w") as f:
+            f.write("{}\n")
+        for forged in ("../../../../etc/passwd", "../agent-secret", "..", "",
+                       "a/b", "a" * 200):
+            self.assertIsNone(ha._workflow_agent_path(run, forged), forged)
+        self.assertTrue(ha._workflow_agent_path(run, "ag1"))
+        # Surrounding whitespace is trimmed rather than refused, matching the
+        # hub's own `.trim()` on the query param — the two ends must agree on
+        # what the id IS before they can agree on whether it is allowed.
+        self.assertTrue(ha._workflow_agent_path(run, " ag1 "))
+
+
 class TestStageSubagentHistory(ManagerMixin, unittest.TestCase):
     def _setup_session(self, sm):
         wt = "/w/.turma/worktrees/repo/aaa"
@@ -10510,6 +11228,81 @@ class TestStageSubagentHistory(ManagerMixin, unittest.TestCase):
         sm.registry = []
         sm._stage_subagent_history("ghost", "Explore", "x")
         self.assertEqual(sm.subagent_history_results[0]["entries"], [])
+
+    # ---- workflow rows (XERK-304) ------------------------------------------
+
+    def _setup_workflow(self, sm, write_agents=True):
+        wt = "/w/.turma/worktrees/repo/bbb"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj)
+        main = os.path.join(proj, "trans2.jsonl")
+        with open(main, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_wf", "name": "Workflow",
+                 "input": {"script": "x"}}]}}) + "\n")
+            f.write(json.dumps({"type": "user", "toolUseResult": {
+                "status": "async_launched", "taskId": "we1gtmfyd",
+                "taskType": "local_workflow", "workflowName": "code-review",
+                "runId": "wf_86e01141-7bc"}, "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_wf",
+                     "content": "launched"}]}}) + "\n")
+        run = os.path.join(proj, "trans2", "subagents", "workflows", "wf_86e01141-7bc")
+        os.makedirs(run)
+        if write_agents:
+            with open(os.path.join(run, "agent-ag1.jsonl"), "w") as f:
+                f.write(json.dumps({"type": "user", "uuid": "u1",
+                                    "timestamp": "2026-08-18T03:31:07.583Z",
+                                    "message": {"content": "review the diff"}}) + "\n")
+                f.write(json.dumps({"type": "assistant", "uuid": "u2",
+                                    "message": {"content": [
+                                        {"type": "text", "text": "found a bug"}]}}) + "\n")
+            with open(os.path.join(run, "journal.jsonl"), "w") as f:
+                f.write(json.dumps({"type": "result", "agentId": "ag1"}) + "\n")
+        sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt}]
+
+    def test_a_workflow_row_stages_the_runs_agent_LIST(self):
+        sm = self.make_manager()
+        self._setup_workflow(sm)
+        sm._stage_subagent_history("s1", "workflow", "code-review")
+        r = sm.subagent_history_results[0]
+        self.assertEqual(r["agents"],
+                         [{"id": "ag1", "label": "review the diff",
+                           "startedAt": "2026-08-18T03:31:07.583Z", "status": "done"}])
+        self.assertFalse(r["agentsTruncated"])
+        self.assertEqual(r["entries"], [], "the run itself has no conversation")
+
+    def test_an_agentId_stages_that_one_agents_transcript(self):
+        sm = self.make_manager()
+        self._setup_workflow(sm)
+        sm._stage_subagent_history("s1", "workflow", "code-review", "ag1")
+        r = sm.subagent_history_results[0]
+        self.assertEqual(r["agentId"], "ag1")
+        self.assertNotIn("agents", r,
+                         "`agents` present is what tells the client it is a list")
+        self.assertTrue(any("found a bug" in (e.get("text") or "") for e in r["entries"]))
+
+    def test_a_started_run_with_no_agents_yet_still_answers_as_a_LIST(self):
+        # An empty list is a real answer ("nothing running yet"), deliberately
+        # distinct from the unresolved row's "unavailable".
+        sm = self.make_manager()
+        self._setup_workflow(sm, write_agents=False)
+        sm._stage_subagent_history("s1", "workflow", "code-review")
+        r = sm.subagent_history_results[0]
+        self.assertEqual(r["agents"], [])
+
+    def test_an_unresolved_workflow_row_carries_no_agents_key_at_all(self):
+        sm = self.make_manager()
+        self._setup_workflow(sm)
+        sm._stage_subagent_history("s1", "workflow", "no-such-workflow")
+        self.assertNotIn("agents", sm.subagent_history_results[0])
+
+    def test_a_forged_agentId_stages_empty_without_raising(self):
+        sm = self.make_manager()
+        self._setup_workflow(sm)
+        sm._stage_subagent_history("s1", "workflow", "code-review", "../../../etc/passwd")
+        r = sm.subagent_history_results[0]
+        self.assertEqual(r["entries"], [])
+        self.assertNotIn("agents", r)
 
 
 class TestSetSummary(ManagerMixin, unittest.TestCase):

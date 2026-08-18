@@ -109,7 +109,14 @@ class HubClient(private val config: Config) {
     }
 
     sealed interface HistoryResult {
-        data class Ready(val entries: List<TailEntry>, val truncated: Boolean) : HistoryResult
+        data class Ready(
+            val entries: List<TailEntry>,
+            val truncated: Boolean,
+            // Non-null only for a workflow row's agent list (XERK-304); its
+            // PRESENCE is the signal, so an empty list is not the same as null.
+            val agents: List<com.xerktech.turma.model.WorkflowAgent>? = null,
+            val agentsTruncated: Boolean = false,
+        ) : HistoryResult
         data class Pending(val cmdId: String) : HistoryResult
 
         /**
@@ -139,7 +146,8 @@ class HubClient(private val config: Config) {
         sessionId: String,
         type: String,
         label: String,
-    ): HistoryResult = mapHistory(api.subagentHistory(host, sessionId, type, label))
+        agentId: String = "",
+    ): HistoryResult = mapHistory(api.subagentHistory(host, sessionId, type, label, agentId))
 
     companion object {
         /**
@@ -157,7 +165,7 @@ class HubClient(private val config: Config) {
             return if (resp.code() == 202 || body == null || body.pending) {
                 HistoryResult.Pending(body?.cmdId ?: "")
             } else {
-                HistoryResult.Ready(body.entries, body.truncated)
+                HistoryResult.Ready(body.entries, body.truncated, body.agents, body.agentsTruncated)
             }
         }
     }

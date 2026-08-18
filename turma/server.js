@@ -152,6 +152,16 @@ const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted 
 // the restore.
 const LIVE_AGENTS_MAX = 32;
 const LIVE_AGENT_FIELD_MAX = 400;
+// Up HERE with the live-agent caps rather than beside sanitizeWorkflowAgents
+// where they are used, and that placement is LOAD-BEARING (XERK-304). The
+// state.json restore calls normalizeRecord ~700 lines below this and ~1000
+// lines ABOVE that function, so a `const` declared next to it sits in the
+// temporal dead zone at restore time; the ReferenceError lands in the restore's
+// own catch, which swallows everything and boots the hub with an EMPTY
+// registry. The function itself hoists, so only its constants must live here.
+// Same trap the comment above that restore loop warns about.
+const WORKFLOW_AGENT_FIELD_MAX = 256;
+const WORKFLOW_AGENTS_MAX = 200;
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -2066,20 +2076,67 @@ function ingestHistory(agent, historyResults) {
 
 // The cache key for one background agent's transcript (see the {type:
 // "subagentHistory"} command): a session can run several agents of the same
-// type, so the short description/label disambiguates them. NUL-separated
-// because neither field can contain it.
-function subagentKey(sessionId, type, label) {
-  return String(sessionId) + "\0" + String(type || "") + "\0" + String(label || "");
+// type, so the short description/label disambiguates them. `agentId` is the
+// workflow drill-down's fourth component (XERK-304) — a `workflow` row answers
+// with an agent LIST under the empty id, and each of that run's agents with its
+// own transcript under its own id, so all of them are distinct cache entries.
+// NUL-separated because no field can contain it.
+function subagentKey(sessionId, type, label, agentId) {
+  return String(sessionId) + "\0" + String(type || "") + "\0" +
+    String(label || "") + "\0" + String(agentId || "");
 }
 
-// Same lifecycle as ingestHistory, keyed by (session,type,label) — merges the
-// agent's `subagentHistoryResults`, then evicts by age and caps the cache.
+// A workflow agent id names a file on the agent host, so the hub refuses a
+// malformed one outright rather than queueing a command that can only miss.
+// The agent pattern-checks it again — this is the cheap half of both-ends.
+const SUBAGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+// The workflow picker's rows, coerced (XERK-304). Android TYPES this field
+// (`HistoryResponse.agents: List<WorkflowAgent>?`), and by this repo's own rule
+// typing a field on a client and adding its hub-side coercion are the SAME
+// change — an unexpected shape from a heartbeat is otherwise served straight
+// through to a decoder that will throw on it. Same shape as sanitizeLiveAgents:
+// non-array -> null (the field is then simply absent, which every client reads
+// as "not a run"), every value through safeString, length capped.
+function sanitizeWorkflowAgents(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const a of raw) {
+    if (!a || typeof a !== "object") continue;
+    const id = safeString(a.id).slice(0, WORKFLOW_AGENT_FIELD_MAX);
+    if (!id) continue;
+    const row = {
+      id,
+      label: safeString(a.label).slice(0, WORKFLOW_AGENT_FIELD_MAX),
+      startedAt: safeString(a.startedAt).slice(0, WORKFLOW_AGENT_FIELD_MAX),
+    };
+    // `status` is OMITTED, never blanked. The agent leaves it off when the run's
+    // journal cannot say whether an agent finished, and an absent field meaning
+    // "that agent can't tell" is the fleet-wide rule — normalizing every row to
+    // a full shape would put that back as `""`, so the wire could no longer
+    // express the difference the agent went to trouble to preserve.
+    // Trimmed, so a whitespace-only value omits rather than becoming a status
+    // the web paints as an empty chip and Android hides — the two clients would
+    // disagree about a row that says nothing.
+    const status = safeString(a.status).trim().slice(0, WORKFLOW_AGENT_FIELD_MAX);
+    if (status) row.status = status;
+    out.push(row);
+    if (out.length >= WORKFLOW_AGENTS_MAX) break;
+  }
+  return out;
+}
+
+// Same lifecycle as ingestHistory, keyed by (session,type,label,agentId) —
+// merges the agent's `subagentHistoryResults`, then evicts by age and caps the
+// cache.
 function ingestSubagentHistory(agent, results) {
   const now = Date.now();
   for (const r of results || []) {
     if (!r || !r.sessionId) continue;
-    agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label)] =
-      { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+    agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label, r.agentId)] =
+      { entries: r.entries, truncated: r.truncated,
+        agents: sanitizeWorkflowAgents(r.agents),
+        agentsTruncated: !!r.agentsTruncated, fetchedAt: now };
   }
   for (const [k, h] of Object.entries(agent.subagentHistory)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.subagentHistory[k];
@@ -3026,6 +3083,24 @@ function dropUnusableHostKeys(store) {
   return dropped;
 }
 
+// The workflow picker's rows are coerced at heartbeat ingest, but the cache they
+// land in is PERSISTED — so a restart serves whatever was on disk, uncoerced,
+// and the restore is the first thing a freshly-shipped coercion has to cover
+// (XERK-304). Same rule as every other typed field: it belongs in
+// normalizeRecord, which runs on the ingest AND the restore.
+function normalizeSubagentHistory(a) {
+  const cache = a && a.subagentHistory;
+  if (!cache || typeof cache !== "object") return;
+  for (const entry of Object.values(cache)) {
+    if (!entry || typeof entry !== "object") continue;
+    // Only touch entries that actually carry a run's list — a plain transcript
+    // has no business growing workflow keys on the way through.
+    if (!("agents" in entry)) continue;
+    entry.agents = sanitizeWorkflowAgents(entry.agents);
+    entry.agentsTruncated = !!entry.agentsTruncated;
+  }
+}
+
 /**
  * Coerce the served `spawnRefusals` map (XERK-325). Android TYPES it as
  * `Map<String, SpawnRefusal>` with a `String` error and a `Long` at, and a full
@@ -3102,6 +3177,7 @@ function normalizeRecord(a) {
   // this one, uncoerced, on every boot. Sessions first only because it is the
   // one that rewrites a shape the others iterate.
   normalizeSessions(a);
+  normalizeSubagentHistory(a);
   normalizeUsage(a);
   normalizeLimits(a);
   normalizeSubscription(a);
@@ -7417,28 +7493,46 @@ const server = http.createServer(async (req, res) => {
         const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "history", sessionId });
         return json(res, 202, { pending: true, cmdId });
       }
-      // GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label= ->
-      // the transcript of one live background agent the session spawned (the
-      // pane agent-list row identifies it by type + short description). Same
-      // fresh-cache / queue-and-202 / single-flight shape as /history.
+      // GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label=
+      //   [&agentId=] -> the transcript of one live background agent the session
+      // spawned (the pane agent-list row identifies it by type + short
+      // description). Same fresh-cache / queue-and-202 / single-flight shape as
+      // /history.
+      //
+      // A `workflow` row is the one that answers differently (XERK-304): with no
+      // `agentId` it comes back carrying `agents` — that run's agent list — and
+      // the client re-requests with one of those ids to get a transcript. The
+      // presence of `agents` is the whole signal, so it is served whenever the
+      // agent sent one, empty list included.
       if (req.method === "GET" && parts.length === 7 &&
           parts[5] === "subagents" && parts[6] === "history") {
         const agentType = (url.searchParams.get("type") || "").trim();
         const label = (url.searchParams.get("label") || "").trim();
+        const agentId = (url.searchParams.get("agentId") || "").trim();
         if (!agentType) return json(res, 400, { error: "type required" });
-        const cached = (agents[key].subagentHistory || {})[subagentKey(sessionId, agentType, label)];
+        if (agentId && !SUBAGENT_ID_RE.test(agentId)) {
+          return json(res, 400, { error: "bad agentId" });
+        }
+        const cached = (agents[key].subagentHistory || {})[
+          subagentKey(sessionId, agentType, label, agentId)];
         if (cached && Date.now() - cached.fetchedAt < HISTORY_FRESH_MS) {
-          return json(res, 200, {
+          const body = {
             entries: cached.entries,
             truncated: cached.truncated,
             fetchedAt: cached.fetchedAt,
-          });
+          };
+          if (cached.agents) {
+            body.agents = cached.agents;
+            body.agentsTruncated = !!cached.agentsTruncated;
+          }
+          return json(res, 200, body);
         }
         const pending = (agents[key].commands || []).find(
           (c) => c.type === "subagentHistory" && c.sessionId === sessionId &&
-            c.agentType === agentType && (c.label || "") === label);
+            c.agentType === agentType && (c.label || "") === label &&
+            (c.agentId || "") === agentId);
         const cmdId = pending ? pending.cmdId
-          : queueCommand(key, { type: "subagentHistory", sessionId, agentType, label });
+          : queueCommand(key, { type: "subagentHistory", sessionId, agentType, label, agentId });
         return json(res, 202, { pending: true, cmdId });
       }
       // DELETE /api/agents/<host>/sessions/<id>

@@ -952,6 +952,30 @@ data class HistoryResponse(
     val fetchedAt: Long = 0,
     val pending: Boolean = false,
     val cmdId: String = "",
+    // A workflow row answers with its RUN's agent list instead of a conversation
+    // (XERK-304). NULLABLE on purpose: `agents` PRESENT — the empty list
+    // included — is what says "this is a run, not a transcript", so an absent
+    // field and an empty one must stay distinguishable.
+    val agents: List<WorkflowAgent>? = null,
+    val agentsTruncated: Boolean = false,
+)
+
+/**
+ * One agent of a workflow run, as the picker lists it (XERK-304). [label] is the
+ * script's own `label:` for that agent, read from the run's record — without it a
+ * fan-out over one prompt template renders every row identically. It falls back
+ * to the agent's description or first prompt for a run with no record, and the
+ * picker falls back to [id] when even that is empty.
+ *
+ * [status] is the state the run recorded ("done", "running", "failed", …), and is
+ * absent — never guessed — when neither the record nor the run's journal can say.
+ */
+@Serializable
+data class WorkflowAgent(
+    val id: String = "",
+    val label: String = "",
+    val startedAt: String = "",
+    val status: String = "",
 )
 
 // ---- archive / search --------------------------------------------------------

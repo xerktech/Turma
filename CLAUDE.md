@@ -13,6 +13,7 @@ that component's files.
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
 | `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
 | `.claude/rules/agent-sessions.md` | `agent/hub-agent.py` | how a session is launched, repos-root sessions, the agent-side session queue, kill/resume/delete, the new-work directive, local-model failover |
+| `.claude/rules/agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
@@ -195,6 +196,13 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   exists to stop. "User-facing" = a control, screen, state, chip, interaction, or layout a person
   sees or touches; pure server/agent plumbing is exempt. Page → screen map in
   `.claude/rules/android.md`.
+- **A background-agent row's `subagentHistory` reply means "a list" by the PRESENCE of `agents`, the
+  empty list included** (XERK-304). A `Workflow` row is N agents with no conversation of its own, so
+  it answers with that run's agent picker and only a second request naming one of those ids returns
+  a transcript. Empty = "this run has started nothing yet"; **absent = the row did not resolve**, and
+  a client must word those two differently rather than collapsing them. It spans `hub-agent.py`,
+  `turma/server.js`, `turma/public/sessions.html` and `android/`, so no `paths:`-scoped file sees
+  every side of it. Mechanics in `.claude/rules/agent-workflows.md` and `.claude/rules/turma-sessions.md`.
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.

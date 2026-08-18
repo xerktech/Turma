@@ -3211,8 +3211,8 @@ test("http: subagent-history 202s on cache miss, single-flight per (session,type
 
   const beat = await request("POST", "/api/heartbeat", { body: { device: "sh1" }, headers: agentHeaders });
   assert.deepEqual(beat.body.commands, [
-    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", cmdId: first.body.cmdId },
-    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", cmdId: other.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", agentId: "", cmdId: first.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", agentId: "", cmdId: other.body.cmdId },
   ]);
 });
 
@@ -3221,6 +3221,199 @@ test("http: subagent-history requires a type", async () => {
   const res = await request(
     "GET", "/api/agents/sh2/sessions/s1/subagents/history?label=x", { headers: userHeaders });
   assert.equal(res.status, 400);
+});
+
+// ---- workflow drill-down (XERK-304) ----------------------------------------
+
+test("XERK-304: a workflow row and one of its agents are DISTINCT cache rows", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "wf1" }, headers: agentHeaders });
+
+  const list = "/api/agents/wf1/sessions/s1/subagents/history?type=workflow&label=code-review";
+  const one = list + "&agentId=a0123";
+  const listRes = await request("GET", list, { headers: userHeaders });
+  const oneRes = await request("GET", one, { headers: userHeaders });
+  assert.equal(listRes.status, 202);
+  assert.equal(oneRes.status, 202);
+  assert.notEqual(oneRes.body.cmdId, listRes.body.cmdId,
+    "the run's agent list and one agent's transcript are different reads");
+
+  // Both deliveries land, each under its own key — the agentId is what keeps the
+  // agent's transcript from overwriting the list it was picked from.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf1",
+      subagentHistoryResults: [
+        { sessionId: "s1", type: "workflow", label: "code-review", agentId: "",
+          entries: [], truncated: false, agentsTruncated: false,
+          agents: [{ id: "a0123", label: "review:bugs", status: "done" }] },
+        { sessionId: "s1", type: "workflow", label: "code-review", agentId: "a0123",
+          entries: [{ id: "1", role: "user", text: "review it" }], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+  const gotList = await request("GET", list, { headers: userHeaders });
+  assert.equal(gotList.status, 200);
+  // Every row is normalized to the full shape on the way in, so a client that
+  // TYPES the field never meets a missing one.
+  assert.deepEqual(gotList.body.agents,
+    [{ id: "a0123", label: "review:bugs", startedAt: "", status: "done" }]);
+  assert.equal(gotList.body.agentsTruncated, false);
+
+  const gotOne = await request("GET", one, { headers: userHeaders });
+  assert.equal(gotOne.status, 200);
+  assert.deepEqual(gotOne.body.entries, [{ id: "1", role: "user", text: "review it" }]);
+  assert.equal(gotOne.body.agents, undefined,
+    "an ordinary transcript must not carry `agents` — its presence is what means `this is a run`");
+});
+
+test("XERK-304: a malformed agentId is refused, never queued", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "wf2" }, headers: agentHeaders });
+  const base = "/api/agents/wf2/sessions/s1/subagents/history?type=workflow&label=x&agentId=";
+  for (const bad of ["../../etc/passwd", "a/b", "a".repeat(65), "a b"]) {
+    const res = await request("GET", base + encodeURIComponent(bad), { headers: userHeaders });
+    assert.equal(res.status, 400, `agentId ${bad} should be refused`);
+    assert.ok(res.body.error);
+  }
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "wf2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [], "a refused id must not reach the agent's queue");
+});
+
+test("XERK-304: a wrong-shaped agents list is coerced, never served raw", async () => {
+  // Android TYPES this field, so an unexpected shape reaching a decoder is a
+  // thrown response, not a cosmetic problem. Same rule as every other typed
+  // heartbeat field: coerce at ingest.
+  await request("POST", "/api/heartbeat", { body: { device: "wf3" }, headers: agentHeaders });
+  const url = "/api/agents/wf3/sessions/s1/subagents/history?type=workflow&label=x";
+
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf3",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], truncated: false, agentsTruncated: "yes",
+        agents: [
+          { id: { nested: 1 }, label: ["a"], status: 7, startedAt: null },
+          "not an object",
+          { label: "no id at all" },
+          { id: "ok1", label: "fine", startedAt: "t", status: "done" },
+        ],
+      }],
+    },
+    headers: agentHeaders,
+  });
+
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.deepEqual(got.body.agents, [
+    { id: "[object Object]", label: "a", startedAt: "", status: "7" },
+    { id: "ok1", label: "fine", startedAt: "t", status: "done" },
+  ], "non-objects and id-less rows dropped; every surviving value a string");
+  assert.equal(got.body.agentsTruncated, true, "coerced to a boolean");
+});
+
+test("XERK-304: a row with no status keeps its omission through the hub", async () => {
+  // The agent OMITS status when the run's journal cannot say. An absent field
+  // meaning "that agent can't tell" is the fleet-wide rule, so coercing every
+  // row to a full shape would put it back as "" and lose the distinction the
+  // agent went to trouble to preserve.
+  await request("POST", "/api/heartbeat", { body: { device: "wf5" }, headers: agentHeaders });
+  const url = "/api/agents/wf5/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf5",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], truncated: false,
+        agents: [{ id: "a1", label: "no journal here", startedAt: "t" },
+                 { id: "a2", label: "knows", startedAt: "t", status: "done" }],
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.ok(!("status" in got.body.agents[0]), "omission survives, never blanked to ''");
+  assert.equal(got.body.agents[1].status, "done");
+});
+
+test("XERK-304: a whitespace-only status omits rather than splitting the clients", async () => {
+  // Web tests truthiness and would paint an empty chip; Android tests isNotBlank
+  // and would hide it. A value that says nothing must not reach either.
+  await request("POST", "/api/heartbeat", { body: { device: "wf6" }, headers: agentHeaders });
+  const url = "/api/agents/wf6/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf6",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], agents: [{ id: "a1", label: "x", status: "   " }],
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.ok(!("status" in got.body.agents[0]));
+});
+
+test("XERK-304: field values are capped, so one row cannot bloat the record", () => {
+  const a = { subagentHistory: { k: { agents: [
+    { id: "i".repeat(5000), label: "l".repeat(5000), status: "s".repeat(5000),
+      startedAt: "t".repeat(5000) },
+  ] } } };
+  hub.normalizeRecord(a);
+  const row = a.subagentHistory.k.agents[0];
+  for (const f of ["id", "label", "status", "startedAt"]) {
+    assert.equal(row[f].length, 256, `${f} must be capped`);
+  }
+});
+
+test("XERK-304: a state.json restore re-coerces the cached workflow rows", () => {
+  // The cache is PERSISTED, so a restart serves whatever was on disk — and the
+  // restore is the first thing a freshly-shipped coercion has to cover. Without
+  // this the typed Android decode meets `status: 99` straight off the volume.
+  const a = {
+    device: "h",
+    subagentHistory: {
+      k1: { agents: [
+        { id: "a1", label: { deep: "object" }, startedAt: 12345, status: 99 },
+        "not-an-object",
+      ], agentsTruncated: "yes" },
+      k2: { entries: [{ id: "1", role: "user", text: "hi" }] },  // a transcript
+      k3: { agents: "lots" },
+    },
+  };
+  hub.normalizeRecord(a);
+  // Every value becomes a string — `status: 99` is the one that throws Android's
+  // typed decode — and the bare string element is dropped for having no id.
+  assert.deepEqual(a.subagentHistory.k1.agents,
+    [{ id: "a1", label: "[object Object]", startedAt: "12345", status: "99" }]);
+  assert.equal(a.subagentHistory.k1.agentsTruncated, true);
+  assert.ok(!("agents" in a.subagentHistory.k2),
+    "a plain transcript must not grow an agents key on restore");
+  assert.equal(a.subagentHistory.k3.agents, null, "junk becomes 'not a run'");
+});
+
+test("XERK-304: a non-array `agents` leaves the reply a plain transcript", async () => {
+  // `agents` present is what means "this is a run", so a junk value must not be
+  // able to turn an ordinary transcript into a list.
+  await request("POST", "/api/heartbeat", { body: { device: "wf4" }, headers: agentHeaders });
+  const url = "/api/agents/wf4/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf4",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [{ id: "1", role: "user", text: "hi" }], truncated: false,
+        agents: "lots",
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.equal(got.body.agents, undefined);
 });
 
 test("http: heartbeat subagentHistoryResults populate the cache; GET returns 200 while fresh", async () => {
