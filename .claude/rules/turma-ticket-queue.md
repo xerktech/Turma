@@ -64,6 +64,28 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
     payload and the board's chip for as long as it stayed down. The one exception is a ticket with
     **no triaged repo**, which the sweep cannot re-queue (it only ever queues a ticket that has
     one), so an auto entry leaves there without churn.
+- **A spawn stranded on a host that dies before taking it is reclaimed** (`reclaimStrandedTicketSpawns`,
+  XERK-303). The queue's guarantee ends at dispatch — the entry leaves it there — so an undelivered
+  command on a dead host was work nothing re-routed, waiting out `PRUNE_AFTER_MS` (a week) with no
+  board surface to be missing from. It runs on the 15s sweep **before `autoStartSweep`**, so a
+  reclaimed MANUAL entry retakes its place as manual instead of being re-queued as auto and swept
+  away with the org's switch.
+  - **The gate is `!c.deliveredAt`, never the host being offline.** A host routinely goes silent
+    BETWEEN delivery and ack — the very window this covers — and withdrawing there hands the ticket
+    a second session on top of the one already starting. A delivered command is left alone: it
+    re-delivers when the host returns (delivery is at-least-once) and runs then. Offline is only what
+    makes an UNDELIVERED command hopeless enough to act on.
+  - **Admission is checked BEFORE the withdrawal.** `enqueueTicketStart` can refuse (a full org
+    line), and dropping a command that then fails to re-queue destroys the work outright rather than
+    delaying it. Refused, the command stays put and the next sweep retries.
+  - **`ticketSource` rides the command as hub-only bookkeeping**, stripped by `publicCommands`
+    exactly like `deliveredAt` so it never becomes a client contract. The queue entry is gone by
+    then, so it is the only record of what KIND of work a stranded spawn was; unstamped (queued
+    before this shipped, restored across the deploy) reads as `auto`, the reading whose failure is a
+    logged drop rather than a duplicate session.
+  - A reclaimed AUTO ticket gets its `autoStarted` attempt **back** — the dispatch spent a retry on
+    a command the agent never saw, and an offline host must not eat that ticket's backoff budget.
+  - Tests: the `XERK-303:` block in `server.test.js`.
 - **A direct dispatch RETIRES that ticket's entry** (`/session` when a host is free), and
   `rememberDispatch` records it. The entry and the dispatch are one intent: left in place it fired
   again on the next free slot, a second session hours later that nobody asked for.

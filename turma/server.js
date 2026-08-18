@@ -1363,16 +1363,21 @@ function invalidateAgentsCache() { agentsCache = null; }
 // has its own route — plus the two time/tunnel-derived live flags.
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
-// A queued command as anyone outside the hub may see it. `deliveredAt` is the
-// hub's own record of having handed the command over (XERK-241) — it lives on
-// the command because that is exactly how long it is meaningful, but it is
-// internal bookkeeping, so neither the agent's reply nor the fleet payload
-// carries it. Returns the same array when there is nothing to strip.
+// A queued command as anyone outside the hub may see it. Both stripped fields
+// are the hub's own bookkeeping, riding on the command because that is exactly
+// how long each is meaningful — so neither the agent's reply nor the fleet
+// payload carries them, and neither becomes a client contract:
+//   - `deliveredAt`, the record of having handed the command over (XERK-241).
+//   - `ticketSource`, which queue entry a spawnTicket came from (XERK-303), so a
+//     reclaim can put the ticket back in line as the same kind of work.
+// Returns the same array when there is nothing to strip.
+const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource"];
 function publicCommands(cmds) {
-  if (!cmds || !cmds.some((c) => c && c.deliveredAt)) return cmds;
+  const internal = (c) => c && INTERNAL_COMMAND_FIELDS.some((f) => f in c);
+  if (!cmds || !cmds.some(internal)) return cmds;
   return cmds.map((c) => {
-    if (!c || !c.deliveredAt) return c;
-    const { deliveredAt, ...rest } = c;
+    if (!internal(c)) return c;
+    const { deliveredAt, ticketSource, ...rest } = c;
     return rest;
   });
 }
@@ -4871,8 +4876,12 @@ function drainTicketQueue() {
     // from the Start button — read at DISPATCH so a pin changed while the ticket
     // waited is the one that takes effect.
     const mpin = ticketModelPin(e.siteKey, e.issueKey);
+    // `ticketSource` rides the command as hub-only bookkeeping (stripped by
+    // publicCommands): the entry leaves the queue here, so it is the only record
+    // of what KIND of work this was if the command has to be reclaimed from a
+    // host that dies before taking it (XERK-303).
     queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
-      ...(mpin ? { model: mpin.model } : {}) });
+      ticketSource: e.source, ...(mpin ? { model: mpin.model } : {}) });
     rememberDispatch(e.siteKey, e.issueKey);
     const wait = Math.round((now - e.at) / 1000);
     console.log(`ticket queue: dispatched ${logName(e.issueKey)} to ${logName(host)}`
@@ -4899,6 +4908,86 @@ function drainTicketQueue() {
     // applied only on enqueue it held at 2x until the next click.
     sweepExpiredNotes();
     publishTicketQueue();
+  }
+}
+
+// A spawnTicket routed to a host that then went offline before it could be
+// handed over (XERK-303). The hub's queue guarantees that any host in the org can
+// take a waiting ticket, but that guarantee ENDS AT DISPATCH — the entry leaves
+// the queue there by design — so an undelivered command on a dead host was work
+// nothing re-routed. It sat until that host came back, up to PRUNE_AFTER_MS (a
+// week), showing nothing on the board: a dispatched ticket is neither a session
+// nor a queue entry, so there was no surface for it to be missing FROM.
+//
+// **The gate is `!deliveredAt`, never the host merely being offline.** Delivery
+// is the line between "the agent never saw this" and "the agent may already have
+// run it", and a host routinely goes silent BETWEEN delivery and ack — which is
+// the very window this exists to cover. Withdrawing there gives the ticket a
+// second session on top of the one already starting, and a double start is worse
+// than a delay. A delivered command is therefore left exactly where it is: it
+// re-delivers when the host returns (delivery is at-least-once) and runs then.
+// Offline is only what makes an UNDELIVERED command hopeless enough to act on.
+//
+// Admission is checked BEFORE the withdrawal, never after. `enqueueTicketStart`
+// can refuse (a full org line), and dropping a command we then fail to re-queue
+// destroys the work outright instead of delaying it — the opposite of the point.
+// Refused, the command stays put and the next sweep tries again.
+//
+// Runs BEFORE autoStartSweep, so a reclaimed MANUAL entry takes its place in line
+// as manual; afterwards, the sweep would have re-queued it as auto and the org's
+// switch would then sweep away an operator's click.
+function reclaimStrandedTicketSpawns() {
+  const now = Date.now();
+  for (const [host, a] of Object.entries(agents)) {
+    if (now - (a.lastSeen || 0) < OFFLINE_AFTER_MS) continue;
+    const siteKey = siteKeyOf(a);
+    // Iterate a COPY: dropQueuedCommand rewrites a.commands underneath us.
+    for (const c of [...(a.commands || [])]) {
+      if (!c || c.type !== "spawnTicket" || !c.issueKey) continue;
+      if (c.deliveredAt) {
+        // Throttled, because this is a line about a CONDITION — true again on
+        // every 15s sweep for as long as the host stays down — and the whole
+        // point of it is that the hub is deliberately not going to act.
+        logQueueState(`held\x00${logName(host)}\x00${logName(c.issueKey)}`,
+          `ticket queue: ${logName(c.issueKey)} was already handed to `
+          + `${logName(host)}, which has since gone offline — it may be mid-spawn, `
+          + "so it waits for that host rather than risk a second session");
+        continue;
+      }
+      // No org on the record is nothing to re-queue it INTO. Leave the command;
+      // it still runs if the host comes back.
+      if (!siteKey) continue;
+      // Unstamped means a command queued before this shipped (restored from
+      // state.json across the deploy). Read as "auto": that is the reading whose
+      // failure is a logged drop rather than a duplicate session, matching the
+      // priority the gate above is built on.
+      const source = c.ticketSource === "manual" ? "manual" : "auto";
+      if (ticketQueueAdmission(siteKey, c.issueKey, source) !== "ok") continue;
+      if (!dropQueuedCommand(host, c.cmdId, "spawnTicket")) continue;
+      if (!enqueueTicketStart(siteKey, c.issueKey, source)) {
+        // Unreachable: admission answered "ok" one line ago and nothing between
+        // the two touches the queue. Said out loud anyway, because the one thing
+        // this function must never do quietly is lose the work.
+        console.error(`ticket queue: reclaimed ${logName(c.issueKey)} from `
+          + `${logName(host)} but could not re-queue it — start it again`);
+        continue;
+      }
+      // The auto-start retry that dispatch spent bought nothing — the agent never
+      // saw the command — so give it back rather than letting an offline host eat
+      // this ticket's backoff budget. `nextAt: 0` because nothing actually failed.
+      if (source === "auto") {
+        const k = ticketQueueKey(siteKey, c.issueKey);
+        const prior = autoStarted.get(k);
+        if (prior && prior.attempts > 1) {
+          autoStarted.set(k, { attempts: prior.attempts - 1, nextAt: 0 });
+        } else {
+          autoStarted.delete(k);
+        }
+      }
+      console.log(`ticket queue: reclaimed ${logName(c.issueKey)} from `
+        + `${logName(host)} — it went offline before taking the spawn, so the `
+        + `ticket is back in line (${source})`);
+    }
   }
 }
 
@@ -5056,6 +5145,10 @@ function autoStopSweep() {
 // stay pure, directly-callable units.)
 setInterval(() => {
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
+  // First: work that was dispatched to a host which then died before taking it
+  // goes back in the queue (XERK-303), so the sweep below sees it already in
+  // line and the drain at the end can hand it to a host that is actually up.
+  reclaimStrandedTicketSpawns();
   autoStartSweep();
   autoStopSweep();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
@@ -7307,7 +7400,7 @@ const server = http.createServer(async (req, res) => {
       const mpin = ticketModelPin(siteKey, issueKey);
       const cmdId = pending ? pending.cmdId
         : queueCommand(host, { type: "spawnTicket", issueKey,
-            ...(mpin ? { model: mpin.model } : {}) });
+            ticketSource: "manual", ...(mpin ? { model: mpin.model } : {}) });
       // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
       // a board that hadn't seen the queue yet clicked Start). Its session is
       // starting now, so its place in line is spent — leaving it there would
@@ -8093,6 +8186,7 @@ if (process.env.TURMA_TEST) {
     dropQueuedTicket,
     dropAutoQueuedTickets,
     drainTicketQueue,
+    reclaimStrandedTicketSpawns,
     queuedTicket,
     liveQueuedTicket,
     liveQueueCount,
