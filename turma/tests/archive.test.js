@@ -363,6 +363,39 @@ test("a rebuild derives rawBytes from disk and never indexes a raw file as a ses
   assert.equal(row.rawBytes, 75);
 });
 
+test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", () => {
+  // `rawCursors` is synchronous on the heartbeat path and the hub is one event
+  // loop, so every stat it makes is a hub-wide stall. Measured at ~5.6us each:
+  // the 40,000 files an agent may offer under its own caps cost 223 ms, and the
+  // ~780,000 that fit in a 32 MiB HEARTBEAT_MAX cost ~4.4 SECONDS — per beat, per
+  // host. The agent's own cap is not this bound; a bound the receiving path does
+  // not enforce is not a bound (XERK-235).
+  //
+  // Held deterministically rather than by wall clock: with a cap of 3, the FOURTH
+  // stored file gets no cursor even though it is on disk.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-statcap-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_CURSOR_MAX = "3";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-08-18T00:00:00Z", summary: "s" };
+    a.ingestChunk("nas", "cap", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+    const rels = ["a.jsonl", "b.jsonl", "c.jsonl", "d.jsonl"];
+    for (const r of rels) a.ingestRaw("nas", "cap", r, 0, Buffer.from("xx"));
+    const have = a.rawCursors([{ transcriptId: "cap", rawFiles: rels.map((r) => [r, 2]) }]).cap;
+    console.log(JSON.stringify(Object.keys(have).sort()));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const covered = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  assert.deepEqual(covered, ["a.jsonl", "b.jsonl", "c.jsonl"],
+    "the cap did not stop the stat loop");
+  // And the truncation is LOUD: silence would read as "the hub holds nothing",
+  // which is a re-ship rather than a refusal.
+  assert.match(fresh.stderr, /ARCHIVE_RAW_CURSOR_MAX/);
+});
+
 test("listRawFiles and rawFileFor read the layer back", () => {
   seedRaw("raw7");
   archive.ingestRaw("nas", "raw7", "raw7.jsonl", 0, Buffer.from("abc"));

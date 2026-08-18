@@ -117,6 +117,24 @@ const ARCHIVE_TOTAL_MAX = byteCeiling(
 // individually still fill the disk together.
 const ARCHIVE_RAW_TRANSCRIPT_MAX = byteCeiling(
   process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES, 128 * 1024 * 1024);
+// The most raw files ONE heartbeat's manifest may have stat-ed for its cursors.
+//
+// `rawCursors` is synchronous and runs on the heartbeat path, and the hub is one
+// event loop — so this spends the same hub-wide-stall budget the store-total walk
+// is sized against (14 ms there). Measured at ~5.6 us per stat: 2,000 files is
+// ~11 ms, where the 40,000 an agent may offer under its OWN caps is 223 ms and the
+// ~780,000 that fit in a 32 MiB HEARTBEAT_MAX is ~4.4 SECONDS of blocked loop —
+// per beat, per host, with every dashboard, SSE tail and other host's beat queued
+// behind it.
+//
+// The agent caps itself at ARCHIVE_RAW_MANIFEST_FILES_MAX, and that is NOT this
+// bound: a bound the receiving path does not enforce is not a bound (XERK-235).
+// Past it the extra files simply get no cursor, which the agent reads as zero and
+// pushes from the start — refused by `ingestRaw`'s offset check, so the stored
+// data is safe and the cost is one small wasted POST per over-cap file per pass.
+// That only ever happens to an agent already ignoring its own cap.
+const ARCHIVE_RAW_CURSOR_MAX = positiveEnvInt("ARCHIVE_RAW_CURSOR_MAX", 2000);
+
 // The suffix that marks a raw directory, so both walks below can tell one from a
 // rendered archive without consulting the index.
 //
@@ -143,6 +161,14 @@ function slugify(s, fallback) {
     .replace(/^[-.]+|[-.]+$/g, "")
     .slice(0, 60);
   return out || fallback;
+}
+
+// A positive-integer tunable. Deliberately NOT byteCeiling: that reads an explicit
+// 0 as "ceiling off", which for a COUNT would mean statting without limit — the
+// opposite of what a 0 here could ever be asking for.
+function positiveEnvInt(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
 }
 
 function repoFolder(meta) {
@@ -723,22 +749,44 @@ function rawCursor(full) {
 function rawCursors(manifest) {
   openDb();
   const out = {};
+  // Bounded across the WHOLE manifest, not per transcript — see
+  // ARCHIVE_RAW_CURSOR_MAX. The manifest arrives newest-transcript-first, so a
+  // truncation drops the oldest history rather than the live sessions.
+  let budget = ARCHIVE_RAW_CURSOR_MAX;
+  let dropped = 0;
   for (const m of Array.isArray(manifest) ? manifest : []) {
     if (!m || !m.transcriptId || !Array.isArray(m.rawFiles) || !m.rawFiles.length) continue;
+    if (budget <= 0) { dropped += m.rawFiles.length; continue; }
     const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(m.transcriptId);
     if (!row || !row.filePath) continue;
     const have = {};
     for (const f of m.rawFiles) {
+      if (budget <= 0) { dropped += 1; continue; }
       const rel = Array.isArray(f) ? f[0] : (f && f.path);
       const full = rawFilePath(row.filePath, rel);
       if (!full) continue;
+      budget -= 1;                // charged for the STAT, which is what costs
       const n = rawCursor(full);
       if (n === null) continue;   // cannot tell — say nothing rather than "0"
       if (n > 0) have[safeRawRel(rel)] = n;
     }
     if (Object.keys(have).length) out[m.transcriptId] = have;
   }
+  if (dropped) warnRawCursorCap(dropped);
   return Object.keys(out).length ? out : undefined;
+}
+
+// One line an hour: an agent ignoring its own cap does so on every beat, so an
+// unthrottled line turns a survived flood into disk pressure on the hub.
+let lastRawCursorWarnAt = 0;
+function warnRawCursorCap(dropped) {
+  const now = Date.now();
+  if (now - lastRawCursorWarnAt < 60 * 60 * 1000) return;
+  lastRawCursorWarnAt = now;
+  console.error(
+    `archive: a manifest offered more than ${ARCHIVE_RAW_CURSOR_MAX} raw files ` +
+    `(ARCHIVE_RAW_CURSOR_MAX); ${dropped} got no cursor this beat. An agent inside ` +
+    `its own limits never reaches this — check that host's ARCHIVE_RAW_* config.`);
 }
 
 /**
@@ -1097,7 +1145,7 @@ function rebuildIndex() {
 
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
-  ARCHIVE_RAW_TRANSCRIPT_MAX, RAW_DIR_SUFFIX,
+  ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, RAW_DIR_SUFFIX,
   slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits,

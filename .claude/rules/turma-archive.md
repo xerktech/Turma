@@ -46,6 +46,16 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
     exists to keep the volume writable for `state.json`, and two budgets that each pass individually
     still fill the disk together. Past the per-session one that session's raw sync stops and the
     rendered transcript carries on, so it stays readable and searchable.
+  - **The per-beat cursor loop is bounded by the HUB** (`ARCHIVE_RAW_CURSOR_MAX`, 2000).
+    `rawCursors` stats one file per offer, synchronously, on the heartbeat path — the same hub-wide
+    stall budget the store-total walk is sized against. Measured ~5.6 µs per stat: the 40,000 files an
+    agent may offer under its OWN caps cost 223 ms, and the ~780,000 that fit in a 32 MiB
+    `HEARTBEAT_MAX` cost ~4.4 SECONDS, per beat, per host, with every dashboard, SSE tail and other
+    host's beat queued behind it. The agent's `ARCHIVE_RAW_MANIFEST_FILES_MAX` is **not** this bound —
+    a bound the receiving path does not enforce is not a bound (XERK-235). Past it a file gets no
+    cursor, the agent pushes from 0, and `ingestRaw`'s offset check refuses: the stored data is safe
+    and the cost is one wasted small POST, only ever for an agent already over its own cap. Logged,
+    throttled, because silence reads as "the hub holds nothing" and provokes a re-ship.
   - `GET /api/archive/<id>/raw` lists it and `GET /api/archive/<id>/raw/<file>` streams one file
     (user-authed, `attachment` + `nosniff` — a transcript holds whatever was pasted into it, and
     rendering that inline behind the hub's login is stored XSS). Bytes nothing can read back are not
