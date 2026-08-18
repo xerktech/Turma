@@ -4940,6 +4940,10 @@ WORKFLOW_AGENTS_MAX = 200
 # with the run. Bounded because it is read whole (json.load) on a memory-limited
 # container; past this the picker falls back to the transcripts.
 WORKFLOW_RECORD_MAX_BYTES = 1 << 24
+# What the whole workflows/ tree may add to a MIGRATION bundle. Nothing prunes
+# that tree, so a long-lived session accumulates one record per run — and the
+# bundle has its own ceiling that a refusal strands the move on.
+WORKFLOW_PACK_MAX_BYTES = 1 << 24
 WORKFLOW_AGENT_LABEL_CHARS = 160
 # A workflow agent's transcript opens with its prompt, so the label read never
 # has to walk far in; these only bound a pathological one. The BYTE bound is the
@@ -4967,6 +4971,26 @@ def _read_head_lines(path, max_bytes):
     except OSError:
         return []
     return [line.strip() for line in raw.split(b"\n") if line.strip()]
+
+
+def _dir_size(root, limit):
+    """Total bytes of the regular files under `root`, or None as soon as the
+    running total passes `limit` — the caller only ever needs "does this fit",
+    so a tree far over the bound costs a walk rather than a full measure.
+    Symlinks are not followed and unreadable entries are skipped."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            fp = os.path.join(dirpath, name)
+            try:
+                if os.path.islink(fp) or not os.path.isfile(fp):
+                    continue
+                total += os.path.getsize(fp)
+            except OSError:
+                continue
+            if total > limit:
+                return None
+    return total
 
 
 def _workflow_runs_dir(main_path):
@@ -11564,8 +11588,20 @@ class SessionManager:
             if os.path.isdir(sub):
                 tar.add(sub, arcname=os.path.join(tid, "subagents"))
             runs = os.path.join(path[:-len(".jsonl")], WORKFLOW_RUNS_SUBDIR)
+            # Best-effort, and BOUNDED: the records are a nicety (row labels),
+            # the move is the product. Letting an accumulated workflows/ tree
+            # push the bundle past MIGRATION_BLOB_MAX would refuse a migration
+            # that used to succeed — trading a working move for prettier labels,
+            # which is the wrong way round. Past the bound it is left behind and
+            # the target's picker falls back to prompt text, exactly as it did
+            # before the tree was carried at all.
             if os.path.isdir(runs):
-                tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
+                size = _dir_size(runs, WORKFLOW_PACK_MAX_BYTES)
+                if size is None:
+                    log(f"migration: workflow records for {tid} exceed "
+                        f"{WORKFLOW_PACK_MAX_BYTES} bytes; not carrying them")
+                else:
+                    tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
         return buf.getvalue()
 
     def _unpack_transcript(self, blob, dest_dir):

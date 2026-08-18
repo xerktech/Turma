@@ -61,7 +61,16 @@ is the run RECORD, never a nested agent dir.
   answer. The fold stays lazy, so the normal fully-covered case never pays for it.
 - **The record is packed into a MIGRATION bundle** (`_pack_transcript`), because it is the only
   place the labels exist: without it a moved session's picker silently reverts to prompt text on the
-  target alone.
+  target alone. **Bounded, and left behind rather than allowed to fail the move**: nothing prunes
+  that tree, so a long-lived session accumulates a record per run, and letting it push the bundle
+  past `MIGRATION_BLOB_MAX` would refuse a migration that used to succeed — trading a working move
+  for prettier labels, which is the wrong way round.
+- **The journal fold is LAZY and MEMOISED, and those are two separate properties.** Lazy: a fully
+  recorded run never reads the journal. Memoised: a run with many uncovered agents reads it ONCE,
+  not once per row. A test asserting only the first leaves the second free to regress, and the fold
+  costs seconds on a large journal inside the synchronous beat loop. Note the fold is now reachable
+  for a partly recorded run, which it was not before — status is worth the read, but it is a path
+  that could not stall a beat previously and can now.
 - **`json.load` on it can raise `RecursionError`, which is not a `ValueError`.** Letting it escape
   leaves `handle_commands`' blanket catch to keep the beat alive while staging NOTHING, so the
   client polls to its timeout instead of being told the row is unavailable.

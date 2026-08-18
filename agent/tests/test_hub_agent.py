@@ -4442,6 +4442,40 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(dest, "trans1", "workflows", "scripts", "s-wf_abc123.js")))
 
+    def test_a_fat_workflows_tree_is_LEFT_BEHIND_rather_than_failing_the_move(self):
+        # The records are a nicety (row labels); the move is the product. An
+        # accumulated tree pushing the bundle past MIGRATION_BLOB_MAX would
+        # refuse a migration that used to succeed — trading a working move for
+        # prettier labels. Past the bound it degrades to the old behaviour.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wffat")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_big.json"), "w") as f:
+            f.write("x" * (ha.WORKFLOW_PACK_MAX_BYTES + 1))
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-fat")
+        os.makedirs(dest)
+        blob = sm._pack_transcript(path)
+        sm._unpack_transcript(blob, dest)
+        # The move still happens, and the transcript still travels whole.
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+        self.assertFalse(os.path.isdir(os.path.join(dest, "trans1", "workflows")))
+        self.assertLess(len(blob), ha.MIGRATION_BLOB_MAX)
+
+    def test_dir_size_bails_out_once_it_is_over_the_bound(self):
+        d = os.path.join(self.tmp, "sizeme")
+        os.makedirs(d)
+        with open(os.path.join(d, "a"), "w") as f:
+            f.write("y" * 100)
+        self.assertEqual(ha._dir_size(d, 1000), 100)
+        self.assertIsNone(ha._dir_size(d, 50))
+        # A symlink is not followed, so it cannot inflate (or leak) the measure.
+        os.symlink("/etc/passwd", os.path.join(d, "link"))
+        self.assertEqual(ha._dir_size(d, 1000), 100)
+
     def test_unpack_rejects_a_traversing_member(self):
         sm = self._manager()
         buf = io.BytesIO()
@@ -10700,18 +10734,37 @@ class TestResolveWorkflowRun(unittest.TestCase):
         self.assertEqual(by_id["p3"].get("status"), "done",
                          "the uncovered agent's status comes from the journal")
 
-    def test_a_fully_recorded_run_never_pays_for_the_journal_fold(self):
-        # The fold is lazy: covering every agent is the normal case and must not
-        # read the journal at all — it runs on the synchronous beat loop.
+    def test_the_journal_is_folded_at_most_ONCE_however_many_rows_need_it(self):
+        # Two separate properties, and asserting only the first leaves the second
+        # free to regress: the fold is LAZY (a fully recorded run never reads the
+        # journal) and MEMOISED (a run with many uncovered agents reads it once,
+        # not once per row). It costs up to 5.7s on a large journal and runs on
+        # the synchronous beat loop, so per-row would be beat latency multiplied.
         self._write_main(self._launch("fixture", "wf_par222"))
-        run = self._run_dir("wf_par222")
-        self._agent(run, "a1", "work", "2026-08-18T04:02:00.000Z", done=True)
+
+        covered = self._run_dir("wf_par222")
+        self._agent(covered, "a1", "work", "2026-08-18T04:02:00.000Z", done=True)
         self._record("wf_par222", [("a1", "named", "done")])
         rec = ha._workflow_run_record(self.main, "wf_par222")
         with mock.patch.object(ha, "_workflow_finished_agents") as folded:
-            rows, _ = ha._workflow_agents(run, rec)
+            rows, _ = ha._workflow_agents(covered, rec)
         folded.assert_not_called()
         self.assertEqual(rows[0]["status"], "done")
+
+        # Now a run the record covers only partly, with SEVERAL uncovered agents.
+        self._write_main(self._launch("fixture", "wf_par333"))
+        partial = self._run_dir("wf_par333")
+        for aid in ("u1", "u2", "u3", "u4"):
+            self._agent(partial, aid, "work " + aid, "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_par333", [("u1", "named", "done")])
+        rec2 = ha._workflow_run_record(self.main, "wf_par333")
+        with mock.patch.object(ha, "_workflow_finished_agents",
+                               return_value={"u2", "u3", "u4"}) as folded:
+            rows, _ = ha._workflow_agents(partial, rec2)
+        self.assertEqual(folded.call_count, 1,
+                         "three uncovered rows must share ONE fold, not take one each")
+        self.assertEqual(sorted(r["status"] for r in rows),
+                         ["done", "done", "done", "done"])
 
     def test_a_record_that_is_not_an_object_is_refused(self):
         # json.load happily returns a list; without the isinstance guard the
