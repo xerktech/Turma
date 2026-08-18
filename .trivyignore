@@ -137,3 +137,32 @@ CVE-2026-69249 exp:2026-10-25
 # already choose. The expiry forces the revisit: bump TERRAFORM_VERSION once
 # HashiCorp ships a stable release built against x/net 0.56+.
 CVE-2026-46600 exp:2026-10-25
+
+# CVE-2026-33818 / -39821 / -56853 / -56858 / -56859 / -56860 / -56862 — the
+# Go 1.25.13 / 1.26.6 stdlib batch (encoding/asn1 recursion DoS, x/net/idna
+# Punycode privilege escalation, unencrypted-HTTP/2 DoS, html/template XSS,
+# encoding/xml recursion DoS, net/url quadratic path parsing, crypto/tls
+# KeyUpdate DoS). Trivy began reporting them on 2026-08-18, and they fail the
+# gate on FOUR bundled third-party Go binaries at once — docker CLI 29.6.2,
+# gh 2.96.0, glab 1.111.0 and terraform 1.15.8 — where the stdlib is compiled
+# in and not independently patchable.
+#
+# Checked 2026-08-18, and the pins genuinely have nothing to bump to:
+#   * terraform 1.15.8 IS the newest stable (everything later is 1.16.0-rc).
+#   * gh 2.97.0 and glab 1.113.0 exist, but BOTH are built with go1.26.5 —
+#     verified by inspecting the released linux_amd64 binaries — and the fix
+#     lands in 1.26.6, so bumping either changes nothing. This is the one thing
+#     worth re-checking first on revisit: the version being newer is not the
+#     question, the toolchain it was built with is.
+# Not first-party code. Each is a CLI a session runs by hand, against input the
+# operator already chose to fetch, so the blast radius is that one invocation;
+# the html/template XSS needs a Go web server, which none of these four runs.
+# The expiry forces the revisit: bump the pins once upstream ships Go-1.25.13 /
+# 1.26.6+ rebuilds.
+CVE-2026-33818 exp:2026-10-25
+CVE-2026-39821 exp:2026-10-25
+CVE-2026-56853 exp:2026-10-25
+CVE-2026-56858 exp:2026-10-25
+CVE-2026-56859 exp:2026-10-25
+CVE-2026-56860 exp:2026-10-25
+CVE-2026-56862 exp:2026-10-25
