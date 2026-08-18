@@ -203,10 +203,24 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
       measured 4.85 GiB written past a 4 MiB ceiling in one window. Growth is therefore exact
       (overshoot ≤ one chunk) and only DELETION is stale, which is why `TOTAL_CACHE_MS` can be
       minutes: waiting one window to notice an operator freeing space costs nothing.
+    - It counts **every file under `ARCHIVE_DIR`, not just the `.jsonl`**: `index.db` defaults to
+      living there and holds a second full copy of every entry's text (`entries_fts` is FTS5 with
+      no `content=`), plus a WAL and a `.meta` each — measured at 2.4× the `.jsonl` total. A
+      ceiling protecting this volume has to count what is on it.
+    - **A walk that THROWS is not a measurement of zero** — only ENOENT on `ARCHIVE_DIR` is (that
+      is the store genuinely absent, and what lets a removed directory be recreated instead of
+      latching full). Anything else — EMFILE from fd exhaustion, EACCES, EIO — keeps the last
+      baseline, because recording the failure re-baselines to nothing AND zeroes the charge, so
+      each blip hands out a whole fresh ceiling: measured amplifying to 6.2× over five blips,
+      silently, with the store reading full throughout.
+    - Once it reads full it re-measures on `FULL_RECHECK_MS` instead — precision is worth most
+      exactly then, ingest is refusing anyway so a walk costs no throughput, and this is what
+      bounds how long an operator waits after freeing space.
     - It is **synchronous on the heartbeat path** and the hub is one event loop, so the walk's cost
-      is a hub-wide stall: 14 ms at the reference ~1,300 files, ~7 µs/file warm, ~18× cold. Fine at
-      today's scale; if the store ever reaches tens of thousands of files, make it async or walk
-      only when near the ceiling rather than shortening the window.
+      is a hub-wide stall: 14 ms at the reference ~1,300 files, ~7 µs/file warm, ~18× cold. Keep it
+      synchronous — that is *why* the charge cannot be interleaved with a walk. If the store ever
+      reaches tens of thousands of files, walk only when near the ceiling rather than making it
+      async or shortening the window.
     - **Do not "improve" this into an indexed column that reconciles against disk.** That means
       inferring "deleted" from a failed stat, which is not knowable: an unmounted volume, a renamed
       parent and a real delete all report ENOENT, while EACCES/EIO/ESTALE report neither. Guessing

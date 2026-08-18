@@ -253,20 +253,109 @@ function writeSidecar(metaPath, obj) {
 let totalCache = { at: 0, bytes: 0 };
 let writtenSinceWalk = 0;
 const TOTAL_CACHE_MS = 5 * 60 * 1000;
-function totalArchiveBytes(now) {
-  now = now || Date.now();
-  if (now - totalCache.at < TOTAL_CACHE_MS) return totalCache.bytes + writtenSinceWalk;
-  const files = [];
-  walkJsonl(ARCHIVE_DIR, files);
+// While the store reads FULL, re-measure far more often. Precision is worth
+// most exactly then — ingest is refusing anyway, so a walk costs no throughput,
+// and this is what bounds how long an operator waits after freeing space.
+const FULL_RECHECK_MS = 30 * 1000;
+
+// Every byte under ARCHIVE_DIR, not just the .jsonl. `index.db` lives in this
+// directory and holds a full second copy of every entry's text (entries_fts is
+// FTS5 without `content=`), plus a WAL, plus a .meta per transcript — measured
+// at 2.4x the .jsonl total on realistic prose. A ceiling whose stated job is
+// keeping this volume writable for the hub's state.json has to count what is
+// actually on the volume, or an operator sizing it against free space still
+// fills the disk.
+function walkAllBytes(dir, seen) {
+  let names;
+  try {
+    names = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    // Distinguish "nothing here" from "couldn't look". ENOENT on ARCHIVE_DIR is
+    // the store being genuinely absent — 0 is the right answer and is what lets
+    // a removed directory be recreated instead of latching full forever.
+    // Anything else (EMFILE from fd exhaustion, EACCES, EIO) is a FAILED
+    // measurement, and must not be recorded as one: see the caller.
+    if (e.code === "ENOENT") return 0;
+    throw e;
+  }
   let bytes = 0;
-  for (const f of files) {
-    // One unreadable file must not abandon the measurement and hand back a
-    // total far under the truth — skip it and keep counting.
-    try { bytes += fs.statSync(f).size; } catch { /* raced with a delete */ }
+  for (const d of names) {
+    // d.name is a single readdirSync entry (never contains a separator), so
+    // this stays inside `dir` — a recursive walk of our own ARCHIVE_DIR.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    const full = path.join(dir, d.name);
+    if (d.isDirectory()) {
+      bytes += walkAllBytes(full, seen);
+    } else if (d.isFile()) {
+      // One unreadable file must not abandon the measurement and hand back a
+      // total far under the truth — skip it and keep counting.
+      try { bytes += fs.statSync(full).size; } catch { /* raced with a delete */ }
+    }
+  }
+  return bytes;
+}
+
+// Bytes the whole store holds, measured by WALKING THE FILES — never summed
+// from the index.
+//
+// The ceiling this feeds exists to stop the archive filling the volume the
+// hub's own state.json lives on, so the honest input is what is actually on
+// that volume. An indexed total has to be kept in step with the disk, and every
+// way of doing that means inferring "the operator deleted this" from a failed
+// stat — which is not reliably knowable: an unmounted volume, a renamed parent
+// and a real deletion all report ENOENT, while EACCES/EIO/ESTALE report neither.
+// Guessing wrong in one direction wedges the ceiling shut; in the other it
+// drops a live transcript's row, and since ingest APPENDS, the re-push writes a
+// SECOND copy of the conversation into a file that was there all along. Walking
+// the files needs no such guess: deleting archives frees bytes because the
+// bytes are gone, and nothing has to notice.
+//
+// The walk is CACHED, because it runs on the heartbeat path and is synchronous:
+// 14 ms over the reference host's ~1,300 files (~7 us/file warm on that pool),
+// and the whole hub is one event loop, so every beat and SSE tail waits on it.
+// Keep it synchronous — that is WHY the charge below cannot be interleaved with
+// a walk; making it async buys 14 ms per window and opens that race.
+//
+// ...but a cached total alone is NOT the ceiling's input, because a frozen
+// number means ingest is unmetered between refreshes: measured 4.85 GiB written
+// past a 4 MiB ceiling in one cache window, the exact outcome the ceiling
+// exists to prevent. So the walk is only the BASELINE, and every byte appended
+// since it is added on top (`writtenSinceWalk`). That keeps the two properties
+// that matter at once — overshoot is bounded by ONE chunk, as it would be with
+// an exactly-maintained counter, and a deletion still frees its bytes at the
+// next walk without anyone having to detect a deletion.
+//
+// Growth is therefore exact and only DELETION is stale, which is why the window
+// can be minutes rather than seconds: a deletion is an operator freeing space,
+// and waiting one window to see it costs nothing.
+function totalArchiveBytes(now, maxAgeMs) {
+  now = now || Date.now();
+  const age = maxAgeMs === undefined ? TOTAL_CACHE_MS : maxAgeMs;
+  if (now - totalCache.at < age) return totalCache.bytes + writtenSinceWalk;
+  let bytes;
+  try {
+    bytes = walkAllBytes(ARCHIVE_DIR);
+  } catch (e) {
+    // A measurement we FAILED to take is not a measurement of zero. Recording
+    // it would re-baseline to nothing and zero the charge, so each such blip
+    // would hand out a whole fresh ceiling — measured amplifying to 6.2x the
+    // ceiling over five blips, silently, with the store reading full throughout.
+    // Keep the last real baseline and let the charge keep accruing on top.
+    console.error(`archive: could not measure ${ARCHIVE_DIR} (${e.code || e.message}); ` +
+      `keeping the previous total of ${totalCache.bytes} bytes`);
+    return totalCache.bytes + writtenSinceWalk;
   }
   totalCache = { at: now, bytes };
   writtenSinceWalk = 0;
   return bytes;
+}
+
+// The ceiling's own read of the total: once it says full, re-measure on the
+// short cadence so freeing space is noticed in seconds rather than minutes.
+function totalForCeiling(now) {
+  const total = totalArchiveBytes(now);
+  if (!ARCHIVE_TOTAL_MAX || total < ARCHIVE_TOTAL_MAX) return total;
+  return totalArchiveBytes(now, FULL_RECHECK_MS);
 }
 
 // Test seam: drop the cache so a test observes a recovery without waiting out
@@ -333,7 +422,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   // error status — the agent must read this as "no progress" and move on, never
   // as a chunk to retry (XERK-267). Deleting archives is what reopens it, and
   // needs nothing from us: the total is measured off the files themselves.
-  const total = totalArchiveBytes();
+  const total = totalForCeiling();
   if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) {
     warnArchiveFull(total);
     return { bytesStored: have, full: true };
@@ -494,7 +583,7 @@ function archiveLimits(ids) {
     ).all(ARCHIVE_TRANSCRIPT_MAX).map((r) => r.transcriptId));
     for (const id of list) if (over.has(id)) shed.push(id);
   }
-  return { shed, full: !!(ARCHIVE_TOTAL_MAX && totalArchiveBytes() >= ARCHIVE_TOTAL_MAX) };
+  return { shed, full: !!(ARCHIVE_TOTAL_MAX && totalForCeiling() >= ARCHIVE_TOTAL_MAX) };
 }
 
 // ---- query ------------------------------------------------------------------
@@ -665,6 +754,6 @@ module.exports = {
   slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits,
-  totalArchiveBytes, __resetTotalCache,
+  totalArchiveBytes, totalForCeiling, __resetTotalCache,
   searchArchive, listArchive, getTranscript,
 };

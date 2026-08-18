@@ -18,7 +18,11 @@ const { DatabaseSync } = require("node:sqlite");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "turma-archive-budget-"));
 process.env.ARCHIVE_DIR = path.join(TMP, "archive");
-process.env.ARCHIVE_DB = path.join(TMP, "archive", "index.db");
+// Deliberately OUTSIDE ARCHIVE_DIR: the walk counts every file under it, and an
+// empty index.db is already ~185 KB, which would swamp the small ceilings these
+// tests use. That it IS counted in the production layout (ARCHIVE_DB defaults
+// inside ARCHIVE_DIR) is what the "counts every file" test below asserts.
+process.env.ARCHIVE_DB = path.join(TMP, "index.db");
 // Tiny stand-ins for the 16 MiB / 64 GiB defaults. The store ceiling is set
 // above what the budget tests below write, so it engages only in the last test.
 process.env.ARCHIVE_TRANSCRIPT_MAX_BYTES = "4096";
@@ -172,17 +176,23 @@ test("an unreachable store reads as empty, never as full — a wedge has no exit
   // archiving, and no amount of deleting reopens it. Measuring the files means
   // "can't see it" reads as 0 bytes, so ingest recreates the directory and
   // carries on.
+  // Establish a REAL non-zero baseline first — otherwise "kept the previous
+  // total" and "measured zero" are the same number and the test proves nothing.
+  archive.__resetTotalCache();
+  const baseline = archive.totalArchiveBytes();
+  assert.ok(baseline > 0);
+
   const moved = process.env.ARCHIVE_DIR + ".away";
   fs.renameSync(process.env.ARCHIVE_DIR, moved);
   let whileGone;
   try {
-    archive.__resetTotalCache();
-    whileGone = archive.totalArchiveBytes();
+    archive.__resetTotalCache(baseline);          // as if a walk had just seen it
+    whileGone = archive.totalArchiveBytes(Date.now() + 6 * 60_000);
   } finally {
     fs.renameSync(moved, process.env.ARCHIVE_DIR);
     archive.__resetTotalCache();
   }
-  assert.equal(whileGone, 0);
+  assert.equal(whileGone, 0, "a removed store must read as empty, not as its last total");
 });
 
 test("a deleted archive does not disturb the cursor or the stored file", () => {
@@ -312,6 +322,156 @@ test("bytes written inside the cache window still count against the ceiling", ()
   archive.__resetTotalCache();
 });
 
+test("ONE transcript pushed as many deltas is metered too", () => {
+  // The production shape, and the one the other ceiling tests miss: a long
+  // session arrives as many deltas against the SAME transcriptId. A charge that
+  // only fires for a first-sight transcript passes every per-chunk test in this
+  // file and still writes tens of MB past the ceiling.
+  archive.__resetTotalCache();
+  const t0 = Date.now();
+  const max = Number(process.env.ARCHIVE_TOTAL_MAX_BYTES);
+  let off = 0, n = 0, refused = null;
+  while (n < 200) {
+    const r = archive.ingestChunk("nas", "onestream", { ...META, summary: "One Stream" },
+      off, off + 100,
+      [{ uuid: `os${n}`, role: "user", ts: "2026-07-10T00:09:00Z", text: "s".repeat(2000) }]);
+    if (r.full) { refused = r; break; }
+    off += 100;
+    n++;
+    // Never let the cache expire — the charge alone must stop this.
+    assert.ok(archive.totalArchiveBytes(t0 + 1000) < max + 8192,
+      `ran ${archive.totalArchiveBytes(t0 + 1000) - max} bytes past the ceiling on delta ${n}`);
+  }
+  assert.ok(refused, "a single-transcript stream was never refused");
+
+  for (const f of fs.readdirSync(path.join(process.env.ARCHIVE_DIR, "turma"))) {
+    if (f.includes("one-stream")) fs.rmSync(path.join(process.env.ARCHIVE_DIR, "turma", f));
+  }
+  archive.__resetTotalCache();
+});
+
+test("the charge equals the bytes actually written, for every entry shape", () => {
+  // Pins the accounting itself rather than its consequences: charging UTF-16
+  // units, charging twice, charging the cumulative total, or charging before the
+  // append instead of after all survive a coarser assertion, and each is a
+  // production-visible error (a CJK session reached 3x the ceiling).
+  const t0 = Date.now();
+  const cases = [
+    ["ascii", "plain prose"],
+    ["cjk", "中文".repeat(200)],
+    ["emoji", "😀".repeat(150)],
+    ["mixed", "a中😀".repeat(100)],
+    ["big", "x".repeat(5000)],
+  ];
+  let off = 0;
+  for (const [name, text] of cases) {
+    archive.__resetTotalCache();
+    const before = archive.totalArchiveBytes(t0);
+    // .jsonl only: the charge covers the APPEND. The .meta sidecar beside it is
+    // rewritten in place rather than grown, so its contribution is bounded by
+    // the transcript count and is absorbed by the next walk.
+    const rel = path.join(process.env.ARCHIVE_DIR, "turma");
+    const sizeOf = () => fs.readdirSync(rel).reduce(
+      (n, f) => n + (f.endsWith(".jsonl") ? fs.statSync(path.join(rel, f)).size : 0), 0);
+    const diskBefore = sizeOf();
+    archive.ingestChunk("nas", "charge", { ...META, summary: "Charge" }, off, off + 100,
+      [{ uuid: `c${name}${off}`, role: "user", ts: "2026-07-10T00:10:00Z", text }]);
+    off += 100;
+    // Read through the CACHE (no walk), so this is the charge talking.
+    const charged = archive.totalArchiveBytes(t0 + 1000) - before;
+    assert.equal(charged, sizeOf() - diskBefore, `${name}: charged != written`);
+  }
+  archive.__resetTotalCache();
+});
+
+test("an append that throws charges nothing", () => {
+  // The charge has to sit AFTER the write. Before it, a failed append still
+  // spends ceiling on bytes that never reached the disk.
+  archive.__resetTotalCache();
+  const t0 = Date.now();
+  const before = archive.totalArchiveBytes(t0);
+  // Make the target path a directory so appendFileSync throws EISDIR.
+  const rel = "turma/2026-07-10__eisdir__nas__eisdir.jsonl";
+  fs.mkdirSync(path.join(process.env.ARCHIVE_DIR, rel), { recursive: true });
+  try {
+    assert.throws(() => archive.ingestChunk("nas", "eisdir", { ...META, summary: "Eisdir" },
+      0, 60, [{ uuid: "ed1", role: "user", ts: "2026-07-10T00:12:00Z", text: "y".repeat(400) }]));
+  } finally {
+    fs.rmSync(path.join(process.env.ARCHIVE_DIR, rel), { recursive: true, force: true });
+  }
+  assert.equal(archive.totalArchiveBytes(t0 + 1000), before, "charged for a write that failed");
+  archive.__resetTotalCache();
+});
+
+test("a full store re-measures on the SHORT cadence, so freeing space is noticed in seconds", () => {
+  // Recovery latency is what this buys. Without it an operator who has just
+  // deleted archives waits out the whole 5-minute window with nothing saying
+  // why, and TOTAL_CACHE_MS cannot be shortened without paying the walk on
+  // every beat of every host.
+  const max = Number(process.env.ARCHIVE_TOTAL_MAX_BYTES);
+  const t0 = Date.now();
+  archive.__resetTotalCache(max + 1000);            // as if the last walk found it full
+  assert.ok(archive.totalForCeiling(t0) >= max, "should read full");
+  // 40s later: past FULL_RECHECK_MS, far short of TOTAL_CACHE_MS. The real
+  // store is under the ceiling, so a re-measure must see that.
+  const seen = archive.totalForCeiling(t0 + 40_000);
+  assert.ok(seen < max, `still ${seen} after a re-check window`);
+  // ...while a store that is NOT full is left on the long cadence.
+  archive.__resetTotalCache(1);
+  assert.equal(archive.totalForCeiling(t0 + 40_000), 1, "re-walked a store that wasn't full");
+  archive.__resetTotalCache();
+});
+
+test("a walk that FAILS keeps the last baseline, so blips can't hand out fresh ceilings", (t) => {
+  // fs errors that are not ENOENT mean "couldn't look", not "nothing there".
+  // Recording one as a measurement re-baselines to zero and zeroes the charge,
+  // so every blip grants another whole ceiling — measured amplifying to 6.2x
+  // over five blips, silently, with the store reading full throughout.
+  archive.__resetTotalCache();
+  const t0 = Date.now();
+  const real = archive.totalArchiveBytes(t0);
+  assert.ok(real > 0);
+
+  const realReaddir = fs.readdirSync;
+  t.mock.method(fs, "readdirSync", (p, ...rest) => {
+    if (String(p) === process.env.ARCHIVE_DIR) {
+      const e = new Error("EMFILE: too many open files");
+      e.code = "EMFILE";
+      throw e;
+    }
+    return realReaddir(p, ...rest);
+  });
+  // Force a walk; it fails, and must hand back the previous baseline.
+  const duringBlip = archive.totalArchiveBytes(t0 + 6 * 60_000);
+  assert.equal(duringBlip, real, "a failed walk was recorded as a measurement");
+  // ...and a write during the blip still accrues on top of it, rather than
+  // starting again from zero.
+  archive.ingestChunk("nas", "blip", { ...META, summary: "Blip" }, 0, 60,
+    [{ uuid: "bl1", role: "user", ts: "2026-07-10T00:11:00Z", text: "z".repeat(400) }]);
+  assert.ok(archive.totalArchiveBytes(t0 + 6 * 60_000) > real,
+    "the blip reset the charge");
+  t.mock.restoreAll();
+  archive.__resetTotalCache();
+});
+
+test("the total counts EVERY file on the volume, not only the .jsonl", () => {
+  // index.db lives inside ARCHIVE_DIR in the production layout and holds a full
+  // second copy of every entry's text (entries_fts is FTS5 without content=),
+  // plus a WAL and a .meta per transcript — 2.4x the .jsonl total on realistic
+  // prose. A ceiling whose job is keeping THIS volume writable has to count it.
+  archive.__resetTotalCache();
+  const before = archive.totalArchiveBytes();
+  const stray = path.join(process.env.ARCHIVE_DIR, "index.db");
+  fs.writeFileSync(stray, Buffer.alloc(7777));
+  try {
+    archive.__resetTotalCache();
+    assert.equal(archive.totalArchiveBytes(), before + 7777);
+  } finally {
+    fs.rmSync(stray);
+    archive.__resetTotalCache();
+  }
+});
+
 test("one unreadable file does not abandon the whole measurement", (t) => {
   // A file deleted between readdir and stat is an ordinary race. Letting it
   // throw abandons the walk, and the caller then treats a partial (or zero)
@@ -361,7 +521,7 @@ test("a walk re-baselines: bytes counted once, not twice", () => {
     for (const d of fs.readdirSync(stack.pop(), { withFileTypes: true })) {
       const full = path.join(d.parentPath || d.path, d.name);
       if (d.isDirectory()) stack.push(full);
-      else if (d.isFile() && d.name.endsWith(".jsonl")) real += fs.statSync(full).size;
+      else if (d.isFile()) real += fs.statSync(full).size;   // every file, not just .jsonl
     }
   }
   assert.equal(walked, real, "the walk double-counted the window's writes");

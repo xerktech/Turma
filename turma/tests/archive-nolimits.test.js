@@ -18,7 +18,11 @@ const assert = require("node:assert/strict");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "turma-archive-nolimit-"));
 process.env.ARCHIVE_DIR = path.join(TMP, "archive");
-process.env.ARCHIVE_DB = path.join(TMP, "archive", "index.db");
+// Deliberately OUTSIDE ARCHIVE_DIR: the walk counts every file under it, and an
+// empty index.db is already ~185 KB, which would swamp the small ceilings these
+// ceilings use — and here it would make the "more than 100 KB stored" check
+// below pass on an empty store.
+process.env.ARCHIVE_DB = path.join(TMP, "index.db");
 process.env.ARCHIVE_TRANSCRIPT_MAX_BYTES = "0";
 process.env.ARCHIVE_TOTAL_MAX_BYTES = "0";
 
