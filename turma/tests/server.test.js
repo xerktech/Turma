@@ -5909,6 +5909,17 @@ test("XERK-325: spawnRefusals is coerced, since Android types it", async () => {
   assert.equal(Object.getPrototypeOf(proto.spawnRefusals), Object.prototype,
     "same shape as the ingest path builds, not a null-prototype special case");
   assert.equal(typeof ({}).error, "undefined", "Object.prototype is untouched");
+  // The COUNT is bounded here too, not just at the ingest. The restore is the
+  // one path this coercion exists for, and a map it serves is served on every
+  // /api/agents until that host next beats — a host that never beats again
+  // serves it forever. Oldest go first, like the ingest's own eviction.
+  const flood = { device: "old", spawnRefusals: {} };
+  for (let i = 0; i < 3000; i++) flood.spawnRefusals["c" + i] = { error: "x", at: i };
+  hub.normalizeRecord(flood);
+  const kept = Object.keys(flood.spawnRefusals);
+  assert.equal(kept.length, 40);
+  assert.equal(kept.includes("c2999"), true, "the newest survive");
+  assert.equal(kept.includes("c0"), false, "the oldest are evicted");
   // The reason is length-capped here as well as at the ingest.
   const long = { device: "old", spawnRefusals: { c: { error: "x".repeat(5000), at: 1 } } };
   hub.normalizeRecord(long);

@@ -18,7 +18,7 @@ const {
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
-  queuedTicketOf,
+  queuedTicketOf, queuedTip,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
 } = require("../public/board.js");
@@ -69,6 +69,64 @@ test("mergeSites: freshest block wins for the same site+user (never unioned)", (
   assert.deepEqual(sites[0].tickets.map((t) => t.key), ["T-2"]);
   assert.deepEqual(sites[0].hosts, ["hostA", "hostB"]);
   assert.equal(sites[0].lastFetched, "2026-07-14T12:00:00Z");
+});
+
+test("XERK-325: mergeSites ranks an ONLINE host's block above any offline one", () => {
+  // The card and the hub have to resolve a ticket the same way. `ticketRepo`
+  // prefers an online host and routing can only reach one, so an offline host
+  // winning on freshness put a repo on the chip that Start would never spawn
+  // against — the card said one repo, the session came up on another.
+  const sites = mergeSites([
+    agent("hostDown", block({
+      fetchedAt: "2026-07-14T12:30:00Z",                      // freshest
+      tickets: [ticket("T-1", { repoGuess: { repo: "Veiller", cloned: true } })],
+    }), { online: false }),
+    agent("hostUp", block({
+      fetchedAt: "2026-07-14T12:00:00Z",                      // staler
+      tickets: [ticket("T-1", { repoGuess: { repo: "Turma", cloned: true } })],
+    })),
+  ]);
+  assert.equal(sites[0].tickets.length, 1);
+  assert.equal(sites[0].tickets[0].repoGuess.repo, "Turma",
+    "the online host's answer is the one shown, because it is the one routed on");
+});
+
+test("XERK-325: with both hosts online, freshness still decides", () => {
+  // Online is a TIER, not a replacement for the freshness rule inside it.
+  const sites = mergeSites([
+    agent("hostOld", block({
+      user: "a@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Veiller", cloned: true } })],
+    })),
+    agent("hostNew", block({
+      user: "a@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Turma", cloned: true } })],
+    })),
+  ]);
+  assert.equal(sites[0].tickets[0].repoGuess.repo, "Turma");
+});
+
+test("XERK-325: an all-offline org still shows its tickets", () => {
+  // Online is a preference, not a filter — otherwise a board whose hosts are
+  // all down goes blank rather than showing what was last known.
+  const sites = mergeSites([
+    agent("hostDown", block({ tickets: [ticket("T-1")] }), { online: false }),
+  ]);
+  assert.equal(sites.length, 1);
+  assert.deepEqual(sites[0].tickets.map((t) => t.key), ["T-1"]);
+});
+
+test("XERK-325: the capacity tip does not promise the whole org", () => {
+  // Only a host that triaged this ticket to this repo can take it, so a free
+  // host that answered a different repo will never pick it up. Promising "one
+  // of the org's agents" sent the reader at capacity they don't have a problem
+  // with.
+  const tip = queuedTip({ reason: "capacity", position: 1 }, "ENG-5");
+  assert.doesNotMatch(tip, /one of the org's agents/);
+  assert.match(tip, /an agent that can run it/);
+  // The blocked and expired wordings still lead with the hub's own reason.
+  assert.match(queuedTip({ reason: "blocked", error: "no online host has triaged it" }, "ENG-5"),
+    /no online host has triaged it/);
 });
 
 test("mergeSites: different users on one site union, deduped by issue key", () => {

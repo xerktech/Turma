@@ -305,14 +305,27 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
         }
         val k = j.siteKey + "\u0000" + j.user
         val prev = byUser[k]
-        if (prev == null || j.fetchedAt > prev.j.fetchedAt) byUser[k] = Block(j, a.online)
+        // An ONLINE host's block outranks any offline one, freshness deciding
+        // only within a tier — the same rule `ticketRepo` applies hub-side
+        // (XERK-325). The hub routes only to an online host that agrees with the
+        // repo it resolved, so an offline host winning on freshness put a repo on
+        // the chip that Start would never spawn against.
+        if (prev == null || (a.online && !prev.online) ||
+            (a.online == prev.online && j.fetchedAt > prev.j.fetchedAt)) {
+            byUser[k] = Block(j, a.online)
+        }
     }
-    // Step 2: union users within a site, dedupe tickets by key (freshest first).
+    // Step 2: union users within a site, dedupe tickets by key (online, then
+    // freshest, first — mirroring board.js).
     val bySite = LinkedHashMap<String, MutableList<Block>>()
     for (b in byUser.values) bySite.getOrPut(b.j.siteKey) { mutableListOf() }.add(b)
     val out = ArrayList<BoardSite>()
     for ((site, blocks) in bySite) {
-        val sorted = blocks.sortedByDescending { it.j.fetchedAt }
+        // Ticket dedupe below is by the ticket's own `updated`, which two hosts
+        // polling one tracker report IDENTICALLY — so ties are the norm and this
+        // order is what really decides a card's fields.
+        val sorted = blocks.sortedWith(
+            compareByDescending<Block> { it.online }.thenByDescending { it.j.fetchedAt })
         // Dedupe by the ticket's OWN `updated`, not by which block was fetched
         // more recently (board.js mergeSites). Two users polling one site can
         // each carry a different copy, and the freshest BLOCK is not

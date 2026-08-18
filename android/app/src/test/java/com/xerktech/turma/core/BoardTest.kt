@@ -94,6 +94,39 @@ class BoardTest {
         assertEquals("2026-07-16T05:00:00Z", site.fetchedAt)
     }
 
+    @Test fun `XERK-325 - an ONLINE host's block outranks a fresher offline one`() {
+        // The card and the hub must resolve a ticket the same way: ticketRepo
+        // prefers an online host and routing reaches only one, so an offline host
+        // winning on freshness put a repo on the chip Start would never spawn
+        // against. Mirrors board.js mergeSites.
+        val down = agent("down", false, JiraBlock(siteKey = "org", user = "u1",
+            fetchedAt = "2026-07-16T05:00:00Z",
+            tickets = listOf(JiraTicket(key = "T-1", statusCategory = "todo",
+                repoGuess = com.xerktech.turma.model.RepoGuess(repo = "Veiller", cloned = true)))))
+        val up = agent("up", true, JiraBlock(siteKey = "org", user = "u1",
+            fetchedAt = "2026-07-16T01:00:00Z",
+            tickets = listOf(JiraTicket(key = "T-1", statusCategory = "todo",
+                repoGuess = com.xerktech.turma.model.RepoGuess(repo = "Turma", cloned = true)))))
+        val t = mergeSites(listOf(down, up)).single().tickets.single()
+        assertEquals("Turma", t.repoGuess?.repo)
+    }
+
+    @Test fun `XERK-325 - online is a tier, so freshness still decides between two live hosts`() {
+        val older = agent("h1", true, JiraBlock(siteKey = "org", user = "u1",
+            fetchedAt = "2026-07-16T01:00:00Z", tickets = listOf(ticket("OLD"))))
+        val newer = agent("h2", true, JiraBlock(siteKey = "org", user = "u1",
+            fetchedAt = "2026-07-16T05:00:00Z", tickets = listOf(ticket("NEW"))))
+        assertEquals(listOf("NEW"), mergeSites(listOf(older, newer)).single().tickets.map { it.key })
+    }
+
+    @Test fun `XERK-325 - an all-offline org still shows its tickets`() {
+        // A preference, not a filter: a board whose hosts are all down shows
+        // what was last known rather than going blank.
+        val down = agent("down", false, JiraBlock(siteKey = "org", user = "u1",
+            fetchedAt = "2026-07-16T01:00:00Z", tickets = listOf(ticket("T-1"))))
+        assertEquals(listOf("T-1"), mergeSites(listOf(down)).single().tickets.map { it.key })
+    }
+
     // ---- XERK-235: divergences from board.js found by a QA parity audit ----
 
     @Test fun `ticket dedupe keeps the freshest UPDATED, not the freshest block`() {

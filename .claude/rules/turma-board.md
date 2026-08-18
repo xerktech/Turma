@@ -155,13 +155,21 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     host that answered a different repo would spawn against THAT one, giving the operator a session
     on a repo the card never showed. Candidate sets differ per host (cloned repos + that host's `gh`
     reach), so hosts legitimately disagree.
-  - **`ticketRepo` ranks an ONLINE host's answer above any offline one**, freshness deciding only
-    within a tier. It and `findTicketHost` must resolve against the SAME pool: every caller is a
-    routing decision and routing reaches only online hosts, so an offline host winning on freshness
-    names a repo nothing can be dispatched against and stalls a ticket an online host had triaged
-    and could run. Hosts poll the tracker independently (~10 min apart here), so an offline host
-    holding the newest block is ordinary. The offline tier stays as the fallback, or a wholly-offline
-    org resolves no repo at all and the sweep drops the ticket instead of holding it.
+  - **ONLINE-first is a FOUR-MIRROR rule**: `ticketRepo` (hub), `mergeSites` in `board.js` and its
+    two vendored copies, and `mergeSites` in android's `core/Board.kt`. All of them rank an online
+    host's block above any offline one, freshness deciding only within a tier. The hub and the card
+    must resolve a ticket the same way — routing reaches only an online host that AGREES with the
+    repo, so an offline host winning on freshness either stalls a ticket an online host could run
+    (hub side) or puts a repo on the chip that Start will never spawn against (card side), which is
+    the "a session on a repo the card never showed" hazard from the other direction. Hosts poll the
+    tracker independently (~10 min apart here), so an offline host holding the newest block is
+    ordinary. The offline tier stays as the fallback, or a wholly-offline org resolves no repo at
+    all — the board goes blank and the sweep drops the ticket instead of holding it.
+    - Ticket dedupe is by the ticket's own `updated`, which two hosts polling one tracker report
+      IDENTICALLY, so **ties are the norm and the block order is what really decides a card's
+      fields**. That is why the merge order, not the dedupe, carries this rule.
+    - The queue tip mirrors it: a capacity hold says an agent **that can run it**, never "one of the
+      org's agents" — a free host that answered a different repo will never take the ticket.
   - **It is a `blocked` hold, never `full`.** A freed slot does not give a host a triage decision,
     so reporting it as capacity promises a wait that clears itself; the blocked timer bounds it and
     the reason says what is actually wrong.

@@ -173,14 +173,29 @@
       }
       const key = site + "\x00" + (j.user || "");
       const prev = byUser.get(key);
-      if (!prev || String(j.fetchedAt || "") > String(prev.block.fetchedAt || "")) {
-        byUser.set(key, { block: j, agent: a });
+      // An ONLINE host's block outranks any offline one, freshness deciding only
+      // within a tier — the same rule `ticketRepo` applies hub-side, and it has
+      // to be the same or the card and the hub disagree (XERK-325). The hub can
+      // only route a ticket to an online host that agrees with the repo it
+      // resolved, so an offline host winning on freshness put a repo on the chip
+      // that Start would never spawn against, with nothing on screen to say so.
+      // Hosts poll the tracker independently, so an offline host holding the
+      // newest block is ordinary rather than an edge case.
+      const online = !!(a && a.online);
+      if (!prev || (online && !prev.online) ||
+          (online === prev.online &&
+           String(j.fetchedAt || "") > String(prev.block.fetchedAt || ""))) {
+        byUser.set(key, { block: j, agent: a, online });
       }
     }
 
     const bySite = new Map(); // siteKey -> merged entry
-    // Fresher blocks first so a collision keeps the fresher copy by default.
+    // Online blocks first, then fresher ones, so a collision keeps the copy the
+    // hub would actually act on. Ticket dedupe below is by the ticket's own
+    // `updated`, which two hosts polling one tracker report IDENTICALLY — so
+    // ties are the norm and this order is what really decides a card's fields.
     const winners = [...byUser.values()].sort((x, y) =>
+      (y.online ? 1 : 0) - (x.online ? 1 : 0) ||
       String(y.block.fetchedAt || "").localeCompare(String(x.block.fetchedAt || "")));
     for (const { block } of winners) {
       const site = block.siteKey;
@@ -585,8 +600,12 @@
     if (q.reason === "blocked") {
       return `${issueKey} is waiting: ${q.error || "the hub can't route it right now"}`;
     }
-    return `${issueKey} is waiting for a free session slot on one of the org's `
-      + `agents — whichever frees up first takes it`
+    // "the org's agents" was true before XERK-325 and is not now: only a host
+    // that has triaged this ticket to this repo can take it, so a free host that
+    // answered a different repo will never pick it up. Promising the whole org
+    // sent the reader looking at capacity they don't have a problem with.
+    return `${issueKey} is waiting for a free session slot on an agent that can `
+      + `run it — whichever of those frees up first takes it`
       + (q.position > 1 ? ` (#${q.position} in line)` : "");
   }
 

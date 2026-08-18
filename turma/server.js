@@ -896,8 +896,8 @@ try {
   // `dropUnusableHostKeys` and `isPlainHostKey` are FUNCTION declarations far
   // below this line and are reached only because those hoist. Do not convert
   // either to a `const`: the TDZ ReferenceError would land in this block's
-  // catch, which swallows everything, and the hub would boot with no agents
-  // and no error printed anywhere.
+  // catch, which swallows everything, and the hub would boot with no agents —
+  // its one `state restore skipped:` line the only sign anything went wrong.
   for (const key of dropUnusableHostKeys(agents)) {
     console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(key)}`);
   }
@@ -2404,8 +2404,10 @@ function rememberCreateInFlight(fields, cmdId, host) {
 // The repo an org's board says a ticket belongs in, as triaged by whichever host
 // reported it (see the Jira -> repo triage section in hub-agent.py). null when no
 // host reports the ticket, or none has triaged it yet, or the model declined it.
-// The FRESHEST reporting block wins, matching how board.js merges the same
-// tickets for display — the hub must resolve against what the operator clicked.
+// ONLINE first, then the freshest reporting block — the SAME order board.js's
+// `mergeSites` applies, because the hub must resolve against what the operator
+// was actually shown. Move one and move the other (and the two vendored copies
+// and `Board.kt` with it), or the card names one repo and Start spawns another.
 //
 // **An ONLINE host's answer outranks any offline one, however stale** (XERK-325).
 // Every caller is a ROUTING decision, and `findTicketHost` can only route to an
@@ -2892,12 +2894,24 @@ function normalizeSpawnRefusals(a) {
     // normalizeSubscription's are: that const is declared far below the
     // state.json restore that calls this, so closing over it would be a TDZ
     // ReferenceError landing in the restore's own `catch {}` — booting the hub
-    // with an empty registry and no error printed anywhere. Keep the two in
-    // step by hand; they are both 500.
+    // with an empty registry, its one `state restore skipped:` line the only
+    // sign anything went wrong. Keep the two in step by hand; they are both 500.
     const error = typeof e.error === "string" && e.error
       ? e.error.slice(0, 500)
       : "the agent refused it";
     out[id] = { error, at: e.at };
+  }
+  // The ingest bounds this map two ways — an age sweep and SPAWN_FAILURE_MAX —
+  // and the restore has to apply the count bound too, or the one path this
+  // coercion exists for is the one that leaves it unbounded: a state.json map is
+  // served on every /api/agents until that host next beats, and a host that
+  // never beats again serves it forever. Oldest-first, like the ingest's own
+  // eviction. A literal for the TDZ reason above; it mirrors SPAWN_FAILURE_MAX.
+  const ids = Object.keys(out);
+  if (ids.length > 40) {
+    ids.sort((x, y) => out[x].at - out[y].at)
+      .slice(0, ids.length - 40)
+      .forEach((id) => delete out[id]);
   }
   a.spawnRefusals = out;
 }
