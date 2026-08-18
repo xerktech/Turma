@@ -11617,9 +11617,17 @@ class SessionManager:
                 try:
                     blob = self._pack_bytes(path, runs)
                 except OSError as e:
-                    # An unreadable file in the records tree (a leftover
+                    # An unreadable file in the RECORDS tree (a leftover
                     # root-owned one after a PUID change, say) must not refuse
-                    # the move either — drop the records, keep the session.
+                    # the move — drop the records, keep the session. A failure
+                    # anywhere ELSE is the session's own data and is re-raised
+                    # to refuse loudly: losing a conversation silently is worse
+                    # than a failed move, which is the opposite of the trade the
+                    # records get. Blaming the records for it would also have
+                    # cost a second full pack before the retry raised anyway.
+                    fn = str(getattr(e, "filename", "") or "")
+                    if fn and fn != runs and not fn.startswith(runs + os.sep):
+                        raise
                     log(f"migration: workflow records for {tid} unreadable "
                         f"({e}); not carrying them")
                 else:

@@ -4521,6 +4521,29 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
 
+    def test_an_unreadable_SUBAGENT_still_refuses_the_move_loudly(self):
+        # The opposite trade from the records: a subagent transcript is
+        # conversation data, and losing one silently is worse than a failed
+        # move. It must not be mistaken for a records failure and swallowed.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfsubperm")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        bad = os.path.join(path[:-len(".jsonl")], "subagents", "agent-x.jsonl")
+        os.chmod(bad, 0)
+        self.addCleanup(os.chmod, bad, 0o644)
+        if os.access(bad, os.R_OK):
+            self.skipTest("running as root — an unreadable file cannot be staged")
+        sm = self._manager()
+        with mock.patch.object(sm, "_pack_bytes",
+                               side_effect=sm._pack_bytes) as packed:
+            with self.assertRaises(OSError):
+                sm._pack_transcript(path)
+        self.assertEqual(packed.call_count, 1,
+                         "a failure outside the records must not buy a second pack")
+
     def test_dir_size_skips_what_it_cannot_read_rather_than_raising(self):
         # A walk/delete race, or a leftover root-owned file, must not raise out
         # of the measure — which would refuse the move it is meant to protect.

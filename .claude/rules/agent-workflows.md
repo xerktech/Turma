@@ -65,6 +65,11 @@ is the run RECORD, never a nested agent dir.
   session accumulates a record per run. The bundle is built WITH them and rebuilt WITHOUT them if
   the finished blob is over `MIGRATION_BLOB_MAX` or the tree could not be read — trading a working
   move for prettier labels is the wrong way round.
+  - **That drop is scoped to the records by the error's own filename.** An unreadable file under
+    `subagents/`, or an unreadable main transcript, is RE-RAISED so the move refuses loudly:
+    conversation data losing itself silently is worse than a failed move, which is the opposite of
+    the trade the records get. Swallowing it also bought a second full pack before the retry raised
+    anyway.
   - **Measuring the TREE against a constant does not achieve that**, and was the first attempt: the
     ceiling is on the whole bundle, so any records tree — however small, however legal — can push a
     near-ceiling transcript over it. Only the FINISHED size can answer. `WORKFLOW_PACK_MAX_BYTES`
