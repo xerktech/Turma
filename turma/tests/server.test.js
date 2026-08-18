@@ -6143,6 +6143,45 @@ test("XERK-325: `updated` is compared as a STRING, like both client mirrors", as
     "string order decides, not Date.parse — which would call these equal");
 });
 
+test("XERK-325: a copy with NO `updated` never overrides one that has it", async () => {
+  // The fourth divergence class, and the one the rules paragraph predicted.
+  // Dropping the `|| ""` fallback — the most plausible "that's redundant" edit —
+  // makes `String(null)`/`String(undefined)` sort ABOVE every ISO date, so a copy
+  // with no `updated` wins outright. It is a real shape, not a contrived one:
+  // `hub-agent.py` writes `fields.get("updated")` and `System.ChangedDate`
+  // straight through, both of which can be null, and the hub coerces neither.
+  resetAutoStart();
+  const site = "tq325v.atlassian.net";
+  // Fresher block, so it is seen FIRST: untriaged, and carrying no `updated`.
+  await asBeat("tq325vNull", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo", updated: null }] });
+  await asBeat("tq325vReal", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Withheld work: without the fallback this 409s while the card shows Turma.
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.repo, "Turma");
+
+  // And the wrong-repo half: both copies triaged, the null one in the fresher
+  // block. The copy that HAS an `updated` is still the row.
+  const site2 = "tq325w.atlassian.net";
+  await asBeat("tq325wNull", site2, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo", updated: null,
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  await asBeat("tq325wReal", site2, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r2 = await startTicket(site2, "ENG-5");
+  assert.equal(r2.body.repo, "Turma", "the copy carrying an `updated` is the row");
+});
+
 test("XERK-325: `fetchedAt` is compared with `>`, and the board agrees", async () => {
   // Nothing pinned the OPERATOR, so reverting either side to localeCompare
   // passed every test and silently re-opened the divergence. The two disagree on
@@ -6278,7 +6317,7 @@ test("XERK-325: only the shared resolvers may read a block's ticket list", () =>
   // arrow-`const`, an `async`/`export`/indented `function` (each of which used to
   // be invisible to the declaration scan and got its read blamed on the previous
   // declaration), a divergent walk added BESIDE a legitimate `fleetTicketRows()`
-  // call, and a re-rank smuggled into an allow-listed function.
+  // call.
   //
   // Still open, stated as the CLASS rather than a list of instances — the list
   // was enumerated twice and was incomplete both times, so it will age again:
@@ -6288,7 +6327,11 @@ test("XERK-325: only the shared resolvers may read a block's ticket list", () =>
   //     allow-listed declaration** so the attribution lands on that name.
   //     Measured examples: an object-literal method, a class method, an
   //     object-literal arrow property, a bare `x = function …` assignment, an
-  //     IIFE, and a getter. All are caught in any other position.
+  //     IIFE, and a getter. All are caught in any other position;
+  //   - a divergent re-rank written INSIDE an allow-listed function, where the
+  //     attribution is correct and simply permissive. Not a `DECL` miss, so no
+  //     amount of pattern work reaches it — measured, 12 behavioural tests catch
+  //     it and this one does not.
   //
   // So it is a tripwire for the honest edit, not a proof. **The guarantee lives
   // in the behavioural tests above** — the two-user, ghost, auto-stop,

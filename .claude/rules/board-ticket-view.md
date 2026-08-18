@@ -77,13 +77,17 @@ of one ticket, every divergence silent, and each one either withheld work or des
       test rather than riding on the others. `Date.parse` is the plausible "compare timestamps
       properly" edit and is wrong twice over: it calls `+0000` and `Z` equal, and on an absent
       `updated` it yields NaN, so every comparison goes false and the override stops firing.
-    - **The row and a block rank disagree in THREE ways, and each needs its own fixture.** They were
-      found one at a time, each after the previous was fixed, and every one of them passed the whole
-      suite until its test existed: a winning copy that is UNTRIAGED (invent no repo), a winning copy
-      triaged DIFFERENTLY (don't reach for the other one), and their intersection — an untriaged copy
-      winning on `updated` over a triaged older one. A fourth is more likely than not; when the next
-      resolver change lands, write the fixture where the two answers differ before trusting a green
-      suite.
+    - **The row and a block rank disagree in FOUR known ways, and each needed its own fixture.** They
+      were found one at a time, each after the previous was fixed, and every one passed the whole
+      suite until its test existed: a winning copy that is UNTRIAGED (invent no repo); a winning copy
+      triaged DIFFERENTLY (don't reach for the other one); their intersection, an untriaged copy
+      winning on `updated` over a triaged older one; and a copy carrying NO `updated` at all, where
+      dropping the `|| ""` fallback makes `String(null)` sort above every ISO date so the empty copy
+      wins outright — real, because `hub-agent.py` passes `fields.get("updated")` and
+      `System.ChangedDate` straight through and the hub coerces neither.
+    - **Assume a fifth.** Four were predicted-then-found in that order, so a green suite is not
+      evidence about a resolver change here. Write the fixture where the row and a block rank give
+      DIFFERENT answers first, and only then trust the run.
     - **`fetchedAt` is compared with plain `>`/`<` in every mirror, both in the group pick AND in
       the winner sort.** `board.js` once used `localeCompare` in its sort and `>` in its pick, so it
       disagreed with itself; "fixing" the hub to localeCompare only moved the divergence off the
