@@ -992,6 +992,9 @@ module.exports = {
     },
     // Test seam for the `grew` gate: its entire effect is that enforceHostShare
     // does NOT run on a numbers-only beat, which nothing else can observe.
+    // **Read it as a DELTA, never as an absolute** — `reset()` deliberately does
+    // not clear it (a counter that resets is a counter two tests can disagree
+    // about), so an absolute assertion is order-dependent on the whole file.
     shareChecks: () => shareChecks,
     load, writeNow, absorb, render, servedSeries, blankSeries, seriesTotals, usageOf, reposOf,
     weekWindow, utcToday, bucketTokens,
