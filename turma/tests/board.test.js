@@ -106,6 +106,42 @@ test("XERK-325: with both hosts online, freshness still decides", () => {
   assert.equal(sites[0].tickets[0].repoGuess.repo, "Turma");
 });
 
+test("XERK-325: mergeSites compares `fetchedAt` with `>`, matching the hub", () => {
+  // The client half of pinning the OPERATOR. This sort used localeCompare while
+  // the group pick above it used `>`, so board.js disagreed with itself and any
+  // port inherited whichever half it copied. The two orders differ on a trailing
+  // `Z` vs `z`: `>` gives the lowercase copy (0x7a > 0x5a), ICU gives the other.
+  const sites = mergeSites([
+    agent("hostUpper", block({
+      fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Upper", cloned: true } })],
+    })),
+    agent("hostLower", block({
+      fetchedAt: "2026-07-14T12:00:00z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Lower", cloned: true } })],
+    })),
+  ]);
+  assert.equal(sites[0].tickets[0].repoGuess.repo, "Lower",
+    "code-unit order, not ICU collation — the hub's compareBlocks uses `>` too");
+
+  // The SAME assertion through the other comparison. One `fetchedAt` order lives
+  // in the byUser group pick (same user, above) and one in the winners sort (two
+  // users, here) — they were different operators once, so a fixture that reaches
+  // only one of them pins only half the rule.
+  const twoUsers = mergeSites([
+    agent("hostUpper2", block({
+      user: "a@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [ticket("T-2", { repoGuess: { repo: "Upper", cloned: true } })],
+    })),
+    agent("hostLower2", block({
+      user: "b@x.com", fetchedAt: "2026-07-14T12:00:00z",
+      tickets: [ticket("T-2", { repoGuess: { repo: "Lower", cloned: true } })],
+    })),
+  ]);
+  assert.equal(twoUsers[0].tickets[0].repoGuess.repo, "Lower",
+    "the winners sort uses `>` as well, not localeCompare");
+});
+
 test("XERK-325: an all-offline org still shows its tickets", () => {
   // Online is a preference, not a filter — otherwise a board whose hosts are
   // all down goes blank rather than showing what was last known.

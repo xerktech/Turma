@@ -1,6 +1,7 @@
 ---
 paths:
   - "turma/server.js"
+  - "agent/hub-agent.py"
   - "turma/public/board.js"
   - "turma/public/board.html"
   - "glasses/src/vendor/board.cjs"
@@ -64,7 +65,8 @@ of one ticket, every divergence silent, and each one either withheld work or des
       `fleetTicketRows` and `hostTriagedTicket` (a per-host question, no ranking) — and a third is a
       new ranking site. A test pins that, because a behavioural test only catches one once some
       fleet shape happens to exercise it; it is a tripwire for the honest edit, not a proof, and
-      says so.
+      says so — its own comment carries the measured list of what still escapes it, which is the
+      part to update rather than the pattern.
     - **`ticketRepo` reads the resolved ROW, it does not rank blocks of its own.** Ranking there was
       subtly different and so wrong twice: it ignored the newer-`updated` override, so a card showing
       RepoA dispatched against RepoB; and where the winning copy carried no `repoGuess`, the card

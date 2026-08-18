@@ -6045,6 +6045,65 @@ test("XERK-325: the DRAIN resolves the repo off the row too", async () => {
   ticketQueue.length = 0;
 });
 
+test("XERK-325: the sweep and drain honour the newer `updated` too, not just the winner", async () => {
+  // The two route tests above pin "winning copy untriaged -> invent nothing".
+  // They do NOT pin "winning copy triaged DIFFERENTLY -> don't use the other
+  // one", which is the other way the row and a block rank disagree — and a
+  // resolver dropping only the `updated` override passed the whole suite while
+  // dispatching a repo the card never showed.
+  resetAutoStart();
+  const site = "tq325r.atlassian.net";
+  // Staler BLOCK, but a strictly newer copy of the ticket — this is the row.
+  await asBeat("tq325rRow", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Fresher block, older copy — the answer a block rank would give.
+  await asBeat("tq325rRank", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  // The DRAIN route.
+  assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325rRow.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "routed to the host holding the repo the card shows");
+  assert.deepEqual((agents.tq325rRank.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+  agents.tq325rRow.commands = [];
+
+  // The SWEEP route, same fixture.
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325rRow.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.deepEqual((agents.tq325rRank.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: `fetchedAt` is compared with `>`, and the board agrees", async () => {
+  // Nothing pinned the OPERATOR, so reverting either side to localeCompare
+  // passed every test and silently re-opened the divergence. The two disagree on
+  // a trailing `Z` vs `z`: `>` makes the lowercase copy win (0x7a > 0x5a),
+  // ICU collation makes the uppercase one. Asserting the `>` outcome pins the
+  // hub; `board.test.js` pins the same fixture on the client side.
+  resetAutoStart();
+  const site = "tq325s.atlassian.net";
+  await asBeat("tq325sUpper", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Upper", cloned: true } }] });
+  await asBeat("tq325sLower", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Lower", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Lower",
+    "code-unit order, not ICU collation — the mirrors all use `>`");
+});
+
 test("XERK-325: auto-start sees BOTH Jira users' tickets, as the board does", async () => {
   // A host polls as `assignee = currentUser()`, so an org whose hosts
   // authenticate as different users reports different lists and the board UNIONS
@@ -6159,9 +6218,12 @@ test("XERK-325: only the shared resolvers may read a block's ticket list", () =>
   // arrow-`const`, an `async`/`export`/indented `function` (each of which used to
   // be invisible to the declaration scan and got its read blamed on the previous
   // declaration), a divergent walk added BESIDE a legitimate `fleetTicketRows()`
-  // call, and a re-rank smuggled into an allow-listed function. Still open, and
-  // no regex closes them: a COMPUTED key (`j["tick" + "ets"]`), and a resolver in
-  // a NEW FILE, since this greps `server.js` alone.
+  // call, and a re-rank smuggled into an allow-listed function. Still open, each
+  // one MEASURED rather than assumed: a COMPUTED key (`j["tick" + "ets"]`), a
+  // resolver in a NEW FILE (this greps `server.js` alone), and — when placed
+  // directly after an allow-listed declaration, so the attribution lands on it —
+  // an object-literal METHOD, a CLASS method, and an object-literal arrow
+  // PROPERTY. All three are caught in any other position.
   //
   // So it is a tripwire for the honest edit, not a proof. **The guarantee lives
   // in the behavioural tests above** — the two-user, ghost, auto-stop,
