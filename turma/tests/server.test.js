@@ -5989,6 +5989,62 @@ test("XERK-325: a strictly newer `updated` beats block rank, as mergeSites does"
     "the newer ticket copy decides the repo, not the fresher block");
 });
 
+test("XERK-325: the SWEEP resolves the repo off the row too, not a rank of its own", async () => {
+  // `ticketRepo` feeds three routes and only the POST was pinned: a divergent
+  // freshness-only resolver wired into the sweep and the drain passed the whole
+  // suite while auto-starting a ticket the board shows UNTRIAGED. This is the
+  // sweep half — the winning copy carries no repoGuess, so the card shows no
+  // chip and no Start button, and the hub must not invent one from a losing block.
+  resetAutoStart();
+  const site = "tq325p.atlassian.net";
+  await asBeat("tq325pWinner", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });        // no repoGuess
+  await asBeat("tq325pLoser", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey), [],
+    "the board shows it untriaged, so the sweep must not start it");
+  drainTicketQueue();
+  for (const h of ["tq325pWinner", "tq325pLoser"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [], h);
+  }
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: the DRAIN resolves the repo off the row too", async () => {
+  // The third route, and it needs a fixture where the two resolvers genuinely
+  // DISAGREE — an earlier version of this test used one where they happened to
+  // agree, so it pinned nothing. Here the winning copy carries no repoGuess (the
+  // card shows the ticket untriaged), so a rank of its own resurrects a losing
+  // block's guess and dispatches a session against a repo nobody was shown; the
+  // row says untriaged, and the entry must hold as blocked instead.
+  resetAutoStart();
+  const site = "tq325q.atlassian.net";
+  await asBeat("tq325qWinner", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });        // no repoGuess
+  await asBeat("tq325qLoser", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Queued directly: the POST would refuse it (409, no triaged repo), which is
+  // the same rule from the other end — this exercises the DRAIN's own read.
+  assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
+  drainTicketQueue();
+  for (const h of ["tq325qWinner", "tq325qLoser"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [],
+      `${h} must not be dispatched a spawn for a ticket the card shows untriaged`);
+  }
+  const e = queuedTicket(site, "ENG-5");
+  assert.equal(e && e.reason, "blocked");
+  assert.match(e.error, /no triaged repo/);
+  ticketQueue.length = 0;
+});
+
 test("XERK-325: auto-start sees BOTH Jira users' tickets, as the board does", async () => {
   // A host polls as `assignee = currentUser()`, so an org whose hosts
   // authenticate as different users reports different lists and the board UNIONS
@@ -6098,26 +6154,42 @@ test("XERK-325: only the shared resolvers may read a block's ticket list", () =>
   // else reads, `ticketRepo` included) and `hostTriagedTicket` (can THIS host run
   // it: a per-host question with no ranking in it) — and a third is the defect.
   //
-  // WHAT IT DOES NOT CATCH. A QA pass walked through the previous version of this
-  // check five ways, and the same evasions apply here in spirit: bracket
-  // notation, destructuring, an arrow-`const` (whose enclosing name resolves to
-  // whatever function declaration precedes it), a divergent walk ADDED beside a
-  // legitimate `fleetTicketRows()` call, and a re-rank smuggled inside a function
-  // already on the allow-list. Some of those are covered below; none of it is
-  // airtight, because this is a regex over source and the evasion space is open.
-  // It is aimed at the honest edit, which is the realistic one. **The guarantee
-  // lives in the behavioural tests above** — the two-user, ghost, auto-stop and
-  // queued-click cases — and a change here that keeps them green while making
-  // this fail is a naming problem, not a bug.
+  // WHAT IT DOES NOT CATCH, measured rather than guessed — QA escaped earlier
+  // versions eight ways. Now covered: bracket notation, destructuring, an
+  // arrow-`const`, an `async`/`export`/indented `function` (each of which used to
+  // be invisible to the declaration scan and got its read blamed on the previous
+  // declaration), a divergent walk added BESIDE a legitimate `fleetTicketRows()`
+  // call, and a re-rank smuggled into an allow-listed function. Still open, and
+  // no regex closes them: a COMPUTED key (`j["tick" + "ets"]`), and a resolver in
+  // a NEW FILE, since this greps `server.js` alone.
+  //
+  // So it is a tripwire for the honest edit, not a proof. **The guarantee lives
+  // in the behavioural tests above** — the two-user, ghost, auto-stop,
+  // queued-click, and the sweep/drain repo-resolution cases, which do catch the
+  // computed-key version on every route. A change that keeps those green while
+  // making this fail is a naming problem, not a bug; say so here rather than
+  // widening the pattern until it means nothing.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
   // Dot, bracket and destructured reads alike.
   const READ = /\.tickets\b|\[\s*["']tickets["']\s*\]|\{[^{}]*\btickets\b[^{}]*\}\s*=/g;
   // Named functions AND `const x = (…) =>` / `= function`, so an arrow is
   // attributed to itself rather than to whatever declaration sits above it.
-  // Anchored at column 0 (`m` flag): these are all module-level declarations, and
-  // without the anchor any inner `const t = (…)` claims the attribution.
-  const DECL = /^function\s+(\w+)\s*\(|^(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:function\b|\()/gm;
+  // Anchored at the START of a line, tolerating leading whitespace and `async`/
+  // `export` — without the anchor an inner `const t = (…)` claims the
+  // attribution, and with too STRICT an anchor (`^function` alone) an
+  // `async function` or a one-space-indented one is invisible and its read is
+  // blamed on whatever declaration precedes it.
+  // The two forms are anchored DIFFERENTLY on purpose. A `function` declaration
+  // may be indented and may be `async`/`export`/generator — a one-space indent or
+  // a bare `async` was an escape, since the read then got blamed on whatever
+  // declaration preceded it. An arrow-`const` must be at column 0, because inner
+  // ones are always indented and would otherwise claim their enclosing
+  // function's reads (`hostTriagedTicket`'s own `const t = (…)` is the case).
+  const DECL = new RegExp(
+    "^[ \\t]*(?:export\\s+)?(?:async\\s+)?function\\s*\\*?\\s*(\\w+)\\s*\\("
+    + "|^(?:export\\s+)?(?:const|let|var)\\s+(\\w+)\\s*=\\s*(?:async\\s+)?(?:function\\b|\\()",
+    "gm");
   const readers = [];
   for (const m of code.matchAll(READ)) {
     const decls = [...code.slice(0, m.index).matchAll(DECL)];

@@ -2428,12 +2428,13 @@ function agentBlockOnline(a, now) {
 }
 function compareBlocks(x, y) {   // rank order, best first
   if (x.online !== y.online) return x.online ? -1 : 1;
-  // localeCompare, not `>`/`<`: board.js sorts its winners that way, and the two
-  // disagree on spellings that differ only in case or separator. No real agent
-  // emits those (one `now_iso()` format fleet-wide), so this is parity for its
-  // own sake — but a port that is exact needs no one to remember the exception.
-  const c = x.at.localeCompare(y.at);
-  return c > 0 ? -1 : c < 0 ? 1 : 0;   // fresher first
+  // Plain `>`/`<`, NOT localeCompare — the comparison every mirror uses, in both
+  // its group pick and its sort. They disagree only on spellings that differ by
+  // case or separator, which no real agent emits (one `now_iso()` format
+  // fleet-wide); the reason to keep them identical anyway is that the last
+  // attempt to "match mergeSites exactly" used localeCompare here and merely
+  // MOVED the divergence from the two-user shape onto the common same-user one.
+  return x.at > y.at ? -1 : x.at < y.at ? 1 : 0;   // fresher first
 }
 function blockOutranks(cand, best) {
   return !best || compareBlocks(cand, best) < 0;
@@ -5054,7 +5055,7 @@ function drainTicketQueue() {
       // into progress is being handled and shouldn't gain a session behind them.
       if (cat && cat !== "todo") { drop("its ticket left To Do"); continue; }
     }
-    const repo = ticketRepo(e.siteKey, e.issueKey);
+    const repo = ticketRepo(e.siteKey, e.issueKey, rows);
     if (!repo) {
       // An AUTO entry leaves at once: the sweep only ever queues a ticket that
       // HAS a repo, so it cannot re-queue this one until the triage comes back —

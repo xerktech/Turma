@@ -194,9 +194,15 @@
     // hub would actually act on. Ticket dedupe below is by the ticket's own
     // `updated`, which two hosts polling one tracker report IDENTICALLY — so
     // ties are the norm and this order is what really decides a card's fields.
-    const winners = [...byUser.values()].sort((x, y) =>
-      (y.online ? 1 : 0) - (x.online ? 1 : 0) ||
-      String(y.block.fetchedAt || "").localeCompare(String(x.block.fetchedAt || "")));
+    // `>`/`<`, matching the group pick above and every other mirror. This sort
+    // used localeCompare while the pick used `>`, so board.js disagreed with
+    // ITSELF on a `fetchedAt` differing only by case or separator — and any port
+    // that copied one half inherited a divergence from the other.
+    const winners = [...byUser.values()].sort((x, y) => {
+      if (x.online !== y.online) return x.online ? -1 : 1;
+      const xa = String(x.block.fetchedAt || ""), ya = String(y.block.fetchedAt || "");
+      return xa > ya ? -1 : xa < ya ? 1 : 0;
+    });
     for (const { block } of winners) {
       const site = block.siteKey;
       let entry = bySite.get(site);
