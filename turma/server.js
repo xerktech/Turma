@@ -4875,7 +4875,10 @@ function drainTicketQueue() {
       if (e.source !== "manual") { drop(why); return; }
       e.expiredAt = now;
       e.reason = "expired";
-      e.error = msg;
+      // Capped like every other hold reason: this one interpolates
+      // findTicketHost's text, which carries a device name, and it rides
+      // /api/agents to every client.
+      e.error = String(msg).slice(0, TICKET_QUEUE_ERROR_MAX);
       changed = true;
       console.log(`ticket queue: ${logName(e.issueKey)} gave up — ${why}`);
     };

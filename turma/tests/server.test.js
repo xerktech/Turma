@@ -5925,6 +5925,56 @@ test("XERK-303: junk in a restored command list is DROPPED, not carried", async 
   fs.unlinkSync(f);
 });
 
+test("XERK-303: an AUTO entry that reaches giveUp still leaves outright, with no note", async () => {
+  // The auto half of the XERK-296 blocked-timer test uses an UNTRIAGED ticket,
+  // which is dropped one `if` above giveUp — so nothing covered giveUp's own auto
+  // arm, and making it mint notes for auto entries too left the suite green.
+  // This drives the routing-failure timer, which is a path giveUp really governs.
+  resetAutoStart();
+  await asBeat("tqAutoNote", "tq58.atlassian.net", { tickets: [
+    { key: "ENG-7", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  autoStartSweep();
+  const e = queuedTicket("tq58.atlassian.net", "ENG-7");
+  assert.equal(e.source, "auto");
+  agents.tqAutoNote.lastSeen = Date.now() - 10 * 60 * 1000;   // the whole org goes dark
+  drainTicketQueue();
+  assert.equal(e.reason, "blocked");
+  e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
+  drainTicketQueue();
+  assert.equal(queuedTicket("tq58.atlassian.net", "ENG-7"), null,
+    "re-derivable work leaves outright — a note for it would be noise nobody asked for");
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-303: a give-up note's text is capped like every other hold reason", async () => {
+  // It interpolates findTicketHost's wording, which carries a DEVICE NAME, and
+  // rides /api/agents to every client. The longest such reason — pinned to a host
+  // that no longer reports the org — plus this path's own prefix runs past the cap
+  // at a 200-char host, which is a name the door actually admits.
+  resetAutoStart();
+  const host = "tqLong" + "z".repeat(194);
+  await asBeat(host, "tq59.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  // A second host keeps REPORTING the ticket, so the entry stays on the routing
+  // path rather than ageing out as one nobody lists any more.
+  await asBeat("tq59Reporter", "tq59.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  hub.ticketAgents["tq59.atlassian.net/ENG-5"] = { host, at: Date.now() };
+  const r = await startTicket("tq59.atlassian.net", "ENG-5");
+  assert.equal(r.body.queued, true, "pinned-but-full is a wait, so it enters the queue");
+  // The pinned host now reports a DIFFERENT org: the longest refusal there is.
+  await asBeat(host, "tq59other.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  drainTicketQueue();
+  const e = queuedTicket("tq59.atlassian.net", "ENG-5");
+  assert.equal(e.reason, "blocked");
+  e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
+  drainTicketQueue();
+  const note = ticketQueuePayload().find((q) => q.issueKey === "ENG-5");
+  assert.equal(note.reason, "expired");
+  assert.equal(note.error.length, TICKET_QUEUE_ERROR_MAX,
+    "this case really does hit the cap, so the assertion below means something");
+  delete hub.ticketAgents["tq59.atlassian.net/ENG-5"];
+});
+
 test("XERK-303: a non-ARRAY commands list is rewritten, not skipped past", async () => {
   // Fatal one line SOONER than a junk element: `(a.commands || []).some` is not
   // a function, and `for…of` a plain object is not iterable — same setInterval,
