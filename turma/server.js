@@ -722,6 +722,13 @@ function registryBytes() {
 const REFUSED_LOG_EVERY_MS = 60 * 1000;
 let refusedLogAt = 0;
 let refusedSinceLog = 0;
+// The usage-coercion throttle (XERK-306), declared here rather than beside
+// logUsageCoercion for the reason that comment gives: `loadState`'s restore
+// runs the coercions from ABOVE this file's later declarations, so a binding
+// down there is read in its TDZ and empties the whole registry on boot.
+const USAGE_COERCION_LOG_EVERY_MS = 60 * 1000;
+let usageCoercionLogAt = 0;
+let usageCoercionSuppressed = 0;
 function logRegistryFull(detail) {
   refusedSinceLog += 1;
   const now = Date.now();
@@ -1733,17 +1740,107 @@ function normalizeSubagentUsage(usage) {
   usage.subagent = out;
 }
 
+// The token FIGURES themselves (XERK-306). A bucket's four counts are Kotlin
+// `Long`s on Android (UsageBucket) and a full /api/agents decode is ATOMIC
+// there, so ONE host reporting `1.5` or `1e308` for a single figure throws for
+// the WHOLE array: every OTHER host silently vanishes from that phone's fleet
+// list while the tile still reads "N / N online". XERK-302 closed this for the
+// `subagent` block alone; these are its siblings — the host/repo/session
+// windows, the per-day buckets, and each model's windows.
+//
+// A figure must be a NON-NEGATIVE SAFE INTEGER, the rule normalizeSubagentUsage
+// established. But an unusable one here is REWRITTEN to 0 rather than
+// invalidating its block: absent totals is not a meaningful "can't tell you"
+// the way an absent `subagent` is — every client renders these unconditionally
+// and an agent that reports usage at all reports all three windows. That
+// silently UNDERSTATES the host, which is why it is logged.
+//
+// Nothing is ever filled IN. A missing key stays missing (every client defaults
+// it to 0), because this walk runs before the SECOND AGENT_RECORD_MAX
+// measurement and `{}` → `{"input":0,"output":0,"cacheWrite":0,"cacheRead":0}`
+// is a ~25x expansion on a `days` map whose size the agent chooses. Rewriting a
+// figure that is PRESENT can only shrink the record: no JSON number that fails
+// the test above is shorter than `0`.
+//
+// The key list is a LITERAL in each walk below, never a module `const`: this
+// runs from `loadState`, which is above any such declaration and would read it
+// in its TDZ — a ReferenceError there lands in the restore's catch and empties
+// the WHOLE registry on boot (the restore-TDZ rule in .claude/rules/turma.md).
+
+// One `owner[key]` bucket, in place. A bucket that is not an object at all is
+// DELETED rather than rebuilt: it holds no figure worth keeping, deleting can
+// never expand the record, and every client already reads an absent window as
+// zeros. A stringified figure ("9") counts as unusable on purpose — it is what
+// the wire type says it isn't, and the web's `+=` would concatenate it.
+function normalizeTokenBucket(owner, key, tally) {
+  if (!objectish(owner) || !(key in owner)) return;
+  const bucket = owner[key];
+  if (!objectish(bucket)) {
+    delete owner[key];
+    noteUsageCoercion(tally, key);
+    return;
+  }
+  for (const k of ["input", "output", "cacheWrite", "cacheRead"]) {
+    if (!(k in bucket)) continue;
+    if (Number.isSafeInteger(bucket[k]) && bucket[k] >= 0) continue;
+    bucket[k] = 0;
+    noteUsageCoercion(tally, `${key}.${k}`);
+  }
+}
+
+// Every bucket one usage block carries.
+function normalizeUsageTokens(usage, tally) {
+  if (!objectish(usage)) return;
+  for (const w of ["totals", "today", "week"]) normalizeTokenBucket(usage, w, tally);
+  // `days` is a `Map<String, UsageBucket>` on Android, so a non-object (an
+  // ARRAY, say) is decode-fatal on its own, before any figure inside it counts.
+  if ("days" in usage) {
+    if (!objectish(usage.days)) {
+      delete usage.days;
+      noteUsageCoercion(tally, "days");
+    } else {
+      for (const d of Object.keys(usage.days)) normalizeTokenBucket(usage.days, d, tally);
+    }
+  }
+  // Runs after normalizeModelUsage, which has already dropped every entry that
+  // is not an object with a name.
+  if (Array.isArray(usage.models)) {
+    for (const m of usage.models) {
+      for (const w of ["totals", "today", "week"]) normalizeTokenBucket(m, w, tally);
+    }
+  }
+  // Typed `String` on Android — a number here is as decode-fatal as a float
+  // figure, and it rides the same block.
+  if ("lastActivity" in usage && typeof usage.lastActivity !== "string") {
+    delete usage.lastActivity;
+    noteUsageCoercion(tally, "lastActivity");
+  }
+}
+
 // Every coercion a usage block needs, wherever one rides the heartbeat.
-function normalizeUsageBlock(usage) {
+function normalizeUsageBlock(usage, tally) {
   normalizeModelUsage(usage);
   normalizeSubagentUsage(usage);
+  normalizeUsageTokens(usage, tally);
+}
+
+// A usage block hangs off its owner under a known key; a non-object one is
+// decode-fatal on Android (`UsageInfo`), so it is DROPPED — deleting shrinks the
+// record where rewriting it to `null` would grow it.
+function dropUnusableUsage(owner, tally) {
+  if (!objectish(owner) || !("usage" in owner)) return;
+  if (objectish(owner.usage)) return;
+  delete owner.usage;
+  noteUsageCoercion(tally, "usage");
 }
 
 // Every place a usage block rides the heartbeat: the host-wide aggregate, the
 // per-repo ones, and each live session's own.
 function normalizeUsage(payload) {
   if (!payload || typeof payload !== "object") return;
-  normalizeUsageBlock(payload.usage);
+  const tally = { count: 0, first: "" };
+  dropUnusableUsage(payload, tally);
+  normalizeUsageBlock(payload.usage, tally);
   // `Array.isArray`, not `|| []`: a non-iterable `repoUsage`/`sessions` (an
   // OBJECT, say) makes a bare `for…of` THROW, and a throw here is uniquely
   // costly — on the restore path it lands in a silent `catch {}` and abandons
@@ -1755,11 +1852,63 @@ function normalizeUsage(payload) {
   if (!Array.isArray(payload.repoUsage)) {
     if ("repoUsage" in payload) payload.repoUsage = [];
   } else {
-    for (const r of payload.repoUsage) normalizeUsageBlock(r && r.usage);
+    // `List<RepoUsage>` on Android, so a `null` or a bare string IN the list is
+    // as fatal as a bad figure inside one — the same drop normalizeSessions
+    // makes over `sessions`.
+    if (!payload.repoUsage.every(objectish)) {
+      payload.repoUsage = payload.repoUsage.filter(objectish);
+      noteUsageCoercion(tally, "repoUsage[]");
+    }
+    for (const r of payload.repoUsage) {
+      // Typed `String` on both, and deleting is what every client already reads
+      // as "unnamed" — rewriting to `String(r.repo)` could grow the record.
+      for (const k of ["repo", "remoteKey"]) {
+        if (k in r && typeof r[k] !== "string") {
+          delete r[k];
+          noteUsageCoercion(tally, `repoUsage.${k}`);
+        }
+      }
+      dropUnusableUsage(r, tally);
+      normalizeUsageBlock(r.usage, tally);
+    }
   }
   if (Array.isArray(payload.sessions)) {
-    for (const s of payload.sessions) normalizeUsageBlock(s && s.usage);
+    // Guarded rather than assuming normalizeSessions ran first: order in
+    // normalizeRecord is deliberately NOT load-bearing.
+    for (const s of payload.sessions) {
+      dropUnusableUsage(s, tally);
+      normalizeUsageBlock(s && s.usage, tally);
+    }
   }
+  logUsageCoercion(payload, tally);
+}
+
+function noteUsageCoercion(tally, where) {
+  if (!tally) return;
+  tally.count += 1;
+  if (!tally.first) tally.first = where;
+}
+
+// Coercing a figure to 0 UNDERSTATES the host rather than excluding it, so it
+// must not be silent. Throttled process-wide (a beat arrives every few seconds
+// and a host reporting one bad figure reports it forever) — the throttle's own
+// state is declared with the other log throttles, above `loadState`, because
+// the restore reaches this too. The example path goes through logName: a `days`
+// key is agent-authored text that would otherwise forge a log line.
+function logUsageCoercion(payload, tally) {
+  if (!tally.count) return;
+  usageCoercionSuppressed += 1;
+  const now = Date.now();
+  if (now - usageCoercionLogAt < USAGE_COERCION_LOG_EVERY_MS) return;
+  const also = usageCoercionSuppressed > 1
+    ? ` (+${usageCoercionSuppressed - 1} more beats coerced since the last line)` : "";
+  usageCoercionLogAt = now;
+  usageCoercionSuppressed = 0;
+  console.warn(
+    `heartbeat from ${logName(payload.device || payload.agentId || "?")}: ` +
+      `${tally.count} unusable usage field(s) coerced (first ${logName(tally.first)}) — ` +
+      `this host's token figures understate what it really spent${also}`
+  );
 }
 
 // The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for

@@ -291,6 +291,51 @@ class AgentDecodeTest {
         assertEquals("", bare.lastActivity)
     }
 
+    // A two-host fleet whose SECOND host reports `input` as [figure] on three
+    // different buckets — the shapes XERK-306 is about.
+    private fun fleetWith(figure: String) = """
+        { "now": 1, "agents": [
+          { "key": "good", "device": "good", "online": true,
+            "usage": { "totals": { "input": 7, "output": 0, "cacheWrite": 0, "cacheRead": 0 } } },
+          { "key": "bad", "device": "bad", "online": true,
+            "usage": {
+              "totals": { "input": $figure, "output": 0, "cacheWrite": 0, "cacheRead": 0 },
+              "days": { "2026-08-15": { "input": $figure } },
+              "models": [ { "model": "opus", "totals": { "input": $figure } } ]
+            } }
+        ] }
+    """.trimIndent()
+
+    // XERK-306: a token figure is a Long here, so a FLOAT one anywhere in ANY
+    // host's usage block throws for the WHOLE array — the poll fails silently,
+    // the app keeps its last snapshot, and the tile still reads "N / N online".
+    // The hub coerces every figure at ingest (normalizeUsageTokens in
+    // turma/server.js); this pins both halves — that the raw shape really is
+    // fatal, so that coercion is load-bearing rather than decorative, and that
+    // the shape the hub serves in its place decodes with every host intact.
+    //
+    // The hub's rule is deliberately STRICTER than this decoder's: a negative
+    // or a quoted figure decodes here (lenient mode reads `"9"` as 9) and is
+    // still not a token count, so it is coerced too.
+    @Test fun `a float token figure is fatal raw, and survives once the hub coerces it`() {
+        val threw = try {
+            TurmaJson.decodeFromString<AgentsResponse>(fleetWith("1.5"))
+            false
+        } catch (e: Exception) {
+            true
+        }
+        assertTrue("a raw float figure must not decode — the hub has to coerce it", threw)
+
+        // What the hub serves for that same host: the unusable figure zeroed,
+        // every other host and every good figure untouched.
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(fleetWith("0"))
+        assertEquals(listOf("good", "bad"), resp.agents.map { it.key })
+        assertEquals(7L, resp.agents[0].usage!!.totals.input)
+        assertEquals(0L, resp.agents[1].usage!!.totals.input)
+        assertEquals(0L, resp.agents[1].usage!!.days["2026-08-15"]!!.input)
+        assertEquals(0L, resp.agents[1].usage!!.models[0].totals.input)
+    }
+
     @Test fun `a tool_use block decodes its SendUserFile files and caption (XERK-221)`() {
         val json = """
             {"t":"tool_use","id":"t1","name":"SendUserFile",
