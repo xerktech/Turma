@@ -4834,6 +4834,19 @@ def _strip_pane_ellipsis(cell):
     return cell, False
 
 
+def _row_label_matches(want_label, have_label):
+    """Does a pane agent-list row's label name this launch?
+
+    An empty want matches anything; otherwise EITHER side may be the prefix —
+    the TUI ellipsizes a long cell on a narrow window (XERK-130), and the
+    launch's own description can itself be the shorter string. Shared by the
+    Task/Agent lookup and the workflow-run lookup so a row resolves the same way
+    whichever kind of background work it names."""
+    if not want_label or have_label == want_label:
+        return True
+    return have_label.startswith(want_label) or want_label.startswith(have_label)
+
+
 def _resolve_subagent(main_path, agent_type, label):
     """Map a pane agent-list row (its `type` + short `label`/description) to the
     background agent's transcript file, via the main transcript's Task calls.
@@ -4885,13 +4898,8 @@ def _resolve_subagent(main_path, agent_type, label):
                 if m and block.get("tool_use_id"):
                     agent_ids[block["tool_use_id"]] = m.group(1)
 
-    def _matches(desc):
-        if not want_label or desc == want_label:
-            return True
-        return desc.startswith(want_label) or want_label.startswith(desc)
-
     for tool_id, desc in reversed(tasks):  # newest matching call wins
-        if not _matches(desc):
+        if not _row_label_matches(want_label, desc):
             continue
         aid = agent_ids.get(tool_id)
         if not aid:
@@ -4900,6 +4908,202 @@ def _resolve_subagent(main_path, agent_type, label):
         if os.path.isfile(path):
             return path
     return None
+
+
+# ---- workflow runs (XERK-304) ----------------------------------------------
+# A Workflow launch is N agents and writes NO transcript of its own, so a
+# clicked `workflow` row resolves to a RUN — a list of agents to pick from —
+# rather than to one conversation. Its agents live one level deeper than an
+# ordinary background agent's:
+#   <stem>/subagents/workflows/<runId>/agent-<x>.jsonl
+WORKFLOW_RUNS_SUBDIR = "workflows"
+# Both of these are joined onto a path and both originate in a clicked row that
+# reaches us over HTTP, so neither is ever trusted: the id before it names a
+# file, the run id before it names a directory.
+VALID_WORKFLOW_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+VALID_WORKFLOW_RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]{1,64}$")
+# One run may legally spawn up to a thousand agents. The list is a picker, so it
+# is capped and flagged rather than served whole.
+WORKFLOW_AGENTS_MAX = 200
+WORKFLOW_AGENT_LABEL_CHARS = 160
+# A workflow agent's transcript opens with its prompt, so the label read never
+# has to walk far in; this only bounds a pathological one.
+WORKFLOW_LABEL_MAX_LINES = 50
+
+
+def _read_head_lines(path, max_bytes):
+    """Non-empty raw lines from roughly the FIRST max_bytes of a file, in file
+    order. The TRAILING line may be a fragment (the window landed mid-line) —
+    callers that json.loads() it get a ValueError and skip it, exactly like
+    _read_tail_lines' leading one."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(max_bytes)
+    except OSError:
+        return []
+    return [line.strip() for line in raw.split(b"\n") if line.strip()]
+
+
+def _workflow_runs_dir(main_path):
+    """The dir Claude Code writes a session's workflow runs into, one level
+    below the flat subagents/ tree: <stem>/subagents/workflows/."""
+    return os.path.join(_subagents_dir(main_path), WORKFLOW_RUNS_SUBDIR)
+
+
+def _resolve_workflow_run(main_path, label):
+    """Directory holding the agent transcripts of the workflow run a clicked
+    `workflow` row names, or None when nothing matches / the dir is absent.
+
+    A Workflow launch records `{taskType:"local_workflow", workflowName, taskId,
+    runId, transcriptDir}` beside its tool_result, and the run dir is named after
+    the **runId** — NOT the `taskId`, which is a different and shorter handle
+    (`we1gtmfyd` against `wf_86e01141-7bc`) and is what _async_launch keys the
+    ROW on. Reading taskId as the directory name resolves nothing at all.
+
+    The record's own absolute `transcriptDir` is deliberately NOT used. It is
+    untrusted input on a path join, and it is wrong for a session that has since
+    MIGRATED (XERK-101) to a host mounting REPOS_ROOT somewhere else — where the
+    run id still resolves, because the dir is rebuilt under THIS transcript's own
+    subagents/ tree.
+
+    Newest matching launch wins, matching _resolve_subagent: one workflow name
+    can be run any number of times in a session. A miss must not raise — the
+    caller stages an empty result."""
+    want_label, _ = _strip_pane_ellipsis((label or "").strip())
+    runs = []
+    for raw in _read_tail_lines(main_path, 1 << 23):  # last 8 MiB, as _resolve_subagent
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        tur = entry.get("toolUseResult") if isinstance(entry, dict) else None
+        if not isinstance(tur, dict) or tur.get("taskType") != "local_workflow":
+            continue
+        # The same name _async_launch put on the row, or the row can never match.
+        name = str(tur.get("workflowName") or tur.get("summary") or "").strip()
+        if not _row_label_matches(want_label, name):
+            continue
+        run_id = str(tur.get("runId") or "").strip()
+        if VALID_WORKFLOW_RUN_ID_RE.match(run_id):
+            runs.append(run_id)
+    for run_id in reversed(runs):  # newest matching launch wins
+        path = os.path.join(_workflow_runs_dir(main_path), run_id)
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _workflow_agent_files(run_dir):
+    """Every `agent-<id>.jsonl` under a workflow run, as {id: path}.
+
+    WALKED rather than listed: a script may call workflow() to run a child
+    workflow inline, and that child's agents — one dir deeper — are as much a
+    part of this run as the top-level ones. Agent ids are unique within a run, so
+    a flat map is enough to address one without ever handing the client a path."""
+    out = {}
+    for dirpath, _dirs, files in os.walk(run_dir):
+        for name in sorted(files):
+            if not (name.startswith("agent-") and name.endswith(".jsonl")):
+                continue
+            aid = name[len("agent-"):-len(".jsonl")]
+            if not VALID_WORKFLOW_AGENT_ID_RE.match(aid) or aid in out:
+                continue
+            path = os.path.join(dirpath, name)
+            if os.path.isfile(path):
+                out[aid] = path
+    return out
+
+
+def _workflow_finished_agents(run_dir):
+    """The ids this run's journal records a RESULT for — the agents that have
+    finished — or None when no journal could be read.
+
+    journal.jsonl is the workflow runtime's own ledger, one
+    `{"type":"result","agentId":…}` line per completed agent. It is best-effort,
+    so None means "this run cannot say", never "none of them finished": a row
+    then carries no status at all rather than claiming everything is running."""
+    seen_journal = False
+    done = set()
+    for dirpath, _dirs, files in os.walk(run_dir):
+        if "journal.jsonl" not in files:
+            continue
+        lines = _read_tail_lines(os.path.join(dirpath, "journal.jsonl"), 1 << 20)
+        seen_journal = True
+        for raw in lines:
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("type") == "result" and rec.get("agentId"):
+                done.add(str(rec["agentId"]))
+    return done if seen_journal else None
+
+
+def _workflow_agent_label(path):
+    """The name to show for one workflow agent, or "".
+
+    A workflow agent's `agent-<id>.meta.json` carries only
+    `{"agentType":"workflow-subagent","spawnDepth":1}` — no description — and the
+    script's own `label:` option is persisted NOWHERE on disk, so the row is
+    named from the agent's FIRST PROMPT, the one thing written down that says
+    what it was asked to do. A meta `description` still wins when there is one,
+    so an ordinary subagent (whose meta does carry it) keeps naming itself."""
+    meta = path[:-len(".jsonl")] + ".meta.json"
+    try:
+        with open(meta, errors="replace") as f:
+            desc = str((json.load(f) or {}).get("description") or "").strip()
+        if desc:
+            return desc[:WORKFLOW_AGENT_LABEL_CHARS]
+    except (OSError, ValueError, AttributeError):
+        pass
+    text = _first_user_text(path, max_lines=WORKFLOW_LABEL_MAX_LINES) or ""
+    return " ".join(text.split())[:WORKFLOW_AGENT_LABEL_CHARS]
+
+
+def _workflow_agent_started(path):
+    """ISO timestamp of a workflow agent's first entry, or "" — its launch time,
+    which is the order the operator watched the run happen in."""
+    for raw in _read_head_lines(path, 1 << 16):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("timestamp"):
+            return str(entry["timestamp"])
+    return ""
+
+
+def _workflow_agents(run_dir):
+    """(rows, truncated) for a workflow run's agent picker, oldest launch first:
+    ([{id, label, startedAt, status?}], bool).
+
+    Ordered by each transcript's FIRST timestamp — launch order — rather than by
+    mtime, which reorders itself live as the agents write. `status` is omitted
+    entirely when the run's journal can't answer (see _workflow_finished_agents);
+    an absent field means "can't tell", exactly as it does on the heartbeat."""
+    files = _workflow_agent_files(run_dir)
+    done = _workflow_finished_agents(run_dir)
+    rows = []
+    for aid, path in files.items():
+        row = {"id": aid, "label": _workflow_agent_label(path),
+               "startedAt": _workflow_agent_started(path)}
+        if done is not None:
+            row["status"] = "done" if aid in done else "running"
+        rows.append(row)
+    rows.sort(key=lambda r: (r["startedAt"], r["id"]))
+    return rows[:WORKFLOW_AGENTS_MAX], len(rows) > WORKFLOW_AGENTS_MAX
+
+
+def _workflow_agent_path(run_dir, agent_id):
+    """One workflow agent's transcript inside an already-resolved run, or None.
+
+    The id arrives from a clicked row over HTTP and is about to name a file, so
+    it is pattern-checked first and then matched against the run's OWN walk —
+    never string-joined onto the run dir, which is what would let `..` out of it."""
+    aid = (agent_id or "").strip()
+    if not VALID_WORKFLOW_AGENT_ID_RE.match(aid):
+        return None
+    return _workflow_agent_files(run_dir).get(aid)
 
 
 # A req file only marks a *live* pending question while the ask.py bridge is
@@ -12097,19 +12301,45 @@ class SessionManager:
             "queued": queued,
         })
 
-    def _stage_subagent_history(self, sid, agent_type, label):
+    def _stage_subagent_history(self, sid, agent_type, label, agent_id=None):
         """Handle a {type:"subagentHistory"} command: resolve the clicked pane
-        agent-list row (type + label) to its background-agent transcript and
-        stage a bounded read for the next heartbeat (subagentHistoryResults).
-        The row key (sessionId+type+label) is echoed back so the hub can match
-        the delivery to the outstanding request. Any miss (unknown session,
-        unresolved agent, absent file) stages an empty result rather than
-        raising — a poison row must not take down the heartbeat loop."""
+        agent-list row (type + label, plus `agentId` on the workflow drill-down)
+        and stage a bounded read for the next heartbeat
+        (subagentHistoryResults). The row key (sessionId+type+label+agentId) is
+        echoed back so the hub can match the delivery to the outstanding
+        request. Any miss (unknown session, unresolved agent, absent file) stages
+        an empty result rather than raising — a poison row must not take down the
+        heartbeat loop.
+
+        A `workflow` row answers with an agent LIST, not a conversation (XERK-304).
+        A workflow is N agents and writes no transcript of its own, so there is no
+        single thing "its history" could be; the row resolves to the run, the run
+        answers `agents`, and a second request naming one of those ids returns
+        that agent's transcript. **`agents` present — even empty — is what tells
+        the client this is a list**, so a run with nothing written yet says "no
+        agents yet" rather than the "unavailable" an unresolved row gets."""
         result = {"sessionId": sid, "type": agent_type or "",
-                  "label": label or "", "entries": [], "truncated": False}
+                  "label": label or "", "agentId": agent_id or "",
+                  "entries": [], "truncated": False}
         sess = self._find(sid)
         main = _session_transcript_path(sess) if sess else None
-        path = _resolve_subagent(main, agent_type, label) if main else None
+        if not main:
+            self.subagent_history_results.append(result)
+            return
+        if (agent_type or "").strip() == "workflow":
+            run_dir = _resolve_workflow_run(main, label)
+            if not run_dir:
+                self.subagent_history_results.append(result)
+                return
+            if not (agent_id or "").strip():
+                agents, agents_truncated = _workflow_agents(run_dir)
+                result["agents"] = agents
+                result["agentsTruncated"] = agents_truncated
+                self.subagent_history_results.append(result)
+                return
+            path = _workflow_agent_path(run_dir, agent_id)
+        else:
+            path = _resolve_subagent(main, agent_type, label)
         if not path:
             self.subagent_history_results.append(result)
             return
@@ -14175,7 +14405,8 @@ class SessionManager:
                     self._stage_history(cmd.get("sessionId"))
                 elif ctype == "subagentHistory":
                     self._stage_subagent_history(
-                        cmd.get("sessionId"), cmd.get("agentType"), cmd.get("label"))
+                        cmd.get("sessionId"), cmd.get("agentType"),
+                        cmd.get("label"), cmd.get("agentId"))
                 elif ctype == "jiraIssue":
                     self._stage_jira_issue(cmd.get("issueKey"))
                 elif ctype == "setTicketStatus":

@@ -1917,11 +1917,20 @@ function ingestHistory(agent, historyResults) {
 
 // The cache key for one background agent's transcript (see the {type:
 // "subagentHistory"} command): a session can run several agents of the same
-// type, so the short description/label disambiguates them. NUL-separated
-// because neither field can contain it.
-function subagentKey(sessionId, type, label) {
-  return String(sessionId) + "\0" + String(type || "") + "\0" + String(label || "");
+// type, so the short description/label disambiguates them. `agentId` is the
+// workflow drill-down's fourth component (XERK-304) — a `workflow` row answers
+// with an agent LIST under the empty id, and each of that run's agents with its
+// own transcript under its own id, so all of them are distinct cache entries.
+// NUL-separated because no field can contain it.
+function subagentKey(sessionId, type, label, agentId) {
+  return String(sessionId) + "\0" + String(type || "") + "\0" +
+    String(label || "") + "\0" + String(agentId || "");
 }
+
+// A workflow agent id names a file on the agent host, so the hub refuses a
+// malformed one outright rather than queueing a command that can only miss.
+// The agent pattern-checks it again — this is the cheap half of both-ends.
+const SUBAGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 // Same lifecycle as ingestHistory, keyed by (session,type,label) — merges the
 // agent's `subagentHistoryResults`, then evicts by age and caps the cache.
@@ -1929,8 +1938,9 @@ function ingestSubagentHistory(agent, results) {
   const now = Date.now();
   for (const r of results || []) {
     if (!r || !r.sessionId) continue;
-    agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label)] =
-      { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+    agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label, r.agentId)] =
+      { entries: r.entries, truncated: r.truncated, agents: r.agents,
+        agentsTruncated: r.agentsTruncated, fetchedAt: now };
   }
   for (const [k, h] of Object.entries(agent.subagentHistory)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.subagentHistory[k];
@@ -6900,28 +6910,46 @@ const server = http.createServer(async (req, res) => {
         const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "history", sessionId });
         return json(res, 202, { pending: true, cmdId });
       }
-      // GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label= ->
-      // the transcript of one live background agent the session spawned (the
-      // pane agent-list row identifies it by type + short description). Same
-      // fresh-cache / queue-and-202 / single-flight shape as /history.
+      // GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label=
+      //   [&agentId=] -> the transcript of one live background agent the session
+      // spawned (the pane agent-list row identifies it by type + short
+      // description). Same fresh-cache / queue-and-202 / single-flight shape as
+      // /history.
+      //
+      // A `workflow` row is the one that answers differently (XERK-304): with no
+      // `agentId` it comes back carrying `agents` — that run's agent list — and
+      // the client re-requests with one of those ids to get a transcript. The
+      // presence of `agents` is the whole signal, so it is served whenever the
+      // agent sent one, empty list included.
       if (req.method === "GET" && parts.length === 7 &&
           parts[5] === "subagents" && parts[6] === "history") {
         const agentType = (url.searchParams.get("type") || "").trim();
         const label = (url.searchParams.get("label") || "").trim();
+        const agentId = (url.searchParams.get("agentId") || "").trim();
         if (!agentType) return json(res, 400, { error: "type required" });
-        const cached = (agents[key].subagentHistory || {})[subagentKey(sessionId, agentType, label)];
+        if (agentId && !SUBAGENT_ID_RE.test(agentId)) {
+          return json(res, 400, { error: "bad agentId" });
+        }
+        const cached = (agents[key].subagentHistory || {})[
+          subagentKey(sessionId, agentType, label, agentId)];
         if (cached && Date.now() - cached.fetchedAt < HISTORY_FRESH_MS) {
-          return json(res, 200, {
+          const body = {
             entries: cached.entries,
             truncated: cached.truncated,
             fetchedAt: cached.fetchedAt,
-          });
+          };
+          if (cached.agents) {
+            body.agents = cached.agents;
+            body.agentsTruncated = !!cached.agentsTruncated;
+          }
+          return json(res, 200, body);
         }
         const pending = (agents[key].commands || []).find(
           (c) => c.type === "subagentHistory" && c.sessionId === sessionId &&
-            c.agentType === agentType && (c.label || "") === label);
+            c.agentType === agentType && (c.label || "") === label &&
+            (c.agentId || "") === agentId);
         const cmdId = pending ? pending.cmdId
-          : queueCommand(key, { type: "subagentHistory", sessionId, agentType, label });
+          : queueCommand(key, { type: "subagentHistory", sessionId, agentType, label, agentId });
         return json(res, 202, { pending: true, cmdId });
       }
       // DELETE /api/agents/<host>/sessions/<id>

@@ -139,9 +139,19 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   just the list under a "Background agents…" spinner. Without that split it either vanished mid-run
   or would have faked a running turn.
 - Clicking a subagent opens its transcript read-only in the right stage (`openSubagentView` → `GET
-  /api/agents/<host>/sessions/<id>/subagents/history?type=&label=`, reusing the archive viewer +
-  chat engine), with **Back** returning to the live session.
-- Tests: `agentsHtml` in `chat.test.js`, the subagent-history cases in `server.test.js`.
+  /api/agents/<host>/sessions/<id>/subagents/history?type=&label=&agentId=`, reusing the archive
+  viewer + chat engine), with **Back** returning to the live session.
+- **A `workflow` row opens the run's AGENT PICKER, not a transcript** (XERK-304): a workflow is N
+  agents and has no conversation of its own. The reply carrying `agents` — **the empty list
+  included** — is the whole signal, so `renderWorkflowAgents` runs on presence and never on length;
+  an empty run reads "hasn't started any agents yet", which is a real answer and deliberately worded
+  apart from the "unavailable" an unresolved row gets.
+- **Back is three rungs deep there**, and `subagentListReturn` is the middle one: one agent of a run
+  returns to that run's list, and only the list returns to the session. Every place that drops
+  `subagentReturn` must drop it too — a stale middle rung sends Back into a list the pane is no
+  longer showing. The back label names the rung it actually reaches ("Workflow" vs "Session").
+- Tests: `agentsHtml` in `chat.test.js`, the subagent-history cases in `server.test.js`, the
+  XERK-304 drill-down cases in `sessions.test.js`.
 
 ### Queued sessions
 

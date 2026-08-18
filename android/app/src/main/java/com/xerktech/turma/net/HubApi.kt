@@ -131,13 +131,16 @@ interface HubApi {
     suspend fun history(@Path("host") host: String, @Path("id") id: String): Response<HistoryResponse>
 
     // One live background agent's transcript (same fresh-cache / queue-and-202
-    // shape as history). type+label identify the pane agent-list row.
+    // shape as history). type+label identify the pane agent-list row; agentId is
+    // the workflow drill-down (XERK-304) — empty asks a `workflow` row for its
+    // run's agent list, one of those ids asks for that agent's transcript.
     @GET("api/agents/{host}/sessions/{id}/subagents/history")
     suspend fun subagentHistory(
         @Path("host") host: String,
         @Path("id") id: String,
         @Query("type") type: String,
         @Query("label") label: String,
+        @Query("agentId") agentId: String,
     ): Response<HistoryResponse>
 
     @POST("api/agents/{host}/clone")

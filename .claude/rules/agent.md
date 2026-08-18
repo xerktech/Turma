@@ -236,6 +236,29 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
     alone left every real launch unnamed (and `_resolve_subagent` had the same bug, so no clicked
     row resolved). A background launch carries no `subagent_type`, so the row's type falls back to
     `agent` and `_resolve_subagent` treats that as a wildcard, matching on the description.
+  - **A `workflow` row resolves to a RUN, not a conversation** (XERK-304). A workflow writes no
+    transcript of its own — its agents live at `<stem>/subagents/workflows/<runId>/agent-<x>.jsonl`
+    — so `_stage_subagent_history` answers it with `agents` (that run's picker) and only a second
+    request naming one of those ids returns a transcript. **`agents` PRESENT, the empty list
+    included, is what tells every client it got a list**; a started run with nothing written yet is
+    an empty list, an unresolved row carries no `agents` key at all, and collapsing the two loses
+    the difference between "nothing running yet" and "this row is broken".
+  - **The run dir is named after the launch record's `runId`, NOT its `taskId`.** They are different
+    handles on the same launch (`wf_86e01141-7bc` against `we1gtmfyd`), and `_async_launch` keys the
+    ROW on taskId — so reading taskId as the directory name resolves nothing, which is the bug
+    XERK-304 was filed for. The record's absolute `transcriptDir` is deliberately ignored too: it is
+    untrusted input on a path join, and it is stale for a session MIGRATED to a host mounting
+    `REPOS_ROOT` elsewhere, where the run id still resolves because the dir is rebuilt under this
+    transcript's own tree.
+  - **A workflow agent's name comes from its FIRST PROMPT.** Its `agent-<id>.meta.json` is only
+    `{"agentType":"workflow-subagent","spawnDepth":1}` — no description — and the script's own
+    `label:` option is persisted nowhere, so the prompt is the one thing on disk saying what it was
+    asked to do. A meta `description` still wins when present. Run status comes from the run's
+    `journal.jsonl` (`{"type":"result","agentId":…}` per finished agent) and is OMITTED entirely
+    when no journal can be read — "can't tell", never a guess.
+  - **The agent id from a clicked row names a FILE, so it is never joined onto a path**: it is
+    pattern-checked and then matched against the run's own walk (`_workflow_agent_path`). The hub
+    checks it again before queueing. Tests: `TestResolveWorkflowRun`, `TestStageSubagentHistory`.
   - **A stop already seen beats a later-read launch** (`stoppedAgents`): the queued copy of a
     notification can sit at an EARLIER file offset than the launch it refers to.
   - **An ASSISTANT turn is never a notification carrier** (real ones ride `queue-operation`/`user`),

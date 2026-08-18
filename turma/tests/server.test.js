@@ -3116,8 +3116,8 @@ test("http: subagent-history 202s on cache miss, single-flight per (session,type
 
   const beat = await request("POST", "/api/heartbeat", { body: { device: "sh1" }, headers: agentHeaders });
   assert.deepEqual(beat.body.commands, [
-    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", cmdId: first.body.cmdId },
-    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", cmdId: other.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", agentId: "", cmdId: first.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", agentId: "", cmdId: other.body.cmdId },
   ]);
 });
 
@@ -3126,6 +3126,60 @@ test("http: subagent-history requires a type", async () => {
   const res = await request(
     "GET", "/api/agents/sh2/sessions/s1/subagents/history?label=x", { headers: userHeaders });
   assert.equal(res.status, 400);
+});
+
+// ---- workflow drill-down (XERK-304) ----------------------------------------
+
+test("XERK-304: a workflow row and one of its agents are DISTINCT cache rows", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "wf1" }, headers: agentHeaders });
+
+  const list = "/api/agents/wf1/sessions/s1/subagents/history?type=workflow&label=code-review";
+  const one = list + "&agentId=a0123";
+  const listRes = await request("GET", list, { headers: userHeaders });
+  const oneRes = await request("GET", one, { headers: userHeaders });
+  assert.equal(listRes.status, 202);
+  assert.equal(oneRes.status, 202);
+  assert.notEqual(oneRes.body.cmdId, listRes.body.cmdId,
+    "the run's agent list and one agent's transcript are different reads");
+
+  // Both deliveries land, each under its own key — the agentId is what keeps the
+  // agent's transcript from overwriting the list it was picked from.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf1",
+      subagentHistoryResults: [
+        { sessionId: "s1", type: "workflow", label: "code-review", agentId: "",
+          entries: [], truncated: false, agentsTruncated: false,
+          agents: [{ id: "a0123", label: "review:bugs", status: "done" }] },
+        { sessionId: "s1", type: "workflow", label: "code-review", agentId: "a0123",
+          entries: [{ id: "1", role: "user", text: "review it" }], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+  const gotList = await request("GET", list, { headers: userHeaders });
+  assert.equal(gotList.status, 200);
+  assert.deepEqual(gotList.body.agents, [{ id: "a0123", label: "review:bugs", status: "done" }]);
+  assert.equal(gotList.body.agentsTruncated, false);
+
+  const gotOne = await request("GET", one, { headers: userHeaders });
+  assert.equal(gotOne.status, 200);
+  assert.deepEqual(gotOne.body.entries, [{ id: "1", role: "user", text: "review it" }]);
+  assert.equal(gotOne.body.agents, undefined,
+    "an ordinary transcript must not carry `agents` — its presence is what means `this is a run`");
+});
+
+test("XERK-304: a malformed agentId is refused, never queued", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "wf2" }, headers: agentHeaders });
+  const base = "/api/agents/wf2/sessions/s1/subagents/history?type=workflow&label=x&agentId=";
+  for (const bad of ["../../etc/passwd", "a/b", "a".repeat(65), "a b"]) {
+    const res = await request("GET", base + encodeURIComponent(bad), { headers: userHeaders });
+    assert.equal(res.status, 400, `agentId ${bad} should be refused`);
+    assert.ok(res.body.error);
+  }
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "wf2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [], "a refused id must not reach the agent's queue");
 });
 
 test("http: heartbeat subagentHistoryResults populate the cache; GET returns 200 while fresh", async () => {

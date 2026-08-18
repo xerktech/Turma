@@ -79,7 +79,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const opened = [];
   const posts = [];
   const toasts = [];
-  const chat = { busy: false, stopped: 0, failed: null, closed: 0, reconnected: 0 };
+  const chat = { busy: false, stopped: 0, failed: null, closed: 0, reconnected: 0, rendered: [] };
   // Window-level listeners the page registers (e.g. popstate), so a test can
   // drive the mobile back-button flow that `history.back()` triggers.
   const winListeners = {};
@@ -100,6 +100,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     addEventListener() {}, removeEventListener() {},
     body: makeEl("body"), activeElement: null,
   };
+  const gets = [];
+  let getReply = null;
   const noop = () => {};
   const stubs = {
     document,
@@ -114,6 +116,13 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
         if (postReply) return Promise.resolve({
           ok: postStatus < 400, status: postStatus, json: async () => postReply,
         });
+      }
+      if (!init || (init.method || "GET") === "GET") {
+        gets.push(url);
+        // `setGet` lets a test answer one specific GET (the subagent-history
+        // poll, say) while every other read stays inert.
+        const body = getReply && getReply(url);
+        if (body) return Promise.resolve({ ok: true, status: 200, json: async () => body });
       }
       return new Promise(() => {});
     },
@@ -140,7 +149,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       // returns (XERK-252) — both are observable only from here.
       close: () => { chat.closed++; },
       reconnectNow: () => { chat.reconnected++; },
-      onPoll: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
+      onPoll: noop, closeStatic: noop, repaint: noop,
+      renderStatic: (o) => { chat.rendered.push(o); },
       // The chat engine owns the live busy read and the interrupt; the terminal's
       // compose button just defers to it. `busy` is what a test flips to model a
       // turn being in flight, and `stopped` records the delegation.
@@ -176,12 +186,14 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
+      + " openSubagentView, transcriptBack,"
       + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts, toasts, chat, sse, body: document.body,
+  return { ...api, els, opened, posts, toasts, chat, sse, gets, body: document.body,
+    setGet: (fn) => { getReply = fn; },
     // `setOrg` narrows the header's org filter, the way picking an org in the
     // menu does — the sidebar lists only that org's hosts afterwards.
     setOrg: (k) => { stubs.TurmaOrg._k = k; } };
@@ -1887,4 +1899,82 @@ test("prBadgeHtml: !n for GitLab/ADO, #n for GitHub", () => {
     prBadgeHtml({ url: "https://gitlab.example.com/grp/app/-/merge_requests/13" }), /!13/);
   assert.match(
     prBadgeHtml({ url: "https://dev.azure.com/org/P/_git/app/pullrequest/9" }), /!9/);
+});
+
+// --- workflow drill-down (XERK-304) ------------------------------------------
+// A Workflow row is N agents and has no conversation of its own, so it opens the
+// run's agent picker rather than a transcript. `agents` present in the reply —
+// the empty list included — is the whole signal.
+
+function liveWorkflowPage() {
+  const page = loadPage();
+  const { now, host: h } = host([working("s1", "Doing work")]);
+  page.beat({ now, agents: [h] });
+  page.selectSession("s1");
+  return page;
+}
+
+test("XERK-304: a workflow row opens the run's agent picker, not an empty transcript", async () => {
+  const page = liveWorkflowPage();
+  page.setGet((url) => url.includes("/subagents/history") ? {
+    entries: [],
+    agents: [
+      { id: "ag1", label: "review:bugs", status: "done" },
+      { id: "ag2", label: "verify:auth.ts", status: "running" },
+    ],
+    agentsTruncated: false,
+  } : null);
+  await page.openSubagentView("workflow", "code-review");
+
+  const html = page.els.trScroll.innerHTML;
+  assert.match(html, /review:bugs/);
+  assert.match(html, /verify:auth\.ts/);
+  assert.match(html, /data-wfid="ag2"/);
+  assert.match(html, /wf-status running/, "a running agent is marked as such");
+  assert.equal(page.chat.rendered.length, 0,
+    "the run itself has no conversation to render");
+  // The list read is the one with no agentId — that is what asks for the run.
+  assert.ok(page.gets.some((u) => u.includes("type=workflow") && u.includes("agentId=")),
+    "the row is fetched by type + label with an empty agentId");
+});
+
+test("XERK-304: a run that has started nothing says so, rather than 'unavailable'", async () => {
+  const page = liveWorkflowPage();
+  page.setGet((url) => url.includes("/subagents/history")
+    ? { entries: [], agents: [], agentsTruncated: false } : null);
+  await page.openSubagentView("workflow", "code-review");
+  assert.match(page.els.trScroll.innerHTML, /hasn't started any agents yet/);
+  assert.doesNotMatch(page.els.trScroll.innerHTML, /unavailable/);
+});
+
+test("XERK-304: picking one agent renders its transcript and Back returns to the RUN", async () => {
+  const page = liveWorkflowPage();
+  page.setGet((url) => url.includes("agentId=ag1")
+    ? { entries: [{ id: "1", role: "user", text: "review it" }] }
+    : { entries: [], agents: [{ id: "ag1", label: "review:bugs", status: "done" }] });
+
+  await page.openSubagentView("workflow", "code-review");
+  assert.equal(page.chat.rendered.length, 0);
+
+  await page.openSubagentView("workflow", "code-review", "ag1");
+  assert.equal(page.chat.rendered.length, 1, "one agent IS a conversation");
+  assert.deepEqual(page.chat.rendered[0].entries, [{ id: "1", role: "user", text: "review it" }]);
+  assert.equal(page.els.trBackLabel.textContent, " Workflow",
+    "Back names the rung it actually returns to");
+
+  // Back from one agent goes to that run's list — the middle rung — and only
+  // from there to the session.
+  page.transcriptBack();
+  await new Promise((r) => setImmediate(r));
+  assert.match(page.els.trScroll.innerHTML, /review:bugs/, "back landed on the run's agent list");
+  assert.equal(page.els.trBackLabel.textContent, " Session");
+});
+
+test("XERK-304: an ordinary agent row is untouched — no picker, straight to its transcript", async () => {
+  const page = liveWorkflowPage();
+  page.setGet((url) => url.includes("/subagents/history")
+    ? { entries: [{ id: "1", role: "assistant", text: "found it" }] } : null);
+  await page.openSubagentView("Explore", "Map the code");
+  assert.equal(page.chat.rendered.length, 1);
+  assert.equal(page.els.trBackLabel.textContent, " Session");
 });

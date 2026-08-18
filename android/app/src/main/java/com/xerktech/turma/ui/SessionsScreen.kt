@@ -357,6 +357,9 @@ fun SessionsRoute(
     // that session's chat. Cleared whenever a different session/ended row is picked.
     var subType by rememberSaveable { mutableStateOf<String?>(null) }
     var subLabel by rememberSaveable { mutableStateOf<String?>(null) }
+    // The workflow drill-down's third rung (XERK-304): non-empty while ONE agent
+    // of a run is open, so Back goes to that run's agent list before the session.
+    var subAgentId by rememberSaveable { mutableStateOf("") }
     // The search box's query, held HERE rather than in the list pane (XERK-243):
     // narrow mode swaps the list out for the open session entirely, so a query
     // remembered inside it dies on the way in and the operator is back to an
@@ -364,14 +367,21 @@ fun SessionsRoute(
     // in turn, so it has to survive the round trip.
     var query by rememberSaveable { mutableStateOf("") }
     val select: (String, String) -> Unit = { h, s ->
-        endHost = null; endTid = null; subType = null; subLabel = null; selHost = h; selId = s
+        endHost = null; endTid = null; subType = null; subLabel = null; subAgentId = ""
+        selHost = h; selId = s
     }
     val selectEnded: (String, String) -> Unit = { h, tid ->
-        selHost = null; selId = null; subType = null; subLabel = null; endHost = h; endTid = tid
+        selHost = null; selId = null; subType = null; subLabel = null; subAgentId = ""
+        endHost = h; endTid = tid
     }
-    val clearSub: () -> Unit = { subType = null; subLabel = null }
+    // Back out of the subagent stage one rung at a time: one agent of a workflow
+    // run returns to that run's agent list, and only the list returns to the chat.
+    val clearSub: () -> Unit = {
+        if (subAgentId.isNotEmpty()) subAgentId = "" else { subType = null; subLabel = null }
+    }
     val clear: () -> Unit = {
-        selHost = null; selId = null; endHost = null; endTid = null; subType = null; subLabel = null
+        selHost = null; selId = null; endHost = null; endTid = null
+        subType = null; subLabel = null; subAgentId = ""
     }
     val hasLive = !selHost.isNullOrEmpty() && !selId.isNullOrEmpty()
     val hasEnded = !endHost.isNullOrEmpty() && !endTid.isNullOrEmpty()
@@ -380,13 +390,15 @@ fun SessionsRoute(
 
     val detail: @Composable () -> Unit = {
         // key() so switching sessions rebuilds the detail subtree (a fresh VM).
-        key(selHost, selId, endHost, endTid, subType, subLabel) {
+        key(selHost, selId, endHost, endTid, subType, subLabel, subAgentId) {
             when {
                 hasSub -> SubagentView(
                     host = selHost.orEmpty(),
                     sessionId = selId.orEmpty(),
                     type = subType.orEmpty(),
                     label = subLabel.orEmpty(),
+                    agentId = subAgentId,
+                    onOpenAgent = { id -> subAgentId = id },
                     onBack = clearSub,
                 )
                 hasEnded -> EndedSessionView(
@@ -402,7 +414,7 @@ fun SessionsRoute(
                     onBack = clear,
                     onTerminal = { onTerminal(selHost.orEmpty(), selId.orEmpty()) },
                     showBack = !wide,
-                    onOpenSubagent = { t, l -> subType = t; subLabel = l },
+                    onOpenSubagent = { t, l -> subType = t; subLabel = l; subAgentId = "" },
                 )
             }
         }
@@ -1193,12 +1205,16 @@ private fun SubagentView(
     sessionId: String,
     type: String,
     label: String,
+    agentId: String,
+    onOpenAgent: (String) -> Unit,
     onBack: () -> Unit,
     vm: com.xerktech.turma.vm.SubagentViewModel = viewModel(),
 ) {
     val ui by vm.state.collectAsStateWithLifecycle()
     var verbosity by remember { mutableStateOf(Verbosity.VERBOSE) }
-    LaunchedEffect(host, sessionId, type, label) { vm.open(host, sessionId, type, label) }
+    LaunchedEffect(host, sessionId, type, label, agentId) {
+        vm.open(host, sessionId, type, label, agentId)
+    }
 
     Scaffold(
         topBar = {
@@ -1216,14 +1232,26 @@ private fun SubagentView(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Session") }
+                    // Names the rung Back actually goes to: one agent of a
+                    // workflow run returns to that run's list, not the session.
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            if (agentId.isNotEmpty()) "Workflow" else "Session",
+                        )
+                    }
                 },
                 actions = { ChatSettingsMenu(verbosity) { verbosity = it } },
             )
         },
     ) { pad ->
+        val agents = ui.agents
         Box(Modifier.fillMaxSize().padding(pad)) {
             when {
+                // `agents` non-null is what says "this is a run, not a
+                // conversation" — an empty list is a run that has started
+                // nothing yet, which is an answer and not an error.
+                agents != null -> WorkflowAgentPicker(agents, ui.agentsTruncated, onOpenAgent)
                 ui.entries.isNotEmpty() -> {
                     val items = buildItems(ui.entries, VerbosityPrefs.forPreset(verbosity))
                     SelectionContainer(Modifier.fillMaxSize()) {
@@ -1236,6 +1264,67 @@ private fun SubagentView(
                 }
                 ui.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 else -> EndedMessage("Agent transcript unavailable.")
+            }
+        }
+    }
+}
+
+/**
+ * The agent picker a workflow row opens (XERK-304) — the Android mirror of the
+ * web's `renderWorkflowAgents`. One row per agent in the run, tapping one opens
+ * that agent's own transcript in this same stage.
+ */
+@Composable
+private fun WorkflowAgentPicker(
+    agents: List<com.xerktech.turma.model.WorkflowAgent>,
+    truncated: Boolean,
+    onOpen: (String) -> Unit,
+) {
+    if (agents.isEmpty()) {
+        EndedMessage("This workflow hasn't started any agents yet.")
+        return
+    }
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        items(agents.size) { i ->
+            val a = agents[i]
+            TurmaCard(Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickable { onOpen(a.id) }
+                        .padding(horizontal = 10.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        a.label.ifBlank { a.id },
+                        Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (a.status.isNotBlank()) {
+                        Text(
+                            a.status,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (a.status == "running") MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        if (truncated) {
+            item {
+                Text(
+                    "Showing the first ${agents.size} agents of this run.",
+                    Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
