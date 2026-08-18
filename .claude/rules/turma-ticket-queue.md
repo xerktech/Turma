@@ -54,6 +54,14 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
     every verdict every 15s, so an unthrottled "this org is at its share" is a line about a
     condition that will still hold in 15 seconds — it buries the log in exactly the situation it
     exists to explain. Per-event lines (queued / dispatched / dropped) are not throttled.
+- **A MANUAL entry never leaves the queue silently.** Every way the hub GIVES UP on one — the
+  blocked timer, the stale timer, the max-wait backstop — goes TERMINAL (`reason:"expired"`, on the
+  payload, with the ✕), never `drop()`. The ways it stops being work (dispatched, cancelled, its
+  ticket reached Done) still just go, and an AUTO entry always does: the next sweep re-queues it if
+  it still qualifies. The blocked timer's silent drop was survivable while only a click could reach
+  that state and the operator was watching it; a reclaimed spawn (XERK-303) arrives with nobody
+  watching, so a click could vanish 30 minutes later with nothing on the board — the class of thing
+  this queue exists to stop. `giveUp()` in `drainTicketQueue` is the one place that decides.
 - **A hold is not forever**, and `TICKET_QUEUE_MAX_WAIT_MS` is the backstop under all of them: an
   entry whose ticket no reporting org lists any more ages out (`TICKET_QUEUE_STALE_MS`, long enough
   to ride out a poll gap or host restart), and one nothing can route ages out
@@ -93,8 +101,9 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
     withdrawn in any of those; the sweep runs again in 15s, so the rescue lands the moment a slot
     exists.
   - One residue is deliberate: once reclaimed the ticket is an **ordinary queue entry**, so an older
-    entry can beat it to the slot and it can eventually expire — VISIBLY, as the terminal note every
-    queued ticket gets. That is the queue's contract, not a silent loss.
+    entry can beat it to the slot and it can eventually end — on the max-wait backstop, or on the
+    blocked timer if the rest of the fleet goes dark behind it. Both leave a terminal note now (see
+    the manual-entry rule below), which is what makes that acceptable rather than a silent loss.
   - Admission is then checked BEFORE the withdrawal — `enqueueTicketStart` can still refuse a full
     org line, and dropping a command that then fails to re-queue is the same destruction by another
     route.
@@ -116,6 +125,11 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
   which is what makes the dozen `c.type`/`c.cmdId` reads across the file safe. `normalizeRecord`
   does not walk `commands`, and a corrupt or hand-edited `state.json` is the only door — nothing on
   the wire reaches the array and `queueCommand` only pushes objects.
+  - **Both the CONTAINER's type and the ELEMENTS'.** A non-array `commands` is REWRITTEN to `[]`,
+    not skipped past: it is fatal one line sooner than a junk element (`.some` is not a function,
+    `for…of` a plain object is not iterable), and a bare string is a plausible hand-edit precisely
+    because it looks scalar. Same rule, and same reason, as `normalizeSessions` rewriting a
+    non-array `sessions`.
   - **The read that matters is `autoStartSweep`'s**, because it runs in a `setInterval` with no
     `uncaughtException` handler behind it: `null.type` there is not a failed request, it EXITS THE
     HUB — every host's control plane — and re-fires 15s after each restart.

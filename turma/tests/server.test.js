@@ -143,6 +143,7 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
   dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot, holdQueued,
+  liveQueueCount,
   reclaimStrandedTicketSpawns,
   TICKET_QUEUE_PER_ORG_MAX, TICKET_QUEUE_PER_ORG_AUTO_MAX, TICKET_QUEUE_MAX_WAIT_MS,
   TICKET_QUEUE_EXPIRED_TTL_MS, logQueueState, TICKET_QUEUE_NOTES_MAX,
@@ -5650,7 +5651,12 @@ test("XERK-296: an entry whose ticket stops existing ages out of its org's line"
   queuedTicket("tq19.atlassian.net", "ENG-5").unknownSince =
     Date.now() - TICKET_QUEUE_STALE_MS - 1;
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0);
+  assert.equal(liveQueueCount(), 0, "out of the line…");
+  // …but a MANUAL click never leaves silently (XERK-303): it goes terminal, on
+  // the payload, with the ✕ — the same treatment the max-wait backstop gives.
+  const note = queuedTicket("tq19.atlassian.net", "ENG-5");
+  assert.equal(note.reason, "expired");
+  assert.match(note.error, /no agent reports that ticket any more/);
 });
 
 test("XERK-296: a permanently blocked entry ages out; an auto one leaves at once", async () => {
@@ -5667,12 +5673,17 @@ test("XERK-296: a permanently blocked entry ages out; an auto one leaves at once
   assert.match(e.error, /no triaged repo/);
   e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0, "a manual click is given a while, then let go");
-  // An AUTO entry is re-derivable, so it leaves the line the moment it can't be
+  assert.equal(liveQueueCount(), 0, "a manual click is given a while, then let go");
+  // Let go VISIBLY (XERK-303). It was survivable while only a click could reach
+  // this state and the operator was watching it; a reclaimed spawn arrives with
+  // nobody watching, so a silent drop is a click that vanishes 30 minutes later.
+  assert.equal(queuedTicket("tq20.atlassian.net", "ENG-5").reason, "expired");
+  // An AUTO entry is re-derivable, so it leaves outright the moment it can't be
   // routed — the sweep re-queues it as soon as it's eligible again.
+  dropQueuedTicket("tq20.atlassian.net", "ENG-5", null);
   assert.ok(enqueueTicketStart("tq20.atlassian.net", "ENG-5", "auto"));
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0);
+  assert.equal(ticketQueue.length, 0, "and leaves nothing behind");
 });
 
 test("XERK-296: the heartbeat itself drains the queue (a freed slot fills in a beat)", async () => {
@@ -5912,6 +5923,54 @@ test("XERK-303: junk in a restored command list is DROPPED, not carried", async 
   assert.deepEqual(mod.agents.junkHost.commands.map((c) => c.cmdId), ["k1"]);
   assert.ok(mod.agents.junkHost.commands[0].deliveredAt, "and the survivor is stamped");
   fs.unlinkSync(f);
+});
+
+test("XERK-303: a non-ARRAY commands list is rewritten, not skipped past", async () => {
+  // Fatal one line SOONER than a junk element: `(a.commands || []).some` is not
+  // a function, and `for…of` a plain object is not iterable — same setInterval,
+  // same no-handler exit. A string is a plausible hand-edit precisely because it
+  // looks scalar.
+  for (const junk of ['"junk"', "5", '{"0":{"type":"kill","cmdId":"k1"}}', "true"]) {
+    const f = path.join(os.tmpdir(), `turma-x303-arr-${process.pid}.json`);
+    fs.writeFileSync(f, `{"badHost":{"device":"badHost","lastSeen":${Date.now()},`
+      + `"sessions":[],"repos":[],"commands":${junk}}}`);
+    const mod = freshServerModule((env) => { env.STATE_FILE = f; });
+    assert.deepEqual(mod.agents.badHost.commands, [], `commands:${junk} rewritten`);
+    assert.doesNotThrow(() => { mod.autoStartSweep(); }, `sweep survives ${junk}`);
+    assert.doesNotThrow(() => { mod.reclaimStrandedTicketSpawns(); }, `reclaim survives ${junk}`);
+    fs.unlinkSync(f);
+  }
+});
+
+test("XERK-303: a MANUAL entry the hub gives up on never leaves the queue silently", async () => {
+  // The reclaim puts entries in the queue with nobody watching, so the blocked
+  // timer's silent drop became a click that vanishes 30 minutes later with
+  // nothing on the board. Every give-up path a manual entry can reach must leave
+  // a terminal note, exactly as the max-wait backstop does.
+  resetAutoStart();
+  await asBeat("tqGoneA", "tq57.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  await asBeat("tqGoneB", "tq57.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  const r = await startTicket("tq57.atlassian.net", "ENG-5");
+  assert.equal(r.body.host, "tqGoneA");
+  agents.tqGoneA.lastSeen = Date.now() - 10 * 60 * 1000;
+  agents.tqGoneB.capacity = { ...ROOMY };
+  reclaimStrandedTicketSpawns();                    // rescued into the queue…
+  assert.ok(queuedTicket("tq57.atlassian.net", "ENG-5"));
+  // …and then the whole fleet goes dark, which is the likeliest continuation of
+  // whatever killed the first host.
+  agents.tqGoneB.lastSeen = Date.now() - 10 * 60 * 1000;
+  drainTicketQueue();
+  const e = queuedTicket("tq57.atlassian.net", "ENG-5");
+  assert.equal(e.reason, "blocked");
+  e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
+  drainTicketQueue();
+  assert.equal(liveQueueCount(), 0, "out of the line");
+  const note = queuedTicket("tq57.atlassian.net", "ENG-5");
+  assert.ok(note, "but NOT gone without a word");
+  assert.equal(note.reason, "expired");
+  const payload = ticketQueuePayload().find((q) => q.issueKey === "ENG-5");
+  assert.equal(payload.reason, "expired", "and the board can see it");
+  assert.match(payload.error, /nothing could run it/);
 });
 
 test("XERK-303: a junk command cannot take the whole hub down via the 15s sweep", async () => {

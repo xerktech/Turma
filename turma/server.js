@@ -1396,7 +1396,8 @@ function invalidateAgentsCache() { agentsCache = null; }
 // with the ingest path, where these commands are live in memory and their stamps
 // are the truth.
 //
-//  1. DROP any element that is not an object. `normalizeRecord` does not walk
+//  1. REWRITE a non-array `commands`, and DROP any element that is not an
+//     object. `normalizeRecord` does not walk
 //     `commands`, and a corrupt or hand-edited state.json is the only way one
 //     gets in — nothing on the wire reaches this array, and `queueCommand` only
 //     ever pushes objects. Dropping it HERE is what makes every `c.type` /
@@ -1413,7 +1414,21 @@ function invalidateAgentsCache() { agentsCache = null; }
 function sanitizeRestoredCommands(reg) {
   const at = Date.now();
   for (const a of Object.values(reg || {})) {
-    if (!a || !Array.isArray(a.commands)) continue;
+    if (!a || typeof a !== "object" || !("commands" in a)) continue;
+    // The CONTAINER's type, checked before the elements'. Skipping a non-array
+    // leaves it in the registry, and it is fatal one line sooner than a junk
+    // element is: `(a.commands || []).some` is not a function, `for…of` a plain
+    // object is not iterable — the same `setInterval` with the same no-handler
+    // exit behind it, and `publicCommands`/the ack filter break identically. A
+    // string is a plausible shape for a hand-edited file precisely because it
+    // looks scalar. Rewritten, not skipped, for the same reason `normalizeSessions`
+    // rewrites a non-array `sessions`.
+    if (!Array.isArray(a.commands)) {
+      console.warn(`dropped a malformed queued command list restored for `
+        + `${logName(a.device)} (${typeof a.commands}, not an array)`);
+      a.commands = [];
+      continue;
+    }
     const clean = a.commands.filter((c) => c && typeof c === "object");
     if (clean.length !== a.commands.length) {
       console.warn(`dropped ${a.commands.length - clean.length} malformed queued `
@@ -4846,6 +4861,24 @@ function drainTicketQueue() {
       changed = true;
       if (why) console.log(`ticket queue: dropped ${logName(e.issueKey)} — ${why}`);
     };
+    // Every way the hub GIVES UP on an entry, as against the ways it stops being
+    // work (dispatched, cancelled, its ticket reached Done). An AUTO entry is
+    // re-derivable — the next sweep re-queues it if it still qualifies — so it
+    // just goes. A MANUAL one is an operator's click and must never leave the
+    // queue silently: it goes TERMINAL, on the payload, with the ✕, exactly as
+    // the max-wait backstop below does. The blocked timer used to `drop()` here,
+    // which was survivable while only a click could put an entry in this state
+    // and the operator was watching it; a reclaimed spawn (XERK-303) arrives
+    // without anyone watching, so a click could vanish 30 minutes later with
+    // nothing on the board — the class of thing this whole queue exists to stop.
+    const giveUp = (why, msg) => {
+      if (e.source !== "manual") { drop(why); return; }
+      e.expiredAt = now;
+      e.reason = "expired";
+      e.error = msg;
+      changed = true;
+      console.log(`ticket queue: ${logName(e.issueKey)} gave up — ${why}`);
+    };
     // A terminal entry is a message to the operator, not work: it holds nothing,
     // dispatches nothing, and leaves once it has been on screen long enough to
     // be read (or the moment they dismiss it with the ✕).
@@ -4875,7 +4908,8 @@ function drainTicketQueue() {
     if (!row) {
       if (!e.unknownSince) { e.unknownSince = now; changed = true; }
       if (now - e.unknownSince > TICKET_QUEUE_STALE_MS) {
-        drop("no reporting org lists that ticket any more");
+        giveUp("no reporting org lists that ticket any more",
+          "no agent reports that ticket any more — it stopped waiting");
       }
       continue;
     }
@@ -4908,7 +4942,8 @@ function drainTicketQueue() {
       changed = holdQueued(e, "blocked", "that ticket has no triaged repo yet") || changed;
       if (!e.blockedSince) e.blockedSince = now;
       if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
-        drop("it stayed blocked with nothing the hub could do about it");
+        giveUp("it stayed blocked with nothing the hub could do about it",
+          "it waited 30 minutes with no triaged repo — triage it and start it again");
       }
       continue;
     }
@@ -4925,7 +4960,8 @@ function drainTicketQueue() {
       // does, and the blocked timer below is what ends it if nobody acts.
       if (!e.blockedSince) e.blockedSince = now;
       if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
-        drop("it stayed blocked with nothing the hub could do about it");
+        giveUp("it stayed blocked with nothing the hub could do about it",
+          `it waited 30 minutes and nothing could run it — ${error || "no host was available"}`);
       }
       continue;
     }
