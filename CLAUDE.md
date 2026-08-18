@@ -20,7 +20,8 @@ that component's files.
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**`, `agent/hub-agent.py` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
 | `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | run-as identity, container boot, start-time Claude Code check, bundled toolchains |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
-| `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, archive, notifications, auth |
+| `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, history, notifications, auth |
+| `.claude/rules/turma-archive.md` | `turma/archive.js` + its tests | the durable archive: layers, the two size ceilings, how the total is measured |
 | `.claude/rules/turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
 | `.claude/rules/turma-ticket-queue.md` | `turma/public/board.*`, `turma/server.js` | the hub's ticket queue: admission, drain, expiries, caps |
@@ -325,9 +326,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
-  - It also carries the migration spool (`MIGRATE_SPOOL_DIR`), which is transient by design and
-    shares that volume's SPACE with the archive — hence `MIGRATE_INFLIGHT_MAX`. No compose change:
-    both default under `/data`.
+  - **Three things share that volume's SPACE**, and each is bounded separately: the archive by
+    `ARCHIVE_TOTAL_MAX_BYTES` (`.claude/rules/turma.md`), the migration spool
+    (`MIGRATE_SPOOL_DIR`, transient by design) by `MIGRATE_INFLIGHT_MAX`, and `state.json` by
+    nothing at all — which is why the other two have ceilings. No compose change: all default
+    under `/data`.
+  - `ARCHIVE_TRANSCRIPT_MAX_BYTES` bounds one transcript rather than the store. Neither archive
+    ceiling counts `index.db`, which lives on the same volume and is unbounded across fill/wipe
+    cycles (XERK-332) — size the volume for that too.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
   `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
   the agent reports `localModel.available:false` so clients hide the control.
