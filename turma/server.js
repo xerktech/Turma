@@ -6093,10 +6093,19 @@ const server = http.createServer(async (req, res) => {
       // an archive/DB hiccup must never break the heartbeat.
       const archiveManifest = payload.archiveManifest;
       delete payload.archiveManifest;
-      let archiveHave;
+      let archiveHave, archiveShed, archiveFull;
       if (Array.isArray(archiveManifest) && archiveManifest.length) {
-        try { archiveHave = archive.manifestCursors(key, archiveManifest); }
-        catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
+        try {
+          archiveHave = archive.manifestCursors(key, archiveManifest);
+          // The budget state that goes back with the cursors (XERK-267): which
+          // transcripts have spent their per-transcript budget, so the agent
+          // strips the inline file payloads before shipping them, and whether
+          // the store is full, so it doesn't push at all this pass. Advisory —
+          // archive.ingestChunk enforces both on its own.
+          const limits = archive.archiveLimits(Object.keys(archiveHave));
+          archiveShed = limits.shed.length ? limits.shed : undefined;
+          archiveFull = limits.full || undefined;
+        } catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
       }
       const next = (agents[key] = {
         ...payload,
@@ -6289,8 +6298,9 @@ const server = http.createServer(async (req, res) => {
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
-      return json(res, 200,
-        archiveHave ? { commands: reply, archiveHave } : { commands: reply });
+      return json(res, 200, archiveHave
+        ? { commands: reply, archiveHave, archiveShed, archiveFull }
+        : { commands: reply });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart

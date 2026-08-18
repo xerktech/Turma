@@ -138,21 +138,29 @@ CVE-2026-69249 exp:2026-10-25
 # HashiCorp ships a stable release built against x/net 0.56+.
 CVE-2026-46600 exp:2026-10-25
 
-# CVE-2026-33818 / CVE-2026-39821 / CVE-2026-56853 / CVE-2026-56858 /
-# CVE-2026-56859 / CVE-2026-56860 / CVE-2026-56862 — seven HIGH Go stdlib
-# issues (asn1 recursion, x/net/idna Punycode handling, cleartext HTTP/2,
-# html/template XSS, encoding/xml recursion, net/url quadratic parsing,
-# crypto/tls KeyUpdate flooding), all fixed in Go 1.25.13 / 1.26.6.
-# Carriers are the four bundled third-party Go CLIs and nothing else:
-# /usr/local/bin/{docker,gh,glab,terraform}. Checked 2026-08-17 by downloading
-# the newest upstream release of each and scanning it — gh 2.97.0, docker
-# 29.7.2 and glab 1.113.0 are all built with Go 1.26.5, and terraform 1.15.8
-# (still the newest stable) with Go 1.25.10, so every one of them still carries
-# all seven and DOCKER_CLI_VERSION / GH_VERSION / GLAB_VERSION /
-# TERRAFORM_VERSION have nothing to bump to. Not first-party code, and each is
-# a CLI a session runs by hand against endpoints it already chose. The expiry
-# forces the revisit: the first upstream rebuild on Go 1.25.13+/1.26.6+ clears
-# the lot with a pin bump.
+# CVE-2026-33818 / -39821 / -56853 / -56858 / -56859 / -56860 / -56862 — the
+# Go 1.25.13 / 1.26.6 stdlib batch: DoS via recursion in encoding/asn1 and
+# encoding/xml, quadratic net/url path parsing, indefinite crypto/tls KeyUpdate,
+# unencrypted HTTP/2, html/template XSS on pathological input, and an
+# x/net/idna Punycode label-processing escalation.
+#
+# All seven reach us ONLY through bundled third-party Go CLIs — docker, gh, glab
+# and terraform — and every one of those is ALREADY at its newest upstream
+# release built on a still-vulnerable toolchain, verified by reading the Go
+# build stamp out of each binary on 2026-08-18:
+#   docker 29.7.2  go1.26.5   (pinned 29.6.2; bumping does not clear these)
+#   gh     2.97.0  go1.26.5   (pinned 2.96.0;  "  )
+#   glab   1.113.0 go1.26.5   (pinned 1.111.0; "  )
+#   terraform 1.15.8 go1.25.10 (already the latest release)
+# The fix is go1.25.13 / 1.26.6 / 1.27.0-rc.3, so there is nothing to bump to
+# until upstream rebuilds. DOCKER_CLI_VERSION / GH_VERSION / GLAB_VERSION /
+# TERRAFORM_VERSION pick the patched toolchain up on their next release.
+#
+# Not first-party code: the hub is Node and the agent is Python, so no Turma
+# code links any of this. Each CLI is invoked by a session by hand against
+# input it chose, which bounds every DoS here to that one invocation; the
+# html/template XSS needs the binary to render a template into a browser, which
+# none of these four does. The expiry forces a revisit rather than a mute.
 CVE-2026-33818 exp:2026-10-17
 CVE-2026-39821 exp:2026-10-17
 CVE-2026-56853 exp:2026-10-17

@@ -1,14 +1,41 @@
 ---
 paths:
   - "agent/hooks/**"
+  - "agent/hub-agent.py"
 ---
 
 # `agent/hooks/` — the guard and AskUserQuestion hooks
 
 `agent/hooks/guard.py` and `agent/hooks/ask.py` are stdlib-only, land at `/usr/local/bin/hooks/`,
 and are wired by `hub-agent.py`'s `build_guard_settings()` into the `--settings` file every session
-launches with. The guard's *policy* (what it denies and why) is in `CLAUDE.md`; this is the
-implementation contract.
+launches with. This file carries both halves: the *policy* (what it denies and why) and the
+implementation contract behind it.
+
+## Policy — what the guard denies, and why
+
+- Sessions run hands-off, so every launch passes `--settings` a generated file
+  (`build_guard_settings()` → `~/.turma/guard-settings.json`) wiring `PreToolUse` hooks over Bash
+  and the file-editing tools, plus `permissions.deny` rules on host credential stores (`~/.ssh`,
+  `~/.aws`, `~/.azure`, `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every
+  session, so deny wins even under bypass.
+- **`~/.claude` is guarded by `hooks/fileguard.py`, not by a pattern**: the rule is "everything
+  under it except the two agent-memory trees", and a glob list cannot express that — deny beats
+  allow, and **a deny matching a DIRECTORY takes its whole subtree**, so `Edit(~/.claude/*)` is the
+  blanket rule. Patterns still cover the catastrophic subset as defence in depth; the mechanics are
+  under "Implementation contract" below.
+- It hard-denies three narrow categories, each with a reason the agent self-corrects from:
+  **destructive** (`rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes,
+  recursive `chmod`/`chown` of system roots, protected-branch history destruction, `DROP
+  DATABASE|TABLE`); **policy** (push to / delete `main`/`master`, or self-merging a PR/MR — work
+  lands via a PR a human merges); **attribution** (AI self-attribution trailers in commit/PR
+  messages).
+- Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) is untouched. Allowlist a
+  command via `$TURMA_TOOL_GRANTS` (CSV of `Bash(<cmd>)`), attribution via
+  `$TURMA_NO_ATTRIBUTION=0`.
+- It classifies what the SHELL runs, **never the raw string** — `qa.md` §6.1 is the rule and its
+  limits.
+
+## Implementation contract
 
 - **Guard** (`hooks/guard.py`, stdlib-only at `/usr/local/bin/hooks/guard.py`) — a `PreToolUse` hook
   over Bash, plus the `permissions.deny` credential-store rules. It classifies what the SHELL runs,

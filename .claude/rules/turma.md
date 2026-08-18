@@ -217,16 +217,8 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 
 ## Durable archive
 
-- The hub hosts a **durable, searchable archive of ended sessions** (`turma/archive.js`): agents
-  push each inactive transcript in, landing as **organized files on `/data`** — one folder per repo,
-  each renamed + dated `/data/archive/<repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl` (+ a
-  `.meta` sidecar), indexed in a **`node:sqlite` FTS5** DB (`/data/archive/index.db`, Node-core, no
-  npm), rebuildable from the files.
-- The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
-  `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
-  browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest
-  is agent-token-authed; the manifest cursors ride the heartbeat reply.
-- Tests: `archive.test.js`, `server.test.js`.
+See `.claude/rules/turma-archive.md` (scoped to `turma/archive.js` + its tests) — the store's two
+layers, the size ceilings, and the rules about how the total is measured.
 
 ## `POST /api/trigger` — external automation
 
