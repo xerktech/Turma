@@ -4491,7 +4491,7 @@ def _session_transcript_path(sess):
     return _newest_transcript_path(wt)
 
 
-def _first_user_text(path, max_lines=500):
+def _first_user_text(path, max_lines=500, max_bytes=None):
     """The first genuine human prompt from the START of a transcript, or None.
 
     Reads forward from the top and returns the first `user` entry that carries
@@ -4506,36 +4506,47 @@ def _first_user_text(path, max_lines=500):
     the original attempt saw, however many turns later it runs. Bounded to the
     first max_lines lines so an already-long resumed transcript can't make this
     walk expensive (the real first prompt sits within the first handful of entries
-    anyway)."""
+    anyway).
+
+    `max_bytes` additionally bounds the READ ITSELF rather than the line count.
+    Line iteration holds one whole line in memory, so a transcript whose first
+    line is enormous costs that much RSS however low max_lines is — which the
+    workflow picker cannot afford, calling this once per agent in a run on a
+    memory-limited container."""
+    def _scan(lines):
+        for i, line in enumerate(lines):
+            if i >= max_lines:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "user" or entry.get("isMeta"):
+                continue
+            if entry.get("promptSource") == "system":
+                continue  # injected turn (e.g. a task-notification), not human
+            if entry.get("isCompactSummary"):
+                continue  # the model's own summary, injected as a user turn
+            if _entry_local_command(entry):
+                continue  # slash-command plumbing, not a real prompt
+            text = _entry_text(entry)
+            if not text:
+                continue  # tool_result-only turn, or empty after stripping
+            return text
+        return None
+
     try:
+        if max_bytes is not None:
+            return _scan(_read_head_lines(path, max_bytes))
         with open(path, errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("type") != "user" or entry.get("isMeta"):
-                    continue
-                if entry.get("promptSource") == "system":
-                    continue  # injected turn (e.g. a task-notification), not human
-                if entry.get("isCompactSummary"):
-                    continue  # the model's own summary, injected as a user turn
-                if _entry_local_command(entry):
-                    continue  # slash-command plumbing, not a real prompt
-                text = _entry_text(entry)
-                if not text:
-                    continue  # tool_result-only turn, or empty after stripping
-                return text
+            return _scan(f)
     except OSError:
         return None
-    return None
 
 
 def _first_command_name(path, max_lines=50):
@@ -4927,8 +4938,11 @@ VALID_WORKFLOW_RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]{1,64}$")
 WORKFLOW_AGENTS_MAX = 200
 WORKFLOW_AGENT_LABEL_CHARS = 160
 # A workflow agent's transcript opens with its prompt, so the label read never
-# has to walk far in; this only bounds a pathological one.
+# has to walk far in; these only bound a pathological one. The BYTE bound is the
+# load-bearing half: the picker reads a label per agent, and line-count alone
+# would still hold one enormous first line in the container's memory.
 WORKFLOW_LABEL_MAX_LINES = 50
+WORKFLOW_LABEL_MAX_BYTES = 1 << 18
 
 
 def _read_head_lines(path, max_bytes):
@@ -5009,33 +5023,119 @@ def _workflow_agent_files(run_dir):
             if not VALID_WORKFLOW_AGENT_ID_RE.match(aid) or aid in out:
                 continue
             path = os.path.join(dirpath, name)
-            if os.path.isfile(path):
+            # islink as well as isfile: isfile FOLLOWS, so a symlinked
+            # `agent-<id>.jsonl` would appear as a phantom agent whose "transcript"
+            # is whatever it points at. os.walk already refuses to descend
+            # directory symlinks; this is the file half of the same rule.
+            if os.path.isfile(path) and not os.path.islink(path):
                 out[aid] = path
     return out
 
 
+# A journal `result` line carries the agent's RETURN VALUE, so its size is
+# unbounded in principle. Lines up to this are parsed exactly; a longer one is
+# matched by its head instead of being buffered whole.
+JOURNAL_LINE_MAX = 1 << 18
+JOURNAL_HEAD_BYTES = 1024
+JOURNAL_READ_MAX = 1 << 26
+JOURNAL_RESULT_RE = re.compile(rb'"type"\s*:\s*"result"')
+JOURNAL_AGENT_ID_RE = re.compile(rb'"agentId"\s*:\s*"([A-Za-z0-9_-]{1,64})"')
+
+
+def _fold_journal_line(line, done):
+    """Fold one journal line into `done` (the ids that have finished).
+
+    Parsed as JSON when it fits, which is exact and independent of field order.
+    An over-long line is matched by REGEX over its first JOURNAL_HEAD_BYTES
+    instead — that head holds the record's own fields, and stopping before the
+    result VALUE begins is what keeps an agent that merely returned the text
+    `"type":"result"` from retiring some other agent. A head that doesn't carry
+    both markers is a miss, i.e. the agent reads as still running: the safe
+    direction, since the alternative is calling a live agent finished."""
+    if len(line) <= JOURNAL_LINE_MAX:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return
+        if isinstance(rec, dict) and rec.get("type") == "result" and rec.get("agentId"):
+            done.add(str(rec["agentId"]))
+        return
+    head = line[:JOURNAL_HEAD_BYTES]
+    if not JOURNAL_RESULT_RE.search(head):
+        return
+    m = JOURNAL_AGENT_ID_RE.search(head)
+    if m:
+        done.add(m.group(1).decode("ascii", "replace"))
+
+
+def _journal_finished(path):
+    """The agent ids one journal records a RESULT for, or None if it can't be read.
+
+    Streamed WHOLE rather than through a tail window. A `result` line carries the
+    agent's return value, so a few dozen agents routinely push the journal past
+    any fixed tail — and the records a tail drops are the OLDEST, which after the
+    picker's launch-order sort are exactly the agents at the TOP of the list. A
+    dropped result reads as "still running" permanently, so the window has to go.
+
+    Memory stays bounded regardless: lines are folded as they complete, and a
+    single absurdly long one is matched by its head and then skipped rather than
+    accumulated (see _fold_journal_line)."""
+    done = set()
+    try:
+        with open(path, "rb") as f:
+            buf = b""
+            read = 0
+            dropping = False   # inside an over-long line, waiting for its newline
+            while read < JOURNAL_READ_MAX:
+                chunk = f.read(1 << 16)
+                if not chunk:
+                    break
+                read += len(chunk)
+                if dropping:
+                    nl = chunk.find(b"\n")
+                    if nl < 0:
+                        continue
+                    dropping = False
+                    chunk = chunk[nl + 1:]
+                buf += chunk
+                parts = buf.split(b"\n")
+                buf = parts.pop()
+                for line in parts:
+                    if line.strip():
+                        _fold_journal_line(line, done)
+                if len(buf) > JOURNAL_LINE_MAX:
+                    _fold_journal_line(buf, done)
+                    buf, dropping = b"", True
+            if buf.strip() and not dropping:
+                _fold_journal_line(buf, done)
+    except OSError:
+        return None
+    return done
+
+
 def _workflow_finished_agents(run_dir):
     """The ids this run's journal records a RESULT for — the agents that have
-    finished — or None when no journal could be read.
+    finished — or None when any journal could not be read.
 
     journal.jsonl is the workflow runtime's own ledger, one
-    `{"type":"result","agentId":…}` line per completed agent. It is best-effort,
-    so None means "this run cannot say", never "none of them finished": a row
-    then carries no status at all rather than claiming everything is running."""
+    `{"type":"result","agentId":…}` line per completed agent. **An unreadable
+    journal must return None, not an empty set**: None means "this run cannot
+    say" and the rows then carry no status at all, whereas an empty set claims
+    every agent is still running — which is what a permission error, an IO
+    error, or an ordinary walk/read race would otherwise paint on a run that
+    finished hours ago. One unreadable journal disowns the whole run's status
+    for the same reason: a partial answer here is indistinguishable from a
+    complete one."""
     seen_journal = False
     done = set()
     for dirpath, _dirs, files in os.walk(run_dir):
         if "journal.jsonl" not in files:
             continue
-        lines = _read_tail_lines(os.path.join(dirpath, "journal.jsonl"), 1 << 20)
+        ids = _journal_finished(os.path.join(dirpath, "journal.jsonl"))
+        if ids is None:
+            return None
         seen_journal = True
-        for raw in lines:
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(rec, dict) and rec.get("type") == "result" and rec.get("agentId"):
-                done.add(str(rec["agentId"]))
+        done |= ids
     return done if seen_journal else None
 
 
@@ -5056,7 +5156,8 @@ def _workflow_agent_label(path):
             return desc[:WORKFLOW_AGENT_LABEL_CHARS]
     except (OSError, ValueError, AttributeError):
         pass
-    text = _first_user_text(path, max_lines=WORKFLOW_LABEL_MAX_LINES) or ""
+    text = _first_user_text(path, max_lines=WORKFLOW_LABEL_MAX_LINES,
+                            max_bytes=WORKFLOW_LABEL_MAX_BYTES) or ""
     return " ".join(text.split())[:WORKFLOW_AGENT_LABEL_CHARS]
 
 

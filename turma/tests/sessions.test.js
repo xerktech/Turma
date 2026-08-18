@@ -1970,6 +1970,39 @@ test("XERK-304: picking one agent renders its transcript and Back returns to the
   assert.equal(page.els.trBackLabel.textContent, " Session");
 });
 
+test("XERK-304: Back is not eaten when the session left the cache", async () => {
+  // The run list is fetched from the session's host, so once the session is
+  // gone there is no list to return to. The middle rung used to consume the
+  // press anyway and leave the pane exactly as it was, still labelled Workflow.
+  const page = liveWorkflowPage();
+  page.setGet((url) => url.includes("agentId=ag1")
+    ? { entries: [{ id: "1", role: "user", text: "review it" }] }
+    : { entries: [], agents: [{ id: "ag1", label: "review:bugs", status: "done" }] });
+  await page.openSubagentView("workflow", "code-review", "ag1");
+  assert.equal(page.els.trBackLabel.textContent, " Workflow");
+
+  // The session ends while its agent transcript is open.
+  const { now, host: h } = host([]);
+  page.beat({ now, agents: [h] });
+
+  page.transcriptBack();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(page.els.trBackLabel.textContent, " Sessions",
+    "one press left the subagent stage rather than doing nothing");
+});
+
+test("XERK-304: an unresolved row reads as unavailable, not as an empty conversation", async () => {
+  // No `agents` and no entries means the row did not resolve. Handing that to
+  // the chat engine paints "This session's transcript is empty." — the wording
+  // for a conversation that exists and is empty, which reads as if the agent
+  // simply did nothing.
+  const page = liveWorkflowPage();
+  page.setGet((url) => url.includes("/subagents/history") ? { entries: [] } : null);
+  await page.openSubagentView("workflow", "no-such-run");
+  assert.equal(page.chat.rendered.length, 0, "nothing was handed to the chat engine");
+  assert.match(page.els.trScroll.innerHTML, /Agent transcript unavailable/);
+});
+
 test("XERK-304: an ordinary agent row is untouched — no picker, straight to its transcript", async () => {
   const page = liveWorkflowPage();
   page.setGet((url) => url.includes("/subagents/history")

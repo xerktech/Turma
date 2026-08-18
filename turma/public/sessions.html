@@ -443,8 +443,8 @@
   .wf-hd { color: var(--muted); font-size: 12px; text-transform: uppercase;
            letter-spacing: .06em; padding: 0 4px 4px; }
   .wf-agent { display: flex; align-items: center; gap: 8px; width: 100%;
-              text-align: left; padding: 9px 10px; border-radius: 8px;
-              border: 1px solid var(--line); background: var(--card);
+              text-align: left; padding: 9px 10px; border-radius: var(--radius-sm);
+              border: 1px solid var(--border); background: var(--surface);
               color: inherit; font: inherit; cursor: pointer; }
   .wf-agent:hover { border-color: var(--accent); }
   .wf-agent .wf-label { flex: 1; min-width: 0; overflow: hidden;
@@ -2408,6 +2408,12 @@ function selectSession(id) {
   if (id === currentId && viewMode === "chat") { enterStage(); return; }
   currentId = id;
   viewMode = "chat";
+  // Landing on a chat retires both subagent rungs. They are only reachable
+  // through the transcript pane, so a leftover pair is latent rather than live
+  // today — but it points at the session we just left, and the next route that
+  // reveals that pane would follow it there.
+  subagentReturn = null;
+  subagentListReturn = null;
   resetEndedBar();   // leaving any ended-session view (incl. one just resumed)
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
@@ -2985,9 +2991,15 @@ async function openSubagentView(type, label, agentId) {
         renderWorkflowAgents(type, label, t);
         return;
       }
+      // No `agents`, no entries: the row did not resolve. Rendering that as a
+      // transcript paints the chat engine's "This session's transcript is
+      // empty." — the wording for a conversation that exists and is empty,
+      // which is a different thing and reads as if the agent did nothing. A
+      // background agent that HAS a transcript always has at least its prompt.
+      if (!(t.entries || []).length) break;
       if (window.TurmaChat && TurmaChat.renderStatic) {
         TurmaChat.renderStatic({
-          entries: t.entries || [],
+          entries: t.entries,
           scrollEl: document.getElementById("trScroll"),
           verbHost: document.getElementById("trVerbosity"),
           transcriptId: vid,
@@ -3011,8 +3023,13 @@ function transcriptBack() {
   // One workflow agent's transcript goes back to its RUN's agent list first —
   // the middle rung — and only from there to the session.
   const toList = subagentListReturn;
-  if (toList != null) {
-    subagentListReturn = null;
+  subagentListReturn = null;
+  // Only if that list can still be FETCHED. It is read from the session's host,
+  // so once the session leaves the cache there is no list to return to, and
+  // openSubagentView would early-return on the missing host key — eating the
+  // press and leaving the pane exactly as it was, still labelled "Workflow".
+  // Falling through hands it to the session rung, which handles a gone session.
+  if (toList != null && currentId && hostKeyForSession(currentId)) {
     openSubagentView(toList.type, toList.label);
     return;
   }

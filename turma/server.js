@@ -1932,15 +1932,44 @@ function subagentKey(sessionId, type, label, agentId) {
 // The agent pattern-checks it again — this is the cheap half of both-ends.
 const SUBAGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
-// Same lifecycle as ingestHistory, keyed by (session,type,label) — merges the
-// agent's `subagentHistoryResults`, then evicts by age and caps the cache.
+// The workflow picker's rows, coerced (XERK-304). Android TYPES this field
+// (`HistoryResponse.agents: List<WorkflowAgent>?`), and by this repo's own rule
+// typing a field on a client and adding its hub-side coercion are the SAME
+// change — an unexpected shape from a heartbeat is otherwise served straight
+// through to a decoder that will throw on it. Same shape as sanitizeLiveAgents:
+// non-array -> null (the field is then simply absent, which every client reads
+// as "not a run"), every value through safeString, length capped.
+const WORKFLOW_AGENT_FIELD_MAX = 256;
+const WORKFLOW_AGENTS_MAX = 200;
+function sanitizeWorkflowAgents(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const a of raw) {
+    if (!a || typeof a !== "object") continue;
+    const id = safeString(a.id).slice(0, WORKFLOW_AGENT_FIELD_MAX);
+    if (!id) continue;
+    out.push({
+      id,
+      label: safeString(a.label).slice(0, WORKFLOW_AGENT_FIELD_MAX),
+      startedAt: safeString(a.startedAt).slice(0, WORKFLOW_AGENT_FIELD_MAX),
+      status: safeString(a.status).slice(0, WORKFLOW_AGENT_FIELD_MAX),
+    });
+    if (out.length >= WORKFLOW_AGENTS_MAX) break;
+  }
+  return out;
+}
+
+// Same lifecycle as ingestHistory, keyed by (session,type,label,agentId) —
+// merges the agent's `subagentHistoryResults`, then evicts by age and caps the
+// cache.
 function ingestSubagentHistory(agent, results) {
   const now = Date.now();
   for (const r of results || []) {
     if (!r || !r.sessionId) continue;
     agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label, r.agentId)] =
-      { entries: r.entries, truncated: r.truncated, agents: r.agents,
-        agentsTruncated: r.agentsTruncated, fetchedAt: now };
+      { entries: r.entries, truncated: r.truncated,
+        agents: sanitizeWorkflowAgents(r.agents),
+        agentsTruncated: !!r.agentsTruncated, fetchedAt: now };
   }
   for (const [k, h] of Object.entries(agent.subagentHistory)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.subagentHistory[k];

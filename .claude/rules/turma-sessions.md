@@ -150,6 +150,14 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   returns to that run's list, and only the list returns to the session. Every place that drops
   `subagentReturn` must drop it too — a stale middle rung sends Back into a list the pane is no
   longer showing. The back label names the rung it actually reaches ("Workflow" vs "Session").
+  - **The middle rung is only taken when the list can still be FETCHED.** It is read from the
+    session's host, so once that session leaves the cache `openSubagentView` early-returns on the
+    missing host key and the press vanishes — the rung must fall through to the session rung, which
+    already handles a session that ended, rather than consume it.
+- **An unresolved row must not be rendered as a transcript.** No `agents` and no entries means the
+  row did not resolve; handing that to the chat engine paints its "This session's transcript is
+  empty.", the wording for a conversation that exists and is empty, which reads as if the agent did
+  nothing. A background agent that has a transcript always has at least its prompt.
 - Tests: `agentsHtml` in `chat.test.js`, the subagent-history cases in `server.test.js`, the
   XERK-304 drill-down cases in `sessions.test.js`.
 

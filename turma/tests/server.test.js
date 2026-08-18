@@ -3160,7 +3160,10 @@ test("XERK-304: a workflow row and one of its agents are DISTINCT cache rows", a
 
   const gotList = await request("GET", list, { headers: userHeaders });
   assert.equal(gotList.status, 200);
-  assert.deepEqual(gotList.body.agents, [{ id: "a0123", label: "review:bugs", status: "done" }]);
+  // Every row is normalized to the full shape on the way in, so a client that
+  // TYPES the field never meets a missing one.
+  assert.deepEqual(gotList.body.agents,
+    [{ id: "a0123", label: "review:bugs", startedAt: "", status: "done" }]);
   assert.equal(gotList.body.agentsTruncated, false);
 
   const gotOne = await request("GET", one, { headers: userHeaders });
@@ -3180,6 +3183,60 @@ test("XERK-304: a malformed agentId is refused, never queued", async () => {
   }
   const beat = await request("POST", "/api/heartbeat", { body: { device: "wf2" }, headers: agentHeaders });
   assert.deepEqual(beat.body.commands, [], "a refused id must not reach the agent's queue");
+});
+
+test("XERK-304: a wrong-shaped agents list is coerced, never served raw", async () => {
+  // Android TYPES this field, so an unexpected shape reaching a decoder is a
+  // thrown response, not a cosmetic problem. Same rule as every other typed
+  // heartbeat field: coerce at ingest.
+  await request("POST", "/api/heartbeat", { body: { device: "wf3" }, headers: agentHeaders });
+  const url = "/api/agents/wf3/sessions/s1/subagents/history?type=workflow&label=x";
+
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf3",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], truncated: false, agentsTruncated: "yes",
+        agents: [
+          { id: { nested: 1 }, label: ["a"], status: 7, startedAt: null },
+          "not an object",
+          { label: "no id at all" },
+          { id: "ok1", label: "fine", startedAt: "t", status: "done" },
+        ],
+      }],
+    },
+    headers: agentHeaders,
+  });
+
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.deepEqual(got.body.agents, [
+    { id: "[object Object]", label: "a", startedAt: "", status: "7" },
+    { id: "ok1", label: "fine", startedAt: "t", status: "done" },
+  ], "non-objects and id-less rows dropped; every surviving value a string");
+  assert.equal(got.body.agentsTruncated, true, "coerced to a boolean");
+});
+
+test("XERK-304: a non-array `agents` leaves the reply a plain transcript", async () => {
+  // `agents` present is what means "this is a run", so a junk value must not be
+  // able to turn an ordinary transcript into a list.
+  await request("POST", "/api/heartbeat", { body: { device: "wf4" }, headers: agentHeaders });
+  const url = "/api/agents/wf4/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf4",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [{ id: "1", role: "user", text: "hi" }], truncated: false,
+        agents: "lots",
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.equal(got.body.agents, undefined);
 });
 
 test("http: heartbeat subagentHistoryResults populate the cache; GET returns 200 while fresh", async () => {

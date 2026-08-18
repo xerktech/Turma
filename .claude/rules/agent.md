@@ -253,9 +253,21 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   - **A workflow agent's name comes from its FIRST PROMPT.** Its `agent-<id>.meta.json` is only
     `{"agentType":"workflow-subagent","spawnDepth":1}` — no description — and the script's own
     `label:` option is persisted nowhere, so the prompt is the one thing on disk saying what it was
-    asked to do. A meta `description` still wins when present. Run status comes from the run's
-    `journal.jsonl` (`{"type":"result","agentId":…}` per finished agent) and is OMITTED entirely
-    when no journal can be read — "can't tell", never a guess.
+    asked to do. A meta `description` still wins when present.
+  - **Run status comes from `journal.jsonl`, and "unreadable" must return None, not an empty set.**
+    An empty set claims every agent is still RUNNING, which is what an EACCES, an IO error, or an
+    ordinary walk/read race would otherwise paint on a run that finished hours ago — permanently,
+    since nothing re-checks. `_read_tail_lines` swallows `OSError` and answers `[]`, so readability
+    has to be established separately from emptiness.
+  - **The journal is streamed WHOLE — never through a tail window.** A `result` line carries the
+    agent's return value, so a few dozen agents push the journal past any fixed tail, and the
+    records a tail drops are the OLDEST — which the launch-order sort puts at the TOP of the picker,
+    reading as "still running" forever. Memory stays bounded by folding each line as it completes;
+    one over-long line is matched by its HEAD instead, which also stops before the result VALUE
+    begins so an agent that merely RETURNS the text of a journal record cannot retire another agent.
+  - **A symlinked `agent-<id>.jsonl` is refused** (`islink` beside `isfile`, which follows): a link
+    in a run dir would otherwise be a phantom agent whose "transcript" is whatever it points at.
+    `os.walk` already declines to descend directory symlinks; this is the file half of that rule.
   - **The agent id from a clicked row names a FILE, so it is never joined onto a path**: it is
     pattern-checked and then matched against the run's own walk (`_workflow_agent_path`). The hub
     checks it again before queueing. Tests: `TestResolveWorkflowRun`, `TestStageSubagentHistory`.

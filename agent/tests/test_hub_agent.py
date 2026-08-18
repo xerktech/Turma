@@ -10593,6 +10593,79 @@ class TestResolveWorkflowRun(unittest.TestCase):
         self.assertEqual(len(rows), ha.WORKFLOW_AGENTS_MAX)
         self.assertTrue(truncated)
 
+    def test_an_UNREADABLE_journal_says_nothing_rather_than_running(self):
+        # An OSError reading the journal used to be indistinguishable from an
+        # empty one, so every agent of a run that finished hours ago came back
+        # `running`. "Can't tell" is no status at all.
+        self._write_main(self._launch("fixture", "wf_jjj111"))
+        run = self._run_dir("wf_jjj111")
+        self._agent(run, "ag1", "do a thing", "2026-08-18T03:31:07.583Z", done=True)
+        journal = os.path.join(run, "journal.jsonl")
+        os.chmod(journal, 0)
+        self.addCleanup(os.chmod, journal, 0o644)
+        if os.access(journal, os.R_OK):
+            self.skipTest("running as root — an unreadable file cannot be staged")
+        self.assertIsNone(ha._workflow_finished_agents(run))
+        rows, _ = ha._workflow_agents(run)
+        self.assertNotIn("status", rows[0])
+
+    def test_a_journal_larger_than_any_tail_window_still_reports_every_result(self):
+        # A `result` line carries the agent's RETURN VALUE, so a few dozen agents
+        # push the journal past a fixed tail — and the records a tail drops are
+        # the OLDEST, which the launch-order sort puts at the TOP of the picker.
+        # They read as "still running" forever.
+        self._write_main(self._launch("big", "wf_kkk222"))
+        run = self._run_dir("wf_kkk222")
+        payload = "x" * 30000
+        with open(os.path.join(run, "journal.jsonl"), "w") as f:
+            for i in range(40):
+                aid = "ag%02d" % i
+                f.write(json.dumps({"type": "started", "agentId": aid}) + "\n")
+                f.write(json.dumps({"type": "result", "agentId": aid,
+                                    "result": payload}) + "\n")
+        self.assertGreater(os.path.getsize(os.path.join(run, "journal.jsonl")), 1 << 20)
+        done = ha._workflow_finished_agents(run)
+        self.assertEqual(len(done), 40)
+        self.assertIn("ag00", done, "the OLDEST result is the one a tail window drops")
+
+    def test_an_over_long_result_line_is_matched_by_its_head_not_buffered(self):
+        # Bounded memory, and the head stops before the result VALUE begins — so
+        # an agent that merely RETURNS the text of a journal record cannot retire
+        # some other agent.
+        self._write_main(self._launch("big", "wf_lll333"))
+        run = self._run_dir("wf_lll333")
+        forged = json.dumps({"type": "result", "agentId": "victim"})
+        with open(os.path.join(run, "journal.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "result", "agentId": "real1",
+                                "result": forged + "y" * (1 << 19)}) + "\n")
+        done = ha._workflow_finished_agents(run)
+        self.assertEqual(done, {"real1"})
+
+    def test_a_SYMLINKED_agent_transcript_is_not_followed(self):
+        # isfile FOLLOWS links, so `agent-etc.jsonl -> /etc/passwd` showed up as a
+        # phantom agent whose "transcript" was whatever it pointed at.
+        self._write_main(self._launch("fixture", "wf_mmm444"))
+        run = self._run_dir("wf_mmm444")
+        self._agent(run, "real", "a real prompt", "2026-08-18T03:31:07.583Z", done=True)
+        outside = os.path.join(self.tmp, "elsewhere.jsonl")
+        with open(outside, "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "secret"}}) + "\n")
+        os.symlink(outside, os.path.join(run, "agent-linked.jsonl"))
+        self.assertEqual(sorted(ha._workflow_agent_files(run)), ["real"])
+        self.assertIsNone(ha._workflow_agent_path(run, "linked"))
+
+    def test_a_file_whose_id_is_not_an_id_is_skipped(self):
+        # Pins VALID_WORKFLOW_AGENT_ID_RE itself. The walk-map lookup already
+        # makes an escape impossible, so without this the pattern check can be
+        # deleted with the whole suite still green.
+        self._write_main(self._launch("fixture", "wf_nnn555"))
+        run = self._run_dir("wf_nnn555")
+        self._agent(run, "good1", "fine", "2026-08-18T03:31:07.583Z", done=True)
+        for bad in ("agent-.jsonl", "agent-with space.jsonl", "agent-" + "z" * 65 + ".jsonl"):
+            with open(os.path.join(run, bad), "w") as f:
+                f.write("{}\n")
+        self.assertEqual(sorted(ha._workflow_agent_files(run)), ["good1"])
+
     def test_an_agent_id_can_never_escape_the_run_dir(self):
         # The id arrives from a clicked row over HTTP and is about to name a
         # file, so it is matched against the run's own walk, never joined on.
