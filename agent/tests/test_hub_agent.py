@@ -12543,6 +12543,326 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             sm._archive_deltas({"t1": body["size"]})
         self.assertEqual(pushed, [])
 
+    # ---- the raw layer (XERK-338) -------------------------------------------
+    #
+    # Beside the RENDERED entries above, the agent ships a byte-for-byte copy of
+    # the session's own files. What is held here is the enumeration (which files
+    # belong to a session, and what must never be followed to reach one) and the
+    # append-only push — which is the whole answer to "a resumed session must not
+    # duplicate data", so it is pinned from both ends: nothing re-ships, and a
+    # source that has SHRUNK never truncates what the hub already holds.
+
+    def _nested(self, slug, tid, rel, data=b"x"):
+        """Write one file inside a session's own directory, e.g. a subagent."""
+        full = os.path.join(ha.PROJECTS_ROOT, slug, tid, *rel.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data)
+        return full
+
+    def test_session_files_lists_the_whole_session_directory(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/agent-1.jsonl", b"{}\n")
+        self._nested(slug, "t1", "subagents/agent-1.meta.json", b"{}")
+        self._nested(slug, "t1", "workflows/wf_abc.json", b"{}")
+        self._nested(slug, "t1", "tool-results/b1.txt", b"overflowed output")
+        # Belongs to the PROJECT, not this session: one copy per conversation
+        # would be storage with no owner.
+        os.makedirs(os.path.join(ha.PROJECTS_ROOT, slug, "memory"), exist_ok=True)
+        with open(os.path.join(ha.PROJECTS_ROOT, slug, "memory", "MEMORY.md"), "w") as f:
+            f.write("nope")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        rels = [rel for rel, _size in sm._session_files(proj, "t1")]
+        self.assertEqual(sorted(rels), sorted([
+            "t1.jsonl",
+            os.path.join("t1", "subagents", "agent-1.jsonl"),
+            os.path.join("t1", "subagents", "agent-1.meta.json"),
+            os.path.join("t1", "tool-results", "b1.txt"),
+            os.path.join("t1", "workflows", "wf_abc.json"),
+        ]))
+        # Sizes are the real ones — they are what the hub's cursor is compared to.
+        sizes = dict(sm._session_files(proj, "t1"))
+        self.assertEqual(sizes[os.path.join("t1", "tool-results", "b1.txt")],
+                         len(b"overflowed output"))
+
+    def test_session_files_never_follows_a_symlink_out(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/agent-1.jsonl", b"{}\n")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        outside = os.path.join(ha.PROJECTS_ROOT, "elsewhere")
+        os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "secret.jsonl"), "w") as f:
+            f.write("{}\n")
+        # A linked DIRECTORY inside the session, and a linked FILE beside it.
+        # Pointed at PROJECTS_ROOT either one drags the whole host's history into
+        # one session's archive.
+        try:
+            os.symlink(outside, os.path.join(ha.PROJECTS_ROOT, slug, "t1", "linked"))
+            os.symlink(os.path.join(outside, "secret.jsonl"),
+                       os.path.join(ha.PROJECTS_ROOT, slug, "t1", "linked.jsonl"))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        rels = [rel for rel, _s in sm._session_files(proj, "t1")]
+        self.assertNotIn(os.path.join("t1", "linked.jsonl"), rels)
+        self.assertFalse([r for r in rels if "secret" in r], rels)
+
+    def test_session_files_stops_at_its_cap(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        for i in range(12):
+            self._nested(slug, "t1", f"tool-results/b{i}.txt", b"x")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        self.assertEqual(len(sm._session_files(proj, "t1", limit=4)), 4)
+
+    def test_manifest_carries_the_raw_file_list(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/agent-1.jsonl", b"{}\n")
+        self._ledger(sm, wt)
+        sm.registry = []
+        m = sm._archive_manifest()[0]
+        # Pairs, not objects — this rides every slow heartbeat.
+        self.assertTrue(all(isinstance(f, list) and len(f) == 2 for f in m["rawFiles"]))
+        self.assertIn("t1.jsonl", [rel for rel, _s in m["rawFiles"]])
+
+    def test_raw_deltas_push_then_resume_without_reshipping(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        path = os.path.join(ha.PROJECTS_ROOT, slug, "t1.jsonl")
+        first = os.path.getsize(path)
+
+        pushed = []
+        # Stands in for the hub: append-only, and it answers with the cursor.
+        stored = {}
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((tid, rel, start, raw))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        self.assertEqual([(t, r, s) for t, r, s, _ in pushed], [("t1", "t1.jsonl", 0)])
+        self.assertEqual(stored["t1.jsonl"], first)
+        # Byte-for-byte, not a rendering of it.
+        with open(path, "rb") as f:
+            self.assertEqual(pushed[0][3], f.read())
+
+        # Caught up: nothing moves.
+        pushed.clear()
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"t1": {"t1.jsonl": first}})
+        self.assertEqual(pushed, [])
+
+        # THE resumed-session case: `claude --resume` appends to the same file
+        # under the same transcript id, so only the appended bytes ship. A
+        # content-addressed or whole-file scheme would re-upload the lot here,
+        # every time the session was resumed.
+        with open(path, "ab") as f:
+            f.write(json.dumps(_text_entry("u2", "user", "and again")).encode() + b"\n")
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"t1": {"t1.jsonl": first}})
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(pushed[0][2], first)
+        self.assertEqual(stored["t1.jsonl"], os.path.getsize(path))
+
+    def test_session_files_skips_what_the_hub_could_never_name(self):
+        """The hub's allowlist is [A-Za-z0-9._-]; a name outside it is a
+        PERMANENT 400. Offering one is not harmless: three of them exhausted the
+        pass's failure budget on every beat and starved every other transcript on
+        the host. Reachable with no malice — a workflow's script is named after
+        the workflow, and a name with a space or an accent is ordinary."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/good.jsonl", b"{}\n")
+        for bad in ["tool-results/agent one.jsonl", "tool-results/a@b.txt",
+                    "tool-results/caf\u00e9.txt"]:
+            self._nested(slug, "t1", bad, b"x")
+        rels = [rel for rel, _s in sm._session_files(os.path.join(ha.PROJECTS_ROOT, slug), "t1")]
+        self.assertIn(os.path.join("t1", "subagents", "good.jsonl"), rels)
+        for bad in ["agent one.jsonl", "a@b.txt", "caf\u00e9.txt"]:
+            self.assertFalse([r for r in rels if bad in r], f"{bad} was offered: {rels}")
+
+    def test_archivable_rel_agrees_with_the_hub_on_a_trailing_newline(self):
+        """Python's `$` matches before a trailing newline and JavaScript's does
+        not, so `^[A-Za-z0-9._-]+$` accepted "a.jsonl\n" here while the hub's
+        identical-looking regex refused it. A trailing newline is a legal Linux
+        filename. Any agent/hub regex pair has this trap."""
+        self.assertTrue(ha._archivable_rel("a.jsonl"))
+        self.assertFalse(ha._archivable_rel("a.jsonl\n"))
+        self.assertFalse(ha._archivable_rel("abc\n"))
+        self.assertFalse(ha._archivable_rel("a\tb"))
+        self.assertFalse(ha._archivable_rel("a b.txt"))
+        self.assertFalse(ha._archivable_rel("caf\u00e9.txt"))
+        self.assertFalse(ha._archivable_rel(".."))
+        self.assertFalse(ha._archivable_rel("/x"))
+        self.assertFalse(ha._archivable_rel("a" * 256))
+        self.assertTrue(ha._archivable_rel("a" * 255))
+        self.assertFalse(ha._archivable_rel("n/" * 10 + "f.txt"))   # too deep
+
+    def test_raw_push_refused_permanently_does_not_spend_the_failure_budget(self):
+        """A 4xx is the hub saying THIS FILE is unacceptable. Counted as a
+        failure, three of them ended the pass every beat — which is how one bad
+        file starved every other transcript on the host."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        for i in range(4):
+            self._nested(slug, "t1", f"subagents/a{i}.jsonl", b"{}\n")
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        seen = []
+
+        def refuse_first_four(tid, rel, start, raw):
+            seen.append(rel)
+            # Everything but the conversation itself is refused permanently.
+            if rel.endswith(".jsonl") and "/" in rel:
+                return {"skip": True}
+            return {"stored": start + len(raw)}
+
+        with mock.patch.object(sm, "_post_archive_raw", refuse_first_four):
+            sm._archive_raw_deltas({})
+        # All five were attempted: a permanent refusal must not end the pass.
+        self.assertEqual(len(seen), 5, seen)
+        self.assertIn("t1.jsonl", seen)
+
+    def test_post_archive_raw_distinguishes_a_permanent_refusal(self):
+        """The REAL _post_archive_raw, not a mock of it: a 4xx is the hub saying
+        THIS FILE is unacceptable, and must come back as `skip` so the delta loop
+        leaves it. Returned as a transport failure it spent the pass's budget,
+        and three such files starved every other transcript on the host.
+
+        The test above mocks _post_archive_raw wholesale, so it cannot see this —
+        mutating the 4xx branch left that test green."""
+        sm = self.make_manager()
+
+        def raising(code):
+            def fake(req, timeout=None):
+                raise urllib.error.HTTPError(req.full_url, code, "no", {}, None)
+            return fake
+
+        with mock.patch.object(ha.urllib.request, "urlopen", raising(400)):
+            self.assertEqual(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"),
+                             {"skip": True})
+        with mock.patch.object(ha.urllib.request, "urlopen", raising(413)):
+            self.assertEqual(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"),
+                             {"skip": True})
+        # A 5xx is transient — the hub is unwell, not the file. That one MUST
+        # stay a failure, or a down hub gets every file on the host thrown at it.
+        with mock.patch.object(ha.urllib.request, "urlopen", raising(503)):
+            self.assertIsNone(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"))
+        # ...as is a dead socket.
+        def boom(req, timeout=None):
+            raise OSError("connection refused")
+        with mock.patch.object(ha.urllib.request, "urlopen", boom):
+            self.assertIsNone(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"))
+
+    def test_raw_deltas_stop_after_repeated_transport_failures(self):
+        """...but a hub that is genuinely down must not have every file on the
+        host thrown at it. `None` (transport) still spends the budget."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        for i in range(9):
+            self._nested(slug, "t1", f"subagents/a{i}.jsonl", b"{}\n")
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        seen = []
+        with mock.patch.object(sm, "_post_archive_raw",
+                               lambda *a: seen.append(a[1]) or None):
+            sm._archive_raw_deltas({})
+        self.assertEqual(len(seen), ha.ARCHIVE_RAW_FAILURES_MAX, seen)
+
+    def test_session_files_never_raises_on_the_heartbeat_path(self):
+        """`_session_files` runs on the beat's critical path, where the walk's
+        contract is that nothing raises — an escape is a host that reads offline.
+        The unnameable-file log's throttle reads its timestamp through `getattr`
+        for exactly that reason: a manager-like object whose __init__ did not run
+        took the beat down over a LOG LINE (XERK-338 QA H2)."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "tool-results/bad name.txt", b"x")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        # The attribute the throttle reads, gone.
+        del sm._unnameable_logged_at
+        rels = sm._session_files(proj, "t1")          # must not raise
+        self.assertIn(("t1.jsonl", mock.ANY), [(r, mock.ANY) for r, _s in rels])
+        self.assertFalse([r for r, _s in rels if "bad name" in r])
+
+    def test_unnameable_file_log_is_throttled(self):
+        """The manifest is rebuilt every beat, so an unthrottled line writes
+        forever for one unnameable file (XERK-338 QA G6/H3). Every comparable
+        warn on this path throttles to 1/hour."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "tool-results/bad name.txt", b"x")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            for _ in range(5):
+                sm._session_files(proj, "t1")
+        said = [m for m in lines if "cannot be named" in m]
+        self.assertEqual(len(said), 1, said)
+        # ...and it names the files, since they are otherwise silently absent.
+        self.assertIn("bad name.txt", said[0])
+
+    def test_raw_deltas_leave_a_shrunken_source_alone(self):
+        # The hub holds MORE than the host now has: the transcript was rewritten
+        # or replaced under us. Truncating the archive to match would throw away
+        # the only copy of the history — so nothing is pushed for that file.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+        with mock.patch.object(sm, "_post_archive_raw",
+                               lambda *a: pushed.append(a) or {"stored": 0}):
+            sm._archive_raw_deltas({"t1": {"t1.jsonl": 10 ** 9}})
+        self.assertEqual(pushed, [])
+
+    def test_raw_deltas_respect_the_hubs_verdict(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+        post = lambda *a: pushed.append(a) or {"stored": 0}
+        # A full store skips the pass outright...
+        with mock.patch.object(sm, "_post_archive_raw", post):
+            sm._archive_raw_deltas({}, store_full=True)
+        self.assertEqual(pushed, [])
+        # ...and a transcript over its own raw budget is skipped by id.
+        with mock.patch.object(sm, "_post_archive_raw", post):
+            sm._archive_raw_deltas({}, skip_ids=["t1"])
+        self.assertEqual(pushed, [])
+        # A `skip` in the REPLY stops that file too, rather than retrying it.
+        with mock.patch.object(sm, "_post_archive_raw",
+                               lambda *a: pushed.append(a) or {"skip": True}):
+            sm._archive_raw_deltas({})
+        self.assertEqual(len(pushed), 1)
+
     def test_deltas_ship_pr_link_marker_with_synthesized_uuid(self):
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/aaa"

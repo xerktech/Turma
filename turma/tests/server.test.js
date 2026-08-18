@@ -18,6 +18,7 @@ const path = require("path");
 const http = require("http");
 const net = require("net");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const { EventEmitter } = require("events");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -71,6 +72,12 @@ process.env.TICKET_MODELS_FILE = path.join(
 process.env.ORG_COLORS_FILE = path.join(
   os.tmpdir(),
   `turma-test-org-colors-${process.pid}.json`
+);
+// Durable token-usage history (XERK-338) is a /data file of its own, read at
+// require time like the stores above, so it gets a throwaway one too.
+process.env.USAGE_LEDGER_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-usage-ledger-${process.pid}.json`
 );
 // The migration relay spools transcript bundles to disk (XERK-263) and sweeps
 // its whole directory at boot, so it gets a throwaway one of its own — sharing
@@ -153,6 +160,7 @@ const {
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
+  usageLedger, normalizeRetired,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -1889,6 +1897,187 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   assert.equal("archiveFull" in r2.body, false);
 });
 
+// ---- the archive's raw layer (XERK-338) -------------------------------------
+//
+// Beside the rendered entries above, agents push a byte-for-byte copy of the
+// session's OWN files. These hold the wire contract: who may push, what a path
+// may name, and that a body which could only be hostile is refused rather than
+// decompressed.
+
+// One raw push. The body is bytes, not JSON, so it can't go through request().
+function rawPush(host, tid, rel, start, buf, headers) {
+  const p = `/api/agents/${host}/archive/${encodeURIComponent(tid)}` +
+            `/raw/${encodeURIComponent(rel)}?start=${start}`;
+  return new Promise((resolve, reject) => {
+    const req = http.request(baseUrl + p, {
+      method: "POST",
+      headers: { "content-type": "application/gzip", ...(headers || {}) },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(data); } catch {}
+        resolve({ status: res.statusCode, body: parsed, raw: data });
+      });
+    });
+    req.on("error", reject);
+    req.end(buf);
+  });
+}
+const gz = (s) => zlib.gzipSync(Buffer.from(s));
+
+test("http: an agent cannot put `retired` on its own record (XERK-338)", async () => {
+  // `retired` marks a hub-BUILT `retiredUsage` entry. Android types it as a
+  // Boolean and a full /api/agents decode is ATOMIC there, so one host serving
+  // `retired:"yes"` threw for the WHOLE array — every OTHER host vanished from
+  // every phone's fleet list, and it persisted into state.json so a restart did
+  // not clear it. Typing a field and coercing it hub-side are one change.
+  for (const bad of ["yes", 1, 0, {}, [], null, true]) {
+    const r = await request("POST", "/api/heartbeat", {
+      body: { device: "retired-forger", retired: bad }, headers: agentHeaders,
+    });
+    assert.equal(r.status, 200);
+    const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === "retired-forger");
+    assert.equal("retired" in rec, false, `served retired for ${JSON.stringify(bad)}`);
+  }
+  // The restore runs the same coercion, since state.json is served before any
+  // host re-beats and a restart is exactly when a coercion ships.
+  const restored = { device: "retired-forger", retired: "yes" };
+  normalizeRetired(restored);
+  assert.equal("retired" in restored, false);
+  delete agents["retired-forger"];
+});
+
+test("http: a raw push is agent-authed and lands byte for byte", async () => {
+  // tr1 was ingested by the rendered-layer test above, so its row (and the
+  // canonical file the raw directory hangs off) already exists.
+  const line = '{"type":"user","message":{"role":"user"},"costUSD":0.01}\n';
+  assert.equal((await rawPush("nas", "tr1", "tr1.jsonl", 0, gz(line))).status, 401);
+
+  const ok = await rawPush("nas", "tr1", "tr1.jsonl", 0, gz(line), agentHeaders);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.stored, Buffer.byteLength(line));
+
+  // Nested files keep their own layout — including the ones that are not
+  // .jsonl, which is precisely the half of a session nothing else carries.
+  const sub = '{"agentId":"a1"}\n';
+  const r2 = await rawPush("nas", "tr1", "tr1/subagents/agent-1.jsonl", 0, gz(sub), agentHeaders);
+  assert.equal(r2.body.stored, Buffer.byteLength(sub));
+  const r3 = await rawPush("nas", "tr1", "tr1/tool-results/b1.txt", 0, gz("overflow"), agentHeaders);
+  assert.equal(r3.body.stored, 8);
+
+  // A resume appends; a re-send of a stored range writes nothing and hands back
+  // the real cursor, which is what keeps a resumed session from duplicating.
+  const more = '{"type":"assistant"}\n';
+  const r4 = await rawPush("nas", "tr1", "tr1.jsonl", Buffer.byteLength(line), gz(more), agentHeaders);
+  assert.equal(r4.body.stored, Buffer.byteLength(line + more));
+  const r5 = await rawPush("nas", "tr1", "tr1.jsonl", 0, gz(line), agentHeaders);
+  assert.equal(r5.body.stored, Buffer.byteLength(line + more));
+
+  // Read it back: the list, then the file itself, byte for byte.
+  const listed = await request("GET", "/api/archive/tr1/raw", { headers: userHeaders });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body.files.map((f) => f.path).sort(),
+    ["tr1.jsonl", "tr1/subagents/agent-1.jsonl", "tr1/tool-results/b1.txt"]);
+  const got = await request("GET", `/api/archive/tr1/raw/${encodeURIComponent("tr1.jsonl")}`,
+    { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.equal(got.raw, line + more);
+  // Served as a download with nosniff: a transcript holds whatever was pasted
+  // into it, and rendering that inline behind the hub's login is stored XSS.
+  assert.equal(got.headers["x-content-type-options"], "nosniff");
+  assert.ok(/^attachment;/.test(got.headers["content-disposition"] || ""));
+  // Both read paths are user-authed and both refuse an unknown file.
+  assert.equal((await request("GET", "/api/archive/tr1/raw")).status, 401);
+  assert.equal((await request("GET", "/api/archive/nope/raw", { headers: userHeaders })).status, 404);
+  assert.equal((await request("GET", "/api/archive/tr1/raw/nope.jsonl", { headers: userHeaders })).status, 404);
+});
+
+test("http: a full chunk of INCOMPRESSIBLE bytes still fits the wire cap", async () => {
+  // gzip EXPANDS incompressible input, so a wire cap equal to the chunk size made
+  // any session file holding a full chunk of already-compressed bytes impossible
+  // to push — permanently, and it took every other transcript on that host down
+  // with it (QA D2). The cap has to CLEAR the worst case, not equal it.
+  const chunk = crypto.randomBytes(1 << 22);          // 4 MiB, incompressible
+  const gzipped = zlib.gzipSync(chunk);
+  assert.ok(gzipped.length > chunk.length, "the fixture compressed; it must not");
+  const r = await rawPush("nas", "tr1", "tr1/tool-results/blob.bin", 0, gzipped, agentHeaders);
+  assert.equal(r.status, 200, `a full incompressible chunk was refused: ${r.raw}`);
+  assert.equal(r.body.stored, chunk.length);
+});
+
+test("http: an over-long transcriptId is refused at the route", async () => {
+  // The id is a DIRECTORY COMPONENT of the raw layer's path, so one past the
+  // filesystem's 255-byte name limit made every push for that session fail at
+  // the syscall and report `skip` with no diagnostic at all (XERK-338 QA F6).
+  // Nothing turned red if the length bound were dropped back to `+` (QA G5).
+  const long = "a".repeat(300);
+  const r = await rawPush("nas", long, "x.jsonl", 0, gz("x"), agentHeaders);
+  assert.equal(r.status, 400);
+  assert.match(r.body.error, /transcriptId/);
+  // 255 is still fine — the bound must not have been tightened past the limit.
+  const ok = await rawPush("nas", "b".repeat(255), "x.jsonl", 0, gz("x"), agentHeaders);
+  assert.equal(ok.status, 200);
+});
+
+test("http: a raw push cannot name anything outside its own session", async () => {
+  for (const bad of ["../../etc/passwd", "/etc/passwd", "..", "tr1/../../x", "a b.jsonl"]) {
+    const r = await rawPush("nas", "tr1", bad, 0, gz("x"), agentHeaders);
+    assert.equal(r.status, 400, `accepted: ${bad}`);
+  }
+  // ...and a hostile transcriptId is refused before any path is built.
+  assert.equal((await rawPush("nas", "..%2f..%2fetc", "x.jsonl", 0, gz("x"), agentHeaders)).status, 400);
+  // The same read-path allowlist, which is a separate call site.
+  assert.equal((await request("GET",
+    `/api/archive/tr1/raw/${encodeURIComponent("../../etc/passwd")}`,
+    { headers: userHeaders })).status, 404);
+});
+
+test("http: a raw body that is not gzip, or is a bomb, is refused not decompressed", async () => {
+  // Plain bytes where gzip was promised: a 400, not a stored chunk. It is NOT
+  // the cursor protocol's "no progress" — the agent has nothing to realign to.
+  const plain = await rawPush("nas", "tr1", "tr1.jsonl", 0, Buffer.from("not gzip"), agentHeaders);
+  assert.equal(plain.status, 400);
+
+  // A zip bomb is the shape that turns a small body into an OOM on a 256 MiB
+  // hub, so the decompression is BOUNDED rather than the body cap being trusted
+  // to imply a bound. 64 MiB of zeros gzips to ~64 KiB.
+  const bomb = zlib.gzipSync(Buffer.alloc(64 << 20));
+  assert.ok(bomb.length < (1 << 20), `bomb was ${bomb.length} bytes on the wire`);
+  const r = await rawPush("nas", "tr1", "tr1.jsonl", 0, bomb, agentHeaders);
+  assert.equal(r.status, 400);
+  // And nothing landed: the stored cursor is untouched.
+  const listed = await request("GET", "/api/archive/tr1/raw", { headers: userHeaders });
+  const f = listed.body.files.find((x) => x.path === "tr1.jsonl");
+  assert.ok(f.bytes < 1000, `a refused body still grew the file to ${f.bytes}`);
+});
+
+test("http: heartbeat carries the raw layer's per-file cursors back", async () => {
+  const beat = {
+    device: "nas",
+    archiveManifest: [{
+      transcriptId: "tr1", slug: "-w-ab", repo: "turma",
+      rawFiles: [["tr1.jsonl", 999], ["tr1/subagents/agent-1.jsonl", 999],
+                 ["tr1/never-pushed.jsonl", 5]],
+    }],
+  };
+  const r = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
+  assert.equal(r.status, 200);
+  const have = r.body.archiveRawHave.tr1;
+  assert.ok(have["tr1.jsonl"] > 0);
+  assert.ok(have["tr1/subagents/agent-1.jsonl"] > 0);
+  // A file this hub holds nothing of is simply absent — the agent reads that as
+  // zero and ships from the start, which is the same case as an older hub that
+  // sends no cursors at all.
+  assert.equal("tr1/never-pushed.jsonl" in have, false);
+  // Nothing is near the raw ceiling, so the skip list stays off the wire.
+  assert.equal("archiveRawSkip" in r.body, false);
+  // Still not persisted onto the record.
+  assert.equal(agents.nas.archiveManifest, undefined);
+});
+
 test("http: login page is public; /api/login sets a working session cookie", async () => {
   // The login form itself needs no auth.
   const page = await request("GET", "/login");
@@ -2046,6 +2235,11 @@ test("http: a malformed sub-agent split is DROPPED, never repaired into zeros", 
     (await request("GET", "/api/agents", { headers: userHeaders }))
       .body.agents.find((a) => a.key === key);
   const beat = async (subagent) => {
+    // Cleared per case because the durable usage ledger (XERK-338) is a
+    // HIGH-WATER mark: once a valid split has been recorded for this host, a
+    // later zero one is served the recorded figure, which is the ledger working
+    // and would hide what this test is about — the coercion, on a fresh host.
+    usageLedger.forget("junk-split-host");
     await request("POST", "/api/heartbeat", {
       body: { device: "junk-split-host", usage: { totals: { input: 1 }, subagent } },
       headers: agentHeaders,
@@ -11228,4 +11422,148 @@ test("heartbeat: the same poison on the ingest path is dropped, not crashed on",
   assert.equal(r.status, 200);
   // The poisoned row is dropped; the beat is otherwise honoured.
   assert.deepEqual(agents["poison-ingest"].sessions[0].session.agents, []);
+});
+
+// ---- durable token usage (XERK-338) -----------------------------------------
+//
+// Usage is an agent-derived aggregate that used to live only on the registry
+// record, so removing a host threw its spend away and a host whose DISK was
+// wiped came back reporting near-zero and overwrote its own past in place. The
+// ledger's own arithmetic is unit-tested in usage-ledger.test.js; what is held
+// here is the WIRING — that the hub folds it into what /api/agents serves, that
+// a removed host keeps riding the payload, and that removing a host is not
+// silently a purge.
+
+// One host's usage half, shaped as the agent reports it (_finalize_usage).
+// `days` is {date: tokens}; the all-time total is their sum.
+function usageBeat(device, days, { repo = "r1" } = {}) {
+  const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+  const total = Object.values(days).reduce((a, n) => a + n, 0);
+  const block = () => ({
+    totals: b(total), today: b(0), week: b(total),
+    days: Object.fromEntries(Object.entries(days).map(([d, n]) => [d, b(n)])),
+    sessions: 1, lastActivity: "2026-08-18T11:00:00Z",
+    models: [{ model: "m1", totals: b(total), today: b(0), week: b(0) }],
+  });
+  return {
+    device,
+    usage: block(),
+    repoUsage: [{ repo, remoteKey: `rk-${repo}`, remote: "", usage: block() }],
+  };
+}
+const totalOf = (u) => (u ? u.totals.input : null);
+async function fleet() {
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(r.status, 200);
+  return r.body;
+}
+
+test("usage: a wiped host's history is added back to what it reports", async () => {
+  const host = "usage-wipe-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: usageBeat(host, { "2026-08-17": 900 }) });
+  let a = (await fleet()).agents.find((x) => x.key === host);
+  // Nothing lost yet, so the record is exactly the agent's own report.
+  assert.equal(totalOf(a.usage), 900);
+
+  // The box is re-imaged and rejoins under the same name: same host, near-empty
+  // projects dir, so the aggregate it reports collapses.
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 20 }) });
+  a = (await fleet()).agents.find((x) => x.key === host);
+  assert.equal(totalOf(a.usage), 920);
+  assert.equal(totalOf(a.repoUsage.find((r) => r.remoteKey === "rk-r1").usage), 920);
+  // The STORED record stays the agent's raw report — the fold is a serving-time
+  // view, so what is size-budgeted and saved is still what the agent sent.
+  assert.equal(agents[host].usage.totals.input, 20);
+
+  delete agents[host];
+  usageLedger.forget(host);
+});
+
+test("usage: transcripts aging out from under a live host are not double-counted", async () => {
+  // Claude Code deletes its own transcripts on `cleanupPeriodDays`, so a live,
+  // healthy host's reported all-time total drops routinely. Adding the old total
+  // to the new one would count every surviving transcript twice, every month —
+  // which is why the ledger is a per-DAY high-water mark and not a carry.
+  const host = "usage-prune-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: usageBeat(host, { "2026-08-16": 300, "2026-08-17": 700 }) });
+  const aged = usageBeat(host, { "2026-08-17": 700 });
+  for (let i = 0; i < 3; i++) {
+    await request("POST", "/api/heartbeat", { headers: agentHeaders, body: aged });
+    const a = (await fleet()).agents.find((x) => x.key === host);
+    assert.equal(totalOf(a.usage), 1000, `beat ${i}: the answer must be stable, not compounding`);
+  }
+  delete agents[host];
+  usageLedger.forget(host);
+});
+
+test("usage: removing a host keeps its spend, as a retired series", async () => {
+  const host = "usage-removed-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { ...usageBeat(host, { "2026-08-18": 400 }), jira: { siteKey: "XERK" } },
+  });
+  const del = await request("DELETE", `/api/agents/${host}`, { headers: userHeaders });
+  assert.equal(del.status, 200);
+  assert.equal(del.body.usagePurged, false);
+
+  const body = await fleet();
+  assert.equal(body.agents.some((x) => x.key === host), false);
+  const rec = body.retiredUsage.find((x) => x.key === host);
+  assert.ok(rec, "a removed host's usage still rides /api/agents");
+  assert.equal(rec.retired, true);
+  assert.equal(rec.online, false);
+  assert.equal(totalOf(rec.usage), 400);
+  // Carried so the header's org filter still applies to it on both clients.
+  assert.deepEqual(rec.jira, { siteKey: "XERK" });
+  // And it is NOT a host: nothing outside the Usage page may treat it as one.
+  assert.equal("sessions" in rec, false);
+
+  usageLedger.forget(host);
+});
+
+test("usage: purging is a separate, deliberate step from removing the host", async () => {
+  const host = "usage-purge-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 700 }) });
+  const del = await request("DELETE", `/api/agents/${host}?usage=purge`, { headers: userHeaders });
+  assert.equal(del.status, 200);
+  assert.equal(del.body.usagePurged, true);
+  assert.equal(usageLedger.has(host), false);
+  const body = await fleet();
+  assert.equal(body.retiredUsage.some((x) => x.key === host), false);
+});
+
+test("usage: a host that returns intact is never counted twice", async () => {
+  const host = "usage-return-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 500 }) });
+  // Removed from the registry — the operator tidying a card, or prune()/eviction
+  // — and then back with its transcripts untouched.
+  delete agents[host];
+  invalidateAgentsCache();
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 500 }) });
+  const a = (await fleet()).agents.find((x) => x.key === host);
+  assert.equal(totalOf(a.usage), 500);
+  delete agents[host];
+  usageLedger.forget(host);
+});
+
+test("usage: a refused beat is not history", async () => {
+  // The ingest sits behind every gate that can still refuse the beat: a record
+  // rolled back to `prev` must not have been banked into the ledger first.
+  const host = "usage-refused-host";
+  usageLedger.forget(host);
+  const fat = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { ...usageBeat(host, { "2026-08-18": 300 }), sessions: "A".repeat(AGENT_RECORD_MAX + 1024) },
+  });
+  assert.equal(fat.status, 413);
+  assert.equal(usageLedger.has(host), false);
 });

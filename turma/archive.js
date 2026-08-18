@@ -6,7 +6,7 @@
 // makes history survive a host being wiped, offline, or decommissioned, and
 // makes search instant (local FTS, no per-keystroke fan-out).
 //
-// Two layers:
+// Three layers:
 //   1. CANONICAL = organized files on disk, under ARCHIVE_DIR, one folder per
 //      repo, each file renamed + dated:
 //        <repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl
@@ -14,7 +14,16 @@
 //      per line — the same subset the rest of Turma renders); a tiny sidecar
 //      <file>.meta carries the session metadata + the raw-byte sync cursor, so
 //      the whole store is self-describing and the index can be rebuilt from it.
-//   2. INDEX = a node:sqlite (Node core, no npm) DB: a `sessions` table for fast
+//   2. RAW = a byte-for-byte copy of the session's own files, beside the layer
+//      above in `<that file>.raw/` (XERK-338). Layer 1 is a PROJECTION — one
+//      rendered line per displayable entry — so everything Claude Code wrote
+//      that Turma does not render today is gone the moment the host is wiped:
+//      the model, the token counts, tool-call ids, the hook records, the
+//      `tool-results/` overflow files, the workflow run records. That is exactly
+//      the material a later feature would want, and it cannot be recovered
+//      after the fact, so the raw bytes are kept whether or not anything reads
+//      them yet. See `ingestRaw` for the layout and the append-only rule.
+//   3. INDEX = a node:sqlite (Node core, no npm) DB: a `sessions` table for fast
 //      browse and an FTS5 `entries_fts` table for ranked full-text search. The
 //      DB is disposable — rebuildIndex() repopulates it from the files.
 //
@@ -30,9 +39,10 @@ const { DatabaseSync } = require("node:sqlite");
 const ARCHIVE_DIR = process.env.ARCHIVE_DIR || "/data/archive";
 const ARCHIVE_DB = process.env.ARCHIVE_DB || path.join(ARCHIVE_DIR, "index.db");
 // 2: dropped the never-populated `cost` column when the product went
-// token-only. 3: added archiveBytes (the budget below reads it). A bump
-// recreates the tables and refills them from the files.
-const SCHEMA_VERSION = 3;
+// token-only. 3: added archiveBytes (the budget below reads it). 4: added
+// rawBytes, the same for the raw layer (XERK-338). A bump recreates the tables
+// and refills them from the files.
+const SCHEMA_VERSION = 4;
 
 // The largest byte offset a transcript may claim (1 TiB). Far above any real
 // conversation, far below the 2^53 point where a stored value stops being
@@ -92,6 +102,57 @@ const ARCHIVE_TRANSCRIPT_MAX = byteCeiling(
 const ARCHIVE_TOTAL_MAX = byteCeiling(
   process.env.ARCHIVE_TOTAL_MAX_BYTES, 64 * 1024 * 1024 * 1024);
 
+// Per-transcript ceiling on the RAW layer (XERK-338), covering the conversation
+// file AND its whole session directory together. Sized against the reference
+// host, where 336 transcripts plus their nested files total 53 MB and the
+// largest single session directory is 7.6 MB — so nothing real approaches this,
+// and what it actually stops is a pathological `tool-results/` tree quietly
+// taking the store's whole budget for one session. Past it that transcript's
+// raw sync stops; the rendered layer is unaffected, so the session stays
+// readable and searchable. `0` disables, like the ceilings above.
+//
+// There is deliberately NO separate STORE-wide raw ceiling: ARCHIVE_TOTAL_MAX
+// exists to keep this volume writable for the hub's own state.json, and a
+// second budget beside it could not do that — two ceilings that each pass
+// individually still fill the disk together.
+const ARCHIVE_RAW_TRANSCRIPT_MAX = byteCeiling(
+  process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES, 128 * 1024 * 1024);
+// The most raw files ONE heartbeat's manifest may have stat-ed for its cursors.
+//
+// `rawCursors` is synchronous and runs on the heartbeat path, and the hub is one
+// event loop — so this spends the same hub-wide-stall budget the store-total walk
+// is sized against (14 ms there). Measured at ~5.6 us per stat: 2,000 files is
+// ~11 ms, where the 40,000 an agent may offer under its OWN caps is 223 ms and the
+// ~780,000 that fit in a 32 MiB HEARTBEAT_MAX is ~4.4 SECONDS of blocked loop —
+// per beat, per host, with every dashboard, SSE tail and other host's beat queued
+// behind it.
+//
+// The agent caps itself at ARCHIVE_RAW_MANIFEST_FILES_MAX, and that is NOT this
+// bound: a bound the receiving path does not enforce is not a bound (XERK-235).
+// Past it the extra files simply get no cursor, which the agent reads as zero and
+// pushes from the start — refused by `ingestRaw`'s offset check, so the stored
+// data is safe and the cost is one small wasted POST per over-cap file per pass.
+// That only ever happens to an agent already ignoring its own cap.
+const ARCHIVE_RAW_CURSOR_MAX = positiveEnvInt("ARCHIVE_RAW_CURSOR_MAX", 2000);
+// The same bound for the RENDERED layer's manifest, which is the costlier of the
+// two (a SELECT + an INSERT per entry, against one stat). The agent sends at most
+// ARCHIVE_MANIFEST_MAX (200); this is generous headroom over that and still ~35x
+// under the point where the stall is measurable in seconds.
+const ARCHIVE_MANIFEST_CURSOR_MAX = positiveEnvInt("ARCHIVE_MANIFEST_CURSOR_MAX", 2000);
+
+// The suffix that marks a raw directory, so both walks below can tell one from a
+// rendered archive without consulting the index.
+//
+// Recognised as `<name>.jsonl.raw` at depth > 0 ONLY, never as a bare `.raw`
+// anywhere: a REPO FOLDER is a slugified repo name at depth 0, and a repo
+// actually named `x.jsonl.raw` would otherwise have its whole archive skipped by
+// the rebuild and mis-measured by the budget. Both halves are cheap; neither
+// alone is airtight.
+const RAW_DIR_SUFFIX = ".raw";
+function isRawDir(name, depth) {
+  return depth > 0 && name.endsWith(".jsonl" + RAW_DIR_SUFFIX);
+}
+
 // ---- filename / path building ----------------------------------------------
 
 // Sanitize a component to a safe, flat token. Every character outside the
@@ -105,6 +166,14 @@ function slugify(s, fallback) {
     .replace(/^[-.]+|[-.]+$/g, "")
     .slice(0, 60);
   return out || fallback;
+}
+
+// A positive-integer tunable. Deliberately NOT byteCeiling: that reads an explicit
+// 0 as "ceiling off", which for a COUNT would mean statting without limit — the
+// opposite of what a 0 here could ever be asking for.
+function positiveEnvInt(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
 }
 
 function repoFolder(meta) {
@@ -125,6 +194,82 @@ function archiveRelPath(transcriptId, meta) {
   return path.join(repoFolder(meta), `${slugify(date, "undated")}__${summary}__${host}__${short}.jsonl`);
 }
 
+// ---- the raw layer's paths --------------------------------------------------
+
+// A session's files keep their own names inside `<canonical .jsonl>.raw/`, so
+// the raw layer is browsable and greppable exactly as it was on the host:
+//   <repo>/<date>__<summary>__<host>__<short>.jsonl.raw/<id>.jsonl
+//   <repo>/<date>__<summary>__<host>__<short>.jsonl.raw/<id>/subagents/agent-x.jsonl
+//   <repo>/<date>__<summary>__<host>__<short>.jsonl.raw/<id>/tool-results/b1.txt
+// Beside the rendered file rather than in a store of its own so one folder per
+// repo stays the whole organisation, and deleting a repo's archive takes its raw
+// bytes with it — which is what makes the store total's WALK the honest measure
+// of both layers at once.
+function rawDirFor(relPath, transcriptId) {
+  // Keyed on the FULL transcript id, not the canonical file name. That name
+  // carries only the first 8 alnum characters of the id, so two transcripts
+  // agreeing on repo/date/summary/host and that prefix share one canonical file
+  // — and, without this, one raw directory: each one's `/raw` listing returned
+  // the OTHER's files, and the read-back route served them (XERK-338 QA D6, hit
+  // accidentally by a QA fixture, and `transcriptId` is agent-chosen so it can
+  // be forced). The id is allowlisted `[A-Za-z0-9._-]+` at the route before it
+  // reaches here, and re-checked here so no other caller can widen that.
+  const id = String(transcriptId || "");
+  if (!id || !/^[A-Za-z0-9._-]+$/.test(id) || id === "." || id === "..") return null;
+  return filePaths(relPath).jsonl + RAW_DIR_SUFFIX + path.sep + id;
+}
+
+// The most components a session-relative path may have, and the most bytes.
+// Claude Code's deepest today is `<id>/subagents/workflows/wf_<run>/agent-x.jsonl`
+// at 5; the headroom is for a shape it grows later, not for anything to lean on.
+const RAW_REL_DEPTH_MAX = 10;
+const RAW_REL_LEN_MAX = 400;
+// Per COMPONENT, because 400 total is not the binding limit: every common
+// filesystem caps one name at 255 bytes, so a longer component passed the
+// allowlist and then failed at the syscall with ENAMETOOLONG — an unthrottled
+// error line per attempt, per beat, forever (XERK-338 QA D10). Refusing it here
+// makes it one quiet skip instead, and the file was never storable either way.
+const RAW_REL_COMPONENT_MAX = 255;
+
+/**
+ * Validate an agent-supplied, session-relative file path. Returns the normalized
+ * path or null.
+ *
+ * This is the one thing between a heartbeating agent and an arbitrary write
+ * anywhere the hub can reach, so it is an ALLOWLIST on every component rather
+ * than a search for `..`: a component is `[A-Za-z0-9._-]+` and is never `.` or
+ * `..`, which leaves nothing that can name a parent, an absolute path, a
+ * Windows drive or a UNC share whatever the platform's separator rules are.
+ * The caller still re-checks the joined result against the raw directory — the
+ * allowlist is the guarantee, that check is the proof it held.
+ */
+function safeRawRel(rel) {
+  const s = String(rel == null ? "" : rel);
+  if (!s || s.length > RAW_REL_LEN_MAX) return null;
+  const parts = s.split("/");
+  if (!parts.length || parts.length > RAW_REL_DEPTH_MAX) return null;
+  for (const p of parts) {
+    if (!p || p === "." || p === "..") return null;
+    if (Buffer.byteLength(p) > RAW_REL_COMPONENT_MAX) return null;
+    if (!/^[A-Za-z0-9._-]+$/.test(p)) return null;
+  }
+  return parts.join("/");
+}
+
+// The absolute path one raw file lands at, or null if `rel` is not nameable.
+function rawFilePath(relPath, transcriptId, rel) {
+  const safe = safeRawRel(rel);
+  if (!safe) return null;
+  const dir = rawDirFor(relPath, transcriptId);
+  if (!dir) return null;
+  // safeRawRel has already made every component a plain token, so this cannot
+  // escape `dir`; the check below is the belt to that braces.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const full = path.join(dir, safe);
+  if (full !== dir && !full.startsWith(dir + path.sep)) return null;
+  return full;
+}
+
 // ---- database ---------------------------------------------------------------
 
 let db = null;
@@ -136,7 +281,7 @@ function createSchema() {
      host TEXT, remoteKey TEXT, repo TEXT, worktree TEXT, slug TEXT,
      createdAt TEXT, endedTs TEXT, summary TEXT,
      msgCount INTEGER DEFAULT 0, bytesStored INTEGER DEFAULT 0,
-     archiveBytes INTEGER DEFAULT 0,
+     archiveBytes INTEGER DEFAULT 0, rawBytes INTEGER DEFAULT 0,
      filePath TEXT, updatedAt TEXT)`);
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
      text, transcriptId UNINDEXED, uuid UNINDEXED, role UNINDEXED, ts UNINDEXED)`);
@@ -312,12 +457,33 @@ function walkJsonlBytes(dir, depth) {
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const full = path.join(dir, d.name);
     if (d.isDirectory()) {
-      bytes += walkJsonlBytes(full, depth + 1);
+      // Inside a raw directory EVERY regular file counts, whatever it is named:
+      // a session's own files are `.jsonl`, `.json` and `.txt` (the
+      // `tool-results/` overflow), and counting only `.jsonl` there would leave
+      // most of the raw layer's bytes outside the ceiling that exists to keep
+      // this volume writable (XERK-338).
+      bytes += isRawDir(d.name, depth)
+        ? walkAllBytes(full) : walkJsonlBytes(full, depth + 1);
     } else if (d.isFile() && d.name.endsWith(".jsonl")) {
       // One unreadable file must not abandon the measurement and hand back a
       // total far under the truth — skip it and keep counting.
       try { bytes += fs.statSync(full).size; } catch { /* raced with a delete */ }
     }
+  }
+  return bytes;
+}
+
+// Every regular file under one raw directory. Same failure posture as the walk
+// above — an unreadable corner costs its subtree rather than the measurement.
+function walkAllBytes(dir) {
+  let names;
+  try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+  let bytes = 0;
+  for (const d of names) {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    const full = path.join(dir, d.name);
+    if (d.isDirectory()) bytes += walkAllBytes(full);
+    else if (d.isFile()) { try { bytes += fs.statSync(full).size; } catch { /* raced */ } }
   }
   return bytes;
 }
@@ -567,12 +733,268 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   return shed ? { bytesStored, shed: true } : { bytesStored };
 }
 
+// ---- the raw layer ----------------------------------------------------------
+
+/**
+ * How much of one raw file this store already holds — THE FILE'S OWN SIZE, not a
+ * number kept beside it.
+ *
+ * The cursor has to agree with what a byte-append will actually do, and the file
+ * is the only thing that can answer that. It also self-heals: an operator who
+ * deletes a raw file gets it re-synced from zero on the next pass, where the
+ * rendered layer's indexed cursor appends onto the gap instead (XERK-280, still
+ * open there for exactly the reason this avoids).
+ *
+ * Returns null — NOT 0 — for a stat that failed with anything but ENOENT.
+ * ENOENT is the file genuinely absent, which is safe to start fresh from. An
+ * EACCES/EIO/ESTALE read as 0 would re-ship the whole file and append it to the
+ * copy that is still there, writing a second copy of the session into the same
+ * file. Null means "cannot tell", and every caller declines to act on it.
+ */
+function rawCursor(full) {
+  try {
+    return fs.statSync(full).size;
+  } catch (e) {
+    if (e && e.code === "ENOENT") return 0;
+    return null;
+  }
+}
+
+/**
+ * The raw-layer cursors for one manifest: `{transcriptId: {relPath: bytes}}`.
+ *
+ * Only files the agent OFFERED are stat-ed, so this costs one stat per offered
+ * file rather than a walk of the store, and a file this hub holds that the agent
+ * no longer has simply isn't mentioned — it is history, and nothing re-derives
+ * it. A transcript with no row yet is skipped: `manifestCursors` creates the row,
+ * and until it exists there is no `filePath` to hang a raw directory off.
+ */
+function rawCursors(manifest) {
+  openDb();
+  const out = {};
+  // Bounded across the WHOLE manifest, not per transcript — see
+  // ARCHIVE_RAW_CURSOR_MAX. The manifest arrives newest-transcript-first, so a
+  // truncation drops the oldest history rather than the live sessions.
+  let budget = ARCHIVE_RAW_CURSOR_MAX;
+  let dropped = 0;
+  // Prepared ONCE. It was recompiled per iteration inside the loop below.
+  const lookup = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?");
+  for (const m of Array.isArray(manifest) ? manifest : []) {
+    if (!m || !m.transcriptId || !Array.isArray(m.rawFiles) || !m.rawFiles.length) continue;
+    if (budget <= 0) { dropped += m.rawFiles.length; continue; }
+    // Charged for the LOOKUP, before it happens. Charging only entries that
+    // resolve to a row left the outer loop uncharged, so a manifest of unknown
+    // ids — or of ids whose row has no `filePath`, which is every transcript
+    // that has never had a rendered chunk — did a SELECT apiece and moved the
+    // stall here instead of removing it: 2,985 ms for 470,051 entries, against
+    // 4.2 ms for the same entries with `rawFiles` omitted (QA F4). Same rule as
+    // the inner loop: the budget bounds the WORK, and a lookup is work.
+    budget -= 1;
+    const row = lookup.get(m.transcriptId);
+    if (!row || !row.filePath) continue;
+    const have = {};
+    for (const f of m.rawFiles) {
+      if (budget <= 0) { dropped += 1; continue; }
+      // Charged BEFORE validation, not after. Validation is not free — a
+      // max-length depth-10 path that fails on its last character measured
+      // 700 ms per 780k entries, against 30 ms for valid ones — so charging only
+      // the survivors let a caller offer millions of REJECTED paths and walk
+      // straight around this cap (XERK-338 QA D4). The budget bounds the WORK,
+      // and every offer costs work whether or not it names anything.
+      budget -= 1;
+      const rel = Array.isArray(f) ? f[0] : (f && f.path);
+      const full = rawFilePath(row.filePath, m.transcriptId, rel);
+      if (!full) continue;
+      const n = rawCursor(full);
+      if (n === null) continue;   // cannot tell — say nothing rather than "0"
+      if (n > 0) have[safeRawRel(rel)] = n;
+    }
+    if (Object.keys(have).length) out[m.transcriptId] = have;
+  }
+  if (dropped) warnRawCursorCap(dropped);
+  return Object.keys(out).length ? out : undefined;
+}
+
+let lastManifestWarnAt = 0;
+function warnManifestCap(dropped) {
+  const now = Date.now();
+  if (now - lastManifestWarnAt < 60 * 60 * 1000) return;
+  lastManifestWarnAt = now;
+  console.error(
+    `archive: a manifest carried more than ${ARCHIVE_MANIFEST_CURSOR_MAX} entries ` +
+    `(ARCHIVE_MANIFEST_CURSOR_MAX); ${dropped} were ignored this beat. An agent ` +
+    `inside ARCHIVE_MANIFEST_MAX never reaches this.`);
+}
+
+// One line an hour: an agent ignoring its own cap does so on every beat, so an
+// unthrottled line turns a survived flood into disk pressure on the hub.
+let lastRawCursorWarnAt = 0;
+function warnRawCursorCap(dropped) {
+  const now = Date.now();
+  if (now - lastRawCursorWarnAt < 60 * 60 * 1000) return;
+  lastRawCursorWarnAt = now;
+  console.error(
+    `archive: a manifest offered more than ${ARCHIVE_RAW_CURSOR_MAX} raw files ` +
+    `(ARCHIVE_RAW_CURSOR_MAX); ${dropped} got no cursor this beat. An agent inside ` +
+    `its own limits never reaches this — check that host's ARCHIVE_RAW_* config.`);
+}
+
+/**
+ * Which of these transcripts have spent their raw budget, so the agent stops
+ * pushing raw bytes for them. Like `archiveLimits`, an optimisation and not the
+ * enforcement — `ingestRaw` applies the ceiling itself, since an agent too old
+ * to read the flag pushes regardless.
+ */
+function rawLimits(ids) {
+  openDb();
+  const list = Array.isArray(ids) ? ids : [];
+  if (!(ARCHIVE_RAW_TRANSCRIPT_MAX > 0) || !list.length) return [];
+  const over = new Set(db.prepare(
+    "SELECT transcriptId FROM sessions WHERE rawBytes >= ?"
+  ).all(ARCHIVE_RAW_TRANSCRIPT_MAX).map((r) => r.transcriptId));
+  return list.filter((id) => over.has(id));
+}
+
+let lastRawOverWarnAt = 0;
+
+/**
+ * Append one raw byte-range to a session's own file, byte for byte.
+ *
+ * Append-only and forward-only, on the same contract as `ingestChunk`: `start`
+ * must equal what is already stored, and a mismatch stores NOTHING and hands
+ * back the real cursor for the agent to realign against. That is the whole
+ * duplicate-prevention story for a session that is resumed — a resumed
+ * conversation appends to the same file under the same transcript id, so the
+ * next pass ships only what is new, however many times it is resumed. It is
+ * also what makes a MIGRATED session safe: the target host carries the same
+ * transcript id and a byte-identical prefix, so its pushes continue this same
+ * file instead of starting a second copy.
+ *
+ * Returns {stored} always, plus {full} at the store ceiling and {skip} at the
+ * per-transcript one — never an error status for a refusal, because an agent
+ * reads an error as a chunk to re-send forever (XERK-255).
+ */
+function ingestRaw(host, transcriptId, rel, start, buf) {
+  openDb();
+  const row = db.prepare(
+    "SELECT filePath, rawBytes, host FROM sessions WHERE transcriptId=?").get(transcriptId);
+  // No row means no canonical file to hang the raw directory off. The manifest
+  // creates the row a beat before any raw push, so this is a stale offer.
+  if (!row || !row.filePath) return { stored: 0, skip: true };
+  // THE SESSION'S OWN HOST, or nobody. `<host>` is proved by the credential at
+  // the gate (XERK-268), but proving WHO is calling says nothing about WHOSE
+  // session they may write into: with a properly bound token, any agent could
+  // create arbitrary named files inside another host's archived session and
+  // serve them back through the read-back route as part of that host's
+  // "byte-for-byte record" (XERK-338 QA D5). A row with no host recorded is
+  // pre-raw-layer history and is not writable by anyone.
+  if (!row.host || row.host !== host) return { stored: 0, skip: true };
+  const full = rawFilePath(row.filePath, transcriptId, rel);
+  if (!full) return { stored: 0, skip: true };
+
+  const have = rawCursor(full);
+  if (have === null) return { stored: 0, skip: true };  // cannot tell; never guess 0
+  const startN = Number(start);
+  if (!Number.isFinite(startN) || startN !== have) return { stored: have };
+  if (!buf || !buf.length) return { stored: have };
+  if (have + buf.length > MAX_TRANSCRIPT_BYTES) return { stored: have, skip: true };
+
+  const total = totalForCeiling();
+  if (ARCHIVE_TOTAL_MAX && total >= ARCHIVE_TOTAL_MAX) {
+    warnArchiveFull(total);
+    return { stored: have, full: true };
+  }
+  const rawBytes = row.rawBytes || 0;
+  if (ARCHIVE_RAW_TRANSCRIPT_MAX > 0 && rawBytes >= ARCHIVE_RAW_TRANSCRIPT_MAX) {
+    const now = Date.now();
+    if (now - lastRawOverWarnAt > 60 * 60 * 1000) {
+      lastRawOverWarnAt = now;
+      console.error(
+        `archive: ${transcriptId} has stored ${rawBytes} raw bytes, over the ` +
+        `${ARCHIVE_RAW_TRANSCRIPT_MAX} limit (ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES) — ` +
+        `its raw copy stops here; the rendered transcript is unaffected`);
+    }
+    return { stored: have, skip: true };
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    if (have === 0) {
+      // EXCLUSIVE create, not a truncating write: the stat above said ENOENT, so
+      // anything there now appeared underneath us and truncating it would delete
+      // a copy this hub had already accepted.
+      fs.writeFileSync(full, buf, { flag: "wx" });
+    } else {
+      fs.appendFileSync(full, buf);
+    }
+  } catch (e) {
+    if (e && e.code === "EEXIST") return { stored: rawCursor(full) || 0 };
+    console.error(`archive: raw append failed for ${transcriptId} ${rel}: ${e.message}`);
+    return { stored: have, skip: true };
+  }
+  // Charge the store total immediately rather than waiting for the next walk —
+  // the same rule the rendered layer follows, and for the same reason.
+  writtenSinceWalk += buf.length;
+  db.prepare("UPDATE sessions SET rawBytes=?, updatedAt=? WHERE transcriptId=?")
+    .run(rawBytes + buf.length, new Date().toISOString(), transcriptId);
+  return { stored: have + buf.length };
+}
+
+/** The raw files held for one transcript, as [{path, bytes}], newest walk order. */
+function listRawFiles(transcriptId) {
+  openDb();
+  const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  if (!row || !row.filePath) return null;
+  const dir = rawDirFor(row.filePath, transcriptId);
+  if (!dir) return null;
+  const out = [];
+  const walk = (d, prefix) => {
+    let names;
+    try { names = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of names.sort((a, b) => a.name.localeCompare(b.name))) {
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+      const full = path.join(d, e.name);
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(full, rel);
+      else if (e.isFile()) {
+        try { out.push({ path: rel, bytes: fs.statSync(full).size }); } catch { /* raced */ }
+      }
+    }
+  };
+  walk(dir, "");
+  return out;
+}
+
+/** One raw file's absolute path, for streaming it back. null when unknown. */
+function rawFileFor(transcriptId, rel) {
+  openDb();
+  const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
+  if (!row || !row.filePath) return null;
+  const full = rawFilePath(row.filePath, transcriptId, rel);
+  if (!full) return null;
+  try { return fs.statSync(full).isFile() ? full : null; } catch { return null; }
+}
+
 // Upsert metadata rows for a manifest and return the bytes-have cursor map the
 // heartbeat reply carries back (transcriptId -> bytesStored we already hold).
 function manifestCursors(host, manifest) {
   openDb();
   const have = {};
-  const list = Array.isArray(manifest) ? manifest : [];
+  // Capped like the raw cursors beside it, and for the same reason — it is the
+  // same handler, the same beat and the same single event loop. Pre-existing but
+  // strictly worse: one SELECT + INSERT per entry, measured at 6.9 SECONDS of
+  // blocked loop for 973,677 new ids in one 26.9 MiB beat, which also wrote
+  // 973,682 rows and grew index.db + WAL to 161 MB on /data — repeatable every
+  // beat, and index.db is outside ARCHIVE_TOTAL_MAX (XERK-332). Left uncapped it
+  // also made ARCHIVE_RAW_CURSOR_MAX nearly pointless: anyone who could send
+  // 780k rawFiles could send 780k manifest entries instead for 20x the stall
+  // (XERK-338 QA D7). The agent caps itself at ARCHIVE_MANIFEST_MAX; that is not
+  // this bound.
+  let list = Array.isArray(manifest) ? manifest : [];
+  if (list.length > ARCHIVE_MANIFEST_CURSOR_MAX) {
+    warnManifestCap(list.length - ARCHIVE_MANIFEST_CURSOR_MAX);
+    list = list.slice(0, ARCHIVE_MANIFEST_CURSOR_MAX);
+  }
   const upsert = db.prepare(`INSERT INTO sessions(
       transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
       summary, updatedAt)
@@ -725,15 +1147,20 @@ function getTranscript(transcriptId) {
 
 // ---- rebuild ----------------------------------------------------------------
 
-function walkJsonl(dir, out) {
+function walkJsonl(dir, out, depth) {
   let names;
   try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const d of names) {
+    // A raw directory is SKIPPED WHOLE (XERK-338). Its contents are the
+    // session's own `.jsonl` files, which are not archive rows and carry no
+    // `.meta` — descending would read every one of them into memory to decide
+    // that, on a rebuild that already re-reads the entire store.
+    if (d.isDirectory() && isRawDir(d.name, depth || 0)) continue;
     // d.name is a single readdirSync entry (never contains a separator), so
     // this stays inside `dir` — a recursive walk of our own ARCHIVE_DIR.
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const full = path.join(dir, d.name);
-    if (d.isDirectory()) walkJsonl(full, out);
+    if (d.isDirectory()) walkJsonl(full, out, (depth || 0) + 1);
     else if (d.isFile() && d.name.endsWith(".jsonl")) out.push(full);
   }
 }
@@ -745,14 +1172,14 @@ function rebuildIndex() {
   db.exec("DELETE FROM entries_fts");
   db.exec("DELETE FROM sessions");
   const files = [];
-  walkJsonl(ARCHIVE_DIR, files);
+  walkJsonl(ARCHIVE_DIR, files, 0);
   const insertEntry = db.prepare(
     "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)"
   );
   const upsert = db.prepare(`INSERT OR REPLACE INTO sessions(
       transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
-      summary, msgCount, bytesStored, archiveBytes, filePath, updatedAt)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      summary, msgCount, bytesStored, archiveBytes, rawBytes, filePath, updatedAt)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   for (const jsonl of files) {
     const meta = readSidecar(jsonl + ".meta") || {};
     const transcriptId = meta.transcriptId;
@@ -764,6 +1191,12 @@ function rebuildIndex() {
     // to be what's actually on disk even if a sidecar is stale or predates the
     // field (every pre-XERK-267 archive has none).
     const archiveBytes = Buffer.byteLength(raw);
+    // Same rule for the raw layer's budget: walked off its directory, never read
+    // back from a sidecar. It is also what makes an operator's `rm -rf` of a raw
+    // directory actually give the budget back, rather than only the disk.
+    // The whole suffix directory: it now holds one subdirectory per transcript
+    // (see rawDirFor), and a collided canonical file legitimately has two.
+    const rawBytes = walkAllBytes(jsonl + RAW_DIR_SUFFIX);
     tx(() => {
       let msgCount = 0;
       for (const line of raw.split("\n")) {
@@ -778,7 +1211,7 @@ function rebuildIndex() {
       upsert.run(transcriptId, meta.host || null, meta.remoteKey || null,
         meta.repo || null, meta.worktree || null, meta.slug || null,
         meta.createdAt || null, meta.endedTs || null, meta.summary || null,
-        msgCount, meta.bytesStored || 0, archiveBytes, relPath,
+        msgCount, meta.bytesStored || 0, archiveBytes, rawBytes, relPath,
         meta.updatedAt || null);
     });
   }
@@ -787,9 +1220,19 @@ function rebuildIndex() {
 
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
+  ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_MANIFEST_CURSOR_MAX,
+  RAW_DIR_SUFFIX,
   slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits,
+  // The raw layer (XERK-338).
+  ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
+  safeRawRel, rawDirFor, rawFilePath,
   totalArchiveBytes, totalForCeiling, __resetTotalCache,
   searchArchive, listArchive, getTranscript,
+  // Test seam. The raw layer's own `.jsonl` files carry no `.meta`, so the
+  // rebuild would skip them anyway — this is exported so the SKIP itself can be
+  // pinned rather than that backstop, because the skip is what stops a rebuild
+  // reading the entire raw store into memory to reach the same conclusion.
+  __walkJsonl(dir) { const out = []; walkJsonl(dir || ARCHIVE_DIR, out, 0); return out; },
 };

@@ -27,6 +27,9 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { Duplex } = require("stream");
+// Only the archive's raw layer uses this (XERK-338): agents gzip a session's own
+// bytes on the wire, and the hub gunzips them under a hard output bound.
+const zlib = require("zlib");
 // Durable, searchable archive of ended sessions (organized files on /data + a
 // node:sqlite FTS index). See archive.js. Lazily opens its DB on first use, so
 // requiring it is cheap and side-effect-free.
@@ -34,6 +37,12 @@ const archive = require("./archive.js");
 // Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
 // FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
 const push = require("./push.js");
+// Durable token-usage history (XERK-338): usage is an agent-derived aggregate
+// that lived only on the registry record, so deleting/pruning a host threw it
+// away and a wiped host overwrote its own past with near-zero. This keeps it on
+// /data, keyed by host, and folds it back into what /api/agents serves. Reads
+// its file at require time (like the other /data stores below).
+const usageLedger = require("./usage-ledger.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 
@@ -1288,6 +1297,22 @@ const MIGRATIONS_MAX = 40; // backstop against unbounded growth
 // Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
 // legitimate at-cap bundle isn't rejected for framing overhead.
 const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
+
+// The archive's raw layer (XERK-338). CHUNK is the decompressed ceiling one push
+// may expand to — it bounds `gunzipSync`, so it is the number that actually
+// stops a zip bomb; BODY is the compressed body cap, sized so an ordinary chunk
+// never trips it (JSONL gzips ~5-8x, so 4 MiB of transcript is well under 1 MiB
+// on the wire) while a body that could only be a bomb is refused before it is
+// ever decompressed. The agent's own read window must stay at or under CHUNK, or
+// every push it makes is refused.
+const ARCHIVE_RAW_CHUNK_MAX = 1 << 22;   // 4 MiB decompressed
+// The wire cap has to clear the worst case of gzipping a full chunk, not equal
+// it. gzip EXPANDS incompressible input (~+0.03%: a measured 4 MiB of urandom
+// came out at 4,195,602 bytes), so an equal cap made any session file holding
+// 4 MiB of already-compressed bytes impossible to push — permanently, and,
+// because a failed push aborted the whole pass, it stopped the raw sync for
+// every OTHER transcript on that host too (XERK-338 QA D2).
+const ARCHIVE_RAW_BODY_MAX = ARCHIVE_RAW_CHUNK_MAX + (1 << 16);
 // **The bundle NEVER rides in the record** (XERK-263). At 65 MiB a pair of
 // concurrent moves — two clicks of the Sessions page's Move control — would
 // retain 130 MiB in a hub running at mem_limit 256m, so the relay spools each
@@ -1484,9 +1509,16 @@ function serializeAgent(key, agent, now) {
   const { history, subagentHistory, jiraIssues, statusResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+  // Earlier epochs of this host's spend added back (XERK-338). Null — and so
+  // free — for every host that has never lost transcripts, which is all of them
+  // until one is wiped; only then does the served block stop being the agent's
+  // own. Applied HERE rather than at ingest so what is stored and size-budgeted
+  // stays the agent's raw report, and so a purge takes effect on the next read.
+  const durable = usageLedger.fold(key, a, now);
   return {
     key,
     ...a,
+    ...(durable || {}),
     commands: publicCommands(a.commands),
     online,
     // An expected restart in progress (XERK-29): only meaningful while the host
@@ -1518,6 +1550,13 @@ function buildAgentsCache() {
     // In-flight (and just-settled) session migrations, so the Sessions page can
     // follow a moved session onto its new host and surface a failure (XERK-101).
     migrations: migrationList(),
+    // Token usage for hosts the registry no longer has (XERK-338): deleted,
+    // pruned, or evicted. Agent-shaped records carrying nothing but `usage` /
+    // `repoUsage` / `jira.siteKey` and flagged `retired`, so the Usage page and
+    // the Android Usage screen chart them beside the live fleet with the code
+    // they already have — and so no OTHER page picks them up, since none of them
+    // reads this key. Empty from a hub predating the ledger.
+    retiredUsage: usageLedger.retiredAgents(Object.keys(agents), now),
     // Whether the hub can actually deliver mobile push (FCM configured). Surfaced
     // so a disabled/misconfigured push is VISIBLE on the dashboard instead of
     // silently swallowing every alert — the failure mode of XERK-152, whose only
@@ -3263,6 +3302,27 @@ function normalizeRecord(a) {
   normalizeSubscription(a);
   normalizeLocalModel(a);
   normalizeSpawnRefusals(a);
+  normalizeRetired(a);
+}
+
+/**
+ * `retired` is a HUB-OWNED flag, never an agent's to set (XERK-338).
+ *
+ * It exists on `AgentsResponse.retiredUsage` entries, which the hub builds
+ * itself; a record that came off the wire is by definition a live host and must
+ * carry `false`. Android TYPES it (`AgentInfo.retired: Boolean`), and typing a
+ * field and adding its hub-side coercion are the SAME change — without this an
+ * agent putting `retired: "yes"` on its own beat had that value served verbatim,
+ * and since a full `/api/agents` decode is ATOMIC on Android, ONE host threw for
+ * the WHOLE array and emptied every other host from every phone's fleet list.
+ * It persisted into `state.json` too, so it survived a restart.
+ *
+ * Deleted rather than coerced to `false`: the field is not part of an agent
+ * record's shape at all, and `false` is already what an absent one decodes to.
+ */
+function normalizeRetired(a) {
+  if (!a || typeof a !== "object") return;
+  if ("retired" in a) delete a.retired;
 }
 
 /**
@@ -3891,7 +3951,12 @@ function readRawBody(req, cap) {
         if (len > drainLimit) req.destroy();
         return;
       }
-      if (len > cap) return refuse(new Error("body too large"));
+      // BodyTooLarge, like readBody (and spoolRawBody): callers test `.tooLarge`
+      // to tell "your body is too big, send less" (413) from "the hub is
+      // momentarily full, send it again" (503), and those must not collapse.
+      // A plain Error left BOTH this reader's callers — the archive raw ingest
+      // and the migration blob relay — answering 400 for an oversized body.
+      if (len > cap) return refuse(new BodyTooLarge(cap));
       if (len > held) {
         const next = laneForCharge(lane, len - held);
         if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
@@ -6436,9 +6501,14 @@ const server = http.createServer(async (req, res) => {
 
     // The archive-ingest endpoint is agent-pushed (bearer token), like the
     // heartbeat — it must not require the user login the rest of /api/* does.
+    // `.../archive/<tid>` is the rendered delta; `.../archive/<tid>/raw/<file>`
+    // is the byte-for-byte copy of one of that session's own files (XERK-338).
+    // Both are agent-pushed on the same credential, which is also what binds
+    // `<host>` (XERK-268).
     const isArchiveIngest =
       req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
-      parts[3] === "archive" && parts.length === 5;
+      parts[3] === "archive" &&
+      (parts.length === 5 || (parts.length === 7 && parts[5] === "raw"));
 
     // The expected-restart signal is agent-pushed (bearer token) like the
     // heartbeat: the agent fires it as it goes down, before it could ever hold
@@ -6760,7 +6830,7 @@ const server = http.createServer(async (req, res) => {
       // an archive/DB hiccup must never break the heartbeat.
       const archiveManifest = payload.archiveManifest;
       delete payload.archiveManifest;
-      let archiveHave, archiveShed, archiveFull;
+      let archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip;
       if (Array.isArray(archiveManifest) && archiveManifest.length) {
         try {
           archiveHave = archive.manifestCursors(key, archiveManifest);
@@ -6772,6 +6842,13 @@ const server = http.createServer(async (req, res) => {
           const limits = archive.archiveLimits(Object.keys(archiveHave));
           archiveShed = limits.shed.length ? limits.shed : undefined;
           archiveFull = limits.full || undefined;
+          // The raw layer's own cursors, per session-relative file (XERK-338).
+          // Computed AFTER manifestCursors, which is what creates the rows the
+          // raw directories hang off. Absent for every transcript this hub holds
+          // nothing of, which the agent reads as zero and ships from the start.
+          archiveRawHave = archive.rawCursors(archiveManifest);
+          const rawSkip = archive.rawLimits(Object.keys(archiveHave));
+          archiveRawSkip = rawSkip.length ? rawSkip : undefined;
         } catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
       }
       const next = (agents[key] = {
@@ -6913,6 +6990,10 @@ const server = http.createServer(async (req, res) => {
           error: "agent registry full", bytes: AGENTS_TOTAL_MAX, share: AGENT_FAIR_SHARE,
         });
       }
+      // Durable usage history (XERK-338). Deliberately after EVERY gate that can
+      // still refuse this beat — a refused beat is not history, and a record
+      // rolled back to `prev` must not have been folded into the ledger first.
+      usageLedger.ingest(key, next);
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
@@ -6967,7 +7048,8 @@ const server = http.createServer(async (req, res) => {
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
       return json(res, 200, archiveHave
-        ? { commands: reply, archiveHave, archiveShed, archiveFull }
+        ? { commands: reply, archiveHave, archiveShed, archiveFull,
+            archiveRawHave, archiveRawSkip }
         : { commands: reply });
     }
 
@@ -7009,6 +7091,16 @@ const server = http.createServer(async (req, res) => {
       const key = decodeURIComponent(parts[2]);
       const transcriptId = decodeURIComponent(parts[4]);
       if (!/^[A-Za-z0-9._-]+$/.test(transcriptId)) return json(res, 400, { error: "bad transcriptId" });
+      // A raw push whose <file> segment was an unencoded `.`/`..` has had that
+      // segment normalised away by the URL parser and arrives HERE, on the
+      // rendered route, with a gzip body. No privilege is gained (the auth gate
+      // reads the same normalised path), but answering the JSON parser's
+      // complaint about a binary body is a confusing way to say "you built that
+      // URL wrong" — so name it (XERK-338 QA).
+      if ((req.headers["content-type"] || "").includes("gzip")) {
+        return json(res, 400, { error: "gzip body on the rendered archive route — " +
+          "percent-encode the raw file path into a single segment" });
+      }
       const body = JSON.parse((await readBody(req)) || "{}");
       try {
         const r = archive.ingestChunk(
@@ -7017,6 +7109,75 @@ const server = http.createServer(async (req, res) => {
           Array.isArray(body.entries) ? body.entries : []
         );
         return json(res, 200, r);
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // POST /api/agents/<host>/archive/<transcriptId>/raw/<file>?start=<n> — an
+    // agent pushing one append-only byte range of one of a session's OWN files
+    // into the archive's raw layer (XERK-338). `<file>` is the session-relative
+    // path, percent-encoded into a single segment (so `subagents/agent-1.jsonl`
+    // arrives as `subagents%2Fagent-1.jsonl`), and is allowlisted component by
+    // component in `archive.safeRawRel` before it can name anything on disk.
+    //
+    // The body is the raw bytes, gzipped — these are 3-14x the size of the
+    // rendered entries beside them and JSONL compresses ~5-8x, so shipping them
+    // uncompressed would make the raw layer cost more on the wire than
+    // everything else the agent sends put together. Decompression is BOUNDED
+    // (`maxOutputLength`): the body cap alone bounds the compressed side, and a
+    // zip bomb is exactly the shape that turns a 1 MiB body into an OOM on a
+    // 256 MiB hub.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) {
+      const key = decodeURIComponent(parts[2]);
+      const transcriptId = decodeURIComponent(parts[4]);
+      // Length-bounded as well as allowlisted: since XERK-338 the id is a
+      // DIRECTORY COMPONENT of the raw layer's path, so an id past the
+      // filesystem's 255-byte name limit made every push for that session fail
+      // at the syscall and report `skip` with no diagnostic at all (QA F6).
+      if (!/^[A-Za-z0-9._-]{1,255}$/.test(transcriptId)) {
+        return json(res, 400, { error: "bad transcriptId" });
+      }
+      let rel;
+      try { rel = decodeURIComponent(parts[6]); } catch { return json(res, 400, { error: "bad file" }); }
+      if (!archive.safeRawRel(rel)) return json(res, 400, { error: "bad file" });
+      const start = Number(url.searchParams.get("start") || 0);
+      if (!Number.isSafeInteger(start) || start < 0) return json(res, 400, { error: "bad start" });
+      let gz;
+      try {
+        gz = await readRawBody(req, ARCHIVE_RAW_BODY_MAX);
+      } catch (e) {
+        // 413 and 503 mean opposite things and must not be collapsed: on a 503
+        // the agent retries, on a 413 it must not. `budgetExceeded` is the flag
+        // the reader actually sets — `overloaded` was never set by anything.
+        if (e && e.tooLarge) return json(res, 413, { error: e.message });
+        if (e && e.budgetExceeded) return json(res, 503, { error: e.message });
+        return json(res, 400, { error: "could not read body" });
+      }
+      // `gunzipSync` is SYNCHRONOUS, so the decompressed buffer is not a
+      // concurrent term: nothing else runs on this loop between the allocation
+      // and the last line that reads it, and at most ONE such buffer exists at a
+      // time. The peak this adds to the hub is therefore ARCHIVE_RAW_CHUNK_MAX,
+      // flat, not N times it.
+      //
+      // An earlier version charged it to the in-flight body budget to bound "N
+      // concurrent gunzips". That was inert — the charge and release sit in one
+      // synchronous run, so 64 concurrent pushes all saw an empty budget and not
+      // one 503 — and the comment asserted a guarantee that does not exist. If
+      // this ever becomes async, the charge has to come back for real.
+      let buf;
+      try {
+        buf = gz.length ? zlib.gunzipSync(gz, { maxOutputLength: ARCHIVE_RAW_CHUNK_MAX })
+                        : Buffer.alloc(0);
+      } catch (e) {
+        // A body that does not decompress is a broken or hostile push, not a
+        // chunk to retry — but it answers 400 rather than the cursor protocol's
+        // "no progress", because the agent has nothing to realign to.
+        return json(res, 400, { error: "body is not gzip within the size limit" });
+      }
+      try {
+        return json(res, 200, archive.ingestRaw(key, transcriptId, rel, start, buf));
       } catch (e) {
         return json(res, 500, { error: e.message });
       }
@@ -7255,6 +7416,49 @@ const server = http.createServer(async (req, res) => {
       const t = archive.getTranscript(transcriptId);
       if (!t) return json(res, 404, { error: "unknown transcript" });
       return json(res, 200, t);
+    }
+
+    // GET /api/archive/<transcriptId>/raw — what the raw layer holds for that
+    // session, as [{path, bytes}] (XERK-338). Storing bytes nothing can read
+    // back is not archiving them, so this and the download below ship with the
+    // ingest rather than waiting for a UI to want them; they are also how an
+    // operator confirms a session really did land.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "raw" && parts.length === 4) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const files = archive.listRawFiles(transcriptId);
+      if (!files) return json(res, 404, { error: "unknown transcript" });
+      return json(res, 200, { transcriptId, files });
+    }
+
+    // GET /api/archive/<transcriptId>/raw/<file> — one raw file, byte for byte.
+    // `<file>` is percent-encoded into a single segment like the ingest route's,
+    // and goes through the same allowlist before it names anything.
+    //
+    // Served as a DOWNLOAD, never inline: these are attacker-influenced bytes
+    // (a session transcript contains whatever was pasted into it), and a
+    // browser rendering them same-origin behind the hub's login is stored XSS.
+    // `text/plain` + `nosniff` + an attachment disposition is the same posture
+    // the rest of the app's file surfaces take.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "raw" && parts.length === 5) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      let rel;
+      try { rel = decodeURIComponent(parts[4]); } catch { return json(res, 400, { error: "bad file" }); }
+      const full = archive.rawFileFor(transcriptId, rel);
+      if (!full) return json(res, 404, { error: "unknown file" });
+      let size;
+      try { size = fs.statSync(full).size; } catch { return json(res, 404, { error: "unknown file" }); }
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": size,
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": `attachment; filename="${archive.slugify(rel, "raw")}"`,
+        "Cache-Control": "no-store",
+      });
+      return void fs.createReadStream(full)
+        .on("error", () => res.destroy())
+        .pipe(res);
     }
 
     // POST /api/agents/<host>/clone — queue a clone into the host's repos
@@ -7779,10 +7983,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "agents" && parts.length === 3) {
       const key = decodeURIComponent(parts[2]);
       delete agents[key];
+      // Removing the host does NOT remove what it spent (XERK-338) — that is the
+      // whole point of the ledger, and the Usage page keeps charting it as a
+      // retired host. `?usage=purge` is the deliberate second step for an
+      // operator who wants the history gone too; there is no way back from it,
+      // so it is never the default and never implied by removing the card.
+      const purged = url.searchParams.get("usage") === "purge"
+        ? usageLedger.forget(key) : false;
       scheduleSave();
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, usagePurged: purged });
     }
 
     // GET /api/jira/<siteKey>/create-meta[?project=<p>] -> the New-ticket form's
@@ -8862,6 +9073,7 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    normalizeRetired,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
@@ -8874,6 +9086,11 @@ if (process.env.TURMA_TEST) {
     // can make it throw and hold the rollback that follows (XERK-262). See its
     // declaration for why that rollback cannot be reached from the wire.
     recordCoercion,
+
+    // Durable token-usage history (XERK-338). Exported so a wire test can clear
+    // it between cases: it is process-wide and outlives the registry by design,
+    // so a synthetic host left in it would ride every later /api/agents body.
+    usageLedger,
 
     queueCommand,
     findSession,

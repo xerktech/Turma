@@ -48,6 +48,10 @@ data class FleetState(
     // the board card's queued chip reads it. Refreshed by the poll and the
     // "ticketQueue" SSE event.
     val ticketQueue: List<com.xerktech.turma.model.QueuedTicket> = emptyList(),
+    // Usage for hosts the hub's registry no longer has (XERK-338), from the same
+    // payload; only the Usage screen reads it. Poll-only (no SSE event), which
+    // the 6s poll covers.
+    val retiredUsage: List<AgentInfo> = emptyList(),
     // Hub-wide mobile-push health (XERK-152): false when the hub has no FCM
     // credential, so every alert is silently dropped. Drives the Dashboard's
     // "push is off" banner. Poll-only (no SSE event); defaults true so an older
@@ -104,6 +108,7 @@ class FleetRepository(
             ticketModels = resp.ticketModels
             orgColors = resp.orgColors
             ticketQueue = resp.ticketQueue
+            retiredUsage = resp.retiredUsage
             pushEnabled = resp.pushEnabled
             emit(resp.now, error = null)
         } catch (e: Exception) {
@@ -127,6 +132,9 @@ class FleetRepository(
     private var ticketQueue: List<com.xerktech.turma.model.QueuedTicket> = emptyList()
 
     @Volatile
+    private var retiredUsage: List<AgentInfo> = emptyList()
+
+    @Volatile
     private var pushEnabled: Boolean = true
 
     private fun emit(now: Long, error: String?) {
@@ -138,6 +146,7 @@ class FleetRepository(
             ticketModels = ticketModels,
             orgColors = orgColors,
             ticketQueue = ticketQueue,
+            retiredUsage = retiredUsage,
             pushEnabled = pushEnabled,
         )
     }

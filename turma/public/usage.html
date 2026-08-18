@@ -506,6 +506,16 @@ function normRepo(name) {
 }
 function repoLabel(name) { return name === ROOT_REPO ? "Root" : name; }
 
+// A host's name on this page. Hosts the hub still has read as themselves; a
+// RETIRED one (XERK-338) — deleted, pruned or evicted from the registry, and
+// present here only because the hub kept its usage — says so, because otherwise
+// a name that no longer exists anywhere else in the app reads as a live host
+// that simply spent nothing today.
+function hostLabel(a) {
+  const name = (a && (a.device || a.key)) || "";
+  return a && a.retired ? name + " (removed)" : name;
+}
+
 // "By repo": one series per repo, summed across every host it runs on. Repos are
 // unified by the agent-supplied `remoteKey` (normalized git origin), so the same
 // repo cloned on two hosts collapses to one series.
@@ -521,7 +531,7 @@ function repoSeries(agents) {
         byKey.set(key, g);
       }
       if (r.repo) g.repo = normRepo(r.repo);
-      g.hosts.add(a.device || a.key);
+      g.hosts.add(hostLabel(a));
       mergeUsageInto(g.usage, r.usage);
     }
   }
@@ -550,14 +560,15 @@ function hostSeries(agents) {
     // dashboard tiles and the Android client fall back the same way.
     if (a.usage) mergeUsageInto(usage, a.usage);
     else for (const r of a.repoUsage || []) mergeUsageInto(usage, r.usage);
+    const label = hostLabel(a);
     return {
       skey: "host::" + a.key,
       group: "Hosts",
-      repo: a.device || a.key,
+      repo: label,
       id: a.key,
-      label: a.device || a.key,
-      device: a.device || a.key,
-      rcName: a.device || a.key,
+      label,
+      device: label,
+      rcName: label,
       usage,
     };
   // A host that has consumed nothing at all isn't a series (this is the filter
@@ -862,7 +873,12 @@ function renderInner(data) {
   // orgs share reads as that org's share of it, which is the point of scoping.
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
-  const agents = TurmaOrg.filter(data.agents || []);
+  // Live hosts PLUS the usage of hosts the hub no longer has (XERK-338), which
+  // is the only place a deleted, pruned or wiped host's spend still exists. They
+  // are appended AFTER TurmaOrg.update so a retired host cannot resurrect an org
+  // in the header's menu — it can only be filtered by one that something live
+  // still reports — while carrying `jira.siteKey` so the filter does apply to it.
+  const agents = TurmaOrg.filter([...(data.agents || []), ...(data.retiredUsage || [])]);
   // Before the series work, and before its empty-state returns below: the
   // headline totals and the limit headroom are both worth showing on a fleet
   // that has charted nothing yet.
@@ -1382,7 +1398,11 @@ function connectSSE() {
   es.addEventListener("removed", (e) => {
     try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); }
     catch { return; }
-    scheduleRender();
+    // A removed host keeps its usage, as a `retiredUsage` entry that rides
+    // /api/agents and has no SSE event of its own (XERK-338) — so patching the
+    // cache alone would drop its spend off the chart until the 30s poll, which
+    // is SKIPPED while the stream is healthy. A removal is rare; re-poll for it.
+    refresh();
   });
   // An org's color pin changed (XERK-145): org.js owns the live map; patching
   // this page's cache keeps the next render's TurmaOrg.update(cache) from

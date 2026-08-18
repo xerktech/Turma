@@ -40,6 +40,8 @@ process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");
 process.env.AUTOSTART_ORGS_FILE = tmp("autostart-orgs");
 process.env.TICKET_MODELS_FILE = tmp("ticket-models");
 process.env.ORG_COLORS_FILE = tmp("org-colors");
+// Durable token-usage history (XERK-338), a /data file of its own.
+process.env.USAGE_LEDGER_FILE = tmp("usage-ledger");
 process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-wfrestore-migrations-"));
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-wfrestore-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");

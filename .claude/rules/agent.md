@@ -438,6 +438,24 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
 - A refused delta comes back as **the hub's real cursor plus a flag, never an error status** — the
   agent must read it as no forward progress and drop it, not as a chunk to re-send forever
   (XERK-255).
+- **Beside the rendered entries it ships the session's OWN FILES, byte for byte** (XERK-338):
+  `_session_files()` enumerates `<id>.jsonl` plus everything under `<id>/` — `subagents/`,
+  `workflows/`, `tool-results/`, and whatever Claude Code adds next — and `_archive_raw_deltas()`
+  pushes each as gzipped, append-only ranges against a PER-FILE cursor (`archiveRawHave`).
+  - **Deliberately not filtered to `*.jsonl`.** The point of the raw layer is that nobody has to have
+    predicted what would be worth keeping, and the files that are not `.jsonl` are exactly the ones
+    no other surface carries. `<slug>/memory/` is excluded — it belongs to the PROJECT, so one copy
+    per conversation would be storage with no owner.
+  - Only regular files, and **never through a symlink** (dir or file), the same hardening
+    `_project_transcripts` applies: a link pointed at `PROJECTS_ROOT` drags every transcript on the
+    host into one session's archive.
+  - A source file SHORTER than the hub's cursor means the transcript was rewritten under us: it is
+    logged and left alone. **Never truncate the archive to match** — the longer copy is the one with
+    the history in it.
+  - The raw pass runs in its **own try/except** off the same reply: a raw failure must never cost the
+    rendered transcript, which is what every other surface reads. Its read window must stay at or
+    under the hub's `ARCHIVE_RAW_CHUNK_MAX`, which bounds its gunzip — a larger window is refused on
+    every push, not truncated. Tests: the raw cases in `TestArchiveSync`.
 
 ## Hooks
 

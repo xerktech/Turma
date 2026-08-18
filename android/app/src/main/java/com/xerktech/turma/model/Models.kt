@@ -35,6 +35,13 @@ data class AgentsResponse(
     // it — so this payload is the only place it exists. Absent on older hubs,
     // which is indistinguishable from "nothing waiting" and reads the same.
     val ticketQueue: List<QueuedTicket> = emptyList(),
+    // Token usage for hosts the hub's registry no longer has (XERK-338):
+    // deleted, pruned, or evicted. Agent-shaped records carrying only `usage` /
+    // `repoUsage` / `jira.siteKey`, flagged `retired`, so the Usage screen can
+    // chart them beside the live fleet — and nothing else reads them. Empty on a
+    // hub predating the ledger, which is indistinguishable from a fleet that has
+    // never removed a host and reads the same.
+    val retiredUsage: List<AgentInfo> = emptyList(),
     // Whether the hub can deliver mobile push at all — FCM configured (XERK-152).
     // Hub-wide, not per-agent. When false, every alert is silently dropped, so
     // the Dashboard shows a "push is off" banner. Defaults true so an older hub
@@ -128,6 +135,13 @@ data class AgentInfo(
     val models: ModelsInfo? = null,
     val usage: UsageInfo? = null,
     val repoUsage: List<RepoUsage> = emptyList(),
+    /**
+     * True only on an [AgentsResponse.retiredUsage] entry (XERK-338): a host the
+     * hub no longer has, kept alive on the Usage screen by its spend alone. It
+     * has no sessions, no repos and no commands, so nothing but Usage may treat
+     * one as a host.
+     */
+    val retired: Boolean = false,
     /**
      * The Claude subscription's 5-hour and 7-day windows as this host last read
      * them out of its own Claude Code (XERK-247). Null on an agent predating the

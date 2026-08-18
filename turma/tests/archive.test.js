@@ -204,3 +204,351 @@ test.after(() => {
   archive.closeDb();
   fs.rmSync(TMP, { recursive: true, force: true });
 });
+
+// ---- the raw layer (XERK-338) ----------------------------------------------
+//
+// Beside the RENDERED entries the archive has always kept, it now holds a
+// byte-for-byte copy of the session's own files. What is held here is the
+// append-only rule — which is the whole reason a resumed session cannot
+// duplicate data — and the path allowlist, which is the one thing between a
+// heartbeating agent and an arbitrary write.
+
+const RAW_META = { ...META, summary: "Raw Layer", endedTs: "2026-07-11T01:00:00Z" };
+const rawRel = (tid) => archive.archiveRelPath(tid, { ...RAW_META, host: "nas" });
+const rawPath = (tid, rel) =>
+  path.join(process.env.ARCHIVE_DIR, rawRel(tid) + archive.RAW_DIR_SUFFIX, tid, rel);
+
+function seedRaw(tid) {
+  // The rendered layer creates the row the raw directory hangs off.
+  archive.ingestChunk("nas", tid, { ...RAW_META }, 0, 10, [ent("u1", "user", "hi")]);
+}
+
+test("safeRawRel allowlists components rather than hunting for '..'", () => {
+  assert.equal(archive.safeRawRel("t1.jsonl"), "t1.jsonl");
+  assert.equal(archive.safeRawRel("t1/subagents/agent-1.jsonl"), "t1/subagents/agent-1.jsonl");
+  for (const bad of [
+    "", "..", "../x", "t1/../../x", "/etc/passwd", "t1//x", "./x",
+    "t1\\..\\x",                      // a Windows separator is not a component char
+    "t1/\u0000x",                      // NUL, which some syscalls truncate at
+    "a/".repeat(20) + "x",              // deeper than any real session
+    "t1/" + "x".repeat(500),            // longer than the length cap
+    "t1/sub agents/a.jsonl",            // a space is outside the allowlist
+  ]) {
+    assert.equal(archive.safeRawRel(bad), null, `accepted: ${JSON.stringify(bad)}`);
+  }
+});
+
+test("ingestRaw stores the session's own bytes, byte for byte", () => {
+  seedRaw("raw1");
+  const body = Buffer.from('{"type":"user","hookRecord":{"x":1}}\n');
+  const r = archive.ingestRaw("nas", "raw1", "raw1.jsonl", 0, body);
+  assert.equal(r.stored, body.length);
+  const full = rawPath("raw1", "raw1.jsonl");
+  assert.deepEqual(fs.readFileSync(full), body);
+  // Nested files keep their own layout, so the store reads like the host did.
+  const sub = Buffer.from('{"agent":"a"}\n');
+  archive.ingestRaw("nas", "raw1", "raw1/subagents/agent-1.jsonl", 0, sub);
+  assert.deepEqual(fs.readFileSync(rawPath("raw1", "raw1/subagents/agent-1.jsonl")), sub);
+  // ...including the ones that are not .jsonl at all, which is the half of a
+  // session no other surface carries.
+  const txt = Buffer.from("overflowed tool output");
+  archive.ingestRaw("nas", "raw1", "raw1/tool-results/b1.txt", 0, txt);
+  assert.deepEqual(fs.readFileSync(rawPath("raw1", "raw1/tool-results/b1.txt")), txt);
+});
+
+test("a resumed session appends and never re-stores what it already sent", () => {
+  seedRaw("raw2");
+  const a = Buffer.from("first turn\n");
+  const b = Buffer.from("second turn, after a resume\n");
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", 0, a).stored, a.length);
+  // The resume appends: the cursor is where the last chunk ended.
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", a.length, b).stored,
+               a.length + b.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw2", "raw2.jsonl")), Buffer.concat([a, b]));
+
+  // A re-send of a range already stored writes NOTHING and hands back the real
+  // cursor. Without this an agent that lost its place would append a second copy
+  // of the conversation into the same file — the exact duplication the ticket is
+  // about, and undetectable afterwards.
+  const before = fs.readFileSync(rawPath("raw2", "raw2.jsonl"));
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", 0, a).stored, before.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw2", "raw2.jsonl")), before);
+  // A chunk from BEYOND the cursor is refused too — it would leave a hole.
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", before.length + 99, b).stored,
+               before.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw2", "raw2.jsonl")), before);
+});
+
+test("the raw cursor is the FILE's size, so deleting one re-syncs it", () => {
+  seedRaw("raw3");
+  const a = Buffer.from("aaaa");
+  archive.ingestRaw("nas", "raw3", "raw3.jsonl", 0, a);
+  fs.unlinkSync(rawPath("raw3", "raw3.jsonl"));
+  // Nothing had to notice the deletion: the next push from 0 is simply correct,
+  // where the rendered layer's indexed cursor appends onto the gap (XERK-280).
+  assert.equal(archive.ingestRaw("nas", "raw3", "raw3.jsonl", 0, a).stored, a.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw3", "raw3.jsonl")), a);
+});
+
+test("ingestRaw cannot be talked into writing outside its own directory", () => {
+  seedRaw("raw4");
+  const dir = path.join(process.env.ARCHIVE_DIR, rawRel("raw4") + archive.RAW_DIR_SUFFIX);
+  const escapee = path.join(process.env.ARCHIVE_DIR, "escaped.jsonl");
+  for (const bad of ["../../escaped.jsonl", "/tmp/escaped.jsonl", "..", "raw4/../../escaped.jsonl"]) {
+    const r = archive.ingestRaw("nas", "raw4", bad, 0, Buffer.from("nope"));
+    assert.equal(r.skip, true, `not refused: ${bad}`);
+  }
+  assert.equal(fs.existsSync(escapee), false);
+  // And an unknown transcript has no directory to write into at all.
+  assert.equal(archive.ingestRaw("nas", "never-seen", "x.jsonl", 0, Buffer.from("x")).skip, true);
+  assert.equal(fs.existsSync(dir + path.sep + "x.jsonl"), false);
+});
+
+test("only the session's OWN host may write its raw files", () => {
+  // `<host>` is proved by the credential at the gate, but proving WHO is calling
+  // says nothing about WHOSE session they may write into. With a properly bound
+  // token any agent could create arbitrary named files inside another host's
+  // archived session — and serve them back through the read-back route as part
+  // of that host's "byte-for-byte record" (XERK-338 QA D5).
+  seedRaw("owned");            // ingested as host "nas"
+  const evil = archive.ingestRaw("evil-host", "owned", "owned.jsonl", 0, Buffer.from("x"));
+  assert.equal(evil.skip, true);
+  assert.equal(fs.existsSync(rawPath("owned", "owned.jsonl")), false);
+  assert.equal(archive.ingestRaw("nas", "owned", "owned.jsonl", 0, Buffer.from("x")).stored, 1);
+});
+
+test("a MIGRATED session keeps writing raw as its new host", () => {
+  // The host that owns a transcript legitimately changes on a migration, so the
+  // ownership check above must not wedge the target out. The rendered delta is
+  // what re-points the row (`ingestChunk` sets `host`), and the beat pushes the
+  // rendered layer BEFORE the raw one — so by the time the target's raw push
+  // lands, the row is already its own. Held here so the ordering cannot drift.
+  archive.ingestChunk("srchost", "moved", { ...RAW_META, summary: "Moved" }, 0, 10,
+    [ent("u1", "user", "before the move")]);
+  const a = Buffer.from("first half\n");
+  assert.equal(archive.ingestRaw("srchost", "moved", "moved.jsonl", 0, a).stored, a.length);
+  // The move: the target carries the same transcript id and a byte-identical
+  // prefix, and its rendered push re-points the row.
+  assert.equal(archive.ingestRaw("tgthost", "moved", "moved.jsonl", a.length,
+    Buffer.from("x")).skip, true, "the target must not write before it owns the row");
+  archive.ingestChunk("tgthost", "moved", { ...RAW_META, summary: "Moved" }, 10, 20,
+    [ent("u2", "user", "after the move")]);
+  const b = Buffer.from("second half\n");
+  assert.equal(archive.ingestRaw("tgthost", "moved", "moved.jsonl", a.length, b).stored,
+    a.length + b.length);
+  // One file, continued — not a second copy.
+  const rel = archive.archiveRelPath("moved", { ...RAW_META, summary: "Moved", host: "srchost" });
+  const full = path.join(process.env.ARCHIVE_DIR, rel + archive.RAW_DIR_SUFFIX, "moved", "moved.jsonl");
+  assert.deepEqual(fs.readFileSync(full), Buffer.concat([a, b]));
+});
+
+test("the per-transcript raw ceiling stops that session, not the archive", () => {
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-rawcap-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES = "32";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-07-11T00:00:00Z", summary: "s" };
+    a.ingestChunk("nas", "cap", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+    const out = [];
+    out.push(a.ingestRaw("nas", "cap", "cap.jsonl", 0, Buffer.alloc(40, 0x61)).stored);
+    // Now over the 32-byte ceiling: the next push is refused with \`skip\`...
+    out.push(a.ingestRaw("nas", "cap", "cap.jsonl", 40, Buffer.alloc(8, 0x62)).skip === true);
+    // ...and rawLimits tells the agent so before it puts bytes on the wire.
+    out.push(a.rawLimits(["cap"]).includes("cap"));
+    // The RENDERED transcript is untouched — the session stays readable.
+    out.push(a.getTranscript("cap").entries.length);
+    console.log(JSON.stringify(out));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.deepEqual(JSON.parse(fresh.stdout.trim().split("\n").pop()), [40, true, true, 1]);
+});
+
+test("the store total counts raw bytes of EVERY extension", () => {
+  // The ceiling exists to keep this volume writable for the hub's own state, so
+  // it has to see the raw layer — most of which is not named .jsonl.
+  seedRaw("raw5");
+  archive.__resetTotalCache();
+  const before = archive.totalArchiveBytes(Date.now(), 0);
+  archive.ingestRaw("nas", "raw5", "raw5/tool-results/big.txt", 0, Buffer.alloc(4096, 0x63));
+  archive.__resetTotalCache();
+  const after = archive.totalArchiveBytes(Date.now(), 0);
+  assert.ok(after - before >= 4096, `raw .txt bytes uncounted: ${before} -> ${after}`);
+});
+
+test("a rebuild derives rawBytes from disk and never indexes a raw file as a session", () => {
+  seedRaw("raw6");
+  archive.ingestRaw("nas", "raw6", "raw6.jsonl", 0, Buffer.from("x".repeat(50)));
+  archive.ingestRaw("nas", "raw6", "raw6/subagents/a.jsonl", 0, Buffer.from("y".repeat(25)));
+  const before = archive.listArchive({ limit: 500 }).sessions.length;
+  // The rebuild's file walk must not DESCEND a raw directory at all. Its
+  // contents are the session's own .jsonl files, which carry no `.meta` and so
+  // would be skipped as rows anyway — but only after the rebuild had read every
+  // one of them into memory, on a pass that already re-reads the whole store.
+  const walked = archive.__walkJsonl();
+  assert.equal(walked.filter((f) => f.includes(archive.RAW_DIR_SUFFIX + path.sep)).length, 0,
+    "the rebuild walk descended a raw directory");
+  assert.ok(walked.length, "the walk found the rendered files");
+  archive.rebuildIndex();
+  const after = archive.listArchive({ limit: 500 });
+  assert.equal(after.sessions.length, before, "a raw file was indexed as a session");
+  // rawBytes comes off the disk, like archiveBytes — so an operator's `rm -rf`
+  // of a raw directory actually gives the budget back.
+  const db = archive.openDb();
+  const row = db.prepare("SELECT rawBytes FROM sessions WHERE transcriptId=?").get("raw6");
+  assert.equal(row.rawBytes, 75);
+});
+
+test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", () => {
+  // `rawCursors` is synchronous on the heartbeat path and the hub is one event
+  // loop, so every stat it makes is a hub-wide stall. Measured at ~5.6us each:
+  // the 40,000 files an agent may offer under its own caps cost 223 ms, and the
+  // ~780,000 that fit in a 32 MiB HEARTBEAT_MAX cost ~4.4 SECONDS — per beat, per
+  // host. The agent's own cap is not this bound; a bound the receiving path does
+  // not enforce is not a bound (XERK-235).
+  //
+  // The budget covers the manifest ENTRY's row lookup as well as the per-file
+  // stats — charging only the files left the outer loop free, which just moved
+  // the stall (QA F4). Held deterministically rather than by wall clock: with a
+  // cap of 3, one entry lookup plus two stats spends it, so the THIRD stored
+  // file gets no cursor even though it is on disk.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-statcap-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_CURSOR_MAX = "3";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-08-18T00:00:00Z", summary: "s" };
+    a.ingestChunk("nas", "cap", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+    const rels = ["a.jsonl", "b.jsonl", "c.jsonl", "d.jsonl"];
+    for (const r of rels) a.ingestRaw("nas", "cap", r, 0, Buffer.from("xx"));
+    const have = a.rawCursors([{ transcriptId: "cap", rawFiles: rels.map((r) => [r, 2]) }]).cap;
+    console.log(JSON.stringify(Object.keys(have).sort()));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const covered = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  assert.deepEqual(covered, ["a.jsonl", "b.jsonl"],
+    "the cap did not stop the stat loop");
+  // And the truncation is LOUD: silence would read as "the hub holds nothing",
+  // which is a re-ship rather than a refusal.
+  assert.match(fresh.stderr, /ARCHIVE_RAW_CURSOR_MAX/);
+});
+
+test("two transcripts sharing a canonical file do not share a raw directory", () => {
+  // `archiveRelPath` keeps only the first 8 alnum characters of the id, so two
+  // transcripts agreeing on repo/date/summary/host and that prefix land on ONE
+  // canonical .jsonl. Their raw layers must still be separate, or each one's
+  // /raw listing returns the other's files and the read-back route serves them
+  // (XERK-338 QA D6). `transcriptId` is agent-chosen, so this can be forced.
+  const A = "collide1-aaaa-bbbb-cccc-000000000001";
+  const B = "collide1-aaaa-bbbb-cccc-000000000002";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Collide" }, 0, 10,
+      [ent("u1", "user", "hi")]);
+    archive.ingestRaw("nas", tid, `${tid}.jsonl`, 0, Buffer.from(tid));
+  }
+  // Same canonical file — the collision is real, not hypothetical.
+  const db = archive.openDb();
+  const rows = db.prepare("SELECT filePath FROM sessions WHERE transcriptId IN (?,?)").all(A, B);
+  assert.equal(rows[0].filePath, rows[1].filePath, "the fixture no longer collides");
+  // ...but each raw layer holds only its own file.
+  assert.deepEqual(archive.listRawFiles(A).map((f) => f.path), [`${A}.jsonl`]);
+  assert.deepEqual(archive.listRawFiles(B).map((f) => f.path), [`${B}.jsonl`]);
+  assert.deepEqual(fs.readFileSync(archive.rawFileFor(A, `${A}.jsonl`)), Buffer.from(A));
+  assert.equal(archive.rawFileFor(A, `${B}.jsonl`), null, "A served B's file");
+});
+
+test("a repo folder named like a raw directory is still archived", () => {
+  // `isRawDir` is `<name>.jsonl.raw` AND depth > 0. The depth half matters
+  // because a REPO FOLDER is a slugified repo name at depth 0 — a repo literally
+  // called `x.jsonl.raw` would otherwise have its whole archive skipped by the
+  // rebuild's walk and its bytes counted under the wrong rule. Dropping the
+  // depth check left the suite green before this (XERK-338 QA D9).
+  const meta = { ...RAW_META, repo: "x.jsonl.raw", summary: "Edge Repo" };
+  archive.ingestChunk("nas", "edgerepo", meta, 0, 10, [ent("u1", "user", "hi")]);
+  const rel = archive.archiveRelPath("edgerepo", { ...meta, host: "nas" });
+  assert.equal(rel.split(path.sep)[0], "x.jsonl.raw", "the fixture no longer names the edge case");
+  const walked = archive.__walkJsonl();
+  assert.ok(walked.some((f) => f.endsWith(rel)),
+    "the rebuild walk skipped a REPO folder that merely looks like a raw directory");
+});
+
+test("safeRawRel bounds a COMPONENT, not just the whole path", () => {
+  // Every common filesystem caps one name at 255 bytes, so a longer component
+  // passed the allowlist and then failed at the syscall — an unthrottled error
+  // per attempt, per beat (QA D10). The 400-byte whole-path cap does not imply
+  // it: a two-component path can be 260/130 and pass that one.
+  assert.ok(archive.safeRawRel("a".repeat(255) + "/b.txt"));
+  assert.equal(archive.safeRawRel("a".repeat(256) + "/b.txt"), null);
+  assert.equal(archive.safeRawRel("a".repeat(300)), null);
+});
+
+test("manifestCursors is capped, and the cap bounds ROWS WRITTEN", () => {
+  // Pre-existing, and the costlier of the two per-beat loops: a SELECT plus an
+  // INSERT per entry, measured at 6.9 SECONDS of blocked event loop for 973,677
+  // ids in one beat — which also wrote 973,682 rows and grew index.db to 161 MB,
+  // outside ARCHIVE_TOTAL_MAX (QA D7). The agent's ARCHIVE_MANIFEST_MAX is not
+  // this bound.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-mancap-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_MANIFEST_CURSOR_MAX = "5";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    a.manifestCursors("nas", Array.from({ length: 500 },
+      (_, i) => ({ transcriptId: "m" + i, repo: "r", remoteKey: "rk" })));
+    const db = a.openDb();
+    console.log(JSON.stringify(db.prepare("SELECT COUNT(*) AS n FROM sessions").get().n));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.equal(JSON.parse(fresh.stdout.trim().split("\n").pop()), 5,
+    "the manifest cap did not stop the row writes");
+  assert.match(fresh.stderr, /ARCHIVE_MANIFEST_CURSOR_MAX/);
+});
+
+test("the cursor budget is charged for REJECTED paths and unknown ids too", () => {
+  // The budget bounds WORK, and validating a path costs work — a max-length
+  // depth-10 path failing on its last character measured 700 ms per 780k entries.
+  // Charging only what survives validation (or only what resolves to a row) left
+  // the cap walk-around-able and just moved the stall (QA D4/F4).
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-charge-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_CURSOR_MAX = "4";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-08-18T00:00:00Z", summary: "s" };
+    a.ingestChunk("nas", "chg", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+    a.ingestRaw("nas", "chg", "real.jsonl", 0, Buffer.from("xx"));
+    // Three ids the hub has never seen (each costs a lookup), then the real one
+    // with its stored file last. With the budget charged for the lookups, the
+    // real file's cursor is never reached.
+    const manifest = ["nope1", "nope2", "nope3"].map((t) => (
+      { transcriptId: t, rawFiles: [["a.jsonl", 1]] }));
+    manifest.push({ transcriptId: "chg", rawFiles: [["real.jsonl", 2]] });
+    console.log(JSON.stringify(a.rawCursors(manifest) || {}));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const out = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  assert.deepEqual(out, {}, "unknown ids were not charged, so the cap did not bind");
+});
+
+test("listRawFiles and rawFileFor read the layer back", () => {
+  seedRaw("raw7");
+  archive.ingestRaw("nas", "raw7", "raw7.jsonl", 0, Buffer.from("abc"));
+  archive.ingestRaw("nas", "raw7", "raw7/tool-results/b.txt", 0, Buffer.from("de"));
+  const files = archive.listRawFiles("raw7");
+  assert.deepEqual(files.map((f) => f.path).sort(),
+    ["raw7.jsonl", "raw7/tool-results/b.txt"]);
+  assert.equal(files.find((f) => f.path === "raw7.jsonl").bytes, 3);
+  assert.ok(archive.rawFileFor("raw7", "raw7.jsonl"));
+  // The same allowlist guards the read path as the write path.
+  assert.equal(archive.rawFileFor("raw7", "../../etc/passwd"), null);
+  assert.equal(archive.rawFileFor("raw7", "nope.jsonl"), null);
+  assert.equal(archive.listRawFiles("never-seen"), null);
+});
