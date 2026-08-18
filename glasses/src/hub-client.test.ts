@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { HubClient } from "./hub-client.ts";
+import { HubClient, BODY_TIMEOUT_MS, REFUSAL_BODY_TIMEOUT_MS } from "./hub-client.ts";
 import type { Config } from "./config.ts";
 
 const config: Config = { hubUrl: "https://hub.example.com", user: "u", password: "p", pollMs: 6000 };
@@ -193,6 +193,244 @@ describe("HubClient", () => {
     const client = new HubClient({ config, fetchFn });
 
     await expect(client.sessionAction("badhost", "s1", "kill")).rejects.toThrow();
+  });
+
+  // XERK-270: the hub explains every refusal it makes, and this client used to
+  // throw all of them away as "hub request failed: <status> <path>" — on a
+  // display this small the message IS the whole feedback.
+  it("puts the hub's own {error} text on the thrown HttpError", async () => {
+    const fetchFn = fakeFetch({ error: "too many queued commands for that host" }, 429);
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.sendInput("h1", "s1", "hello")).rejects.toMatchObject({
+      status: 429,
+      message: "too many queued commands for that host",
+    });
+  });
+
+  it("falls back to the status when the hub sent no {error}, worded like the other clients", async () => {
+    const client = new HubClient({ config, fetchFn: fakeFetch({}, 503) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({
+      status: 503,
+      message: "the hub answered HTTP 503",
+    });
+  });
+
+  it("falls back to the status when the body is unreadable rather than failing on it", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: false,
+      status: 502,
+      json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+    })) as unknown as typeof fetch;
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.sessionAction("h1", "s1", "kill")).rejects.toMatchObject({
+      status: 502,
+      message: "the hub answered HTTP 502",
+    });
+  });
+
+  // The request timeout bounds the RESPONSE, not the body after it. Reading the
+  // refusal body is a second await on the same socket, so a hub that sends
+  // headers and then stalls would hang the throw itself — and App.poll() re-arms
+  // only in its `finally`, so that one stall freezes the display for good.
+  it("gives up on a refusal body that never arrives instead of hanging the throw", async () => {
+    vi.useFakeTimers();
+    try {
+      const stalled = vi.fn(async () => ({
+        ok: false,
+        status: 503,
+        json: () => new Promise(() => {}), // headers arrived; the body never does
+      })) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: stalled, timeoutMs: 0 });
+
+      const pending = client.sessionAction("h1", "s1", "kill");
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await vi.advanceTimersByTimeAsync(REFUSAL_BODY_TIMEOUT_MS - 1);
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(pending).rejects.toMatchObject({
+        status: 503,
+        message: "the hub answered HTTP 503",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The SUCCESS body stalls the same way and is the likelier route — listAgents
+  // runs every poll. Bounding only the refusal read left the freeze intact one
+  // route over, which is the whole point of the guard.
+  it("gives up on a 200 whose body never arrives, not just a refusal's", async () => {
+    vi.useFakeTimers();
+    try {
+      const stalled = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: () => new Promise(() => {}),
+      })) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: stalled, timeoutMs: 0 });
+
+      const pending = client.listAgents();
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await vi.advanceTimersByTimeAsync(BODY_TIMEOUT_MS - 1);
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(pending).rejects.toThrow(/timed out/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The hub's text reaches render.ts's wrapText, which is quadratic in an
+  // unbroken word — a megabyte refusal would stall the render loop for seconds.
+  it("clamps a huge refusal so it can't stall the renderer", async () => {
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: "x".repeat(200_000) }, 413) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({
+      status: 413,
+      message: `${"x".repeat(300)}…`,
+    });
+  });
+
+  // Pins the LENGTH boundary as well as the surrogate one: without this, moving
+  // the cut to `<= MAX + 1` lets a 301-char refusal through unclamped and with
+  // no ellipsis, and every other clamp test still passes.
+  it("clamps the first refusal that is one character over the limit", async () => {
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: "c".repeat(301) }, 413) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({
+      status: 413,
+      message: `${"c".repeat(300)}…`,
+    });
+  });
+
+  it("leaves a refusal that already fits completely alone", async () => {
+    const said = "the target agent is in a different org";
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: said }, 409) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({ status: 409, message: said });
+  });
+
+  // A body that can't be read on a SUCCESS must throw, not resolve empty. The
+  // swallowed `{}` here rendered as a ticket created with no key — a false
+  // success on a write whose real fate is unknown.
+  it("throws rather than reporting an empty success when a 200 body is unreadable", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+    })) as unknown as typeof fetch;
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.createResult("SITE", "cmd1")).rejects.toThrow();
+  });
+
+  // The refusal deadline has to reach the create endpoints too — they build
+  // their own HttpError rather than going through request(), and a refused
+  // create that hung for the full success budget is the phone form freezing.
+  it("holds a refused create to the refusal deadline, not the success one", async () => {
+    vi.useFakeTimers();
+    try {
+      const stalled = vi.fn(async () => ({
+        ok: false,
+        status: 403,
+        json: () => new Promise(() => {}),
+      })) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: stalled, timeoutMs: 0 });
+
+      const pending = client.createMeta("SITE");
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await vi.advanceTimersByTimeAsync(REFUSAL_BODY_TIMEOUT_MS + 1);
+      await expect(pending).rejects.toMatchObject({
+        status: 403,
+        message: "the hub answered HTTP 403",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A polyfilled Response may not have `json` as a function at all, so the call
+  // itself sits inside readJson's promise chain. Covered here rather than only
+  // through refusal(), whose own try/catch would mask a regression.
+  it("surfaces a broken json() as a rejected promise, never a raised throw", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: () => { throw new TypeError("json is not a function"); },
+    })) as unknown as typeof fetch;
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.listAgents()).rejects.toThrow(/json is not a function/);
+  });
+
+  it("clamps without splitting an emoji that straddles the boundary", async () => {
+    const said = `${"b".repeat(299)}😀tail`;
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: said }, 409) });
+
+    let message = "";
+    await client.listAgents().catch((e: unknown) => { message = (e as Error).message; });
+
+    expect(message).toBe(`${"b".repeat(299)}…`);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(message)).toBe(false);
+  });
+
+  // The other side of the boundary: a pair sitting entirely INSIDE the clamp
+  // must survive intact. Widening the surrogate check to 0xdfff would back the
+  // cut off here too and split this one the other way — an escape the straddle
+  // case alone does not catch.
+  it("keeps an emoji that ends exactly on the boundary rather than splitting it", async () => {
+    const said = `${"b".repeat(298)}\u{1F600}tail`;
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: said }, 409) });
+
+    let message = "";
+    await client.listAgents().catch((e: unknown) => { message = (e as Error).message; });
+
+    expect(message).toBe(`${"b".repeat(298)}\u{1F600}…`);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(message)).toBe(false);
+    expect(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(message)).toBe(false);
+  });
+
+  it("reads the hub's words on getHistory and jiraDetail too, not just request()", async () => {
+    const refused = { error: "that agent is in a different org" };
+    const history = new HubClient({ config, fetchFn: fakeFetch(refused, 409) });
+    await expect(history.getHistory("h1", "s1")).rejects.toMatchObject({
+      status: 409,
+      message: "that agent is in a different org",
+    });
+
+    const jira = new HubClient({ config, fetchFn: fakeFetch(refused, 409) });
+    await expect(jira.jiraDetail("site", "XERK-1")).rejects.toMatchObject({
+      status: 409,
+      message: "that agent is in a different org",
+    });
+  });
+
+  it("createMeta/createResult share that wording and still pass a 202 through", async () => {
+    const meta = new HubClient({ config, fetchFn: fakeFetch({}, 500) });
+    await expect(meta.createMeta("site")).rejects.toMatchObject({
+      status: 500,
+      message: "the hub answered HTTP 500",
+    });
+
+    const result = new HubClient({ config, fetchFn: fakeFetch({ error: "no such command" }, 404) });
+    await expect(result.createResult("site", "cmd1")).rejects.toMatchObject({
+      status: 404,
+      message: "no such command",
+    });
+
+    const pending = new HubClient({ config, fetchFn: fakeFetch({ pending: true }, 202) });
+    await expect(pending.createMeta("site")).resolves.toEqual({ status: 202, body: { pending: true } });
   });
 
   it("defaults fetchFn to globalThis.fetch when not injected", () => {

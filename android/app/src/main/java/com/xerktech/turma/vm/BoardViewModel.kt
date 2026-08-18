@@ -195,10 +195,16 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             val sessions = ticketSessionsOf(idx, siteKey, issueKey)
             val host = fleet.agents.find { it.key == p.host }
             val cmdPresent = host?.commands?.any { it.cmdId == p.cmdId } == true
-            val (verdict, updated) =
-                startSweepVerdict(p, sessions, cmdPresent, host != null, now - p.at, START_TIMEOUT_MS)
+            // The agent's own word that it declined this spawn (XERK-265). An
+            // absent entry means "can't tell" — an older hub sends none — so the
+            // timeout rules inside the verdict stay as they were.
+            val refusal = p.cmdId?.let { host?.spawnRefusals?.get(it)?.error }
+            val (verdict, updated) = startSweepVerdict(
+                p, sessions, cmdPresent, host != null, now - p.at, START_TIMEOUT_MS, refusal)
             when (verdict) {
                 SweepVerdict.CLEAR -> next.remove(k)
+                SweepVerdict.REFUSED -> next[k] =
+                    StartState(error = refusal?.ifBlank { null } ?: "the host refused it")
                 SweepVerdict.ERROR -> next[k] = StartState(error = "the host didn't start it in time")
                 SweepVerdict.HOLD -> next[k] = updated
             }

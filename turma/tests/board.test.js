@@ -18,7 +18,7 @@ const {
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
-  queuedTicketOf,
+  queuedTicketOf, queuedTip,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
 } = require("../public/board.js");
@@ -69,6 +69,100 @@ test("mergeSites: freshest block wins for the same site+user (never unioned)", (
   assert.deepEqual(sites[0].tickets.map((t) => t.key), ["T-2"]);
   assert.deepEqual(sites[0].hosts, ["hostA", "hostB"]);
   assert.equal(sites[0].lastFetched, "2026-07-14T12:00:00Z");
+});
+
+test("XERK-325: mergeSites ranks an ONLINE host's block above any offline one", () => {
+  // The card and the hub have to resolve a ticket the same way. `ticketRepo`
+  // prefers an online host and routing can only reach one, so an offline host
+  // winning on freshness put a repo on the chip that Start would never spawn
+  // against — the card said one repo, the session came up on another.
+  const sites = mergeSites([
+    agent("hostDown", block({
+      fetchedAt: "2026-07-14T12:30:00Z",                      // freshest
+      tickets: [ticket("T-1", { repoGuess: { repo: "Veiller", cloned: true } })],
+    }), { online: false }),
+    agent("hostUp", block({
+      fetchedAt: "2026-07-14T12:00:00Z",                      // staler
+      tickets: [ticket("T-1", { repoGuess: { repo: "Turma", cloned: true } })],
+    })),
+  ]);
+  assert.equal(sites[0].tickets.length, 1);
+  assert.equal(sites[0].tickets[0].repoGuess.repo, "Turma",
+    "the online host's answer is the one shown, because it is the one routed on");
+});
+
+test("XERK-325: with both hosts online, freshness still decides", () => {
+  // Online is a TIER, not a replacement for the freshness rule inside it.
+  const sites = mergeSites([
+    agent("hostOld", block({
+      user: "a@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Veiller", cloned: true } })],
+    })),
+    agent("hostNew", block({
+      user: "a@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Turma", cloned: true } })],
+    })),
+  ]);
+  assert.equal(sites[0].tickets[0].repoGuess.repo, "Turma");
+});
+
+test("XERK-325: mergeSites compares `fetchedAt` with `>`, matching the hub", () => {
+  // The client half of pinning the OPERATOR. This sort used localeCompare while
+  // the group pick above it used `>`, so board.js disagreed with itself and any
+  // port inherited whichever half it copied. The two orders differ on a trailing
+  // `Z` vs `z`: `>` gives the lowercase copy (0x7a > 0x5a), ICU gives the other.
+  const sites = mergeSites([
+    agent("hostUpper", block({
+      fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Upper", cloned: true } })],
+    })),
+    agent("hostLower", block({
+      fetchedAt: "2026-07-14T12:00:00z",
+      tickets: [ticket("T-1", { repoGuess: { repo: "Lower", cloned: true } })],
+    })),
+  ]);
+  assert.equal(sites[0].tickets[0].repoGuess.repo, "Lower",
+    "code-unit order, not ICU collation — the hub's compareBlocks uses `>` too");
+
+  // The SAME assertion through the other comparison. One `fetchedAt` order lives
+  // in the byUser group pick (same user, above) and one in the winners sort (two
+  // users, here) — they were different operators once, so a fixture that reaches
+  // only one of them pins only half the rule.
+  const twoUsers = mergeSites([
+    agent("hostUpper2", block({
+      user: "a@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+      tickets: [ticket("T-2", { repoGuess: { repo: "Upper", cloned: true } })],
+    })),
+    agent("hostLower2", block({
+      user: "b@x.com", fetchedAt: "2026-07-14T12:00:00z",
+      tickets: [ticket("T-2", { repoGuess: { repo: "Lower", cloned: true } })],
+    })),
+  ]);
+  assert.equal(twoUsers[0].tickets[0].repoGuess.repo, "Lower",
+    "the winners sort uses `>` as well, not localeCompare");
+});
+
+test("XERK-325: an all-offline org still shows its tickets", () => {
+  // Online is a preference, not a filter — otherwise a board whose hosts are
+  // all down goes blank rather than showing what was last known.
+  const sites = mergeSites([
+    agent("hostDown", block({ tickets: [ticket("T-1")] }), { online: false }),
+  ]);
+  assert.equal(sites.length, 1);
+  assert.deepEqual(sites[0].tickets.map((t) => t.key), ["T-1"]);
+});
+
+test("XERK-325: the capacity tip does not promise the whole org", () => {
+  // Only a host that triaged this ticket to this repo can take it, so a free
+  // host that answered a different repo will never pick it up. Promising "one
+  // of the org's agents" sent the reader at capacity they don't have a problem
+  // with.
+  const tip = queuedTip({ reason: "capacity", position: 1 }, "ENG-5");
+  assert.doesNotMatch(tip, /one of the org's agents/);
+  assert.match(tip, /an agent that can run it/);
+  // The blocked and expired wordings still lead with the hub's own reason.
+  assert.match(queuedTip({ reason: "blocked", error: "no online host has triaged it" }, "ENG-5"),
+    /no online host has triaged it/);
 });
 
 test("mergeSites: different users on one site union, deduped by issue key", () => {
@@ -1708,6 +1802,32 @@ test("startSweepVerdict: a host that dropped out of the fleet only ever times ou
   assert.equal(startSweepVerdict(fresh, [], false, false, TMO), "hold");
   const old = { cmdId: "c1", host: "gone", sawCmd: false, ageMs: TMO + 1 };
   assert.equal(startSweepVerdict(old, [], false, false, TMO), "error");
+});
+
+test("XERK-325: startSweepVerdict: a refusal ends the wait with the agent's reason", () => {
+  // Without it a refused spawn drained the queue and cleared silently — which is
+  // exactly what a spawn that WORKED looks like, so the operator clicked Start
+  // again rather than reading why it hadn't started.
+  const p = { cmdId: "c1", sawCmd: true, ageMs: 0 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO,
+    { error: "PROJ-7 has no triaged repo on this host" }), "refused");
+});
+
+test("XERK-325: startSweepVerdict: a session that landed beats a refusal", () => {
+  // The same ordering the hub applies to a migration handoff: a spawn that
+  // actually came up always wins the tie, whatever else rode that beat.
+  const p = { cmdId: "c1", sawCmd: true, ageMs: 0 };
+  assert.equal(startSweepVerdict(p, [{ spawnCmdId: "c1" }], false, true, TMO,
+    { error: "no triaged repo" }), "clear");
+});
+
+test("XERK-325: startSweepVerdict: no refusal reported leaves the old timing rules alone", () => {
+  // An older hub serves no spawnRefusals and an older agent stages none, so an
+  // absent entry has to mean "can't tell", never "it was refused".
+  const p = { cmdId: "c1", sawCmd: true, ageMs: 0 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO, null), "clear");
+  const fresh = { cmdId: "c2", sawCmd: false, ageMs: 0 };
+  assert.equal(startSweepVerdict(fresh, [], false, true, TMO, undefined), "hold");
 });
 
 test("startSweepVerdict: a never-seen command past the timeout errors (backstop)", () => {

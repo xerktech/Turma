@@ -17,8 +17,9 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
 
 - **Every ticket spawn goes through it** — Start button and auto-start sweep alike, both via
   `findTicketHost(..., {requireFree:true})`. A host with a free slot is used at once; only a fleet
-  with none queues. The agent-side session queue (XERK-14) keeps the cases where the host IS the
-  decision: "+ New session", and a ticket session waiting on its clone.
+  with none queues. The agent-side session queue (XERK-14, `.claude/rules/agent-sessions.md`) keeps
+  the cases where the host IS the decision: "+ New session", and a ticket session waiting on its
+  clone.
 - `drainTicketQueue()` runs on **every heartbeat** (the beat IS the capacity report, so a freed slot
   is claimed within a beat) and on the 15s sweep after `autoStartSweep`/`autoStopSweep`. **At most
   one dispatch per host per pass**, mirroring the agent's one-per-beat drain — the shared
@@ -100,6 +101,10 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
     not it only trades a week on a dead host for four hours and a "gave up waiting" note. Nothing is
     withdrawn in any of those; the sweep runs again in 15s, so the rescue lands the moment a slot
     exists.
+  - **That call passes `issueKey`, so it inherits XERK-325's triage rule** (see
+    `board-ticket-view.md`): a host that has not triaged the ticket cannot satisfy the precondition,
+    so the reclaim never withdraws into a host that would refuse the spawn. Dropping the `issueKey`
+    to "simplify" the call silently removes that.
   - One residue is deliberate: once reclaimed the ticket is an **ordinary queue entry**, so an older
     entry can beat it to the slot and it can eventually end — on the max-wait backstop, or on the
     blocked timer if the rest of the fleet goes dark behind it. Both leave a terminal note now (see
@@ -107,7 +112,7 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
   - Admission is then checked BEFORE the withdrawal — `enqueueTicketStart` can still refuse a full
     org line, and dropping a command that then fails to re-queue is the same destruction by another
     route.
-- **A command restored from `state.json` is stamped DELIVERED at boot** (`restoreCommandDelivery`).
+- **A command restored from `state.json` is stamped DELIVERED at boot** (`sanitizeRestoredCommands`).
   `deliveredAt` cannot be reconstructed from disk: `scheduleSave` is a 30-second debounce, so a save
   that landed between the queue and the delivery wrote the command without the stamp, and restoring
   that as undelivered re-routes work the agent has already run under a fresh cmdId its **in-memory**

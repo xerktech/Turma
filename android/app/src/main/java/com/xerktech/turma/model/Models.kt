@@ -150,6 +150,18 @@ data class AgentInfo(
     val gitSources: List<GitSourceInfo> = emptyList(),
     val clones: List<CloneInfo> = emptyList(),
     val commands: List<CommandInfo> = emptyList(),
+    /**
+     * Session-creating commands this host DECLINED, keyed by the cmdId the hub
+     * issued (XERK-265). A command is ACKed whether the agent ran it or refused
+     * it, so without this a refused spawn is indistinguishable from a slow one —
+     * which is what left a refused ticket start clearing silently (XERK-325).
+     * Hub-BUILT, not agent-supplied: `ingestSpawnFailures` checks the cmdId
+     * against the queue that host was actually given and substitutes a default
+     * for a missing reason, so both fields are always present and typed.
+     * Empty from an older hub, which means "can't tell", never "nothing was
+     * refused".
+     */
+    val spawnRefusals: Map<String, SpawnRefusal> = emptyMap(),
     val jira: JiraBlock? = null,
     // Killed-but-resumable sessions (hub-agent _closed_payload) — the web's
     // "Ended sessions" list.
@@ -532,6 +544,18 @@ data class CommandInfo(
     val cmdId: String = "",
     val sessionId: String = "",
     val repo: String = "",
+)
+
+/**
+ * One declined session-creating command (XERK-265), the value side of
+ * [AgentInfo.spawnRefusals]. [error] is operator-facing and is what the UI
+ * shows — the hub caps its length and substitutes a default, so it is never
+ * empty. [at] is when the hub ingested it, which is what ages the entry out.
+ */
+@Serializable
+data class SpawnRefusal(
+    val error: String = "",
+    val at: Long = 0,
 )
 
 @Serializable
@@ -928,6 +952,30 @@ data class HistoryResponse(
     val fetchedAt: Long = 0,
     val pending: Boolean = false,
     val cmdId: String = "",
+    // A workflow row answers with its RUN's agent list instead of a conversation
+    // (XERK-304). NULLABLE on purpose: `agents` PRESENT — the empty list
+    // included — is what says "this is a run, not a transcript", so an absent
+    // field and an empty one must stay distinguishable.
+    val agents: List<WorkflowAgent>? = null,
+    val agentsTruncated: Boolean = false,
+)
+
+/**
+ * One agent of a workflow run, as the picker lists it (XERK-304). [label] is the
+ * script's own `label:` for that agent, read from the run's record — without it a
+ * fan-out over one prompt template renders every row identically. It falls back
+ * to the agent's description or first prompt for a run with no record, and the
+ * picker falls back to [id] when even that is empty.
+ *
+ * [status] is the state the run recorded ("done", "running", "failed", …), and is
+ * absent — never guessed — when neither the record nor the run's journal can say.
+ */
+@Serializable
+data class WorkflowAgent(
+    val id: String = "",
+    val label: String = "",
+    val startedAt: String = "",
+    val status: String = "",
 )
 
 // ---- archive / search --------------------------------------------------------

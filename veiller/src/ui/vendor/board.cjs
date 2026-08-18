@@ -173,15 +173,36 @@
       }
       const key = site + "\x00" + (j.user || "");
       const prev = byUser.get(key);
-      if (!prev || String(j.fetchedAt || "") > String(prev.block.fetchedAt || "")) {
-        byUser.set(key, { block: j, agent: a });
+      // An ONLINE host's block outranks any offline one, freshness deciding only
+      // within a tier — the same rule `ticketRepo` applies hub-side, and it has
+      // to be the same or the card and the hub disagree (XERK-325). The hub can
+      // only route a ticket to an online host that agrees with the repo it
+      // resolved, so an offline host winning on freshness put a repo on the chip
+      // that Start would never spawn against, with nothing on screen to say so.
+      // Hosts poll the tracker independently, so an offline host holding the
+      // newest block is ordinary rather than an edge case.
+      const online = !!(a && a.online);
+      if (!prev || (online && !prev.online) ||
+          (online === prev.online &&
+           String(j.fetchedAt || "") > String(prev.block.fetchedAt || ""))) {
+        byUser.set(key, { block: j, agent: a, online });
       }
     }
 
     const bySite = new Map(); // siteKey -> merged entry
-    // Fresher blocks first so a collision keeps the fresher copy by default.
-    const winners = [...byUser.values()].sort((x, y) =>
-      String(y.block.fetchedAt || "").localeCompare(String(x.block.fetchedAt || "")));
+    // Online blocks first, then fresher ones, so a collision keeps the copy the
+    // hub would actually act on. Ticket dedupe below is by the ticket's own
+    // `updated`, which two hosts polling one tracker report IDENTICALLY — so
+    // ties are the norm and this order is what really decides a card's fields.
+    // `>`/`<`, matching the group pick above and every other mirror. This sort
+    // used localeCompare while the pick used `>`, so board.js disagreed with
+    // ITSELF on a `fetchedAt` differing only by case or separator — and any port
+    // that copied one half inherited a divergence from the other.
+    const winners = [...byUser.values()].sort((x, y) => {
+      if (x.online !== y.online) return x.online ? -1 : 1;
+      const xa = String(x.block.fetchedAt || ""), ya = String(y.block.fetchedAt || "");
+      return xa > ya ? -1 : xa < ya ? 1 : 0;
+    });
     for (const { block } of winners) {
       const site = block.siteKey;
       let entry = bySite.get(site);
@@ -585,8 +606,12 @@
     if (q.reason === "blocked") {
       return `${issueKey} is waiting: ${q.error || "the hub can't route it right now"}`;
     }
-    return `${issueKey} is waiting for a free session slot on one of the org's `
-      + `agents — whichever frees up first takes it`
+    // "the org's agents" was true before XERK-325 and is not now: only a host
+    // that has triaged this ticket to this repo can take it, so a free host that
+    // answered a different repo will never pick it up. Promising the whole org
+    // sent the reader looking at capacity they don't have a problem with.
+    return `${issueKey} is waiting for a free session slot on an agent that can `
+      + `run it — whichever of those frees up first takes it`
       + (q.position > 1 ? ` (#${q.position} in line)` : "");
   }
 
@@ -1295,11 +1320,13 @@
   //
   // `p` is {cmdId, host, sawCmd, ageMs}; `sessions` are the ticket's sessions,
   // `cmd` whether the host's queue still holds this cmdId right now, `known`
-  // whether the host is in the fleet payload at all.
-  //   - "hold"  keep showing ⏳ (also mutates p.sawCmd once the command appears)
-  //   - "clear" drop it: a session reported this cmdId (landed), or the command
-  //             we WATCHED land has since drained (the agent ran or refused it)
-  //   - "error" the backstop for a host that stopped beating mid-spawn
+  // whether the host is in the fleet payload at all, `refusal` this cmdId's entry
+  // in the host's `spawnRefusals` (XERK-265), if the agent declined it.
+  //   - "hold"    keep showing ⏳ (also mutates p.sawCmd once the command appears)
+  //   - "clear"   drop it: a session reported this cmdId (landed), or the command
+  //               we WATCHED land has since drained with nothing else to say
+  //   - "refused" the agent declined it and said why — the caller shows the reason
+  //   - "error"   the backstop for a host that stopped beating mid-spawn
   //
   // The load-bearing subtlety is `sawCmd`: "command absent" only means "acked"
   // once we've actually seen it PRESENT. A cache too stale to have seen it land
@@ -1307,9 +1334,18 @@
   // too, and treating that as acked sweeps the pending the instant it's set —
   // the bug where the ⏳ never appeared at all. A cmdId-less pending (POST not
   // back yet) always holds; its own fetch resolves it.
-  function startSweepVerdict(p, sessions, cmd, known, timeoutMs) {
+  //
+  // `refusal` is checked AFTER the landed-session test, so a spawn that actually
+  // came up always wins the tie — the same ordering the hub applies on the
+  // migration side and sessions.html applies on its own follow. It is checked
+  // BEFORE the sawCmd/timeout heuristics because those only ever guess at what a
+  // drained command meant, and this is the agent saying it outright: without it a
+  // refused ticket start cleared silently, which is indistinguishable from the
+  // session having started and is what left the operator clicking Start again.
+  function startSweepVerdict(p, sessions, cmd, known, timeoutMs, refusal) {
     if (!p || !p.cmdId) return "hold";
     if ((sessions || []).some(s => s.spawnCmdId === p.cmdId)) return "clear";
+    if (refusal) return "refused";
     if (!known) return (p.ageMs > timeoutMs) ? "error" : "hold";  // host gone: only time out
     if (cmd) { p.sawCmd = true; return "hold"; }                  // command still queued
     if (p.sawCmd) return "clear";                                 // watched it land, now drained

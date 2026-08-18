@@ -1882,6 +1882,11 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   assert.equal(r2.body.archiveHave.tr1, 120);
   // The bulky manifest is not persisted onto the agent record.
   assert.equal(agents.nas.archiveManifest, undefined);
+  // Nothing here is near either archive ceiling, so the budget fields stay off
+  // the wire entirely — an agent reads their absence as "no limit reached", and
+  // a hub too old to send them is the same case (XERK-267).
+  assert.equal("archiveShed" in r2.body, false);
+  assert.equal("archiveFull" in r2.body, false);
 });
 
 test("http: login page is public; /api/login sets a working session cookie", async () => {
@@ -2071,6 +2076,96 @@ test("http: a malformed sub-agent split is DROPPED, never repaired into zeros", 
     { totals: { ...win, input: 4 }, today: win, week: win });
   assert.deepEqual(await beat({ totals: {}, today: {}, week: {} }),
                    { totals: win, today: win, week: win });
+});
+
+test("http: an unusable token figure is coerced to 0 on every usage block", async () => {
+  // XERK-306: a bucket's four counts are Kotlin `Long`s on Android and a full
+  // /api/agents decode is ATOMIC there, so ONE host's `1.5` threw for the WHOLE
+  // array — every OTHER host silently vanished from that phone's fleet list
+  // while the tile still read "N / N online". XERK-302 fixed `subagent` alone;
+  // these are its siblings, on every block a beat carries.
+  const bad = { input: 1.5, output: 1e308, cacheWrite: "9", cacheRead: -5 };
+  const good = { input: 7, output: 0, cacheWrite: Number.MAX_SAFE_INTEGER, cacheRead: 3 };
+  const zeros = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  const usage = () => ({
+    totals: { ...bad },
+    today: { ...good },
+    week: { input: 2 },  // a partial bucket: the keys it HAS are all it gets
+    days: { "2026-08-01": { ...bad }, "2026-08-02": { ...good } },
+    models: [{ model: "opus", totals: { ...bad }, today: { ...good } }],
+  });
+
+  assert.equal((await request("POST", "/api/heartbeat", {
+    body: {
+      device: "figure-host",
+      usage: usage(),
+      repoUsage: [{ repo: "Turma", usage: usage() }],
+      sessions: [{ id: "s1", repo: "Turma", status: "running", usage: usage() }],
+    },
+    headers: agentHeaders,
+  })).status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "figure-host");
+
+  for (const [where, u] of [["host", rec.usage], ["repo", rec.repoUsage[0].usage],
+                            ["session", rec.sessions[0].usage]]) {
+    assert.deepEqual(u.totals, zeros, `${where}: bad figures not zeroed`);
+    assert.deepEqual(u.today, good, `${where}: good figures not left alone`);
+    // A MISSING key stays missing. Filling it in would GROW the record, and
+    // this walk runs before the second AGENT_RECORD_MAX measurement.
+    assert.deepEqual(u.week, { input: 2 }, `${where}: absent figures filled in`);
+    assert.deepEqual(u.days["2026-08-01"], zeros, `${where}: day bucket not zeroed`);
+    assert.deepEqual(u.days["2026-08-02"], good, `${where}: good day bucket changed`);
+    assert.deepEqual(u.models[0].totals, zeros, `${where}: model bucket not zeroed`);
+    assert.deepEqual(u.models[0].today, good, `${where}: good model bucket changed`);
+  }
+
+  // The property the Android decoder actually needs, asserted over the whole
+  // served record rather than the fields this test happened to name.
+  const walk = (v, at) => {
+    if (Array.isArray(v)) return v.forEach((x, i) => walk(x, `${at}[${i}]`));
+    if (!v || typeof v !== "object") return;
+    for (const [k, x] of Object.entries(v)) {
+      if (["input", "output", "cacheWrite", "cacheRead"].includes(k)) {
+        assert.ok(Number.isSafeInteger(x) && x >= 0, `${at}.${k} is not a Long: ${x}`);
+      } else walk(x, `${at}.${k}`);
+    }
+  };
+  walk(rec, "agent");
+});
+
+test("http: usage shapes that are not buckets are dropped, and no coercion grows the record", async () => {
+  // The other half of XERK-306: a window, a `days` map or a whole `usage` that
+  // is not an object at all is decode-fatal before any figure inside it counts.
+  // Each is DELETED rather than rebuilt — a rebuilt bucket would be four keys
+  // of invented zeros, and this walk runs between the raw and the coerced
+  // AGENT_RECORD_MAX measurements, so it must never expand what it is given.
+  const junk = {
+    usage: {
+      totals: "lots", today: 7, week: [], days: [1, 2], lastActivity: 5,
+      models: [{ model: "opus", totals: null }],
+    },
+    repoUsage: [null, "x", { repo: 5, remoteKey: {}, usage: 9 },
+                { repo: "Turma", usage: { totals: { input: 4 } } }],
+    sessions: [{ id: "s1", repo: "Turma", status: "running", usage: 3 }],
+  };
+  const sent = JSON.stringify({ usage: junk.usage, repoUsage: junk.repoUsage });
+
+  assert.equal((await request("POST", "/api/heartbeat", {
+    body: { device: "junk-usage-host", ...junk },
+    headers: agentHeaders,
+  })).status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "junk-usage-host");
+
+  assert.deepEqual(rec.usage, { models: [{ model: "opus" }] });
+  // A non-object element of a typed LIST is as fatal as a bad field inside one.
+  assert.deepEqual(rec.repoUsage, [{}, { repo: "Turma", usage: { totals: { input: 4 } } }]);
+  assert.ok(!("usage" in rec.sessions[0]), "a session's non-object usage survived");
+
+  const kept = JSON.stringify({ usage: rec.usage, repoUsage: rec.repoUsage });
+  assert.ok(kept.length <= sent.length,
+            `coercion grew the record: ${sent.length} -> ${kept.length}`);
 });
 
 test("http: an agent's subscription limits reach the clients, and clear again", async () => {
@@ -3118,8 +3213,8 @@ test("http: subagent-history 202s on cache miss, single-flight per (session,type
 
   const beat = await request("POST", "/api/heartbeat", { body: { device: "sh1" }, headers: agentHeaders });
   assert.deepEqual(beat.body.commands, [
-    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", cmdId: first.body.cmdId },
-    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", cmdId: other.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", agentId: "", cmdId: first.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", agentId: "", cmdId: other.body.cmdId },
   ]);
 });
 
@@ -3128,6 +3223,199 @@ test("http: subagent-history requires a type", async () => {
   const res = await request(
     "GET", "/api/agents/sh2/sessions/s1/subagents/history?label=x", { headers: userHeaders });
   assert.equal(res.status, 400);
+});
+
+// ---- workflow drill-down (XERK-304) ----------------------------------------
+
+test("XERK-304: a workflow row and one of its agents are DISTINCT cache rows", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "wf1" }, headers: agentHeaders });
+
+  const list = "/api/agents/wf1/sessions/s1/subagents/history?type=workflow&label=code-review";
+  const one = list + "&agentId=a0123";
+  const listRes = await request("GET", list, { headers: userHeaders });
+  const oneRes = await request("GET", one, { headers: userHeaders });
+  assert.equal(listRes.status, 202);
+  assert.equal(oneRes.status, 202);
+  assert.notEqual(oneRes.body.cmdId, listRes.body.cmdId,
+    "the run's agent list and one agent's transcript are different reads");
+
+  // Both deliveries land, each under its own key — the agentId is what keeps the
+  // agent's transcript from overwriting the list it was picked from.
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf1",
+      subagentHistoryResults: [
+        { sessionId: "s1", type: "workflow", label: "code-review", agentId: "",
+          entries: [], truncated: false, agentsTruncated: false,
+          agents: [{ id: "a0123", label: "review:bugs", status: "done" }] },
+        { sessionId: "s1", type: "workflow", label: "code-review", agentId: "a0123",
+          entries: [{ id: "1", role: "user", text: "review it" }], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+  const gotList = await request("GET", list, { headers: userHeaders });
+  assert.equal(gotList.status, 200);
+  // Every row is normalized to the full shape on the way in, so a client that
+  // TYPES the field never meets a missing one.
+  assert.deepEqual(gotList.body.agents,
+    [{ id: "a0123", label: "review:bugs", startedAt: "", status: "done" }]);
+  assert.equal(gotList.body.agentsTruncated, false);
+
+  const gotOne = await request("GET", one, { headers: userHeaders });
+  assert.equal(gotOne.status, 200);
+  assert.deepEqual(gotOne.body.entries, [{ id: "1", role: "user", text: "review it" }]);
+  assert.equal(gotOne.body.agents, undefined,
+    "an ordinary transcript must not carry `agents` — its presence is what means `this is a run`");
+});
+
+test("XERK-304: a malformed agentId is refused, never queued", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "wf2" }, headers: agentHeaders });
+  const base = "/api/agents/wf2/sessions/s1/subagents/history?type=workflow&label=x&agentId=";
+  for (const bad of ["../../etc/passwd", "a/b", "a".repeat(65), "a b"]) {
+    const res = await request("GET", base + encodeURIComponent(bad), { headers: userHeaders });
+    assert.equal(res.status, 400, `agentId ${bad} should be refused`);
+    assert.ok(res.body.error);
+  }
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "wf2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [], "a refused id must not reach the agent's queue");
+});
+
+test("XERK-304: a wrong-shaped agents list is coerced, never served raw", async () => {
+  // Android TYPES this field, so an unexpected shape reaching a decoder is a
+  // thrown response, not a cosmetic problem. Same rule as every other typed
+  // heartbeat field: coerce at ingest.
+  await request("POST", "/api/heartbeat", { body: { device: "wf3" }, headers: agentHeaders });
+  const url = "/api/agents/wf3/sessions/s1/subagents/history?type=workflow&label=x";
+
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf3",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], truncated: false, agentsTruncated: "yes",
+        agents: [
+          { id: { nested: 1 }, label: ["a"], status: 7, startedAt: null },
+          "not an object",
+          { label: "no id at all" },
+          { id: "ok1", label: "fine", startedAt: "t", status: "done" },
+        ],
+      }],
+    },
+    headers: agentHeaders,
+  });
+
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.deepEqual(got.body.agents, [
+    { id: "[object Object]", label: "a", startedAt: "", status: "7" },
+    { id: "ok1", label: "fine", startedAt: "t", status: "done" },
+  ], "non-objects and id-less rows dropped; every surviving value a string");
+  assert.equal(got.body.agentsTruncated, true, "coerced to a boolean");
+});
+
+test("XERK-304: a row with no status keeps its omission through the hub", async () => {
+  // The agent OMITS status when the run's journal cannot say. An absent field
+  // meaning "that agent can't tell" is the fleet-wide rule, so coercing every
+  // row to a full shape would put it back as "" and lose the distinction the
+  // agent went to trouble to preserve.
+  await request("POST", "/api/heartbeat", { body: { device: "wf5" }, headers: agentHeaders });
+  const url = "/api/agents/wf5/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf5",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], truncated: false,
+        agents: [{ id: "a1", label: "no journal here", startedAt: "t" },
+                 { id: "a2", label: "knows", startedAt: "t", status: "done" }],
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.ok(!("status" in got.body.agents[0]), "omission survives, never blanked to ''");
+  assert.equal(got.body.agents[1].status, "done");
+});
+
+test("XERK-304: a whitespace-only status omits rather than splitting the clients", async () => {
+  // Web tests truthiness and would paint an empty chip; Android tests isNotBlank
+  // and would hide it. A value that says nothing must not reach either.
+  await request("POST", "/api/heartbeat", { body: { device: "wf6" }, headers: agentHeaders });
+  const url = "/api/agents/wf6/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf6",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], agents: [{ id: "a1", label: "x", status: "   " }],
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.ok(!("status" in got.body.agents[0]));
+});
+
+test("XERK-304: field values are capped, so one row cannot bloat the record", () => {
+  const a = { subagentHistory: { k: { agents: [
+    { id: "i".repeat(5000), label: "l".repeat(5000), status: "s".repeat(5000),
+      startedAt: "t".repeat(5000) },
+  ] } } };
+  hub.normalizeRecord(a);
+  const row = a.subagentHistory.k.agents[0];
+  for (const f of ["id", "label", "status", "startedAt"]) {
+    assert.equal(row[f].length, 256, `${f} must be capped`);
+  }
+});
+
+test("XERK-304: a state.json restore re-coerces the cached workflow rows", () => {
+  // The cache is PERSISTED, so a restart serves whatever was on disk — and the
+  // restore is the first thing a freshly-shipped coercion has to cover. Without
+  // this the typed Android decode meets `status: 99` straight off the volume.
+  const a = {
+    device: "h",
+    subagentHistory: {
+      k1: { agents: [
+        { id: "a1", label: { deep: "object" }, startedAt: 12345, status: 99 },
+        "not-an-object",
+      ], agentsTruncated: "yes" },
+      k2: { entries: [{ id: "1", role: "user", text: "hi" }] },  // a transcript
+      k3: { agents: "lots" },
+    },
+  };
+  hub.normalizeRecord(a);
+  // Every value becomes a string — `status: 99` is the one that throws Android's
+  // typed decode — and the bare string element is dropped for having no id.
+  assert.deepEqual(a.subagentHistory.k1.agents,
+    [{ id: "a1", label: "[object Object]", startedAt: "12345", status: "99" }]);
+  assert.equal(a.subagentHistory.k1.agentsTruncated, true);
+  assert.ok(!("agents" in a.subagentHistory.k2),
+    "a plain transcript must not grow an agents key on restore");
+  assert.equal(a.subagentHistory.k3.agents, null, "junk becomes 'not a run'");
+});
+
+test("XERK-304: a non-array `agents` leaves the reply a plain transcript", async () => {
+  // `agents` present is what means "this is a run", so a junk value must not be
+  // able to turn an ordinary transcript into a list.
+  await request("POST", "/api/heartbeat", { body: { device: "wf4" }, headers: agentHeaders });
+  const url = "/api/agents/wf4/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf4",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [{ id: "1", role: "user", text: "hi" }], truncated: false,
+        agents: "lots",
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.equal(got.body.agents, undefined);
 });
 
 test("http: heartbeat subagentHistoryResults populate the cache; GET returns 200 while fresh", async () => {
@@ -4736,7 +5024,7 @@ test("http: starting a ticket session requires the user login", async () => {
 // is a To Do ticket already triaged to Turma. `autoStart:true` (the default)
 // also flips the org's HUB toggle on, since the opt-in is hub-only now.
 const asBeat = async (device, site, {
-  autoStart = true, repos = ["Turma"], capacity,
+  autoStart = true, repos = ["Turma"], capacity, user,
   sessions = [], closedSessions = [],
   tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
                repoGuess: { repo: "Turma", cloned: true } }],
@@ -4749,7 +5037,7 @@ const asBeat = async (device, site, {
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
       jira: { available: true, configured: true, siteKey: site,
-              user: `${device}@x.com`, fetchedAt, tickets },
+              user: user || `${device}@x.com`, fetchedAt, tickets },
     },
     headers: agentHeaders,
   });
@@ -5847,6 +6135,42 @@ test("XERK-303: a ticket pinned to the dead host is not withdrawn from it", asyn
   delete hub.ticketAgents["tq47.atlassian.net/ENG-5"];
 });
 
+test("XERK-303: a free host that has NOT triaged the ticket is not withdrawn into", async () => {
+  // The reclaim's routability precondition passes issueKey to findTicketHost, so
+  // it inherits XERK-325's triage rule for free: a host that has not triaged the
+  // ticket would refuse the spawn (`spawn_ticket` re-derives from its OWN ledger),
+  // so withdrawing into it is a session that never starts. Dropping the issueKey
+  // to "simplify" that call silently removes this.
+  //
+  // A third host owns the fleet's row for the ticket (freshest fetchedAt, and it
+  // is online), so the repo the fleet resolves is NOT whatever the free host
+  // happens to have decided for itself — otherwise the free host's own triage
+  // becomes the thing being checked against.
+  resetAutoStart();
+  const site = "tq60.atlassian.net";
+  await strandOn(site, "tqTriA", "tqTriB");
+  await asBeat("tqTriRow", site, { autoStart: false, capacity: { ...FULL },
+    fetchedAt: "2026-07-14T13:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // The free host has triaged this ticket to a DIFFERENT repo, so it cannot run
+  // the spawn even though it has the slot.
+  agents.tqTriB.jira.tickets = [{ key: "ENG-5", statusCategory: "todo",
+    repoGuess: { repo: "SomethingElse", cloned: true } }];
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqTriA.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "left on the dead host — the free host would only refuse it");
+  assert.equal((agents.tqTriB.commands || []).length, 0);
+  // Flip ONLY that: once the free host agrees with the board, the rescue lands.
+  agents.tqTriB.jira.tickets = [{ key: "ENG-5", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true } }];
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqTriB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.tqTriA.commands || []).length, 0, "and it leaves the dead host");
+});
+
 test("XERK-303: a merely BUSY org is not somewhere to withdraw INTO either", async () => {
   // `full` is a wait that clears itself for a ticket already in line. For one
   // that is NOT, withdrawing into it just trades a week on a dead host for four
@@ -6195,6 +6519,715 @@ test("XERK-303: ticketSource is hub-only — the agent and the fleet payload nev
   }
   // Stripping must not cost the agent the fields it actually runs on.
   assert.equal(beat.body.commands[0].issueKey, "ENG-5");
+});
+
+// ---- routing only to a host that has TRIAGED the ticket (XERK-325) ----------
+// Triage is per-host (each agent's own ledger, its own model run, its own
+// candidate repos), while `ticketRepo` publishes the freshest host's answer
+// fleet-wide. `spawn_ticket` re-derives from the LOCAL ledger and refuses what it
+// has no decision for, so a host that has not triaged the ticket cannot run the
+// spawn — routing to one is a session that never starts.
+
+test("XERK-325: a host that has not triaged the ticket is not dispatched to", async () => {
+  // The reported bug: host B has the ticket triaged, host A is free and does not.
+  // The old pool ranked purely on availability, so the free untriaged host won and
+  // its agent refused the spawn with nothing on screen to say so.
+  resetAutoStart();
+  const site = "tq325a.atlassian.net";
+  await asBeat("tq325aUntriaged", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });          // no repoGuess
+  // Fresher, so this is the copy the card renders — the board shows Turma.
+  await asBeat("tq325aTriaged", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.deepEqual((agents.tq325aUntriaged.commands || []).map((c) => c.issueKey), [],
+    "the untriaged host must never be handed a spawn it will refuse");
+  assert.deepEqual((agents.tq325aTriaged.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a host that triaged the ticket ELSEWHERE is not dispatched to either", async () => {
+  // It would spawn against its OWN answer, so the operator would get a session on
+  // a repo the card never showed. Agreement with the published repo is the test,
+  // not merely having some decision.
+  resetAutoStart();
+  const site = "tq325b.atlassian.net";
+  await asBeat("tq325bOther", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  // Fresher, so ticketRepo publishes "Turma" — which is what the card shows.
+  await asBeat("tq325bTurma", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await startTicket(site, "ENG-5");
+  assert.deepEqual((agents.tq325bOther.commands || []).map((c) => c.issueKey), []);
+  assert.deepEqual((agents.tq325bTurma.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a 'nothing fits' verdict is not a triage decision", async () => {
+  // _apply_triage publishes a declined ticket as repoGuess.repo = null, and
+  // spawn_ticket refuses it exactly as it refuses an absent one. This host is
+  // permanently that way (_triage_stale never re-triages a decided entry), which
+  // is what made the symptom look host-specific rather than like a race.
+  resetAutoStart();
+  const site = "tq325c.atlassian.net";
+  await asBeat("tq325cNull", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo", repoGuess: { repo: null } }] });
+  await asBeat("tq325cReal", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:30:00Z",                    // the copy the card shows
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  // The only host that can run it is full, so this waits on capacity — it does
+  // NOT fall through to the host holding a null verdict.
+  assert.equal(r.body.queued, true);
+  assert.deepEqual((agents.tq325cNull.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: no online host having triaged it HOLDS as blocked, not as capacity", async () => {
+  // A freed slot does not give a host a triage decision, so reporting this as
+  // "waiting for a slot" would promise a wait that clears itself. It holds on the
+  // blocked timer instead, which is bounded and says what is wrong.
+  resetAutoStart();
+  const site = "tq325d.atlassian.net";
+  // The offline host is the only one whose Jira user is assigned ENG-5, so its
+  // row IS what the card renders — the chip is there and Start is live. The
+  // online host is in the org but has never seen the ticket.
+  await asBeat("tq325dOff", site, { autoStart: false, capacity: ROOMY,
+    user: "off@x.com",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325dOff.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325dOn", site, { autoStart: false, capacity: ROOMY,
+    user: "on@x.com", tickets: [] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /has triaged that ticket to Turma/);
+  assert.equal(r.body.queued, undefined, "a hard refusal reaches the operator, it doesn't queue");
+  assert.deepEqual((agents.tq325dOn.commands || []).map((c) => c.issueKey), []);
+});
+
+test("XERK-325: an agent PIN to a host that hasn't triaged it is refused, not routed around", async () => {
+  // The pin says which host, never that the host can run it — and the one thing a
+  // pin asserts is that no other host is chosen, so this reports rather than
+  // silently picking the host that did triage it.
+  resetAutoStart();
+  const site = "tq325e.atlassian.net";
+  await asBeat("tq325ePinned", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });
+  await asBeat("tq325eOther", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                    // the copy the card shows
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const pin = await setAgent(site, "ENG-5", { host: "tq325ePinned" });
+  assert.equal(pin.status, 200);
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /pinned to agent "tq325ePinned", which has not triaged it/);
+  assert.deepEqual((agents.tq325eOther.commands || []).map((c) => c.issueKey), [],
+    "the pin still forbids routing elsewhere");
+});
+
+test("XERK-325: an OFFLINE host's fresher triage never dictates the repo", async () => {
+  // ticketRepo and findTicketHost have to resolve against the SAME pool. The
+  // freshest block routinely belongs to a host that is down (hosts poll Jira
+  // ~10 min apart), and routing can only reach an online host that AGREES — so
+  // ranking on freshness alone named a repo nothing could be dispatched against
+  // and stalled a ticket an online host had triaged and could run.
+  resetAutoStart();
+  const site = "tq325g.atlassian.net";
+  await asBeat("tq325gDown", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  agents.tq325gDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325gUp", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.queued, undefined, "it starts — it does not stall as blocked");
+  assert.equal(r.body.repo, "Turma", "the online host's answer is the one routed on");
+  assert.deepEqual((agents.tq325gUp.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a wholly OFFLINE org still resolves a repo, so the ticket can wait", async () => {
+  // The online tier is a preference, not a filter: with nothing online the
+  // offline answer still stands, so the queue holds the ticket instead of the
+  // sweep dropping it for having no triaged repo at all.
+  resetAutoStart();
+  const site = "tq325h.atlassian.net";
+  await asBeat("tq325hDown", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325hDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /offline/,
+    "the refusal is about the org being down, not about triage");
+});
+
+test("XERK-325: 'slots full' names the hosts that can actually run it", async () => {
+  // The pool is the hosts that triaged this ticket to this repo, so reporting
+  // the ORG as full while a host with four free slots sits idle sends the
+  // operator to look at capacity they do not have a problem with.
+  resetAutoStart();
+  const site = "tq325i.atlassian.net";
+  await asBeat("tq325iAgreesFull", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325iDisagreesFree", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  // Still a capacity wait — the one host that can run it really is full, and
+  // that reason clears itself — but worded truthfully.
+  assert.equal(r.body.queued, true);
+  const e = queuedTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.ok(e, "it waits on the agreeing host rather than being refused");
+  assert.deepEqual((agents.tq325iDisagreesFree.commands || []).map((c) => c.issueKey), []);
+  // And the wording says WHICH hosts are full.
+  const { error, full } = hub.findTicketHost(site, "Turma", "ENG-5", { requireFree: true });
+  assert.equal(full, true);
+  assert.match(error, /has triaged that ticket to Turma has its session slots full/);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: spawnRefusals is coerced, since Android types it", async () => {
+  // A full /api/agents decode is atomic on Android, so one bad entry from the
+  // state.json restore (served before any host re-beats, and NOT stripped from
+  // the payload like the other caches) would fail the whole fleet array.
+  // Driven through normalizeRecord, not the leaf: the wiring is the half that
+  // can go missing, and calling the coercion directly passes with it unhooked.
+  const bad = { device: "old", spawnRefusals: "not-a-map" };
+  hub.normalizeRecord(bad);
+  assert.deepEqual(bad.spawnRefusals, {});
+
+  const mixed = { device: "old", spawnRefusals: {
+    ok: { error: "no triaged repo", at: 123 },
+    numericError: { error: 12345, at: 5 },        // reason unusable, refusal real
+    badAt: { error: "x", at: "yesterday" },       // cannot be aged out — dropped
+    notAnObject: 7,
+  } };
+  hub.normalizeRecord(mixed);
+  assert.deepEqual(Object.keys(mixed.spawnRefusals).sort(), ["numericError", "ok"]);
+  assert.deepEqual(mixed.spawnRefusals.ok, { error: "no triaged repo", at: 123 });
+  // Coerced to the default the ingest uses, never to a fabricated reason.
+  assert.equal(mixed.spawnRefusals.numericError.error, "the agent refused it");
+  // A dangerous key name never becomes an entry, and never re-points the
+  // record's prototype — the keys come off a file this coercion exists to
+  // distrust, and JSON can express any of them.
+  const proto = { device: "old", spawnRefusals: JSON.parse(
+    '{"__proto__":{"error":"x","at":1},"constructor":{"error":"y","at":1},' +
+    '"c9":{"error":"real","at":2}}') };
+  hub.normalizeRecord(proto);
+  assert.deepEqual(Object.keys(proto.spawnRefusals), ["c9"]);
+  assert.equal(Object.getPrototypeOf(proto.spawnRefusals), Object.prototype,
+    "same shape as the ingest path builds, not a null-prototype special case");
+  assert.equal(typeof ({}).error, "undefined", "Object.prototype is untouched");
+  // The COUNT is bounded here too, not just at the ingest. The restore is the
+  // one path this coercion exists for, and a map it serves is served on every
+  // /api/agents until that host next beats — a host that never beats again
+  // serves it forever. Oldest go first, like the ingest's own eviction.
+  const flood = { device: "old", spawnRefusals: {} };
+  for (let i = 0; i < 3000; i++) flood.spawnRefusals["c" + i] = { error: "x", at: i };
+  hub.normalizeRecord(flood);
+  const kept = Object.keys(flood.spawnRefusals);
+  assert.equal(kept.length, 40);
+  assert.equal(kept.includes("c2999"), true, "the newest survive");
+  assert.equal(kept.includes("c0"), false, "the oldest are evicted");
+  // The reason is length-capped here as well as at the ingest.
+  const long = { device: "old", spawnRefusals: { c: { error: "x".repeat(5000), at: 1 } } };
+  hub.normalizeRecord(long);
+  assert.equal(long.spawnRefusals.c.error.length, 500);
+});
+
+test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead host's", async () => {
+  // The sweep is the FIFTH reader of the online-first ranking. Left on freshness
+  // alone it failed twice over: it queued tickets present only in an OFFLINE
+  // host's fresher block — which no card shows, so the entry has no chip and no
+  // way to cancel it — while never starting the To Do tickets on screen.
+  // SAME Jira user on both hosts — the documented common case (an org's agents
+  // share one token), where the board keeps ONE winning block rather than
+  // unioning. The other user's case is the test below.
+  resetAutoStart();
+  const site = "tq325j.atlassian.net";
+  const user = "shared@x.com";
+  await asBeat("tq325jDown", site, { autoStart: false, capacity: ROOMY, user,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "GHOST-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325jDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325jUp", site, { autoStart: false, capacity: ROOMY, user,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "SEEN-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey),
+    ["SEEN-1"], "the visible ticket is queued, and the invisible one is not");
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325jUp.commands || []).map((c) => c.issueKey), ["SEEN-1"]);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: a strictly newer `updated` beats block rank, as mergeSites does", async () => {
+  // The two hosts' copies of a ticket normally carry an IDENTICAL `updated` (it
+  // is the tracker's own field), so this override only fires when the fleet is
+  // mid-poll — and it was the one piece of mergeSites parity with no test, which
+  // meant it could be deleted outright with the suite still green.
+  resetAutoStart();
+  const site = "tq325o.atlassian.net";
+  // Fresher BLOCK, older copy of the ticket.
+  await asBeat("tq325oFreshBlock", site, { autoStart: false, capacity: ROOMY,
+    user: "a@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "Stale", cloned: true } }] });
+  // Staler block, but a strictly newer copy of the ticket — what the board shows.
+  await asBeat("tq325oNewTicket", site, { autoStart: false, capacity: ROOMY,
+    user: "b@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Fresh", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Fresh",
+    "the newer ticket copy decides the repo, not the fresher block");
+});
+
+test("XERK-325: the SWEEP resolves the repo off the row too, not a rank of its own", async () => {
+  // `ticketRepo` feeds three routes and only the POST was pinned: a divergent
+  // freshness-only resolver wired into the sweep and the drain passed the whole
+  // suite while auto-starting a ticket the board shows UNTRIAGED. This is the
+  // sweep half — the winning copy carries no repoGuess, so the card shows no
+  // chip and no Start button, and the hub must not invent one from a losing block.
+  resetAutoStart();
+  const site = "tq325p.atlassian.net";
+  await asBeat("tq325pWinner", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });        // no repoGuess
+  await asBeat("tq325pLoser", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey), [],
+    "the board shows it untriaged, so the sweep must not start it");
+  drainTicketQueue();
+  for (const h of ["tq325pWinner", "tq325pLoser"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [], h);
+  }
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: the DRAIN resolves the repo off the row too", async () => {
+  // The third route, and it needs a fixture where the two resolvers genuinely
+  // DISAGREE — an earlier version of this test used one where they happened to
+  // agree, so it pinned nothing. Here the winning copy carries no repoGuess (the
+  // card shows the ticket untriaged), so a rank of its own resurrects a losing
+  // block's guess and dispatches a session against a repo nobody was shown; the
+  // row says untriaged, and the entry must hold as blocked instead.
+  resetAutoStart();
+  const site = "tq325q.atlassian.net";
+  await asBeat("tq325qWinner", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });        // no repoGuess
+  await asBeat("tq325qLoser", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Queued directly: the POST would refuse it (409, no triaged repo), which is
+  // the same rule from the other end — this exercises the DRAIN's own read.
+  assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
+  drainTicketQueue();
+  for (const h of ["tq325qWinner", "tq325qLoser"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [],
+      `${h} must not be dispatched a spawn for a ticket the card shows untriaged`);
+  }
+  const e = queuedTicket(site, "ENG-5");
+  assert.equal(e && e.reason, "blocked");
+  assert.match(e.error, /no triaged repo/);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: the sweep and drain honour the newer `updated` too, not just the winner", async () => {
+  // The two route tests above pin "winning copy untriaged -> invent nothing".
+  // They do NOT pin "winning copy triaged DIFFERENTLY -> don't use the other
+  // one", which is the other way the row and a block rank disagree — and a
+  // resolver dropping only the `updated` override passed the whole suite while
+  // dispatching a repo the card never showed.
+  resetAutoStart();
+  const site = "tq325r.atlassian.net";
+  // Staler BLOCK, but a strictly newer copy of the ticket — this is the row.
+  await asBeat("tq325rRow", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Fresher block, older copy — the answer a block rank would give.
+  await asBeat("tq325rRank", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  // The DRAIN route.
+  assert.ok(enqueueTicketStart(site, "ENG-5", "manual"));
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325rRow.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "routed to the host holding the repo the card shows");
+  assert.deepEqual((agents.tq325rRank.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+  agents.tq325rRow.commands = [];
+
+  // The SWEEP route, same fixture.
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325rRow.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.deepEqual((agents.tq325rRank.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: an UNTRIAGED copy winning on `updated` is still untriaged", async () => {
+  // The third divergence class, and the intersection of the two above: the
+  // pinned cases are untriaged-winner-by-BLOCK-RANK and triaged-differently-by-
+  // `updated`. A resolver preferring a triaged older copy over an untriaged newer
+  // one satisfies both and still dispatches a repo the card shows as untriaged.
+  //
+  // Ordinary fleet shape, not an edge case: a ticket is edited in Jira, the host
+  // that re-polled first has not triaged the new copy yet, and the other still
+  // holds the older triaged one.
+  resetAutoStart();
+  const site = "tq325t.atlassian.net";
+  await asBeat("tq325tFresh", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T11:00:00Z",
+    tickets: [{ key: "ENG-9", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000+0000" }] });   // newer, untriaged
+  await asBeat("tq325tStale", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-9", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "RepoOld", cloned: true } }] });
+  // The POST refuses it, because the card shows no chip.
+  const r = await startTicket(site, "ENG-9");
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /no triaged repo/);
+  // And the DRAIN holds it rather than reviving the older triaged copy.
+  assert.ok(enqueueTicketStart(site, "ENG-9", "manual"));
+  drainTicketQueue();
+  for (const h of ["tq325tFresh", "tq325tStale"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [], h);
+  }
+  const e = queuedTicket(site, "ENG-9");
+  assert.equal(e && e.reason, "blocked");
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: `updated` is compared as a STRING, like both client mirrors", async () => {
+  // `Date.parse` is the plausible "compare timestamps properly" edit and it
+  // escapes every other test here: it disagrees on mixed `+0000`/`Z` spellings,
+  // and on an absent `updated` it yields NaN, so every comparison goes false and
+  // the override silently stops firing. Both client mirrors string-compare.
+  resetAutoStart();
+  const site = "tq325u.atlassian.net";
+  // Same instant, two spellings. As strings "2026-07-14T12:00:00.000+0000" sorts
+  // BELOW "2026-07-14T12:00:00.000Z" ('+' < 'Z'), so the Z copy is the row;
+  // Date.parse calls them equal and first-wins by block rank would give Offset.
+  await asBeat("tq325uZ", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T11:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000Z",
+                repoGuess: { repo: "Zulu", cloned: true } }] });
+  await asBeat("tq325uOffset", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",                       // fresher block
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000+0000",
+                repoGuess: { repo: "Offset", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Zulu",
+    "string order decides, not Date.parse — which would call these equal");
+});
+
+test("XERK-325: a copy with NO `updated` never overrides one that has it", async () => {
+  // The fourth divergence class, and the one the rules paragraph predicted.
+  // Dropping the `|| ""` fallback — the most plausible "that's redundant" edit —
+  // makes `String(null)`/`String(undefined)` sort ABOVE every ISO date, so a copy
+  // with no `updated` wins outright. It is a real shape, not a contrived one:
+  // `hub-agent.py` writes `fields.get("updated")` and `System.ChangedDate`
+  // straight through, both of which can be null, and the hub coerces neither.
+  resetAutoStart();
+  const site = "tq325v.atlassian.net";
+  // Fresher block, so it is seen FIRST: untriaged, and carrying no `updated`.
+  await asBeat("tq325vNull", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo", updated: null }] });
+  await asBeat("tq325vReal", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // Withheld work: without the fallback this 409s while the card shows Turma.
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.repo, "Turma");
+
+  // And the wrong-repo half: both copies triaged, the null one in the fresher
+  // block. The copy that HAS an `updated` is still the row.
+  const site2 = "tq325w.atlassian.net";
+  await asBeat("tq325wNull", site2, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", repos: ["Veiller"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo", updated: null,
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  await asBeat("tq325wReal", site2, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z", repos: ["Turma"],
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r2 = await startTicket(site2, "ENG-5");
+  assert.equal(r2.body.repo, "Turma", "the copy carrying an `updated` is the row");
+});
+
+test("XERK-325: `fetchedAt` is compared with `>`, and the board agrees", async () => {
+  // Nothing pinned the OPERATOR, so reverting either side to localeCompare
+  // passed every test and silently re-opened the divergence. The two disagree on
+  // a trailing `Z` vs `z`: `>` makes the lowercase copy win (0x7a > 0x5a),
+  // ICU collation makes the uppercase one. Asserting the `>` outcome pins the
+  // hub; `board.test.js` pins the same fixture on the client side.
+  resetAutoStart();
+  const site = "tq325s.atlassian.net";
+  await asBeat("tq325sUpper", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Upper", cloned: true } }] });
+  await asBeat("tq325sLower", site, { autoStart: false, capacity: ROOMY,
+    user: "shared@x.com", fetchedAt: "2026-07-14T12:00:00z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Lower", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Lower",
+    "code-unit order, not ICU collation — the mirrors all use `>`");
+});
+
+test("XERK-325: auto-start sees BOTH Jira users' tickets, as the board does", async () => {
+  // A host polls as `assignee = currentUser()`, so an org whose hosts
+  // authenticate as different users reports different lists and the board UNIONS
+  // them. Resolving the org to one block left the other user's tickets sitting
+  // on the board in To Do, never started, with nothing to say why.
+  resetAutoStart();
+  const site = "tq325m.atlassian.net";
+  await asBeat("tq325mA", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "AAA-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325mB", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "BBB-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(
+    ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey).sort(),
+    ["AAA-1", "BBB-1"]);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: auto-STOP sees the other Jira user's Done too", async () => {
+  // The same grouping bug on the sweep that KILLS: a Done the board plainly
+  // displayed never stopped its session, because the ticket belonged to the
+  // other user and the org resolved to one block.
+  resetAutoStart();
+  const site = "tq325n.atlassian.net";
+  const sess = { id: "s-other", status: "running", repo: "Turma",
+                 ticket: { key: "BBB-9", siteKey: site } };
+  await asBeat("tq325nA", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z", sessions: [sess],
+    tickets: [{ key: "AAA-9", statusCategory: "todo" }] });
+  await asBeat("tq325nB", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "BBB-9", statusCategory: "done" }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325nA.commands || []).map((c) => c.type), ["kill"]);
+});
+
+test("XERK-325: auto-STOP does not kill a session over a Done only a dead host reports", async () => {
+  // The sweep KILLS, so ranking it differently from the board is the most
+  // damaging divergence of the set: the operator's running session ended for a
+  // status no card anywhere displayed, with nothing on screen saying why.
+  resetAutoStart();
+  const site = "tq325k.atlassian.net";
+  const sess = { id: "s-live", status: "running", repo: "Turma",
+                 ticket: { key: "ENG-5", siteKey: site } };
+  await asBeat("tq325kDown", site, { autoStart: false, capacity: ROOMY, user: "shared@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  agents.tq325kDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325kUp", site, { user: "shared@x.com", autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z", sessions: [sess],             // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325kUp.commands || []).map((c) => c.type), [],
+    "the board shows ENG-5 in To Do, so nothing may be killed for it");
+  // And the reverse still works: once the ONLINE host reports Done, it stops.
+  await asBeat("tq325kUp", site, { user: "shared@x.com", autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:40:00Z", sessions: [sess],
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  autoStopSweep();
+  assert.deepEqual((agents.tq325kUp.commands || []).map((c) => c.type), ["kill"]);
+});
+
+test("XERK-325: a queued click is not dropped over a Done only a dead host reports", async () => {
+  // `fleetTicketRows` feeds the drainer's "its ticket moved to Done" check, so
+  // ranking it on freshness alone accepted the click with `{queued:true,
+  // position:1}` and discarded it within one beat — silently, since the drop is
+  // a log line and the entry simply vanishes from the payload.
+  resetAutoStart();
+  const site = "tq325l.atlassian.net";
+  await asBeat("tq325lDown", site, { autoStart: false, capacity: ROOMY, user: "shared@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  agents.tq325lDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325lUp", site, { user: "shared@x.com", autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.queued, true);
+  drainTicketQueue();
+  assert.ok(queuedTicket(site, "ENG-5"),
+    "the board still shows it in To Do, so the click survives the drain");
+  // A Done from the ONLINE host still retires it, as it always did.
+  await asBeat("tq325lUp", site, { user: "shared@x.com", autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:40:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "done" }] });
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5"), null);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: only the shared resolvers may read a block's ticket list", () => {
+  // A TRIPWIRE, not a proof — read the limits below before trusting it.
+  //
+  // The ranking diverged three times, every time because a new site walked the
+  // agents map and re-derived the board's view instead of calling the shared
+  // resolver. A behavioural test catches that only once some fleet shape happens
+  // to exercise the new site, so this is the structural half: the thing such a
+  // site must do to exist at all is read a tracker block's `tickets`. Two
+  // functions may — `fleetTicketRows` (the board's own view, which everything
+  // else reads, `ticketRepo` included) and `hostTriagedTicket` (can THIS host run
+  // it: a per-host question with no ranking in it) — and a third is the defect.
+  //
+  // WHAT IT DOES NOT CATCH, measured rather than guessed — QA escaped earlier
+  // versions eight ways. Now covered: bracket notation, destructuring, an
+  // arrow-`const`, an `async`/`export`/indented `function` (each of which used to
+  // be invisible to the declaration scan and got its read blamed on the previous
+  // declaration), a divergent walk added BESIDE a legitimate `fleetTicketRows()`
+  // call.
+  //
+  // Still open, stated as the CLASS rather than a list of instances — the list
+  // was enumerated twice and was incomplete both times, so it will age again:
+  //   - a COMPUTED key (`j["tick" + "ets"]`), which escapes in EVERY position;
+  //   - a resolver in ANOTHER FILE, since this greps `server.js` alone;
+  //   - **any declaration form `DECL` does not match, sitting directly after an
+  //     allow-listed declaration** so the attribution lands on that name.
+  //     Measured examples: an object-literal method, a class method, an
+  //     object-literal arrow property, a bare `x = function …` assignment, an
+  //     IIFE, and a getter. All are caught in any other position;
+  //   - a divergent re-rank written INSIDE an allow-listed function, where the
+  //     attribution is correct and simply permissive. Not a `DECL` miss, so no
+  //     amount of pattern work reaches it. Measured on two shapes — a
+  //     freshest-block-wins re-rank inside `fleetTicketRows`, and a
+  //     grouping-kept freshness-only one — this test passes both while 8-9
+  //     behavioural tests fail. The same re-rank inside a NON-allow-listed
+  //     function does trip it, so the boundary is the allow-list, not the read.
+  //
+  // So it is a tripwire for the honest edit, not a proof. **The guarantee lives
+  // in the behavioural tests above** — the two-user, ghost, auto-stop,
+  // queued-click, and the sweep/drain repo-resolution cases, which do catch the
+  // computed-key version on every route. A change that keeps those green while
+  // making this fail is a naming problem, not a bug; say so here rather than
+  // widening the pattern until it means nothing.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+  // Dot, bracket and destructured reads alike.
+  const READ = /\.tickets\b|\[\s*["']tickets["']\s*\]|\{[^{}]*\btickets\b[^{}]*\}\s*=/g;
+  // Named functions AND `const x = (…) =>` / `= function`, so an arrow is
+  // attributed to itself rather than to whatever declaration sits above it.
+  // Anchored at the START of a line, tolerating leading whitespace and `async`/
+  // `export` — without the anchor an inner `const t = (…)` claims the
+  // attribution, and with too STRICT an anchor (`^function` alone) an
+  // `async function` or a one-space-indented one is invisible and its read is
+  // blamed on whatever declaration precedes it.
+  // The two forms are anchored DIFFERENTLY on purpose. A `function` declaration
+  // may be indented and may be `async`/`export`/generator — a one-space indent or
+  // a bare `async` was an escape, since the read then got blamed on whatever
+  // declaration preceded it. An arrow-`const` must be at column 0, because inner
+  // ones are always indented and would otherwise claim their enclosing
+  // function's reads (`hostTriagedTicket`'s own `const t = (…)` is the case).
+  const DECL = new RegExp(
+    "^[ \\t]*(?:export\\s+)?(?:async\\s+)?function\\s*\\*?\\s*(\\w+)\\s*\\("
+    + "|^(?:export\\s+)?(?:const|let|var)\\s+(\\w+)\\s*=\\s*(?:async\\s+)?(?:function\\b|\\()",
+    "gm");
+  const readers = [];
+  for (const m of code.matchAll(READ)) {
+    const decls = [...code.slice(0, m.index).matchAll(DECL)];
+    const last = decls[decls.length - 1];
+    readers.push(last ? (last[1] || last[2]) : "(top level)");
+  }
+  assert.deepEqual([...new Set(readers)].sort(),
+    ["fleetTicketRows", "hostTriagedTicket"],
+    "a new reader of a block's ticket list is a new ranking site — route it "
+    + "through fleetTicketRows instead. (If this is an unrelated `tickets` "
+    + "field, say so here rather than widening the pattern.)");
+
+  // The other half of agreeing with the board is the GROUPING, not just the
+  // tie-break, and it is the one that broke most recently: both sweeps must read
+  // the board's view rather than resolving an org to a block of their own.
+  for (const fn of ["function autoStartSweep(", "function autoStopSweep("]) {
+    const at = code.indexOf(fn);
+    assert.ok(at > -1, `${fn} must be locatable`);
+    const body = code.slice(at, code.indexOf("\n}", at));
+    assert.match(body, /fleetTicketRows\(\)|ticketRowsForSite\(/,
+      `${fn} must resolve tickets through fleetTicketRows, not its own walk`);
+  }
+});
+
+test("XERK-325: the drainer re-checks triage, so a decision landing later dispatches", async () => {
+  // The common case is a race, not a permanent disagreement: a new ticket is
+  // untriaged on a host for the few minutes its batch takes. The queue must pick
+  // it up on the beat the decision lands rather than having given up.
+  resetAutoStart();
+  const site = "tq325f.atlassian.net";
+  await asBeat("tq325fLate", site, { autoStart: false, capacity: FULL,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325fFree", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });          // untriaged
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.queued, true, "the only triaged host is full, so it waits");
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325fFree.commands || []).map((c) => c.issueKey), []);
+  // Its triage batch comes back and it publishes the same repo.
+  await asBeat("tq325fFree", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325fFree.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(queuedTicket(site, "ENG-5"), null, "and the entry retires with the dispatch");
 });
 
 // ---- manual org colors (XERK-145) -------------------------------------------
