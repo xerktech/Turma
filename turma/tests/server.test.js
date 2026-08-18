@@ -2076,6 +2076,96 @@ test("http: a malformed sub-agent split is DROPPED, never repaired into zeros", 
                    { totals: win, today: win, week: win });
 });
 
+test("http: an unusable token figure is coerced to 0 on every usage block", async () => {
+  // XERK-306: a bucket's four counts are Kotlin `Long`s on Android and a full
+  // /api/agents decode is ATOMIC there, so ONE host's `1.5` threw for the WHOLE
+  // array — every OTHER host silently vanished from that phone's fleet list
+  // while the tile still read "N / N online". XERK-302 fixed `subagent` alone;
+  // these are its siblings, on every block a beat carries.
+  const bad = { input: 1.5, output: 1e308, cacheWrite: "9", cacheRead: -5 };
+  const good = { input: 7, output: 0, cacheWrite: Number.MAX_SAFE_INTEGER, cacheRead: 3 };
+  const zeros = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  const usage = () => ({
+    totals: { ...bad },
+    today: { ...good },
+    week: { input: 2 },  // a partial bucket: the keys it HAS are all it gets
+    days: { "2026-08-01": { ...bad }, "2026-08-02": { ...good } },
+    models: [{ model: "opus", totals: { ...bad }, today: { ...good } }],
+  });
+
+  assert.equal((await request("POST", "/api/heartbeat", {
+    body: {
+      device: "figure-host",
+      usage: usage(),
+      repoUsage: [{ repo: "Turma", usage: usage() }],
+      sessions: [{ id: "s1", repo: "Turma", status: "running", usage: usage() }],
+    },
+    headers: agentHeaders,
+  })).status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "figure-host");
+
+  for (const [where, u] of [["host", rec.usage], ["repo", rec.repoUsage[0].usage],
+                            ["session", rec.sessions[0].usage]]) {
+    assert.deepEqual(u.totals, zeros, `${where}: bad figures not zeroed`);
+    assert.deepEqual(u.today, good, `${where}: good figures not left alone`);
+    // A MISSING key stays missing. Filling it in would GROW the record, and
+    // this walk runs before the second AGENT_RECORD_MAX measurement.
+    assert.deepEqual(u.week, { input: 2 }, `${where}: absent figures filled in`);
+    assert.deepEqual(u.days["2026-08-01"], zeros, `${where}: day bucket not zeroed`);
+    assert.deepEqual(u.days["2026-08-02"], good, `${where}: good day bucket changed`);
+    assert.deepEqual(u.models[0].totals, zeros, `${where}: model bucket not zeroed`);
+    assert.deepEqual(u.models[0].today, good, `${where}: good model bucket changed`);
+  }
+
+  // The property the Android decoder actually needs, asserted over the whole
+  // served record rather than the fields this test happened to name.
+  const walk = (v, at) => {
+    if (Array.isArray(v)) return v.forEach((x, i) => walk(x, `${at}[${i}]`));
+    if (!v || typeof v !== "object") return;
+    for (const [k, x] of Object.entries(v)) {
+      if (["input", "output", "cacheWrite", "cacheRead"].includes(k)) {
+        assert.ok(Number.isSafeInteger(x) && x >= 0, `${at}.${k} is not a Long: ${x}`);
+      } else walk(x, `${at}.${k}`);
+    }
+  };
+  walk(rec, "agent");
+});
+
+test("http: usage shapes that are not buckets are dropped, and no coercion grows the record", async () => {
+  // The other half of XERK-306: a window, a `days` map or a whole `usage` that
+  // is not an object at all is decode-fatal before any figure inside it counts.
+  // Each is DELETED rather than rebuilt — a rebuilt bucket would be four keys
+  // of invented zeros, and this walk runs between the raw and the coerced
+  // AGENT_RECORD_MAX measurements, so it must never expand what it is given.
+  const junk = {
+    usage: {
+      totals: "lots", today: 7, week: [], days: [1, 2], lastActivity: 5,
+      models: [{ model: "opus", totals: null }],
+    },
+    repoUsage: [null, "x", { repo: 5, remoteKey: {}, usage: 9 },
+                { repo: "Turma", usage: { totals: { input: 4 } } }],
+    sessions: [{ id: "s1", repo: "Turma", status: "running", usage: 3 }],
+  };
+  const sent = JSON.stringify({ usage: junk.usage, repoUsage: junk.repoUsage });
+
+  assert.equal((await request("POST", "/api/heartbeat", {
+    body: { device: "junk-usage-host", ...junk },
+    headers: agentHeaders,
+  })).status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "junk-usage-host");
+
+  assert.deepEqual(rec.usage, { models: [{ model: "opus" }] });
+  // A non-object element of a typed LIST is as fatal as a bad field inside one.
+  assert.deepEqual(rec.repoUsage, [{}, { repo: "Turma", usage: { totals: { input: 4 } } }]);
+  assert.ok(!("usage" in rec.sessions[0]), "a session's non-object usage survived");
+
+  const kept = JSON.stringify({ usage: rec.usage, repoUsage: rec.repoUsage });
+  assert.ok(kept.length <= sent.length,
+            `coercion grew the record: ${sent.length} -> ${kept.length}`);
+});
+
 test("http: an agent's subscription limits reach the clients, and clear again", async () => {
   // XERK-247: the 5h/7d windows are a snapshot the agent captures out of Claude
   // Code itself, so the hub is pure carriage — but it has to be carriage that

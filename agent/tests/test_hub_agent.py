@@ -568,6 +568,42 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
     def test_missing_project_dir_returns_none(self):
         self.assertIsNone(ha.usage_report("/does/not/exist"))
 
+    def test_unusable_token_figures_count_as_zero(self):
+        """XERK-306: whatever the transcript says travels untouched to the hub,
+        the web UI and a Kotlin `Long` on Android, where a float or an
+        out-of-range figure fails the decode of the WHOLE /api/agents array and
+        empties every OTHER host from that phone's fleet list. A string is worse
+        still here — it raised out of the beat's own aggregation on the first
+        `+=`, costing this host its entire usage report. Each unusable figure
+        counts as 0 — a FRACTIONAL one is truncated rather than discarded, since
+        the count is real and only its type is wrong — and the rest of the
+        entry, and every other entry, still count."""
+        write_jsonl(os.path.join(self.proj, "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1", "sonnet",
+                        1.5, "9", cw=-5, cr=10 ** 400),
+            usage_entry("2026-07-01T11:00:00.000Z", "m2", "r2", "sonnet",
+                        100, 200, cw=300, cr=400),
+            usage_entry("2026-07-01T12:00:00.000Z", "m3", "r3", "sonnet",
+                        True, None, cw=float("nan"), cr=2.0),
+        ])
+        rep = ha.usage_report(self.WORKDIR)
+        # A bool is not a count (isinstance(True, int) is True, so it would
+        # otherwise fold in as 1); a whole-valued float is one, truncated.
+        self.assertEqual(rep["totals"],
+                         {"input": 101, "output": 200, "cacheWrite": 300, "cacheRead": 402})
+        self.assertEqual(rep["days"]["2026-07-01"], rep["totals"])
+        for bucket in (rep["totals"], rep["models"][0]["totals"]):
+            for k, v in bucket.items():
+                self.assertIsInstance(v, int, k)
+                self.assertNotIsInstance(v, bool, k)
+
+    def test_token_count_accepts_only_plausible_figures(self):
+        for v in (0, 5, 2 ** 53 - 1, 2.0, 1.5):
+            self.assertEqual(ha._token_count(v), int(v), v)
+        for v in (-1, -0.5, True, False, None, "9", [], {},
+                  2 ** 53, 10 ** 400, float("nan"), float("inf")):
+            self.assertEqual(ha._token_count(v), 0, v)
+
     def test_aggregation_dedup_and_model_tokens(self):
         today = ha._utc_today()
         opus = usage_entry(

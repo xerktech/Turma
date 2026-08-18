@@ -1909,6 +1909,40 @@ def _usage_bucket():
     return {k: 0 for k in TOKEN_KEYS}
 
 
+# The largest token figure that survives the whole chain: JavaScript's
+# Number.MAX_SAFE_INTEGER, which is also what the hub's coercion accepts and
+# what a Kotlin `Long` decodes. A real per-message count is six digits.
+TOKEN_MAX = 2 ** 53 - 1
+
+
+def _token_count(v):
+    """One token figure off a transcript's usage block, as a non-negative int.
+
+    Whatever the transcript says travels untouched to the hub, the web UI and a
+    Kotlin `Long` on Android, where a float or an out-of-range value fails the
+    decode of the WHOLE /api/agents array and empties every OTHER host from that
+    phone's fleet list (XERK-306). The hub coerces at its own boundary because
+    it must survive any agent; this stops it at the source, and keeps THIS
+    host's own arithmetic sane — a float would poison every total it is folded
+    into, and a string raises straight out of the beat on the first `+=`.
+
+    Anything unusable counts as 0 rather than aborting the parse: one odd entry
+    must not cost a host its entire usage report. A FRACTIONAL figure is
+    truncated instead — the count is real and only its type is wrong, and the
+    hub cannot make that distinction from the wire, which is why its own
+    coercion zeroes what reaches it. A bool is not a count (`isinstance(True,
+    int)` is True, so it would otherwise fold in as 1)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    # isfinite BEFORE the comparisons: NaN compares False against both bounds,
+    # and math.isfinite of a huge int raises rather than answering.
+    if isinstance(v, float) and not math.isfinite(v):
+        return 0
+    if v < 0 or v > TOKEN_MAX:
+        return 0
+    return int(v)
+
+
 def _add_tokens(bucket, tok):
     """Fold one message's (input, output, cacheWrite, cacheRead) into `bucket`."""
     for k, n in zip(TOKEN_KEYS, tok):
@@ -1981,12 +2015,12 @@ def _accumulate_usage(lines, acc, subagent=False):
             acc.last_ts = ts
         model = msg.get("model") or "unknown"
 
-        tok = (
-            usage.get("input_tokens", 0) or 0,
-            usage.get("output_tokens", 0) or 0,
-            usage.get("cache_creation_input_tokens", 0) or 0,
-            usage.get("cache_read_input_tokens", 0) or 0,
-        )
+        tok = tuple(_token_count(usage.get(k)) for k in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ))
         # Transcript timestamps are UTC ISO; date-prefix bucketing is close
         # enough for a dashboard.
         day = ts[:10] if len(ts) >= 10 else ""

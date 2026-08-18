@@ -39,6 +39,12 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
     `{totals:{input:"9"}}` would land in the denominator with a fabricated 0 on top. Figures must be
     non-negative SAFE INTEGERS — a float or a `1e308` decodes into a Kotlin `Long` and fails the
     whole `/api/agents` array.
+  - **Every token figure is coerced where it leaves the transcript** (`_token_count`, XERK-306).
+    A figure travels untouched to a Kotlin `Long` on Android, where a float or an out-of-range one
+    fails the decode of the WHOLE `/api/agents` array and empties every OTHER host from that phone's
+    fleet list; a string raised straight out of `_add_tokens`, costing this host its whole report.
+    Unusable counts as 0, a FRACTIONAL one truncates (the count is real, only its type is wrong),
+    and a bool is not a count. The hub coerces again at ingest because it must survive any agent.
   - **Only REGULAR FILES are enumerated, on both branches.** A `*.jsonl` directory would read as a
     conversation and skip its own `subagents/` tree; a FIFO named `*.jsonl` blocks a read forever,
     on the heartbeat's critical path. Nothing in the walk raises — an escape there is a host that
