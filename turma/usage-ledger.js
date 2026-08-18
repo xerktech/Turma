@@ -550,7 +550,9 @@ function load() {
  *
  * Returns whether it fits, so the caller can tell "trimmed" from "cannot".
  */
+let shareChecks = 0;
 function enforceHostShare(key, entry) {
+  shareChecks += 1;
   const share = hostShare();
   const size = () => { try { return JSON.stringify(entry).length; } catch { return 0; } };
   let now = size();
@@ -988,6 +990,9 @@ module.exports = {
       if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
       if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
     },
+    // Test seam for the `grew` gate: its entire effect is that enforceHostShare
+    // does NOT run on a numbers-only beat, which nothing else can observe.
+    shareChecks: () => shareChecks,
     load, writeNow, absorb, render, servedSeries, blankSeries, seriesTotals, usageOf, reposOf,
     weekWindow, utcToday, bucketTokens,
   },

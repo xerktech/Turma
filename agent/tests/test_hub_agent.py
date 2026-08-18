@@ -12789,6 +12789,41 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             sm._archive_raw_deltas({})
         self.assertEqual(len(seen), ha.ARCHIVE_RAW_FAILURES_MAX, seen)
 
+    def test_session_files_never_raises_on_the_heartbeat_path(self):
+        """`_session_files` runs on the beat's critical path, where the walk's
+        contract is that nothing raises — an escape is a host that reads offline.
+        The unnameable-file log's throttle reads its timestamp through `getattr`
+        for exactly that reason: a manager-like object whose __init__ did not run
+        took the beat down over a LOG LINE (XERK-338 QA H2)."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "tool-results/bad name.txt", b"x")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        # The attribute the throttle reads, gone.
+        del sm._unnameable_logged_at
+        rels = sm._session_files(proj, "t1")          # must not raise
+        self.assertIn(("t1.jsonl", mock.ANY), [(r, mock.ANY) for r, _s in rels])
+        self.assertFalse([r for r, _s in rels if "bad name" in r])
+
+    def test_unnameable_file_log_is_throttled(self):
+        """The manifest is rebuilt every beat, so an unthrottled line writes
+        forever for one unnameable file (XERK-338 QA G6/H3). Every comparable
+        warn on this path throttles to 1/hour."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "tool-results/bad name.txt", b"x")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            for _ in range(5):
+                sm._session_files(proj, "t1")
+        said = [m for m in lines if "cannot be named" in m]
+        self.assertEqual(len(said), 1, said)
+        # ...and it names the files, since they are otherwise silently absent.
+        self.assertIn("bad name.txt", said[0])
+
     def test_raw_deltas_leave_a_shrunken_source_alone(self):
         # The hub holds MORE than the host now has: the transcript was rewritten
         # or replaced under us. Truncating the archive to match would throw away

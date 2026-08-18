@@ -513,6 +513,94 @@ test("hostShare leaves room for the JSON envelope", () => {
     `LEDGER_MAX ${ledger.LEDGER_MAX} — no room for the JSON envelope`);
 });
 
+test("trimming reaches the share by dropping MODELS, before it costs any spend", () => {
+  // The ORDER is the fix, not just the fact of trimming. Step 2 (the per-model
+  // breakdown, whose totals are kept in full anyway) is what actually brings a
+  // repo-heavy host under its share; without it the host falls through to step 3
+  // and drops 88 of its 100 REPOS — 88 repos of per-repo spend gone from the
+  // breakdown, where the correct code loses none (XERK-338 QA H1). Nothing
+  // turned red for removing it.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    process.env.USAGE_LEDGER_FILE = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "turma-order-")), "l.json");
+    process.env.USAGE_LEDGER_MAX = "3000000";
+    process.env.USAGE_LEDGER_HOSTS = "32";
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const N = "x".repeat(200);
+    const blk = () => ({ totals: b(1000), today: b(0), week: b(0),
+      days: { "2026-08-18": b(1000) }, sessions: 1,
+      models: Array.from({ length: 64 }, (_, i) => (
+        { model: "m" + i + N, totals: b(1), today: b(0), week: b(0) })) });
+    l.ingest("fat", { device: "fat", usage: blk(),
+      repoUsage: Array.from({ length: 100 }, (_, i) => (
+        { repo: "r" + i + N, remoteKey: "rk" + i + N, remote: N, usage: blk() })) });
+    const e = l._internals.hosts().fat;
+    console.log(JSON.stringify({
+      repos: Object.keys(e.repos).length,
+      models: Object.keys(e.host.models).length,
+      size: JSON.stringify(e).length, share: l.hostShare() }));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const out = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  assert.ok(out.size <= out.share, `host at ${out.size}, share ${out.share}`);
+  // The point: it got there on MODELS, so every repo's spend survived.
+  assert.equal(out.repos, 100, `${100 - out.repos} repos of spend were dropped instead`);
+  assert.ok(out.models < 64, "the model breakdown was not trimmed at all");
+});
+
+test("the share and evict warnings quantify, and are throttled", () => {
+  // Both are throttled to 1/hour, so each is the ONLY trace of a host losing
+  // detail — a line that does not say how much was lost is barely a trace, and
+  // an unthrottled one buries the rest (XERK-338 QA G7/H4).
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    process.env.USAGE_LEDGER_FILE = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "turma-warn-")), "l.json");
+    process.env.USAGE_LEDGER_MAX = "70000";
+    process.env.USAGE_LEDGER_HOSTS = "32";
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const lines = [];
+    console.warn = (m) => lines.push(m);
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const N = "x".repeat(200);
+    const blk = () => ({ totals: b(1000), today: b(0), week: b(0),
+      days: { "2026-08-18": b(1000) }, sessions: 1, models: [] });
+    // Two hosts, each big enough to trim, so an unthrottled warn shows up twice.
+    for (const h of ["fatA", "fatB"]) l.ingest(h, { device: h, usage: blk(),
+      repoUsage: Array.from({ length: 100 }, (_, i) => (
+        { repo: "r" + i + N, remoteKey: "rk" + i + N, remote: N, usage: blk() })) });
+    console.log(JSON.stringify(lines));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const lines = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  const share = lines.filter((l) => /over its .*-byte share/.test(l));
+  assert.equal(share.length, 1, `share warning fired ${share.length} times, not once`);
+  // ...and it says what it cost, in repos and in tokens.
+  assert.match(share[0], /Dropped \d+ of its smallest repo\(s\), taking \d+ tokens/);
+});
+
+test("a numbers-only beat does not re-run the share check", () => {
+  // enforceHostShare stringifies the whole entry (4.6 ms at 100 repos) and runs
+  // on the heartbeat path; a beat that merely raises existing counts grows the
+  // entry by digits (XERK-338 QA F9). Its whole effect is that the check does
+  // NOT run, so the counter is the only way to see it.
+  const before = ledger._internals.shareChecks();
+  const b1 = beat({ [DAY]: 10 }, { r: { [DAY]: 10 } }, { device: "steady" });
+  ledger.ingest("steady", b1, now);
+  const afterFirst = ledger._internals.shareChecks();
+  assert.ok(afterFirst > before, "a fresh host must be checked");
+  // Same shape, bigger numbers: no new day, repo or model.
+  ledger.ingest("steady", beat({ [DAY]: 99 }, { r: { [DAY]: 99 } }, { device: "steady" }), now);
+  assert.equal(ledger._internals.shareChecks(), afterFirst,
+    "the share check re-ran on a beat that added no structure");
+  // ...but a NEW repo does trigger it.
+  ledger.ingest("steady", beat({ [DAY]: 99 }, { r: { [DAY]: 99 }, r2: { [DAY]: 5 } },
+    { device: "steady" }), now);
+  assert.ok(ledger._internals.shareChecks() > afterFirst, "a new repo must be checked");
+});
+
 test("a host that has spent nothing never takes a ledger slot", () => {
   ledger.ingest("empty", { device: "empty", usage: null, repoUsage: [] }, now);
   assert.deepEqual(Object.keys(hosts()), []);
