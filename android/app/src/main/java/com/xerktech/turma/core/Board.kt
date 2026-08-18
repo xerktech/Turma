@@ -338,7 +338,15 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
             if (seen == null || t.updated > seen.updated) byKey[t.key] = t
         }
         val tickets = ArrayList(byKey.values)
+        // The winning block for every single-valued field: online first, then
+        // freshest — `sorted`'s own order.
         val newest = sorted.first().j
+        // ...EXCEPT `fetchedAt`, which board.js takes as the MAX across the
+        // winner blocks, not off the winner. The two were the same thing only
+        // while the sort was freshest-first; once online outranks freshness
+        // (XERK-325) the winner can be the OLDER block, and reporting its stamp
+        // as the site's last-fetched understates how current the board is.
+        val lastFetched = sorted.maxOfOrNull { it.j.fetchedAt }.orEmpty()
         // Unioned over every reporting host in the first loop above — see
         // repoOptsBySite for why it cannot be collected here.
         val repoOpts = repoOptsBySite[site] ?: LinkedHashMap()
@@ -350,7 +358,7 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                 source = newest.source.ifBlank { "jira" },
                 online = reporterOnline[site] ?: false,
                 error = sorted.firstNotNullOfOrNull { it.j.error },
-                fetchedAt = newest.fetchedAt,
+                fetchedAt = lastFetched,
                 tickets = tickets,
                 // Cloned repos first (the ones you can work in today), then by
                 // name — the picker's own order, so it doesn't inherit the

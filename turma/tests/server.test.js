@@ -5926,6 +5926,31 @@ test("XERK-325: spawnRefusals is coerced, since Android types it", async () => {
   assert.equal(long.spawnRefusals.c.error.length, 500);
 });
 
+test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead host's", async () => {
+  // The sweep is the FIFTH reader of the online-first ranking. Left on freshness
+  // alone it failed twice over: it queued tickets present only in an OFFLINE
+  // host's fresher block — which no card shows, so the entry has no chip and no
+  // way to cancel it — while never starting the To Do tickets on screen.
+  resetAutoStart();
+  const site = "tq325j.atlassian.net";
+  await asBeat("tq325jDown", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "GHOST-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325jDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325jUp", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "SEEN-1", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  setAutoStartOrg(site, true);
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.filter((e) => e.siteKey === site).map((e) => e.issueKey),
+    ["SEEN-1"], "the visible ticket is queued, and the invisible one is not");
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325jUp.commands || []).map((c) => c.issueKey), ["SEEN-1"]);
+  ticketQueue.length = 0;
+});
+
 test("XERK-325: the drainer re-checks triage, so a decision landing later dispatches", async () => {
   // The common case is a race, not a permanent disagreement: a new ticket is
   // untriaged on a host for the few minutes its batch takes. The queue must pick

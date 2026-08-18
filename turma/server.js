@@ -2406,8 +2406,10 @@ function rememberCreateInFlight(fields, cmdId, host) {
 // host reports the ticket, or none has triaged it yet, or the model declined it.
 // ONLINE first, then the freshest reporting block — the SAME order board.js's
 // `mergeSites` applies, because the hub must resolve against what the operator
-// was actually shown. Move one and move the other (and the two vendored copies
-// and `Board.kt` with it), or the card names one repo and Start spawns another.
+// was actually shown. FIVE places rank this way and they move together: here,
+// `autoStartSweep`'s own block pick, `board.js` + its two vendored copies, and
+// `Board.kt`. Break the tie differently in any one of them and the card names
+// one repo while Start spawns another.
 //
 // **An ONLINE host's answer outranks any offline one, however stale** (XERK-325).
 // Every caller is a ROUTING decision, and `findTicketHost` can only route to an
@@ -5060,14 +5062,27 @@ function autoStartSweep() {
   const now = Date.now();
   const started = startedTicketKeys();
   for (const siteKey of orgs) {
-    // The freshest reporting block owns the ticket list and its repo guesses, the
-    // same copy ticketRepo/mergeSites resolve against — so the hub auto-starts on
-    // what the board would show, not a lagging host's older view.
-    let block = null, bestAt = "";
+    // ONLINE first, then the freshest reporting block owns the ticket list and
+    // its repo guesses — the SAME ranking `ticketRepo` and every `mergeSites`
+    // mirror apply, so the hub auto-starts on what the board would show rather
+    // than a lagging host's older view. This is the FIFTH place that ranking
+    // lives; moving any of them means moving all five (XERK-325).
+    //
+    // Ranking on freshness alone here while the others preferred online was two
+    // silent failures at once: the sweep queued tickets present only in an
+    // offline host's fresher block — which no card shows, so the entry has no
+    // chip, no reason and no way to cancel it, and it holds one of the org's auto
+    // slots until the blocked timer drops it — while never starting the To Do
+    // tickets the operator can actually see.
+    let block = null, bestAt = "", bestOnline = false;
     for (const a of Object.values(agents)) {
       if (!a.jira || a.jira.siteKey !== siteKey) continue;
+      const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
       const at = String(a.jira.fetchedAt || "");
-      if (!block || at > bestAt) { block = a.jira; bestAt = at; }
+      if (!block || (online && !bestOnline) ||
+          (online === bestOnline && at > bestAt)) {
+        block = a.jira; bestAt = at; bestOnline = online;
+      }
     }
     for (const t of (block && block.tickets) || []) {
       if (!t || !t.key) continue;

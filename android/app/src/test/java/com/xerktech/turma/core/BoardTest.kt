@@ -127,6 +127,21 @@ class BoardTest {
         assertEquals(listOf("T-1"), mergeSites(listOf(down)).single().tickets.map { it.key })
     }
 
+    @Test fun `XERK-325 - lastFetched is the MAX across winners, not the winner's own`() {
+        // board.js takes the max; taking the winner's own stamp was equivalent
+        // only while the sort was freshest-first. With online outranking
+        // freshness the winner can be the OLDER block, which understated how
+        // current the board is.
+        val onlineOld = agent("alice", true, JiraBlock(siteKey = "org", user = "alice",
+            fetchedAt = "2026-08-18T09:00:00.000Z", tickets = listOf(ticket("A-1"))))
+        val offlineNew = agent("bob", false, JiraBlock(siteKey = "org", user = "bob",
+            fetchedAt = "2026-08-18T10:00:00.000Z", tickets = listOf(ticket("B-1"))))
+        val site = mergeSites(listOf(onlineOld, offlineNew)).single()
+        assertEquals("2026-08-18T10:00:00.000Z", site.fetchedAt)
+        // The online block still owns the single-valued fields and wins ties.
+        assertEquals(setOf("A-1", "B-1"), site.tickets.map { it.key }.toSet())
+    }
+
     // ---- XERK-235: divergences from board.js found by a QA parity audit ----
 
     @Test fun `ticket dedupe keeps the freshest UPDATED, not the freshest block`() {
