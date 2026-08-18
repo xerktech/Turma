@@ -134,7 +134,7 @@ const hub = require("../server.js");
 // see the fan-out. Real fan-out/pruning is exercised separately below.
 hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
-  server, agents, queueCommand, findSession,
+  server, agents, queueCommand, findSession, orgPeers,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
@@ -2461,7 +2461,10 @@ test("http: command queue rides the reply until acked", async () => {
   // Register the host; queue is empty at first.
   let res = await beat({ device: "h1" });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { commands: [] });
+  // `peers` rides every reply (XERK-348) — it is how a host learns which
+  // sessions its own may address, so an absent key means "no roster", which the
+  // agent reads as a boundary it cannot widen past its own host.
+  assert.deepEqual(res.body, { commands: [], peers: [] });
 
   // The UI queues two session commands (as the /api/agents/... routes do).
   const spawnRes = await request("POST", "/api/agents/h1/sessions", {
@@ -11566,4 +11569,126 @@ test("usage: a refused beat is not history", async () => {
   });
   assert.equal(fat.status, 413);
   assert.equal(usageLedger.has(host), false);
+});
+
+// --- the org-scoped peer roster (XERK-348) ---------------------------------
+// `ListAgents` is denied agent-side, so this roster is the ONLY address book a
+// session has. What the hub puts in it IS the org boundary, which is why these
+// assert what is EXCLUDED as hard as what is included.
+
+function peerHost(key, siteKey, sessions, ageMs = 0) {
+  agents[key] = {
+    key, device: key, lastSeen: Date.now() - ageMs,
+    jira: siteKey ? { siteKey } : undefined,
+    sessions,
+  };
+}
+function peerSession(id, extra = {}) {
+  return { id, rcName: `rc-${id}`, repo: "Turma", status: "running", ...extra };
+}
+function dropPeerHosts(...keys) {
+  for (const k of keys) delete agents[k];
+}
+
+test("orgPeers spans the org's hosts and excludes every other org", () => {
+  peerHost("nasA", "acme.atlassian.net", [peerSession("s1")]);
+  peerHost("nasB", "acme.atlassian.net", [peerSession("s2")]);
+  peerHost("other", "rival.atlassian.net", [peerSession("s3")]);
+  try {
+    const names = orgPeers("nasA").map((p) => p.id);
+    // The whole point: a multi-host org still reaches itself...
+    assert.deepEqual(names.sort(), ["s1", "s2"]);
+    // ...and never anyone else. A regression here is a cross-org leak, not a
+    // cosmetic bug.
+    assert.equal(names.includes("s3"), false);
+  } finally {
+    dropPeerHosts("nasA", "nasB", "other");
+  }
+});
+
+test("an org-less host is alone, never pooled with other org-less hosts", () => {
+  // "No tracker block" is not an org they share — it is the absence of one, and
+  // pooling them would build a roster spanning unrelated deployments.
+  peerHost("loneA", null, [peerSession("s1")]);
+  peerHost("loneB", null, [peerSession("s2")]);
+  try {
+    assert.deepEqual(orgPeers("loneA").map((p) => p.id), ["s1"]);
+  } finally {
+    dropPeerHosts("loneA", "loneB");
+  }
+});
+
+test("an offline host's sessions are left out; the caller's own are not", () => {
+  // A name that can only absorb a message is worse than no name. The caller is
+  // exempt: it is beating right now, by definition.
+  peerHost("nasA", "acme.atlassian.net", [peerSession("mine")]);
+  peerHost("gone", "acme.atlassian.net", [peerSession("dead")], 10 * 60 * 1000);
+  try {
+    assert.deepEqual(orgPeers("nasA").map((p) => p.id), ["mine"]);
+  } finally {
+    dropPeerHosts("nasA", "gone");
+  }
+});
+
+test("only running sessions are listed", () => {
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("run"),
+    peerSession("q", { status: "queued" }),
+    peerSession("stop", { status: "stopped" }),
+  ]);
+  try {
+    assert.deepEqual(orgPeers("nasA").map((p) => p.id), ["run"]);
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("a row carries the ticket, the live branch and the host", () => {
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("s1", {
+      ticket: { key: "XERK-348", summary: "Scope messaging" },
+      summary: "ignored when a ticket names it",
+      git: { liveBranch: "XERK-348" },
+    }),
+  ]);
+  try {
+    const [row] = orgPeers("nasA");
+    assert.equal(row.host, "nasA");
+    assert.equal(row.branch, "XERK-348");
+    assert.equal(row.task, "XERK-348 Scope messaging");
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("a long task is cut on the wire, before the agent ever sees it", () => {
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("s1", { summary: "x".repeat(5000) }),
+  ]);
+  try {
+    assert.ok(orgPeers("nasA")[0].task.length <= 200);
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("the roster is capped, and same-host rows survive the cap first", () => {
+  // Every session reads this file, so an unbounded roster is charged to all of
+  // them — and the peer in the next worktree is likelier to be worth a message
+  // than one two hosts away.
+  peerHost("nasA", "acme.atlassian.net",
+    Array.from({ length: 40 }, (_, i) => peerSession(`mine${i}`)));
+  peerHost("nasB", "acme.atlassian.net",
+    Array.from({ length: 400 }, (_, i) => peerSession(`theirs${i}`)));
+  try {
+    const rows = orgPeers("nasA");
+    assert.equal(rows.length, 120);
+    assert.equal(rows.filter((r) => r.host === "nasA").length, 40);
+  } finally {
+    dropPeerHosts("nasA", "nasB");
+  }
+});
+
+test("an unknown host gets no roster at all", () => {
+  assert.deepEqual(orgPeers("never-heard-of-it"), []);
 });

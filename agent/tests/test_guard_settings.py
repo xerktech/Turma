@@ -389,8 +389,22 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # emitted whenever that is outside REPOS_ROOT — which is exactly how CI
         # checks out. Asserting the static list alone passed only when the tree
         # happened to live under /mnt/data/Docker/git.
-        self.assertEqual(s["permissions"]["deny"],
-                         list(ha._GUARD_DENY_PATH_RULES) + ha.runtime_code_deny_rules())
+        self.assertEqual(
+            s["permissions"]["deny"],
+            list(ha._GUARD_DENY_PATH_RULES) + ha._GUARD_DENY_TOOL_RULES
+            + ha.runtime_code_deny_rules())
+
+    def test_listagents_is_denied_and_sendmessage_is_not(self):
+        # XERK-348. `ListAgents` enumerates the whole ACCOUNT — every org's hosts
+        # and every cloud session — so it is org-blind by construction and no
+        # setting narrows it. Denying it REMOVES the tool, which is what makes
+        # PEERS_FILE (org-scoped by the hub) the only address book a session has.
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        self.assertIn("ListAgents", deny)
+        # SendMessage must survive: it resolves a bare roster name with no prior
+        # listing, and denying it would also remove messaging to SUBAGENTS and
+        # agent-team teammates, which ride the same tool.
+        self.assertNotIn("SendMessage", deny)
 
     def test_malformed_file_fails_open(self):
         fd, path = tempfile.mkstemp(suffix=".json")

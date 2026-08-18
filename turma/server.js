@@ -1686,6 +1686,62 @@ function siteKeyOf(a) {
   return (a && a.jira && a.jira.siteKey) || "";
 }
 
+// --- the org-scoped peer roster (XERK-348) --------------------------------
+//
+// Cross-session messaging has exactly ONE boundary control of its own — this
+// machine vs. beyond it — and OUR boundary is the org, which spans hosts. The
+// axes don't line up, so the boundary is drawn where the hub can draw it: an
+// agent denies `ListAgents` (which removes the tool outright, so a session
+// cannot discover anyone), and the only address book left is the roster this
+// builds. A session can therefore name only what the hub put in front of it.
+//
+// The rule is siteKeyOf's, exactly as a migration's is: same org only, and an
+// ORG-LESS host is alone rather than pooled with every other org-less host.
+// Never widen this to "every host the hub knows" — the roster IS the boundary.
+const PEERS_MAX_ROWS = 120;
+// The wire cap on one free-text cell. The agent caps and flattens every cell
+// again on arrival (_peer_cell) — it owns the file's format, and this crosses a
+// trust boundary — but an unbounded ticket summary would still make an
+// unbounded reply, and the hub pays for that before the agent ever sees it.
+const PEER_TASK_MAX = 200;
+
+function orgPeers(key) {
+  const me = agents[key];
+  if (!me) return [];
+  const org = siteKeyOf(me);
+  const now = Date.now();
+  const mine = [], theirs = [];
+  for (const [host, a] of Object.entries(agents)) {
+    if (!a) continue;
+    const self = host === key;
+    if (!self) {
+      // No org of its own means no peers of its own: an org-less host gets its
+      // own sessions and nothing else.
+      if (!org || siteKeyOf(a) !== org) continue;
+      // An offline host's sessions cannot take delivery, and a name that only
+      // absorbs a message is worse than no name at all.
+      if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    }
+    for (const s of a.sessions || []) {
+      if (!s || s.status !== "running") continue;
+      const t = s.ticket || {};
+      const task = t.key ? `${t.key} ${t.summary || ""}` : (s.summary || s.label || "");
+      (self ? mine : theirs).push({
+        id: s.id,
+        name: s.rcName,
+        host,
+        repo: s.repo,
+        // The branch the agent named for itself; "" reads as detached agent-side.
+        branch: (s.git && s.git.liveBranch) || "",
+        task: String(task).slice(0, PEER_TASK_MAX),
+      });
+    }
+  }
+  // Same-host rows survive the cap FIRST: the peer in the next worktree is the
+  // one most likely to be worth a message, and every session reads this file.
+  return mine.concat(theirs).slice(0, PEERS_MAX_ROWS);
+}
+
 // Begin a migration: queue exportSession on the source and record the pending
 // move. The caller validated the source session + target host; this owns the
 // bookkeeping. Returns the migration record.
@@ -7047,10 +7103,14 @@ const server = http.createServer(async (req, res) => {
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
+      // The roster rides every reply (XERK-348). Built AFTER this beat's ingest,
+      // so a session that first appeared on it is addressable by its peers on
+      // their next beat rather than the one after.
+      const peers = orgPeers(key);
       return json(res, 200, archiveHave
-        ? { commands: reply, archiveHave, archiveShed, archiveFull,
+        ? { commands: reply, peers, archiveHave, archiveShed, archiveFull,
             archiveRawHave, archiveRawSkip }
-        : { commands: reply });
+        : { commands: reply, peers });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
@@ -9192,6 +9252,7 @@ if (process.env.TURMA_TEST) {
     dropMigrationBlob,
     migrationSpoolPath,
     siteKeyOf,
+    orgPeers,
   };
 } else if (process.argv[2] === "--agent-token") {
   // `node turma/server.js --agent-token <host>` prints the token that host's

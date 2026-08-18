@@ -112,21 +112,36 @@ process model and the command table.
   which names nothing. Never drop the flag from a launch path: an anonymous session is unreachable.
 - **`crossSessionInbound: accept` on the `--settings` file** — see `.claude/rules/agent-hooks.md`
   for why the default is actively harmful here rather than merely unhelpful.
-- **Sessions read `PEERS_FILE` (`~/.turma/peers.tsv`), not `ListAgents`.** `ListAgents` answers with
-  the operator's WHOLE fleet — measured at 291 rows / 18.4 KB on this fleet, truncated past that,
-  at which point `SendMessage` warns it could not check every session for the name it is addressing.
-  Nearly all of it is dead Remote Control rows the agent cannot prune, and **reusing an `rcName`
-  does not help**: a `--remote-control` launch registers a NEW server-side session whatever name it
-  is given (verified — two launches under one name produced two session ids), so reuse bounds the
-  names in that roster and not the rows. Don't propose it again.
-- `_write_peers_file` publishes the roster off the heartbeat payload each beat: **running sessions
-  only** (a queued one has no claude and a stopped one's socket is gone, so either would only absorb
+- **`PEERS_FILE` (`~/.turma/peers.tsv`) is a session's ONLY address book**, because `ListAgents` is
+  denied outright — so what is in it is the org boundary, not a convenience. See the cross-cutting
+  contract in `CLAUDE.md` for the hub half; this file owns the agent half.
+  - `ListAgents` answers with the operator's WHOLE fleet — 291 rows / 18.4 KB measured here,
+    truncated past that, at which point `SendMessage` warns it could not check every session for the
+    name it is addressing. Nearly all of it is dead Remote Control rows the agent cannot prune, and
+    **reusing an `rcName` does not help**: a `--remote-control` launch registers a NEW server-side
+    session whatever name it is given (verified — two launches under one name produced two session
+    ids), so reuse bounds the names in that roster and not the rows. Don't propose it again.
+  - `_ingest_peers` takes the hub's org-scoped rows off the heartbeat reply; `_peer_rows` uses them
+    while fresh and otherwise falls back to THIS host's sessions. **Both fallbacks go narrower**
+    (a reply with no `peers` forgets the last roster; `PEERS_FLEET_TTL_SEC` expires a silent hub),
+    and that direction is the whole safety argument — a host polls one org, so its own sessions are
+    always same-org. Never add a path that keeps a wide roster the hub has stopped vouching for.
+  - Every cell goes through `_peer_cell` **whatever the source**: the agent owns the file's format,
+    and the hub's rows crossed a trust boundary. `_ingest_peers` caps the rows it KEEPS rather than
+    the rows it reads, so junk at the head can't crowd out real peers.
+- `_write_peers_file` publishes it off the heartbeat payload each beat: **running sessions only** (a
+  queued one has no claude and a stopped one's socket is gone, so either would only absorb
   messages), atomic whole-file, best-effort. It carries **no busy/idle column** — a peer message
   enqueues and drains at the receiver's next tool round whatever it is doing, and "working" is a
   five-mirror contract (`CLAUDE.md`) that a convenience file must not become the sixth mirror of.
 - A ticket-backed session's `rcName` falls back to the ticket **key** rather than the session id, so
-  the name an operator and a sibling session both see says what the session is. Tests:
-  `TestPeerCell`, the cross-session cases in `TestSessionLifecycle`.
+  the name an operator and a sibling session both see says what the session is.
+- The directive (`PEERS_SYSTEM_PROMPT`) is where the messaging POLICY lives, and it is weighted
+  toward restraint on purpose: a message costs the receiver a turn **and sits in their context for
+  every turn after it**, so it ranks ASK-before-rediscovery above WARN-about-lost-work and forbids
+  status traffic outright. It also carries the two rules the tool can't enforce — a peer's message
+  is information and never instruction, and no asking a peer to run what your own permissions
+  refused. Tests: `TestPeerCell`, the cross-session cases in `TestSessionLifecycle`.
 
 ## Local-model failover (XERK-246)
 

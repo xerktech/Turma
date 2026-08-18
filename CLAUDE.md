@@ -222,6 +222,24 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - The archive does NOT already hold this. It stores displayable entries and no token counts, never
     sees a live session, and excludes background-agent transcripts. Mechanics in
     `.claude/rules/turma-usage.md`.
+- **The peer roster IS the org boundary for cross-session messaging** (XERK-348). Claude Code's own
+  control is per-MACHINE (`isolatePeerMachines`) and a Turma org spans hosts, so no setting
+  expresses the rule: instead the agent denies `ListAgents` — which removes the tool, leaving a
+  session unable to discover anyone — and the hub's **`orgPeers`** puts the same-org sessions on
+  every heartbeat reply, which the agent renders to `~/.turma/peers.tsv`. A session can name only
+  what the hub put in front of it. It spans `turma/server.js` and `agent/hub-agent.py`, so no
+  `paths:`-scoped file sees both halves.
+  - **`orgPeers` uses `siteKeyOf`, exactly as a migration does**: same org only, and an ORG-LESS
+    host is alone rather than pooled with every other org-less host. Widening it to "every host the
+    hub knows" is a cross-org leak, not a convenience.
+  - **Both sides fail NARROW.** No `peers` on a reply forgets the roster; a silent hub expires it;
+    either way the agent falls back to its OWN host's sessions, which are same-org by construction
+    because a host polls one org. Never add a path that keeps a wide roster nothing vouches for.
+  - **It is a strong soft boundary, not an airtight one.** `crossSessionInbound` has no per-sender
+    filter (accept/hold/refuse only), so an off-org session sharing the Claude login can still
+    DELIVER into a session — it just can't discover one. **One Claude login per org is the only
+    hard boundary**, and it is a DockerOps decision. Don't describe this contract as sealing it.
+  - Mechanics in `.claude/rules/agent-sessions.md` and `.claude/rules/agent-hooks.md`.
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.

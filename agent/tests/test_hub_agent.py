@@ -6032,7 +6032,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         cmd = self._claude_cmd()
         self.assertIn(ha.PEERS_FILE, cmd)
         self.assertIn(f"the row whose `id` is {sess['id']} is you", cmd)
-        self.assertIn("rather than calling\nListAgents", cmd)
+        self.assertIn("use no other roster: ListAgents is\nunavailable", cmd)
+        # The org boundary is the point of the file, so the directive has to say
+        # so — a session that treats it as a convenience will reach past it.
+        self.assertIn("scoped to your organisation", cmd)
 
     def test_peers_file_lists_running_sessions_only(self):
         """A queued session has no claude to receive anything and a stopped one's
@@ -6050,8 +6053,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         ])
         body = open(ha.PEERS_FILE).read()
         rows = [r for r in body.splitlines() if not r.startswith("#")]
-        self.assertEqual(rows,
-                         ["aaaaa\tnas-Turma-XERK-1\tTurma\tXERK-1\tlive one"])
+        self.assertEqual(
+            rows, [f"aaaaa\tnas-Turma-XERK-1\t{sm.device}\tTurma\tXERK-1\tlive one"])
 
     def test_peers_file_prefers_the_ticket_and_says_detached(self):
         """The task column names the ticket where there is one, and a session
@@ -6065,8 +6068,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         ])
         row = [r for r in open(ha.PEERS_FILE).read().splitlines()
                if not r.startswith("#")][0]
-        self.assertEqual(row.split("\t")[3], "detached")
-        self.assertEqual(row.split("\t")[4], "XERK-9 Do the thing")
+        self.assertEqual(row.split("\t")[4], "detached")
+        self.assertEqual(row.split("\t")[5], "XERK-9 Do the thing")
 
     def test_a_beat_publishes_the_roster(self):
         """The wiring, not just the writer: a heartbeat leaves the roster on disk
@@ -6080,7 +6083,84 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         rows = [r for r in open(ha.PEERS_FILE).read().splitlines()
                 if not r.startswith("#")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].split("\t")[:2], [sess["id"], sess["rcName"]])
+        self.assertEqual(rows[0].split("\t")[:3],
+                         [sess["id"], sess["rcName"], sm.device])
+
+    def test_hub_roster_replaces_the_local_one(self):
+        """XERK-348: the hub's rows are ORG-scoped and span hosts, so when it
+        sends them they are the roster — the local list is only the fallback."""
+        sm = self.make_manager()
+        sm._ingest_peers([
+            {"id": "p1", "name": "MaxAI-Turma-XERK-9", "host": "MaxAI",
+             "repo": "Turma", "branch": "XERK-9", "task": "XERK-9 elsewhere"},
+        ])
+        sm._write_peers_file([
+            {"id": "local", "rcName": "nas-Turma-local", "repo": "Turma",
+             "status": "running", "summary": "not this one"},
+        ])
+        rows = [r for r in open(ha.PEERS_FILE).read().splitlines()
+                if not r.startswith("#")]
+        self.assertEqual(
+            rows, ["p1\tMaxAI-Turma-XERK-9\tMaxAI\tTurma\tXERK-9\tXERK-9 elsewhere"])
+
+    def test_a_reply_without_peers_forgets_the_last_roster(self):
+        """The boundary may only fail NARROW. A hub that stops vouching for a
+        roster — downgraded, or unable to resolve this host's org — must not
+        leave sessions addressing names it no longer stands behind."""
+        sm = self.make_manager()
+        sm._ingest_peers([{"id": "p1", "name": "other-host-session",
+                           "host": "MaxAI", "repo": "Turma"}])
+        self.assertIsNotNone(sm.peer_fleet)
+        sm._ingest_peers(None)                  # a reply carrying no `peers`
+        self.assertIsNone(sm.peer_fleet)
+        sm._write_peers_file([
+            {"id": "local", "rcName": "nas-Turma-local", "repo": "Turma",
+             "status": "running", "summary": "mine"},
+        ])
+        body = open(ha.PEERS_FILE).read()
+        self.assertNotIn("other-host-session", body)
+        self.assertIn("nas-Turma-local", body)
+
+    def test_a_stale_hub_roster_falls_back_to_this_host(self):
+        """Same rule against the clock: the hub going silent expires its roster
+        rather than freezing it, since its rows name sessions on OTHER hosts
+        that nothing has confirmed since."""
+        sm = self.make_manager()
+        sm._ingest_peers([{"id": "p1", "name": "other-host-session",
+                           "host": "MaxAI", "repo": "Turma"}])
+        sm.peer_fleet_at = time.time() - (ha.PEERS_FLEET_TTL_SEC + 1)
+        sm._write_peers_file([
+            {"id": "local", "rcName": "nas-Turma-local", "repo": "Turma",
+             "status": "running", "summary": "mine"},
+        ])
+        body = open(ha.PEERS_FILE).read()
+        self.assertNotIn("other-host-session", body)
+        self.assertIn("nas-Turma-local", body)
+
+    def test_wire_rows_are_validated_and_capped(self):
+        """The roster crossed a trust boundary, so the agent re-checks it: a row
+        with no `name` is unaddressable and only misleads, a non-dict is noise,
+        and the row count is bounded here as well as hub-side."""
+        sm = self.make_manager()
+        sm._ingest_peers(
+            ["not a dict", {"id": "x", "host": "h"}]                 # both dropped
+            + [{"id": f"p{i}", "name": f"n{i}", "host": "h"}
+               for i in range(ha.PEERS_MAX_ROWS + 25)])
+        self.assertEqual(len(sm.peer_fleet), ha.PEERS_MAX_ROWS)
+        self.assertTrue(all(r[1] for r in sm.peer_fleet))
+
+    def test_wire_rows_are_sanitized_like_local_ones(self):
+        """_peer_cell runs whatever the source: a hub row carrying a tab would
+        otherwise shift every later column under the wrong heading."""
+        sm = self.make_manager()
+        sm._ingest_peers([{"id": "p1", "name": "peer", "host": "h",
+                           "repo": "Turma", "branch": "b",
+                           "task": "two\tcols\nand a row"}])
+        sm._write_peers_file([])
+        row = [r for r in open(ha.PEERS_FILE).read().splitlines()
+               if not r.startswith("#")][0]
+        self.assertEqual(row.split("\t"),
+                         ["p1", "peer", "h", "Turma", "b", "two cols and a row"])
 
     def test_peers_file_write_failure_never_reaches_the_beat(self):
         """Best-effort by contract: the roster is a convenience, and a heartbeat
