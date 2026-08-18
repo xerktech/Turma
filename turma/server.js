@@ -1507,7 +1507,8 @@ function serializeAgent(key, agent, now) {
   // `unsupported` is NOT: it's a tiny, rarely-changing map of what this host's
   // agent can't do, worth reading.
   const { history, subagentHistory, jiraIssues, statusResults,
-          createMeta, createTypes, createResults, resultWaits, tokenBound, ...a } = agent;
+          createMeta, createTypes, createResults, resultWaits, tokenBound,
+          orgBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   // Earlier epochs of this host's spend added back (XERK-338). Null — and so
   // free — for every host that has never lost transcripts, which is all of them
@@ -1692,23 +1693,79 @@ function siteKeyOf(a) {
 // machine vs. beyond it — and OUR boundary is the org, which spans hosts. The
 // axes don't line up, so the boundary is drawn where the hub can draw it: an
 // agent denies `ListAgents` (which removes the tool outright, so a session
-// cannot discover anyone), and the only address book left is the roster this
-// builds. A session can therefore name only what the hub put in front of it.
+// cannot ENUMERATE anyone), and the only address book left is the roster this
+// builds. Note the limit precisely: `SendMessage` resolves any string it is
+// given, so a session can still GUESS a name — rcName is `<host>-<repo>-<KEY>`
+// and structurally guessable. What the roster removes is discovery, not
+// delivery. Never write it up as "can only name what the hub sent".
 //
 // The rule is siteKeyOf's, exactly as a migration's is: same org only, and an
 // ORG-LESS host is alone rather than pooled with every other org-less host.
 // Never widen this to "every host the hub knows" — the roster IS the boundary.
 const PEERS_MAX_ROWS = 120;
-// The wire cap on one free-text cell. The agent caps and flattens every cell
-// again on arrival (_peer_cell) — it owns the file's format, and this crosses a
-// trust boundary — but an unbounded ticket summary would still make an
-// unbounded reply, and the hub pays for that before the agent ever sees it.
-const PEER_TASK_MAX = 200;
+// The wire cap on EVERY cell, not just the free-text one. The agent caps and
+// flattens each cell again on arrival (_peer_cell) — it owns the file's format,
+// and this crosses a trust boundary — but the reply is built and held HERE, so
+// an uncapped field is the hub's problem before it is ever the agent's.
+//
+// Capping only `task` was not a smaller version of this, it was a hole: nothing
+// in sanitizeHeartbeat or normalizeRecord bounds `rcName`, whose only limit is
+// AGENT_RECORD_MAX across the WHOLE record, and the hub's own spawn route takes
+// a SPAWN_FIELD_MAX (100k) `label` that the agent slugs straight into it. Four
+// org hosts x 30 sessions x a 200 KB name each — every record inside the 8 MiB
+// gate — built a 23.8 MB reply and OOM-killed a hub in a real 256 MiB cgroup,
+// while the same load left a pre-roster hub serving at 122 MB. `mem_limit: 256m`
+// plus `restart: unless-stopped` is the outage loop the memory-ceiling contract
+// in CLAUDE.md exists to prevent. Six capped cells x PEERS_MAX_ROWS bounds the
+// whole roster at ~86 KB.
+const PEER_CELL_MAX = 120;
+const peerCell = (v) => String(v == null ? "" : v).slice(0, PEER_CELL_MAX);
+
+// The org the hub BOUND this host to when it first declared one, which is NOT
+// the one it claims on this beat. `jira.siteKey` is asserted by the agent about
+// itself, so gating a disclosure on it lets any holder of any host's token join
+// any org and read that org's whole session roster — session ids, peer names,
+// repos, live branches and ticket summaries — none of which an agent credential
+// could reach before (`/api/agents` refuses one). That is the same objection
+// XERK-268 makes to trusting a self-asserted `<host>`, and the binding is the
+// answer to it: trust-on-first-use, hub-owned, persisted with the record, and
+// reset by the operator action that already exists — DELETE /api/agents/<host>.
+function boundOrgOf(a) {
+  return (a && a.orgBound) || "";
+}
+
+// Warned once per host per drift, so a permanently misconfigured host does not
+// bury the log — but the operator has to be able to SEE this: from the host's
+// own side a drift is indistinguishable from "my org has no other hosts up".
+const orgDriftWarned = new Map();
+function warnOrgDrift(key, a) {
+  const drifted = orgDrifted(a);
+  if (drifted && orgDriftWarned.get(key) !== siteKeyOf(a)) {
+    console.warn(
+      `heartbeat from ${logName(key)}: declares org ${JSON.stringify(siteKeyOf(a))} ` +
+        `but is bound to ${JSON.stringify(boundOrgOf(a))} — serving it no peers ` +
+        `beyond its own sessions. If this host really moved org, remove it ` +
+        `(DELETE /api/agents/<host>) and let it re-register.`
+    );
+  }
+  orgDriftWarned.set(key, drifted ? siteKeyOf(a) : null);
+}
+
+// A host declaring a different org than the one it is bound to. Either it was
+// reconfigured (remove the host; the binding goes with the record) or a token
+// holder is trying to change orgs. Both get the same answer: no peers but its
+// own, and it is excluded from everyone else's roster.
+function orgDrifted(a) {
+  const bound = boundOrgOf(a);
+  return !!bound && siteKeyOf(a) !== bound;
+}
 
 function orgPeers(key) {
   const me = agents[key];
   if (!me) return [];
-  const org = siteKeyOf(me);
+  // A drifted host is treated exactly as an org-less one: it still sees its own
+  // sessions, which it already knows, and nothing else.
+  const org = orgDrifted(me) ? "" : boundOrgOf(me);
   const now = Date.now();
   const mine = [], theirs = [];
   for (const [host, a] of Object.entries(agents)) {
@@ -1717,7 +1774,7 @@ function orgPeers(key) {
     if (!self) {
       // No org of its own means no peers of its own: an org-less host gets its
       // own sessions and nothing else.
-      if (!org || siteKeyOf(a) !== org) continue;
+      if (!org || boundOrgOf(a) !== org || orgDrifted(a)) continue;
       // An offline host's sessions cannot take delivery, and a name that only
       // absorbs a message is worse than no name at all.
       if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
@@ -1727,13 +1784,13 @@ function orgPeers(key) {
       const t = s.ticket || {};
       const task = t.key ? `${t.key} ${t.summary || ""}` : (s.summary || s.label || "");
       (self ? mine : theirs).push({
-        id: s.id,
-        name: s.rcName,
-        host,
-        repo: s.repo,
+        id: peerCell(s.id),
+        name: peerCell(s.rcName),
+        host: peerCell(host),
+        repo: peerCell(s.repo),
         // The branch the agent named for itself; "" reads as detached agent-side.
-        branch: (s.git && s.git.liveBranch) || "",
-        task: String(task).slice(0, PEER_TASK_MAX),
+        branch: peerCell((s.git && s.git.liveBranch) || ""),
+        task: peerCell(task),
       });
     }
   }
@@ -6917,6 +6974,11 @@ const server = http.createServer(async (req, res) => {
         // heartbeat claiming it is bound cannot make itself so; read only by
         // ttydAuth, and stripped from the fleet payload like the caches.
         tokenBound,
+        // The org this host is BOUND to (XERK-348), assigned after the spread
+        // for the same reason `tokenBound` is: a heartbeat claiming a binding
+        // must not be able to make itself one. Set on the first beat that
+        // declares an org and never moved after — see boundOrgOf.
+        orgBound: prev.orgBound || siteKeyOf(payload) || undefined,
         lastSeen: Date.now(),
         // Per-agent alert bookkeeping survives across beats and hub restarts.
         alerts: prev.alerts || {},
@@ -7106,6 +7168,7 @@ const server = http.createServer(async (req, res) => {
       // The roster rides every reply (XERK-348). Built AFTER this beat's ingest,
       // so a session that first appeared on it is addressable by its peers on
       // their next beat rather than the one after.
+      warnOrgDrift(key, next);
       const peers = orgPeers(key);
       return json(res, 200, archiveHave
         ? { commands: reply, peers, archiveHave, archiveShed, archiveFull,
@@ -9253,6 +9316,9 @@ if (process.env.TURMA_TEST) {
     migrationSpoolPath,
     siteKeyOf,
     orgPeers,
+    boundOrgOf,
+    orgDrifted,
+    orgDriftWarned,
   };
 } else if (process.argv[2] === "--agent-token") {
   // `node turma/server.js --agent-token <host>` prints the token that host's

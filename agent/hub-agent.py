@@ -1085,17 +1085,25 @@ PEERS_MAX_ROWS = 120
 # stale wide roster is the one failure that could name an off-org session after
 # the hub stopped vouching for it. Never let this degrade the other way.
 PEERS_FLEET_TTL_SEC = 6 * INTERVAL
+# The most of a heartbeat REPLY this agent will read. The roster is bounded
+# hub-side, and archive cursors are small, so this is slack over the real
+# maximum rather than a working limit.
+HEARTBEAT_REPLY_MAX = 8 * 1024 * 1024
 
 # Rides --append-system-prompt beside NEW_WORK_SYSTEM_PROMPT on every launch, so
 # it reaches resumed sessions too. Kept deliberately short: every session pays it
 # on every launch, and its whole job is to trade an 18 KB tool call for a file
-# read of a few hundred bytes.
+# read that is a few hundred bytes typically and 87 KB at the ceiling (measured:
+# PEERS_MAX_ROWS x 6 cells x PEER_CELL_MAX_CHARS). Quote the ceiling, not the
+# typical case — the file is read by every session on the host.
 PEERS_SYSTEM_PROMPT = """
 Other Claude Code sessions run beside you — one per Turma session, each in its
 own worktree, often on another ticket in the same repo or on another host.
 
 {path} lists the ones you may contact (TSV: id, name, host, repo, branch, task);
-the row whose `id` is {sid} is you. It is rewritten every heartbeat. Address a
+the row whose `host` is {host} AND `id` is {sid} is you — check both, since ids
+are unique per host and this roster spans hosts. It is rewritten every heartbeat.
+Address a
 peer by its `name` with SendMessage, and use no other roster: ListAgents is
 unavailable here on purpose. This file is scoped to your organisation, so a name
 that is not in it belongs to another organisation and must not be contacted. If
@@ -1262,6 +1270,12 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.turma/guard-settings.json)",
     "Edit(~/.turma/limits-settings.json)",
     "Edit(~/.turma/local-model.env)",
+    # The peer roster IS the org boundary (XERK-348), so a session must not be
+    # able to append rows to its own address book. It sat unprotected beside two
+    # files that were deny-listed, which is the inconsistency this closes; the
+    # guard walks past Bash either way (XERK-309), so this covers the file-edit
+    # tools only, exactly like its neighbours.
+    "Edit(~/.turma/peers.tsv)",
 ]
 
 # Operator-supplied extra permissions. Claude Code does NOT read a *user-level*
@@ -10706,6 +10720,32 @@ class SessionManager:
             p += 1
         return p
 
+    def _unique_rc_name(self, base):
+        """`base`, or the first `-N` variant no LIVE session on this host holds.
+
+        Two sessions answering to one name are BOTH unaddressable, not merely
+        confusable: SendMessage refuses the ambiguous name and asks for a
+        `[ref]`, which peers.tsv has no column for and no way to learn now that
+        `ListAgents` is denied. So the message reaches NEITHER session.
+
+        Claude Code does not silently rename the later session — measured on
+        2.1.235, both panes kept the name and the send failed. A comment here
+        once claimed otherwise; it was wrong. Naming a ticket session after its
+        key (XERK-339) made collisions structural rather than freak — two
+        sessions on one ticket, or one operator label reused in a repo — so the
+        dedupe is what keeps the name an ADDRESS instead of a label.
+
+        Only LIVE sessions reserve a name: a stopped one holds no inbox socket,
+        so reusing its name is exactly the recycling we want."""
+        taken = {s.get("rcName") for s in self.registry
+                 if s.get("status") in ("running", "queued")}
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base}-{n}" in taken:
+            n += 1
+        return f"{base}-{n}"
+
     def _running_count(self):
         return sum(1 for s in self.registry if s.get("status") == "running")
 
@@ -10970,7 +11010,8 @@ class SessionManager:
         # at the roster this manager publishes rather than at ListAgents. Same
         # flag again, and unconditional: peers are a property of the host, so a
         # resumed or migrated session needs it exactly as much as a fresh one.
-        policy += PEERS_SYSTEM_PROMPT.format(path=PEERS_FILE, sid=sess["id"])
+        policy += PEERS_SYSTEM_PROMPT.format(
+            path=PEERS_FILE, sid=sess["id"], host=self.device)
         parts.append(f"--append-system-prompt {shlex.quote(policy)}")
         claude_cmd = " ".join(parts)
         if prompt:
@@ -11207,9 +11248,9 @@ class SessionManager:
         # now also the session's PEER name (XERK-339), so `truenas-Turma-XERK-339`
         # tells an operator scanning claude.ai/code — and a sibling session
         # choosing who to message — what the session is, where a hash told either
-        # of them nothing. Two sessions on one ticket would share it; Claude Code
-        # resolves a duplicate peer name itself by renaming the later session to a
-        # variant, and the RC roster keys on its own ids rather than the name.
+        # of them nothing. Collisions are resolved by _unique_rc_name, NOT by
+        # Claude Code (see there) — and naming by ticket key is what made them
+        # structural, so the two arrived together on purpose.
         # The id stays the last resort, for a bare spawn that has nothing better.
         rc_slug = slugify(label) if label else ""
         if not rc_slug and ticket and ticket.get("key"):
@@ -11235,7 +11276,8 @@ class SessionManager:
             # The claude conversation this session IS; pinned by _launch_tmux.
             "claudeSessionId": None,
             "label": label,
-            "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{rc_slug or sid}",
+            "rcName": self._unique_rc_name(
+                f"{slugify(self.device)}-{slugify(repo['name'])}-{rc_slug or sid}"),
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
             "model": None,                  # resolved --model value (None = omit)
@@ -11879,9 +11921,9 @@ class SessionManager:
             # its ticket here, so it keeps being called after its key rather
             # than reverting to a hash the moment it changes host — the name is
             # what a peer addresses and what the operator recognises.
-            "rcName": (f"{slugify(self.device)}-{slugify(repo)}-"
-                       + (slugify((extra.get("ticket") or {}).get("key") or "")
-                          or sid)),
+            "rcName": self._unique_rc_name(
+                f"{slugify(self.device)}-{slugify(repo)}-"
+                + (slugify((extra.get("ticket") or {}).get("key") or "") or sid)),
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
             "model": extra.get("model"),
@@ -16469,7 +16511,14 @@ class SessionManager:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
-                reply = json.loads(resp.read().decode() or "{}")
+                # BOUNDED read. The reply now carries a peer roster (XERK-348),
+                # so it is no longer a handful of commands, and an agent that
+                # slurps whatever arrives makes the hub's reply size this
+                # process's memory ceiling too. The hub caps the roster; this is
+                # the independent backstop on the receiving side. A truncated
+                # read fails the JSON parse, which this method already treats as
+                # "no reply" — a skipped beat rather than a wedged agent.
+                reply = json.loads(resp.read(HEARTBEAT_REPLY_MAX).decode() or "{}")
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
             self.subagent_history_results.clear()  # delivered — same lifecycle

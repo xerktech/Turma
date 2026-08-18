@@ -5794,7 +5794,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
         sess = sm.registry[0]
-        peers = ha.PEERS_SYSTEM_PROMPT.format(path=ha.PEERS_FILE, sid=sess["id"])
+        peers = ha.PEERS_SYSTEM_PROMPT.format(
+            path=ha.PEERS_FILE, sid=sess["id"], host=sm.device)
         self.assertEqual(sess["status"], "running")
         wt = self._worktree_add_cmd()
         self.assertIn("--detach", wt)
@@ -5937,7 +5938,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm.spawn("Turma")
         cmd = self._claude_cmd()
         peers = ha.PEERS_SYSTEM_PROMPT.format(
-            path=ha.PEERS_FILE, sid=sm.registry[0]["id"])
+            path=ha.PEERS_FILE, sid=sm.registry[0]["id"], host=sm.device)
         self.assertIn(
             "--append-system-prompt "
             + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + peers),
@@ -6004,6 +6005,41 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                         sess["rcName"])
         self.assertNotIn(sess["id"], sess["rcName"])
 
+    def test_two_sessions_never_share_a_peer_name(self):
+        """A duplicate name makes BOTH sessions unaddressable, not just
+        confusable: SendMessage refuses the ambiguous name and demands a `[ref]`
+        the roster has no column for and no way to learn with ListAgents denied,
+        so the message reaches neither. Measured on Claude Code 2.1.235 — it does
+        not rename the later session for us."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", ticket={"key": "XERK-339", "summary": "first go"})
+        sm.spawn("Turma", ticket={"key": "XERK-339", "summary": "second go"})
+        names = [s["rcName"] for s in sm.registry]
+        self.assertEqual(len(set(names)), 2, names)
+        self.assertTrue(names[0].endswith("-Turma-XERK-339"))
+        self.assertTrue(names[1].endswith("-Turma-XERK-339-2"))
+
+    def test_a_stopped_session_releases_its_peer_name(self):
+        """Only a LIVE session reserves a name — a stopped one holds no inbox
+        socket, so recycling its name is the point rather than a hazard."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", label="hotfix")
+        first = sm.registry[0]["rcName"]
+        sm.registry[0]["status"] = "stopped"
+        sm.spawn("Turma", label="hotfix")
+        self.assertEqual(sm.registry[1]["rcName"], first)
+
+    def test_a_duplicate_operator_label_also_gets_a_variant(self):
+        """The collision is not ticket-specific: an operator reusing a label in
+        one repo hits it too."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", label="hotfix")
+        sm.spawn("Turma", label="hotfix")
+        self.assertNotEqual(sm.registry[0]["rcName"], sm.registry[1]["rcName"])
+
     def test_operator_label_still_beats_the_ticket_key(self):
         """An explicitly typed label is the operator's own name for the session
         and outranks the key we would otherwise derive."""
@@ -6031,7 +6067,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sess = sm.registry[0]
         cmd = self._claude_cmd()
         self.assertIn(ha.PEERS_FILE, cmd)
-        self.assertIn(f"the row whose `id` is {sess['id']} is you", cmd)
+        # Keyed on host AND id: ids are unique per host and the roster now spans
+        # hosts, so a bare id can name a peer as yourself.
+        self.assertIn(f"`host` is {sm.device} AND `id` is {sess['id']}", cmd)
         self.assertIn("use no other roster: ListAgents is\nunavailable", cmd)
         # The org boundary is the point of the file, so the directive has to say
         # so — a session that treats it as a convenience will reach past it.
@@ -10242,7 +10280,10 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            # Real HTTPResponse.read takes an optional size, and post() now
+            # passes one (HEARTBEAT_REPLY_MAX) — a no-arg double stops standing
+            # in for the thing it fakes.
+            def read(self, *a):
                 return b"{}"
 
         with mock.patch.object(ha.urllib.request, "urlopen",
@@ -10559,7 +10600,7 @@ class _FakeHttpResp:
     def __exit__(self, *a):
         return False
 
-    def read(self):
+    def read(self, *a):          # real HTTPResponse.read takes an optional size
         return json.dumps(self._body).encode()
 
 

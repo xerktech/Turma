@@ -135,7 +135,12 @@ process model and the command table.
   enqueues and drains at the receiver's next tool round whatever it is doing, and "working" is a
   five-mirror contract (`CLAUDE.md`) that a convenience file must not become the sixth mirror of.
 - A ticket-backed session's `rcName` falls back to the ticket **key** rather than the session id, so
-  the name an operator and a sibling session both see says what the session is.
+  the name an operator and a sibling session both see says what the session is — and
+  **`_unique_rc_name` suffixes a `-N` on collision**, because two sessions sharing a name are BOTH
+  unaddressable: `SendMessage` refuses the ambiguous name and demands a `[ref]` the roster has no
+  column for and no way to learn with `ListAgents` denied. Claude Code does NOT rename the later
+  session (measured on 2.1.235); naming by ticket key is what made collisions structural, so the
+  dedupe arrived with it. Only running/queued sessions reserve a name.
 - The directive (`PEERS_SYSTEM_PROMPT`) is where the messaging POLICY lives, and it is weighted
   toward restraint on purpose: a message costs the receiver a turn **and sits in their context for
   every turn after it**, so it ranks ASK-before-rediscovery above WARN-about-lost-work and forbids

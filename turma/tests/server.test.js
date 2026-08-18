@@ -134,7 +134,8 @@ const hub = require("../server.js");
 // see the fan-out. Real fan-out/pruning is exercised separately below.
 hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
-  server, agents, queueCommand, findSession, orgPeers,
+  server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
+  orgDriftWarned,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
@@ -11576,10 +11577,15 @@ test("usage: a refused beat is not history", async () => {
 // session has. What the hub puts in it IS the org boundary, which is why these
 // assert what is EXCLUDED as hard as what is included.
 
-function peerHost(key, siteKey, sessions, ageMs = 0) {
+// `bound` defaults to the declared org — the ordinary case, a host the hub bound
+// on its first beat. Pass it explicitly to model a host DECLARING one org while
+// bound to another, which is what an agent token trying to change orgs looks
+// like from here.
+function peerHost(key, siteKey, sessions, ageMs = 0, bound = siteKey) {
   agents[key] = {
     key, device: key, lastSeen: Date.now() - ageMs,
     jira: siteKey ? { siteKey } : undefined,
+    orgBound: bound || undefined,
     sessions,
   };
 }
@@ -11691,4 +11697,97 @@ test("the roster is capped, and same-host rows survive the cap first", () => {
 
 test("an unknown host gets no roster at all", () => {
   assert.deepEqual(orgPeers("never-heard-of-it"), []);
+});
+
+test("a host is served on the org it is BOUND to, never the one it claims", () => {
+  // The defect this binding exists for: `jira.siteKey` is asserted by the agent
+  // about itself, so without a binding any host token could join any org and
+  // read that org's whole roster — session ids, names, repos, branches, ticket
+  // summaries — which no agent credential can reach otherwise (/api/agents
+  // refuses one). Same objection XERK-268 makes to a self-asserted <host>.
+  peerHost("alpha", "acme.atlassian.net", [peerSession("secret")]);
+  peerHost("rogue", "acme.atlassian.net", [peerSession("mine")],
+           0, "rival.atlassian.net");           // bound elsewhere, claiming acme
+  try {
+    const ids = orgPeers("rogue").map((p) => p.id);
+    assert.deepEqual(ids, ["mine"]);            // its own sessions and nothing else
+    assert.equal(ids.includes("secret"), false);
+    // ...and it is excluded from the roster of the org it is impersonating.
+    assert.deepEqual(orgPeers("alpha").map((p) => p.id), ["secret"]);
+  } finally {
+    dropPeerHosts("alpha", "rogue");
+  }
+});
+
+test("orgDrifted/boundOrgOf read the binding, not the claim", () => {
+  assert.equal(boundOrgOf({ orgBound: "a" }), "a");
+  assert.equal(boundOrgOf({ jira: { siteKey: "a" } }), "");   // claim alone binds nothing
+  assert.equal(boundOrgOf(null), "");
+  assert.equal(orgDrifted({ orgBound: "a", jira: { siteKey: "a" } }), false);
+  assert.equal(orgDrifted({ orgBound: "a", jira: { siteKey: "b" } }), true);
+  // Never bound: nothing to drift from, and it gets no peers by the org check.
+  assert.equal(orgDrifted({ jira: { siteKey: "b" } }), false);
+});
+
+test("http: the org binds on first sight and does not move afterwards", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  const host = "tofu-host";
+  try {
+    await beat({ device: host, jira: { siteKey: "first.atlassian.net" } });
+    assert.equal(agents[host].orgBound, "first.atlassian.net");
+    // A later beat claiming a different org must not move the binding — this is
+    // the whole mechanism, and it has to hold on the real route, not just in
+    // the helper.
+    await beat({ device: host, jira: { siteKey: "second.atlassian.net" } });
+    assert.equal(agents[host].orgBound, "first.atlassian.net");
+    // And a heartbeat cannot simply assert its own binding: the field is
+    // assigned AFTER the payload spread, like tokenBound.
+    await beat({ device: host, orgBound: "third.atlassian.net",
+                 jira: { siteKey: "first.atlassian.net" } });
+    assert.equal(agents[host].orgBound, "first.atlassian.net");
+  } finally {
+    delete agents[host];
+    orgDriftWarned.delete(host);
+  }
+});
+
+test("http: orgBound is hub-internal and never served to clients", async () => {
+  const host = "tofu-hidden";
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { siteKey: "acme.atlassian.net" } },
+      headers: agentHeaders,
+    });
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const served = res.body.agents.find((a) => a.device === host);
+    assert.ok(served);
+    assert.equal("orgBound" in served, false);
+  } finally {
+    delete agents[host];
+  }
+});
+
+test("every roster cell is capped on the wire, not just the free-text one", () => {
+  // rcName has no length bound anywhere in the hub's normalizers, and the hub's
+  // own spawn route accepts a 100k label the agent slugs into it. Uncapped, a
+  // few such names build a reply large enough to OOM a 256 MiB hub.
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("i".repeat(9000), {
+      rcName: "n".repeat(200000),
+      repo: "r".repeat(9000),
+      summary: "t".repeat(9000),
+      git: { liveBranch: "b".repeat(9000) },
+    }),
+  ]);
+  try {
+    const [row] = orgPeers("nasA");
+    for (const [field, value] of Object.entries(row)) {
+      assert.ok(value.length <= 120, `${field} was ${value.length} chars`);
+    }
+    // And the whole roster with it: six capped cells x the row cap.
+    assert.ok(JSON.stringify(orgPeers("nasA")).length < 100 * 1024);
+  } finally {
+    dropPeerHosts("nasA");
+  }
 });

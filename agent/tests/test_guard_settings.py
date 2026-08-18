@@ -256,6 +256,9 @@ class TestGuardSettings(unittest.TestCase):
         "Edit(~/.turma/guard-settings.json)",
         "Edit(~/.turma/limits-settings.json)",
         "Edit(~/.turma/local-model.env)",
+        # The peer roster is the org boundary (XERK-348), so a session must not
+        # be able to append rows to its own address book.
+        "Edit(~/.turma/peers.tsv)",
     })
 
     def test_every_claude_backstop_rule_is_pinned(self):

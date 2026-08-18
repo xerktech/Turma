@@ -225,13 +225,22 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - **The peer roster IS the org boundary for cross-session messaging** (XERK-348). Claude Code's own
   control is per-MACHINE (`isolatePeerMachines`) and a Turma org spans hosts, so no setting
   expresses the rule: instead the agent denies `ListAgents` — which removes the tool, leaving a
-  session unable to discover anyone — and the hub's **`orgPeers`** puts the same-org sessions on
-  every heartbeat reply, which the agent renders to `~/.turma/peers.tsv`. A session can name only
-  what the hub put in front of it. It spans `turma/server.js` and `agent/hub-agent.py`, so no
-  `paths:`-scoped file sees both halves.
-  - **`orgPeers` uses `siteKeyOf`, exactly as a migration does**: same org only, and an ORG-LESS
-    host is alone rather than pooled with every other org-less host. Widening it to "every host the
-    hub knows" is a cross-org leak, not a convenience.
+  session unable to ENUMERATE anyone — and the hub's **`orgPeers`** puts the same-org sessions on
+  every heartbeat reply, which the agent renders to `~/.turma/peers.tsv`. It spans
+  `turma/server.js` and `agent/hub-agent.py`, so no `paths:`-scoped file sees both halves.
+  - **The roster removes DISCOVERY, not delivery.** `SendMessage` resolves any string, and an
+    `rcName` is `<host>-<repo>-<TICKET-KEY>`, so a session can still guess one. Never write this up
+    as "a session can only name what the hub sent" — it is not true and it hides the residual risk.
+  - **The org is the one the hub BOUND the host to, never the one the host claims** (`orgBound`,
+    trust-on-first-use). `jira.siteKey` is agent-asserted, so gating on it let any host's token
+    join any org and read its whole roster — exposure no agent credential had, since `/api/agents`
+    refuses one. Same objection XERK-268 makes to a self-asserted `<host>`. The binding is
+    hub-owned, assigned AFTER the payload spread like `tokenBound`, persisted with the record, and
+    reset only by `DELETE /api/agents/<host>`; a host declaring a different org gets its own
+    sessions and nothing else, and is dropped from everyone else's roster.
+  - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one.
+    Nothing bounds `rcName` in the normalizers and the spawn route takes a 100k `label`, so
+    capping one field of six built a 23.8 MB reply that OOM-killed a hub in a real 256 MiB cgroup.
   - **Both sides fail NARROW.** No `peers` on a reply forgets the roster; a silent hub expires it;
     either way the agent falls back to its OWN host's sessions, which are same-org by construction
     because a host polls one org. Never add a path that keeps a wide roster nothing vouches for.
