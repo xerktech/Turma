@@ -47,15 +47,44 @@ export function refusalText(status: number, body: unknown): string {
   return words || `the hub answered HTTP ${status}`;
 }
 
+// How long the refusal path waits for the error body itself.
+//
+// `timeoutFetch` below bounds the RESPONSE, not the body that follows it. A hub
+// that sends headers and then stalls mid-body leaves this read pending forever,
+// and because App.poll() re-arms only in its `finally`, ONE stalled error body
+// would kill the poll loop permanently — precisely the freeze `timeoutFetch`
+// exists to prevent, reintroduced on the failure path.
+//
+// A refusal body is a few bytes of JSON, so this ceiling can only fire on a
+// stall. When it does the wearer gets the bare status instead of the hub's
+// words: a worse message, but a far better outcome than a frozen display.
+export const REFUSAL_BODY_TIMEOUT_MS = 5_000;
+
+/** Settle `work` or give up after `ms`, so one stalled read can't hang a caller. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  const settled = Promise.resolve(work);
+  if (!ms || ms <= 0) return settled;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`hub body read timed out after ${ms}ms`));
+    }, ms);
+    settled.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 /** The same reading for a response whose body hasn't been consumed yet. */
 export async function refusal(res: Response): Promise<HttpError> {
-  // The body may be empty, HTML from an edge, or unreadable on a torn socket —
-  // and on a polyfilled Response `json` may not even be a function. Any of
-  // those means "the hub sent no words", never a failure of its own, so the
-  // try/catch has to cover a SYNCHRONOUS throw as well as a rejection.
+  // The body may be empty, HTML from an edge, unreadable on a torn socket, or
+  // never arrive at all — and on a polyfilled Response `json` may not even be a
+  // function. Every one of those means "the hub sent no words", never a failure
+  // of its own, so this has to cover a SYNCHRONOUS throw, a rejection, and a
+  // read that simply never settles.
   let body: unknown = {};
   try {
-    body = await res.json();
+    body = await withDeadline(res.json(), REFUSAL_BODY_TIMEOUT_MS);
   } catch {
     body = {};
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { HubClient } from "./hub-client.ts";
+import { HubClient, REFUSAL_BODY_TIMEOUT_MS } from "./hub-client.ts";
 import type { Config } from "./config.ts";
 
 const config: Config = { hubUrl: "https://hub.example.com", user: "u", password: "p", pollMs: 6000 };
@@ -229,6 +229,37 @@ describe("HubClient", () => {
       status: 502,
       message: "the hub answered HTTP 502",
     });
+  });
+
+  // The request timeout bounds the RESPONSE, not the body after it. Reading the
+  // refusal body is a second await on the same socket, so a hub that sends
+  // headers and then stalls would hang the throw itself — and App.poll() re-arms
+  // only in its `finally`, so that one stall freezes the display for good.
+  it("gives up on a refusal body that never arrives instead of hanging the throw", async () => {
+    vi.useFakeTimers();
+    try {
+      const stalled = vi.fn(async () => ({
+        ok: false,
+        status: 503,
+        json: () => new Promise(() => {}), // headers arrived; the body never does
+      })) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: stalled, timeoutMs: 0 });
+
+      const pending = client.sessionAction("h1", "s1", "kill");
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await vi.advanceTimersByTimeAsync(REFUSAL_BODY_TIMEOUT_MS - 1);
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(pending).rejects.toMatchObject({
+        status: 503,
+        message: "the hub answered HTTP 503",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reads the hub's words on getHistory and jiraDetail too, not just request()", async () => {

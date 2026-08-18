@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
-import { HubClient } from "./hub-client.ts";
+import { HubClient, REFUSAL_BODY_TIMEOUT_MS } from "./hub-client.ts";
+import { fakeTimers } from "../test-utils/fake-timers.ts";
 import type { Config } from "./config.ts";
 
 const config: Config = { hubUrl: "https://hub.example.com", user: "u", password: "p", pollMs: 6000 };
@@ -189,6 +190,38 @@ describe("HubClient", () => {
       status: 502,
       message: "the hub answered HTTP 502",
     });
+  });
+
+  // Reading the refusal body is a second await on the same response, and a
+  // request timeout bounds only the response itself. This transport can't stall
+  // there today (the background context hands back an already-materialized
+  // body), so the test guards the PARITY with glasses/src/hub-client.ts, where
+  // the read is a live socket and a stall would freeze the poll loop for good.
+  it("gives up on a refusal body that never arrives instead of hanging the throw", async () => {
+    fakeTimers.useFakeTimers();
+    try {
+      const stalled = vi.fn(async () => ({
+        ok: false,
+        status: 503,
+        json: () => new Promise(() => {}), // headers arrived; the body never does
+      })) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: stalled });
+
+      const pending = client.sessionAction("h1", "s1", "kill");
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await fakeTimers.advanceTimersByTimeAsync(REFUSAL_BODY_TIMEOUT_MS - 1);
+      expect(settled).not.toHaveBeenCalled();
+
+      await fakeTimers.advanceTimersByTimeAsync(2);
+      await expect(pending).rejects.toMatchObject({
+        status: 503,
+        message: "the hub answered HTTP 503",
+      });
+    } finally {
+      fakeTimers.useRealTimers();
+    }
   });
 
   it("reads the hub's words on getHistory and jiraDetail too, not just request()", async () => {
