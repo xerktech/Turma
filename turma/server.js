@@ -2428,7 +2428,12 @@ function agentBlockOnline(a, now) {
 }
 function compareBlocks(x, y) {   // rank order, best first
   if (x.online !== y.online) return x.online ? -1 : 1;
-  return x.at > y.at ? -1 : x.at < y.at ? 1 : 0;
+  // localeCompare, not `>`/`<`: board.js sorts its winners that way, and the two
+  // disagree on spellings that differ only in case or separator. No real agent
+  // emits those (one `now_iso()` format fleet-wide), so this is parity for its
+  // own sake — but a port that is exact needs no one to remember the exception.
+  const c = x.at.localeCompare(y.at);
+  return c > 0 ? -1 : c < 0 ? 1 : 0;   // fresher first
 }
 function blockOutranks(cand, best) {
   return !best || compareBlocks(cand, best) < 0;
@@ -2437,9 +2442,14 @@ function blockOutranks(cand, best) {
 // The repo an org's board says a ticket belongs in, as triaged by whichever host
 // reported it (see the Jira -> repo triage section in hub-agent.py). null when no
 // host reports the ticket, or none has triaged it yet, or the model declined it.
-// Ranked by `blockOutranks` — online first, then freshest — the SAME order
-// board.js's `mergeSites` applies, because the hub must resolve against what the
-// operator was actually shown.
+// Read off the ROW `fleetTicketRows` resolved, so it is by construction the same
+// copy the card renders. Ranking blocks here on its own was subtly different and
+// therefore wrong twice over: it ignored the newer-`updated` override, so a board
+// showing RepoA (the newer copy) dispatched against RepoB (the better-ranked
+// block); and where the winning copy carried no `repoGuess` at all, the card
+// showed the ticket untriaged while the hub started it off a losing block's
+// guess. `rows` is optional and exists only so a caller already holding the map
+// — the auto-start sweep, per ticket — does not rebuild it per call.
 //
 // **An ONLINE host's answer outranks any offline one, however stale** (XERK-325).
 // Every caller is a ROUTING decision, and `findTicketHost` can only route to an
@@ -2451,18 +2461,9 @@ function blockOutranks(cand, best) {
 // Freshness still decides WITHIN each tier; the offline tier is the fallback that
 // keeps a wholly-offline org resolving a repo at all, which is what lets the
 // queue hold the ticket rather than drop it.
-function ticketRepo(siteKey, issueKey) {
-  const now = Date.now();
-  let best = null;
-  for (const a of Object.values(agents)) {
-    if (!a.jira || a.jira.siteKey !== siteKey) continue;
-    const t = (a.jira.tickets || []).find((x) => x && x.key === issueKey);
-    if (!t || !t.repoGuess || !t.repoGuess.repo) continue;
-    const cand = { repo: t.repoGuess.repo, online: agentBlockOnline(a, now),
-                   at: String(a.jira.fetchedAt || "") };
-    if (blockOutranks(cand, best)) best = cand;
-  }
-  return best && best.repo;
+function ticketRepo(siteKey, issueKey, rows) {
+  const r = (rows || fleetTicketRows()).get(ticketQueueKey(siteKey, issueKey));
+  return (r && r.row.repoGuess && r.row.repoGuess.repo) || null;
 }
 
 // How many more sessions a host can take RIGHT NOW, as the hub sees it — the
@@ -5134,7 +5135,7 @@ function autoStartSweep() {
     for (const { row: t } of ticketRowsForSite(rows, siteKey)) {
       if (!t || !t.key) continue;
       if (t.statusCategory !== "todo") continue;      // only "To Do" tickets
-      const repo = ticketRepo(siteKey, t.key);         // a repo must be assigned
+      const repo = ticketRepo(siteKey, t.key, rows);   // a repo must be assigned
       if (!repo) continue;
       const k = siteKey + "\x00" + t.key;
       // A session exists on some channel — the work is under way (or was, and

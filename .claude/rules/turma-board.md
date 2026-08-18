@@ -180,10 +180,19 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
       different Jira users reports different lists and the board unions them; collapsing an org to
       one block loses the other user's tickets entirely. Unioning across raw HOSTS instead — the
       grouping skipped — resurrects the losing block of a same-user pair, so a ticket the board has
-      dropped comes back and gets auto-started. Only three functions may read a block's `tickets`
-      (`ticketRepo`, `hostTriagedTicket`, `fleetTicketRows`); a fourth is a new ranking site, and a
-      test pins that, because a behavioural test only catches one once some fleet shape exercises it.
-  - **Do not count the mirrors and call it done — this diverged three times that way**, each time
+      dropped comes back and gets auto-started. Only TWO functions may read a block's `tickets` —
+      `fleetTicketRows` and `hostTriagedTicket` (a per-host question, no ranking) — and a third is a
+      new ranking site. A test pins that, because a behavioural test only catches one once some
+      fleet shape happens to exercise it; it is a tripwire for the honest edit, not a proof, and
+      says so.
+    - **`ticketRepo` reads the resolved ROW, it does not rank blocks of its own.** Ranking there was
+      subtly different and so wrong twice: it ignored the newer-`updated` override, so a card showing
+      RepoA dispatched against RepoB; and where the winning copy carried no `repoGuess`, the card
+      showed the ticket untriaged while the hub started it off a losing block's guess.
+    - **A strictly newer `updated` beats block rank** for a key two groups both report — `mergeSites`'
+      rule. It fires only mid-poll, since the two copies normally carry the tracker's identical
+      value, which is exactly why it needs its own test rather than riding on the others.
+    - **Do not count the mirrors and call it done — this diverged three times that way**, each time
       because a site re-derived the view itself instead of calling the shared resolver. What each
       omission cost, all of it silent and all of it user-visible:
       - `autoStartSweep` queued tickets present only in an offline host's fresher block — which no

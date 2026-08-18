@@ -5717,8 +5717,11 @@ test("XERK-325: a host that has not triaged the ticket is not dispatched to", as
   resetAutoStart();
   const site = "tq325a.atlassian.net";
   await asBeat("tq325aUntriaged", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
     tickets: [{ key: "ENG-5", statusCategory: "todo" }] });          // no repoGuess
+  // Fresher, so this is the copy the card renders — the board shows Turma.
   await asBeat("tq325aTriaged", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
   const r = await startTicket(site, "ENG-5");
@@ -5756,8 +5759,10 @@ test("XERK-325: a 'nothing fits' verdict is not a triage decision", async () => 
   resetAutoStart();
   const site = "tq325c.atlassian.net";
   await asBeat("tq325cNull", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
     tickets: [{ key: "ENG-5", statusCategory: "todo", repoGuess: { repo: null } }] });
   await asBeat("tq325cReal", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:30:00Z",                    // the copy the card shows
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
   const r = await startTicket(site, "ENG-5");
@@ -5774,13 +5779,16 @@ test("XERK-325: no online host having triaged it HOLDS as blocked, not as capaci
   // blocked timer instead, which is bounded and says what is wrong.
   resetAutoStart();
   const site = "tq325d.atlassian.net";
-  // A host that triaged it, offline; and an online host that has not.
+  // The offline host is the only one whose Jira user is assigned ENG-5, so its
+  // row IS what the card renders — the chip is there and Start is live. The
+  // online host is in the org but has never seen the ticket.
   await asBeat("tq325dOff", site, { autoStart: false, capacity: ROOMY,
+    user: "off@x.com",
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
   agents.tq325dOff.lastSeen = Date.now() - 10 * 60 * 1000;
   await asBeat("tq325dOn", site, { autoStart: false, capacity: ROOMY,
-    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });
+    user: "on@x.com", tickets: [] });
   const r = await startTicket(site, "ENG-5");
   assert.equal(r.status, 503);
   assert.match(r.body.error, /has triaged that ticket to Turma/);
@@ -5795,8 +5803,10 @@ test("XERK-325: an agent PIN to a host that hasn't triaged it is refused, not ro
   resetAutoStart();
   const site = "tq325e.atlassian.net";
   await asBeat("tq325ePinned", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
     tickets: [{ key: "ENG-5", statusCategory: "todo" }] });
   await asBeat("tq325eOther", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                    // the copy the card shows
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
   const pin = await setAgent(site, "ENG-5", { host: "tq325ePinned" });
@@ -5955,6 +5965,30 @@ test("XERK-325: auto-start reads the ticket list the BOARD shows, not a dead hos
   ticketQueue.length = 0;
 });
 
+test("XERK-325: a strictly newer `updated` beats block rank, as mergeSites does", async () => {
+  // The two hosts' copies of a ticket normally carry an IDENTICAL `updated` (it
+  // is the tracker's own field), so this override only fires when the fleet is
+  // mid-poll — and it was the one piece of mergeSites parity with no test, which
+  // meant it could be deleted outright with the suite still green.
+  resetAutoStart();
+  const site = "tq325o.atlassian.net";
+  // Fresher BLOCK, older copy of the ticket.
+  await asBeat("tq325oFreshBlock", site, { autoStart: false, capacity: ROOMY,
+    user: "a@x.com", fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "Stale", cloned: true } }] });
+  // Staler block, but a strictly newer copy of the ticket — what the board shows.
+  await asBeat("tq325oNewTicket", site, { autoStart: false, capacity: ROOMY,
+    user: "b@x.com", fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T11:00:00.000+0000",
+                repoGuess: { repo: "Fresh", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Fresh",
+    "the newer ticket copy decides the repo, not the fresher block");
+});
+
 test("XERK-325: auto-start sees BOTH Jira users' tickets, as the board does", async () => {
   // A host polls as `assignee = currentUser()`, so an org whose hosts
   // authenticate as different users reports different lists and the board UNIONS
@@ -6004,11 +6038,11 @@ test("XERK-325: auto-STOP does not kill a session over a Done only a dead host r
   const site = "tq325k.atlassian.net";
   const sess = { id: "s-live", status: "running", repo: "Turma",
                  ticket: { key: "ENG-5", siteKey: site } };
-  await asBeat("tq325kDown", site, { autoStart: false, capacity: ROOMY,
+  await asBeat("tq325kDown", site, { autoStart: false, capacity: ROOMY, user: "shared@x.com",
     fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
     tickets: [{ key: "ENG-5", statusCategory: "done" }] });
   agents.tq325kDown.lastSeen = Date.now() - 10 * 60 * 1000;
-  await asBeat("tq325kUp", site, { autoStart: false, capacity: ROOMY,
+  await asBeat("tq325kUp", site, { user: "shared@x.com", autoStart: false, capacity: ROOMY,
     fetchedAt: "2026-07-14T12:00:00Z", sessions: [sess],             // staler
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
@@ -6016,7 +6050,7 @@ test("XERK-325: auto-STOP does not kill a session over a Done only a dead host r
   assert.deepEqual((agents.tq325kUp.commands || []).map((c) => c.type), [],
     "the board shows ENG-5 in To Do, so nothing may be killed for it");
   // And the reverse still works: once the ONLINE host reports Done, it stops.
-  await asBeat("tq325kUp", site, { autoStart: false, capacity: ROOMY,
+  await asBeat("tq325kUp", site, { user: "shared@x.com", autoStart: false, capacity: ROOMY,
     fetchedAt: "2026-07-14T12:40:00Z", sessions: [sess],
     tickets: [{ key: "ENG-5", statusCategory: "done" }] });
   autoStopSweep();
@@ -6030,11 +6064,11 @@ test("XERK-325: a queued click is not dropped over a Done only a dead host repor
   // a log line and the entry simply vanishes from the payload.
   resetAutoStart();
   const site = "tq325l.atlassian.net";
-  await asBeat("tq325lDown", site, { autoStart: false, capacity: ROOMY,
+  await asBeat("tq325lDown", site, { autoStart: false, capacity: ROOMY, user: "shared@x.com",
     fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
     tickets: [{ key: "ENG-5", statusCategory: "done" }] });
   agents.tq325lDown.lastSeen = Date.now() - 10 * 60 * 1000;
-  await asBeat("tq325lUp", site, { autoStart: false, capacity: FULL,
+  await asBeat("tq325lUp", site, { user: "shared@x.com", autoStart: false, capacity: FULL,
     fetchedAt: "2026-07-14T12:00:00Z",                                // staler
     tickets: [{ key: "ENG-5", statusCategory: "todo",
                 repoGuess: { repo: "Turma", cloned: true } }] });
@@ -6044,7 +6078,7 @@ test("XERK-325: a queued click is not dropped over a Done only a dead host repor
   assert.ok(queuedTicket(site, "ENG-5"),
     "the board still shows it in To Do, so the click survives the drain");
   // A Done from the ONLINE host still retires it, as it always did.
-  await asBeat("tq325lUp", site, { autoStart: false, capacity: FULL,
+  await asBeat("tq325lUp", site, { user: "shared@x.com", autoStart: false, capacity: FULL,
     fetchedAt: "2026-07-14T12:40:00Z",
     tickets: [{ key: "ENG-5", statusCategory: "done" }] });
   drainTicketQueue();
@@ -6053,31 +6087,48 @@ test("XERK-325: a queued click is not dropped over a Done only a dead host repor
 });
 
 test("XERK-325: only the shared resolvers may read a block's ticket list", () => {
-  // The ranking diverged twice, both times because a new site walked the agents
-  // map and wrote the tie-break out again. A behavioural test catches that only
-  // once some fleet shape happens to exercise the new site, so this is the
-  // structural half — and it is deliberately NOT a regex over comparison
-  // spellings, which an earlier version of this test was: a QA pass escaped that
-  // by renaming a local, and it also flagged unrelated recency logic elsewhere.
+  // A TRIPWIRE, not a proof — read the limits below before trusting it.
   //
-  // The invariant instead is the thing every such site must do to exist at all:
-  // read a tracker block's `tickets`. Three functions may, and a fourth is the
-  // defect — `ticketRepo` (which repo, ranked by blockOutranks),
-  // `hostTriagedTicket` (can THIS host run it — a per-host question, no ranking),
-  // and `fleetTicketRows` (the board's own view, which everything else reads).
+  // The ranking diverged three times, every time because a new site walked the
+  // agents map and re-derived the board's view instead of calling the shared
+  // resolver. A behavioural test catches that only once some fleet shape happens
+  // to exercise the new site, so this is the structural half: the thing such a
+  // site must do to exist at all is read a tracker block's `tickets`. Two
+  // functions may — `fleetTicketRows` (the board's own view, which everything
+  // else reads, `ticketRepo` included) and `hostTriagedTicket` (can THIS host run
+  // it: a per-host question with no ranking in it) — and a third is the defect.
+  //
+  // WHAT IT DOES NOT CATCH. A QA pass walked through the previous version of this
+  // check five ways, and the same evasions apply here in spirit: bracket
+  // notation, destructuring, an arrow-`const` (whose enclosing name resolves to
+  // whatever function declaration precedes it), a divergent walk ADDED beside a
+  // legitimate `fleetTicketRows()` call, and a re-rank smuggled inside a function
+  // already on the allow-list. Some of those are covered below; none of it is
+  // airtight, because this is a regex over source and the evasion space is open.
+  // It is aimed at the honest edit, which is the realistic one. **The guarantee
+  // lives in the behavioural tests above** — the two-user, ghost, auto-stop and
+  // queued-click cases — and a change here that keeps them green while making
+  // this fail is a naming problem, not a bug.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+  // Dot, bracket and destructured reads alike.
+  const READ = /\.tickets\b|\[\s*["']tickets["']\s*\]|\{[^{}]*\btickets\b[^{}]*\}\s*=/g;
+  // Named functions AND `const x = (…) =>` / `= function`, so an arrow is
+  // attributed to itself rather than to whatever declaration sits above it.
+  // Anchored at column 0 (`m` flag): these are all module-level declarations, and
+  // without the anchor any inner `const t = (…)` claims the attribution.
+  const DECL = /^function\s+(\w+)\s*\(|^(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:function\b|\()/gm;
   const readers = [];
-  for (const m of code.matchAll(/\.tickets\b/g)) {
-    // The enclosing function is the nearest `function <name>(` above the hit.
-    const before = code.slice(0, m.index);
-    const decl = [...before.matchAll(/function (\w+)\s*\(/g)].pop();
-    readers.push(decl ? decl[1] : "(top level)");
+  for (const m of code.matchAll(READ)) {
+    const decls = [...code.slice(0, m.index).matchAll(DECL)];
+    const last = decls[decls.length - 1];
+    readers.push(last ? (last[1] || last[2]) : "(top level)");
   }
   assert.deepEqual([...new Set(readers)].sort(),
-    ["fleetTicketRows", "hostTriagedTicket", "ticketRepo"],
+    ["fleetTicketRows", "hostTriagedTicket"],
     "a new reader of a block's ticket list is a new ranking site — route it "
-    + "through fleetTicketRows instead");
+    + "through fleetTicketRows instead. (If this is an unrelated `tickets` "
+    + "field, say so here rather than widening the pattern.)");
 
   // The other half of agreeing with the board is the GROUPING, not just the
   // tie-break, and it is the one that broke most recently: both sweeps must read
