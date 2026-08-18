@@ -61,13 +61,22 @@ is the run RECORD, never a nested agent dir.
   answer. The fold stays lazy, so the normal fully-covered case never pays for it.
 - **The record is packed into a MIGRATION bundle** (`_pack_transcript`), because it is the only
   place the labels exist: without it a moved session's picker silently reverts to prompt text on the
-  target alone. **Bounded, and left behind rather than allowed to fail the move**: nothing prunes
-  that tree, so a long-lived session accumulates a record per run, and letting it push the bundle
-  past `MIGRATION_BLOB_MAX` would refuse a migration that used to succeed — trading a working move
-  for prettier labels, which is the wrong way round.
+  target alone. **The records can never cost a move**: nothing prunes that tree, so a long-lived
+  session accumulates a record per run. The bundle is built WITH them and rebuilt WITHOUT them if
+  the finished blob is over `MIGRATION_BLOB_MAX` or the tree could not be read — trading a working
+  move for prettier labels is the wrong way round.
+  - **Measuring the TREE against a constant does not achieve that**, and was the first attempt: the
+    ceiling is on the whole bundle, so any records tree — however small, however legal — can push a
+    near-ceiling transcript over it. Only the FINISHED size can answer. `WORKFLOW_PACK_MAX_BYTES`
+    survives as a cheap pre-filter keeping an obviously huge tree from being tarred into memory at
+    all; it is not the guarantee, and pinning it needs a realistically sized fixture — with a toy
+    one, shrinking the bound to 1 KiB (silently dropping every real session's records) passes the
+    whole suite.
 - **The journal fold is LAZY and MEMOISED, and those are two separate properties.** Lazy: a fully
   recorded run never reads the journal. Memoised: a run with many uncovered agents reads it ONCE,
-  not once per row. A test asserting only the first leaves the second free to regress, and the fold
+  not once per row — **including a fold that answers None**, an unreadable journal being the case
+  where re-reading per row is most expensive. A test asserting only the first leaves the second free
+  to regress (both variants were shipped and both passed the suite), and the fold
   costs seconds on a large journal inside the synchronous beat loop. Note the fold is now reachable
   for a partly recorded run, which it was not before — status is worth the read, but it is a path
   that could not stall a beat previously and can now.

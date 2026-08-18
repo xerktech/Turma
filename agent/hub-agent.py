@@ -11563,17 +11563,10 @@ class SessionManager:
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
                             extra=extra, migration_id=migration_id)
 
-    def _pack_transcript(self, path):
-        """Bundle a transcript file (+ its subagents/ and workflows/ dirs, if
-        any) into gzipped tar bytes, laid out relative to the project-slug dir so
-        the target unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and,
-        when present, `<id>/subagents/...` and `<id>/workflows/...`. The main
-        file is truncated to its last complete line.
-
-        `workflows/` is the SIBLING tree holding each run's record — the only
-        place the picker's row labels exist (XERK-304). Leaving it behind moved a
-        session whose workflow rows then fell back to prompt text, i.e. the
-        unpickable picker, on the target only."""
+    def _pack_bytes(self, path, runs):
+        """The bundle itself: `<id>.jsonl` (truncated to its last complete line),
+        plus `<id>/subagents/...` when present, plus the `runs` dir as
+        `<id>/workflows/...` when one is given. See _pack_transcript."""
         tid = os.path.basename(path)[:-len(".jsonl")]
         with open(path, "rb") as f:
             raw = f.read()
@@ -11587,22 +11580,54 @@ class SessionManager:
             sub = _subagents_dir(path)
             if os.path.isdir(sub):
                 tar.add(sub, arcname=os.path.join(tid, "subagents"))
-            runs = os.path.join(path[:-len(".jsonl")], WORKFLOW_RUNS_SUBDIR)
-            # Best-effort, and BOUNDED: the records are a nicety (row labels),
-            # the move is the product. Letting an accumulated workflows/ tree
-            # push the bundle past MIGRATION_BLOB_MAX would refuse a migration
-            # that used to succeed — trading a working move for prettier labels,
-            # which is the wrong way round. Past the bound it is left behind and
-            # the target's picker falls back to prompt text, exactly as it did
-            # before the tree was carried at all.
-            if os.path.isdir(runs):
-                size = _dir_size(runs, WORKFLOW_PACK_MAX_BYTES)
-                if size is None:
-                    log(f"migration: workflow records for {tid} exceed "
-                        f"{WORKFLOW_PACK_MAX_BYTES} bytes; not carrying them")
-                else:
-                    tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
+            if runs:
+                tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
         return buf.getvalue()
+
+    def _pack_transcript(self, path):
+        """Bundle a transcript file (+ its subagents/ and workflows/ dirs, if
+        any) into gzipped tar bytes, laid out relative to the project-slug dir so
+        the target unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and,
+        when present, `<id>/subagents/...` and `<id>/workflows/...`.
+
+        `workflows/` is the SIBLING tree holding each run's record — the only
+        place the picker's row labels exist (XERK-304). Without it a moved
+        session's workflow rows fall back to prompt text on the target.
+
+        **The records can never cost a migration.** They are a nicety; the move
+        is the product. So the bundle is built WITH them and, if the finished
+        blob is over MIGRATION_BLOB_MAX or the tree could not be read, rebuilt
+        WITHOUT them — the fallback being exactly the bundle that shipped before
+        the tree was carried at all.
+
+        Measuring the tree against a constant is NOT enough and was the first
+        attempt: the ceiling applies to the whole bundle, so any records tree,
+        however small, can push a near-ceiling transcript over it. Only the
+        finished size can answer that, which is why this checks the blob rather
+        than estimating. `WORKFLOW_PACK_MAX_BYTES` survives as a cheap
+        pre-filter, so an obviously huge tree is skipped without being tarred
+        into memory first — it is not the guarantee."""
+        tid = os.path.basename(path)[:-len(".jsonl")]
+        runs = os.path.join(path[:-len(".jsonl")], WORKFLOW_RUNS_SUBDIR)
+        if os.path.isdir(runs):
+            if _dir_size(runs, WORKFLOW_PACK_MAX_BYTES) is None:
+                log(f"migration: workflow records for {tid} exceed "
+                    f"{WORKFLOW_PACK_MAX_BYTES} bytes; not carrying them")
+            else:
+                try:
+                    blob = self._pack_bytes(path, runs)
+                except OSError as e:
+                    # An unreadable file in the records tree (a leftover
+                    # root-owned one after a PUID change, say) must not refuse
+                    # the move either — drop the records, keep the session.
+                    log(f"migration: workflow records for {tid} unreadable "
+                        f"({e}); not carrying them")
+                else:
+                    if len(blob) <= MIGRATION_BLOB_MAX:
+                        return blob
+                    log(f"migration: workflow records for {tid} would put the "
+                        f"bundle over {MIGRATION_BLOB_MAX} bytes; not carrying them")
+        return self._pack_bytes(path, None)
 
     def _unpack_transcript(self, blob, dest_dir):
         """Extract a _pack_transcript bundle into dest_dir. A bundle crosses a

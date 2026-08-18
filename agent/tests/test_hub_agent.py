@@ -4425,12 +4425,22 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         path = self._write_transcript(wt, "trans1", subagents=True)
         runs = os.path.join(path[:-len(".jsonl")], "workflows")
         os.makedirs(os.path.join(runs, "scripts"))
+        # Deliberately a REALISTIC size (a record embeds the script and a
+        # preview per agent). With a toy fixture, shrinking the bound to 1 KiB —
+        # which silently stops every real session carrying its records — passed
+        # the entire suite. The fixture is what pins the bound from below.
         with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
-            json.dump({"runId": "wf_abc123", "workflowProgress": [
-                {"type": "workflow_agent", "index": 1, "agentId": "x",
-                 "label": "review:bugs", "state": "done"}]}, f)
+            json.dump({"runId": "wf_abc123", "script": "x" * 200000,
+                       "workflowProgress": [
+                           {"type": "workflow_agent", "index": 1, "agentId": "x",
+                            "label": "review:bugs", "state": "done",
+                            "promptPreview": "p" * 2000}]}, f)
         with open(os.path.join(runs, "scripts", "s-wf_abc123.js"), "w") as f:
-            f.write("export const meta = {}\n")
+            f.write("export const meta = {}\n" + "// pad\n" * 20000)
+        self.assertGreater(
+            sum(os.path.getsize(os.path.join(dp, n))
+                for dp, _d, fs in os.walk(runs) for n in fs),
+            300000, "a toy fixture cannot pin the pack bound from below")
         sm = self._manager()
         dest = os.path.join(self.tmp, "dest-wf")
         os.makedirs(dest)
@@ -4464,6 +4474,62 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
             os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
         self.assertFalse(os.path.isdir(os.path.join(dest, "trans1", "workflows")))
         self.assertLess(len(blob), ha.MIGRATION_BLOB_MAX)
+
+    def test_records_are_dropped_when_they_would_put_the_bundle_over(self):
+        # Bounding the TREE against a constant is not enough: the ceiling is on
+        # the whole bundle, so any records tree — however small, however legal —
+        # can push a near-ceiling transcript over it and refuse a move that used
+        # to succeed. Only the finished blob can answer that.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfhead")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        # Incompressible, so the gzipped blob really does approach the ceiling.
+        with open(path, "ab") as f:
+            f.write(os.urandom(200000))
+            f.write(b"\n")
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "wb") as f:
+            f.write(os.urandom(120000))
+        sm = self._manager()
+        with mock.patch.object(ha, "MIGRATION_BLOB_MAX", 260000):
+            blob = sm._pack_transcript(path)
+        self.assertLessEqual(len(blob), 260000, "the move must still be possible")
+        dest = os.path.join(self.tmp, "dest-head")
+        os.makedirs(dest)
+        sm._unpack_transcript(blob, dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertFalse(os.path.isdir(os.path.join(dest, "trans1", "workflows")),
+                         "the records are what gets dropped, not the session")
+
+    def test_an_unreadable_record_drops_the_records_not_the_move(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfperm")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        bad = os.path.join(runs, "wf_abc123.json")
+        with open(bad, "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        os.chmod(bad, 0)
+        self.addCleanup(os.chmod, bad, 0o644)
+        if os.access(bad, os.R_OK):
+            self.skipTest("running as root — an unreadable file cannot be staged")
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-perm")
+        os.makedirs(dest)
+        sm._unpack_transcript(sm._pack_transcript(path), dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+
+    def test_dir_size_skips_what_it_cannot_read_rather_than_raising(self):
+        # A walk/delete race, or a leftover root-owned file, must not raise out
+        # of the measure — which would refuse the move it is meant to protect.
+        d = os.path.join(self.tmp, "unreadable")
+        os.makedirs(d)
+        with open(os.path.join(d, "a"), "w") as f:
+            f.write("y" * 100)
+        with mock.patch.object(ha.os.path, "getsize", side_effect=OSError("boom")):
+            self.assertEqual(ha._dir_size(d, 1000), 0)
 
     def test_dir_size_bails_out_once_it_is_over_the_bound(self):
         d = os.path.join(self.tmp, "sizeme")
@@ -10765,6 +10831,15 @@ class TestResolveWorkflowRun(unittest.TestCase):
                          "three uncovered rows must share ONE fold, not take one each")
         self.assertEqual(sorted(r["status"] for r in rows),
                          ["done", "done", "done", "done"])
+
+        # And a fold that answers None — an UNREADABLE journal — is memoised too.
+        # Memoising only a truthy result re-reads once per uncovered row in
+        # exactly the case where the read is most likely to be slow.
+        with mock.patch.object(ha, "_workflow_finished_agents",
+                               return_value=None) as folded:
+            rows, _ = ha._workflow_agents(partial, rec2)
+        self.assertEqual(folded.call_count, 1, "a None fold is memoised too")
+        self.assertEqual([r for r in rows if "status" in r][0]["label"], "named")
 
     def test_a_record_that_is_not_an_object_is_refused(self):
         # json.load happily returns a list; without the isinstance guard the
