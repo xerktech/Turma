@@ -733,6 +733,22 @@ class BoardTest {
         assertEquals(SweepVerdict.ERROR, startSweepVerdict(p, emptyList(), false, true, 150, 100).first)
     }
 
+    @Test fun `XERK-325 - a reported refusal ends the wait instead of clearing silently`() {
+        val p = StartState(pending = true, cmdId = "c1", host = "h", at = 0, sawCmd = true)
+        // The agent said it declined this spawn: that is the verdict, whatever the
+        // sawCmd/timeout rules would have guessed.
+        assertEquals(SweepVerdict.REFUSED,
+            startSweepVerdict(p, emptyList(), false, true, 0, 100, "no triaged repo on this host").first)
+        // A session that actually landed still wins the tie.
+        assertEquals(SweepVerdict.CLEAR,
+            startSweepVerdict(p, listOf(sess("c1")), false, true, 0, 100, "no triaged repo").first)
+        // No refusal reported is "can't tell" (older hub), never "it was refused":
+        // the old timing rules apply unchanged.
+        assertEquals(SweepVerdict.CLEAR, startSweepVerdict(p, emptyList(), false, true, 0, 100, null).first)
+        val fresh = StartState(pending = true, cmdId = "c2", host = "h", at = 0)
+        assertEquals(SweepVerdict.HOLD, startSweepVerdict(fresh, emptyList(), false, true, 50, 100, null).first)
+    }
+
     // ---- status change (XERK-138): parity with board.js canChangeStatus -------
     @Test fun `status is changeable only when online and options exist`() {
         val opts = listOf(StatusOption(id = "31", name = "Done", category = "done"))

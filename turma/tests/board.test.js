@@ -1710,6 +1710,32 @@ test("startSweepVerdict: a host that dropped out of the fleet only ever times ou
   assert.equal(startSweepVerdict(old, [], false, false, TMO), "error");
 });
 
+test("XERK-325: startSweepVerdict: a refusal ends the wait with the agent's reason", () => {
+  // Without it a refused spawn drained the queue and cleared silently — which is
+  // exactly what a spawn that WORKED looks like, so the operator clicked Start
+  // again rather than reading why it hadn't started.
+  const p = { cmdId: "c1", sawCmd: true, ageMs: 0 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO,
+    { error: "PROJ-7 has no triaged repo on this host" }), "refused");
+});
+
+test("XERK-325: startSweepVerdict: a session that landed beats a refusal", () => {
+  // The same ordering the hub applies to a migration handoff: a spawn that
+  // actually came up always wins the tie, whatever else rode that beat.
+  const p = { cmdId: "c1", sawCmd: true, ageMs: 0 };
+  assert.equal(startSweepVerdict(p, [{ spawnCmdId: "c1" }], false, true, TMO,
+    { error: "no triaged repo" }), "clear");
+});
+
+test("XERK-325: startSweepVerdict: no refusal reported leaves the old timing rules alone", () => {
+  // An older hub serves no spawnRefusals and an older agent stages none, so an
+  // absent entry has to mean "can't tell", never "it was refused".
+  const p = { cmdId: "c1", sawCmd: true, ageMs: 0 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO, null), "clear");
+  const fresh = { cmdId: "c2", sawCmd: false, ageMs: 0 };
+  assert.equal(startSweepVerdict(fresh, [], false, true, TMO, undefined), "hold");
+});
+
 test("startSweepVerdict: a never-seen command past the timeout errors (backstop)", () => {
   const p = { cmdId: "c1", host: "hostA", sawCmd: false, ageMs: TMO + 1 };
   assert.equal(startSweepVerdict(p, [], false, true, TMO), "error");

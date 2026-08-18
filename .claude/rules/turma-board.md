@@ -145,8 +145,30 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   rapid clicks split. An agent predating `capacity` scores below one that reports it.
 - **No host has the repo → clone on demand.** `findTicketHost` returns `{host, needsClone:true}` for
   the most-available host; `spawn_ticket` clones it and queues behind the clone — never a refusal.
-- The **multi-host-per-org limits still apply**: the triage/branch state is per-host, so a
-  clone-on-demand routed to a host that didn't triage the ticket has no ledger entry to clone from.
+- **Only a host that has TRIAGED the ticket is eligible at all** (XERK-325, `hostTriagedTicket`),
+  filtered ahead of the capacity and cloned-repo preferences. Triage is per-host — its own ledger,
+  its own model run, its own candidate repos — while `ticketRepo` publishes the FRESHEST host's
+  answer fleet-wide, so the pool routinely holds hosts with no decision for a ticket the board
+  already chips. `spawn_ticket` re-derives from the local ledger and refuses those, so routing to
+  one is a spawn that cannot run: the click did nothing and said nothing, on that host only.
+  - **Agreement with the published repo is part of the test**, not merely having some decision: a
+    host that answered a different repo would spawn against THAT one, giving the operator a session
+    on a repo the card never showed. Candidate sets differ per host (cloned repos + that host's `gh`
+    reach), so hosts legitimately disagree.
+  - **It is a `blocked` hold, never `full`.** A freed slot does not give a host a triage decision,
+    so reporting it as capacity promises a wait that clears itself; the blocked timer bounds it and
+    the reason says what is actually wrong. A PIN to an untriaged host refuses for the same reason
+    — after its own capacity check, so the self-clearing verdict still wins a tie.
+  - The common case is a RACE, not a permanent split: a new ticket is untriaged on a host for the
+    minutes its batch takes, and the drainer re-checks every beat. The permanent case is a decided
+    `repo: null` — `_triage_stale` never re-triages that — which is what makes the symptom look
+    host-specific rather than intermittent.
+- **A refused spawn ends the card's wait with the agent's reason** (`spawnRefusals` by cmdId, the
+  XERK-265 channel). `startSweepVerdict` checks it after the landed-session test and before the
+  `sawCmd`/timeout heuristics: those only guess at what a drained command meant, and a silent
+  "clear" is byte-for-byte what a spawn that WORKED looks like — which is what left the operator
+  pressing Start again. An absent entry still means "can't tell", so older hubs and agents keep the
+  old timing rules.
 
 #### The hub's ticket queue (XERK-296)
 

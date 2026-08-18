@@ -167,9 +167,14 @@ function sweepStarts(agents, sessionIndex) {
     const sessions = B.ticketSessionsOf(sessionIndex, siteKey, issueKey);
     const host = (agents || []).find(a => a.key === p.host);
     const cmd = !!host && (host.commands || []).some(c => c && c.cmdId === p.cmdId);
+    // An older hub serves no spawnRefusals and an older agent stages none, so an
+    // absent entry means "that agent can't tell" — the timeout heuristics below
+    // stay exactly as they were.
+    const refusal = (host && p.cmdId && host.spawnRefusals) ? host.spawnRefusals[p.cmdId] : null;
     p.ageMs = now - p.at;
-    switch (B.startSweepVerdict(p, sessions, cmd, !!host, START_TIMEOUT_MS)) {
+    switch (B.startSweepVerdict(p, sessions, cmd, !!host, START_TIMEOUT_MS, refusal)) {
       case "clear": starts.delete(k); break;
+      case "refused": starts.set(k, { error: refusal.error || "the host refused it" }); break;
       case "error": starts.set(k, { error: "the host didn't start it in time" }); break;
       // "hold": leave the pending as-is (verdict may have set p.sawCmd).
     }

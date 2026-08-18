@@ -733,7 +733,7 @@ fun ticketStartControl(
     )
 }
 
-enum class SweepVerdict { HOLD, CLEAR, ERROR }
+enum class SweepVerdict { HOLD, CLEAR, REFUSED, ERROR }
 
 /**
  * What a start-in-flight should become, given the current fleet — a pure port
@@ -744,6 +744,15 @@ enum class SweepVerdict { HOLD, CLEAR, ERROR }
  * A cmdId-less pending (POST not back yet) always holds; its own request
  * resolves it. Returns the verdict plus the state to keep on HOLD (which is
  * where a newly-seen command sets `sawCmd`).
+ *
+ * [refusal] is this cmdId's entry in the host's `spawnRefusals` (XERK-265), the
+ * agent's own word that it declined the spawn. Checked AFTER the landed-session
+ * test, so a spawn that actually came up always wins the tie, and BEFORE the
+ * sawCmd/timeout rules, which only ever guess at what a drained command meant:
+ * without it a refused start CLEARED silently, which is byte-for-byte what a
+ * start that worked looks like, and the operator simply pressed it again
+ * (XERK-325). Null means "can't tell" — an older hub serves no refusals and an
+ * older agent stages none — so the timing rules below stay exactly as they were.
  */
 fun startSweepVerdict(
     p: StartState,
@@ -752,9 +761,11 @@ fun startSweepVerdict(
     hostKnown: Boolean,
     ageMs: Long,
     timeoutMs: Long,
+    refusal: String? = null,
 ): Pair<SweepVerdict, StartState> {
     val cmdId = p.cmdId ?: return SweepVerdict.HOLD to p
     if (sessions.any { it.spawnCmdId == cmdId }) return SweepVerdict.CLEAR to p
+    if (refusal != null) return SweepVerdict.REFUSED to p
     if (!hostKnown) return (if (ageMs > timeoutMs) SweepVerdict.ERROR else SweepVerdict.HOLD) to p
     if (cmdPresent) return SweepVerdict.HOLD to p.copy(sawCmd = true) // command still queued
     if (p.sawCmd) return SweepVerdict.CLEAR to p                      // watched it land, now drained

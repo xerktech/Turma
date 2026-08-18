@@ -5703,6 +5703,136 @@ test("XERK-296: a hold reason from the hub is length-capped on the entry", async
   ticketQueue.length = 0;
 });
 
+// ---- routing only to a host that has TRIAGED the ticket (XERK-325) ----------
+// Triage is per-host (each agent's own ledger, its own model run, its own
+// candidate repos), while `ticketRepo` publishes the freshest host's answer
+// fleet-wide. `spawn_ticket` re-derives from the LOCAL ledger and refuses what it
+// has no decision for, so a host that has not triaged the ticket cannot run the
+// spawn — routing to one is a session that never starts.
+
+test("XERK-325: a host that has not triaged the ticket is not dispatched to", async () => {
+  // The reported bug: host B has the ticket triaged, host A is free and does not.
+  // The old pool ranked purely on availability, so the free untriaged host won and
+  // its agent refused the spawn with nothing on screen to say so.
+  resetAutoStart();
+  const site = "tq325a.atlassian.net";
+  await asBeat("tq325aUntriaged", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });          // no repoGuess
+  await asBeat("tq325aTriaged", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.deepEqual((agents.tq325aUntriaged.commands || []).map((c) => c.issueKey), [],
+    "the untriaged host must never be handed a spawn it will refuse");
+  assert.deepEqual((agents.tq325aTriaged.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a host that triaged the ticket ELSEWHERE is not dispatched to either", async () => {
+  // It would spawn against its OWN answer, so the operator would get a session on
+  // a repo the card never showed. Agreement with the published repo is the test,
+  // not merely having some decision.
+  resetAutoStart();
+  const site = "tq325b.atlassian.net";
+  await asBeat("tq325bOther", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  // Fresher, so ticketRepo publishes "Turma" — which is what the card shows.
+  await asBeat("tq325bTurma", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await startTicket(site, "ENG-5");
+  assert.deepEqual((agents.tq325bOther.commands || []).map((c) => c.issueKey), []);
+  assert.deepEqual((agents.tq325bTurma.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a 'nothing fits' verdict is not a triage decision", async () => {
+  // _apply_triage publishes a declined ticket as repoGuess.repo = null, and
+  // spawn_ticket refuses it exactly as it refuses an absent one. This host is
+  // permanently that way (_triage_stale never re-triages a decided entry), which
+  // is what made the symptom look host-specific rather than like a race.
+  resetAutoStart();
+  const site = "tq325c.atlassian.net";
+  await asBeat("tq325cNull", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo", repoGuess: { repo: null } }] });
+  await asBeat("tq325cReal", site, { autoStart: false, capacity: FULL,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  // The only host that can run it is full, so this waits on capacity — it does
+  // NOT fall through to the host holding a null verdict.
+  assert.equal(r.body.queued, true);
+  assert.deepEqual((agents.tq325cNull.commands || []).map((c) => c.issueKey), []);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: no online host having triaged it HOLDS as blocked, not as capacity", async () => {
+  // A freed slot does not give a host a triage decision, so reporting this as
+  // "waiting for a slot" would promise a wait that clears itself. It holds on the
+  // blocked timer instead, which is bounded and says what is wrong.
+  resetAutoStart();
+  const site = "tq325d.atlassian.net";
+  // A host that triaged it, offline; and an online host that has not.
+  await asBeat("tq325dOff", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325dOff.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325dOn", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /has triaged that ticket to Turma/);
+  assert.equal(r.body.queued, undefined, "a hard refusal reaches the operator, it doesn't queue");
+  assert.deepEqual((agents.tq325dOn.commands || []).map((c) => c.issueKey), []);
+});
+
+test("XERK-325: an agent PIN to a host that hasn't triaged it is refused, not routed around", async () => {
+  // The pin says which host, never that the host can run it — and the one thing a
+  // pin asserts is that no other host is chosen, so this reports rather than
+  // silently picking the host that did triage it.
+  resetAutoStart();
+  const site = "tq325e.atlassian.net";
+  await asBeat("tq325ePinned", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });
+  await asBeat("tq325eOther", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const pin = await setAgent(site, "ENG-5", { host: "tq325ePinned" });
+  assert.equal(pin.status, 200);
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /pinned to agent "tq325ePinned", which has not triaged it/);
+  assert.deepEqual((agents.tq325eOther.commands || []).map((c) => c.issueKey), [],
+    "the pin still forbids routing elsewhere");
+});
+
+test("XERK-325: the drainer re-checks triage, so a decision landing later dispatches", async () => {
+  // The common case is a race, not a permanent disagreement: a new ticket is
+  // untriaged on a host for the few minutes its batch takes. The queue must pick
+  // it up on the beat the decision lands rather than having given up.
+  resetAutoStart();
+  const site = "tq325f.atlassian.net";
+  await asBeat("tq325fLate", site, { autoStart: false, capacity: FULL,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325fFree", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo" }] });          // untriaged
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.queued, true, "the only triaged host is full, so it waits");
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325fFree.commands || []).map((c) => c.issueKey), []);
+  // Its triage batch comes back and it publishes the same repo.
+  await asBeat("tq325fFree", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  drainTicketQueue();
+  assert.deepEqual((agents.tq325fFree.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(queuedTicket(site, "ENG-5"), null, "and the entry retires with the dispatch");
+});
+
 // ---- manual org colors (XERK-145) -------------------------------------------
 
 test("POST /api/jira/<site>/color pins the slot, rides the payload, releases on auto", async () => {

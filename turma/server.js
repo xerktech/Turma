@@ -2489,16 +2489,42 @@ function hostHasFreeSlot(a) {
 // decision rather than an enqueue-time one. Returns `{full:true}` with that
 // refusal so the caller can tell "wait, this will clear" from "this can't work".
 // Returns {host, needsClone} | {error, status, full?}.
+//
+// Does THIS host's own triage answer the question the board asked? Triage is
+// per-host (each agent's ~/.turma/jira-repos.json, decided by its own model run
+// over its own candidate repos), while `ticketRepo` shows the freshest host's
+// answer — so a fleet routinely holds hosts that have not triaged a ticket the
+// board already displays a chip for, and hosts that triaged it somewhere else.
+// `spawn_ticket` re-derives the repo from the LOCAL ledger and refuses what it
+// has no decision for, so dispatching to either kind is a spawn that cannot run.
+// Eligibility therefore has to be the agent's own accept condition, and matching
+// `repo` is part of it: a host that answered a different repo would spawn against
+// THAT one, which is not the repo the operator was shown.
+//
+// Mirrors `_apply_triage`: no entry (or an undecided one) publishes no repoGuess,
+// and a "nothing fits" verdict publishes `repo: null` — both of which the agent
+// refuses, and both of which fail this test.
+function hostTriagedTicket(a, issueKey, repo) {
+  const t = ((a.jira && a.jira.tickets) || []).find((x) => x && x.key === issueKey);
+  return !!(t && t.repoGuess && t.repoGuess.repo && t.repoGuess.repo === repo);
+}
 function findTicketHost(siteKey, repo, issueKey, opts) {
   const requireFree = !!(opts && opts.requireFree);
   const now = Date.now();
   let anyOrg = false, anyOnline = false;
+  // Vacuously satisfied when there is no ticket to have triaged.
+  let anyTriaged = !issueKey;
   const cloned = [], uncloned = [];
   for (const [key, a] of Object.entries(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
     anyOrg = true;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     anyOnline = true;
+    // Ahead of the capacity filter, so an untriaged host is never the reason the
+    // ticket is reported as "waiting for a slot" — the two hold for different
+    // lengths of time and only one of them clears itself.
+    if (issueKey && !hostTriagedTicket(a, issueKey, repo)) continue;
+    anyTriaged = true;
     // A host with no room is out of the running entirely under requireFree —
     // including out of the "has the repo cloned" preference, so a full cloned
     // host never holds the ticket back from a free one that can clone on demand.
@@ -2522,11 +2548,25 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       return { status: 503, full: true, error:
         `this ticket is pinned to agent "${pin.host}", which has no free session slot` };
     }
+    // The pin says WHICH host, never that the host can run it. Checked after the
+    // capacity refusal above so the self-clearing reason wins a tie, and reported
+    // rather than routed around, exactly like every other pin refusal.
+    if (!hostTriagedTicket(a, issueKey, repo)) {
+      return { status: 503, error:
+        `this ticket is pinned to agent "${pin.host}", which has not triaged it to ${repo}` };
+    }
     return { host: pin.host,
       needsClone: !(a.repos || []).some((r) => r && r.name === repo) };
   }
   if (!anyOnline) {
     return { status: 503, error: "every host reporting that Jira org is offline" };
+  }
+  // Not `full`: a slot coming free does not give a host a triage decision, so
+  // this holds on the queue as `blocked` and ages out rather than waiting for a
+  // capacity change that would not help.
+  if (!anyTriaged) {
+    return { status: 503, error:
+      `no online host has triaged that ticket to ${repo}` };
   }
   if (requireFree && !cloned.length && !uncloned.length) {
     return { status: 503, full: true, error:
