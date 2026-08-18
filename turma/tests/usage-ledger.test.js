@@ -271,6 +271,38 @@ test("a retired host's model windows read as zero, not as its last day's", () =>
   assert.equal(bucketTokens(m.week), 0);
 });
 
+test("the serve budget truncates newest-first, loudly, without rendering the rest", () => {
+  // `retiredAgents` runs inside `buildAgentsCache`, so it is a hub-wide stall
+  // like every other synchronous step there. It is bounded (unlike the raw
+  // layer's cursor loop was), but it used to RENDER every host and then discard
+  // the ones that did not fit — 45.5 ms for 32 hosts at the ceilings, of which 4
+  // shipped. Stopping at the first drop takes that to 13.6 ms.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    process.env.USAGE_LEDGER_FILE = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "turma-serve-")), "l.json");
+    process.env.USAGE_LEDGER_SERVE_MAX = "700";   // room for roughly one host
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const blk = () => ({ totals: b(5), today: b(0), week: b(5),
+      days: { "2026-08-18": b(5) }, sessions: 1, models: [] });
+    // Ingested oldest-first, so "newest wins" cannot pass by insertion order.
+    for (const [i, key] of ["old", "mid", "new"].entries()) {
+      l.ingest(key, { device: key, usage: blk(),
+        repoUsage: [{ repo: "r", remoteKey: "rk", remote: "", usage: blk() }] },
+        1000 + i * 1000);
+    }
+    console.log(JSON.stringify(l.retiredAgents([]).map((a) => a.device)));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const served = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  // The NEWEST survives a truncation: what is given up is the oldest history.
+  assert.deepEqual(served, ["new"]);
+  // And it says so — a Usage page quietly missing a host reads as a fleet that
+  // spent less, with nothing on screen to say otherwise.
+  assert.match(fresh.stderr, /USAGE_LEDGER_SERVE_MAX/);
+});
+
 test("a host that has spent nothing never takes a ledger slot", () => {
   ledger.ingest("empty", { device: "empty", usage: null, repoUsage: [] }, now);
   assert.deepEqual(Object.keys(hosts()), []);

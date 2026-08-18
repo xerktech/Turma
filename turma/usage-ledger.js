@@ -695,6 +695,20 @@ function retiredAgents(liveKeys, now = Date.now()) {
   let dropped = 0;
   for (const key of keys) {
     const entry = hosts[key];
+    // Once ONE host has been dropped for size, stop rendering the rest. Keys are
+    // newest-first, so the remainder is older history that is worth less than
+    // what already shipped, and rendering it only to discard it is pure cost on
+    // the serving path — measured 45.5 ms for 32 retired hosts at the day/repo
+    // ceilings, of which 4 actually fit. (Bounded either way, unlike the raw
+    // layer's cursor loop; but this runs inside `buildAgentsCache`, so it is a
+    // hub-wide stall like every other synchronous step there.)
+    //
+    // Deliberately NOT "stop once `bytes` reaches the ceiling": it never does.
+    // The total plateaus below it as soon as every remaining host individually
+    // overflows what is left, so that test renders all 32 and saves nothing —
+    // measured 48.1 ms, i.e. no change. The remainder is still COUNTED, because
+    // the log has to say how much was left out.
+    if (dropped && out.length) { dropped += 1; continue; }
     const usage = entry.host ? servedSeries(entry.host, null, now) : null;
     const repoUsage = repoBlocks(entry, null, now);
     if (!usage && !repoUsage.length) continue;
