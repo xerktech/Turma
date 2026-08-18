@@ -44,6 +44,10 @@ data class FleetState(
     // 1..8; every screen's org tint reads it. Refreshed by the poll and the
     // "orgColors" SSE event.
     val orgColors: Map<String, Int> = emptyMap(),
+    // Tickets waiting for a free session slot (XERK-296), from the same payload;
+    // the board card's queued chip reads it. Refreshed by the poll and the
+    // "ticketQueue" SSE event.
+    val ticketQueue: List<com.xerktech.turma.model.QueuedTicket> = emptyList(),
     // Hub-wide mobile-push health (XERK-152): false when the hub has no FCM
     // credential, so every alert is silently dropped. Drives the Dashboard's
     // "push is off" banner. Poll-only (no SSE event); defaults true so an older
@@ -99,6 +103,7 @@ class FleetRepository(
             autoStartOrgs = resp.autoStartOrgs
             ticketModels = resp.ticketModels
             orgColors = resp.orgColors
+            ticketQueue = resp.ticketQueue
             pushEnabled = resp.pushEnabled
             emit(resp.now, error = null)
         } catch (e: Exception) {
@@ -119,6 +124,9 @@ class FleetRepository(
     private var orgColors: Map<String, Int> = emptyMap()
 
     @Volatile
+    private var ticketQueue: List<com.xerktech.turma.model.QueuedTicket> = emptyList()
+
+    @Volatile
     private var pushEnabled: Boolean = true
 
     private fun emit(now: Long, error: String?) {
@@ -129,6 +137,7 @@ class FleetRepository(
             autoStartOrgs = autoStartOrgs,
             ticketModels = ticketModels,
             orgColors = orgColors,
+            ticketQueue = ticketQueue,
             pushEnabled = pushEnabled,
         )
     }
@@ -170,6 +179,11 @@ class FleetRepository(
                     "orgColors" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, Int>>(data)
                     }.getOrNull()?.let { orgColors = it; emit(_state.value.now, null) }
+                    // A ticket was queued, dispatched or cancelled (XERK-296);
+                    // the event carries the whole (small) list, like the maps.
+                    "ticketQueue" -> runCatching {
+                        TurmaJson.decodeFromString<List<com.xerktech.turma.model.QueuedTicket>>(data)
+                    }.getOrNull()?.let { ticketQueue = it; emit(_state.value.now, null) }
                 }
             }
 

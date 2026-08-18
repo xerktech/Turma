@@ -45,7 +45,12 @@ services:
       # Both containers are on this compose's network, so the agent reaches the
       # hub by service name and neither needs to be published to the LAN.
       TURMA_URL: "${HUB_URL:-http://turma:8300}"
-      TURMA_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}"
+      # The fleet master, deliberately: this compose is a ONE-host fleet, so
+      # there is no other host for this agent to impersonate and no per-host
+      # token to derive. Add a second machine (agent.yaml) and that stops being
+      # true — give each agent its own token then, and set TURMA_AGENT_STRICT=1
+      # on the hub above.
+      TURMA_TOKEN: "${AGENT_TOKEN:-${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}}"
       DEVICE_NAME: "${AGENT_DEVICE_NAME:-my-host}"
       REPOS_ROOT: "/repos"
       MAX_SESSIONS: "${AGENT_MAX_SESSIONS:-6}"

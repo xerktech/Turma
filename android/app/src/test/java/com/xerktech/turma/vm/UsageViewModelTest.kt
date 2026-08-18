@@ -5,6 +5,7 @@ import com.xerktech.turma.model.LimitWindow
 import com.xerktech.turma.model.LimitsInfo
 import com.xerktech.turma.model.ModelUsage
 import com.xerktech.turma.model.RepoUsage
+import com.xerktech.turma.model.SubscriptionInfo
 import com.xerktech.turma.model.UsageBucket
 import com.xerktech.turma.model.UsageInfo
 import com.xerktech.turma.net.FleetState
@@ -291,6 +292,136 @@ class UsageViewModelTest {
         assertEquals(listOf("fresh", "stale"), UsageViewModel.compute(fleet, now).limits.map { it.host })
     }
 
+    // --- one card per subscription (XERK-301) -------------------------------
+    // Ports of usage.html's limitGroups / limitHostLabel.
+
+    private fun sub(key: String) = SubscriptionInfo(key = key)
+
+    @Test fun `hosts on one subscription fold into a single card`() {
+        // Both are logged into the same Claude account, so they read and spend
+        // one pool — two sets of bars was the same number drawn twice.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "maxai", device = "maxai", subscription = sub("k1"),
+                limits = limits(now - 600, five = LimitWindow(usedPct = 30.0))),
+            AgentInfo(key = "truenas", device = "truenas", subscription = sub("k1"),
+                limits = limits(now - 60, five = LimitWindow(usedPct = 42.0))),
+        ))
+        val cards = UsageViewModel.compute(fleet, now).limits
+        assertEquals(1, cards.size)
+        assertEquals(listOf("truenas", "maxai"), cards[0].hosts.map { it.host })
+        assertEquals("truenas · maxai", cards[0].host)
+        assertEquals(now - 60, cards[0].capturedAt)
+    }
+
+    @Test fun `different subscriptions keep their own cards`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "work", device = "work", subscription = sub("k1"),
+                limits = limits(now, five = LimitWindow(usedPct = 30.0))),
+            AgentInfo(key = "home", device = "home", subscription = sub("k2"),
+                limits = limits(now - 30, five = LimitWindow(usedPct = 5.0))),
+        ))
+        assertEquals(listOf(listOf("work"), listOf("home")),
+            UsageViewModel.compute(fleet, now).limits.map { c -> c.hosts.map { it.host } })
+    }
+
+    @Test fun `two hosts that merely both report NO subscription are never folded`() {
+        // Absent means "this host can't tell you", so two silent hosts are not
+        // thereby on one plan — an older agent must not have its bars merged
+        // into somebody else's.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old-a", device = "old-a",
+                limits = limits(now, five = LimitWindow(usedPct = 30.0))),
+            AgentInfo(key = "old-b", device = "old-b",
+                limits = limits(now, five = LimitWindow(usedPct = 70.0))),
+            AgentInfo(key = "old-c", device = "old-c", subscription = sub(""),
+                limits = limits(now, five = LimitWindow(usedPct = 90.0))),
+        ))
+        assertEquals(listOf(listOf("old-a"), listOf("old-b"), listOf("old-c")),
+            UsageViewModel.compute(fleet, now).limits.map { c -> c.hosts.map { it.host } })
+    }
+
+    @Test fun `each window takes its freshest reading, per window`() {
+        // The newest read of a shared counter is the most recent truth, and
+        // across a reset it is the only right answer — a maximum would keep the
+        // pre-reset figure alive. Per window, since the freshest snapshot need
+        // not carry both.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "a", device = "a", subscription = sub("k1"), limits = limits(
+                now - 600, five = LimitWindow(usedPct = 80.0), seven = LimitWindow(usedPct = 44.0))),
+            AgentInfo(key = "b", device = "b", subscription = sub("k1"),
+                limits = limits(now - 60, five = LimitWindow(usedPct = 3.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(3.0, card.fiveHour!!.pct, 0.001)    // freshest, not highest
+        assertEquals(44.0, card.sevenDay!!.pct, 0.001)   // the only reading there is
+    }
+
+    @Test fun `an aged-out snapshot never joins a group`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "dead", device = "dead", subscription = sub("k1"), limits = limits(
+                now - UsageViewModel.LIMIT_MAX_AGE_SEC - 60, five = LimitWindow(usedPct = 40.0))),
+            AgentInfo(key = "live", device = "live", subscription = sub("k1"),
+                limits = limits(now, five = LimitWindow(usedPct = 7.0))),
+        ))
+        assertEquals(listOf("live"),
+            UsageViewModel.compute(fleet, now).limits.single().hosts.map { it.host })
+    }
+
+    @Test fun `a capturedAt tie breaks the same way the web does`() {
+        // Two hosts whose snapshots tie to the second: fold in fleet order (or
+        // accept an equal capturedAt as newer) and this client shows a DIFFERENT
+        // percentage from the web for one subscription — the parity rule. Both
+        // sort freshest-first stably and replace only on a strictly newer read.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "first", device = "first", subscription = sub("k1"), limits = limits(
+                now - 5, five = LimitWindow(usedPct = 11.0), seven = LimitWindow(usedPct = 21.0))),
+            AgentInfo(key = "second", device = "second", subscription = sub("k1"), limits = limits(
+                now - 5, five = LimitWindow(usedPct = 99.0), seven = LimitWindow(usedPct = 91.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(11.0, card.fiveHour!!.pct, 0.001)
+        assertEquals(21.0, card.sevenDay!!.pct, 0.001)
+    }
+
+    @Test fun `a window read before the card's stamp carries its own read time`() {
+        // The head shows the group's FRESHEST capture, so a window the freshest
+        // host didn't report must not be presented under it.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", device = "old", subscription = sub("k1"),
+                limits = limits(now - 900, seven = LimitWindow(usedPct = 44.0))),
+            AgentInfo(key = "new", device = "new", subscription = sub("k1"),
+                limits = limits(now - 30, five = LimitWindow(usedPct = 3.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(now - 30, card.capturedAt)
+        assertEquals(now - 30, card.fiveHourAt)   // same as the head: nothing to disclose
+        assertEquals(now - 900, card.sevenDayAt)  // older, so the row says so
+    }
+
+    @Test fun `the five-hour row discloses its own read time too`() {
+        // The web renders both windows through one loop; this screen has two
+        // separate LimitRow call sites, so covering only the 7d one leaves the
+        // 5d half free to regress. Same fleet as above with the windows swapped.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", device = "old", subscription = sub("k1"),
+                limits = limits(now - 900, five = LimitWindow(usedPct = 80.0))),
+            AgentInfo(key = "new", device = "new", subscription = sub("k1"),
+                limits = limits(now - 30, seven = LimitWindow(usedPct = 12.0))),
+        ))
+        val card = UsageViewModel.compute(fleet, now).limits.single()
+        assertEquals(now - 900, card.fiveHourAt)
+        assertEquals(now - 30, card.sevenDayAt)
+    }
+
+    @Test fun `a long host list gives way to a count`() {
+        val fleet = FleetState(agents = (1..5).map {
+            AgentInfo(key = "h$it", device = "h$it", subscription = sub("k1"),
+                limits = limits(now - it, five = LimitWindow(usedPct = 1.0)))
+        })
+        assertEquals("h1 · h2 · h3 +2 more",
+            UsageViewModel.compute(fleet, now).limits.single().host)
+    }
+
     @Test fun `a window reports its percentage and the countdown to reset`() {
         val v = UsageViewModel.limitView(
             LimitWindow(usedPct = 23.5, resetsAt = now + 2 * 3600 + 14 * 60), now)!!
@@ -323,6 +454,77 @@ class UsageViewModelTest {
     @Test fun `a window with no percentage has nothing to draw`() {
         assertEquals(null, UsageViewModel.limitView(LimitWindow(resetsAt = now + 60), now))
         assertEquals(null, UsageViewModel.limitView(null, now))
+    }
+
+    // --- the sub-agent split (XERK-302) ---------------------------------
+    // Delegated tokens are a SLICE of the totals above, not an addend. The rule
+    // worth guarding is that a host which cannot report the split is left OUT of
+    // the share rather than counted as one that delegated nothing.
+
+    private fun split(all: Long) =
+        com.xerktech.turma.model.SubagentUsage(
+            today = bucket(all), week = bucket(all), totals = bucket(all))
+
+    @Test fun `the delegated share is taken against reporting hosts only`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "new", usage = usage(today = 250, week = 250, all = 1000)
+                .copy(subagent = split(250))),
+            // Too old to break its usage down — its 2000 must not dilute the share.
+            AgentInfo(key = "old", usage = usage(today = 2000, week = 2000, all = 2000)),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(250L, sub.total)
+        assertEquals(1000L, sub.ofTotal)
+        assertEquals(25.0, sub.totalPct!!, 0.001)
+        assertEquals(1, sub.reporting)
+        assertEquals(2, sub.hosts)
+        assertEquals(true, sub.partial)
+    }
+
+    @Test fun `no host reporting a split means no answer, not a zero share`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", usage = usage(today = 1, week = 1, all = 500)),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(false, sub.any)
+        assertEquals(null, sub.totalPct)
+    }
+
+    @Test fun `a host that delegated nothing is a real zero percent`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "new", usage = usage(today = 1, week = 1, all = 500)
+                .copy(subagent = split(0))),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(true, sub.any)
+        assertEquals(false, sub.partial)
+        assertEquals(0.0, sub.totalPct!!, 0.001)
+    }
+
+    @Test fun `a window with no spend has no share to take`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "new", usage = UsageInfo(totals = bucket(500))
+                .copy(subagent = split(0))),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(null, sub.todayPct)      // nothing spent today
+        assertEquals(0.0, sub.totalPct!!, 0.001)
+    }
+
+    @Test fun `a host with no usage block takes its split from its repos`() {
+        // Same host-block-then-repos fallback as the totals: an older aggregate
+        // shape must not drop this host out of the share.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", usage = null, repoUsage = listOf(
+                RepoUsage("A", "k/a", usage(today = 4, week = 4, all = 40)
+                    .copy(subagent = split(10))),
+                RepoUsage("B", "k/b", usage(today = 6, week = 6, all = 60)),  // no split
+            )),
+        ))
+        val sub = UsageViewModel.compute(fleet).subagent
+        assertEquals(10L, sub.total)
+        assertEquals(40L, sub.ofTotal)   // only the repo that reported one
+        assertEquals(25.0, sub.totalPct!!, 0.001)
     }
 
     @Test fun `fmtDuration reads as an age or a countdown at every scale`() {

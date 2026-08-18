@@ -41,6 +41,7 @@ stdlib only — no pip installs in the image.
 
 import base64
 import datetime
+import hashlib
 import html
 import io
 import ipaddress
@@ -53,6 +54,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -225,6 +227,18 @@ CLAUDE_CREDS_PATH = os.environ.get(
 CLAUDE_AUTH_WARN_MS = int(
     os.environ.get("TURMA_CLAUDE_AUTH_WARN_SEC", str(3 * 24 * 3600)) or 0) * 1000
 
+# Claude Code's own config file, which is where the logged-in ACCOUNT is
+# recorded (XERK-301). Two layouts are real, so both are tried in order: with
+# CLAUDE_CONFIG_DIR set it sits INSIDE that dir, and by default it is a SIBLING
+# of ~/.claude. Derived from PROJECTS_ROOT so a native install's override moves
+# it too; CLAUDE_CONFIG_PATH pins it outright.
+_CLAUDE_HOME = os.path.dirname(PROJECTS_ROOT)
+CLAUDE_CONFIG_PATHS = tuple(p for p in (
+    os.environ.get("CLAUDE_CONFIG_PATH"),
+    os.path.join(_CLAUDE_HOME, ".claude.json"),
+    os.path.join(os.path.dirname(_CLAUDE_HOME), ".claude.json"),
+) if p)
+
 # Archive sync: ship INACTIVE-session transcripts to the hub's durable, searchable
 # store (see turma/archive.js). The agent enumerates ended transcripts, and pushes
 # each as append-only byte-range deltas the hub asks for (via the archiveHave map on
@@ -286,6 +300,16 @@ ARCHIVE_PAYLOAD_MAX = _byte_ceiling(
 # in-memory relay. Transcripts are JSON and compress ~10x, so this covers very
 # large sessions; the guard is a backstop, not an expected limit (XERK-101).
 MIGRATION_BLOB_MAX = int(os.environ.get("TURMA_MIGRATION_BLOB_MAX", str(1 << 26)))  # 64 MiB
+
+# How many staged session-start refusals (XERK-265) a beat may carry, and how
+# long one reason may be. Neither is a normal limit — a refusal only exists where
+# a command was declined, and the reasons are one line. They are here because the
+# reason can interpolate an exception (`the session failed to launch: {e}`) whose
+# text is unbounded, and it lands in a hub cache that COUNTS against the record
+# ceiling: an 8 MiB beat would wedge this host's control plane. Matches the 500
+# `_set_error` already truncates a session's errorMsg to.
+SPAWN_FAILURES_MAX = 40
+SPAWN_FAILURE_REASON_MAX = 500
 
 
 def _project_slug(path):
@@ -981,7 +1005,61 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.aws/**)",
     "Edit(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
-    "Edit(~/.claude/**)",
+    # ~/.claude is covered by `hooks/fileguard.py`, NOT by a pattern, because the
+    # rule is "everything under ~/.claude except the two agent-memory trees" and
+    # a glob list cannot express it: deny beats allow, so the exception must be a
+    # hole in the deny, and every hole is either too big (a deny matching the
+    # `agent-memory` DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is
+    # the blanket rule again) or too small (an enumerated danger list missed
+    # `shell-snapshots/`, which is arbitrary code in every live session's shell).
+    #
+    # These rules stay as DEFENCE IN DEPTH for the subset where being wrong is
+    # catastrophic: if the hook is ever misconfigured or crashes, the login, the
+    # agent definitions, the hook scripts and the shell snapshots are still
+    # protected. Every pattern here is anchored on a dot, a name or a suffix, so
+    # none can match the `agent-memory` or `projects` directory entries.
+    "Edit(~/.claude.json)",             # mcpServers: command lines run at startup
+    "Edit(~/.claude/.*)",               # .credentials.json — the fleet's login
+    "Edit(~/.claude/*.json)",
+    "Edit(~/.claude/*.jsonl)",
+    "Edit(~/.claude/settings.json*)",   # …and its .bak-* siblings
+    "Edit(~/.claude/CLAUDE.md*)",       # injected into every session on this host
+    "Edit(~/.claude/agents/**)",        # steers every future run
+    "Edit(~/.claude/bin/**)",           # hook scripts auto-execute: RCE
+    "Edit(~/.claude/hooks/**)",
+    "Edit(~/.claude/local/**)",         # the alternate install: the claude binary
+    "Edit(~/.claude/plugins/**)",
+    "Edit(~/.claude/rules/**)",         # loaded into sessions as instructions
+    "Edit(~/.claude/sessions/**)",      # session keys + the remote-control registry
+    "Edit(~/.claude/shell-snapshots/**)",  # sourced by every Bash call, every session
+    "Edit(~/.claude/skills/**)",
+    # Executed or loaded as instructions when the hook is not in force. QA
+    # measured each of these writable with the hook crashed, where the blanket
+    # rule had denied them, so the backstop has to name them for the
+    # "catastrophic subset" claim above to be true.
+    "Edit(~/.claude/commands/**)",
+    "Edit(~/.claude/output-styles/**)",
+    "Edit(~/.claude/workflows/**)",
+    "Edit(~/.claude/routines/**)",
+    "Edit(~/.claude/cowork_plugins/**)",
+    "Edit(~/.claude/jobs/**)",
+    "Edit(~/.claude/daemon/**)",
+    "Edit(~/.claude/ide/**)",              # lock files publish a port + token
+    "Edit(~/.claude/todos/**)",
+    "Edit(~/.claude/themes/**)",
+    # In Claude Code's own integrity walk beside shell-snapshots and hooks, and
+    # where the successful post-neutralisation write actually landed when QA
+    # re-ran the attack — so it belongs here at least as much as themes/ does.
+    "Edit(~/.claude/session-env/**)",
+    "Edit(~/.claude/worktrees/**)",
+    "Edit(~/.claude/plans/**)",
+    "Edit(~/.claude/backups/**)",          # the restore path for all of the above
+    "Edit(~/.claude/statusline-command.sh)",  # run when settings.json sets statusLine
+    # Transcripts: replayed into a resumed session and pushed to the hub's
+    # archive. Files only — `projects/*/*` would match the `memory` DIRECTORY
+    # beside them and take its whole subtree.
+    "Edit(~/.claude/projects/*/*.jsonl)",
+    "Edit(~/.claude/projects/*/subagents/**)",
     "Edit(~/.config/gcloud/**)",
     # The host's cached non-GitHub git creds (the `store` helper's file), shared
     # by every session on the box exactly like ~/.aws.
@@ -998,6 +1076,22 @@ _GUARD_DENY_PATH_RULES = [
     # change that. Do not treat this line as containment. Keeping the token out
     # of child environments would need Claude Code's apiKeyHelper.
     "Read(~/.turma/local-model.env)",
+    # The files that WIRE the guard. `_ensure_guard_settings` caches the path on
+    # the manager INSTANCE and rewrites the file from build_guard_settings() on a
+    # fresh process, so one Write disables both hooks and rewrites the deny list
+    # for every session that manager launches for the rest of its lifetime —
+    # managers here run for days — and only a restart repairs it. Denying the
+    # agent's installed code (runtime_code_deny_rules) without this just moves
+    # the attack one directory over. NOT all of ~/.turma: the agent stages
+    # uploads and question files there and sessions legitimately write it.
+    # The interpreter injection points the -sE flags close. Kept as defence in
+    # depth: a hook invoked without the flags (an older settings file still on
+    # disk, a path this module does not build) is neutralised by one Write here.
+    "Edit(~/.local/lib/python*/site-packages/**)",
+    "Edit(~/.local/lib/python*/site-packages/*.pth)",
+    "Edit(~/.config/python*/**)",
+    "Edit(~/.turma/guard-settings.json)",
+    "Edit(~/.turma/limits-settings.json)",
     "Edit(~/.turma/local-model.env)",
 ]
 
@@ -1056,6 +1150,87 @@ def ask_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
 
 
+def _glob_literal(path):
+    """Escape glob metacharacters so a path is matched as literal text.
+
+    `runtime_code_deny_rules` interpolates a filesystem path into a glob. An
+    install prefix containing `[`, `*` or `?` would otherwise be read as a
+    pattern: a directory literally named `t[1]` yields a character class, so the
+    directory it names goes UNPROTECTED while an unrelated `t1` is wrongly
+    denied.
+
+    MEASURED against claude 2.1.231 — do not "simplify" from intuition:
+    **backslash escapes `[` and `*`**, and the escaped form does not over-reach
+    onto a neighbouring name; a literal `?` has no working escape — only the `?`
+    wildcard matches it, and that over-reaches onto unrelated names.
+
+    The spelling that shipped broken applied `[c]` to EVERY metacharacter, so
+    `t[1]` became `t[[]1[]]`, which denies nothing. `[[]` on its own does escape
+    `[` correctly — the earlier note here that the character-class spelling
+    "escapes NOTHING" was wrong. tests/test_matcher_oracle.py pins both against
+    the real binary; a string assertion cannot, which is how it shipped.
+
+    So a `?` in the install prefix cannot be expressed. Rather than emit a rule
+    that silently protects the wrong thing, `runtime_code_deny_rules` refuses to
+    emit one and says so — an unprotected prefix the operator is told about
+    beats a rule everyone believes in.
+    """
+    # Backslash FIRST, or escaping the others re-introduces the bug: an install
+    # path containing a literal `\` had its next character read as escaped, so
+    # the real directory went unprotected while an unrelated one was denied —
+    # the exact defect this function exists to fix, one character over.
+    return "".join("\\" + ch if ch in "\\*[" else ch for ch in path)
+
+
+def runtime_code_deny_rules(script_dir=None, repos_root=None):
+    """Deny writes to the agent's OWN installed code — the hooks above all.
+
+    `fileguard.py` refuses writes under ~/.claude, and nothing was stopping a
+    session overwriting `fileguard.py` itself: two Writes (neutralise the hook,
+    then write anywhere) re-opened the whole config directory. The blanket
+    pattern this hook replaced had no such dependency, so the hook's own
+    integrity has to be protected explicitly. Covers `guard.py` and `ask.py`
+    beside it, and `hub-agent.py`/`tunnel-agent.js` in the parent — a session
+    rewriting the manager owns the host.
+
+    **Skipped when the code lives inside REPOS_ROOT**, i.e. a developer checkout
+    of this repo: sessions working on Turma must be able to edit Turma. That is
+    exactly the case where the files are NOT the running agent's — the container
+    and native installs both put the runtime at a prefix outside the git root.
+    """
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    repos_root = repos_root if repos_root is not None else REPOS_ROOT
+    try:
+        real_dir = os.path.realpath(script_dir)
+        real_root = os.path.realpath(repos_root)
+    except OSError:
+        return []
+    if real_dir == real_root or real_dir.startswith(real_root + os.sep):
+        return []                          # a checkout, not the installed agent
+    # The DOUBLED leading slash is load-bearing. Claude Code reads a single `/`
+    # as relative to the directory holding the `--settings` file, so
+    # `Edit(/root/.local/share/turma-agent/**)` resolves against
+    # `~/.turma/guard-settings.json` and means `~/.turma/root/.local/...` — a
+    # path that exists nowhere, so the rule binds to NOTHING. Measured: with one
+    # slash the two-Write hook-neutralisation attack succeeds; with two it is
+    # refused. The rule read fine and did nothing, which is why the test
+    # asserting its STRING was green over a rule with no effect.
+    if "?" in real_dir:
+        # No escape for a literal `?` exists in this matcher, so any rule built
+        # here would protect the wrong paths. Say so rather than emit one.
+        log(f"WARNING: agent install path {real_dir!r} contains '?', which cannot be "
+            f"expressed as a literal in a permission rule — the agent's own code is "
+            f"NOT protected from session writes. Reinstall to a path without it.")
+        return []
+    return [f"Edit(/{_glob_literal(real_dir)}/**)"]
+
+
+def fileguard_script_path():
+    """Absolute path to the bundled file-write guard hook
+    (``hooks/fileguard.py``), resolved the same way as ``guard_script_path``."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
+
+
 def statusline_script_path():
     """Absolute path to the bundled subscription-limits statusLine hook
     (``hooks/statusline.py``), resolved the same way as ``guard_script_path``."""
@@ -1071,9 +1246,10 @@ ASK_HOOK_TIMEOUT_SEC = 660
 
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
-                         local_settings_path=None):
+                         local_settings_path=None, fileguard_path=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
-    Bash (the safety guard) and AskUserQuestion (the glasses answer bridge),
+    Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
+    and AskUserQuestion (the glasses answer bridge),
     plus deny rules protecting the host credential stores. The bypass-mode
     session runs freely except for what the guard blocks (see ``hooks/guard.py``);
     the ask bridge routes interactive questions to the glasses (see
@@ -1086,10 +1262,29 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
-    guard_command = f'"{python_exe}" "{guard_path}"'
-    ask_command = f'"{python_exe}" "{ask_path}"'
+    # `-SsE` are SECURITY flags here, not tidiness. A plain interpreter start
+    # imports user-site `usercustomize` before the hook's own code, so one Write
+    # to ~/.local/lib/pythonX/site-packages/usercustomize.py neutralises EVERY
+    # hook on the host — measured: with such a payload the Bash guard allowed
+    # `rm -rf /`, `git push --force origin main` and `chmod -R 777 /`, and it
+    # persists into every future python3 run as that user.
+    #
+    # `-S` is the one that closes the CLASS: `-s` drops only the USER site dir,
+    # while the interpreter's OWN site-packages is still scanned, so a `.pth` or
+    # `sitecustomize.py` there runs inside every hook process — measured, end to
+    # end, and reachable in the container, whose final stage sets no USER and so
+    # runs sessions as root over a writable /usr. `-s` and `-E` stay for the
+    # user-site and PYTHON* env halves. The ~/.local deny patterns beside this
+    # stop a plant via the file-editing TOOLS only; Bash walks past them like it
+    # walks past every pattern (XERK-309), so they are a partial reduction, not
+    # the fix. The flags are the fix.
+    # The hooks are stdlib-only by contract, so neither flag can break them.
+    guard_command = f'"{python_exe}" -SsE "{guard_path}"'
+    fileguard_path = fileguard_path or fileguard_script_path()
+    ask_command = f'"{python_exe}" -SsE "{ask_path}"'
+    fileguard_command = f'"{python_exe}" -SsE "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
-    perms = {"deny": list(_GUARD_DENY_PATH_RULES)}
+    perms = {"deny": list(_GUARD_DENY_PATH_RULES) + runtime_code_deny_rules()}
     for rule in deny:  # operator deny unions on top of the guard's own rules
         if rule not in perms["deny"]:
             perms["deny"].append(rule)
@@ -1097,25 +1292,36 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     for rule in allow:  # operator allow unions on top of the app's own rules
         if rule not in perms["allow"]:
             perms["allow"].append(rule)
-    return {
-        "permissions": perms,
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": guard_command}],
-                },
-                {
-                    "matcher": "AskUserQuestion",
-                    "hooks": [{
-                        "type": "command",
-                        "command": ask_command,
-                        "timeout": ASK_HOOK_TIMEOUT_SEC,
-                    }],
-                },
-            ]
-        },
-    }
+    pre = [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": guard_command}],
+    }]
+    # A hook whose script EXITS NONZERO fails open; a hook whose script is
+    # MISSING fails closed, and Claude Code then refuses every file edit in
+    # every session on the host — a version-skewed install would present as an
+    # unexplainable permissions bug. So wire it only when it is actually there,
+    # and say so loudly: patterns-only is degraded, not broken.
+    if os.path.exists(fileguard_path):
+        pre.append({
+            # ~/.claude is "everything except the two memory trees", which is a
+            # predicate and not a glob. See hooks/fileguard.py for why.
+            # MultiEdit does not exist in Claude Code 2.1.229; it is listed so
+            # the matcher does not silently stop covering it if it returns.
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+            "hooks": [{"type": "command", "command": fileguard_command}],
+        })
+    else:
+        log(f"fileguard hook missing at {fileguard_path}; ~/.claude is protected "
+            f"by deny patterns only (see .claude/rules/agent-hooks.md)")
+    pre.append({
+        "matcher": "AskUserQuestion",
+        "hooks": [{
+            "type": "command",
+            "command": ask_command,
+            "timeout": ASK_HOOK_TIMEOUT_SEC,
+        }],
+    })
+    return {"permissions": perms, "hooks": {"PreToolUse": pre}}
 
 
 def build_limits_settings(python_exe=None, statusline_path=None):
@@ -1141,7 +1347,7 @@ def build_limits_settings(python_exe=None, statusline_path=None):
     return {
         "statusLine": {
             "type": "command",
-            "command": f'"{python_exe}" "{statusline_path}"',
+            "command": f'"{python_exe}" -SsE "{statusline_path}"',
             "padding": 0,
         },
     }
@@ -1154,10 +1360,22 @@ def build_limits_settings(python_exe=None, statusline_path=None):
 _HOSTNAME_PLACEHOLDERS = {"", "localhost", "unknown-device", "docker-desktop"}
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12}$|^[0-9a-f]{64}$")
 
+# A name that is a URL dot segment is UNADDRESSABLE, not merely ugly: percent-
+# encoding leaves "." and ".." untouched (they are unreserved), and the URL
+# parser resolving /api/agents/<host>/... then collapses the segment away — so
+# the host heartbeats and looks online while every route against it 404s, with
+# nothing pointing at the name as the cause (XERK-269). Rejecting it here makes
+# the agent fall through to its next naming source instead.
+_DOT_SEGMENT_NAMES = {".", ".."}
+
 
 def _usable_hostname(name):
     name = (name or "").strip()
     if name.lower() in _HOSTNAME_PLACEHOLDERS:
+        return ""
+    if name in _DOT_SEGMENT_NAMES:
+        log(f"ignoring device name {name!r}: a URL dot segment is unaddressable "
+            "on /api/agents/<host>/... routes")
         return ""
     if _CONTAINER_ID_RE.match(name):
         return ""
@@ -1289,10 +1507,19 @@ def device_name():
     #      / WSL2 path, where the container is isolated from the host name.
     #   5. socket.gethostname() — only when it isn't a container id (the
     #      "fe0e38df73b4" bug); inside a container it usually is, so it's rejected.
+    # An explicit override deliberately outranks _usable_hostname()'s placeholder
+    # rules — an operator naming a host "localhost" means it. But a dot segment is
+    # unaddressable no matter who chose it (XERK-269), so that one check still
+    # applies here; the name is dropped and detection continues below.
     for env in ("DEVICE_NAME", "COMPUTERNAME"):
         name = os.environ.get(env, "").strip()
-        if name:
-            return name
+        if not name:
+            continue
+        if name in _DOT_SEGMENT_NAMES:
+            log(f"ignoring ${env}={name!r}: a URL dot segment is unaddressable "
+                "on /api/agents/<host>/... routes")
+            continue
+        return name
     try:
         with open("/host/etc/hostname") as f:
             name = _usable_hostname(f.read())
@@ -1542,6 +1769,135 @@ def claude_auth_status(path=None, now_ms=None):
     return status
 
 
+# --- which subscription this host is on (XERK-301) --------------------------
+# The 5-hour and 7-day windows belong to the ACCOUNT, not the machine: every
+# host logged into one Claude account reads — and spends — the same pool, so
+# the usage page draws one set of bars per subscription rather than one per
+# host. That grouping needs a stable identity for the login, and the only one
+# Claude Code records is `oauthAccount.accountUuid` in its config file. The
+# credentials file beside it is no use here: its tokens rotate, and
+# `subscriptionType` names a PLAN ("max"), which two different accounts share.
+#
+# What rides the wire is a HASH of that uuid, never the uuid, the org uuid or
+# the email. The hub persists every heartbeat into state.json and fans it out
+# to web, Android and glasses, and grouping only ever asks whether two hosts
+# are equal — so there is nothing to gain by shipping the identifier itself.
+SUBSCRIPTION_KEY_ENV = "TURMA_SUBSCRIPTION_KEY"
+# The config file is ~120 KiB of caches on a real host and grows; this is the
+# "that is not the file I think it is" bound, not a size anyone should approach.
+SUBSCRIPTION_CONFIG_MAX_BYTES = 8 << 20
+# Truncated: this is a grouping key, not a credential, and 64 bits makes a
+# collision between two of one operator's logins a non-event.
+SUBSCRIPTION_KEY_CHARS = 16
+
+# path -> ((mtime, size), block) for each config path read. That file is big and
+# almost never changes, so re-parsing it every beat would be pure waste; a
+# changed mtime/size is what invalidates this, so a re-login is picked up.
+_subscription_cache = {}
+# path -> the last problem logged about it. Keyed per PATH, not one global last
+# message: the read walks every candidate, so two simultaneously-bad paths (a
+# directory at one, a FIFO at the other) alternate messages and a single-slot
+# memo never matches — which is thousands of lines a day, the exact burial this
+# exists to prevent. Bounded by CLAUDE_CONFIG_PATHS, which is fixed and short.
+_subscription_last_problem = {}
+
+
+def _log_subscription_problem(path, msg):
+    """Log a bad config file ONCE per distinct problem per path — this runs
+    every beat, and a permanently unreadable file would otherwise bury the log."""
+    if _subscription_last_problem.get(path) != msg:
+        _subscription_last_problem[path] = msg
+        log(msg)
+
+
+def _subscription_key(value):
+    """An opaque, stable key: equal inputs give equal keys, and nothing about
+    the input survives. Domain-separated so the digest can't be confused with
+    one of the other things this fleet hashes."""
+    digest = hashlib.sha256(("turma-subscription:" + value).encode("utf-8"))
+    return digest.hexdigest()[:SUBSCRIPTION_KEY_CHARS]
+
+
+def subscription_identity(paths=None, env=None):
+    """The heartbeat's `subscription` block — ``{key, source}`` — or None when
+    this host cannot say which subscription it is on.
+
+    None is the heartbeat contract's "that agent can't tell you" value, and the
+    usage page keeps such a host on a card of its own rather than guessing:
+    two hosts that BOTH report nothing are not thereby on the same plan.
+
+    `TURMA_SUBSCRIPTION_KEY` pins the group by hand, for a host whose config
+    file this cannot read (a login shape that stops carrying the uuid, or an
+    install that keeps it somewhere unusual). It is hashed like the uuid is, so
+    two hosts given the same string land in the same group and neither source
+    leaks its input.
+
+    Every candidate path is tried until one ANSWERS — a path that exists but
+    carries no account must not suppress the layout that does, since the two are
+    routinely both present (`~/.claude/` is a directory beside `~/.claude.json`).
+    """
+    env = os.environ if env is None else env
+    pinned = (env.get(SUBSCRIPTION_KEY_ENV) or "").strip()
+    if pinned:
+        return {"key": _subscription_key("env:" + pinned), "source": "env"}
+    for path in (paths if paths is not None else CLAUDE_CONFIG_PATHS):
+        block = _subscription_from_config(path)
+        if block:
+            return block
+    return None
+
+
+def _subscription_from_config(path):
+    """One config path's subscription block, or None — missing, not a regular
+    file, implausibly large, unreadable, or simply carrying no account.
+
+    Never raises, and never BLOCKS. It runs on the beat's critical path over a
+    path this agent does not own, so a truncated write, a shape a release
+    changed, or something at that path that isn't the config file at all must
+    cost the grouping and nothing else.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None                     # not this layout; the caller tries the next
+    # Regular files ONLY. A FIFO here blocks `open()` for as long as nobody
+    # writes to it, and this call is inline in the beat — the host would simply
+    # stop heartbeating, with no error anywhere to say why. A directory or a
+    # device at that path is equally not the file being looked for.
+    if not stat.S_ISREG(st.st_mode):
+        _log_subscription_problem(
+            path, f"claude config at {path} is not a regular file; ignoring it")
+        return None
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _subscription_cache.get(path)
+    if cached and cached[0] == sig:
+        return cached[1]
+    block = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            # Bounded by the READ, never by `st_size`: a char device reports a
+            # size of 0 and then hands over bytes forever, so a stat-only check
+            # is not a check at all (the same trap read_limits_snapshot spells
+            # out). S_ISREG above already excludes /dev/zero itself; this is
+            # what makes the bound true for anything that merely looks regular.
+            text = fh.read(SUBSCRIPTION_CONFIG_MAX_BYTES + 1)
+        if len(text) > SUBSCRIPTION_CONFIG_MAX_BYTES:
+            _log_subscription_problem(
+                path, f"claude config at {path} is implausibly large; not reading it")
+        else:
+            account = (json.loads(text) or {}).get("oauthAccount") or {}
+            account_uuid = account.get("accountUuid")
+            if isinstance(account_uuid, str) and account_uuid.strip():
+                block = {"key": _subscription_key("account:" + account_uuid.strip()),
+                         "source": "login"}
+    except Exception as e:
+        _log_subscription_problem(
+            path, f"claude config at {path} unreadable ({e}); "
+            "this host will not be grouped by subscription")
+    _subscription_cache[path] = (sig, block)
+    return block
+
+
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 
 
@@ -1559,7 +1915,9 @@ def _add_tokens(bucket, tok):
         bucket[k] += n
 
 
-def _model_acc():
+def _window_acc():
+    """A totals bucket plus its per-day buckets — the shape both the per-model
+    breakdown and the sub-agent split accumulate into."""
     return {"totals": _usage_bucket(), "days": {}}
 
 
@@ -1579,16 +1937,29 @@ class _UsageAcc:
         # breakdown costs a few scalars per model on the wire rather than a
         # whole second days matrix.
         self.models = {}
+        # The sub-agent SLICE of everything above (XERK-302), same totals+days
+        # shape and the same day-bucket economy as `models`. Tokens a background
+        # agent spent are folded into `totals`/`days`/`models` like any other —
+        # they are real spend on the same subscription — and counted here a
+        # second time so the report can say how much of the whole is delegated
+        # work. Never a bucket of its own beside the totals: that would read as
+        # "sub-agents are extra", and the two would then have to be added to get
+        # what the host actually spent.
+        self.subagent = _window_acc()
         self.seen = set()   # (message id, requestId) dedup keys
         self.last_ts = ""
         self.sessions = 0   # transcript files folded in
 
 
-def _accumulate_usage(lines, acc):
+def _accumulate_usage(lines, acc, subagent=False):
     """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
     usage block count for anything; each message is deduped on
     (message id, requestId) via acc.seen, so a message re-seen across files or
-    across incremental beats counts exactly once."""
+    across incremental beats counts exactly once.
+
+    `subagent` marks the lines as a background agent's own transcript, which
+    counts toward the totals exactly like a session's own turns AND is tallied
+    into acc.subagent so the report can name the delegated share."""
     for line in lines:
         if '"usage"' not in line:
             continue
@@ -1630,18 +2001,91 @@ def _accumulate_usage(lines, acc):
         # model" table doesn't list a phantom "<synthetic>" model that consumed
         # nothing. Mirrors _scan_model_entry's same guard.
         if not model.startswith("<"):
-            m = acc.models.setdefault(model, _model_acc())
+            m = acc.models.setdefault(model, _window_acc())
             buckets.append(m["totals"])
             if day:
                 buckets.append(m["days"].setdefault(day, _usage_bucket()))
+        if subagent:
+            buckets.append(acc.subagent["totals"])
+            if day:
+                buckets.append(acc.subagent["days"].setdefault(day, _usage_bucket()))
         for b in buckets:
             _add_tokens(b, tok)
+
+
+def _project_transcripts(proj):
+    """Every transcript under one Claude project dir, as [(relpath, subagent)].
+
+    TWO kinds of transcript live under a slug, and both are real spend on the
+    same login (XERK-302):
+      - the sessions' own conversations, `<slug>/<id>.jsonl`; and
+      - the transcripts of the background agents those sessions delegate to,
+        which Claude Code writes into a dir keyed on the parent's id —
+        `<slug>/<id>/subagents/agent-<x>.jsonl`, one level deeper for a Workflow
+        run (`<slug>/<id>/subagents/workflows/wf_<run>/agent-<x>.jsonl`).
+    Only the flat listing was ever read, so **every delegated token went
+    uncounted** — measured at 19% of one host's real total, and rising with how
+    much work the fleet delegates.
+
+    The nesting under `subagents/` is Claude Code's and has already grown a
+    level, so it is WALKED rather than either depth hard-coded; a shape added
+    later folds in with no change here. The walk is anchored on a `subagents`
+    dir rather than on its parent transcript still existing — the tokens were
+    spent whether or not that conversation has since been pruned.
+
+    Keys are RELATIVE PATHS, never bare filenames: the two namespaces share one
+    offsets map, and `agent-<x>.jsonl` under two different parents would
+    otherwise collide and silently skip one of them.
+
+    **Only regular files count, on both branches.** A `*.jsonl` DIRECTORY would
+    otherwise be counted as a conversation AND skip its own `subagents/` tree,
+    and a FIFO (or a symlink to `/dev/zero`) named `*.jsonl` blocks the full-read
+    path forever — this walk is the one place that can cheaply refuse both.
+
+    Returns None (not []) when the dir can't be listed, so the caller can tell
+    an unreadable project from an empty one. Nothing below raises: this runs on
+    the heartbeat's critical path, where an escape is a host that reads offline."""
+    try:
+        with os.scandir(proj) as it:
+            entries = sorted(it, key=lambda e: e.name)
+    except OSError:
+        return None
+    out = []
+    for entry in entries:
+        try:
+            if entry.name.endswith(".jsonl") and entry.is_file():
+                out.append((entry.name, False))
+            # A *.jsonl dir still gets its subagents read; a SYMLINKED dir never
+            # does (see below).
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            sub = os.path.join(entry.path, "subagents")
+            if not os.path.isdir(sub) or os.path.islink(sub):
+                continue
+            # `followlinks=False` only stops os.walk following links it finds
+            # BELOW its top; it always descends the top itself. So NEITHER of
+            # the two link checks above is redundant — one refuses a `subagents`
+            # symlink, the other a symlinked PARENT that reaches a real one.
+            # Pointed at PROJECTS_ROOT such a link drags every transcript on the
+            # host into a single slug; pointed at an ancestor it re-reads the
+            # slug's own conversations flagged as delegated. No writer creates
+            # one (the guard denies ~/.claude), so this is hardening rather than
+            # a live path — but the whole class is cheaper to refuse than to
+            # reason about one shape at a time.
+            for dirpath, _dirs, files in os.walk(sub):
+                for name in sorted(files):
+                    path = os.path.join(dirpath, name)
+                    if name.endswith(".jsonl") and os.path.isfile(path):
+                        out.append((os.path.relpath(path, proj), True))
+        except OSError:
+            continue
+    return out
 
 
 def _aggregate_project(proj, acc, offsets=None):
     """Fold one Claude project dir's transcript token usage into `acc`.
 
-    With an `offsets` dict {filename: byte-offset} this parses INCREMENTALLY:
+    With an `offsets` dict {relpath: byte-offset} this parses INCREMENTALLY:
     only bytes appended since the last call are read, and each offset advances
     only to a newline boundary, so an entry still mid-write at a beat boundary
     is re-read whole next beat rather than split. Returns False — without
@@ -1650,14 +2094,13 @@ def _aggregate_project(proj, acc, offsets=None):
     from a fresh acc. With `offsets=None` it does a plain full read (tests /
     one-shot callers) and always returns True. Silently no-ops on a
     missing/unreadable dir (the source of truth is best-effort)."""
-    try:
-        files = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
-    except OSError:
+    files = _project_transcripts(proj)
+    if files is None:
         return True
     if offsets is not None:
         # A tracked transcript that shrank/disappeared can't be reconciled
         # incrementally — tell the caller to start this slug's acc over.
-        present = set(files)
+        present = {rel for rel, _sub in files}
         for f, off in offsets.items():
             path = os.path.join(proj, f)
             try:
@@ -1666,12 +2109,12 @@ def _aggregate_project(proj, acc, offsets=None):
                 size = -1
             if f not in present or size < off:
                 return False
-    for fname in files:
-        path = os.path.join(proj, fname)
+    for rel, subagent in files:
+        path = os.path.join(proj, rel)
         if offsets is None:
             try:
                 with open(path, errors="replace") as fh:
-                    _accumulate_usage(fh, acc)
+                    _accumulate_usage(fh, acc, subagent)
             except OSError:
                 continue
             continue
@@ -1679,9 +2122,9 @@ def _aggregate_project(proj, acc, offsets=None):
             size = os.stat(path).st_size
         except OSError:
             continue
-        start = offsets.get(fname, 0)
+        start = offsets.get(rel, 0)
         if size <= start:
-            offsets[fname] = size
+            offsets[rel] = size
             continue
         try:
             with open(path, "rb") as fh:
@@ -1695,16 +2138,19 @@ def _aggregate_project(proj, acc, offsets=None):
         if nl < 0:
             continue
         _accumulate_usage(
-            chunk[:nl + 1].decode(errors="replace").splitlines(), acc)
-        offsets[fname] = start + nl + 1
-    # `sessions` is a display stat (transcript files folded in). A persistent
-    # per-slug acc holds just its own slug's file count (set, since the acc
-    # outlives the call); the full-read path accumulates across the several dirs
-    # a caller may fold into one acc.
+            chunk[:nl + 1].decode(errors="replace").splitlines(), acc, subagent)
+        offsets[rel] = start + nl + 1
+    # `sessions` is a display stat (CONVERSATIONS folded in), so a delegated
+    # agent's transcript is not one — it belongs to a session already counted,
+    # and counting it would inflate the figure by however much that session
+    # delegated. A persistent per-slug acc holds just its own slug's file count
+    # (set, since the acc outlives the call); the full-read path accumulates
+    # across the several dirs a caller may fold into one acc.
+    n = sum(1 for _rel, sub in files if not sub)
     if offsets is None:
-        acc.sessions += len(files)
+        acc.sessions += n
     else:
-        acc.sessions = len(files)
+        acc.sessions = n
     return True
 
 
@@ -1775,6 +2221,15 @@ def _finalize_usage(acc):
             key=lambda m: _total_tokens(m["totals"]),
             reverse=True,
         ),
+        # How much of the block above was spent by background agents (XERK-302).
+        # A SLICE of the totals, never an addend — see _UsageAcc.subagent. Its
+        # day buckets stay agent-side for the same reason the per-model ones do:
+        # only the three windows the UI shows travel.
+        "subagent": {
+            "totals": dict(acc.subagent["totals"]),
+            "today": dict(acc.subagent["days"].get(window[-1]) or _usage_bucket()),
+            "week": _sum_days(acc.subagent["days"], window),
+        },
     }
 
 
@@ -1804,10 +2259,13 @@ def _merge_acc(dst, src):
     for d, b in src.days.items():
         _merge_bucket(dst.days.setdefault(d, _usage_bucket()), b)
     for name, m in src.models.items():
-        tgt = dst.models.setdefault(name, _model_acc())
+        tgt = dst.models.setdefault(name, _window_acc())
         _merge_bucket(tgt["totals"], m["totals"])
         for d, b in m["days"].items():
             _merge_bucket(tgt["days"].setdefault(d, _usage_bucket()), b)
+    _merge_bucket(dst.subagent["totals"], src.subagent["totals"])
+    for d, b in src.subagent["days"].items():
+        _merge_bucket(dst.subagent["days"].setdefault(d, _usage_bucket()), b)
     dst.seen |= src.seen
     dst.sessions += src.sessions
     if src.last_ts > dst.last_ts:
@@ -1908,7 +2366,12 @@ def repo_usage_report(ledger, fold_slug):
             "usage": report,
         })
 
-    host_usage = _finalize_usage(host) if host.sessions else None
+    # `sessions` counts CONVERSATIONS, so it is no longer a proxy for "this host
+    # spent something" (XERK-302): a slug left holding only a pruned session's
+    # subagents/ tree has real tokens and zero conversations, and gating on the
+    # count alone reported per-repo usage beside a null host block.
+    host_usage = (_finalize_usage(host)
+                  if host.sessions or _total_tokens(host.totals) else None)
     repo_usage.sort(key=lambda r: _total_tokens(r["usage"]["totals"]), reverse=True)
     return repo_usage, host_usage
 
@@ -5894,6 +6357,13 @@ def _http_error_detail(err):
             msg = str(parsed.get("message") or "").strip()
             if not msg:
                 msg = "; ".join(str(m) for m in (parsed.get("errorMessages") or []))
+            # The TURMA HUB says {"error": ...} — same need, same function: its
+            # refusals name the host a credential is for and whether
+            # TURMA_AGENT_STRICT is on (XERK-268), and the status line alone
+            # cannot say either. Checked AFTER both tracker shapes, so adding it
+            # cannot change what an existing Jira/ADO failure reports.
+            if not msg:
+                msg = str(parsed.get("error") or "").strip()
             errors = parsed.get("errors")
             if not msg and isinstance(errors, dict):
                 msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
@@ -8604,6 +9074,15 @@ class SessionManager:
         # same held-across-a-failed-POST lifecycle as jira_issue_results.
         self.create_meta_results = []
         self.create_ticket_results = []
+        # Staged refusals of a command that was supposed to PRODUCE a session
+        # (XERK-265) — each `{cmdId, migrationId, error, at}`, same lifecycle as
+        # the results above. A resume/import this agent declined used to be a
+        # container log line and nothing more: the command is ACKed either way,
+        # so the hub saw a session that simply never arrived and a migration sat
+        # in `importing` until MIGRATE_TIMEOUT_MS, failing with no reason. The
+        # cmdId is what the UI followed the spawn by; the migrationId is what the
+        # hub's migration bookkeeping keys on.
+        self.spawn_failures = []
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -10322,7 +10801,7 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def resume(self, sid):
+    def resume(self, sid, cmd_id=None):
         """Bring back a KILLED session with its conversation: re-register it and
         relaunch claude in its kept worktree, resuming its newest transcript
         (re-adding a detached worktree off the recorded base only if the dir has
@@ -10376,7 +10855,13 @@ class SessionManager:
         # A prune removing this very worktree would leave claude running in a
         # half-unlinked dir, so the registration and that check are one step.
         if not self._claim_worktree(sess["worktreePath"], sess):
-            log(f"resume refused: {sess['worktreePath']} is being pruned")
+            # Same prune race as _resume_at_cwd's, and reported the same way. The
+            # PAGE can't consume this one yet — a killed resume keeps its id, so
+            # the dashboard deep-links `?session=<id>`, whose wait never times
+            # out (XERK-275). Staging it still gets the refusal off the container
+            # log and onto the wire, where that fix will read it.
+            self._refuse_start(f"a prune is removing the worktree at "
+                               f"{sess['worktreePath']}", cmd_id=cmd_id)
             return
         self.closed = [c for c in self.closed if c.get("id") != sid]
         try:
@@ -10406,7 +10891,8 @@ class SessionManager:
         in spawn(): a resume-by-transcript creates a session whose id the hub
         can't predict, so that's the UI's only handle on the one it asked for."""
         if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
-            log(f"resumeTranscript: bad transcript id {transcript_id!r}")
+            self._refuse_start(f"bad transcript id {transcript_id!r}",
+                               cmd_id=cmd_id, context="resumeTranscript")
             return
         # Find the transcript dir: trust the picker's cwd hint if it still holds
         # the file, else scan PROJECTS_ROOT for it.
@@ -10418,7 +10904,8 @@ class SessionManager:
         if proj is None:
             proj = self._find_transcript_dir(transcript_id)
         if proj is None:
-            log(f"resumeTranscript: no transcript {transcript_id}")
+            self._refuse_start(f"no transcript {transcript_id} on this host",
+                               cmd_id=cmd_id, context="resumeTranscript")
             return
         path = os.path.join(proj, transcript_id + ".jsonl")
         cwd = _transcript_cwd(path) or cwd_hint
@@ -10456,7 +10943,37 @@ class SessionManager:
         extra = {"modelSource": closed.get("modelSource")} if closed else None
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
-    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None):
+    def _refuse_start(self, reason, *, cmd_id=None, migration_id=None,
+                      context="resume"):
+        """Log a refused session-creating command AND stage it for the next beat
+        so whatever asked for it learns why (XERK-265).
+
+        Every one of these paths used to end at a `log()` the hub never saw: the
+        command is ACKed regardless, so a refused resume left the Sessions page
+        spinning out its follow window and a refused migration import left the
+        move in `importing` until MIGRATE_TIMEOUT_MS, failing with no reason
+        attached. `reason` is therefore operator-facing — it is what the UI and
+        the migration record show, so it says WHY, not just that it failed.
+
+        A refusal with neither handle is logged only: `cmdId`/`migrationId` are
+        the correlation, and a malformed migration id (the very field being
+        rejected) has nothing to report against."""
+        log(f"{context} refused: {reason}")
+        if not cmd_id and not migration_id:
+            return
+        self.spawn_failures.append({
+            "cmdId": cmd_id,
+            "migrationId": migration_id,
+            # Truncated for the same reason _set_error truncates errorMsg: a
+            # reason can carry an exception's text, and this one rides the beat
+            # into a hub cache that counts against the record ceiling.
+            "error": reason[:SPAWN_FAILURE_REASON_MAX],
+            "at": now_iso(),
+        })
+        del self.spawn_failures[:-SPAWN_FAILURES_MAX]
+
+    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None,
+                       migration_id=None):
         """Launch `claude --resume <transcript_id>` cwd'd at `cwd`, the shared
         core of resume_transcript (host-local resume-any) and import_session
         (a session migrated in from another agent). The transcript file must
@@ -10469,20 +10986,27 @@ class SessionManager:
         `extra` carries fields a plain resume-any has no source for but a
         migration does — the session's ticket, name, model and mode — so the
         moved session lands looking like its old self rather than an anonymous
-        resume. Returns the new session record, or None if it couldn't launch."""
+        resume. Returns the new session record, or None if it couldn't launch —
+        and every such refusal is staged for the hub by `_refuse_start`, since
+        both callers discard the return value and the command is ACKed anyway.
+        `migration_id` is passed by import_session so the hub can fail THAT
+        migration now instead of waiting out its timeout."""
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd_id, migration_id=migration_id)
+
         # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
         # path reach git/tmux.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"resume: cwd {cwd!r} not resumable on this host")
+            refuse(f"cwd {cwd!r} is not resumable on this host")
             return None
         repo, _origin, is_root = cls
         cwd = os.path.normpath(cwd)
         if self._running_count() >= MAX_SESSIONS:
-            log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            refuse(f"the host is at MAX_SESSIONS ({MAX_SESSIONS})")
             return None
         if is_root and self._root_running():
-            log("resume refused: a root session is already running")
+            refuse("a root session is already running on this host")
             return None
         # One live session per cwd: two claudes in the same dir share a project
         # slug + RC bridge pointer and would collide (the same reason root is
@@ -10491,11 +11015,11 @@ class SessionManager:
         if any(s.get("status") == "running"
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
-            log(f"resume refused: a session is already running in {cwd}")
+            refuse(f"a session is already running in {cwd}")
             return None
         repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
         if not is_root and not os.path.isdir(repo_path):
-            log(f"resume: repo {repo!r} is gone; cannot resume")
+            refuse(f"repo {repo!r} is gone from this host")
             return None
         extra = extra or {}
         sid = self._new_id()
@@ -10541,7 +11065,10 @@ class SessionManager:
         # removing right now — the dir still exists for most of that removal, so
         # the isdir check below would skip the re-add and launch into it.
         if not self._claim_worktree(cwd, sess):
-            log(f"resume refused: {cwd} is being pruned")
+            # THE refusal this ticket exists for: ordinary timing between two
+            # features the operator is not thinking about, so it must not read
+            # as "the migration randomly hung for the timeout" (XERK-256).
+            refuse(f"a prune is removing the worktree at {cwd}")
             return None
         try:
             # A deleted/pruned Turma worktree (or a migrated session, whose
@@ -10564,6 +11091,11 @@ class SessionManager:
             return sess
         except Exception as e:
             self._set_error(sess, e)
+            # The record survives carrying the error, but it is `status:"error"`
+            # — the hub's migration handoff waits for a RUNNING session with this
+            # cmdId, so without this the move waits out its timeout exactly like
+            # a refusal above.
+            refuse(f"the session failed to launch: {e}")
             return None
 
     # --- session migration across hosts (XERK-101) ------------------------
@@ -10582,24 +11114,31 @@ class SessionManager:
         if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
             log(f"exportSession: bad migration id {migration_id!r}")
             return
+        # Every refusal below is staged against the migration id (XERK-265): the
+        # hub is waiting on a blob that will never arrive, and without a reason
+        # the move sits in `exporting` for the whole MIGRATE_TIMEOUT_MS.
+        def refuse(reason):
+            self._refuse_start(reason, migration_id=migration_id,
+                               context="exportSession")
         sess = self._find(session_id)
         if not sess:
-            log(f"exportSession: no such session {session_id}")
+            refuse(f"no such session {session_id} on the source host")
             return
         path = _session_transcript_path(sess)
         if not path or not os.path.isfile(path):
-            log(f"exportSession: session {session_id} has no transcript to move")
+            refuse(f"session {session_id} has no transcript to move")
             return
         try:
             blob = self._pack_transcript(path)
         except Exception as e:
-            log(f"exportSession: pack failed for {session_id}: {e}")
+            refuse(f"packing the transcript failed: {e}")
             return
         if len(blob) > MIGRATION_BLOB_MAX:
-            log(f"exportSession: transcript bundle {len(blob)} bytes exceeds "
-                f"{MIGRATION_BLOB_MAX}; migration aborted")
+            refuse(f"the transcript bundle is {len(blob)} bytes, over the "
+                   f"{MIGRATION_BLOB_MAX} limit")
             return
-        self._migration_upload(migration_id, blob)
+        if not self._migration_upload(migration_id, blob):
+            refuse("uploading the transcript bundle to the hub failed")
 
     def import_session(self, cmd):
         """Target half of a migration: pull the transcript bundle the source
@@ -10615,21 +11154,30 @@ class SessionManager:
         # below use this localized cwd, so they stay self-consistent.
         cwd = self._localize_migrated_cwd(cmd.get("cwd"))
         if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
+            # The one refusal with nothing to report against — the migration id
+            # IS the handle, and this is it being rejected.
             log(f"importSession: bad migration id {migration_id!r}")
             return
+        # Everything past here is staged against the migration id (XERK-265) so
+        # advanceMigrations can fail the move now, with a reason, instead of the
+        # operator watching it hang for MIGRATE_TIMEOUT_MS.
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd.get("cmdId"),
+                               migration_id=migration_id,
+                               context="importSession")
         if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
-            log(f"importSession: bad transcript id {transcript_id!r}")
+            refuse(f"bad transcript id {transcript_id!r}")
             return
         # Classify the cwd BEFORE spending a download — a foreign path or a
         # missing repo can't be resumed here, and the hub already vetted the org
         # + repo, so this only trips on a genuinely inconsistent target.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"importSession: cwd {cwd!r} not resumable on this host")
+            refuse(f"cwd {cwd!r} is not resumable on this host")
             return
         blob = self._migration_download(migration_id)
         if blob is None:
-            log(f"importSession: could not fetch bundle for {migration_id}")
+            refuse("fetching the transcript bundle from the hub failed")
             return
         slug_dir = os.path.join(PROJECTS_ROOT,
                                 _project_slug(os.path.normpath(cwd)))
@@ -10637,7 +11185,7 @@ class SessionManager:
             os.makedirs(slug_dir, exist_ok=True)
             self._unpack_transcript(blob, slug_dir)
         except Exception as e:
-            log(f"importSession: unpack failed for {migration_id}: {e}")
+            refuse(f"unpacking the transcript bundle failed: {e}")
             return
         extra = {
             "ticket": cmd.get("ticket"),
@@ -10649,8 +11197,8 @@ class SessionManager:
             "modelSource": cmd.get("modelSource"),
             "migratedFrom": cmd.get("migratedFrom"),
         }
-        self._resume_at_cwd(transcript_id, cwd,
-                            cmd_id=cmd.get("cmdId"), extra=extra)
+        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
+                            extra=extra, migration_id=migration_id)
 
     def _pack_transcript(self, path):
         """Bundle a transcript file (+ its subagents/ dir, if any) into gzipped
@@ -10701,25 +11249,55 @@ class SessionManager:
                         shutil.copyfileobj(src, f)
                 # anything else (symlink/device/fifo) is silently skipped
 
+    # A bundle is the largest thing an agent ever sends, so it is the body most
+    # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
+    # try again". Nothing else would retry it — a lost bundle strands the whole
+    # move until it times out hub-side — and the hub deliberately holds the
+    # migration in `exporting` on that refusal so a re-POST can still land.
+    # 4xx is NOT retried: the hub parsed the bundle and declined it, and sending
+    # the same bytes again would be refused the same way.
+    MIGRATION_UPLOAD_ATTEMPTS = 3
+    MIGRATION_UPLOAD_BACKOFF_SEC = 2
+
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,
-        agent-authed). Best-effort: a failure leaves the migration to time out
-        hub-side rather than raising into the command loop."""
-        try:
-            headers = {"Content-Type": "application/octet-stream",
-                       "User-Agent": "hub-agent/1.0"}
-            if TURMA_TOKEN:
-                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
-            url = (f"{TURMA_URL}/api/agents/"
-                   f"{urllib.parse.quote(self.device, safe='')}"
-                   f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
-            req = urllib.request.Request(url, data=blob, headers=headers,
-                                         method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp.read()
-            log(f"migration {migration_id}: uploaded {len(blob)} bytes")
-        except Exception as e:
-            log(f"migration upload failed for {migration_id}: {e}")
+        agent-authed). Returns True on success; a failure is reported (never
+        raised into the command loop) so the caller can tell the hub rather than
+        leaving the move to time out.
+
+        Retries a 5xx first. A bundle is the largest body an agent ever sends,
+        so it is the one most likely to meet the hub's in-flight budget and be
+        told 503 "busy, try again" (XERK-258); nothing else would retry it, and
+        the hub deliberately holds the migration in `exporting` on that refusal
+        so a re-POST can still land. 4xx is NOT retried: the hub parsed the
+        bundle and declined it, and the same bytes would be refused the same
+        way."""
+        headers = {"Content-Type": "application/octet-stream",
+                   "User-Agent": "hub-agent/1.0"}
+        if TURMA_TOKEN:
+            headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+        url = (f"{TURMA_URL}/api/agents/"
+               f"{urllib.parse.quote(self.device, safe='')}"
+               f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
+        for attempt in range(1, self.MIGRATION_UPLOAD_ATTEMPTS + 1):
+            try:
+                req = urllib.request.Request(url, data=blob, headers=headers,
+                                             method="POST")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp.read()
+                log(f"migration {migration_id}: uploaded {len(blob)} bytes")
+                return True
+            except Exception as e:
+                code = getattr(e, "code", None)
+                transient = not isinstance(code, int) or code >= 500
+                last = attempt >= self.MIGRATION_UPLOAD_ATTEMPTS
+                if not transient or last:
+                    log(f"migration upload failed for {migration_id}: {e}")
+                    return False
+                log(f"migration {migration_id}: upload attempt {attempt} failed "
+                    f"({e}) — retrying")
+                time.sleep(self.MIGRATION_UPLOAD_BACKOFF_SEC * attempt)
+        return False
 
     def _migration_download(self, migration_id):
         """GET a transcript bundle from the hub's migration relay. Returns the
@@ -13695,7 +14273,7 @@ class SessionManager:
                 elif ctype == "restart":
                     self.restart(cmd.get("sessionId"))
                 elif ctype == "resume":
-                    self.resume(cmd.get("sessionId"))
+                    self.resume(cmd.get("sessionId"), cmd_id=cid)
                 elif ctype == "resumeTranscript":
                     self.resume_transcript(
                         cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
@@ -14617,6 +15195,12 @@ class SessionManager:
             # login lapses (XERK-98). Read fresh each beat — it's a tiny JSON
             # read and this is the fact that decides whether sessions can run.
             "claudeAuth": claude_auth_status(),
+            # Which SUBSCRIPTION that login is on, as an opaque key (XERK-301),
+            # so the usage page draws ONE set of limit bars per plan instead of
+            # one per host — hosts sharing an account are all reading the same
+            # 5h/7d pool. Absent = "this host can't tell you", which keeps it on
+            # its own card: two silent hosts are not thereby on one plan.
+            "subscription": subscription_identity(),
             # The login's real model list + what "default" currently resolves
             # to, from the models probe. None until the first successful probe;
             # the hub's model menu falls back to its static list then.
@@ -14699,6 +15283,8 @@ class SessionManager:
             payload["createMetaResults"] = list(self.create_meta_results)
         if self.create_ticket_results:
             payload["createTicketResults"] = list(self.create_ticket_results)
+        if self.spawn_failures:
+            payload["spawnFailures"] = list(self.spawn_failures)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -14738,7 +15324,16 @@ class SessionManager:
             self.ticket_status_results.clear()  # delivered — same lifecycle
             self.create_meta_results.clear()  # delivered — same lifecycle
             self.create_ticket_results.clear()  # delivered — same lifecycle
+            self.spawn_failures.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
+        except urllib.error.HTTPError as e:
+            # urllib stringifies an HTTPError to just its status line and throws
+            # the body away — and for a REFUSED beat that body is the only thing
+            # that says why (XERK-268: whose token this is, whether the hub is
+            # strict). A rollover that goes wrong otherwise reads as a bare
+            # "HTTP Error 403: Forbidden" and a host that silently vanishes.
+            log(f"heartbeat failed: {_http_error_detail(e)}")
+            return None
         except Exception as e:
             log(f"heartbeat failed: {e}")
             return None
@@ -14781,6 +15376,8 @@ class SessionManager:
                 resp.read()
             log(f"announced updating to hub (reason={reason or 'restart'}"
                 f"{', v' + version if version else ''})")
+        except urllib.error.HTTPError as e:
+            log(f"updating announce failed (continuing shutdown): {_http_error_detail(e)}")
         except Exception as e:
             log(f"updating announce failed (continuing shutdown): {e}")
 

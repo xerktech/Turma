@@ -119,6 +119,10 @@ function render(data) {
     $board.innerHTML = B.boardHtml(sites, orgFilter, {
       allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
       moves: activeMoves,
+      // Tickets waiting for a free slot (XERK-296) — hub state, so the payload
+      // (and its SSE event) is the source of truth; `queueView` only overlays
+      // the moment between a click and the beat that confirms it.
+      ticketQueue: queueView(data.ticketQueue),
       // Manual org-color pins (XERK-145), via TurmaOrg so the SSE event and the
       // poll feed one map.
       orgColors: TurmaOrg.orgColors(),
@@ -193,8 +197,73 @@ async function startSession(issueKey, siteKey) {
   if (r.status === 401) return void (location.href = "/login");
   try { body = await r.json(); } catch { /* non-JSON error body */ }
   if (!r.ok) return void fail(body.error || `HTTP ${r.status}`);
+  // No host had a free slot, so the hub put the TICKET in line rather than
+  // handing it to an agent (XERK-296). There is no cmdId to follow — the card
+  // switches to the queued chip, fed by the hub's own queue from the next beat.
+  if (body.queued) {
+    starts.delete(k);
+    queueAdds.set(k, { siteKey, issueKey, at: Date.now(),
+      position: body.position || 1 });
+    if (cache) render(cache);
+    return;
+  }
   starts.set(k, { pending: true, cmdId: body.cmdId, host: body.host, at: Date.now(), sawCmd: false });
   if (cache) render(cache);
+}
+
+// --- The hub's ticket queue on the card (XERK-296) ---------------------------
+// The queue itself is hub state and arrives on the payload (plus its own SSE
+// event). These two overlays exist only to cover the round trip of a click:
+//   queueAdds  — queued by a POST whose confirming beat hasn't landed yet.
+//   queueDrops — cancelled by a DELETE the payload still lists.
+// Each is dropped the moment the hub agrees, so neither can outlive the truth;
+// an add also expires, since a hub that never lists it has already dispatched
+// it (or dropped it) and the payload is right either way.
+const QUEUE_OPTIMISM_MS = 8000;
+const queueAdds = new Map();    // "<siteKey>\x00<key>" -> {siteKey, issueKey, at, position}
+const queueDrops = new Set();   // "<siteKey>\x00<key>"
+
+function queueView(hubQueue) {
+  const hub = (hubQueue || []).filter(q => q && q.issueKey);
+  const inHub = (k) => hub.some(q => startKey(q.siteKey, q.issueKey) === k);
+  const now = Date.now();
+  for (const [k, add] of [...queueAdds]) {
+    if (inHub(k) || now - add.at > QUEUE_OPTIMISM_MS) queueAdds.delete(k);
+  }
+  for (const k of [...queueDrops]) if (!inHub(k)) queueDrops.delete(k);
+  const list = hub.filter(q => !queueDrops.has(startKey(q.siteKey, q.issueKey)));
+  for (const add of queueAdds.values()) {
+    list.push({ siteKey: add.siteKey, issueKey: add.issueKey, source: "manual",
+      queuedAt: add.at, position: add.position, reason: null, error: null });
+  }
+  return list;
+}
+
+// Take a waiting ticket back out of the line. Nothing has started, so this
+// cancels a queue entry and touches neither a session nor the ticket itself. The
+// removal paints immediately and rolls back onto the card if the hub refuses.
+async function cancelQueued(issueKey, siteKey) {
+  const k = startKey(siteKey, issueKey);
+  queueAdds.delete(k);
+  queueDrops.add(k);
+  if (cache) render(cache);
+  const fail = (error) => {
+    queueDrops.delete(k);
+    starts.set(k, { error });
+    if (cache) render(cache);
+  };
+  let r, body = {};
+  try {
+    r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(issueKey)}/session`,
+                    { method: "DELETE", keepalive: true });
+  } catch { return void fail("the hub is unreachable"); }
+  if (r.status === 401) return void (location.href = "/login");
+  try { body = await r.json(); } catch { /* non-JSON error body */ }
+  // A 404 means it was already out of the queue and nothing started — cancelled
+  // from another board, or never queued — so the operator's intent is satisfied.
+  // A 409 is the opposite: the cancel LOST to a dispatch and a session is coming
+  // up, which they have to be told rather than shown a vanishing chip.
+  if (!r.ok && r.status !== 404) return void fail(body.error || `HTTP ${r.status}`);
 }
 
 // --- Drag a card into another column to change its status (XERK-141) --------
@@ -813,7 +882,7 @@ async function openDetail(key, siteKey, fromEl) {
 // re-bound constantly (and leak). The card's own interactive children are left
 // alone — kc-key is the deliberate way out to Jira, kc-sess into the session —
 // and kc-start does its own thing below instead of opening the panel.
-const CARD_OWN = ".kc-key, .kc-sess, .kc-start";
+const CARD_OWN = ".kc-key, .kc-sess, .kc-start, .kc-unqueue";
 
 // The start button acts on POINTERDOWN, not click, and this is load-bearing:
 // the board innerHTML-replaces on every heartbeat beat, so a press that
@@ -831,9 +900,19 @@ function startFrom(el) {
   if (card) startSession(btn.dataset.start, card.dataset.site);
   return true;
 }
+// The ✕ on a queued ticket (XERK-296). Same pointerdown treatment as the start
+// button, for the same reason: the board repaints every beat, so a press that
+// straddles one loses its button between down and up.
+function unqueueFrom(el) {
+  const btn = el.closest(".kc-unqueue[data-unqueue]");
+  if (!btn || btn.disabled) return false;
+  const card = btn.closest(".kanban-card");
+  if (card) cancelQueued(btn.dataset.unqueue, card.dataset.site);
+  return true;
+}
 $board.addEventListener("pointerdown", (e) => {
   if (e.button != null && e.button !== 0) return;   // primary button only
-  if (startFrom(e.target)) e.preventDefault();       // don't also focus/select
+  if (startFrom(e.target) || unqueueFrom(e.target)) e.preventDefault();
 });
 $board.addEventListener("click", (e) => {
   // A just-finished drag synthesizes a click on the captured card; swallow it so
@@ -842,6 +921,7 @@ $board.addEventListener("click", (e) => {
   // Keyboard activation (and a mouse fallback if pointerdown was missed); the
   // pending guard in startSession makes a double-fire a no-op.
   if (e.target.closest(".kc-start[data-start]")) { startFrom(e.target); return; }
+  if (e.target.closest(".kc-unqueue[data-unqueue]")) { unqueueFrom(e.target); return; }
   if (e.target.closest(CARD_OWN)) return;
   const card = e.target.closest(".kanban-card");
   if (card) openDetail(card.dataset.key, card.dataset.site, card);
@@ -1026,7 +1106,7 @@ async function refresh() {
 
 // Live push: same SSE pattern as the other pages — patch the cached agent
 // record and re-render (debounced); the 15s poll stays as a fallback only.
-let sseOk = false, sseBackoff = 2000, renderTimer = null;
+let sseOk = false, sseEverOpen = false, sseBackoff = 2000, renderTimer = null;
 function scheduleRender() {
   if (renderTimer) return;
   renderTimer = setTimeout(() => { renderTimer = null; if (cache) render(cache); }, 1000);
@@ -1041,7 +1121,18 @@ function connectSSE() {
   let es;
   try { es = new EventSource("/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
-  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.onopen = () => {
+    // A RECONNECT re-reads the whole payload once. Everything else on this page
+    // is patched by events, but the hub's ticket queue is in-memory (XERK-296),
+    // so a hub restart empties it with no event this socket could have carried —
+    // and the poll below only runs while SSE is DOWN. Without this re-read a
+    // cancelled or dispatched ticket kept its "queued" chip forever, and since
+    // the chip REPLACES the start button, that ticket could not be started at
+    // all. Skipped on the first connect, which the initial refresh() covers.
+    if (sseEverOpen) refresh();
+    sseEverOpen = true;
+    sseOk = true; sseBackoff = 2000;
+  };
   es.addEventListener("agent", (e) => {
     try { applyAgent(JSON.parse(e.data)); } catch { return; }
     scheduleRender();
@@ -1067,6 +1158,16 @@ function connectSSE() {
     try { tm = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketModels = tm;
+    scheduleRender();
+  });
+  // The hub's ticket queue changed (XERK-296) — a ticket queued, dispatched or
+  // cancelled, by this board or any other. Same whole-value pattern: the list is
+  // small and hub-owned, so there is nothing to patch.
+  es.addEventListener("ticketQueue", (e) => {
+    let tq;
+    try { tq = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketQueue = tq;
     scheduleRender();
   });
   // An org's color pin changed (XERK-145) — same tiny-whole-map pattern. org.js

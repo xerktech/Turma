@@ -387,8 +387,8 @@ do_verify() {
   local ok=0
   echo "== turma native agent: verify =="
   echo "prefix: $PREFIX (version $( [ -f "$PREFIX/VERSION" ] && cat "$PREFIX/VERSION" || echo MISSING))"
-  for f in hub-agent.py tunnel-agent.js hooks/guard.py hooks/ask.py \
-           hooks/statusline.py \
+  for f in hub-agent.py tunnel-agent.js hooks/guard.py hooks/fileguard.py \
+           hooks/ask.py hooks/statusline.py \
            bin/turma-agent bin/turma-agentctl bin/turma-agent-update; do
     if [ -e "$PREFIX/$f" ]; then echo "  file $f: ok"; else echo "  file $f: MISSING"; ok=1; fi
   done

@@ -21,8 +21,15 @@ services:
       # the hub warns at boot rather than refusing to start. Set all three.
       TURMA_USER: "${TURMA_USER:?set TURMA_USER in .env}"
       TURMA_PASSWORD: "${TURMA_PASSWORD:?set TURMA_PASSWORD in .env}"
-      # Shared with every agent, where it is named TURMA_TOKEN.
+      # The fleet MASTER agent credential. Each agent should hold only its own
+      # token derived from this — `node turma/server.js --agent-token <device>`,
+      # run on the hub — set as that agent's TURMA_TOKEN. The hub re-derives it
+      # to prove the host a request names is the host it is.
       TURMA_AGENT_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}"
+      # Set this once every agent runs on its own derived token: the master then
+      # stops being accepted, and an agent can no longer act as another host.
+      # Until then the master still works, so a rollover needs no downtime.
+      # TURMA_AGENT_STRICT: "1"
 
       # Optional: bearer token for POST /api/trigger (CI, webhooks). Unlike the
       # two above this one does NOT fail open — leaving it unset just means the

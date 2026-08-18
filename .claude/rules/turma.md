@@ -134,6 +134,17 @@ which makes an `android/` change part of the same PR) live there.
   across every host it runs on (matched by `remoteKey`); **By host** shows per-host totals.
 - The usage page renders `(root)` as **Root**, folding older agents' `(other)`/`?` in
   (`normRepo`/`repoLabel`).
+- **"Delegated to sub-agents"** (`subagentCard`, XERK-302) names the share of those figures spent by
+  background agents. It is a slice of every other number on the page and says so — a reader who adds
+  it back double-counts.
+  - **The share's denominator is `subagentOf`, not the fleet total**: only the spend that came with a
+    split contributes to it, so one older host can't dilute the answer. A host reporting none is left
+    out entirely, and with no series reporting one the card shows no percentage at all.
+  - **`subagentOf` accumulates per CONTRIBUTION, not per series**, and the coverage caveat is
+    measured in SPEND for the same reason: a series merges every host that ran that repo, so a
+    series-level check reads full coverage on a series three quarters of whose tokens came from a
+    host that can't answer.
+  - Android's `SubagentLine` is the one-line rendering of the same three windows.
 - Above the chart it shows the **Claude subscription's 5h/7d windows** (XERK-247) from each agent's
   `limits` block — the numbers exist only inside Claude Code (see `.claude/rules/agent-usage.md` for
   how they're captured).
@@ -154,7 +165,37 @@ which makes an `android/` change part of the same PR) live there.
   - A host reporting no window at all gets **no card** — an older agent, a non-subscription login and
     an unprobed host all mean "can't tell you", never 0% used. The section renders before the
     chart's empty-state returns, so headroom shows on a fleet that has charted nothing.
-  - Tests: `usage.test.js`, the `limits` heartbeat case in `server.test.js`.
+  - **One card per SUBSCRIPTION, not per host** (XERK-301, `limitGroups`): hosts sharing a Claude
+    account are reading one pool, so several cards were one number drawn several times. Grouping is
+    on the agent's opaque `subscription.key` (`.claude/rules/agent-usage.md`), and a host reporting
+    none keeps a card of its own — **never folded in with another silent host**, since "can't tell
+    you" from two hosts does not make them one plan. The card is headed by its hosts; the key is a
+    hash, so there is no other name to give a subscription.
+    - Each window takes its **FRESHEST** reading, not an average or a maximum: every host reads the
+      same counter, and across a window's reset the newest read is the only right answer where a
+      maximum would keep the pre-reset figure alive. Per window, since the freshest snapshot need
+      not carry both — so a window sourced from an older host **discloses its own read age**, the
+      head's stamp being the group's freshest rather than that row's.
+    - **Both clients sort freshest-first before folding and replace only on a STRICTLY newer read.**
+      Fold in fleet order, or accept an equal `capturedAt`, and two hosts whose snapshots tie to the
+      second resolve to a different host on each client — one subscription showing two different
+      percentages. Tests: the tie cases in `usage.test.js` and `UsageViewModelTest`.
+    - `normalizeSubscription` coerces the block at ingest for the same reason `normalizeLimits`
+      does, and because the key is a MAP KEY on every client: anything unusable becomes null, never
+      a plausible default that would fold two subscriptions into one set of bars. Its bounds are
+      **literals, not module `const`s** — see the restore-TDZ rule below.
+  - **Anything a `normalize*` closes over must be reachable from `loadState`'s line.** That loop
+    sits near the top of `server.js` and reaches each one only because function declarations hoist;
+    a module `const` declared below is in its TDZ there, the `ReferenceError` lands in the restore's
+    catch, and the WHOLE registry is emptied — then the 30s save timer rewrites `state.json` from
+    only the hosts that have re-beaten, losing every host offline at that moment. XERK-301 shipped
+    exactly that and it is invisible to `server.test.js`, which walks the loader's body rather than
+    booting; `registry-restore.test.js` boots a hub instead — over **two** records, one usable and
+    one unusable in every coerced field, since a `const` on an error BRANCH is invisible to a
+    fixture that only ever takes the happy one (and would then fire only on malformed records, in
+    production).
+  - Tests: `usage.test.js`, the `limits` and subscription-key heartbeat cases in `server.test.js`,
+    android `UsageViewModelTest`.
 
 ## Board page (`/board`)
 
@@ -168,81 +209,8 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 
 ## Durable archive
 
-- The hub hosts a **durable, searchable archive of ended sessions** (`turma/archive.js`): agents
-  push each inactive transcript in, landing as **organized files on `/data`** — one folder per repo,
-  each renamed + dated `/data/archive/<repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl` (+ a
-  `.meta` sidecar), indexed in a **`node:sqlite` FTS5** DB (`/data/archive/index.db`, Node-core, no
-  npm), rebuildable from the files.
-- The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
-  `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
-  browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest
-  is agent-token-authed; the manifest cursors ride the heartbeat reply.
-- **Two size ceilings, both enforced in `ingestChunk` whatever an agent sends** (XERK-267):
-  - `ARCHIVE_TRANSCRIPT_MAX_BYTES` (16 MiB) per transcript. What lands here is the agent's
-    pre-parsed entries, and a SendUserFile block carries the delivered file INLINE, so an archived
-    session can dwarf the conversation it records (measured: 28 KB of transcript → 447 MB stored).
-    Past it, that transcript's file payloads shed to the name-only chip the chat already renders
-    for an unpreviewable delivery — **sticky for the rest of the transcript**, so a reader sees one
-    clean cutover rather than a flicker. Ordinary sessions are untouched; the largest real archived
-    file measured 1.2 MB.
-  - `ARCHIVE_TOTAL_MAX_BYTES` (64 GiB) for the store. `ARCHIVE_DIR` shares its volume with
-    `state.json`, so a blow-up takes the hub's own state down with it.
-  - **Both refuse by handing back the real cursor plus a flag, never an error** — an agent reads
-    that as no forward progress and drops the chunk, where an error status is re-sent forever
-    (XERK-255). `archiveLimits` puts the same verdict on the heartbeat reply
-    (`archiveShed`/`archiveFull`) so an agent sheds before the bytes reach the wire; that is an
-    optimisation, and the hub never relies on it.
-  - Budget spend is the `archiveBytes` column, **re-derived from the files by `rebuildIndex`** —
-    the index is disposable, so reading it from a sidecar would drift (and every pre-XERK-267
-    sidecar has no such field).
-  - **The store total is WALKED off the files, never summed from the index** (`totalArchiveBytes`).
-    Deleting archives is the operator's way out of a full store, and it works here because the
-    bytes are simply gone — nothing has to notice a deletion.
-    - The walk is the **baseline only**; `writtenSinceWalk` adds every byte appended since, and the
-      walk zeroes it. A cached total on its own leaves ingest **unmetered between refreshes** —
-      measured 4.85 GiB written past a 4 MiB ceiling in one window. Growth is therefore exact
-      (overshoot ≤ one chunk) and only DELETION is stale, which is why `TOTAL_CACHE_MS` can be
-      minutes: waiting one window to notice an operator freeing space costs nothing.
-    - It counts the **`.jsonl` files only — deliberately NOT `index.db`**, even though the index
-      sits in the same directory and is ~2.4× their size. A ceiling enforced by REFUSING INGEST may
-      only bound what refusing can reclaim, and refusing does not shrink a database: nothing reaps
-      its rows for a deleted file and nothing VACUUMs, so counted, an operator who deleted every
-      transcript stayed full forever (measured: still refusing after 84 attempts / 421 s, capacity
-      per fill-delete cycle ratcheting 429 transcripts down to 4). The index and the `.meta`
-      sidecars are **overhead to size the volume for, not budget** — and that overhead is **at least 3×
-      the ceiling and unbounded across fill/wipe cycles** (measured 3.0–3.2× at first fill, then
-      ~13 MB of index per cycle to 61× by cycle 38, unreclaimed by a restart; XERK-332 tracks
-      reclaiming it). Size the volume for the churn, not for one fill.
-    - **A walk that THROWS is not a measurement of zero** — only ENOENT on `ARCHIVE_DIR` is (that
-      is the store genuinely absent, and what lets a removed directory be recreated instead of
-      latching full). Anything else — EMFILE from fd exhaustion, EACCES, EIO — keeps the last
-      baseline **and stamps the cache** so it isn't retried per call, because recording the failure
-      re-baselines to nothing AND zeroes the charge, so each blip hands out a whole fresh ceiling:
-      measured amplifying to 6.2× over five blips, silently, with the store reading full throughout.
-    - That applies to **`ARCHIVE_DIR` itself only**. An unreadable SUBDIRECTORY is skipped and costs
-      its subtree — an under-measure, which this errs toward anyway. Propagating it froze the
-      baseline permanently, so no deletion was ever seen again and the store latched full with no
-      exit; one root-owned directory (an expected state per the run-as-identity rules) or one
-      over-long path was enough. The subtree's cost is one-time only while it is also UNWRITABLE,
-      which is the realistic shape; unreadable-but-writable under-measures without bound.
-    - Once it reads full it re-measures on `FULL_RECHECK_MS` instead — precision is worth most
-      exactly then, ingest is refusing anyway so a walk costs no throughput, and this is what
-      bounds how long an operator waits after freeing space.
-    - It is **synchronous on the heartbeat path** and the hub is one event loop, so the walk's cost
-      is a hub-wide stall: 14 ms at the reference ~1,300 files, ~7 µs/file warm, ~18× cold. Keep it
-      synchronous — that is *why* the charge cannot be interleaved with a walk. If the store ever
-      reaches tens of thousands of files, walk only when near the ceiling rather than making it
-      async or shortening the window.
-    - **Do not "improve" this into an indexed column that reconciles against disk.** That means
-      inferring "deleted" from a failed stat, which is not knowable: an unmounted volume, a renamed
-      parent and a real delete all report ENOENT, while EACCES/EIO/ESTALE report neither. Guessing
-      "deleted" drops the row and resets the cursor, and since ingest APPENDS, the re-push writes a
-      SECOND copy of the conversation into a file that was there all along; guessing "present"
-      latches the ceiling shut with no exit. Both were built and both were reproduced.
-  - **A deleted `.jsonl` whose index row survives leaves the cursor alone** and the next delta
-    appends onto the gap — pre-existing, tracked as XERK-280. Repairing it needs a reliable answer
-    to "was this deleted", which is the thing above that cannot be had cheaply.
-- Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.
+See `.claude/rules/turma-archive.md` (scoped to `turma/archive.js` + its tests) — the store's two
+layers, the size ceilings, and the rules about how the total is measured.
 
 ## `POST /api/trigger` — external automation
 
@@ -312,12 +280,136 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
 - Tests: `push.test.js`, `prAlertDecision`/`readyForReview`/`XERK-154`/`pushEnabled` in
   `server.test.js`.
 
+## Terminal proxy (`/term/<sessionId>/`)
+
+- Each session's ttyd runs with `-b /term/<id>`, so it answers the BARE base path with a 302 to the
+  slash form. **The hub adds that slash itself before proxying**, rather than letting ttyd redirect:
+  a hop that normalizes the slash away makes ttyd's redirect point at itself, and the browser gives
+  up with ERR_TOO_MANY_REDIRECTS. One cloudflared release did exactly that (`path.Clean` in
+  `canonicalizeRequestPath`), which killed every terminal on the fleet while the agents stayed
+  connected and `terminalOnline` stayed true — so the symptom reads as a Turma bug and is not one.
+- **Only the base path is rewritten.** Assets and the WS below it never end in a slash, and
+  appending one there would 404 them.
+- Every client (`sessions.html`, android `TerminalScreen`, `glasses/src/hub-client.ts`,
+  `veiller/src/core/hub-client.ts`) asks for the slash form, so this is belt-and-braces for the
+  wire, not a client contract.
+- The slash is **inserted into the original request target**, not rebuilt from the parsed URL, and
+  only for origin-form requests — so the query reaches ttyd byte-for-byte and an absolute-form or
+  backslash target still 404s there rather than newly resolving to a terminal.
+- Tests: `the terminal document is fetched at ttyd's base path`, `assets below the terminal base
+  path are never rewritten` in `server.test.js`.
+
 ## Auth and the glasses surface
 
 - UI, API, and the click-to-attach live terminal (`/term/<sessionId>/`, reverse-tunneled to that
   session's ttyd by port) sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`).
-  Agents authenticate heartbeats, tunnel WebSockets, and ttyd with one shared token (`TURMA_TOKEN`
-  in the agent's env = `TURMA_AGENT_TOKEN` on the hub).
+  Agents authenticate heartbeats, tunnel WebSockets, and ttyd with a **per-host** token —
+  `TURMA_TOKEN` in the agent's env, `hostAgentToken()` = `<base64url(device)>.<HMAC(master, device)>`
+  on the hub. See `CLAUDE.md`'s cross-cutting contracts for the rule; the mechanics:
+  - The hub keeps only the master and **re-derives** the expected value for whatever host a request
+    names, so adding a host needs no hub-side list and no restart. Print one with `node
+    turma/server.js --agent-token <device>`. The name is IN the token, so a **host rename
+    invalidates it** — deliberate, since the hub cannot tell a rename from an impersonation.
+  - `agentBearerKind(req, host)` is the single resolver → `proved` (that host's derived token) /
+    `operator` (the user login, allowed to name any host — it already drives them all) / `legacy`
+    (the raw master, refused under `TURMA_AGENT_STRICT`) / null. `agentHostRefusal` turns it into
+    the response. **Never settle for `agentAuthorized` where a host is in hand**: it answers "an
+    agent", not "which".
+  - The heartbeat is the one surface bound in its HANDLER, not at the route gate, since `device` is
+    in the body. `agentPresented` is the gate: it says the credential is one the hub ISSUED, without
+    saying which host, and **must keep refusing an unknown bearer** — it stands in front of a 32 MiB
+    `readBody`, so admitting any `Bearer <anything>` is an unauthenticated remote OOM of the hub,
+    and with it the whole fleet's control plane. **`TURMA_AGENT_STRICT` has to bite HERE too**, not
+    only at the authorization check past it, or a leaked master still OOMs a fleet whose whole point
+    was that the master had been retired. `agentPresentedRefusal` words that 403 without a host,
+    since the host is still unread behind the gate.
+  - **A wrong-host token answers 403 naming both hosts, not a bare 401.** The overwhelmingly likely
+    cause is a host RENAME (the name is inside the token, so the credential silently stops matching);
+    it leaks nothing, since the token names its own host on its face. `hub-agent.py` logs the hub's
+    `{error}` body via `_http_error_detail` — the status line alone cannot say any of this.
+  - `controlChannels`/`pendingChannels` are **null-prototype**: their keys come off the wire, and on
+    a plain object a `ch` of `__proto__` read back as `Object.prototype` — truthy, so it passed the
+    "is there a pending channel" check and killed the hub on the next property access.
+  - `ttydAuth(host)` sends the token that host's ttyd is actually running (`tokenBound` on the
+    record, from how its own heartbeat authenticated), so a half-rolled fleet keeps every terminal
+    working. It is hub-derived and **stripped from the fleet payload** — putting it on the wire
+    would make it a client contract.
+  - Tests: the `XERK-268:` cases in `server.test.js`.
+
+### The agent registry's ceiling (XERK-272)
+
+- **`agents` is bounded as an AGGREGATE, not just per record.** `AGENT_RECORD_MAX` (8 MiB) bounds
+  ONE record and `prune()` only reclaims at 7 days, so an unbounded NUMBER of `device` names was an
+  unbounded amount of retained memory — 512 beats of 0.9 MiB under 512 names OOM-killed a 256 MiB
+  hub, while the same 512 beats under ONE name peaked at 169 MiB.
+  - **XERK-268 shrank who can do this; it did not bound it.** `device` is now PROVED by the
+    credential, so this is no longer any-token-holder — but a compromised or buggy host still mints
+    names under its own token, the `legacy` master a mid-rollover fleet accepts is not yet retired,
+    and a host deriving its name from something unstable grows records with no attacker at all.
+    Per-agent tokens and this cap are complementary, not alternatives.
+- Two budgets, bounding different things: **`AGENTS_TOTAL_MAX`** (aggregate record bytes, defaulting
+  to an eighth of the container's own cgroup limit, clamped 8–64 MiB) and **`AGENTS_MAX`** (record
+  count, default 64). The count cap is not redundant — the byte budget measures what
+  `agentRecordSize` measures, which EXCLUDES the on-demand caches, so it bounds their MULTIPLE and
+  nothing bounds their SIZE. A ceiling above the limit the kernel kills on is not a ceiling: size it
+  from the container, never pick a number.
+- **A newcomer never displaces a host that is still around.** Past the cap a record is reclaimed
+  only if it has been unseen for `AGENT_EVICT_IDLE_MS` (1h, ≫ `OFFLINE_AFTER_MS`) — a record holds
+  an offline host's last known sessions, PR chips and usage, so a host rebooting or updating keeps
+  its slot and the new `device` gets a 429 instead. Nothing is evicted when eviction could not
+  satisfy the request anyway. The accepted cost is that a flood of names can squat slots and block
+  onboarding a genuinely new host until it stops or `AGENTS_MAX` is raised.
+- A host **already in the registry is always admitted** — turning the cap into a wall for the fleet's
+  own hosts is the same outage from the other side.
+- **The aggregate refuses only a host OVER its share** (`AGENT_FAIR_SHARE` = total/count, floored at
+  64 KiB; 512 KiB deployed, against a measured largest-real-record of 0.30 MiB). Refusing a KNOWN
+  host rolls it back to its previous record — `lastSeen` included — so a host refused every beat
+  ages past `OFFLINE_AFTER_MS` and **reads offline while it is up**, indistinguishable from a
+  network failure and invisible to the operator. A host inside its share is not why the registry is
+  full, so it never pays; the refusal lands on the host the operator needs named. An OVER-share host
+  is still refused silently — it freezes and ages to offline, or (if new) never appears at all, with
+  only the throttled log to say why. That is the accepted cost, and the headroom is 1.7× the largest
+  measured real record.
+- **The cost of the exemption is a bounded overshoot, and the bound is an identity**: worst-case
+  retained is `AGENTS_TOTAL_MAX + AGENTS_MAX × AGENT_FAIR_SHARE`. **So the share is DERIVED and
+  never floored** — a floor makes the second term unbounded in `AGENTS_MAX`, and raising
+  `AGENTS_MAX` is exactly what an operator with a growing fleet is told to do (at 2000 hosts a
+  64 KiB floor was 3.9× the budget and OOM-killed the hub). **Raising the count means raising the
+  budget with it**; a share under `AGENT_SHARE_SANE_MIN` warns at load rather than letting the two
+  contradict silently. The flood path cannot reach the exemption at all — a new device is admitted
+  only while the registry is inside the budget, so only an already-seated host can overshoot.
+- **The state.json restore enforces the same budget** (`trimRestoredAgents`, keep-newest), and the
+  file is **measured with `statSync` before it is opened** (`STATE_FILE_MAX`, container/4): the trim
+  cannot protect a restore it never reaches, and `readFileSync` + `JSON.parse` of a flooded file
+  killed the hub at init with no log line, every boot, forever. An oversized file is moved to
+  `.oversized` and the hub boots empty — losing that cache is documented as harmless; not booting
+  is not.
+- **Every log line naming a host goes through `logName`** — `device` is agent-supplied and validated
+  only for length and prototype keys, so a newline in it forged a line reading exactly like the
+  hub's own. It strips C0, DEL **and C1** (`JSON.stringify` escapes none of the C1 block). All FIVE
+  sites go through it: converting only the new ones left the two cheapest to reach — the 413, which
+  is one request needing no registry pressure, and the unknown-field drop, which rides a 200.
+  Refusal logs are throttled to one a minute with the suppressed count, because the flood the cap
+  exists to survive is precisely the traffic that writes them.
+- **A host is warned on the crossing into half its share** (`shareWarned`, the `recordSizeWarned`
+  pattern). Without it the first signal is the host vanishing: the per-record ceiling's warning is at
+  4 MiB and a share is 512 KiB, so a record drifts past its share — and starts being refused — with
+  that warning still eight times away. This is what makes the eighth-of-the-container default safe;
+  a record grows over weeks, which is ample notice provided somebody is told. If real records ever
+  approach the share, raise `AGENTS_TOTAL_MAX` in the DockerOps compose beside `mem_limit` rather
+  than moving the derived default for every deployment at once.
+- Byte accounting is a side map (`recordBytes`), never a field on the record — anything on a record
+  is served to every client — and `registryBytes()` re-measures unknown keys and forgets dead ones,
+  so the many places that `delete agents[key]` need not remember it.
+- New env knobs go through `positiveEnv`: a silently-obeyed negative cap refuses the whole fleet on
+  its first beat, so a bad value is announced and ignored. The effective budget is printed at boot
+  because it is DERIVED, not configured.
+- Tests: `registry-cap.test.js` (small caps) and `registry-restore.test.js` (the restore, plus the
+  DEGENERATE `AGENTS_MAX=2000` config — the overshoot bound only breaks when the derived share falls
+  below what a floor would impose, which the small-cap rig never does). Each needs its own process
+  because the caps are read at require time; `server.test.js` lifts `AGENTS_MAX` because ~100
+  synthetic host names is not a fleet, so the cap's interaction with other routes lives only in
+  those two files.
 - The hub also serves the `glasses/` client: a CORS'd `/api/*` surface for that cross-origin
   WebView; per-session `input`/`history` endpoints; `GET /api/ws-token` for short-lived WebSocket
   auth; an `/audio` STT WebSocket (G2-mic PCM to the LiteLLM instance's transcription endpoint); and

@@ -2,6 +2,7 @@ package com.xerktech.turma.vm
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import java.util.Locale
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.model.UsageBucket
 import com.xerktech.turma.model.UsageInfo
@@ -84,13 +85,77 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val cache: CacheSummary = CacheSummary(),
     )
 
-    /** One host's subscription-limit snapshot, ready to render (XERK-247). */
+    /**
+     * How much of the fleet's spend went to background agents (XERK-302, web
+     * usage.html `subagentCard`).
+     *
+     * The `of*` figures are the denominators, and they are NOT the fleet totals:
+     * they carry only what the hosts REPORTING a split spent. A fleet with one
+     * older host would otherwise take the share against spend that host never
+     * offered a split for, quietly understating it.
+     */
+    data class SubagentSplit(
+        val today: Long = 0,
+        val week: Long = 0,
+        val total: Long = 0,
+        val ofToday: Long = 0,
+        val ofWeek: Long = 0,
+        val ofTotal: Long = 0,
+        /** Hosts that reported a split; 0 means nothing to show at all. */
+        val reporting: Int = 0,
+        /** Hosts in view, reporting or not — `reporting < hosts` is a partial answer. */
+        val hosts: Int = 0,
+    ) {
+        val any: Boolean get() = reporting > 0
+
+        /** True when some host in view can't answer, so the figures cover only part of it. */
+        val partial: Boolean get() = reporting in 1 until hosts
+
+        /**
+         * Delegated share of a window, 0..100 — null when that window has no
+         * spend to take a ratio of ("nothing happened", never "0% delegated").
+         */
+        fun pct(spent: Long, delegated: Long): Double? =
+            if (spent > 0) delegated * 100.0 / spent else null
+
+        val todayPct: Double? get() = pct(ofToday, today)
+        val weekPct: Double? get() = pct(ofWeek, week)
+        val totalPct: Double? get() = pct(ofTotal, total)
+    }
+
+    /**
+     * One SUBSCRIPTION's limit snapshot, ready to render (XERK-247, XERK-301).
+     * [hosts] is every host on that subscription — usually one — and each
+     * window carries the freshest reading any of them took.
+     */
     data class LimitCard(
-        val host: String,
+        val hosts: List<LimitHost>,
         val capturedAt: Long,
         val fiveHour: LimitView? = null,
         val sevenDay: LimitView? = null,
-    )
+        /**
+         * When each window's reading was actually taken. [capturedAt] is the
+         * group's FRESHEST capture, so on a consolidated card a window sourced
+         * from an older host would otherwise be presented under an age that is
+         * not its own; the screen discloses these when they differ.
+         */
+        val fiveHourAt: Long = capturedAt,
+        val sevenDayAt: Long = capturedAt,
+    ) {
+        /**
+         * The card's heading. There is no better name for a subscription — the
+         * key is a hash by design — and the hosts are what the operator
+         * recognises. Long lists give way to a count; every name is still in
+         * [hosts] for the detail line.
+         */
+        val host: String get() =
+            if (hosts.size <= LIMIT_HOSTS_SHOWN) hosts.joinToString(" · ") { it.host }
+            else hosts.take(LIMIT_HOSTS_SHOWN).joinToString(" · ") { it.host } +
+                " +${hosts.size - LIMIT_HOSTS_SHOWN} more"
+    }
+
+    /** One host on a subscription, with the moment IT last read the windows. */
+    data class LimitHost(val host: String, val capturedAt: Long)
 
     /**
      * One window's rendered state. [expired] beats the percentage: when the
@@ -118,6 +183,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val cache: CacheSummary = CacheSummary(),
         /** Freshest snapshot first; empty when no host reports any window. */
         val limits: List<LimitCard> = emptyList(),
+        /** The delegated share of the spend above (XERK-302). */
+        val subagent: SubagentSplit = SubagentSplit(),
     )
 
     companion object {
@@ -159,6 +226,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             var week = 0L
             var total = 0L
             var cache = CacheSummary()
+            var sub = SubagentSplit()
 
             for (a in fleet.agents) {
                 // Prefer the host-level block (aggregated from every transcript
@@ -182,6 +250,32 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 week += hostWeek
                 total += hostTotal
                 cache += hostCache
+
+                // The delegated slice, and beside it the spend it is a slice OF
+                // (XERK-302). Host block first, then the repo blocks — the same
+                // fallback as the totals above. A host reporting no split at all
+                // contributes to NEITHER side, so it drops out of the share
+                // instead of reading as a host that delegated nothing.
+                val hostSub = a.usage?.subagent
+                val repoSubs = if (a.usage == null) a.repoUsage.filter { it.usage.subagent != null }
+                               else emptyList()
+                if (hostSub != null || repoSubs.isNotEmpty()) {
+                    sub = sub.copy(
+                        today = sub.today + (hostSub?.today?.total
+                            ?: repoSubs.sumOf { it.usage.subagent!!.today.total }),
+                        week = sub.week + (hostSub?.week?.total
+                            ?: repoSubs.sumOf { it.usage.subagent!!.week.total }),
+                        total = sub.total + (hostSub?.totals?.total
+                            ?: repoSubs.sumOf { it.usage.subagent!!.totals.total }),
+                        ofToday = sub.ofToday + (if (hostSub != null) hostToday
+                                  else repoSubs.sumOf { it.usage.today.total }),
+                        ofWeek = sub.ofWeek + (if (hostSub != null) hostWeek
+                                 else repoSubs.sumOf { it.usage.week.total }),
+                        ofTotal = sub.ofTotal + (if (hostSub != null) hostTotal
+                                  else repoSubs.sumOf { it.usage.totals.total }),
+                        reporting = sub.reporting + 1,
+                    )
+                }
 
                 for (ru in a.repoUsage) {
                     val key = normRepo(ru.remoteKey.ifBlank { ru.repo })
@@ -222,6 +316,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 total = total,
                 cache = cache,
                 limits = limitCards(fleet, nowSec),
+                subagent = sub.copy(hosts = fleet.agents.size),
             )
         }
 
@@ -251,7 +346,9 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             val mins = Math.round(s / 60.0)
             if (mins < 60) return "${mins}m"
             val hours = mins / 60
-            if (hours < 24) return "%dh %02dm".format(hours, mins % 60)
+            // Locale.US: `%d` renders Arabic-Indic digits under ar_EG, and this
+            // is the "captured 2h 05m ago" stamp beside a token count that does not.
+            if (hours < 24) return String.format(Locale.US, "%dh %02dm", hours, mins % 60)
             return "${hours / 24}d ${hours % 24}h"
         }
 
@@ -281,22 +378,88 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
 
+        /** How many host names a card's heading spells out before counting them. */
+        const val LIMIT_HOSTS_SHOWN = 3
+
         /**
-         * One card per host that reports a usable snapshot, freshest first. A
-         * host reporting none is skipped entirely — an agent too old to send the
-         * field, a login with no subscription windows, or one that hasn't been
-         * probed yet all mean "this host can't tell you", not "0% used" — and so
-         * is one whose snapshot is older than [LIMIT_MAX_AGE_SEC].
+         * One card per SUBSCRIPTION that reports a usable snapshot, freshest
+         * first (web usage.html `limitGroups`).
+         *
+         * A host reporting no snapshot is skipped entirely — an agent too old to
+         * send the field, a login with no subscription windows, or one that
+         * hasn't been probed yet all mean "this host can't tell you", not "0%
+         * used" — and so is one whose snapshot is older than [LIMIT_MAX_AGE_SEC].
+         *
+         * Hosts logged into one Claude account read and spend the SAME 5h/7d
+         * pool, so their snapshots are readings of a single thing and fold into
+         * one card. Grouping is on the agent's opaque `subscription.key`; a host
+         * that reports none keeps a card of its own and is never folded in with
+         * another silent host, since "can't tell you" from two hosts does not
+         * make them one plan.
+         *
+         * Within a group each window takes its FRESHEST reading rather than an
+         * average or a maximum: every host reads the same server-side counter,
+         * and across a window's reset the newest read is the only right answer
+         * where a maximum would keep the pre-reset figure alive.
          */
-        fun limitCards(fleet: FleetState, nowSec: Long): List<LimitCard> =
-            fleet.agents.mapNotNull { a ->
+        fun limitCards(fleet: FleetState, nowSec: Long): List<LimitCard> {
+            // Freshest-first BEFORE folding, and a strict `>` when a window is
+            // replaced, exactly as the web's limitEntries → limitGroups pair
+            // does. Both halves matter for the parity rule: fold in fleet order
+            // (or accept an equal capturedAt) and two hosts whose snapshots tie
+            // to the second resolve to a different host on each client, showing
+            // two different percentages for one subscription. Kotlin's sort is
+            // stable and so is the browser's, so a tie keeps fleet order on
+            // both.
+            val ranked = fleet.agents.mapNotNull { a ->
                 val lim = a.limits ?: return@mapNotNull null
                 if (nowSec - lim.capturedAt > LIMIT_MAX_AGE_SEC) return@mapNotNull null
-                val five = limitView(lim.fiveHour, nowSec)
-                val seven = limitView(lim.sevenDay, nowSec)
-                if (five == null && seven == null) return@mapNotNull null
-                LimitCard(a.device.ifBlank { a.key }, lim.capturedAt, five, seven)
+                if (lim.fiveHour?.usedPct == null && lim.sevenDay?.usedPct == null) return@mapNotNull null
+                a to lim
+            }.sortedByDescending { (_, lim) -> lim.capturedAt }
+
+            // Insertion-ordered so ungrouped hosts keep their place among the
+            // groups; the sort at the end is what actually orders the cards.
+            val groups = mutableListOf<MutableLimitGroup>()
+            val byKey = mutableMapOf<String, MutableLimitGroup>()
+            for ((a, lim) in ranked) {
+                val subKey = a.subscription?.key?.takeIf { it.isNotBlank() }
+                val group = subKey?.let { byKey[it] } ?: MutableLimitGroup().also {
+                    groups.add(it)
+                    if (subKey != null) byKey[subKey] = it
+                }
+                group.hosts.add(LimitHost(a.device.ifBlank { a.key }, lim.capturedAt))
+                group.capturedAt = maxOf(group.capturedAt, lim.capturedAt)
+                if (lim.fiveHour?.usedPct != null && lim.capturedAt > group.fiveHourAt) {
+                    group.fiveHour = lim.fiveHour
+                    group.fiveHourAt = lim.capturedAt
+                }
+                if (lim.sevenDay?.usedPct != null && lim.capturedAt > group.sevenDayAt) {
+                    group.sevenDay = lim.sevenDay
+                    group.sevenDayAt = lim.capturedAt
+                }
+            }
+            return groups.map { g ->
+                LimitCard(
+                    hosts = g.hosts,
+                    capturedAt = g.capturedAt,
+                    fiveHour = limitView(g.fiveHour, nowSec),
+                    sevenDay = limitView(g.sevenDay, nowSec),
+                    fiveHourAt = if (g.fiveHour != null) g.fiveHourAt else g.capturedAt,
+                    sevenDayAt = if (g.sevenDay != null) g.sevenDayAt else g.capturedAt,
+                )
             }.sortedByDescending { it.capturedAt }
+        }
+
+        /** Accumulator behind [limitCards]; never leaves this file. */
+        private class MutableLimitGroup {
+            val hosts = mutableListOf<LimitHost>()
+            var capturedAt = 0L
+            var fiveHour: com.xerktech.turma.model.LimitWindow? = null
+            var fiveHourAt = Long.MIN_VALUE
+            var sevenDay: com.xerktech.turma.model.LimitWindow? = null
+            var sevenDayAt = Long.MIN_VALUE
+        }
 
         /** How many days the stacked daily chart shows (web usage.html DAYS_SHOWN). */
         const val DAYS_SHOWN = 30

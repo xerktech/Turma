@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.net.AnswerRequest
 import com.xerktech.turma.net.CloneRequest
 import com.xerktech.turma.net.InputRequest
@@ -14,6 +15,7 @@ import com.xerktech.turma.net.OkResponse
 import com.xerktech.turma.net.ResumeRequest
 import com.xerktech.turma.net.SpawnRequest
 import com.xerktech.turma.net.SummaryRequest
+import com.xerktech.turma.net.hubErrorMessage
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -59,13 +61,37 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() = container.fleet.stop()
     fun refresh() = container.fleet.nudge()
 
-    private fun run(ok: String, block: suspend () -> OkResponse) {
+    /**
+     * Fire one command and report what actually happened.
+     *
+     * A refusal the hub EXPLAINED — an org mismatch, an agent too old to run it,
+     * an offline host, a command queue too full to take another — arrives as a
+     * non-2xx, which Retrofit throws as an HttpException with the body attached.
+     * Reporting that as "hub unreachable" sent the operator hunting for a
+     * network fault that isn't there (XERK-264), so [hubErrorMessage] reads the
+     * hub's own `{error}` text and only a genuine transport failure keeps the
+     * generic wording.
+     *
+     * `pendKeys` are the optimistic rows this command painted: a command that
+     * never reached the agent must not keep a spinner up for the whole TTL, so
+     * they come straight back off on a failure.
+     */
+    private fun run(ok: String, vararg pendKeys: String, block: suspend () -> OkResponse) {
         viewModelScope.launch {
             val msg = try {
                 val r = block()
                 if (r.error.isNotEmpty()) "✗ ${r.error}" else "✓ $ok"
             } catch (e: Exception) {
-                "✗ hub unreachable"
+                // Prefer the hub's OWN reason when it gave one (XERK-246): a
+                // refused spawn — "host has no local model configured" on a 409
+                // — used to read "hub unreachable", which is both wrong and
+                // unactionable. Only a genuinely unanswered request says that.
+                "✗ " + (hubErrorMessage(e) ?: "hub unreachable")
+            }
+            // A refusal also rolls back whatever was painted optimistically
+            // (XERK-264) — the card must not sit dimmed on a command that never ran.
+            if (msg.startsWith("✗") && pendKeys.isNotEmpty()) {
+                _pending.value = _pending.value - pendKeys.toSet()
             }
             _messages.tryEmit(msg)
             container.fleet.nudge()
@@ -86,39 +112,33 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun spawn(
         host: String, repo: String, prompt: String? = null, label: String? = null,
         baseRef: String? = null, model: String? = null, permissionMode: String? = null,
+        modelSource: String? = null,
     ) = run("session queued") {
         container.client.api.spawnSession(
             host,
-            SpawnRequest(
-                repo = repo,
-                prompt = prompt?.ifBlank { null },
-                label = label?.ifBlank { null },
-                baseRef = baseRef?.ifBlank { null },
-                model = model?.ifBlank { null },
-                permissionMode = permissionMode?.ifBlank { null },
-            ),
+            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource),
         )
     }
 
     fun kill(host: String, id: String) {
         mark(host, id, "kill")
-        run("kill queued") { container.client.api.sessionAction(host, id, "kill") }
+        run("kill queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "kill") }
     }
     fun start(host: String, id: String) {
         mark(host, id, "start")
-        run("start queued") { container.client.api.sessionAction(host, id, "start") }
+        run("start queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "start") }
     }
     fun restart(host: String, id: String) {
         mark(host, id, "restart")
-        run("restart queued") { container.client.api.sessionAction(host, id, "restart") }
+        run("restart queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "restart") }
     }
     fun resume(host: String, id: String) {
         mark(host, id, "resume")
-        run("resume queued") { container.client.api.sessionAction(host, id, "resume") }
+        run("resume queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "resume") }
     }
     fun delete(host: String, id: String) {
         mark(host, id, "delete")
-        run("delete queued") { container.client.api.deleteSession(host, id) }
+        run("delete queued", pendKey(host, id)) { container.client.api.deleteSession(host, id) }
     }
 
     /** Move a running session to another agent in the same org (XERK-101). The
@@ -158,6 +178,32 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         fun pendKey(host: String, id: String) = "$host::$id"
+
+        /**
+         * The body a "New session" spawn posts. Pure, and separate from [spawn]
+         * so the wire shape is pinned by a test rather than only by driving the
+         * app: every blank optional is omitted, so a bare one-click spawn queues
+         * exactly `{repo}` as it always did.
+         *
+         * `modelSource` is sent ONLY for the local model (XERK-246) —
+         * "subscription" is what a spawn already meant. `model` is sent whatever
+         * the source, matching the web composer: the agent drops `--model` for a
+         * local session itself, and the alias is what that session goes back to
+         * if it is later switched to the subscription.
+         */
+        fun spawnRequest(
+            repo: String, prompt: String? = null, label: String? = null,
+            baseRef: String? = null, model: String? = null, permissionMode: String? = null,
+            modelSource: String? = null,
+        ) = SpawnRequest(
+            repo = repo,
+            prompt = prompt?.ifBlank { null },
+            label = label?.ifBlank { null },
+            baseRef = baseRef?.ifBlank { null },
+            model = model?.ifBlank { null },
+            permissionMode = permissionMode?.ifBlank { null },
+            modelSource = ModelSource.spawnValue(modelSource),
+        )
 
         /** The in-flight action kind for a session, or null (web sessPending). */
         fun sessPending(pending: Map<String, SessPending>, host: String, id: String): String? =

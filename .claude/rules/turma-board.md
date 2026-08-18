@@ -119,7 +119,9 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   demand); a "no repo" verdict and an untriaged ticket get none. A failed start renders its reason
   beside a LIVE button.
 - In-flight state clears on **evidence**, not a timer: a session reporting the spawn's `cmdId`, or
-  the command clearing from the host's queue (which covers a spawn the agent REFUSED).
+  the command clearing from the host's queue (which covers a spawn the agent REFUSED). A `{queued}`
+  reply has neither — nothing was handed to a host — so it clears the pending outright and the card
+  paints from `ticketQueue` (XERK-296).
 - The press is acknowledged **instantly and survives leaving the board** (XERK-18): the button acts
   on **`pointerdown`** (fired before any re-render — the board `innerHTML`-replaces every beat),
   `click` the keyboard path, both via `startFrom` whose pending guard no-ops a double-fire;
@@ -135,7 +137,9 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   refuses rather than reroutes.
 - `findTicketHost` chooses among the org's **ONLINE** hosts: **prefers one with the repo cloned**,
   and — within that group, or across all when none has it — picks the **most available**
-  (`hostAvailability`). A momentarily-full host is still valid: the session **queues** there.
+  (`hostAvailability`). Under `requireFree` (every ticket spawn — see the ticket queue below) a
+  **full host is not a target at all**: with none free the TICKET queues hub-side instead, and is
+  routed on a later pass.
 - `hostAvailability(a)` = `capacity.free` **minus `capacity.queued` and the spawn/spawnTicket
   commands still queued** since its last heartbeat — subtracting in-flight commands is what makes
   rapid clicks split. An agent predating `capacity` scores below one that reports it.
@@ -143,6 +147,12 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   the most-available host; `spawn_ticket` clones it and queues behind the clone — never a refusal.
 - The **multi-host-per-org limits still apply**: the triage/branch state is per-host, so a
   clone-on-demand routed to a host that didn't triage the ticket has no ledger entry to clone from.
+
+#### The hub's ticket queue (XERK-296)
+
+Waiting work is a queued TICKET on the hub, and its host is chosen at dispatch. The rule is in
+`CLAUDE.md`; the mechanics — admission, the drain, the expiries, the caps — are in
+`.claude/rules/turma-ticket-queue.md`, which loads on the same files this does.
 
 #### Auto-starting To Do tickets (XERK-32)
 
@@ -154,9 +164,10 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   riding the fleet payload as top-level `autoStartOrgs` plus an SSE event. **No agent-side flag**,
   so toggling never needs an agent redeploy.
 - **The decision and routing live on the HUB** (only it sees the whole fleet). `autoStartSweep()` (a
-  15s `setInterval`, boot-grace-gated) walks each org in `orgsWithAutoStart` and routes a
-  `spawnTicket` through the **same `findTicketHost`** the button uses, for each To Do ticket with a
-  `repoGuess.repo`.
+  15s `setInterval`, boot-grace-gated) walks each org in `orgsWithAutoStart` and **queues** each To
+  Do ticket with a `repoGuess.repo`; `drainTicketQueue` then routes it through the **same
+  `findTicketHost`** the button uses, at the moment a host can take it (XERK-296). The sweep decides
+  WHICH tickets run; it no longer decides WHERE.
 - Never opens a **second** session for work already started. Three guards, increasing in strength:
   `startedTicketKeys()` — durable, a ticket carrying a session on ANY channel (`a.sessions`,
   `a.closedSessions`, a repo's `resumable` scan) is handled, a **killed** session counting; an
@@ -172,9 +183,10 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     such a ticket for the hub's lifetime even after its condition clears. A **no-online-host**
     result likewise spends NO attempt, so it retries once a host returns.
   - The retry gate is **evidence, in the sweep's existing order**: a session on any channel ends the
-    attempts and drops the record; an in-flight command concludes nothing; only a still-session-less
-    ticket with nothing in flight, past its backoff, is retried. A queued session reports its
-    `ticket` from the first beat, so a slow spawn is never mistaken for a failed one.
+    attempts and drops the record; an in-flight command — or a place in the hub queue — concludes
+    nothing; only a still-session-less ticket with nothing pending, past its backoff, is re-queued.
+    A queued session reports its `ticket` from the first beat, so a slow spawn is never mistaken for
+    a failed one.
 - Nothing is written to Jira.
 
 #### Auto-stopping Done tickets (XERK-45, XERK-161)

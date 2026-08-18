@@ -147,6 +147,32 @@ class TestDeviceName(unittest.TestCase):
         for good in ("truenas", "WIN-DESK01", "host.lab", "server-1"):
             self.assertEqual(ha._usable_hostname(good), good, good)
 
+    def test_usable_hostname_rejects_url_dot_segments(self):
+        # "." / ".." survive percent-encoding untouched and are then collapsed by
+        # the URL parser resolving /api/agents/<host>/..., so such a host looks
+        # online while every route against it 404s (XERK-269).
+        for bad in (".", "..", " . ", "\t..\n"):
+            self.assertEqual(ha._usable_hostname(bad), "", bad)
+        # Only the bare segments are unaddressable — names that merely contain or
+        # start with dots percent-encode and route fine.
+        for good in ("...", ".hidden", "a.b", "HOST.local.", "..host"):
+            self.assertEqual(ha._usable_hostname(good), good, good)
+
+    def test_dot_segment_name_falls_through_to_next_source(self):
+        # The whole point of rejecting it: the agent registers under the next
+        # usable source rather than under a name the hub cannot address.
+        self.assertEqual(
+            self._run(host_file=".\n", docker_name="..", smb_name="truenas"),
+            "truenas")
+
+    def test_dot_segment_env_override_is_refused(self):
+        # DEVICE_NAME otherwise outranks every detection source, but a dot
+        # segment is unaddressable no matter who chose it.
+        for bad in (".", ".."):
+            self.assertEqual(
+                self._run(env={"DEVICE_NAME": bad}, host_file="truenas\n"),
+                "truenas", bad)
+
     def test_env_wins_first(self):
         # entrypoint.sh exports DEVICE_NAME after resolving once; it (or an
         # explicit operator override) is checked before any auto-detection.
@@ -862,6 +888,238 @@ class TestAggregateProjectIncremental(ProjectDirMixin, unittest.TestCase):
         fresh, foff = ha._UsageAcc(), {}
         self.assertTrue(self._fold(fresh, foff))
         self.assertEqual(fresh.totals["input"], 5)
+
+
+class TestSubagentUsage(ProjectDirMixin, unittest.TestCase):
+    """Background agents' transcripts are real spend on the same login, and were
+    never counted at all (XERK-302) — the walk only ever read the flat listing.
+    They now fold into the totals like any other turn AND are reported as a
+    named slice of them."""
+
+    def _entry(self, ts, mid, inp, out=0):
+        return usage_entry(ts, mid, mid, "claude-opus-4-20250514", inp, out)
+
+    def _sub(self, transcript_id, *parts):
+        """A subagent transcript path under `<id>/subagents/<parts…>`."""
+        path = os.path.join(self.proj, transcript_id, "subagents", *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def _report(self):
+        acc = ha._UsageAcc()
+        ha._aggregate_project(self.proj, acc)
+        return ha._finalize_usage(acc)
+
+    def test_counts_flat_and_workflow_nested_subagent_transcripts(self):
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        write_jsonl(self._sub("main", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        # A Workflow run nests one level deeper; the shape has already grown
+        # once, which is why the walk is a walk and not two hard-coded depths.
+        write_jsonl(self._sub("main", "workflows", "wf_x", "agent-def.jsonl"),
+                    [self._entry("2026-07-01T10:06:00Z", "s2", 3)])
+
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 123)          # all of it
+        self.assertEqual(rep["subagent"]["totals"]["input"], 23)  # the delegated part
+
+    def test_subagent_tokens_are_a_slice_not_an_addend(self):
+        # The per-model breakdown and the day buckets count a delegated turn
+        # exactly like a session's own — only the `subagent` block separates it.
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        write_jsonl(self._sub("main", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        rep = self._report()
+        self.assertEqual(rep["days"]["2026-07-01"]["input"], 120)
+        self.assertEqual([m["totals"]["input"] for m in rep["models"]], [120])
+
+    def test_a_subagents_dir_is_counted_without_its_parent_transcript(self):
+        # The parent conversation can be archived or pruned away; the tokens the
+        # agents it launched spent were still spent.
+        write_jsonl(self._sub("gone", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 20)
+        self.assertEqual(rep["subagent"]["totals"]["input"], 20)
+
+    def test_sessions_counts_conversations_only(self):
+        # `sessions` is a display stat meaning conversations. Counting delegated
+        # transcripts would inflate it by however much a session delegated.
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 1)])
+        for i in range(3):
+            write_jsonl(self._sub("main", f"agent-{i}.jsonl"),
+                        [self._entry("2026-07-01T10:05:00Z", f"s{i}", 1)])
+        self.assertEqual(self._report()["sessions"], 1)
+
+    def test_offsets_key_on_the_relative_path_so_names_cannot_collide(self):
+        # Two parents' agents can share a filename; keyed on the bare name, one
+        # would take the other's offset and be skipped.
+        write_jsonl(self._sub("one", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 11)])
+        write_jsonl(self._sub("two", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:01:00Z", "s2", 22)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+        self.assertEqual(acc.totals["input"], 33)
+        self.assertEqual(
+            sorted(offsets),
+            [os.path.join("one", "subagents", "agent-abc.jsonl"),
+             os.path.join("two", "subagents", "agent-abc.jsonl")])
+
+    def test_incremental_matches_a_full_parse_for_subagents_too(self):
+        main = os.path.join(self.proj, "main.jsonl")
+        sub = self._sub("main", "agent-abc.jsonl")
+        write_jsonl(main, [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        write_jsonl(sub, [self._entry("2026-07-01T10:05:00Z", "s1", 20)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+        # A later beat: the agent wrote more, and a NEW agent was launched.
+        write_jsonl(sub, [self._entry("2026-07-02T10:00:00Z", "s2", 5)])
+        write_jsonl(self._sub("main", "agent-xyz.jsonl"),
+                    [self._entry("2026-07-02T10:01:00Z", "s3", 7)])
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+
+        full = ha._UsageAcc()
+        ha._aggregate_project(self.proj, full)
+        self.assertEqual(acc.totals, full.totals)
+        self.assertEqual(acc.subagent["totals"], full.subagent["totals"])
+        self.assertEqual(acc.subagent["totals"]["input"], 32)
+
+    def test_a_vanished_subagent_transcript_signals_a_rebuild(self):
+        sub = self._sub("main", "agent-abc.jsonl")
+        write_jsonl(sub, [self._entry("2026-07-01T10:00:00Z", "s1", 20)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(ha._aggregate_project(self.proj, acc, offsets))
+        os.remove(sub)
+        # Already-counted bytes can't be un-counted incrementally, so the caller
+        # is told to start this slug over — same contract as a main transcript.
+        self.assertFalse(ha._aggregate_project(self.proj, acc, offsets))
+
+    def test_windows_and_merge_carry_the_split(self):
+        today = ha._utc_today()
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry(today + "T10:00:00Z", "m1", 100)])
+        write_jsonl(self._sub("main", "agent-abc.jsonl"),
+                    [self._entry(today + "T10:05:00Z", "s1", 20)])
+        acc = ha._UsageAcc()
+        ha._aggregate_project(self.proj, acc)
+        merged = ha._UsageAcc()
+        ha._merge_acc(merged, acc)
+        rep = ha._finalize_usage(merged)
+        self.assertEqual(rep["subagent"]["today"]["input"], 20)
+        self.assertEqual(rep["subagent"]["week"]["input"], 20)
+        self.assertEqual(rep["subagent"]["totals"]["input"], 20)
+
+    def test_only_regular_files_count_on_either_branch(self):
+        # A DIRECTORY named *.jsonl would read as a conversation and, by taking
+        # the .jsonl branch, skip its own subagents/ tree entirely.
+        write_jsonl(self._sub("adir.jsonl", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 20)])
+        rep = self._report()
+        self.assertEqual(rep["sessions"], 0)
+        self.assertEqual(rep["subagent"]["totals"]["input"], 20)
+
+    def test_a_fifo_named_like_a_transcript_is_never_ENUMERATED(self):
+        # A FIFO (or a symlink to /dev/zero) blocks a plain read forever, and
+        # this walk is the cheap place to refuse it — the usage parse runs on the
+        # heartbeat's critical path, where a block is a host that reads offline.
+        #
+        # **Asserted on the enumeration, which never opens anything.** Asserting
+        # it through the parse instead makes a regression HANG the suite rather
+        # than fail it: CI then burns its whole job timeout and reports as
+        # infrastructure flake instead of as this test going red.
+        os.mkfifo(os.path.join(self.proj, "pipe.jsonl"))
+        os.mkfifo(self._sub("main", "agent-pipe.jsonl"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        self.assertEqual(ha._project_transcripts(self.proj), [("main.jsonl", False)])
+
+    def test_the_parse_itself_completes_over_a_fifo(self):
+        # The end-to-end half of the test above, run on a DAEMON thread with a
+        # join timeout so a lost guard fails here instead of hanging the suite.
+        os.mkfifo(os.path.join(self.proj, "pipe.jsonl"))
+        os.mkfifo(self._sub("main", "agent-pipe.jsonl"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        out = {}
+        t = threading.Thread(target=lambda: out.update(self._report()), daemon=True)
+        t.start()
+        t.join(20)
+        if t.is_alive():
+            self.fail("the usage parse blocked on a FIFO named like a transcript")
+        self.assertEqual(out["totals"]["input"], 100)
+        self.assertEqual(out["sessions"], 1)
+
+    def test_a_subagents_SYMLINK_is_refused_outright(self):
+        # os.walk always descends its own top, so followlinks=False does not
+        # cover this one. Pointed at PROJECTS_ROOT it would drag every
+        # transcript on the host into this slug.
+        os.makedirs(os.path.join(self.proj, "main"))
+        other = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(other)
+        write_jsonl(os.path.join(other, "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 999)])
+        os.symlink(other, os.path.join(self.proj, "main", "subagents"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 100)   # the foreign 999 stays out
+        self.assertEqual(rep["subagent"]["totals"], ha._usage_bucket())
+
+    def test_a_symlinked_PARENT_reaching_a_real_subagents_is_refused_too(self):
+        # `islink` on the `subagents` component alone checks the FINAL one, so a
+        # symlinked parent still reached a real subagents/ through the link. Both
+        # checks are needed; refusing the class beats reasoning about each shape.
+        other = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(os.path.join(other, "subagents"))
+        write_jsonl(os.path.join(other, "subagents", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 999)])
+        os.symlink(other, os.path.join(self.proj, "main"))
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        rep = self._report()
+        self.assertEqual(rep["totals"]["input"], 100)
+        self.assertEqual(rep["subagent"]["totals"], ha._usage_bucket())
+
+    def test_a_symlink_loop_under_subagents_does_not_hang_or_raise(self):
+        sub = os.path.join(self.proj, "main", "subagents")
+        os.makedirs(sub)
+        os.symlink(sub, os.path.join(sub, "loop"))
+        write_jsonl(os.path.join(sub, "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 20)])
+        self.assertEqual(self._report()["subagent"]["totals"]["input"], 20)
+
+    def test_a_slug_holding_only_subagents_still_reports_a_host_block(self):
+        # `sessions` counts conversations, so it stopped being a proxy for "this
+        # host spent something": a pruned parent leaves a subagents/ tree with
+        # real tokens and no conversation, which reported per-repo usage beside
+        # a NULL host-level block.
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        proj = os.path.join(self.tmp, ha._project_slug(wt))
+        os.makedirs(os.path.join(proj, "gone", "subagents"))
+        write_jsonl(os.path.join(proj, "gone", "subagents", "agent-abc.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "s1", 90)])
+
+        def fold(slug):
+            acc = ha._UsageAcc()
+            ha._aggregate_project(os.path.join(self.tmp, slug), acc)
+            return acc
+
+        repo_usage, host = ha.repo_usage_report(
+            {wt: {"repo": "Turma", "remote": "", "slug": ha._project_slug(wt)}}, fold)
+        self.assertEqual(repo_usage[0]["usage"]["totals"]["input"], 90)
+        self.assertIsNotNone(host)
+        self.assertEqual(host["totals"]["input"], 90)
+
+    def test_a_project_with_no_subagents_reports_a_zeroed_split(self):
+        # Zeroed, not absent: this agent CAN answer, and the answer is "none".
+        write_jsonl(os.path.join(self.proj, "main.jsonl"),
+                    [self._entry("2026-07-01T10:00:00Z", "m1", 100)])
+        rep = self._report()
+        self.assertEqual(rep["subagent"]["totals"], ha._usage_bucket())
 
 
 class TestLastEntry(ProjectDirMixin, unittest.TestCase):
@@ -3332,6 +3590,148 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         self.assertFalse(ha._looks_like_internal_tool_prompt("ok, ship the probe"))
 
 
+class TestSubscriptionIdentity(unittest.TestCase):
+    """Which subscription a host's login is on (XERK-301). The limits above are a
+    property of the ACCOUNT, so hosts sharing one account share one set of bars —
+    which needs a stable, opaque key, and needs "I can't tell" to stay tellable
+    apart from "I share yours"."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, ".claude.json")
+        ha._subscription_cache = {}
+        ha._subscription_last_problem = {}
+        self.addCleanup(setattr, ha, "_subscription_cache", {})
+        self.addCleanup(setattr, ha, "_subscription_last_problem", {})
+
+    def _write(self, data, path=None):
+        with open(path or self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def _read(self, env=None):
+        return ha.subscription_identity(paths=[self.path], env=env or {})
+
+    def test_reads_the_account_from_the_claude_config(self):
+        self._write({"oauthAccount": {"accountUuid": "acc-1", "emailAddress": "a@b.c"}})
+        block = self._read()
+        self.assertEqual(block["source"], "login")
+        self.assertEqual(len(block["key"]), ha.SUBSCRIPTION_KEY_CHARS)
+
+    def test_the_key_carries_nothing_of_the_account_it_names(self):
+        # The hub persists every heartbeat and fans it out to web, Android and
+        # glasses; grouping only ever asks whether two hosts are equal, so the
+        # uuid, the org uuid and the email have no business on the wire.
+        self._write({"oauthAccount": {"accountUuid": "acc-1",
+                                      "emailAddress": "someone@example.com",
+                                      "organizationUuid": "org-9"}})
+        key = self._read()["key"]
+        for secret in ("acc-1", "someone@example.com", "org-9"):
+            self.assertNotIn(secret, key)
+
+    def test_the_same_account_gives_the_same_key_and_a_different_one_does_not(self):
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        first = self._read()["key"]
+        ha._subscription_cache = {}
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        self.assertEqual(self._read()["key"], first)
+        ha._subscription_cache = {}
+        self._write({"oauthAccount": {"accountUuid": "acc-2"}})
+        self.assertNotEqual(self._read()["key"], first)
+
+    def test_a_login_that_cannot_be_identified_reports_nothing(self):
+        # None is the heartbeat's "that agent can't tell you" value: such a host
+        # keeps a card of its own rather than being folded in with every other
+        # host that also can't say.
+        self.assertIsNone(self._read())                    # no file at all
+        self._write({"numStartups": 3})                    # no oauthAccount
+        self.assertIsNone(self._read())
+        ha._subscription_cache = {}
+        self._write({"oauthAccount": {"accountUuid": ""}})  # blank uuid
+        self.assertIsNone(self._read())
+
+    def test_a_broken_config_costs_the_grouping_not_the_beat(self):
+        # This runs on the beat's critical path over a file Claude Code rewrites
+        # constantly, so a truncated write must never raise.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write('{"oauthAccount": {"accountUu')
+        self.assertIsNone(self._read())
+        ha._subscription_cache = {}
+        self._write(["not", "an", "object"])
+        self.assertIsNone(self._read())
+
+    def test_an_implausibly_large_config_is_not_read(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(" " * (ha.SUBSCRIPTION_CONFIG_MAX_BYTES + 1))
+        self.assertIsNone(self._read())
+
+    def test_the_env_pin_overrides_the_login_and_is_hashed_too(self):
+        # For a host whose config this can't read. Two hosts given the same
+        # string must land in the same group, and neither source leaks its input.
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        pinned = self._read({ha.SUBSCRIPTION_KEY_ENV: " team-max "})
+        self.assertEqual(pinned["source"], "env")
+        self.assertNotIn("team-max", pinned["key"])
+        self.assertEqual(pinned, self._read({ha.SUBSCRIPTION_KEY_ENV: "team-max"}))
+        self.assertNotEqual(pinned["key"], self._read()["key"])
+
+    def test_every_layout_is_tried_until_one_ANSWERS(self):
+        # CLAUDE_CONFIG_DIR puts the file INSIDE the config dir; the default puts
+        # it beside it. Both are routinely present, so falling through only on a
+        # MISSING path lets an accountless first file permanently suppress the
+        # one that actually holds the login.
+        other = os.path.join(self.dir, "other.json")
+        self._write({"oauthAccount": {"accountUuid": "acc-2"}}, path=other)
+        self._write({"numStartups": 3})          # exists, but answers nothing
+        missing = os.path.join(self.dir, "nope.json")
+        for paths in ([missing, other], [self.path, other]):
+            self.assertEqual(
+                ha.subscription_identity(paths=paths, env={})["source"], "login", paths)
+
+    def test_something_that_is_not_a_regular_file_is_never_opened(self):
+        # A FIFO blocks open() until somebody writes, and this runs INLINE in the
+        # beat — the host would just stop heartbeating with nothing to say why.
+        # A directory and a device at that path are equally not the config file.
+        os.mkfifo(self.path)
+        self.assertIsNone(self._read())
+        os.unlink(self.path)
+        os.mkdir(self.path)
+        self.assertIsNone(self._read())
+
+    def test_two_bad_paths_at_once_do_not_bury_the_log(self):
+        # The read walks EVERY candidate, so two simultaneously-bad paths
+        # alternate messages — a single-slot memo never matches either and logs
+        # both on every beat, which is thousands of lines a day and the exact
+        # burial the memo exists to prevent.
+        second = os.path.join(self.dir, "second.json")
+        os.mkdir(self.path)                 # a directory where the config should be
+        os.mkfifo(second)                   # and a FIFO at the other layout
+        lines = []
+        with mock.patch.object(ha, "log", lines.append):
+            for _ in range(5):
+                self.assertIsNone(ha.subscription_identity(paths=[self.path, second], env={}))
+        self.assertEqual(len(lines), 2, lines)   # one per path, once each
+
+    @unittest.skipUnless(os.path.exists("/dev/zero"), "needs /dev/zero")
+    def test_an_endless_device_is_refused_without_being_read(self):
+        # /dev/zero reports st_size 0 and then hands over bytes forever, so a
+        # ceiling read off stat alone is not a ceiling — the old shape allocated
+        # 16 GiB in 12 seconds against it. The regular-file gate is what refuses
+        # it; the read bound behind that is belt and braces.
+        started = time.monotonic()
+        self.assertIsNone(ha.subscription_identity(paths=["/dev/zero"], env={}))
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_re_login_is_picked_up_rather_than_cached_forever(self):
+        # The config file is ~120 KiB and almost never changes, so it is read
+        # once per (mtime, size) — but a changed login has to win.
+        self._write({"oauthAccount": {"accountUuid": "acc-1"}})
+        first = self._read()["key"]
+        self._write({"oauthAccount": {"accountUuid": "acc-2-longer"}})
+        os.utime(self.path, (0, 0))   # force a different mtime than the write
+        self.assertNotEqual(self._read()["key"], first)
+
+
 class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
     orphan transcript (session aged out of closed.json, or predating the ledger)
@@ -4035,7 +4435,12 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         sm.registry = [{"id": "sess1", "worktreePath": wt, "status": "running",
                         "repo": "Turma", "claudeSessionId": "transE"}]
         sent = {}
-        sm._migration_upload = lambda mid, blob: sent.update(mid=mid, blob=blob)
+
+        def upload(mid, blob):
+            sent.update(mid=mid, blob=blob)
+            return True   # the real one answers whether the POST landed
+
+        sm._migration_upload = upload
         sm.export_session("sess1", "mig123")
         self.assertEqual(sent["mid"], "mig123")
         # What it uploaded really is the packed transcript.
@@ -4052,6 +4457,41 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         sm._migration_upload = lambda *a: called.append(a)
         sm.export_session("s", "mig1")
         self.assertEqual(called, [])
+
+    def test_migration_upload_retries_a_busy_hub_but_not_a_refusal(self):
+        # A bundle is the largest body an agent ever sends, so it is the one most
+        # likely to meet the hub's in-flight budget and be told 503 (XERK-258).
+        # Nothing else retries it, and a lost bundle strands the whole move until
+        # it times out hub-side.
+        sm = self._manager()
+        sm.MIGRATION_UPLOAD_BACKOFF_SEC = 0  # don't actually sleep in the suite
+
+        def attempts_for(codes):
+            """Run an upload whose Nth call raises codes[N], and count the calls."""
+            calls = []
+
+            def fake_urlopen(req, timeout=None):
+                calls.append(req)
+                code = codes[len(calls) - 1] if len(calls) <= len(codes) else None
+                if code is not None:
+                    raise urllib.error.HTTPError(
+                        req.full_url, code, "nope", {}, None)
+                return mock.MagicMock(
+                    __enter__=lambda s: mock.Mock(read=lambda: b""),
+                    __exit__=lambda *a: False)
+
+            with mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+                sm._migration_upload("mig1", b"bundle")
+            return len(calls)
+
+        # 503 twice then success: it keeps trying and the move survives.
+        self.assertEqual(attempts_for([503, 503]), 3)
+        # A 4xx is the hub having parsed the bundle and declined it — re-sending
+        # the same bytes would be refused identically, so it gives up at once.
+        self.assertEqual(attempts_for([413]), 1)
+        # And it never retries forever.
+        self.assertEqual(attempts_for([503, 503, 503, 503, 503]),
+                         sm.MIGRATION_UPLOAD_ATTEMPTS)
 
     def test_import_unpacks_and_resumes_with_identity(self):
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig")  # not on disk here
@@ -4200,6 +4640,174 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess.get("prUrls"), [url])
         self.assertEqual(sm.session_pr_urls[sess["id"]], [url])
         self.assertEqual(sm.pr_ledger["transP"]["urls"], [url])
+
+
+class TestSpawnFailures(ManagerMixin, unittest.TestCase):
+    """A refused session-creating command is REPORTED, not just logged
+    (XERK-265). The command is ACKed whether the agent ran it or declined it, so
+    without a staged failure the hub cannot tell a refusal from a slow spawn: a
+    migration sits in `importing` until MIGRATE_TIMEOUT_MS and the Sessions page
+    spins out its follow window, both with no reason attached."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.repo = {"name": "Turma", "path": os.path.join(ha.REPOS_ROOT, "Turma")}
+        os.makedirs(self.repo["path"], exist_ok=True)
+        p2 = mock.patch.object(ha, "scan_repos", lambda: [self.repo])
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sm.device = "hostA"
+        return sm
+
+    def test_a_refused_resume_stages_its_reason_against_the_cmd_id(self):
+        sm = self._manager()
+        with mock.patch.object(ha, "MAX_SESSIONS", 0):
+            sm._resume_at_cwd("trans1", os.path.join(ha.WORKTREES_ROOT, "Turma", "w1"),
+                              cmd_id="c1")
+        self.assertEqual(len(sm.spawn_failures), 1)
+        f = sm.spawn_failures[0]
+        self.assertEqual(f["cmdId"], "c1")
+        self.assertIsNone(f["migrationId"])
+        self.assertIn("MAX_SESSIONS", f["error"])
+        self.assertEqual(sm.registry, [])   # and no half-built session behind it
+
+    def test_a_refused_import_names_its_migration_so_the_hub_can_fail_it(self):
+        """The case the ticket is about: the target declines, and the hub needs
+        the migrationId to fail that move now instead of at its timeout."""
+        sm = self._manager()
+        sm._migration_download = lambda mid: None   # relay fetch fails
+        sm.import_session({"migrationId": "mig9", "cmdId": "c9",
+                           "transcriptId": "0" * 8 + "-0000-4000-8000-" + "0" * 12,
+                           "cwd": os.path.join(ha.WORKTREES_ROOT, "Turma", "w2"),
+                           "repo": "Turma"})
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["mig9"])
+        self.assertEqual(sm.spawn_failures[0]["cmdId"], "c9")
+
+    def test_an_import_refused_inside_resume_still_names_its_migration(self):
+        """_resume_at_cwd's own refusals are the ones the ticket found discarded
+        — they must carry the migration id through, not just the cmdId."""
+        sm = self._manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "w3")
+        with mock.patch.object(ha, "MAX_SESSIONS", 0):
+            sm._resume_at_cwd("trans3", cwd, cmd_id="c3", migration_id="mig3")
+        self.assertEqual(sm.spawn_failures[0]["migrationId"], "mig3")
+
+    def test_a_refused_export_is_reported_too(self):
+        """The SOURCE half hangs the same way — a move whose blob never ships
+        sits in `exporting` for the whole timeout."""
+        sm = self._manager()
+        sm.registry = [{"id": "s", "worktreePath": "/nope", "status": "running",
+                        "repo": "Turma", "claudeSessionId": "gone"}]
+        sm.export_session("s", "mig1")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["mig1"])
+        self.assertIn("transcript", sm.spawn_failures[0]["error"])
+
+    def test_a_failed_upload_is_reported(self):
+        sm = self._manager()
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "sessU")
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "transU.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "cwd": wt}) + "\n")
+        sm.registry = [{"id": "sessU", "worktreePath": wt, "status": "running",
+                        "repo": "Turma", "claudeSessionId": "transU"}]
+        sm._migration_upload = lambda mid, blob: False
+        sm.export_session("sessU", "migU")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["migU"])
+
+    def test_a_resume_any_that_finds_no_transcript_is_reported(self):
+        sm = self._manager()
+        sm.resume_transcript("11111111-2222-4333-8444-555555555555",
+                             cwd_hint=None, cmd_id="c7")
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c7"])
+
+    def test_an_uncorrelatable_refusal_is_logged_only(self):
+        """Nothing to report it against: the migration id IS the handle, and a
+        malformed one is what's being rejected."""
+        sm = self._manager()
+        sm.import_session({"migrationId": "bad id!", "transcriptId": "t"})
+        self.assertEqual(sm.spawn_failures, [])
+
+    def test_staged_failures_ride_the_next_beat_and_clear_on_delivery(self):
+        sm = self._manager()
+        self.assertNotIn("spawnFailures", sm.build_payload(1))  # absent when empty
+        with mock.patch.object(ha, "MAX_SESSIONS", 0):
+            sm._resume_at_cwd("t", os.path.join(ha.WORKTREES_ROOT, "Turma", "w4"),
+                              cmd_id="c4")
+        self.assertEqual(len(sm.build_payload(1)["spawnFailures"]), 1)
+        with mock.patch.object(ha.urllib.request, "urlopen") as uo:
+            uo.return_value.__enter__.return_value.read.return_value = b"{}"
+            sm.post({"device": "hostA"})
+        self.assertEqual(sm.spawn_failures, [])
+
+    def test_the_prune_race_is_reported(self):
+        """THE refusal this ticket exists for. XERK-256 made a resume decline
+        while a prune removes the target worktree — ordinary timing between two
+        features, so it must not read as a move that randomly hung for the
+        timeout."""
+        sm = self._manager()
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "wP")
+        os.makedirs(cwd, exist_ok=True)
+        sm._claim_worktree = mock.Mock(return_value=False)
+        sm._resume_at_cwd("tP", cwd, cmd_id="cP", migration_id="migP")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["migP"])
+        self.assertIn("prune", sm.spawn_failures[0]["error"])
+        self.assertEqual(sm.registry, [])   # the claim failing un-registers it
+
+    def test_the_prune_race_is_reported_on_a_killed_resume_too(self):
+        """resume() hits the same handshake, and its refusal was equally silent
+        — worse, in fact: that wait is by session id and never times out."""
+        sm = self._manager()
+        sm.closed = [{"id": "k1", "repo": "Turma", "worktreePath":
+                      os.path.join(ha.WORKTREES_ROOT, "Turma", "wK"),
+                      "claudeSessionId": "tK", "ttydPort": 7700}]
+        sm._claim_worktree = mock.Mock(return_value=False)
+        sm.resume("k1", cmd_id="cK")
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["cK"])
+        self.assertIn("prune", sm.spawn_failures[0]["error"])
+
+    def test_a_launch_that_throws_is_reported_like_a_refusal(self):
+        """The record survives as `status:"error"`, and the hub's migration
+        handoff waits for a RUNNING session — so without this the move waits out
+        its timeout exactly as a refusal used to."""
+        sm = self._manager()
+        sm._launch_tmux = mock.Mock(side_effect=RuntimeError("tmux is gone"))
+        cwd = os.path.join(ha.WORKTREES_ROOT, "Turma", "wE")
+        os.makedirs(cwd, exist_ok=True)
+        sm._resume_at_cwd("tE", cwd, cmd_id="cE", migration_id="migE")
+        self.assertEqual([f["migrationId"] for f in sm.spawn_failures], ["migE"])
+        self.assertIn("tmux is gone", sm.spawn_failures[0]["error"])
+        # The record is left carrying the error, as _set_error intends — the
+        # refusal is what tells the hub, since an `error` record never satisfies
+        # its wait for a running one.
+        self.assertEqual(sm.registry[0]["status"], "error")
+
+    def test_a_reason_carrying_an_exception_is_truncated(self):
+        """A reason interpolates `{e}`, whose text is unbounded, and it lands in
+        a hub cache that counts against that host's record ceiling — an 8 MiB
+        one would wedge the host's control plane."""
+        sm = self._manager()
+        sm._refuse_start("x" * 100000, cmd_id="c1")
+        self.assertEqual(len(sm.spawn_failures[0]["error"]),
+                         ha.SPAWN_FAILURE_REASON_MAX)
+
+    def test_the_staged_list_is_bounded(self):
+        sm = self._manager()
+        for i in range(ha.SPAWN_FAILURES_MAX + 10):
+            sm._refuse_start(f"nope {i}", cmd_id=f"c{i}")
+        self.assertEqual(len(sm.spawn_failures), ha.SPAWN_FAILURES_MAX)
+        # Oldest-first eviction: the newest refusal is always the one kept.
+        self.assertEqual(sm.spawn_failures[-1]["cmdId"],
+                         f"c{ha.SPAWN_FAILURES_MAX + 9}")
 
 
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
@@ -4949,11 +5557,13 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
         )
-        # The guard settings file was written and wires the Bash guard hook plus
-        # the AskUserQuestion → glasses bridge, both as PreToolUse matchers.
+        # The guard settings file was written and wires three PreToolUse
+        # matchers: the Bash guard, the ~/.claude file guard, and the
+        # AskUserQuestion → glasses bridge.
         loaded = json.loads(open(settings).read())
         matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
-        self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
+        self.assertEqual(matchers, ["Bash", "Write|Edit|MultiEdit|NotebookEdit",
+                                    "AskUserQuestion"])
 
     def test_spawn_exports_gitlab_host_for_glab(self):
         """A GitLab-configured host tells every session's glab WHERE to auth:

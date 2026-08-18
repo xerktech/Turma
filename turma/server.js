@@ -23,6 +23,7 @@
 
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { Duplex } = require("stream");
@@ -35,6 +36,58 @@ const archive = require("./archive.js");
 const push = require("./push.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
+
+/**
+ * The memory ceiling this process actually runs under — `containerMemoryLimit()`
+ * when containerised (which is how it is deployed), else the host's RAM.
+ *
+ * Every memory ceiling in this file is a fraction of this rather than a fixed
+ * number (XERK-258), so raising the container's `mem_limit` widens them all with
+ * no code change, and a hub given LESS memory tightens itself instead of dying.
+ * Declared here, at the top, because those ceilings sit beside the features they
+ * bound and so are spread through the whole file. (`containerMemoryLimit` is
+ * defined further down, next to the registry budget that shares it, and is
+ * reachable here by hoisting.)
+ *
+ * It answers `null` when there is no limit to read, and a limit ABOVE real RAM
+ * cannot be the binding constraint — both fall back to the host's memory, or the
+ * derived ceilings come out absurd.
+ */
+const MEMORY_LIMIT =
+  Number(process.env.MEMORY_LIMIT_BYTES) ||
+  Math.min(containerMemoryLimit() || os.totalmem(), os.totalmem());
+// One request may hold an eighth of the container; everything being read at once
+// may hold a quarter. The gap between them is deliberate — it leaves room for the
+// response, the parsed object (a JSON body costs several times its wire size once
+// parsed) and the rest of the hub's working set. See chargeBody for how they are
+// enforced and why a body arriving into an idle hub is admitted regardless.
+//
+// The PER-REQUEST ceiling only ever tightens: it is `min(what one request can
+// legitimately need, what the container can hold)`. Deriving it purely from the
+// limit would hand a hub on a 64 GB host an 8 GB single-body ceiling, which is
+// not generosity — no caller has any business sending that, and the fixed
+// number is the sanity bound. The TOTAL budget is the one that genuinely wants
+// to widen with mem_limit, because that buys CONCURRENCY.
+const BODY_INFLIGHT_ABSOLUTE_MAX = 32 << 20; // 32 MiB — the largest one body may be
+const BODY_INFLIGHT_MAX =
+  Number(process.env.BODY_INFLIGHT_MAX) ||
+  Math.min(BODY_INFLIGHT_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / 8));
+// The ceiling on EVERYTHING being read at once, across BOTH lanes.
+//
+// It has to be one number covering both, because two independent ceilings have
+// to be ADDED to know the worst case and nobody does that arithmetic when
+// tuning one of them. That is not hypothetical: when the lanes were made
+// genuinely independent, the real worst case silently became `shared + a whole
+// big body` — the shared half having been sized back when a big body still
+// consumed it — and the 256-concurrent-30 MiB flood started OOM-killing the hub
+// that had survived it for four commits.
+//
+// Half the container, so that one max-size body (BODY_INFLIGHT_MAX at
+// BODY_PARSE_COST, i.e. three quarters of this) plus the shared traffic beside
+// it still leaves room for the response, the working set and the sockets.
+const BODY_INFLIGHT_TOTAL_MAX =
+  Number(process.env.BODY_INFLIGHT_TOTAL_MAX) || Math.floor(MEMORY_LIMIT / 2);
+
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 // Ticket -> agent pins (XERK-38): which HOST a ticket's sessions spawn on,
@@ -90,6 +143,15 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// Bounds for a session's live agent rows (sanitizeLiveAgents, far below). They
+// live UP HERE, away from their function, because the state.json restore runs
+// at module init and calls that function: a `const` declared later is in its
+// temporal dead zone then, so reading one throws a ReferenceError that the
+// restore's own `catch {}` swallows — the record loads half-coerced and says
+// nothing. Any constant a restore-path function reads has to be declared above
+// the restore.
+const LIVE_AGENTS_MAX = 32;
+const LIVE_AGENT_FIELD_MAX = 400;
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -157,7 +219,18 @@ const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES) || (1 << 25); // 3
 // The whole relay's memory ceiling. Held blobs are RAM, so this is the number
 // that keeps a hub with a fat pipe and a slow agent from being OOM'd; a POST
 // arriving over it is refused rather than evicting someone else's pending file.
-const UPLOAD_TOTAL_MAX_BYTES = Number(process.env.UPLOAD_TOTAL_MAX_BYTES) || (1 << 27); // 128 MiB
+//
+// A FRACTION OF THE CONTAINER LIMIT, like the in-flight body ceilings (XERK-258)
+// — the flat 128 MiB this replaced was double the whole 256m the hub is deployed
+// with, so the refusal could never fire before the OOM killer did. It tightens
+// only: 128 MiB stays 128 MiB on a big host, and comes down to a quarter of the
+// container on a small one.
+//
+// A SEPARATE budget from the in-flight quarter, deliberately: these blobs are
+// held for MINUTES (UPLOAD_TTL_MS), not for the length of one request.
+const UPLOAD_TOTAL_MAX_BYTES =
+  Number(process.env.UPLOAD_TOTAL_MAX_BYTES) ||
+  Math.min(1 << 27, Math.floor(MEMORY_LIMIT / 4));
 // How long a staged blob waits to be collected. Generous, because the operator
 // attaches files and then keeps typing before pressing Send — the clock starts
 // at the upload, not at the message.
@@ -266,6 +339,75 @@ const UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
 const TURMA_USER = process.env.TURMA_USER || "";
 const TURMA_PASSWORD = process.env.TURMA_PASSWORD || "";
 const TURMA_AGENT_TOKEN = process.env.TURMA_AGENT_TOKEN || "";
+// Per-host agent identity (XERK-268). TURMA_AGENT_TOKEN is the fleet MASTER; a
+// host's own credential is derived from it and its host name, and each agent is
+// given ONLY that derived value as its TURMA_TOKEN (DockerOps, per service —
+// `node turma/server.js --agent-token <host>` prints one). The hub never needs a
+// list of hosts or a token map: it re-derives the expected value for whatever
+// host a request NAMES and compares.
+//
+// Why this exists: `<host>` in /api/agents/<host>/… and `device` on the
+// heartbeat are values the CALLER types. With one shared token they proved
+// nothing, so any token-holder could beat as another host, collect the commands
+// queued for it (migration/upload ids ride there) and act as either half of a
+// move. Deriving per host makes the host the CREDENTIAL's, not the caller's.
+//
+// A per-relay one-time secret was the other candidate and does not work: it
+// would ride on exactly the commands an impersonated heartbeat hands out.
+const TURMA_AGENT_STRICT = /^(1|true|yes|on)$/i.test(process.env.TURMA_AGENT_STRICT || "");
+// A host's own agent token: `<base64url(host)>.<HMAC(master, host)>`.
+//
+// It NAMES the host it is for, and the HMAC is what makes that name unforgeable
+// — so the hub can identify a caller from the token ALONE, before it has read a
+// body or looked at a path. That is what lets `/api/heartbeat`, whose host is
+// buried in its payload, refuse an unknown credential BEFORE reading 32 MiB
+// (an HMAC cannot be inverted, so a bare digest could not be placed without
+// already knowing the host, and the gate would have had to let anything
+// through). The name half is not a secret: whoever holds the token is that
+// host, and host names travel in the URL anyway.
+//
+// Keyed on the host name the agent reports as `device`, so a host RENAME
+// invalidates its token by design — the hub cannot tell a rename from an
+// impersonation, and guessing would be the bug.
+function hostAgentToken(host) {
+  // Non-strings never get a token: `String(host)` would coerce an array or a
+  // toString()-carrying object into a host name and mint a REAL credential for
+  // it. No caller passes one today; this is so none can start.
+  if (!TURMA_AGENT_TOKEN || typeof host !== "string" || !host) return "";
+  const name = Buffer.from(host);
+  // A name that doesn't survive the UTF-8 round trip gets no token: a lone
+  // surrogate encodes to the replacement character, so two different host names
+  // would derive the SAME credential. No real host name does this — the point
+  // is that the derivation is injective, not that anyone would hit it.
+  if (name.toString() !== host) return "";
+  // Nor a name the hub would refuse to register anyway (XERK-269): minting a
+  // valid credential for an unusable host produces the worst outcome of all —
+  // the agent renames ITSELF to its next naming source, the token no longer
+  // matches, and the tunnel reconnect-loops forever without ever mentioning the
+  // name. Refusing at mint time is where the operator can still act on it.
+  if (!isPlainHostKey(host)) return "";
+  return name.toString("base64url") + "." +
+    crypto.createHmac("sha256", TURMA_AGENT_TOKEN).update(host).digest("hex");
+}
+
+// The host a bearer token proves it is, or null if it proves nothing. Reads the
+// name off the token and re-derives to check it, so an attacker editing the name
+// half invalidates the HMAC half.
+function tokenHost(token) {
+  if (!TURMA_AGENT_TOKEN || typeof token !== "string") return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0) return null;
+  let host;
+  try {
+    host = Buffer.from(token.slice(0, dot), "base64url").toString();
+  } catch {
+    return null;
+  }
+  // Compare the WHOLE token, so a name that doesn't round-trip through base64url
+  // (padding games, a different encoding of the same bytes) fails here rather
+  // than resolving to a host it isn't the token for.
+  return host && safeEqual(token, hostAgentToken(host)) ? host : null;
+}
 // A dedicated bearer token for the programmatic session-trigger endpoint
 // (POST /api/trigger), so external automation (CI, webhooks, cron) can start a
 // session without the single-user login. It never opens the endpoint on its
@@ -291,7 +433,18 @@ const SESSION_KEY =
 // (-c term:$TURMA_TOKEN, loopback-bound in the container) is satisfied without
 // the browser ever seeing the credentials. The terminal shares the agent
 // token — one credential per agent container for heartbeat, tunnel, and ttyd.
-const TTYD_AUTH = "Basic " + Buffer.from(`term:${TURMA_AGENT_TOKEN || "changeme"}`).toString("base64");
+//
+// Which token that IS is per host now (XERK-268), and the hub must send the one
+// this host's ttyd was actually started with: its derived token if the host
+// authenticates with it, the legacy master while it hasn't rolled over yet. We
+// know which from how its own heartbeat authenticated (`tokenBound` on the
+// record), so a half-rolled fleet keeps every terminal working rather than
+// 401ing the hosts that haven't moved.
+function ttydAuth(host) {
+  const a = agents[host];
+  const token = (a && a.tokenBound ? hostAgentToken(host) : TURMA_AGENT_TOKEN) || "changeme";
+  return "Basic " + Buffer.from(`term:${token}`).toString("base64");
+}
 
 // ---- LiteLLM backend (OpenAI-compatible: Whisper STT) -----------------------
 // Whisper STT is served by a LiteLLM instance's `/v1` base: LITELLM_URL points
@@ -347,11 +500,337 @@ const PR_ALERT_MAX_TRACKED = 20;
 // bookkeeping. One container per host, so the host name is the stable identity.
 let agents = {};
 
+// ---- the registry's own ceiling (XERK-272) ---------------------------------
+//
+// Nothing capped how many DISTINCT `device` names the registry could hold, and
+// every one of them is a retained record that also lands in state.json, every
+// /api/agents body and every SSE frame. `prune()` only reclaims at seven days
+// and AGENT_RECORD_MAX bounds ONE record, so 512 beats of 0.9 MiB under 512
+// names OOM-killed a 256 MiB hub while the same 512 beats under ONE name peaked
+// at 169 MiB. The per-record bound was never the aggregate.
+//
+// XERK-268 binds `device` to the credential, so this is no longer reachable by
+// anyone holding the fleet token — but it does not BOUND anything: a
+// compromised or buggy host still mints names under its own proved token, the
+// `legacy` master a mid-rollover fleet accepts is not yet retired, and a host
+// whose name derives from something unstable grows records with no attacker at
+// all. The two are complementary; neither replaces the other.
+//
+// Two budgets, because they bound different things:
+//   * AGENTS_TOTAL_MAX — the aggregate BYTES of every record, sized from the
+//     container the hub actually runs in. A ceiling above the limit the kernel
+//     kills on is not a ceiling (XERK-258), so this is derived from the cgroup
+//     rather than picked.
+//   * AGENTS_MAX — the record COUNT. The byte budget measures what
+//     `agentRecordSize` measures, which deliberately EXCLUDES the on-demand
+//     caches (history, subagent history, Jira issues, create results). Those are
+//     capped per host by COUNT, not by bytes, so this bounds their multiple and
+//     nothing here bounds their size — one host can still park a lot in them.
+//
+// The aggregate is what a NEWCOMER is admitted against, and what an OVER-SHARE
+// host is refused against — never a host beating a normal-sized record, whose
+// refusal would be indistinguishable from an outage. See AGENT_FAIR_SHARE.
+//
+// Both are env-overridable: an operator who grows the fleet past the cap should
+// raise it in compose, not discover the hub silently dropping a host.
+
+/**
+ * A positive-integer env knob, or the default. A knob that silently accepts a
+ * negative refuses the WHOLE fleet on its first beat with nothing but a
+ * per-beat 429 to explain it, so a bad value is announced and ignored rather
+ * than obeyed.
+ */
+function positiveEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  console.warn(`WARNING: ${name}=${JSON.stringify(raw)} is not a positive number — using ${fallback}`);
+  return fallback;
+}
+
+// A host name is agent-supplied and reaches the hub's log; it is validated for
+// length and prototype keys but NOT for content, so a newline in it forges a
+// log line that reads exactly like one of the hub's own. Every log that names a
+// host goes through this.
+function logName(key) {
+  // JSON.stringify does the line-forging half (a newline becomes the two
+  // characters \ and n, so it can never start a line); the sweep after it
+  // covers the control characters JSON leaves intact, which a terminal acts on.
+  // C0, DEL **and C1** — JSON.stringify escapes none of the C1 block, and NEL
+  // (U+0085) is a line break to some readers.
+  return JSON.stringify(String(key).slice(0, 200))
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+}
+
+const AGENTS_MAX = positiveEnv("AGENTS_MAX", 64);
+// How long a record must have gone unseen before the registry may reclaim its
+// slot for a host it has never met. Deliberately far longer than
+// OFFLINE_AFTER_MS: a record holds an offline host's last known sessions, PR
+// chips and usage, so a host rebooting, updating, or off for the afternoon must
+// never be displaced by a newcomer — a flood is refused instead. Only a host
+// that has been gone long enough to be uninteresting is evictable.
+const AGENT_EVICT_IDLE_MS = positiveEnv("AGENT_EVICT_IDLE_MS", 60 * 60 * 1000);
+
+// The container's memory limit in bytes, or null when it cannot be read (not
+// containerised, no cgroupfs, or explicitly unlimited). cgroup v2 first, then
+// v1, whose "unlimited" is a near-2^63 sentinel rather than a word.
+function containerMemoryLimit() {
+  for (const p of ["/sys/fs/cgroup/memory.max",
+                   "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
+    let raw;
+    try { raw = fs.readFileSync(p, "utf8").trim(); } catch { continue; }
+    if (raw === "max") continue;
+    const n = Number(raw);
+    // 2 ** 40, not `1 << 40` — JS bitwise is 32-bit and would wrap to 0.
+    if (Number.isFinite(n) && n > 0 && n < 2 ** 40) return n;
+  }
+  return null;
+}
+
+// An eighth of the container, clamped. The deployed hub is `mem_limit: 256m`,
+// so that is 32 MiB retained — against a measured real fleet whose LARGEST
+// record is 0.30 MiB, i.e. ~100 hosts of headroom. The eighth is what leaves
+// room for the copies the registry implies: the memoized /api/agents body, the
+// state.json blob the save timer builds, and the per-record SSE frames all
+// materialize alongside it.
+function defaultRegistryBudget() {
+  const limit = containerMemoryLimit();
+  if (!limit) return 32 << 20;
+  return Math.max(8 << 20, Math.min(64 << 20, Math.floor(limit / 8)));
+}
+const AGENTS_TOTAL_MAX = positiveEnv("AGENTS_TOTAL_MAX", defaultRegistryBudget());
+
+// One host's share of the aggregate — 512 KiB at the deployed sizing, against a
+// measured real fleet whose LARGEST record is 0.30 MiB.
+//
+// This is what keeps a full registry from reading as an outage. The aggregate
+// gate refuses whoever happens to beat next, and rolling a known host back to
+// its previous record rolls back its `lastSeen` too — so under sustained
+// pressure a live host is refused on every beat and crosses OFFLINE_AFTER_MS
+// while it is up, silently, with no way for the operator to tell that from a
+// network failure. A host inside its share is never the reason the registry is
+// full, so it is never the one that pays: the refusal lands on the host whose
+// record is over its share, which is also the host the operator needs named.
+//
+// The cost is a bounded overshoot rather than a hard total: fat records are
+// still admitted only while the aggregate has slack, and every host inside its
+// share sums to at most AGENTS_TOTAL_MAX again — so worst-case retained is
+// exactly AGENTS_TOTAL_MAX + AGENTS_MAX * AGENT_FAIR_SHARE, i.e. 2x the budget
+// (a quarter of the container at the deployed sizing), not the unbounded growth
+// this replaces.
+//
+// **That identity is the whole bound, so the share is DERIVED and never
+// floored.** A floor under it (there was a 64 KiB one) makes the second term
+// `AGENTS_MAX * 64 KiB`, which is unbounded in AGENTS_MAX — and raising
+// AGENTS_MAX is exactly what an operator with a growing fleet is told to do.
+// At AGENTS_MAX=2000 against the deployed 32 MiB budget that is 3.9x, and the
+// hub is OOM-killed. Raising the count means raising the budget with it; the
+// boot check below says so rather than letting the two contradict silently.
+//
+// A function, not an expression, so the extremes are reachable to a test
+// without a whole process pinned to a degenerate config: the interesting cases
+// (a count past the budget in BYTES, a count of one) are exactly the ones a
+// realistic rig never reaches.
+function fairShare(total, max) {
+  return Math.max(1, Math.floor(total / max));
+}
+const AGENT_FAIR_SHARE = fairShare(AGENTS_TOTAL_MAX, AGENTS_MAX);
+// A share this small means the count cap and the byte budget disagree about how
+// big a fleet this hub is for: hosts would be refused on size long before the
+// slots ran out. The memory bound still holds — it is the CONFIGURATION that is
+// wrong, so this warns rather than adjusting either number, and it warns HERE
+// (module scope) rather than in the listen banner, so it is reachable to a test
+// and to anything that loads the module without binding a port.
+const AGENT_SHARE_SANE_MIN = 64 << 10;
+if (AGENT_FAIR_SHARE < AGENT_SHARE_SANE_MIN) {
+  console.warn(
+    `WARNING: AGENTS_MAX=${AGENTS_MAX} leaves each host only ${AGENT_FAIR_SHARE} ` +
+      `bytes of the ${AGENTS_TOTAL_MAX}-byte registry budget — hosts will be ` +
+      `refused on record size long before the slots run out. Raise ` +
+      `AGENTS_TOTAL_MAX alongside AGENTS_MAX.`
+  );
+}
+
+// The most state.json may be before the restore refuses to open it at all. Sized
+// like the registry budget and generously above it, because the saved blob
+// carries the on-demand caches the budget deliberately excludes; the point is
+// to catch a file that cannot fit in the container's memory, not to second-guess
+// a legitimate one. See the restore for why measuring beats parsing.
+const STATE_FILE_MAX = positiveEnv(
+  "STATE_FILE_MAX",
+  (() => {
+    const limit = containerMemoryLimit();
+    if (!limit) return 64 << 20;
+    return Math.max(32 << 20, Math.min(128 << 20, Math.floor(limit / 4)));
+  })()
+);
+
+// The cache keys `serializeAgent` strips; see AGENT_RECORD_MAX.
+//
+// Declared UP HERE, above the state.json restore, for the reason LIVE_AGENTS_MAX
+// documents: the restore runs at module init and enforces the budget below, so
+// every constant that path reads has to exist by then or the `const` is in its
+// temporal dead zone and the restore's own `catch {}` swallows the throw.
+const AGENT_CACHE_KEYS = [
+  "history", "subagentHistory", "jiraIssues", "statusResults",
+  "createMeta", "createTypes", "createResults", "resultWaits",
+];
+
+// The serialized size of what this record contributes to /api/agents.
+function agentRecordSize(record) {
+  try {
+    return JSON.stringify(record, (k, v) =>
+      AGENT_CACHE_KEYS.includes(k) && v && typeof v === "object" ? undefined : v
+    ).length;
+  } catch {
+    return Infinity; // circular or unserializable — it cannot be persisted anyway
+  }
+}
+
+// Last measured size per host, so the aggregate costs a sum over numbers rather
+// than re-serializing the whole registry on every beat. A side map, not a field
+// on the record: anything stored on the record is served to every client.
+const recordBytes = new Map();
+
+// Which hosts are already over half their share, so that warning fires on the
+// crossing rather than on every beat — same discipline as recordSizeWarned.
+const shareWarned = new Map();
+
+// The aggregate `agentRecordSize` of the whole registry. Measures lazily for a
+// key it has not seen (the state.json restore, and the tests, install records
+// without going through the heartbeat) and forgets keys that are gone, so it
+// stays correct without every `delete agents[key]` site having to remember it.
+function registryBytes() {
+  let total = 0;
+  for (const [key, a] of Object.entries(agents)) {
+    let n = recordBytes.get(key);
+    if (n === undefined) recordBytes.set(key, (n = agentRecordSize(a)));
+    total += n;
+  }
+  if (recordBytes.size > Object.keys(agents).length) {
+    for (const key of recordBytes.keys()) {
+      if (!Object.prototype.hasOwnProperty.call(agents, key)) recordBytes.delete(key);
+    }
+  }
+  return total;
+}
+
+// A refusal is one line per window, not one per beat: a flood is exactly the
+// traffic that triggers it, so an unthrottled log turns a survived attack into
+// disk pressure. The suppressed count rides the next line so nothing is hidden.
+const REFUSED_LOG_EVERY_MS = 60 * 1000;
+let refusedLogAt = 0;
+let refusedSinceLog = 0;
+function logRegistryFull(detail) {
+  refusedSinceLog += 1;
+  const now = Date.now();
+  if (now - refusedLogAt < REFUSED_LOG_EVERY_MS) return;
+  const also = refusedSinceLog > 1 ? ` (+${refusedSinceLog - 1} more refused since the last line)` : "";
+  refusedLogAt = now;
+  refusedSinceLog = 0;
+  console.error(
+    `registry is full (${Object.keys(agents).length}/${AGENTS_MAX} hosts, ` +
+      `${registryBytes()}/${AGENTS_TOTAL_MAX} bytes): ${detail}${also}`
+  );
+}
+
+// Hosts whose slot may be reclaimed for a newcomer, least-recently-seen first.
+function evictableAgents(now) {
+  return Object.entries(agents)
+    .filter(([, a]) => now - (a.lastSeen || 0) > AGENT_EVICT_IDLE_MS)
+    .sort((a, b) => (a[1].lastSeen || 0) - (b[1].lastSeen || 0))
+    .map(([key]) => key);
+}
+
+// Reclaim long-idle records until the registry has room for `addSlots` more
+// hosts and `addBytes` more bytes; returns whether it does. `false` is the
+// caller's cue to REFUSE the beat rather than take a live host's slot — see
+// AGENT_EVICT_IDLE_MS for why a newcomer never wins that trade.
+function makeRegistryRoom(addBytes, addSlots) {
+  let bytes = registryBytes();
+  let count = Object.keys(agents).length;
+  const overBudget = () =>
+    bytes + addBytes > AGENTS_TOTAL_MAX || count + addSlots > AGENTS_MAX;
+  if (!overBudget()) return true;
+  const now = Date.now();
+  const evictable = evictableAgents(now);
+  // Would evicting ALL of them even be enough? If not, evict none: dropping
+  // records the caller is going to be refused anyway loses an offline host's
+  // last known state and buys nothing.
+  const reclaimable = evictable.reduce((n, key) => n + (recordBytes.get(key) || 0), 0);
+  if (bytes - reclaimable + addBytes > AGENTS_TOTAL_MAX ||
+      count - evictable.length + addSlots > AGENTS_MAX) return false;
+  const before = evictable.length;
+  while (overBudget() && evictable.length) {
+    const key = evictable.shift();
+    bytes -= recordBytes.get(key) || 0;
+    count -= 1;
+    console.warn(
+      `registry at its limit — evicting ${logName(key)}, unseen for ` +
+        `${Math.round((now - (agents[key].lastSeen || 0)) / 60000)}m`
+    );
+    delete agents[key];
+    recordBytes.delete(key);
+    // Everything else keyed by host name has to let go too, or a registry that
+    // admits and evicts forever leaks a per-host entry per name it ever saw.
+    recordSizeWarned.delete(key);
+    shareWarned.delete(key);
+    invalidateAgentsCache();
+    sseBroadcast("removed", { key });
+  }
+  // An eviction has to reach state.json, or a restart brings the record back.
+  if (evictable.length !== before) scheduleSave();
+  return !overBudget();
+}
+
+// Hold the restored registry to the same budget. A hub that was flooded before
+// it restarted has the flood ON DISK, and loading all of it is an OOM before
+// the first request is served — a bound that the path which LOADS the state
+// doesn't enforce is not a bound (the same reason `normalizeRecord` runs on the
+// restore as well as the ingest, XERK-259).
+//
+// Unconditional keep-newest, NOT the idle rule above: nothing is live at boot,
+// every record is by definition from before the restart, and the alternative to
+// dropping the stalest is not booting at all.
+function trimRestoredAgents() {
+  const keys = Object.keys(agents);
+  if (!keys.length) return;
+  const newestFirst = keys.sort((a, b) => (agents[b].lastSeen || 0) - (agents[a].lastSeen || 0));
+  let bytes = 0;
+  const dropped = [];
+  newestFirst.forEach((key, i) => {
+    const size = agentRecordSize(agents[key]);
+    if (i < AGENTS_MAX && bytes + size <= AGENTS_TOTAL_MAX) {
+      bytes += size;
+      recordBytes.set(key, size);
+      return;
+    }
+    dropped.push(key);
+    delete agents[key];
+    recordBytes.delete(key);
+  });
+  if (dropped.length) {
+    console.warn(
+      `dropped ${dropped.length} restored agent record(s) over the registry ` +
+        `budget (${AGENTS_MAX} hosts / ${AGENTS_TOTAL_MAX} bytes); kept the ` +
+        `${keys.length - dropped.length} most recently seen`
+    );
+  }
+}
+
 // Reverse-tunnel state. controlChannels[name] = the live control connection for
-// that container's tunnel-agent; pendingChannels[ch] = resolver awaiting the
+// that container's tunnel-agent; pendingChannels[ch] = the record awaiting the
 // agent's data-WS dial-back for channel `ch`.
-const controlChannels = {};
-const pendingChannels = {};
+//
+// Both are NULL-PROTOTYPE: the keys are attacker-influenced (a `?name=`/`?ch=`
+// off the wire), and on a plain object `__proto__` is not a key. It read back as
+// Object.prototype — truthy, so a `ch` of `__proto__` sailed past the "is there
+// a pending channel" check and died on `.resolve is not a function`, out of an
+// async upgrade handler with no unhandledRejection hook: an instant hub exit.
+// Assignment was worse, silently re-parenting the map.
+const controlChannels = Object.create(null);
+const pendingChannels = Object.create(null);
 // Live transcript subscribers: liveClients[host][sessionId] = Set of glasses
 // WebSocket sockets watching that session's transcript in near-real-time (see
 // the /live upgrade handler). The hub asks the host's tunnel-agent to tail a
@@ -362,14 +841,82 @@ const liveClients = {};
 // ---- persistence (best-effort: survives hub restarts so the UI isn't blank
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
-  agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  // Records written before the ingest-side coercion below (and any host that is
-  // OFFLINE, so no beat will ever rewrite its record) still carry the legacy
-  // per-model usage shape — normalize what we load, not just what arrives.
-  for (const a of Object.values(agents)) normalizeUsage(a);
+  // The trim below cannot protect a restore it never reaches: `readFileSync` +
+  // `JSON.parse` materialize the WHOLE file first, so a 264 MiB state.json left
+  // by a flood kills a 256 MiB hub at init — before a single log line, on every
+  // boot, which `restart: unless-stopped` turns into a permanent crash loop
+  // with nothing to read. So the file is measured before it is opened
+  // (XERK-272). Losing the cache is documented as harmless; not booting is not,
+  // and the file is preserved beside itself rather than deleted so the flood
+  // can still be examined.
+  const stateSize = fs.statSync(STATE_FILE).size;
+  if (stateSize > STATE_FILE_MAX) {
+    // The rename can fail (a read-only /data), and the message has to say what
+    // actually happened: an operator sent to a `.oversized` that was never
+    // created finds nothing and concludes the hub ate their state.
+    const aside = `${STATE_FILE}.oversized`;
+    let movedTo = null;
+    try { fs.renameSync(STATE_FILE, aside); movedTo = aside; } catch { /* read-only volume */ }
+    throw new Error(
+      `state file is ${stateSize} bytes, over the ${STATE_FILE_MAX} limit — ` +
+        `starting with an empty registry; the file is ` +
+        (movedTo ? `kept at ${movedTo}` : `left in place at ${STATE_FILE} (could not move it)`)
+    );
+  }
+  // Parsed into a LOCAL so the shape can be judged before anything is installed
+  // (XERK-269). A blob that isn't a plain object is not a registry: `Object.keys`
+  // of a JSON string yields character indices, which restored "5 agents" out of
+  // `"hello"`. The array/number/boolean shapes throw nowhere on their own, so
+  // without this check they reach `agents` intact and the catch never runs.
+  const loaded = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
+    // `typeof null` is "object", so null needs naming explicitly — otherwise the
+    // one shape with no other diagnosis reads "state file is object, not an
+    // object", which is the opposite of a useful message.
+    const shape = loaded === null ? "null"
+      : Array.isArray(loaded) ? "an array" : typeof loaded;
+    throw new Error(`state file is ${shape}, not an object`);
+  }
+  agents = loaded;
+  // Records written before a coercion existed — and any host that is OFFLINE,
+  // so no beat will ever rewrite its record — carry whatever shape was current
+  // when they were saved. Normalize what we LOAD, not just what arrives: the
+  // first `/api/agents` after a restart serves the raw record, and a hub
+  // restart is exactly when a new coercion ships. `normalizeRecord` is shared
+  // with the ingest path so the two cannot drift; adding a coercion in one
+  // place covers both. Tests: `the state.json restore coerces too`.
+  // The KEY is coerced here too, for the same reason the record is: a record
+  // written before the key guard existed carries a name the ingest path would
+  // now refuse, and the restore is the first thing served after a restart. A
+  // dot-segment key is the case that matters — it is uncommandable AND
+  // undeletable (`DELETE /api/agents/.` is itself one of the routes whose path
+  // collapses), so without this it sits there until `prune()` ages it out days
+  // later. Dropping it is safe: a live host re-registers on its next beat.
+  //
+  // `dropUnusableHostKeys` and `isPlainHostKey` are FUNCTION declarations far
+  // below this line and are reached only because those hoist. Do not convert
+  // either to a `const`: the TDZ ReferenceError would land in this block's
+  // catch, which swallows everything, and the hub would boot with no agents
+  // and no error printed anywhere.
+  for (const key of dropUnusableHostKeys(agents)) {
+    console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(key)}`);
+  }
+  for (const a of Object.values(agents)) normalizeRecord(a);
+  // Hold what we LOAD to the registry budget too — a flood that landed before
+  // the restart is on disk, and restoring all of it is an OOM before the first
+  // request (XERK-272).
+  trimRestoredAgents();
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
-} catch {
-  /* first boot or no volume mounted */
+} catch (e) {
+  // A missing file is first boot / no volume mounted and says nothing worth
+  // saying. Anything else is a state file the hub HAS and could not use — an
+  // oversized one, corrupt JSON, or a blob that is not a registry — which the
+  // operator has to be told about, and which leaves a partially-built registry
+  // behind unless it is cleared.
+  if (!e || e.code !== "ENOENT") {
+    agents = {};
+    console.error(`state restore skipped: ${(e && e.message) || e}`);
+  }
 }
 // The state blob, or null when it cannot be produced. JSON.stringify throws
 // RangeError once the aggregate passes V8's ~512 MiB string ceiling, and it runs
@@ -637,6 +1184,11 @@ function setAutoStartOrg(siteKey, enabled) {
   if (enabled) autoStartOrgs[siteKey] = true;
   else delete autoStartOrgs[siteKey];
   scheduleAutoStartSave();
+  // Switching auto OFF calls off the work it queued and NOTHING else (XERK-296):
+  // the org's auto-queued tickets leave the line, its running sessions carry on,
+  // and a ticket an operator queued by hand keeps its place. That is only
+  // possible because a waiting ticket is no longer a created session.
+  if (!enabled) dropAutoQueuedTickets(siteKey);
   // Rides the /api/agents payload (and its own SSE event), like the agent pins,
   // so open boards reflect the toggle without waiting out an ETag match.
   invalidateAgentsCache();
@@ -693,8 +1245,8 @@ function setOrgColor(siteKey, slot) {
 //      resumes the same conversation there;
 //   3. target session comes up -> the source session is KILLED (kept, so its
 //      worktree/uncommitted work stays resumable on the origin as a fallback).
-// State is in-memory and short-lived (the blob rides in the record); a hub
-// restart mid-migration aborts it, leaving the source session intact.
+// State is in-memory and short-lived; a hub restart mid-migration aborts it,
+// leaving the source session intact.
 const migrations = new Map(); // migrationId -> record (see startMigration)
 const MIGRATE_TIMEOUT_MS = Number(process.env.MIGRATE_TIMEOUT_MS) || 5 * 60 * 1000;
 const MIGRATE_DONE_KEEP_MS = 30 * 1000; // keep a done/failed record briefly so UI can observe
@@ -702,6 +1254,76 @@ const MIGRATIONS_MAX = 40; // backstop against unbounded growth
 // Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
 // legitimate at-cap bundle isn't rejected for framing overhead.
 const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
+// **The bundle NEVER rides in the record** (XERK-263). At 65 MiB a pair of
+// concurrent moves — two clicks of the Sessions page's Move control — would
+// retain 130 MiB in a hub running at mem_limit 256m, so the relay spools each
+// one to a file here and the record keeps only its path. Same volume as the
+// rest of /data, but nothing in it is durable: a file outliving its migration
+// is garbage, which is why boot sweeps the whole directory.
+const MIGRATE_SPOOL_DIR = process.env.MIGRATE_SPOOL_DIR || "/data/migrations";
+// Spooling moved the pressure off the heap and onto /data, which the archive
+// shares — so bound how much of it a burst of moves can hold at once. Enforced
+// where a move STARTS, not on the relay upload: an agent's upload is
+// best-effort with no retry, so refusing one strands a migration, while
+// refusing the operator's click just says "not right now" on the Move control.
+const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
+
+// The id `crypto.randomBytes(8).toString("hex")` produces in startMigration, and
+// the filename that makes — the second being the ONLY thing the boot sweep may
+// delete. Keep the two in step: they are the same name either side of `.bin`.
+const MIGRATE_ID_RE = /^[0-9a-f]{16}$/;
+const MIGRATE_SPOOL_RE = /^[0-9a-f]{16}\.bin$/;
+
+// Where a migration's spooled bundle lives. Keyed on the HUB-MINTED id (hex
+// from crypto.randomBytes, and only ever an id already in `migrations`), never
+// on the path segment the agent sent — the relay is a host boundary, so the
+// filename must not be something a caller can steer.
+// It ENFORCES that rather than trusting it: the id is checked against the shape
+// startMigration mints, so a caller-supplied one could not name a path here even
+// if some future route passed one through. Throwing is right — the request
+// handler turns it into a 500, and there is no sane fallback path to spool to.
+function migrationSpoolPath(id) {
+  if (!MIGRATE_ID_RE.test(String(id)))
+    throw new Error("refusing to spool under a migration id this hub did not mint");
+  // Not path-traversable: the guard above leaves 16 hex characters, so no
+  // component can hold a separator or '..'.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  return path.join(MIGRATE_SPOOL_DIR, `${id}.bin`);
+}
+
+// Release a migration's spooled bundle. Idempotent, and safe to call while the
+// target is still streaming it out: the unlink drops the name, and the reader's
+// open fd keeps the bytes alive until it finishes. Every path that settles or
+// abandons a migration goes through this — a leaked file is 65 MiB of disk that
+// nothing will ever come back for.
+function dropMigrationBlob(m) {
+  const p = m && m.blobPath;
+  if (!p) return;
+  m.blobPath = null;
+  m.blobSize = 0;
+  fs.unlink(p, () => {});
+}
+
+// Boot sweep: the migration records are in memory, so a restart abandons every
+// in-flight move and anything still in the spool dir belongs to no one. Without
+// this, a hub killed mid-relay leaks its bundle to disk permanently.
+//
+// It deletes ONLY names this hub could have written (MIGRATE_SPOOL_RE), never
+// whatever it happens to find. MIGRATE_SPOOL_DIR is deployment config, and a
+// one-word compose slip pointing it at /data would otherwise have boot delete
+// state.json and devices.json.
+function sweepMigrationSpool() {
+  let names;
+  try {
+    names = fs.readdirSync(MIGRATE_SPOOL_DIR);
+  } catch {
+    return; // no spool dir yet — nothing has been relayed on this volume
+  }
+  for (const n of names) {
+    if (!MIGRATE_SPOOL_RE.test(n)) continue;
+    try { fs.unlinkSync(path.join(MIGRATE_SPOOL_DIR, n)); } catch {}
+  }
+}
 
 // The wire shape (blob stripped) the /api/agents payload and SSE carry, so the
 // UI can follow a migration to its new host and surface a failure.
@@ -757,10 +1379,13 @@ function publicCommands(cmds) {
 
 function serializeAgent(key, agent, now) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
-  // internal state, stripped like the caches. `unsupported` is NOT: it's a tiny,
-  // rarely-changing map of what this host's agent can't do, worth reading.
+  // internal state, stripped like the caches. `tokenBound` likewise: it is the
+  // hub's note of which credential this host beat with (XERK-268), read only by
+  // ttydAuth, and putting it on the wire would make it a client contract.
+  // `unsupported` is NOT: it's a tiny, rarely-changing map of what this host's
+  // agent can't do, worth reading.
   const { history, subagentHistory, jiraIssues, statusResults,
-          createMeta, createTypes, createResults, resultWaits, ...a } = agent;
+          createMeta, createTypes, createResults, resultWaits, tokenBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     key,
@@ -789,6 +1414,10 @@ function buildAgentsCache() {
   // own SSE events for open boards).
   const body = JSON.stringify({
     now, agents: list, ticketAgents, ticketModels, autoStartOrgs, orgColors,
+    // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
+    // above — a queued ticket has no host and no session, so this payload is the
+    // only place it exists.
+    ticketQueue: ticketQueuePayload(),
     // In-flight (and just-settled) session migrations, so the Sessions page can
     // follow a moved session onto its new host and surface a failure (XERK-101).
     migrations: migrationList(),
@@ -934,7 +1563,7 @@ function startMigration(srcHost, s, targetHost) {
         if (!oldest || m.at < oldest.at) oldest = m;
       }
     }
-    if (oldest) migrations.delete(oldest.id);
+    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
   }
   const id = crypto.randomBytes(8).toString("hex");
   const m = {
@@ -960,7 +1589,14 @@ function startMigration(srcHost, s, targetHost) {
       ticket: s.ticket || null,
     },
     phase: "exporting", // exporting -> importing -> done | failed
-    blob: null, importCmdId: null, targetSessionId: null,
+    // The bundle is spooled to disk, so the record carries only where it is and
+    // how big it is (for the target's Content-Length) — see MIGRATE_SPOOL_DIR.
+    blobPath: null, blobSize: 0, uploading: false,
+    importCmdId: null, targetSessionId: null,
+    // The reason an agent gave for declining its half (XERK-265), staged here by
+    // ingestSpawnFailures and turned into a terminal failure by advanceMigrations
+    // rather than applied on the spot — the handoff check must still win the tie.
+    refusal: null,
     error: null, startedAt: Date.now(), at: Date.now(),
   };
   migrations.set(id, m);
@@ -985,7 +1621,7 @@ function advanceMigrations() {
         m.targetSessionId = up.id;
         m.phase = "done";
         m.error = null;
-        m.blob = null;
+        dropMigrationBlob(m);
         m.at = now;
         if (agents[m.srcHost]) {
           queueCommand(m.srcHost, { type: "kill", sessionId: m.srcSessionId });
@@ -994,13 +1630,26 @@ function advanceMigrations() {
         continue;
       }
     }
+    // The agent REFUSED its half of the move and said so on a beat (XERK-265):
+    // fail now, carrying its reason, instead of leaving the operator watching a
+    // move that can no longer complete for the whole MIGRATE_TIMEOUT_MS. Read
+    // after the handoff above so a success always wins the tie, and covers both
+    // halves — an export that never shipped a blob as well as a refused import.
+    if ((m.phase === "exporting" || m.phase === "importing") && m.refusal) {
+      m.phase = "failed";
+      m.error = m.refusal;
+      dropMigrationBlob(m);   // the spool file, exactly as the timeout below
+      m.at = now;
+      publishMigrations();
+      continue;
+    }
     // A move that never completed: fail it so the UI stops waiting. The source
     // session was never killed, so nothing is lost — the operator retries.
     if ((m.phase === "exporting" || m.phase === "importing") &&
         now - m.startedAt > MIGRATE_TIMEOUT_MS) {
       m.phase = "failed";
       m.error = "migration timed out";
-      m.blob = null;
+      dropMigrationBlob(m);
       m.at = now;
       publishMigrations();
       continue;
@@ -1009,6 +1658,7 @@ function advanceMigrations() {
     // terminal state before it disappears.
     if ((m.phase === "done" || m.phase === "failed") &&
         now - m.at > MIGRATE_DONE_KEEP_MS) {
+      dropMigrationBlob(m); // settling already dropped it; this is the backstop
       migrations.delete(m.id);
       publishMigrations();
     }
@@ -1037,13 +1687,79 @@ function normalizeModelUsage(usage) {
     .filter((m) => m && typeof m.model === "string" && m.model);
 }
 
+// The sub-agent split (XERK-302): what share of a usage block was spent by the
+// background agents its sessions delegated to. Coerced here for exactly the
+// reason the model lists above are — Android TYPES it, so one host's
+// `subagent: "lots"` would fail the decode of the WHOLE /api/agents array and
+// silently empty every other host from that phone's fleet.
+//
+// Anything unusable becomes ABSENT, never a zeroed block: absent is what every
+// client already reads as "this agent can't tell you" (an agent predating the
+// field reports none), while a zeroed one asserts that nothing was delegated —
+// and the Usage page divides by these, so a fabricated zero would quietly
+// understate the fleet's delegated share instead of excluding the host.
+//
+// So this VALIDATES rather than repairs, which is the only way to keep that
+// promise: repairing junk into a well-formed all-zero block is indistinguishable
+// from a host that genuinely delegated nothing, and both `{}` and
+// `{totals:{input:"9"}}` would land in the denominator with a fabricated 0 on
+// top. A real agent always sends all three windows (`_finalize_usage` builds
+// them unconditionally), so strictness costs a working host nothing.
+//
+// A figure must be a NON-NEGATIVE SAFE INTEGER, not merely a finite number: this
+// is decoded into a Kotlin `Long`, and a float or a 1e308 serialized back out
+// fails the decode of the WHOLE /api/agents array — killing the fleet list on
+// every phone over one host's bad figure. A MISSING key is 0 (a newer agent may
+// add fields; silence is not a false claim), but a key that is present and
+// unusable invalidates the block.
+function normalizeSubagentUsage(usage) {
+  if (!usage || typeof usage !== "object") return;
+  const s = usage.subagent;
+  const drop = () => { if ("subagent" in usage) delete usage.subagent; };
+  if (!s || typeof s !== "object" || Array.isArray(s)) return drop();
+  const out = {};
+  for (const w of ["totals", "today", "week"]) {
+    const b = s[w];
+    if (!b || typeof b !== "object" || Array.isArray(b)) return drop();
+    const clean = {};
+    for (const k of ["input", "output", "cacheWrite", "cacheRead"]) {
+      const v = b[k];
+      if (v === undefined || v === null) { clean[k] = 0; continue; }
+      if (!Number.isSafeInteger(v) || v < 0) return drop();
+      clean[k] = v;
+    }
+    out[w] = clean;
+  }
+  usage.subagent = out;
+}
+
+// Every coercion a usage block needs, wherever one rides the heartbeat.
+function normalizeUsageBlock(usage) {
+  normalizeModelUsage(usage);
+  normalizeSubagentUsage(usage);
+}
+
 // Every place a usage block rides the heartbeat: the host-wide aggregate, the
 // per-repo ones, and each live session's own.
 function normalizeUsage(payload) {
   if (!payload || typeof payload !== "object") return;
-  normalizeModelUsage(payload.usage);
-  for (const r of payload.repoUsage || []) normalizeModelUsage(r && r.usage);
-  for (const s of payload.sessions || []) normalizeModelUsage(s && s.usage);
+  normalizeUsageBlock(payload.usage);
+  // `Array.isArray`, not `|| []`: a non-iterable `repoUsage`/`sessions` (an
+  // OBJECT, say) makes a bare `for…of` THROW, and a throw here is uniquely
+  // costly — on the restore path it lands in a silent `catch {}` and abandons
+  // every host after this one, uncoerced, on every boot.
+  // Both are typed LISTS on Android, so a non-array is decode-fatal for the
+  // WHOLE fleet payload, not just this host — rewrite it rather than merely
+  // stepping around it. (Safe because normalizeRecord runs past the raw-size
+  // gate; before it, this would have shrunk away an amplifier.)
+  if (!Array.isArray(payload.repoUsage)) {
+    if ("repoUsage" in payload) payload.repoUsage = [];
+  } else {
+    for (const r of payload.repoUsage) normalizeUsageBlock(r && r.usage);
+  }
+  if (Array.isArray(payload.sessions)) {
+    for (const s of payload.sessions) normalizeUsageBlock(s && s.usage);
+  }
 }
 
 // The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for
@@ -1079,6 +1795,100 @@ function normalizeLimits(payload) {
   out.capturedAt = captured;
   if (typeof lim.source === "string") out.source = lim.source.slice(0, 32);
   payload.limits = out;
+}
+
+// The subscription grouping key (XERK-301), coerced for the same reason
+// normalizeLimits above is: it fans out to web, Android and glasses, and
+// Android decodes it into TYPED fields. Anything unusable becomes null — the
+// "that host can't tell you" value every client already handles by leaving the
+// host on a card of its own, never a plausible default, since a bogus shared
+// key would fold two unrelated subscriptions into one set of bars.
+//
+// The bounds are LITERALS here, exactly as normalizeLimits' are. Every
+// normalize* is reached from `loadState`'s restore loop, which runs far above
+// this line and is only legal because function declarations hoist — a module
+// `const` up here would be in its TDZ there, and the ReferenceError lands in
+// the restore's catch, which empties the whole registry. 128 bounds the key:
+// the agent emits 16 hex chars, so this is the boundary's bound rather than
+// that length, and it exists because the key is a MAP KEY on every client, so
+// an unbounded one is a per-beat amplification of the XERK-235 kind.
+function normalizeSubscription(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const sub = payload.subscription;
+  if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+    if ("subscription" in payload) payload.subscription = null;
+    return;
+  }
+  const key = typeof sub.key === "string" ? sub.key.trim() : "";
+  if (!key) {
+    payload.subscription = null;
+    return;
+  }
+  const out = { key: key.slice(0, 128) };
+  if (typeof sub.source === "string") out.source = sub.source.slice(0, 32);
+  payload.subscription = out;
+}
+
+// Coerce the local-model block at ingest, for exactly the reason normalizeLimits
+// above does it (XERK-246): this fans out to web, Android and glasses, and
+// Android decodes it into TYPED fields — `available: Boolean`, `contextTokens:
+// Int?` — so an `available` of "yes" or a contextTokens past 2^31 from ONE buggy
+// host fails the decode of the WHOLE /api/agents array, and every other host
+// silently vanishes from that phone's fleet.
+//
+// Anything unusable becomes null, which every client already reads as "this host
+// cannot fail over" — the same degradation as an agent too old to report it.
+function normalizeLocalModel(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const lm = payload.localModel;
+  if (!lm || typeof lm !== "object" || Array.isArray(lm)) {
+    if ("localModel" in payload) payload.localModel = null;
+    return;
+  }
+  // Strictly boolean: a truthy string would turn a host that cannot fail over
+  // into one the UI offers the switch on, and the command would be dropped.
+  if (lm.available !== true) {
+    payload.localModel = { available: false, model: null, contextTokens: null };
+    return;
+  }
+  // Nothing XML-ILLEGAL may leave here, from either direction — the whole class,
+  // not just the one case that bit us. A lone surrogate, a C0 control and the
+  // noncharacters U+FFFE/U+FFFF are all unencodable in XML, and each kills
+  // Android's `uiautomator dump` outright (`KXmlSerializer: Illegal character`
+  // / a 0-byte file), i.e. the tool a QA pass drives the app with. Cutting with
+  // `slice(60)` through an astral pair MANUFACTURES a lone surrogate, so that
+  // cut is on CODE POINTS and runs after the strip. Only a rogue agent reaches
+  // this — a real one is bounded by LOCAL_MODEL_NAME_RE — which is this
+  // function's whole threat model.
+  //
+  // BOUND FIRST, THEN SPREAD. `[...s]` materialises one array element per code
+  // point over the WHOLE string, and this runs BEFORE the AGENT_RECORD_MAX check
+  // that refuses an oversized beat — so spreading the raw value let a single
+  // agent-authed heartbeat with a 24 MiB name OOM-kill the hub at its deployed
+  // `mem_limit: 256m` (32M chars measured at 288 MB heap), which
+  // `restart: unless-stopped` turns into an outage loop of the fleet's whole
+  // control plane. 512 UTF-16 units is far more than the 60 code points that
+  // survive, and cutting there can only split an astral pair — which the
+  // surrogate replace immediately below then handles.
+  const name = typeof lm.model === "string"
+    ? [...lm.model.slice(0, 512)
+        .replace(/\p{Surrogate}/gu, "�")     // unpaired halves -> replacement
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]/g, "")  // XML-illegal
+        .trim()]
+      .slice(0, 60).join("")
+    : "";
+  const ctx = lm.contextTokens;
+  payload.localModel = {
+    available: true,
+    // The name is display-only here (the agent validates its own charset before
+    // launching), but it must be A STRING or the decode dies.
+    model: name || null,
+    // Int-safe or nothing: the field is unused by the UI, so dropping a bad one
+    // costs nothing and keeps the fleet decodable.
+    contextTokens:
+      typeof ctx === "number" && Number.isSafeInteger(ctx) &&
+      ctx > 0 && ctx <= 2_147_483_647 ? ctx : null,
+  };
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
@@ -1181,6 +1991,84 @@ function ingestStatusResults(agent, ticketStatusResults) {
       .sort((a, b) => a[1].at - b[1].at)
       .slice(0, over)
       .forEach(([id]) => delete agent.statusResults[id]);
+  }
+}
+
+// How long a staged session-start refusal (XERK-265) stays readable, and how
+// many one host may hold. It exists to answer a wait that is already running —
+// the Sessions page's SPAWN_FOLLOW_MS, or a migration — so minutes is generous.
+const SPAWN_FAILURE_MAX_AGE_MS = 10 * 60 * 1000;
+const SPAWN_FAILURE_MAX = 40;
+// And how long one reason / one cmdId key may be. These are NOT stylistic: this
+// cache is served with the record, so `agentRecordSize` counts it, and the
+// ceiling check runs BEFORE the ingest — an unbounded reason would land, push
+// the record past AGENT_RECORD_MAX, and then 413 every following beat from that
+// host, including the ones that would have swept it. The agent truncates too;
+// this is the boundary that makes a buggy or hostile one survivable (XERK-235).
+const SPAWN_FAILURE_ERROR_MAX = 500;
+const SPAWN_FAILURE_CMDID_MAX = 200;
+
+// Merge the agent's refusals of a session-creating command (heartbeat
+// `spawnFailures`, XERK-265) into a per-cmdId cache, and stamp any it names onto
+// the migration waiting on it.
+//
+// Every one of these used to be a line in the agent's container log: the command
+// is ACKed whether the agent ran it or refused it, so the hub could not tell a
+// refused resume from a slow one. It kept the Sessions page spinning out its
+// follow window with no reason, and left a migration in `importing` until
+// MIGRATE_TIMEOUT_MS — which XERK-256's prune/resume race made an ordinary event
+// rather than an operator error.
+//
+// Unlike `statusResults` this cache is NOT stripped from the fleet payload: the
+// point is that the client following the spawn can see it. It is small, capped
+// and short-lived, so it costs the record almost nothing. It is named apart from
+// the wire field it comes from (`spawnRefusals`, keyed by cmdId, vs the beat's
+// `spawnFailures` list) so the two shapes can't be mistaken for each other.
+// `ownCmdIds` is the set of command ids this host was actually GIVEN (its queue
+// before this beat's acks were applied). Both handles are checked against what
+// the hub knows, never taken on the agent's word: all agents share one token, so
+// an unchecked cmdId lets any host end another host's spawn wait with arbitrary
+// text, and an unchecked migrationId lets it fail a move it has no part in.
+function ingestSpawnFailures(hostKey, agent, ownCmdIds, results) {
+  const now = Date.now();
+  // A non-array here would throw mid-handler, AFTER the record was replaced and
+  // before the ack/publish/save — costing the host its commands every beat.
+  for (const r of (Array.isArray(results) ? results : [])) {
+    if (!r) continue;
+    const error = typeof r.error === "string" && r.error
+      ? r.error.slice(0, SPAWN_FAILURE_ERROR_MAX)
+      : "the agent refused it";
+    // The length and key-name checks are belt-and-braces BEHIND `ownCmdIds`:
+    // `queueCommand` mints ids from crypto.randomBytes, so the hub can never
+    // have issued one called `__proto__` or 200 chars long, and no test can
+    // fail on their removal today. They are here for the day that membership
+    // check is relaxed — `__proto__` would then invoke the prototype setter
+    // rather than store an entry, silently dropping the refusal, which is why
+    // `device` refuses the same names.
+    if (typeof r.cmdId === "string" && r.cmdId &&
+        r.cmdId.length <= SPAWN_FAILURE_CMDID_MAX &&
+        r.cmdId !== "__proto__" && r.cmdId !== "constructor" &&
+        r.cmdId !== "prototype" && ownCmdIds.has(r.cmdId)) {
+      agent.spawnRefusals[r.cmdId] = { error, at: now };
+    }
+    // A migration's own handle. The refusal can arrive for either half, so match
+    // the record by id — the export half has no importCmdId to key on. Only a
+    // host actually IN the move may fail it.
+    if (r.migrationId) {
+      const m = migrations.get(r.migrationId);
+      if (m && (m.phase === "exporting" || m.phase === "importing") &&
+          (m.srcHost === hostKey || m.targetHost === hostKey)) m.refusal = error;
+    }
+  }
+  for (const [id, e] of Object.entries(agent.spawnRefusals)) {
+    if (now - e.at > SPAWN_FAILURE_MAX_AGE_MS) delete agent.spawnRefusals[id];
+  }
+  const over = Object.keys(agent.spawnRefusals).length - SPAWN_FAILURE_MAX;
+  if (over > 0) {
+    Object.entries(agent.spawnRefusals)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.spawnRefusals[id]);
   }
 }
 
@@ -1554,6 +2442,23 @@ function hostAvailability(a) {
   return c.free - (c.queued || 0) - pendingSpawnCount(a);
 }
 
+// Can this host take a session RIGHT NOW? The gate the hub-side ticket queue
+// dispatches on (XERK-296), and deliberately a different question from the
+// ranking above: that one orders hosts, this one decides whether any may be
+// given work at all.
+//
+// An agent that reports no `capacity` block is "can't tell", never "full" — the
+// heartbeat contract's rule for an absent capability. Such a host stays
+// dispatchable (it still queues the session itself, exactly as it did before
+// this queue existed, which is the pre-XERK-296 behavior a mixed fleet needs);
+// hostAvailability already ranks it below every host with real free slots, so it
+// is only ever picked when nothing better is known.
+function hostHasFreeSlot(a) {
+  const c = a && a.capacity;
+  if (!c || typeof c.free !== "number") return true;
+  return hostAvailability(a) > 0;
+}
+
 // Which HOST should run a ticket's session, splitting load across the org's
 // agents. Among the ONLINE hosts reporting the org:
 //   - prefer one that already has the repo cloned;
@@ -1573,11 +2478,19 @@ function hostAvailability(a) {
 // so the availability ranking never overrides it. It is honored, not worked
 // around: a pinned host that's offline (or gone from the org) is an ERROR with
 // the pin in the message, never a silent fallback to another host — routing
-// elsewhere would contradict the one thing the pin asserts. The auto-start
-// sweep treats that error like any no-host result (retry next sweep,
-// unrecorded), so a pinned host that's briefly down just delays the spawn.
-// Returns {host, needsClone} | {error, status}.
-function findTicketHost(siteKey, repo, issueKey) {
+// elsewhere would contradict the one thing the pin asserts. A pinned host that
+// is merely FULL is not an error: the ticket waits in the hub queue for that
+// host, which is what the pin asks for.
+//
+// `opts.requireFree` (XERK-296) narrows the pool to hosts with a slot free RIGHT
+// NOW, so a ticket is only ever routed to a host that can actually start it.
+// Nothing is chosen when none can — the caller queues the TICKET instead and
+// asks again on the next beat, which is what makes the host a dispatch-time
+// decision rather than an enqueue-time one. Returns `{full:true}` with that
+// refusal so the caller can tell "wait, this will clear" from "this can't work".
+// Returns {host, needsClone} | {error, status, full?}.
+function findTicketHost(siteKey, repo, issueKey, opts) {
+  const requireFree = !!(opts && opts.requireFree);
   const now = Date.now();
   let anyOrg = false, anyOnline = false;
   const cloned = [], uncloned = [];
@@ -1586,6 +2499,10 @@ function findTicketHost(siteKey, repo, issueKey) {
     anyOrg = true;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     anyOnline = true;
+    // A host with no room is out of the running entirely under requireFree —
+    // including out of the "has the repo cloned" preference, so a full cloned
+    // host never holds the ticket back from a free one that can clone on demand.
+    if (requireFree && !hostHasFreeSlot(a)) continue;
     if ((a.repos || []).some((r) => r && r.name === repo)) cloned.push(key);
     else uncloned.push(key);
   }
@@ -1601,11 +2518,19 @@ function findTicketHost(siteKey, repo, issueKey) {
       return { status: 503, error:
         `this ticket is pinned to agent "${pin.host}", which is offline` };
     }
+    if (requireFree && !hostHasFreeSlot(a)) {
+      return { status: 503, full: true, error:
+        `this ticket is pinned to agent "${pin.host}", which has no free session slot` };
+    }
     return { host: pin.host,
       needsClone: !(a.repos || []).some((r) => r && r.name === repo) };
   }
   if (!anyOnline) {
     return { status: 503, error: "every host reporting that Jira org is offline" };
+  }
+  if (requireFree && !cloned.length && !uncloned.length) {
+    return { status: 503, full: true, error:
+      "every host reporting that Jira org has its session slots full" };
   }
   const pool = cloned.length ? cloned : uncloned;
   const needsClone = cloned.length === 0;
@@ -1638,7 +2563,12 @@ const BODY_MAX = 1 << 20; // 1 MiB
 // and — because it holds staged results until a POST succeeds — re-sent the
 // same oversized body every beat, so the host stayed offline forever with
 // nothing logged (XERK-235).
-const HEARTBEAT_MAX = 32 << 20; // 32 MiB
+// Now the SHARED per-request ceiling rather than a fixed 32 MiB (XERK-258): the
+// fixed number happened to equal an eighth of the deployed 256m, so this is the
+// same value today, but a hub given more or less memory must move with it. It
+// stays a named constant because the reason a HEARTBEAT needs the biggest body
+// the hub allows is the paragraph above, not the arithmetic.
+const HEARTBEAT_MAX = BODY_INFLIGHT_MAX;
 
 // Longest prompt/label/baseRef a queued spawn may carry. A queued command is
 // re-serialized into every /api/agents response, every SSE broadcast and
@@ -1656,9 +2586,10 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
   "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
-  "sessions", "startedAt", "uploadMaxBytes", "usage",
+  "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
+  "spawnFailures",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -1688,22 +2619,9 @@ const AGENT_RECORD_MAX = 8 << 20; // 8 MiB
 // the crossing rather than on every beat.
 const recordSizeWarned = new Map();
 
-// The cache keys `serializeAgent` strips; see AGENT_RECORD_MAX.
-const AGENT_CACHE_KEYS = [
-  "history", "subagentHistory", "jiraIssues", "statusResults",
-  "createMeta", "createTypes", "createResults", "resultWaits",
-];
-
-// The serialized size of what this record contributes to /api/agents.
-function agentRecordSize(record) {
-  try {
-    return JSON.stringify(record, (k, v) =>
-      AGENT_CACHE_KEYS.includes(k) && v && typeof v === "object" ? undefined : v
-    ).length;
-  } catch {
-    return Infinity; // circular or unserializable — it cannot be persisted anyway
-  }
-}
+// `AGENT_CACHE_KEYS` and `agentRecordSize` are declared with the registry
+// budget instead (see `let agents`), because the state.json restore enforces
+// that budget at module init and so has to be able to measure a record.
 
 // Drop unrecognised keys that are too large to be a plausible new field.
 //
@@ -1726,7 +2644,7 @@ function sanitizeHeartbeat(payload, key) {
     }
     if (size > HEARTBEAT_UNKNOWN_MAX) {
       console.error(
-        `heartbeat from ${key}: dropped unknown field ${JSON.stringify(k)} ` +
+        `heartbeat from ${logName(key)}: dropped unknown field ${JSON.stringify(k)} ` +
           `(${size} bytes, limit ${HEARTBEAT_UNKNOWN_MAX})`
       );
       delete payload[k];
@@ -1736,15 +2654,208 @@ function sanitizeHeartbeat(payload, key) {
   // session's live agent rows come from a pane scrape and are re-shaped and
   // bounded here for the same reason the `turn` frame's are — the clients turn
   // this list into a count and a label, and nothing else bounds it.
+  // Pre-ceiling, so this may only ever SHRINK (see normalizeRecord, which runs
+  // past the gate and is free to rewrite). Live agent rows come from a pane
+  // scrape and are re-shaped and bounded here for the same reason the `turn`
+  // frame's are — clients turn this list into a count and a label, and nothing
+  // else bounds it.
   if (Array.isArray(payload.sessions)) {
     for (const s of payload.sessions) {
-      const live = s && typeof s === "object" ? s.session : null;
-      if (live && typeof live === "object" && "agents" in live) {
+      const live = objectish(s) ? s.session : null;
+      if (objectish(live) && "agents" in live) {
         live.agents = sanitizeLiveAgents(live.agents) || [];
       }
     }
   }
   return payload;
+}
+
+/**
+ * Is this a plain object — the thing a client that TYPED a field will accept?
+ *
+ * The one predicate every shape check in the coercion path goes through, because
+ * the obvious spelling is wrong in the same way every time: `typeof [] ===
+ * "object"`, so `!x || typeof x !== "object"` passes arrays straight through,
+ * and the follow-on `"k" in []` is false so an array is neither coerced nor
+ * rejected. Both escapes were measured the same way — the Android login probe
+ * decodes /api/agents, so one raw array anywhere in the payload reads as "Could
+ * not reach the hub" and the app cannot sign in at all.
+ *
+ * A `function` declaration, not a `const`: it is used ~70 lines ABOVE this point
+ * by `sanitizeHeartbeat`, and this file has already shipped a coercion that
+ * threw a ReferenceError at module init from exactly that pattern (a const in
+ * its temporal dead zone, swallowed by the restore's `catch {}` — see
+ * `normalizeRecord`'s ordering comment). Declarations hoist; consts do not.
+ */
+function objectish(x) {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
+
+/**
+ * Every coercion an agent record needs before a client sees it, in ONE place.
+ *
+ * Called from the heartbeat ingest and from the `state.json` restore, because a
+ * coercion applied at only one of those is a hole straight through itself: the
+ * restore serves whatever was persisted, for one beat on a live host and up to
+ * the record's whole life on an offline one. Add a new `normalize*` HERE and
+ * both paths get it.
+ *
+ * The stakes are Android's: `/api/agents` decodes atomically into typed fields,
+ * so one host's wrong-typed value throws for the whole array and every OTHER
+ * host silently disappears from that phone.
+ */
+/**
+ * Whether a string is usable as the `agents` key, i.e. as a host this hub can
+ * actually address. Shared by the heartbeat ingest and the `state.json` restore
+ * so the two cannot drift — the same reason `normalizeRecord` is shared.
+ *
+ * Two families are refused. `agents` is a plain object, so a prototype key is
+ * not a host: `__proto__` 200'd while the beat was silently discarded, and
+ * replaced the registry's prototype (XERK-235). And a URL dot segment is
+ * unaddressable: percent-encoding leaves "." and ".." untouched (both are
+ * unreserved), and the URL parser resolving /api/agents/<host>/... then
+ * collapses the segment — "." drops it, ".." climbs a level — so such a host
+ * shows online and healthy while every route against it 404s (XERK-269).
+ *
+ * Exact match, deliberately: the padded forms (" . ", ".\n") ARE addressable,
+ * since the padding percent-encodes to %20/%0A and no parser collapses those.
+ * Names that merely contain dots ("...", ".hidden", "a.b", "HOST.local.") are
+ * ordinary host names and must keep working.
+ */
+function isPlainHostKey(key) {
+  return typeof key === "string" && key.length > 0 && key.length <= 200 &&
+    key !== "__proto__" && key !== "constructor" && key !== "prototype" &&
+    key !== "." && key !== "..";
+}
+
+/**
+ * A refused key is attacker-controlled and NOT length-capped on the way in —
+ * `sanitizeHeartbeat` doesn't bound `device`, so only HEARTBEAT_MAX (32 MiB)
+ * does. Logging it raw let two refused beats write 9 MiB into the hub log, a
+ * synchronous write on the request path that blocks every other host's beat
+ * while it runs. Always log a key through this.
+ */
+function hostKeyLabel(key) {
+  const s = typeof key === "string" ? key : String(key);
+  return s.length > 80
+    ? `${JSON.stringify(s.slice(0, 80))}… (${s.length} chars)`
+    : JSON.stringify(s);
+}
+
+/**
+ * Drop every key `isPlainHostKey` refuses, returning the dropped names.
+ *
+ * Extracted from the restore loop so it can be tested directly: a regex over
+ * the loader's source proves the call is THERE, not that it drops anything —
+ * removing the `delete` still logs "dropping …" while dropping nothing, and
+ * `continue`→`break` silently makes survival depend on JSON key order. Both
+ * kept the suite green.
+ *
+ * Non-object input returns empty rather than iterating: `Object.keys("hello")`
+ * is ["0".."4"], which restored a five-"agent" registry out of a corrupt file.
+ */
+function dropUnusableHostKeys(store) {
+  const dropped = [];
+  if (!store || typeof store !== "object" || Array.isArray(store)) return dropped;
+  for (const key of Object.keys(store)) {
+    if (isPlainHostKey(key)) continue;
+    dropped.push(key);
+    delete store[key];
+  }
+  return dropped;
+}
+
+function normalizeRecord(a) {
+  // Order is NOT load-bearing, and must not become so: each of these guards its
+  // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
+  // here lands in the restore's silent `catch {}` and abandons every host after
+  // this one, uncoerced, on every boot. Sessions first only because it is the
+  // one that rewrites a shape the others iterate.
+  normalizeSessions(a);
+  normalizeUsage(a);
+  normalizeLimits(a);
+  normalizeSubscription(a);
+  normalizeLocalModel(a);
+}
+
+/**
+ * The heartbeat's coercion step, reached through a holder so a test can force it
+ * to throw (XERK-262). Production always holds the real [normalizeRecord]; only
+ * a `TURMA_TEST` suite ever replaces `normalize`.
+ *
+ * The indirection exists because the backstop around this call cannot be
+ * reached from the heartbeat wire today, and a QA mutation pass deleted the
+ * whole try/catch with the suite green.
+ *
+ * Why it is unreachable: every `normalize*` guards its own input shape, so the
+ * only throw the path has ever had was `sanitizeLiveAgents`'s `String(...)` on a
+ * value with no primitive conversion (pure JSON can express one —
+ * `{"toString":1,"valueOf":1}`), and `sanitizeHeartbeat` walks those same rows
+ * BEFORE any record is installed. Do not read that as "the input is impossible":
+ * the same value reaches `sanitizeLiveAgents` from the `/agent/control` frame
+ * handler, where nothing catches it (XERK-278).
+ *
+ * Being unreachable is exactly why deleting this catch reads as safe. It is not:
+ * `agents[key] = next` has ALREADY run by the time the coercion is called, so
+ * without the rollback a throw leaves the RAW, uncoerced record installed and
+ * served — defeating every gate downstream, `normalizeLocalModel`'s
+ * strict-boolean `available` check included. One `normalize*` that can throw on
+ * an input `sanitizeHeartbeat` does not walk makes this load-bearing with no
+ * other warning.
+ */
+const recordCoercion = { normalize: normalizeRecord };
+
+// The per-SESSION coercions (see normalizeRecord).
+//
+// `sessions` is a KNOWN key, so sanitizeHeartbeat's unknown-field sweep never
+// looks inside it — everything typed under a session has to be handled here.
+// Android decodes /api/agents into typed fields, so an object or array where it
+// expects a String throws for the WHOLE array and every other host disappears
+// from that phone; a field only becomes this dangerous once a client TYPES it,
+// which is why `modelSource`/`modelSourceAt` are here from the commit that
+// declared them on `SessionInfo`.
+function normalizeSessions(payload) {
+  if (!payload || typeof payload !== "object") return;
+  // A non-array `sessions` is REWRITTEN, not skipped. It is decode-fatal on
+  // Android — measured as the app failing to sign in at all, reporting "Could
+  // not reach the hub" — and on the restore path it also throws out of
+  // normalizeUsage's `for … of`, silently abandoning the record. Rewriting is
+  // safe only because this now runs PAST the AGENT_RECORD_MAX gate: doing it
+  // before would have erased the amplifier that gate exists to refuse.
+  if (!Array.isArray(payload.sessions)) {
+    if ("sessions" in payload) payload.sessions = [];
+    return;
+  }
+  // DROP a non-object element, never skip past it: `sessions` is typed
+  // `List<SessionInfo>` on Android, so a `null` or a bare string in the array is
+  // as fatal as a wrong-typed field inside one — measured as a host silently
+  // missing from the phone while the tile still counted it.
+  if (!payload.sessions.every(objectish)) payload.sessions = payload.sessions.filter(objectish);
+  for (const s of payload.sessions) {
+    // Re-bounded here as well as in sanitizeHeartbeat, because the restore path
+    // never goes through that: idempotent, so running twice costs nothing.
+    //
+    // REWRITE a non-object `session`, never merely skip past it. `session` is
+    // typed `LiveSignals?` on Android, so any non-object is decode-fatal for
+    // the WHOLE /api/agents array — measured as the app unable to sign in at
+    // all, since the login probe decodes it and reads the throw as "Could not
+    // reach the hub". Skipping the sanitize is NOT enough: the raw value stays
+    // in the record and is what gets served. `null` is the "can't tell you"
+    // value every client already handles.
+    //
+    // An array is the case a bare `typeof live === "object"` guard misses, and
+    // `"agents" in []` is false, so it fell through both halves of the old
+    // test. Rewriting is safe here only because normalizeSessions runs PAST the
+    // AGENT_RECORD_MAX gate — see normalizeRecord's ordering comment.
+    if ("session" in s && !objectish(s.session)) s.session = null;
+    const live = s.session;
+    if (live && "agents" in live) {
+      live.agents = sanitizeLiveAgents(live.agents) || [];
+    }
+    for (const k of ["modelSource", "modelSourceAt"]) {
+      if (k in s && typeof s[k] !== "string") s[k] = "";
+    }
+  }
 }
 
 // Thrown past the cap so a route can answer 413 instead of leaking a generic
@@ -1757,6 +2868,209 @@ class BodyTooLarge extends Error {
   }
 }
 
+// ---- in-flight body budget (XERK-258) ---------------------------------------
+// A per-request ceiling bounds ONE body. Nothing bounded the SUM of the bodies
+// being read at the same moment, so two requests each comfortably under
+// HEARTBEAT_MAX together exceeded the container's whole memory limit: measured
+// at the deployed 256m, two concurrent 30 MiB heartbeats OOM-kill the hub, and
+// all agents share one TURMA_AGENT_TOKEN, so any one host can take down the
+// fleet's entire control plane — which `restart: unless-stopped` then loops.
+//
+// The ceilings are FRACTIONS OF THE CONTAINER LIMIT, not fixed numbers, so
+// raising mem_limit widens them with no code change and a hub given LESS memory
+// tightens itself instead of dying. Both are logged at boot.
+
+// Thrown when admitting a body would put the hub over the budget. A 503 (not a
+// 413): the request is not too big, the hub is momentarily too busy, and the
+// caller should retry rather than shrink anything.
+class BodyBudgetExceeded extends Error {
+  constructor(held) {
+    super("hub busy: too many large requests in flight");
+    this.budgetExceeded = true;
+    this.held = held;
+    this.limit = BODY_INFLIGHT_TOTAL_MAX;
+  }
+}
+
+let bodyInflightBytes = 0;
+// Whether the big-body lane below is occupied. At most one body at a time may
+// exceed the shared budget.
+let bigLaneTaken = false;
+// Charged to the big lane, kept OUT of `bodyInflightBytes` on purpose — see
+// chargeBody. Tracked for reporting; the lane's real bound is the per-request
+// cap plus the fact that only one body may hold it.
+let bigLaneBytes = 0;
+
+/**
+ * Which lane a body of `n` budget units may use right now, or null to refuse.
+ * Holds nothing — this is the admission rule alone, so both readers can also ask
+ * it of a DECLARED length that has not arrived (see readBody).
+ *
+ * Two lanes, because one shared budget cannot express both of the hub's real
+ * obligations:
+ *
+ *  - **shared** — bodies that fit alongside everything else in flight. This is
+ *    almost all traffic and needs no special case.
+ *  - **big** — ONE body at a time that does not fit. Without it, the hub's own
+ *    advertised per-request ceilings are unreachable under any concurrent
+ *    traffic: `HEARTBEAT_MAX` says a 32 MiB beat is legal, but at 3x parse cost
+ *    it needs 96 of the 64 MiB budget, so it would be refused whenever ANY other
+ *    body was being read. A rule keyed on the hub being bit-for-bit idle is not
+ *    a rule anyone can rely on: one trickling request defeats it, and it also
+ *    refused a real 65 MiB migration bundle with 3 KB in flight — back when the
+ *    relay buffered one. It spools to disk now (XERK-263) and never reaches this
+ *    budget, so large HEARTBEATS are what the lane carries.
+ *
+ * The lane bounds the hub because only one body can hold it and every body is
+ * still capped per-request. Worst case is therefore one max-size body plus the
+ * whole shared budget, which is what the container is sized against.
+ */
+function bodyLaneFor(n) {
+  return laneForCharge(null, n);
+}
+
+/**
+ * Move an already-charged `n` from the shared lane into the big one, when a read
+ * that started ordinary outgrows the budget and is promoted.
+ *
+ * Without this the charge is split across two counters while the read owns only
+ * ONE lane, and `release()` — which can only name the lane the read ENDED in —
+ * hands the whole amount back to the big lane, leaking the shared portion
+ * forever. That is not an attack: a single legitimate 22 MiB heartbeat (well
+ * inside HEARTBEAT_MAX, and the size XERK-235 exists because staged history
+ * reaches) permanently consumed the entire shared budget, after which every
+ * non-trivial body was refused for the life of the process.
+ *
+ * A body's charge must live entirely in the lane it currently occupies. Then
+ * release is correct by construction, and so is every reading of either counter.
+ */
+function migrateToBigLane(n) {
+  bodyInflightBytes -= n;
+  if (bodyInflightBytes < 0) bodyInflightBytes = 0;
+  bigLaneBytes += n;
+}
+
+/**
+ * Whether the budget is contended enough for a non-progressing read to be worth
+ * reclaiming. True while the one big lane is occupied, or the shared budget is
+ * more than half spent — the two states in which one body holding on actually
+ * costs another body its turn.
+ */
+function budgetUnderPressure(lane) {
+  // The big lane is EXCLUSIVE, so a body sitting in it blocks the next large
+  // body however much room the shared budget has. A stall there is contention
+  // by definition.
+  if (lane === "big") return true;
+  return (bodyInflightBytes + bigLaneBytes) * 2 > BODY_INFLIGHT_TOTAL_MAX;
+}
+
+/**
+ * The same decision for a read that is ALREADY under way and wants `delta` more
+ * units, given the lane it is in.
+ *
+ * A shared-lane body is re-judged on every top-up. Deciding a lane once and then
+ * charging blindly is what makes a budget stop being one: several bodies each
+ * entered the shared lane while they were small, never consulted it again, and
+ * grew straight past the ceiling together — two 30 MiB heartbeats OOM-killed the
+ * hub with the budget nominally in force.
+ *
+ * A body that outgrows the shared lane is PROMOTED to the big one if it is free,
+ * rather than being killed at the point it stops fitting — a body that could not
+ * have known its own final size should not be punished for the hub filling up
+ * behind it, and this is the ordinary path for a large heartbeat that arrives
+ * chunked with no length to check up front.
+ */
+function laneForCharge(lane, delta) {
+  if (lane === "big") return "big"; // already exempt, for the whole read
+  // Shared admission counts the big lane too. A big body really is occupying
+  // memory, so pretending otherwise is what let the true worst case drift above
+  // what the container can hold. As it grows, ordinary traffic's room shrinks —
+  // but never to nothing, because the ceiling is set above what one body can
+  // ever charge, which is what keeps a holder from starving everyone (the total
+  // outage that made the lanes separate accounts in the first place).
+  if (bodyInflightBytes + bigLaneBytes + delta <= BODY_INFLIGHT_TOTAL_MAX) return "shared";
+  if (!bigLaneTaken) return "big";
+  return null;
+}
+
+/**
+ * Charge `n` budget units for bytes THAT HAVE ALREADY ARRIVED, in `lane`.
+ *
+ * **Only real, buffered bytes are ever charged — never a declared
+ * `Content-Length`.** Reserving on the declared length looks like the better
+ * trade (it refuses a doomed body before buffering any of it) and is a
+ * denial-of-service: a socket that declares the maximum body and then sends
+ * nothing holds the whole budget for as long as the request timeout allows,
+ * and every other body on the hub is refused 503. That costs an attacker no
+ * bandwidth, needs no credentials (`/api/login` reads a body before any auth
+ * gate) and is renewable, so it wedges the fleet's control plane far more
+ * cheaply than the OOM this budget exists to prevent. A declared length is a
+ * CLAIM; the budget may only ever track what was actually spent.
+ *
+ * A body's lane is decided once and held for the whole read. Re-judged per
+ * top-up, a big-lane body would be refused mid-stream by its own accumulated
+ * charge the moment it passed the shared budget.
+ */
+function chargeBody(n, lane) {
+  // **The lanes are accounted SEPARATELY, and that is the whole point of having
+  // lanes.** Billing the big body to the shared budget made merely OCCUPYING
+  // the lane a total outage: its own charge exceeds the budget, so every other
+  // body — a 200-byte heartbeat, the operator's own login — was refused 503
+  // behind it, and one authenticated socket could hold the fleet's control
+  // plane offline for about 29 kbit/s.
+  //
+  // Kept apart, a big body costs the shared lane nothing: occupying the lane
+  // delays other LARGE bodies, which is what an exclusive lane means, and
+  // ordinary traffic never notices. The hub's ceiling is unchanged either way —
+  // one max-size body plus the shared budget, which is what it is sized for.
+  if (lane === "big") {
+    bigLaneTaken = true;
+    bigLaneBytes += n;
+    return;
+  }
+  bodyInflightBytes += n;
+}
+
+/**
+ * What a body of `n` wire bytes really costs the hub, which is NOT `n`.
+ *
+ * A budget that charged wire bytes did not save the hub: two concurrent 30 MiB
+ * heartbeats summed to 60 MiB against a 64 MiB budget, were both admitted, and
+ * OOM-killed it anyway. The wire size is the smallest part of the bill — the
+ * body is also held as a JS string, and then `JSON.parse` builds an object graph
+ * beside it that outweighs both. So a JSON body is charged a MULTIPLE of what it
+ * declares, and the budget bounds the hub's real footprint rather than its
+ * traffic.
+ *
+ * Raw (Buffer) bodies keep their 1x: the migration relay and the attachment
+ * uploads never decode or parse what they hold, so for them the wire size IS the
+ * cost, and inflating it would refuse legitimate bundles that fit comfortably.
+ */
+const BODY_PARSE_COST = 3;
+
+/**
+ * Give `n` bytes back. Both readers call this the moment the body stops being
+ * held — on end, on error, and on either refusal — because a charge that
+ * outlives its buffer ratchets the budget permanently shut, which would take the
+ * hub down just as surely as the OOM this replaced, only more quietly.
+ */
+function releaseBody(n, lane) {
+  // Freeing the lane is the half that must never be missed — leaked, the hub
+  // refuses every large body for the rest of its life.
+  if (lane === "big") {
+    bigLaneBytes -= n;
+    if (bigLaneBytes < 0) bigLaneBytes = 0;
+    bigLaneTaken = false;
+    return;
+  }
+  bodyInflightBytes -= n;
+  // Belt and braces: a double release would drive this negative, which would
+  // hand the shared lane more room than the container has.
+  if (bodyInflightBytes < 0) bodyInflightBytes = 0;
+}
+// Everything held right now, BOTH lanes — what a test or a log wants to see.
+const bodyInflightHeld = () => bodyInflightBytes + bigLaneBytes;
+
 // Collect a request body as a string. Past `cap` it keeps DRAINING for a while
 // rather than destroying the socket: draining is what lets the route write a
 // 413 on the same connection, where a mid-body destroy reaches the client as a
@@ -1766,22 +3080,146 @@ function readBody(req, cap = BODY_MAX) {
     let data = "";
     let len = 0;
     let over = false;
+    // Budget units this read has charged — the body's wire bytes times
+    // BODY_PARSE_COST, not the wire bytes themselves. Released the moment the
+    // body stops being held — on end, on error, and on either refusal — because
+    // a charge that outlives its buffer would ratchet the budget shut.
+    let held = 0;
+    let lane = null; // decided on the first charge, held for the whole read
+    let bigLaneSince = 0; // when this read took the exclusive lane, if it has
+    let draining = false; // holds one of the DRAIN_CONCURRENCY_MAX slots
+    const costOf = (bytes) => bytes * BODY_PARSE_COST;
+    // How far past the refusal point we keep draining before cutting the socket.
+    // Draining is what lets the route answer on the same connection; a mid-body
+    // destroy reaches the client as a hang-up with no status to branch on. A
+    // body refused on BUDGET may be tiny, so it drains from where it stopped
+    // rather than all the way to `cap` — otherwise a flood of refusals would
+    // cost the hub the very read time the budget exists to avoid spending.
+    let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
+    const release = () => { releaseBody(held, lane); held = 0; lane = null; };
+    const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
+    // Armed only while this read holds budget, and reset by every chunk: a slow
+    // client keeps sending and is never touched; an abandoned one is.
+    let idleTimer = null;
+    // Where `len` stood when the window opened, and how much further it must get
+    // before the window may be reopened. Without these the window resets on any
+    // byte and a dribble holds its charge for as long as it likes.
+    let progressMark = 0;
+    let progressNeeded = 0;
+    const disarmIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+    const armIdle = () => {
+      disarmIdle();
+      progressMark = len;
+      // Never ask for more than the body has left to give, so a nearly-finished
+      // upload is not reclaimed over its last few bytes.
+      const left = Number.isFinite(declared) && declared > len ? declared - len : Infinity;
+      progressNeeded = Math.max(1, Math.min(BODY_MIN_PROGRESS_BYTES, left));
+      idleTimer = setTimeout(() => {
+        if (over) return;
+        // Reclaiming exists to relieve CONTENTION, so it only fires under it.
+        // On a hub with room to spare a stalled read is blocking nobody, and
+        // dropping it would be a pure false positive — a small request over a
+        // bad link holds a few hundred KB of a 64 MiB budget and monopolizes
+        // nothing. Under pressure the non-progressing reads are exactly the
+        // ones that should give way.
+        if (!budgetUnderPressure(lane)) return armIdle();
+        over = true;
+        release();
+        reject(new BodyStalled());
+        try { req.destroy(); } catch {}
+      }, BODY_IDLE_TIMEOUT_MS);
+      // Must not hold the process open on its own (the suite would never exit).
+      if (idleTimer.unref) idleTimer.unref();
+    };
+    req.on("close", () => { endDrain(); disarmIdle(); });
+    const refuse = (err, from = cap) => {
+      over = true;
+      data = ""; // release it — it is not going to be used
+      drainLimit = from + (err.budgetExceeded ? BUDGET_DRAIN_SLACK : RAW_BODY_DRAIN_SLACK);
+      // Draining is capped by CONCURRENCY, not just by length. Under the cap
+      // this reads on so the route can answer on the same connection — that is
+      // how an agent whose staged history outgrew HEARTBEAT_MAX learns its own
+      // limit and resizes instead of looping offline (XERK-235). Past it, the
+      // request reads nothing more and `noDrain` tells the route to close: the
+      // courtesy is what is killing the hub by then, and a reset the caller
+      // retries beats a status nobody is alive to read.
+      if (drainingNow >= DRAIN_CONCURRENCY_MAX) { drainLimit = 0; err.noDrain = true; }
+      else { drainingNow++; draining = true; }
+      release();
+      disarmIdle();
+      // A budget refusal STOPS READING rather than draining. Draining is a
+      // courtesy paid out of the very resource that has just run out, and Node
+      // hands us whatever has accumulated in one `data` event — megabytes — so
+      // even "destroy on the first chunk" costs a chunk per socket, and 256 of
+      // those OOM-killed the hub with not one body being buffered. Paused, the
+      // bytes stop at the kernel's socket buffer and TCP backpressure tells the
+      // client to stop; the 503 already queued still flushes, and Node closes
+      // the connection once it has.
+      if (err.budgetExceeded || err.noDrain) req.pause();
+      reject(err);
+    };
+
+    const declared = Number(req.headers["content-length"]);
+    // NOTE the asymmetry with the budget check below: an OVERSIZE body is NOT
+    // refused on its declaration. Refusing before the client has sent anything
+    // makes Node close the connection under a request still being written, and a
+    // client that writes its whole body before reading — python's urllib, which
+    // is exactly what hub-agent.py posts with — then loses the response and sees
+    // a socket error. That is XERK-235's failure: an agent whose staged history
+    // outgrew the cap must learn its LIMIT from the 413 and resize, not re-send
+    // the same body every beat forever. So an oversize body is read to `cap`
+    // first, as it always was, and answered on a connection the client is done
+    // with. What keeps that bounded is the budget: those `cap` bytes are charged
+    // like any other, so a FLOOD of oversize bodies is refused below on budget
+    // (cheaply, before buffering) and only the one or two the hub can afford
+    // ever buffer their way to a 413.
+    //
+    // A declared length is CHECKED against the budget but never CHARGED to it
+    // (see chargeBody). The distinction is the whole point: checking costs an
+    // attacker's idle socket nothing, because a claim that is never charged is
+    // never held, so nothing is denied to anyone else.
+    //
+    // The check has to exist, though. Node delivers whatever has accumulated in
+    // one `data` event — megabytes, not one buffer's worth — so a body refused
+    // on its first chunk has already been buffered that far. Waiting for bytes
+    // to arrive before refusing let 256 sockets streaming 30 MiB each OOM the
+    // hub anyway. Refusing on the claim keeps that to nothing, and a client that
+    // under-declares is still caught by the incremental charge below.
+    if (Number.isFinite(declared) && declared > 0 && !bodyLaneFor(costOf(declared)))
+      return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+
     req.on("data", (c) => {
       len += c.length;
       if (over) {
-        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        if (len > drainLimit) req.destroy();
         return;
       }
-      if (len > cap) {
-        over = true;
-        data = ""; // release it — it is not going to be used
-        reject(new BodyTooLarge(cap));
-        return;
+      if (len > cap) return refuse(new BodyTooLarge(cap));
+      // Top the charge up to what has actually arrived. Compared in BUDGET
+      // UNITS, not wire bytes — against `len` this would stop topping up after
+      // the first chunk and a body would ride most of the way in uncharged.
+      const want = costOf(len);
+      if (want > held) {
+        const next = laneForCharge(lane, want - held);
+        if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        if (lane !== "big" && next === "big") {
+          // Carry what is already charged into the lane this read now occupies.
+          if (lane === "shared") migrateToBigLane(held);
+          bigLaneSince = Date.now();
+        }
+        lane = next;
+        chargeBody(want - held, lane);
+        held = want;
+        // Held the exclusive lane too long, however well-behaved: see
+        // BIG_LANE_MAX_HOLD_MS for why progress alone cannot bound this.
+        if (lane === "big" && Date.now() - bigLaneSince > BIG_LANE_MAX_HOLD_MS)
+          return refuse(new BodyStalled(), len);
+        if (!progressNeeded || len - progressMark >= progressNeeded) armIdle();
       }
       data += c;
     });
-    req.on("end", () => { if (!over) resolve(data); });
-    req.on("error", reject);
+    req.on("end", () => { if (!over) { disarmIdle(); release(); resolve(data); } });
+    req.on("error", (e) => { disarmIdle(); release(); reject(e); });
   });
 }
 
@@ -1791,6 +3229,86 @@ function readBody(req, cap = BODY_MAX) {
 // hang up, and "the network broke" is the wrong thing to tell someone whose
 // file was simply too big (XERK-234).
 const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
+// How many refused bodies may be draining at once. Draining is unbuffered, but
+// it is not free: Node allocates for every read it hands us, and 256 sockets
+// each streaming past an oversize refusal out-allocated the collector and
+// OOM-killed the hub at the deployed 256m — unauthenticated, via /api/login's
+// 1 MiB cap. Past this many, a refusal stops reading and closes instead.
+//
+// The count, not a byte budget, is what matters: the cost is concurrent read
+// churn, and the whole point of draining is that the bytes are never kept.
+// Small enough to bound the flood, and comfortably more than the number of
+// oversize bodies a healthy fleet produces at once — which is normally zero, and
+// one when a host's staged history has outgrown HEARTBEAT_MAX. That one still
+// drains, still gets its 413, and still resizes against it (XERK-235); only a
+// flood is cut off, and only past the point where draining is what is killing us.
+const DRAIN_CONCURRENCY_MAX = Number(process.env.DRAIN_CONCURRENCY_MAX) || 8;
+let drainingNow = 0;
+
+// The same courtesy, rationed, for a body refused on BUDGET rather than on size.
+// A budget refusal happens when the hub is ALREADY at its ceiling and, unlike an
+// oversize one, happens to many requests at once — 256 sockets each draining a
+// megabyte to read their 503 is a quarter-gigabyte of churn at exactly the wrong
+// moment, and it OOM-killed the hub even though not one of those bodies was
+// being buffered. This is enough for the response to flush and no more.
+const BUDGET_DRAIN_SLACK = 64 << 10; // 64 KiB
+
+// How long a body holding budget may go silent before the hub takes it back.
+//
+// The budget bounds how MUCH may be held; without this nothing bounded how
+// LONG. One socket that streamed 22 MiB and then simply stopped took the big
+// lane and refused every other body on the hub — tiny heartbeats and the
+// operator's own login included — until `requestTimeout` (300s) expired, and it
+// cost ~0.6 kbit/s to renew forever. A hold with no progress is not slow, it is
+// abandoned, and the two are told apart by whether bytes are still arriving.
+//
+// Only armed while a read actually holds a charge, and reset by every chunk, so
+// a genuinely slow client on a bad link is untouched — it keeps sending. The
+// window is generous for that reason: this is not a throughput floor.
+const BODY_IDLE_TIMEOUT_MS = Number(process.env.BODY_IDLE_TIMEOUT_MS) || 20 * 1000;
+
+// ...and how much must ARRIVE in that window for the body to count as making
+// progress. This is the half that matters.
+//
+// A window reset by ANY byte is not a liveness check, it is a heartbeat an
+// attacker can forge: one byte every 15s is neither silence nor slowness, and it
+// held the big lane — refusing every POST on the hub, operator login included —
+// indefinitely, for about 0.5 bit/s after a one-time 22 MiB warmup. Renewing
+// cost nothing because it never had to re-stream.
+//
+// So the rule is a minimum RATE, not a minimum sign of life: roughly 3 KiB/s at
+// the defaults. That is far below anything the fleet does — agents reach the hub
+// over a LAN or the tunnel — and far above what a dribble can fake. The floor
+// gives way to what is actually left of the body, so a nearly-complete upload is
+// never reclaimed for the sake of a few last bytes; an attacker cannot use that,
+// since holding a big charge requires a large body with a large remainder.
+const BODY_MIN_PROGRESS_BYTES =
+  Number(process.env.BODY_MIN_PROGRESS_BYTES) || 64 << 10; // 64 KiB per window
+
+// The longest any ONE body may occupy the exclusive big lane, however well it
+// behaves. The progress floor cannot close this on its own: a body dribbling AT
+// the floor is byte-for-byte indistinguishable from a legitimate slow migration
+// at the same rate, so no rate threshold separates them and raising the floor
+// only moves the price. This is the orthogonal bound — not "are you making
+// progress" but "you have had the lane long enough".
+//
+// Generous on purpose: the largest body that reaches this budget is a
+// BODY_INFLIGHT_MAX heartbeat, which clears the window at a few dozen KiB/s —
+// far below what a LAN or the tunnel does. (The 65 MiB migration bundle spools
+// to disk and is not charged here at all.) What this denies is the indefinite
+// hold — an attacker must re-establish rather than sit there forever.
+const BIG_LANE_MAX_HOLD_MS =
+  Number(process.env.BIG_LANE_MAX_HOLD_MS) || 10 * 60 * 1000;
+
+// Thrown when a body holding budget stops arriving. Its socket is destroyed —
+// a caller that stopped mid-body is not waiting to read a status, and by this
+// point it is holding room the rest of the fleet needs.
+class BodyStalled extends Error {
+  constructor() {
+    super("body stalled while holding the in-flight budget");
+    this.stalled = true;
+  }
+}
 
 // Collect a request body as raw bytes (for the binary migration relay and the
 // attachment uploads, which readBody's 1 MiB string cap would truncate). Rejects
@@ -1802,24 +3320,226 @@ function readRawBody(req, cap) {
     let chunks = [];
     let len = 0;
     let over = false;
+    // Charged and released exactly as readBody does — the two readers must stay
+    // in step, or the budget bounds only half of what the hub buffers.
+    let held = 0;
+    let lane = null;
+    let bigLaneSince = 0;
+    let draining = false;
+    let drainLimit = cap + RAW_BODY_DRAIN_SLACK;
+    const release = () => { releaseBody(held, lane); held = 0; lane = null; };
+    const endDrain = () => { if (draining) { draining = false; drainingNow--; } };
+    // Armed only while this read holds budget, and reset by every chunk: a slow
+    // client keeps sending and is never touched; an abandoned one is.
+    let idleTimer = null;
+    // Where `len` stood when the window opened, and how much further it must get
+    // before the window may be reopened. Without these the window resets on any
+    // byte and a dribble holds its charge for as long as it likes.
+    let progressMark = 0;
+    let progressNeeded = 0;
+    const disarmIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+    const armIdle = () => {
+      disarmIdle();
+      progressMark = len;
+      // Never ask for more than the body has left to give, so a nearly-finished
+      // upload is not reclaimed over its last few bytes.
+      const left = Number.isFinite(declared) && declared > len ? declared - len : Infinity;
+      progressNeeded = Math.max(1, Math.min(BODY_MIN_PROGRESS_BYTES, left));
+      idleTimer = setTimeout(() => {
+        if (over) return;
+        // Reclaiming exists to relieve CONTENTION, so it only fires under it.
+        // On a hub with room to spare a stalled read is blocking nobody, and
+        // dropping it would be a pure false positive — a small request over a
+        // bad link holds a few hundred KB of a 64 MiB budget and monopolizes
+        // nothing. Under pressure the non-progressing reads are exactly the
+        // ones that should give way.
+        if (!budgetUnderPressure(lane)) return armIdle();
+        over = true;
+        release();
+        reject(new BodyStalled());
+        try { req.destroy(); } catch {}
+      }, BODY_IDLE_TIMEOUT_MS);
+      // Must not hold the process open on its own (the suite would never exit).
+      if (idleTimer.unref) idleTimer.unref();
+    };
+    req.on("close", () => { endDrain(); disarmIdle(); });
+    const refuse = (err, from = cap) => {
+      over = true;
+      chunks = []; // release what we'd buffered — it is not going to be used
+      drainLimit = from + (err.budgetExceeded ? BUDGET_DRAIN_SLACK : RAW_BODY_DRAIN_SLACK);
+      // Draining is capped by CONCURRENCY, not just by length. Under the cap
+      // this reads on so the route can answer on the same connection — that is
+      // how an agent whose staged history outgrew HEARTBEAT_MAX learns its own
+      // limit and resizes instead of looping offline (XERK-235). Past it, the
+      // request reads nothing more and `noDrain` tells the route to close: the
+      // courtesy is what is killing the hub by then, and a reset the caller
+      // retries beats a status nobody is alive to read.
+      if (drainingNow >= DRAIN_CONCURRENCY_MAX) { drainLimit = 0; err.noDrain = true; }
+      else { drainingNow++; draining = true; }
+      release();
+      disarmIdle();
+      // A budget refusal STOPS READING rather than draining. Draining is a
+      // courtesy paid out of the very resource that has just run out, and Node
+      // hands us whatever has accumulated in one `data` event — megabytes — so
+      // even "destroy on the first chunk" costs a chunk per socket, and 256 of
+      // those OOM-killed the hub with not one body being buffered. Paused, the
+      // bytes stop at the kernel's socket buffer and TCP backpressure tells the
+      // client to stop; the 503 already queued still flushes, and Node closes
+      // the connection once it has.
+      if (err.budgetExceeded || err.noDrain) req.pause();
+      reject(err);
+    };
+
+    // Same rule readBody follows: checked against the budget, charged to nothing,
+    // and NOT refused early for being oversize — see readBody for why.
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > 0 && !bodyLaneFor(declared))
+      return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+
     req.on("data", (c) => {
       len += c.length;
       if (over) {
         // Still coming after we've said no: read and throw it away up to a
         // point, then stop paying for a client that won't.
+        if (len > drainLimit) req.destroy();
+        return;
+      }
+      if (len > cap) return refuse(new Error("body too large"));
+      if (len > held) {
+        const next = laneForCharge(lane, len - held);
+        if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        if (lane !== "big" && next === "big") {
+          // Carry what is already charged into the lane this read now occupies.
+          if (lane === "shared") migrateToBigLane(held);
+          bigLaneSince = Date.now();
+        }
+        lane = next;
+        chargeBody(len - held, lane);
+        held = len;
+        // Held the exclusive lane too long, however well-behaved: see
+        // BIG_LANE_MAX_HOLD_MS for why progress alone cannot bound this.
+        if (lane === "big" && Date.now() - bigLaneSince > BIG_LANE_MAX_HOLD_MS)
+          return refuse(new BodyStalled(), len);
+        if (!progressNeeded || len - progressMark >= progressNeeded) armIdle();
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => { if (!over) { disarmIdle(); release(); resolve(Buffer.concat(chunks)); } });
+    req.on("error", (e) => { disarmIdle(); release(); reject(e); });
+  });
+}
+
+/**
+ * Close the connection under a request whose body we refused on BUDGET, once its
+ * response has flushed.
+ *
+ * Pausing the request is not enough on its own. Node keeps a connection alive by
+ * DUMPING an unread body when the response finishes — it resumes the stream we
+ * paused and reads the whole thing, discarding it. Discarded or not, those bytes
+ * are read into memory, and with 256 sockets each sending a 30 MiB body that is
+ * gigabytes of churn while the hub is already at its ceiling. It OOM-killed the
+ * hub at the deployed 256m with not one of those bodies being buffered.
+ *
+ * So the socket goes, and it goes AFTER `finish` so the 503 the caller needs
+ * (XERK-264) is on the wire first. The connection is not reusable anyway — we
+ * never read its body — which is what `Connection: close` tells the client.
+ */
+function endRefusedConnection(req, res) {
+  try { req.pause(); } catch {}
+  const kill = () => { try { req.socket.destroy(); } catch {} };
+  if (res.writableFinished) kill();
+  else res.once("finish", kill);
+}
+
+// Collect a request body straight into a FILE, never the heap (XERK-263), and
+// resolve with the byte count. For the migration relay, whose bundle can be 65
+// MiB against a hub that runs at mem_limit 256m: buffering one costs a quarter
+// of the container's memory, and the operator can start two at once.
+//
+// Reads with backpressure (the socket is paused whenever the file stream is
+// behind) so a fast uploader can't queue the whole body in the write buffer and
+// undo the point of spooling. Past `cap` it follows readRawBody's drain rule —
+// keep reading a little further so the route can answer 413 on the same
+// connection instead of hanging the socket up on the agent.
+//
+// On ANY failure the partial file is removed BEFORE the rejection lands, so a
+// caller only has to fail the migration; on success the file is the caller's to
+// unlink (see dropMigrationBlob).
+function spoolRawBody(req, cap, filePath) {
+  return new Promise((resolve, reject) => {
+    let out;
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      out = fs.createWriteStream(filePath);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let len = 0;
+    let settled = false;
+    // Whichever fails first — the request or the file — tears the spool down
+    // and rejects exactly once.
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      // The socket may be paused on the file stream's backpressure, and that
+      // stream is gone — resume so the drain rule above can run (and, on the
+      // over-cap path, so the 413 reaches the agent instead of a hang-up).
+      req.resume();
+      const cleanup = () => fs.unlink(filePath, () => reject(err));
+      // A write stream that ALREADY errored has emitted its `close`, so waiting
+      // for another one would hang the request forever instead of failing it.
+      if (out.destroyed || out.closed) cleanup();
+      else { out.once("close", cleanup); out.destroy(); }
+    };
+    req.on("data", (c) => {
+      len += c.length;
+      if (settled) {
+        // Still coming after we've said no: read and throw it away up to a
+        // point, then stop paying for a client that won't stop.
         if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
         return;
       }
       if (len > cap) {
-        over = true;
-        chunks = []; // release what we'd buffered — it is not going to be used
-        reject(new Error("body too large"));
+        fail(new BodyTooLarge(cap));
         return;
       }
-      chunks.push(c);
+      if (!out.write(c)) {
+        req.pause();
+        out.once("drain", () => req.resume());
+      }
     });
-    req.on("end", () => { if (!over) resolve(Buffer.concat(chunks)); });
-    req.on("error", reject);
+    req.on("error", fail);
+    req.on("aborted", () => fail(new Error("request aborted")));
+    req.on("end", () => {
+      if (settled) return;
+      // Resolve only once the bytes are actually on disk — the target agent may
+      // GET this file the moment the migration flips to `importing`.
+      //
+      // **The end callback's error is the whole point of this shape**: a write
+      // that fails during the FINAL flush (an ENOSPC on the last ≤64 KiB, which
+      // is every body small enough to fit the write buffer) surfaces here and
+      // nowhere else. Swallowing it answered 200 for a truncated bundle, which
+      // the target then failed to unpack with nothing logged anywhere. Settle
+      // only INSIDE the callback, so `fail` is still armed when it fires.
+      out.end((err) => {
+        if (err) return fail(err);
+        // Resolve with what reached the DISK, never with what came off the
+        // socket: a short write is a corrupt bundle, not a smaller one.
+        if (out.bytesWritten !== len)
+          return fail(new Error(`spool wrote ${out.bytesWritten} of ${len} bytes`));
+        // And resolve on `close`, not here: the end callback runs BEFORE the
+        // descriptor is closed (end-cb → finish → close), so a close(2) failure
+        // would land on `error` after a resolve and be swallowed — the same
+        // shape as the flush error above.
+        out.once("close", () => {
+          if (settled) return;
+          settled = true;
+          resolve(len);
+        });
+      });
+    });
+    out.on("error", fail);
   });
 }
 
@@ -1938,13 +3658,111 @@ function userAuthorized(req) {
   return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1));
 }
 
-// Agent auth (heartbeats). The user credentials also work here, so a curl
-// with the basic-auth login can exercise the endpoint.
-function agentAuthorized(req) {
+// Did this request carry a VALID agent credential, whatever host it is for?
+// Weaker than agentBearerKind only in that it doesn't say which host — it still
+// refuses an unknown token outright, which is what keeps an anonymous caller off
+// the heartbeat's 32 MiB body read (XERK-268). The one caller is that pre-body
+// gate; everywhere else has a host in hand and must bind to it.
+function agentPresented(req) {
   if (!TURMA_AGENT_TOKEN) return true;
   const header = req.headers.authorization || "";
-  if (header.startsWith("Bearer ")) return safeEqual(header.slice(7), TURMA_AGENT_TOKEN);
+  if (header.startsWith("Bearer ")) {
+    const token = header.slice(7);
+    if (tokenHost(token)) return true;
+    // Under TURMA_AGENT_STRICT the master is not a credential at all, and that
+    // has to hold HERE and not only at the authorization check past it: this
+    // gate stands in front of the 32 MiB read, so leaving the master usable
+    // through it means a leaked master still OOMs the hub on a fleet whose
+    // whole point was that the master had been retired.
+    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
+  }
   return userAuthorized(req) && !!TURMA_PASSWORD;
+}
+
+// The heartbeat's pre-body gate as a response. Refusing the master under strict
+// costs the caller the host-named 403 that agentHostRefusal gives every other
+// surface — the host is still unread, in the body behind this gate — so say the
+// same thing without it, rather than dropping an agent mid-rollover onto a bare
+// "unauthorized" it cannot act on (XERK-268).
+function agentPresentedRefusal(req) {
+  if (agentPresented(req)) return null;
+  const token = (req.headers.authorization || "").startsWith("Bearer ")
+    ? req.headers.authorization.slice(7) : "";
+  if (TURMA_AGENT_STRICT && TURMA_AGENT_TOKEN && token && safeEqual(token, TURMA_AGENT_TOKEN)) {
+    return {
+      status: 403,
+      error: "this hub requires each agent's own token (TURMA_AGENT_STRICT is set), not the fleet master",
+    };
+  }
+  return { status: 401, error: "unauthorized" };
+}
+
+// WHAT an agent-authed request proved about which host it is (XERK-268). Every
+// agent-authed surface names a host — the `<host>` path segment, the heartbeat's
+// `device`, the tunnel's `?name=` — and this says whether the credential backs
+// that claim. Four outcomes:
+//
+//   "proved"   the bearer is this host's derived token, so `host` is the
+//              credential's and not the caller's to pick;
+//   "operator" the ordinary user login (Basic/cookie). The operator owns the
+//              whole fleet and can already drive every host through the user
+//              API, so they may name any host — this is what keeps the
+//              documented curl paths working;
+//   "legacy"   the raw fleet master. It authenticates "some agent in this
+//              fleet" and NOTHING about which one, which is the pre-XERK-268
+//              trust model, kept so a host that hasn't been given its derived
+//              token yet keeps working. TURMA_AGENT_STRICT refuses it;
+//   null       not an agent credential at all (or the wrong host's).
+//
+// `host` null asks only "is this an agent at all" — the coarse gate before a
+// body has been parsed. Never let a route settle for that when it has a host to
+// check: "authenticated" is not "is who it says it is".
+function agentBearerKind(req, host) {
+  // Unconfigured hub: no token check at all (warned about loudly at boot).
+  if (!TURMA_AGENT_TOKEN) return "legacy";
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) {
+    const token = header.slice(7);
+    const bound = tokenHost(token);
+    // A host token proves exactly one host. Naming any other is the
+    // impersonation this exists to refuse — not a fallback to `legacy`.
+    if (bound) return host != null && bound === host ? "proved" : null;
+    if (safeEqual(token, TURMA_AGENT_TOKEN)) return "legacy";
+    return null;
+  }
+  return userAuthorized(req) && !!TURMA_PASSWORD ? "operator" : null;
+}
+
+// The gate every host-scoped agent route goes through: resolve the credential
+// against the host the caller NAMED and turn it into a response, or null to
+// carry on. Refusals are worded so the operator can act on them, per the hub's
+// refusal contract — a rolled-over agent hitting a strict hub, or a strict hub
+// meeting a host still on the master, must not read as a generic 401.
+function agentHostRefusal(req, host) {
+  const kind = agentBearerKind(req, host);
+  if (!kind) {
+    // A token that IS a host token, for a different host, gets said out loud.
+    // The commonest cause by far is not an attack but a host RENAME — the name
+    // is inside the token, so the agent's credential silently stops matching —
+    // and "unauthorized" sends the operator hunting for a wrong secret instead
+    // of a changed name. It tells the caller nothing it doesn't already hold:
+    // the token names its own host on its face.
+    const bound = tokenHost((req.headers.authorization || "").slice(7));
+    if (bound) {
+      return {
+        status: 403,
+        error: `this agent token is ${bound}'s, not ${host}'s — a host's token is derived from its name, so re-derive it if the host was renamed`,
+      };
+    }
+    return { status: 401, error: "unauthorized" };
+  }
+  if (kind === "legacy" && TURMA_AGENT_STRICT && TURMA_AGENT_TOKEN) {
+    return {
+      status: 403,
+      error: `this hub requires ${host}'s own agent token (TURMA_AGENT_STRICT is set), not the fleet master`,
+    };
+  }
+  return null;
 }
 
 // Trigger auth (POST /api/trigger). A caller passes either the dedicated
@@ -1967,11 +3785,19 @@ function triggerAuthorized(req) {
 // Agent auth for the tunnel WebSockets. Node's browser-style WebSocket client
 // (used by tunnel-agent.js) can't set headers, so the token rides a query
 // param; a Bearer header is accepted too for tools that can send one.
-function agentWsAuthorized(url, req) {
+//
+// `host` is the host this socket claims to be (XERK-268): `?name=` on the
+// control channel, and the host the data channel's `ch` was opened FOR on the
+// data channel — a socket may only be the host its credential derives to. Null
+// means there is no claim to check, which is not a state either caller is in.
+function agentWsAuthorized(url, req, host) {
   if (!TURMA_AGENT_TOKEN) return true;
   const token = url.searchParams.get("token");
-  if (token) return safeEqual(token, TURMA_AGENT_TOKEN);
-  return agentAuthorized(req);
+  if (token) {
+    if (host != null && safeEqual(token, hostAgentToken(host))) return true;
+    return !TURMA_AGENT_STRICT && safeEqual(token, TURMA_AGENT_TOKEN);
+  }
+  return !agentHostRefusal(req, host);
 }
 
 // ---- push alerts (Firebase Cloud Messaging) ---------------------------------
@@ -2054,17 +3880,49 @@ function fmtDur(ms) {
 // and cost that repaint; the cap matches the agent's own PANE_AGENTS_MAX.
 // `null` (not `[]`) for a frame with no `agents` key at all, so the chat can
 // tell "this agent can't report them" from "no agents are running".
-const LIVE_AGENTS_MAX = 32;
-const LIVE_AGENT_FIELD_MAX = 400;
+/**
+ * `String(x)` for a value that came off the wire — it CANNOT throw (XERK-278).
+ *
+ * Plain `String(x)` throws `TypeError: Cannot convert object to primitive value`
+ * when a value has no usable primitive conversion, and **pure JSON can express
+ * one**: `{"toString":1,"valueOf":1}` gives both hooks as own, non-callable
+ * properties, so neither ToPrimitive path works. `JSON.parse` of an
+ * attacker-controlled body produces exactly that object.
+ *
+ * That was a one-packet remote kill of the whole hub. `sanitizeLiveAgents` has
+ * three callers; two are on the heartbeat path, where the request handler's
+ * catch turns the throw into a 400. The third is the `/agent/control` WebSocket
+ * frame handler, which runs inside a `socket.on("data")` listener with no
+ * try/catch above it — and this process installs no `uncaughtException` handler,
+ * so the throw exited node. Under DockerOps' `restart: unless-stopped` that is a
+ * repeatable outage loop of the fleet's entire control plane, and the ordinary
+ * single-user web login is enough to open the socket.
+ *
+ * Fixed HERE rather than by wrapping the caller: a coercion that throws on
+ * untrusted input is the bug, and a caller-side guard is one that the next
+ * caller gets added without.
+ */
+function safeString(v) {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
+  try {
+    return String(v);
+  } catch {
+    // Unconvertible. Treated as absent, which is what every field here already
+    // does with a missing value — nothing downstream could render it anyway.
+    return "";
+  }
+}
+
 function sanitizeLiveAgents(raw) {
   if (!Array.isArray(raw)) return null;
   const out = [];
   for (const a of raw) {
     if (!a || typeof a !== "object") continue;
-    const type = String(a.type == null ? "" : a.type).slice(0, LIVE_AGENT_FIELD_MAX);
+    const type = safeString(a.type).slice(0, LIVE_AGENT_FIELD_MAX);
     if (!type) continue;
     out.push({ sel: !!a.sel, type,
-      label: String(a.label == null ? "" : a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
+      label: safeString(a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
     if (out.length >= LIVE_AGENTS_MAX) break;
   }
   return out;
@@ -2541,6 +4399,509 @@ function startedTicketKeys() {
   return keys;
 }
 
+// ---- the hub-side ticket queue (XERK-296) ----------------------------------
+// Work waiting for a session is a QUEUED TICKET on the hub, not a session record
+// on a host. Before this, a spawn that couldn't run right now was still routed
+// to a host immediately and the AGENT turned it into a real session — id minted,
+// host claimed, ledger entry, card on the board — that then sat doing nothing
+// until a slot freed. Two things were wrong with that:
+//   - it isn't a session. It has no worktree, no conversation and no branch; it
+//     is a promise to start one, and showing it as a session made the fleet look
+//     busier than it was and made "cancel this" read as "kill a session".
+//   - it nailed the ticket to ONE host at the moment it was queued. In an org
+//     with several agents, a slot freeing on any OTHER host couldn't take it —
+//     the work waited for the machine it happened to be assigned, which is the
+//     complaint this ticket opens with.
+// So the queue lives here, holds tickets, and the HOST IS CHOSEN AT DISPATCH:
+// drainTicketQueue() re-runs findTicketHost (with requireFree) every beat, so
+// whichever agent frees a slot first gets the oldest waiting ticket.
+//
+// The agent-side session queue (XERK-14) is unchanged and still carries what it
+// is actually for: an explicit "+ New session" on a host the operator named, and
+// a ticket session waiting on its repo to finish cloning — both cases where the
+// host IS the decision and the work has already begun there. A ticket spawn can
+// still land in it if a host fills between our capacity read and its beat; that
+// is a race, not the normal path, and it drains as it always did.
+//
+// Deliberately IN-MEMORY, like the migration records and the auto-start attempt
+// map: a hub restart drops the queue rather than starting a burst of sessions
+// from a boot-time replay of stale intent. Auto-queued tickets come straight
+// back on the next sweep; a manually queued one is lost and has to be clicked
+// again (its ticket is untouched, so nothing is destroyed by that).
+const TICKET_QUEUE_MAX = 200;
+// And how many ONE ORG may hold. The fleet cap alone is not a cap: an ordinary
+// 250-ticket To Do backlog on one opted-in org filled all 200 in a single sweep,
+// and every OTHER org's Start button then answered "the ticket queue is full" —
+// one org's routine backlog switching ticket-starting off fleet-wide. The queue
+// is drained per org (capacity is per org), so a per-org line is the real
+// resource; the fleet cap is only the memory bound behind it.
+const TICKET_QUEUE_PER_ORG_MAX = 25;
+// …of which the SWEEP may hold this many. The rest is reserved for a person: an
+// opted-in org's backlog refills its line every 15s, so without a reserve the
+// per-org cap simply moved the starvation one level down — the operator's own
+// Start button answering "that org already has 25 tickets waiting" for as long
+// as the backlog lasts. Auto work is re-derivable and can wait; a click can't.
+const TICKET_QUEUE_PER_ORG_AUTO_MAX = 20;
+// Longest a hold reason from findTicketHost is carried on an entry — it is
+// operator-facing text that rides /api/agents to every client.
+const TICKET_QUEUE_ERROR_MAX = 300;
+// Longest an issue key / siteKey may be to enter the queue. Both come off an
+// AGENT's jira block on the sweep path, and an entry is served to every client
+// on the fleet payload, so they are bounded HERE — see enqueueTicketStart.
+const TICKET_KEY_MAX = 64;
+const TICKET_SITE_MAX = 200;
+// How long an entry may sit with its ticket unresolvable (no reporting org lists
+// it any more) before it is dropped. Long enough to ride out a poll gap or a
+// host restart, short enough that a deleted/renamed ticket can't hold a place in
+// its org's line forever.
+const TICKET_QUEUE_STALE_MS = 10 * 60 * 1000;
+// How long an entry may sit "blocked" — a hold only the operator can clear (no
+// triaged repo, a pinned agent that's gone).
+const TICKET_QUEUE_BLOCKED_MAX_MS = 30 * 60 * 1000;
+// The longest ANY entry may wait, however good its reason. This is what bounds
+// a manual entry rather than second-guessing it from fleet state: a click is one
+// operator asking for one session, and the only honest ways to end it are their
+// cancel, its own dispatch, its ticket reaching Done, or giving up out loud
+// after a while. Long enough that an org busy all afternoon still starts the
+// work; short enough that nobody is surprised by a session tomorrow.
+const TICKET_QUEUE_MAX_WAIT_MS = 4 * 60 * 60 * 1000;
+// …and when it does end that way, the entry does NOT silently vanish. It goes
+// TERMINAL — `reason:"expired"`, still on the payload, rendered as "gave up
+// waiting" with the ✕ to dismiss — for this long. A queued click disappearing
+// without a word reads exactly like someone else cancelling it, which is the
+// class of thing this whole ticket is about: work that goes missing quietly. A
+// terminal entry never dispatches and never counts against a line's length.
+const TICKET_QUEUE_EXPIRED_TTL_MS = 60 * 60 * 1000;
+// How many notes may be held at once. They count against no line, so this is the
+// only thing bounding them.
+const TICKET_QUEUE_NOTES_MAX = TICKET_QUEUE_MAX;
+// How long a dispatch is remembered, so a cancel that LOST to it can say so
+// rather than 404ing as if the ticket had never been queued.
+const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
+// FIFO. Entries: {siteKey, issueKey, source:"auto"|"manual", at, reason, error,
+// blockedSince, unknownSince, expiredAt}. `reason` is why it is STILL waiting, as of the
+// last drain: "capacity" (some host will free up), "blocked" (something the
+// operator has to fix — the text is in `error`), or null before the first drain
+// has judged it.
+const ticketQueue = [];
+// "<siteKey>\x00<issueKey>" -> when its spawn was handed to a host. Bounded by
+// the prune in rememberDispatch; read only by the cancel route.
+const ticketDispatchedAt = new Map();
+
+function ticketQueueKey(siteKey, issueKey) {
+  return (siteKey || "") + "\x00" + issueKey;
+}
+
+// Say a thing at most once every TICKET_LOG_THROTTLE_MS. The sweep re-derives
+// its whole verdict every 15 seconds, so any line about a STATE ("this org is at
+// its share", "this row can't be queued") is a line about a condition that will
+// still be true in 15 seconds — printed raw, it buries the log in the case it
+// exists to explain. Per-event lines (queued, dispatched, dropped) are not
+// throttled: those are things that happened once.
+const TICKET_LOG_THROTTLE_MS = 10 * 60 * 1000;
+const ticketLogAt = new Map();
+function logQueueState(key, msg) {
+  const now = Date.now();
+  const last = ticketLogAt.get(key);
+  if (last && now - last < TICKET_LOG_THROTTLE_MS) return;
+  for (const [k, at] of ticketLogAt) {
+    if (now - at > TICKET_LOG_THROTTLE_MS) ticketLogAt.delete(k);
+  }
+  ticketLogAt.set(key, now);
+  console.log(msg);
+}
+
+function queuedTicket(siteKey, issueKey) {
+  return ticketQueue.find(
+    (e) => e.siteKey === siteKey && e.issueKey === issueKey) || null;
+}
+
+// The same lookup, but only for an entry that is actually WAITING. A terminal
+// note answers `queuedTicket` and must not stand in for a place in line —
+// treating one as "already queued" is what made a note block its own ticket's
+// auto-start for the whole hour it was on screen.
+function liveQueuedTicket(siteKey, issueKey) {
+  const e = queuedTicket(siteKey, issueKey);
+  return e && !e.expiredAt ? e : null;
+}
+
+function liveQueueCount() {
+  return ticketQueue.reduce((n, e) => n + (e.expiredAt ? 0 : 1), 0);
+}
+
+// Terminal notes are bounded on their own, since they count against no line: a
+// fleet that saturates for hours can mint one per expired entry, and each lives
+// TICKET_QUEUE_EXPIRED_TTL_MS. Oldest notes go first — they are the ones most
+// likely to have been read, and none of them is work.
+function sweepExpiredNotes() {
+  const notes = ticketQueue.filter((e) => e.expiredAt);
+  const over = notes.length - TICKET_QUEUE_NOTES_MAX;
+  if (over <= 0) return;
+  notes.sort((x, y) => x.expiredAt - y.expiredAt);
+  for (const e of notes.slice(0, over)) {
+    const i = ticketQueue.indexOf(e);
+    if (i >= 0) ticketQueue.splice(i, 1);
+  }
+}
+
+// May this ticket join the line, and if not, WHY not — the wording an operator
+// gets and, just as importantly, what the sweep should do about it. The three
+// refusals are different facts and were once all reported as "the queue is
+// full": an unqueueable ROW is one ticket's problem and the sweep must skip past
+// it (reporting it as a full queue made one bad row truncate an org's auto-start
+// at that row, every sweep, forever), while a full line is the whole org's.
+//   "ok" | "invalid" | "org-auto-full" | "org-full" | "fleet-full"
+function ticketQueueAdmission(siteKey, issueKey, source) {
+  if (typeof siteKey !== "string" || !siteKey || siteKey.length > TICKET_SITE_MAX) return "invalid";
+  if (typeof issueKey !== "string" || issueKey.length > TICKET_KEY_MAX
+      || !isIssueKey(issueKey)) {
+    return "invalid";
+  }
+  const cur = queuedTicket(siteKey, issueKey);
+  if (cur && !cur.expiredAt) return "ok";               // already in line
+  // A terminal entry holds no place, so it neither blocks its own re-queue nor
+  // counts toward the lines below.
+  const mine = ticketQueue.filter((e) => e.siteKey === siteKey && !e.expiredAt);
+  if (source === "auto"
+      && mine.filter((e) => e.source === "auto").length >= TICKET_QUEUE_PER_ORG_AUTO_MAX) {
+    return "org-auto-full";
+  }
+  if (mine.length >= TICKET_QUEUE_PER_ORG_MAX) return "org-full";
+  // The fleet cap is a LINE'S LENGTH, and a terminal note is not in the line —
+  // counting it let dead notes 429 a live click from an unrelated org, which is
+  // the refusal this ticket exists to remove. Notes are bounded separately, by
+  // sweepExpiredNotes below.
+  if (liveQueueCount() >= TICKET_QUEUE_MAX) return "fleet-full";
+  return "ok";
+}
+
+// The queue as clients see it, oldest first, with each entry's 1-based place in
+// its OWN org's line — capacity is per org, so "3rd waiting" only means anything
+// among the tickets competing for the same hosts.
+function ticketQueuePayload() {
+  const seen = new Map();
+  return ticketQueue.map((e) => {
+    // A terminal entry is not IN the line — it is a note about one that ended —
+    // so it takes no place and doesn't push the tickets behind it down.
+    const n = e.expiredAt ? 0 : (seen.get(e.siteKey) || 0) + 1;
+    if (!e.expiredAt) seen.set(e.siteKey, n);
+    return { siteKey: e.siteKey, issueKey: e.issueKey, source: e.source,
+      queuedAt: e.at, position: n, reason: e.reason || null,
+      error: e.error || null };
+  });
+}
+
+// Rides /api/agents like ticketAgents/autoStartOrgs, plus its own SSE event so
+// an open board reflects a queue change without waiting out the poll.
+//
+// The CACHE is invalidated synchronously (the next reader must not be served a
+// stale payload) but the BROADCAST is coalesced to the end of the turn: a sweep
+// queues one ticket at a time, and publishing per entry made a routine backlog
+// cost every open board a frame per ticket — 201 frames and 2.8 MB for 200
+// tickets. Every caller in one synchronous pass therefore shares one frame.
+let ticketQueueBroadcastPending = false;
+function publishTicketQueue() {
+  invalidateAgentsCache();
+  if (ticketQueueBroadcastPending) return;
+  ticketQueueBroadcastPending = true;
+  setImmediate(() => {
+    ticketQueueBroadcastPending = false;
+    sseBroadcast("ticketQueue", ticketQueuePayload());
+  }).unref?.();
+}
+
+// Remember that a ticket's spawn went out, so the cancel route can tell "you
+// already cancelled this" from "this started a moment ago" — the queue entry is
+// gone in both cases, and answering the second like the first told an operator
+// their cancel worked while a session was starting.
+function rememberDispatch(siteKey, issueKey) {
+  const now = Date.now();
+  for (const [k, at] of ticketDispatchedAt) {
+    if (now - at > TICKET_DISPATCH_MEMO_MS) ticketDispatchedAt.delete(k);
+  }
+  ticketDispatchedAt.set(ticketQueueKey(siteKey, issueKey), now);
+}
+
+function dispatchedRecently(siteKey, issueKey) {
+  const at = ticketDispatchedAt.get(ticketQueueKey(siteKey, issueKey));
+  return !!at && Date.now() - at <= TICKET_DISPATCH_MEMO_MS;
+}
+
+// Put a ticket in line. Returns the entry, or null when it can't be queued (a
+// key this hub won't serve, or a full line).
+//
+// One entry per ticket: a click on a ticket the sweep already queued UPGRADES it
+// to "manual" rather than adding a second. That upgrade is the point — an
+// operator who asked for this by hand keeps their place when the org's auto
+// switch goes off, and only the auto-queued entries are swept away.
+//
+// The key is validated HERE, not only on the manual route. On the sweep path
+// both fields come from an AGENT's `jira` block — untrusted — and an entry is
+// then served to every client on the top-level payload, where Android TYPES
+// `issueKey` as a String and decodes the whole payload atomically. An object or
+// a 20k-char key from one buggy host would break every phone's fleet decode,
+// hub-wide rather than per-host, and no `normalize*` covers this list: this
+// check is that coercion.
+function enqueueTicketStart(siteKey, issueKey, source) {
+  if (ticketQueueAdmission(siteKey, issueKey, source) !== "ok") return null;
+  const existing = queuedTicket(siteKey, issueKey);
+  if (existing && !existing.expiredAt) {
+    if (source === "manual" && existing.source !== "manual") {
+      existing.source = "manual";
+      publishTicketQueue();
+    }
+    return existing;
+  }
+  // Asking again after it gave up REPLACES the note with a fresh place in line,
+  // rather than handing back the dead entry.
+  if (existing) dropQueuedTicket(siteKey, issueKey, null);
+  const e = { siteKey, issueKey, source: source === "manual" ? "manual" : "auto",
+    at: Date.now(), reason: null, error: null, blockedSince: 0, unknownSince: 0 };
+  ticketQueue.push(e);
+  sweepExpiredNotes();
+  publishTicketQueue();
+  return e;
+}
+
+// Drop one ticket's entry. `why` is for the log only. Returns whether it was there.
+function dropQueuedTicket(siteKey, issueKey, why) {
+  const i = ticketQueue.findIndex(
+    (e) => e.siteKey === siteKey && e.issueKey === issueKey);
+  if (i < 0) return false;
+  ticketQueue.splice(i, 1);
+  if (why) console.log(`ticket queue: dropped ${logName(issueKey)} — ${why}`);
+  publishTicketQueue();
+  return true;
+}
+
+// Every AUTO-queued ticket of one org leaves the queue — the third thing XERK-296
+// asks for: turning an org's auto switch off must be able to call the waiting
+// work off, and be nothing more than that. It cannot touch a session, because a
+// queued ticket ISN'T one; and it leaves manual entries alone, since an operator
+// who clicked Start asked for that ticket specifically rather than for the org's
+// blanket policy.
+function dropAutoQueuedTickets(siteKey) {
+  let n = 0;
+  for (let i = ticketQueue.length - 1; i >= 0; i--) {
+    const e = ticketQueue[i];
+    if (e.siteKey !== siteKey || e.source !== "auto") continue;
+    ticketQueue.splice(i, 1);
+    n++;
+  }
+  if (n) {
+    console.log(`ticket queue: dropped ${n} auto-queued ticket(s) for ${logName(siteKey)}`
+      + " — auto-start was switched off");
+    publishTicketQueue();
+  }
+  return n;
+}
+
+// Every ticket the fleet reports, indexed "<siteKey>\x00<issueKey>" -> the
+// freshest host's row for it. Built ONCE per drain pass, because the drain runs
+// on every heartbeat and the walk is over every host's whole ticket list.
+//
+// **Merged across ALL of an org's hosts, never resolved against one winning
+// block.** Each agent polls Jira as `assignee = currentUser()`, so two hosts in
+// one org routinely report DIFFERENT ticket lists, and the poll is ~10 minutes
+// apart. Picking one block per org therefore made a ticket only the other host's
+// Jira user can see look like a ticket that no longer exists — dispatch-blocked
+// while it "waited", then aged out and deleted. Freshest-wins is only the
+// tie-break for a key two hosts BOTH report.
+function fleetTicketRows() {
+  const rows = new Map();   // key -> {row, at}
+  for (const a of Object.values(agents)) {
+    const j = a && a.jira;
+    if (!j || !j.siteKey) continue;
+    const at = String(j.fetchedAt || "");
+    for (const t of j.tickets || []) {
+      if (!t || !t.key) continue;
+      const k = ticketQueueKey(j.siteKey, t.key);
+      const cur = rows.get(k);
+      if (!cur || at > cur.at) rows.set(k, { row: t, at });
+    }
+  }
+  return rows;
+}
+
+// Is a spawnTicket for this ticket already riding some org host's command queue?
+// The window between dispatch and the session's first heartbeat.
+function spawnTicketInFlight(siteKey, issueKey) {
+  return Object.values(agents).some((a) =>
+    a.jira && a.jira.siteKey === siteKey &&
+    (a.commands || []).some(
+      (c) => c && c.type === "spawnTicket" && c.issueKey === issueKey));
+}
+
+function holdQueued(e, reason, error) {
+  const msg = error ? String(error).slice(0, TICKET_QUEUE_ERROR_MAX) : null;
+  if (e.reason === reason && e.error === msg) return false;
+  e.reason = reason;
+  e.error = msg;
+  return true;
+}
+
+// Hand the oldest waiting tickets to whichever hosts can actually start them.
+// Runs on every heartbeat (a beat is when capacity changes) and on the 15s
+// sweep, so a freed slot is filled within a beat rather than a sweep interval.
+//
+// AT MOST ONE DISPATCH PER HOST PER PASS, mirroring the agent's own one-per-beat
+// drain: provisioning launches claude against the one shared ~/.claude login, so
+// handing a host four sessions at once is the contention that stagger exists to
+// avoid. A second ticket for the same host waits for the next pass; a ticket for
+// a DIFFERENT host in the same pass goes straight out.
+//
+// An AUTO entry leaves on the sweep's own evidence: a session on any channel, a
+// spawn in flight, its org's switch going off, or its ticket leaving To Do.
+//
+// A MANUAL entry is one operator asking for one session, and the only honest
+// ends for it are their cancel, its own dispatch, its ticket reaching Done, and
+// the bounded waits below. It is deliberately NOT retired by fleet state — a
+// rule that dropped it when the ticket's session count grew swallowed the click
+// whenever a session it never asked for appeared (the auto sweep, another
+// operator, another board), and a count that can DIP (an agent mid-restart, a
+// `closedSessions` eviction) swallowed it with no new session at all. A second
+// session on a ticket is a thing the + button exists to ask for, so the queue
+// cannot infer the ask from a count it does not own.
+//
+// Every hold is bounded except `capacity`, the one that clears itself:
+// TICKET_QUEUE_MAX_WAIT_MS caps any wait, TICKET_QUEUE_STALE_MS a ticket no host
+// reports any more, TICKET_QUEUE_BLOCKED_MAX_MS one nothing can route.
+function drainTicketQueue() {
+  if (!ticketQueue.length) return;
+  const now = Date.now();
+  const rows = fleetTicketRows();
+  const usedHosts = new Set();
+  let started = null;
+  let changed = false;
+  for (const e of [...ticketQueue]) {
+    const k = ticketQueueKey(e.siteKey, e.issueKey);
+    const drop = (why) => {
+      const i = ticketQueue.indexOf(e);
+      if (i >= 0) ticketQueue.splice(i, 1);
+      changed = true;
+      if (why) console.log(`ticket queue: dropped ${logName(e.issueKey)} — ${why}`);
+    };
+    // A terminal entry is a message to the operator, not work: it holds nothing,
+    // dispatches nothing, and leaves once it has been on screen long enough to
+    // be read (or the moment they dismiss it with the ✕).
+    if (e.expiredAt) {
+      if (now - e.expiredAt > TICKET_QUEUE_EXPIRED_TTL_MS) drop(null);
+      continue;
+    }
+    // The backstop under every hold below: nothing waits here indefinitely
+    // except a slot that is coming, and even that has an end. It ends VISIBLY —
+    // see TICKET_QUEUE_EXPIRED_TTL_MS.
+    if (now - e.at > TICKET_QUEUE_MAX_WAIT_MS) {
+      const mins = Math.round((now - e.at) / 60000);
+      e.expiredAt = now;
+      e.reason = "expired";
+      e.error = `no agent had a free slot for ${Math.round(mins / 60)} hours, `
+        + "so it stopped waiting — start it again when the fleet is quieter";
+      changed = true;
+      console.log(`ticket queue: ${logName(e.issueKey)} gave up after ${mins} minutes`
+        + " without a free slot");
+      continue;
+    }
+    const hit = rows.get(k);
+    const row = hit ? hit.row : null;
+    // Nobody reports this ticket any more. Give it a while (a poll gap, a host
+    // restart) and then let it go — an entry whose ticket has ceased to exist
+    // held its org's line open forever, which is what made a full queue permanent.
+    if (!row) {
+      if (!e.unknownSince) { e.unknownSince = now; changed = true; }
+      if (now - e.unknownSince > TICKET_QUEUE_STALE_MS) {
+        drop("no reporting org lists that ticket any more");
+      }
+      continue;
+    }
+    if (e.unknownSince) { e.unknownSince = 0; changed = true; }
+    const cat = row.statusCategory || null;
+    if (cat === "done") { drop("its ticket moved to Done"); continue; }
+    if (e.source === "auto") {
+      // The auto guards, unchanged in strength from the sweep's: a session on any
+      // channel means the work is under way (or was, and was killed), and a spawn
+      // in flight means one is about to be.
+      // Computed at most once per pass, and only if an auto entry needs it — it
+      // walks every host's sessions, closed sessions and resumable scans.
+      if (!started) started = startedTicketKeys();
+      if (started.has(k)) { drop("it already has a session"); continue; }
+      if (spawnTicketInFlight(e.siteKey, e.issueKey)) {
+        drop("a spawn for it is already in flight");
+        continue;
+      }
+      if (!autoStartOrgs[e.siteKey]) { drop("auto-start is off for its org"); continue; }
+      // Auto-start only ever starts To Do work; a ticket a human has since moved
+      // into progress is being handled and shouldn't gain a session behind them.
+      if (cat && cat !== "todo") { drop("its ticket left To Do"); continue; }
+    }
+    const repo = ticketRepo(e.siteKey, e.issueKey);
+    if (!repo) {
+      // An AUTO entry leaves at once: the sweep only ever queues a ticket that
+      // HAS a repo, so it cannot re-queue this one until the triage comes back —
+      // no churn. A manual click is given a while to be made good on first.
+      if (e.source === "auto") { drop("its ticket has no triaged repo"); continue; }
+      changed = holdQueued(e, "blocked", "that ticket has no triaged repo yet") || changed;
+      if (!e.blockedSince) e.blockedSince = now;
+      if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
+        drop("it stayed blocked with nothing the hub could do about it");
+      }
+      continue;
+    }
+    const { host, error, full } = findTicketHost(
+      e.siteKey, repo, e.issueKey, { requireFree: true });
+    if (!host) {
+      changed = holdQueued(e, full ? "capacity" : "blocked", full ? null : error) || changed;
+      // "capacity" clears itself, so it waits (up to the max wait above).
+      if (full) { if (e.blockedSince) { e.blockedSince = 0; changed = true; } continue; }
+      // A routing failure HOLDS, whatever queued it. Dropping an auto entry here
+      // dropped it into the sweep's arms: an org whose hosts are all offline was
+      // re-queued 15s later, every 15s, churning the log, the payload and the
+      // board's chip for as long as it stayed down. It waits, like a full org
+      // does, and the blocked timer below is what ends it if nobody acts.
+      if (!e.blockedSince) e.blockedSince = now;
+      if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
+        drop("it stayed blocked with nothing the hub could do about it");
+      }
+      continue;
+    }
+    if (e.blockedSince) { e.blockedSince = 0; changed = true; }
+    if (usedHosts.has(host)) continue;   // that host already took one this pass
+    usedHosts.add(host);
+    // The operator's model pin (XERK-123) rides the command, exactly as it does
+    // from the Start button — read at DISPATCH so a pin changed while the ticket
+    // waited is the one that takes effect.
+    const mpin = ticketModelPin(e.siteKey, e.issueKey);
+    queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
+      ...(mpin ? { model: mpin.model } : {}) });
+    rememberDispatch(e.siteKey, e.issueKey);
+    const wait = Math.round((now - e.at) / 1000);
+    console.log(`ticket queue: dispatched ${logName(e.issueKey)} to ${logName(host)}`
+      + ` (${e.source}, waited ${wait}s)`);
+    // An auto-started ticket's attempt is recorded HERE, where the spawn is
+    // actually handed over — queuing on the hub commits nothing, so it must not
+    // spend a retry. The backoff still exists for what it has always covered: an
+    // agent that ACKS this command and leaves no session (XERK-61/109).
+    if (e.source === "auto") {
+      const prior = autoStarted.get(k);
+      const attempts = Math.min((prior ? prior.attempts : 0) + 1,
+        AUTO_START_BACKOFF_STEPS);
+      autoStarted.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
+      if (attempts > 1) {
+        console.log(`auto-start: retrying ${logName(e.issueKey)} on ${logName(host)} — the previous `
+          + "spawnTicket was acked but left no session (backing off, but the hub "
+          + "keeps trying so it recovers once the block clears)");
+      }
+    }
+    drop(null);
+  }
+  if (changed) {
+    // The drain is where notes are MINTED, so the bound belongs here too —
+    // applied only on enqueue it held at 2x until the next click.
+    sweepExpiredNotes();
+    publishTicketQueue();
+  }
+}
+
 function autoStartSweep() {
   const orgs = orgsWithAutoStart();
   if (!orgs.size) return;
@@ -2566,6 +4927,9 @@ function autoStartSweep() {
       // was deliberately killed). Done with this ticket for good; drop any
       // attempt record so the map only ever holds tickets still failing.
       if (started.has(k)) { autoStarted.delete(k); continue; }
+      // Already waiting in the hub queue — its place in line IS the pending
+      // attempt, and drainTicketQueue owns everything from here (XERK-296).
+      if (liveQueuedTicket(siteKey, t.key)) continue;
       // A spawnTicket already riding some org host's queue: the agent hasn't
       // taken it yet, so there is nothing to conclude about it either way.
       const inFlight = Object.values(agents).some((a) =>
@@ -2578,25 +4942,36 @@ function autoStartSweep() {
       // recovers on its own the moment the block clears (XERK-109).
       const prior = autoStarted.get(k);
       if (prior && now < prior.nextAt) continue;
-      const { host } = findTicketHost(siteKey, repo, t.key);
-      // No online host to route to right now (the org's hosts are down, or the
-      // ticket's pinned agent is) — spend no attempt, so the next sweep retries
-      // immediately once a host is back rather than sitting out a backoff for a
-      // failure that was never the ticket's fault.
-      if (!host) continue;
-      const mpin = ticketModelPin(siteKey, t.key);   // XERK-123, see /session
-      queueCommand(host, { type: "spawnTicket", issueKey: t.key,
-        ...(mpin ? { model: mpin.model } : {}) });
-      // Grow the backoff toward its ceiling; the counter is capped there so it
-      // settles into a steady once-per-ceiling retry instead of climbing forever.
-      const attempts = Math.min((prior ? prior.attempts : 0) + 1,
-        AUTO_START_BACKOFF_STEPS);
-      autoStarted.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
-      if (attempts > 1) {
-        console.log(`auto-start: retrying ${t.key} on ${host} — the previous `
-          + "spawnTicket was acked but left no session (backing off, but the hub "
-          + "keeps trying so it recovers once the block clears)");
+      // The sweep DECIDES the ticket should run; it no longer picks the host.
+      // That is drainTicketQueue's, at the moment an agent can actually take it,
+      // so a slot freeing anywhere in the org claims the oldest waiting ticket
+      // (XERK-296). The attempt/backoff is likewise spent at dispatch, not here:
+      // sitting in the queue commits nothing and must not burn a retry.
+      // A refusal is NOT one fact. An unqueueable ROW (a key this hub won't
+      // serve) is that ticket's problem and the rest of the list must still go
+      // through — reporting it as a full queue truncated an org's auto-start at
+      // its first bad row, every sweep, forever. A full line IS the org's
+      // problem, and only the fleet cap ends the sweep outright.
+      const verdict = ticketQueueAdmission(siteKey, t.key, "auto");
+      if (verdict === "invalid") {
+        // Keyed on the SANITISED name: t.key is agent-supplied and this map
+        // outlives the call, so an unbounded key would be an unbounded entry.
+        logQueueState(`bad\x00${siteKey}\x00${logName(t.key)}`,
+          `auto-start: ${logName(t.key)} isn't a key this hub can queue — skipped`);
+        continue;
       }
+      if (verdict === "org-auto-full" || verdict === "org-full") {
+        logQueueState(`share\x00${logName(siteKey)}`,
+          `auto-start: ${logName(siteKey)} already has its share of the queue `
+          + `(${TICKET_QUEUE_PER_ORG_AUTO_MAX} auto); the rest wait for a free slot`);
+        break;                       // this ORG is full; other orgs still sweep
+      }
+      if (verdict === "fleet-full") {
+        logQueueState("fleet-full",
+          `auto-start: the hub's ticket queue is full (${TICKET_QUEUE_MAX})`);
+        return;                      // nothing fits anywhere this sweep
+      }
+      enqueueTicketStart(siteKey, t.key, "auto");
     }
   }
 }
@@ -2683,6 +5058,11 @@ setInterval(() => {
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
   autoStartSweep();
   autoStopSweep();
+  // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
+  // same tick, and a session auto-stop just freed is seen by the drain the beat
+  // it lands. The heartbeat drains too (that's where capacity actually changes);
+  // this is the backstop for a fleet that is quiet but full.
+  drainTicketQueue();
 }, AUTO_START_EVERY_MS).unref();
 
 // Migration timeouts + settled-record cleanup (the fast handoff runs on the
@@ -2990,10 +5370,16 @@ function openChannel(name, port) {
       delete pendingChannels[ch];
       reject(new Error("channel open timeout"));
     }, 10000);
-    pendingChannels[ch] = (duplex) => {
-      clearTimeout(timer);
-      delete pendingChannels[ch];
-      resolve(duplex);
+    // `host` is carried so the dial-back can be checked against the host the
+    // channel was opened FOR (XERK-268) — `ch` alone identifies the channel but
+    // proves nothing about who answered it.
+    pendingChannels[ch] = {
+      host: name,
+      resolve: (duplex) => {
+        clearTimeout(timer);
+        delete pendingChannels[ch];
+        resolve(duplex);
+      },
     };
     cc.sendOpen(ch, port);
   });
@@ -3099,7 +5485,7 @@ function dropTermAgents(name) {
   }
 }
 async function proxyTerm(req, res, name, port) {
-  const headers = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH };
+  const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
   // so ttyd keeps the tunnel channel open for the next asset instead of closing.
   delete headers.connection;
@@ -3151,6 +5537,41 @@ async function proxyTerm(req, res, name, port) {
   });
   req.pipe(up);
 }
+
+// ---- connection cap (XERK-273) ----------------------------------------------
+// Nothing else bounds concurrent SOCKETS. Every accepted connection costs a read
+// buffer, an HTTP parser and request/response objects before a single body byte
+// is read — a cost the in-flight byte budget above cannot see, because it is not
+// made of body bytes.
+//
+// Measured at `-m 256m` (the deployed limit), that cost is ~28 KiB per socket:
+// 1024 idle-bodied connections peak at 49 MiB and 4096 at 135 MiB, where the hub
+// survives the OOM killer but stops answering. So sockets alone turn fatal
+// somewhere past ~8000, NOT at the ~1024 the ticket first attributed to them —
+// there the bill was overwhelmingly the 0.9 MiB bodies, which is the budget's
+// job, not this one's. Both bounds are needed and neither substitutes for the
+// other: the cap cannot bound bytes (a cap safe against a worst-case body would
+// have to be ~4) and the budget cannot bound sockets.
+//
+// The number is sized against real use, not against what survives. A dashboard
+// viewer holds an SSE stream, up to ~6 HTTP/1.1 sockets and a terminal socket;
+// every agent holds a control channel plus a data channel per open terminal.
+// A plausible fleet is well under 100 sockets, so 256 is ~3.5x headroom and
+// still far below the lethal count. Raise it via the env if a bigger fleet ever
+// needs it — set it too LOW and the UI breaks looking like a network fault,
+// which is exactly why the refusal is logged rather than silent.
+//
+// A refused connection is DESTROYED by Node before any HTTP parsing, so there is
+// no way to answer it with a 503 — the client sees a reset. That is the accepted
+// cost, and the reason the `drop` log below is the only diagnosable trace.
+const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS) || 256;
+// Refusals are logged rate-limited: a flood is thousands of drops per second and
+// a line each would make the log its own resource problem. The FIRST drop of a
+// burst prints immediately (that edge is the diagnosis), then at most one
+// summary line per window for as long as it lasts.
+const DROP_LOG_EVERY_MS = 60 * 1000;
+let dropsSinceLog = 0;
+let dropLoggedAt = 0;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
@@ -3236,9 +5657,26 @@ const server = http.createServer(async (req, res) => {
       req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "uploads" && parts[5] === "blob" && parts.length === 6;
 
-    if (url.pathname === "/api/heartbeat" || isArchiveIngest || isUpdatingSignal ||
-        isMigrationBlob || isUploadBlob) {
-      if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    if (url.pathname === "/api/heartbeat") {
+      // The heartbeat names the host it acts as in its BODY, so it is bound to
+      // the credential in the handler, once that is parsed (XERK-268). All this
+      // can do is refuse a caller carrying no agent credential at ALL: a bearer
+      // that isn't the master is indistinguishable from some host's derived
+      // token until we know which host it claims to be. That keeps the
+      // credential-less case refused before the body is read, as it always was.
+      const gate = agentPresentedRefusal(req);
+      if (gate) return json(res, gate.status, { error: gate.error });
+    } else if (isArchiveIngest || isUpdatingSignal || isMigrationBlob || isUploadBlob) {
+      // These all carry the host they act as in `<host>`, so the credential is
+      // checked AGAINST it rather than merely being a valid agent token. The
+      // decode is the same expression each route runs on the same segment, so
+      // the host checked here and the host compared there cannot diverge; a
+      // segment that does not decode is matched raw so an anonymous caller
+      // still gets 401 here rather than the route's 400 before any auth ran.
+      let claimed;
+      try { claimed = decodeURIComponent(parts[2]); } catch { claimed = parts[2]; }
+      const refusal = agentHostRefusal(req, claimed);
+      if (refusal) return json(res, refusal.status, { error: refusal.error });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isLoginRoute) {
@@ -3415,21 +5853,53 @@ const server = http.createServer(async (req, res) => {
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
-      normalizeUsage(payload);
-      normalizeLimits(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.
       const key = payload.device || payload.agentId;
       if (!key) return json(res, 400, { error: "device/agentId required" });
-      // `agents` is a plain object keyed by host name, so a non-string or a
-      // prototype key is not a host: `__proto__` 200'd while the beat was
-      // silently discarded (and replaced the registry's prototype), and an
-      // object key landed as "[object Object]" (XERK-235). Refuse it loudly —
-      // a beat the hub throws away must never report success.
-      if (typeof key !== "string" || key.length > 200 ||
-          key === "__proto__" || key === "constructor" || key === "prototype") {
+      // A beat the hub would throw away must never report success — see
+      // isPlainHostKey for which names are refused and why. Logged because the
+      // agent side cannot say why on its own: urllib's HTTPError stringifies
+      // without the body, so the agent's log shows a bare "HTTP Error 400" and
+      // the host simply vanishes from the dashboard. This line is the only
+      // place the reason is recoverable.
+      if (!isPlainHostKey(key)) {
+        console.warn(`refused heartbeat: device ${hostKeyLabel(key)} is not a plain host name`);
         return json(res, 400, { error: "device must be a plain host name" });
+      }
+      // `device` is the host this beat claims to BE, and the whole record —
+      // sessions, capacity, the command queue it drains — hangs off it. Bind it
+      // to the credential now that it's parsed (XERK-268): unbound, any
+      // token-holder could beat as another host and be handed the commands
+      // queued for it, which is how a migration/upload id leaves the fleet.
+      const beatRefusal = agentHostRefusal(req, key);
+      if (beatRefusal) return json(res, beatRefusal.status, { error: beatRefusal.error });
+      // Which credential it used decides which token its ttyd is running with
+      // (see ttydAuth). Hub-derived, never read off the payload.
+      const tokenBound = agentBearerKind(req, key) === "proved";
+      // Admission control (XERK-272), ordered AFTER the binding above so an
+      // unbound beat can never spend a registry slot. A host already in the
+      // registry always gets in — its record is bounded below and replacing it
+      // frees what it held — but a name the hub has never seen only gets a slot
+      // if there is room, or one can be reclaimed from a host gone longer than
+      // AGENT_EVICT_IDLE_MS.
+      //
+      // XERK-268 makes `device` PROVED rather than self-asserted, which shrinks
+      // this from an anyone-with-the-token attack to a compromised-or-buggy host
+      // and the `legacy` master credential a mid-rollover fleet still accepts —
+      // neither of which is nothing, and a host deriving its name from something
+      // unstable grows records with no attacker at all.
+      const known = Object.prototype.hasOwnProperty.call(agents, key);
+      if (!known && !makeRegistryRoom(0, 1)) {
+        // Throttled like the over-half warning, and for the same reason: the
+        // flood this exists to survive is exactly the traffic that would write
+        // this line, so a per-beat log turns a refused attack into disk
+        // pressure on the host. Once per REFUSED_LOG_EVERY_MS, with the count.
+        logRegistryFull(`new host ${logName(key)} refused`);
+        return json(res, 429, {
+          error: "agent registry full", limit: AGENTS_MAX, bytes: AGENTS_TOTAL_MAX,
+        });
       }
       const prev = agents[key] || {};
       // At-least-once command delivery: drop any queued command the agent
@@ -3462,6 +5932,11 @@ const server = http.createServer(async (req, res) => {
       delete payload.createMetaResults;
       const createTicketResults = payload.createTicketResults;
       delete payload.createTicketResults;
+      // Session-creating commands this agent REFUSED since the last beat
+      // (XERK-265) — cached by cmdId below and applied to any migration they
+      // name, so a refusal fails the move now rather than at its timeout.
+      const spawnFailures = payload.spawnFailures;
+      delete payload.spawnFailures;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -3488,6 +5963,11 @@ const server = http.createServer(async (req, res) => {
         // Pending host commands (spawn/kill/start/restart/resume/delete)
         // queued by the UI; re-sent on every reply below until acked.
         commands,
+        // Whether this host authenticated with its OWN derived token or the
+        // fleet master (XERK-268). Assigned AFTER the payload spread so a
+        // heartbeat claiming it is bound cannot make itself so; read only by
+        // ttydAuth, and stripped from the fleet payload like the caches.
+        tokenBound,
         lastSeen: Date.now(),
         // Per-agent alert bookkeeping survives across beats and hub restarts.
         alerts: prev.alerts || {},
@@ -3503,6 +5983,10 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId board-status-change outcome cache (see the /status route,
         // XERK-138); survives across beats like `jiraIssues`.
         statusResults: prev.statusResults || {},
+        // Per-cmdId refusals of a session-creating command (XERK-265). Survives
+        // across beats like the caches above, but is SERVED with the record
+        // rather than stripped — the client following that spawn is who needs it.
+        spawnRefusals: prev.spawnRefusals || {},
         // New-ticket create caches (XERK-137): the org's project/label metadata,
         // per-project issue types, and per-cmdId create outcomes. Like the other
         // on-demand caches, they survive across beats and are stripped from the
@@ -3521,6 +6005,40 @@ const server = http.createServer(async (req, res) => {
       // and then restoring `prev` restored an object the ingests had already
       // mutated — a refused beat still poisoned the caches and its content came
       // back out of /history with a 413 on the wire.
+      const refuseOversized = (size) => {
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        console.error(
+          `heartbeat from ${logName(key)}: record is ${size} bytes, over the ` +
+            `${AGENT_RECORD_MAX} limit — beat refused`
+        );
+        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+      };
+      // TWO measurements, one ceiling. The RAW size is the amplifier check: a
+      // coercion that discards junk must not be able to shrink an oversized
+      // beat into an accepted one (rewriting an 8 MiB string `sessions` to `[]`
+      // did exactly that, turning a 413 into a 200). The COERCED size is what
+      // actually gets stored and served, and a coercion can EXPAND —
+      // normalizeModelUsage rewrites `"m"` to `{model:"m"}`, ~3.5x, so an 8 MiB
+      // beat of model names parked 28 MiB per host for a week. Neither
+      // measurement alone holds the ceiling.
+      const rawSize = agentRecordSize(next);
+      if (rawSize > AGENT_RECORD_MAX) return refuseOversized(rawSize);
+      // Coercion sits BETWEEN the two, so it never walks an unbounded record —
+      // that is how a 24 MiB model name reached a per-code-point spread and
+      // OOM-killed the hub. A throw here would leave the RAW record installed
+      // (`agents[key] = next` is already done), which is worse than refusing:
+      // it defeats every gate downstream, including localModelAvailable's
+      // strict-boolean check. The coercions are written not to throw; this is
+      // the backstop that makes that not matter.
+      try {
+        recordCoercion.normalize(next);
+      } catch (e) {
+        console.error(`heartbeat from ${logName(key)}: coercion failed (${e.message}) — beat refused`);
+        if (prev && Object.keys(prev).length) agents[key] = prev;
+        else delete agents[key];
+        return json(res, 400, { error: "malformed heartbeat" });
+      }
       const recordSize = agentRecordSize(next);
       // Visible BEFORE it 413s. Measured against the operator's real fleet the
       // largest record is 0.30 MiB, so half the ceiling means something has
@@ -3531,19 +6049,53 @@ const server = http.createServer(async (req, res) => {
       const overHalf = recordSize > AGENT_RECORD_MAX / 2 && recordSize <= AGENT_RECORD_MAX;
       if (overHalf && !recordSizeWarned.get(key)) {
         console.warn(
-          `heartbeat from ${key}: record is ${recordSize} bytes, over half the ` +
+          `heartbeat from ${logName(key)}: record is ${recordSize} bytes, over half the ` +
             `${AGENT_RECORD_MAX} limit`
         );
       }
       recordSizeWarned.set(key, overHalf);
-      if (recordSize > AGENT_RECORD_MAX) {
-        if (prev && Object.keys(prev).length) agents[key] = prev;
-        else delete agents[key];
-        console.error(
-          `heartbeat from ${key}: record is ${recordSize} bytes, over the ` +
-            `${AGENT_RECORD_MAX} limit — beat refused`
+      // The same crossing-edge warning against the host's SHARE, which is the
+      // line that actually bites: the ceiling above is 8 MiB and a share is
+      // 512 KiB, so a host drifts past its share — and starts being refused
+      // once the registry is also full — with the ceiling's warning still
+      // eight times away. A record grows over weeks, which is plenty of notice
+      // if anyone is told; without this the first signal is the host vanishing.
+      const overHalfShare = recordSize > AGENT_FAIR_SHARE / 2;
+      if (overHalfShare && !shareWarned.get(key)) {
+        console.warn(
+          `heartbeat from ${logName(key)}: record is ${recordSize} bytes, over half ` +
+            `its ${AGENT_FAIR_SHARE}-byte share of the registry budget — past the ` +
+            `whole share it is refused whenever the registry is full`
         );
-        return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
+      }
+      shareWarned.set(key, overHalfShare);
+      if (recordSize > AGENT_RECORD_MAX) return refuseOversized(recordSize);
+      // The AGGREGATE budget (XERK-272). One record under the per-record ceiling
+      // is not the bound: AGENTS_MAX records AT that ceiling is 512 MiB on a
+      // 256 MiB hub. Measured after the coercion, because the coerced record is
+      // the one that gets retained, served and saved.
+      recordBytes.set(key, recordSize);
+      if (!makeRegistryRoom(0, 0) && recordSize > AGENT_FAIR_SHARE) {
+        // Only a host OVER its share is refused here. A host inside it is not
+        // the reason the registry is full, and refusing it would roll back its
+        // `lastSeen` with its record — reading as offline while it is up, every
+        // beat, with nothing to distinguish that from a network failure. See
+        // AGENT_FAIR_SHARE. This host is never what gets EVICTED either: it was
+        // just seen, so the idle rule excludes it.
+        if (prev && Object.keys(prev).length) {
+          agents[key] = prev;
+          recordBytes.set(key, agentRecordSize(prev));
+        } else {
+          delete agents[key];
+          recordBytes.delete(key);
+        }
+        logRegistryFull(
+          `${logName(key)} refused — its record is ${recordSize} bytes, over the ` +
+            `${AGENT_FAIR_SHARE}-byte per-host share`
+        );
+        return json(res, 429, {
+          error: "agent registry full", bytes: AGENTS_TOTAL_MAX, share: AGENT_FAIR_SHARE,
+        });
       }
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
@@ -3551,6 +6103,17 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
+      // Scoped to the commands this host was actually given: `prev.commands` is
+      // the queue BEFORE this beat's acks were filtered out, and the agent
+      // stages a refusal in the same handle_commands call that acks it, so the
+      // two always ride together. A hub restart inside `scheduleSave`'s debounce
+      // forgets the queue and therefore drops that refusal — correctly: the hub
+      // can no longer tell whose command it was, and the wait simply degrades to
+      // the pre-XERK-265 timeout. Never authenticate it from the beat's own
+      // `ackedCommands` instead; that is the agent's word, which is the thing
+      // being checked.
+      ingestSpawnFailures(key, next,
+        new Set((prev.commands || []).map((c) => c && c.cmdId)), spawnFailures);
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);
@@ -3560,6 +6123,13 @@ const server = http.createServer(async (req, res) => {
       // the handoff (kill source, mark done) now rather than waiting out the
       // sweep interval (XERK-101). Cheap: a no-op unless a migration is live.
       if (migrations.size) advanceMigrations();
+      // This beat is the fleet's capacity report, so it is exactly when a
+      // waiting ticket may have become startable (XERK-296) — a session that
+      // ended here frees a slot the queue can claim within one beat instead of
+      // up to a 15s sweep. A no-op unless something is queued. The dispatch
+      // rides the NEXT beat's reply (this one's command list is already built),
+      // which is the same one-beat handoff every other queued command takes.
+      if (ticketQueue.length) drainTicketQueue();
       // Stamp what this reply hands over. Delivery is the line between "the
       // agent never saw this" and "the agent may already have run it" — the
       // hub's only evidence for either, since the queue drains on ACK, not on
@@ -3568,6 +6138,14 @@ const server = http.createServer(async (req, res) => {
       const reply = publicCommands(commands);   // strip AFTER stamping, or the
       scheduleSave();                           // no-op copy hands back the
                                                 // same objects and leaks it
+      // Re-measure what the record ACTUALLY ended up as. The gate above runs
+      // before the ingests on purpose (a refused beat must never reach the
+      // caches, XERK-235), so it measures the record before the alert/PR
+      // bookkeeping lands on it — and an aggregate that only ever sees the
+      // pre-bookkeeping size drifts low, which is a budget that quietly grows.
+      // Settling it here costs the next beat's gate nothing and keeps the
+      // number honest; a beat that ends slightly over is caught on that gate.
+      recordBytes.set(key, agentRecordSize(next));
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
@@ -3606,7 +6184,9 @@ const server = http.createServer(async (req, res) => {
 
     // POST /api/agents/<host>/archive/<transcriptId> — an agent pushing one delta
     // chunk of an inactive session's transcript into the durable hub archive.
-    // Agent-authed above. Body: {startOffset, endOffset, size, entries, meta}.
+    // Agent-authed above, and `<host>` — which is the archive row's owner — is
+    // bound to the credential there (XERK-268), so a host cannot file transcript
+    // chunks under another's name. Body: {startOffset, endOffset, size, entries, meta}.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "archive" && parts.length === 5) {
       const key = decodeURIComponent(parts[2]);
@@ -3626,26 +6206,93 @@ const server = http.createServer(async (req, res) => {
     }
 
     // POST /api/agents/<host>/migrations/<id>/blob — the SOURCE agent uploading
-    // a migrated session's raw transcript bundle. Agent-authed above. Body is
-    // the raw gzipped tar; storing it advances the migration to `importing` and
-    // queues importSession on the target (XERK-101).
+    // a migrated session's raw transcript bundle. Body is the raw gzipped tar;
+    // storing it advances the migration to `importing` and queues importSession
+    // on the target (XERK-101).
+    //
+    // Only this migration's OWN source host may post it (XERK-266), and `<host>`
+    // is PROVED by the credential at the gate above rather than typed
+    // (XERK-268) — it takes both halves to make this an identity check. With
+    // the scope alone an attacker simply named the real source and passed.
+    // **Every refusal answers the SAME 404** — wrong host, wrong phase, an
+    // upload already in flight, a spool that could not be written, empty body,
+    // vanished source session; the 413 below is the one exception, and is
+    // discussed there — and that uniformity is the point, not tidiness: any
+    // RESPONSE a non-source cannot also get names the source to a prober. So do
+    // NOT restore a friendlier 409/400/500 at any of them, and **enumerate what
+    // this route can answer rather than eyeballing the guard** — the `source
+    // session gone` branch below is why. The real source loses nothing it acts
+    // on: it only logs the failure, and the RECORD still carries the true
+    // reason for the operator.
+    // The uniform 404s are now belt AND braces rather than the whole defence:
+    // the two residual oracles they could not close — the TIMING of the reply
+    // (this guard runs before the body read) and the 413 — needed an unverified
+    // caller to be exploitable, and there is no longer any such caller. Keep
+    // them anyway: they are what still holds if a future route reaches this
+    // code with a weaker credential.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m) return json(res, 404, { error: "unknown migration" });
-      if (m.phase !== "exporting")
-        return json(res, 409, { error: "migration not awaiting a bundle" });
-      let blob;
-      try {
-        blob = await readRawBody(req, MIGRATE_BLOB_MAX);
-      } catch (e) {
-        m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
-        publishMigrations();
-        return json(res, 413, { error: e.message });
+      if (!m || m.srcHost !== host || m.phase !== "exporting")
+        return json(res, 404, { error: "unknown migration" });
+      // Two uploads for one migration would interleave into a single spool
+      // file, since the phase only flips once the first finishes writing.
+      // Drained first, so the loser reads the reply instead of a socket error
+      // — and it is the SAME 404 as every other refusal above, since only the
+      // real source can reach this line.
+      if (m.uploading) {
+        req.resume();
+        return json(res, 404, { error: "unknown migration" });
       }
-      if (!blob.length) return json(res, 400, { error: "empty bundle" });
-      m.blob = blob;
+      // Spooled to disk rather than buffered (XERK-263); the record keeps only
+      // the path, so an in-flight move costs the hub bytes, not megabytes.
+      const spool = migrationSpoolPath(m.id);
+      let size;
+      m.uploading = true;
+      try {
+        size = await spoolRawBody(req, MIGRATE_BLOB_MAX, spool);
+      } catch (e) {
+        m.uploading = false;
+        const tooBig = e && e.tooLarge;
+        m.phase = "failed";
+        m.error = tooBig ? "transcript bundle too large" : "transcript bundle spool failed";
+        m.at = Date.now();
+        publishMigrations();
+        // The 413 is the enumerated exception discussed above. A SPOOL failure
+        // is not a second one: it answers the uniform 404 like every other
+        // refusal, because a distinct status would name the source to anyone
+        // holding the id the moment the hub's disk misbehaved. Nothing is lost
+        // — the agent only logs the reply, the RECORD carries the real reason
+        // for the operator, and the detail (which names the spool path) goes to
+        // the hub's log where it is actionable.
+        if (tooBig) return json(res, 413, { error: e.message });
+        console.error(`migration ${m.id}: spool failed: ${e && e.message}`);
+        return json(res, 404, { error: "unknown migration" });
+      }
+      m.uploading = false;
+      if (!size) {
+        // Never recorded on m, so drop the empty file here — and drop it
+        // BEFORE answering. This is the one path that leaves the migration
+        // retriable, and a fire-and-forget unlink could land after a retry had
+        // already re-created the same path and deleted the good bundle.
+        try { fs.unlinkSync(spool); } catch {}
+        return json(res, 404, { error: "unknown migration" });
+      }
+      // The move may have SETTLED while those bytes were being written — a
+      // refusal the source staged for this very upload (its POST timed out
+      // while the hub was still spooling, XERK-265) fails it within one beat,
+      // and the timeout can land here too. Advancing anyway would resurrect a
+      // move the operator was already told had failed, queue an importSession
+      // for it, and then kill the source when the target came up. Same careful
+      // unlink as the empty-body path: this file is now nobody's.
+      if (m.phase !== "exporting") {
+        try { fs.unlinkSync(spool); } catch {}
+        return json(res, 404, { error: "unknown migration" });
+      }
+      m.blobPath = spool;
+      m.blobSize = size;
       m.phase = "importing";
       m.at = Date.now();
       // Hand the target everything it needs to resume the moved session as its
@@ -3656,9 +6303,16 @@ const server = http.createServer(async (req, res) => {
       const s = src && (src.sessions || []).find((x) => x.id === m.srcSessionId);
       const cwd = s && s.worktreePath;
       if (!cwd) {
-        m.phase = "failed"; m.error = "source session gone"; m.blob = null; m.at = Date.now();
+        // The RECORD says what really happened (the operator reads that, and it
+        // stays truthful), but the REPLY is the same 404 as every other refusal
+        // — only the real source can reach this line, so a distinct status here
+        // would name it to anyone holding the id, exactly like the spool and
+        // empty-body refusals above. Nothing consumes this reply; the agent
+        // only logs it.
+        m.phase = "failed"; m.error = "source session gone";
+        dropMigrationBlob(m); m.at = Date.now();
         publishMigrations();
-        return json(res, 409, { error: "source session gone" });
+        return json(res, 404, { error: "unknown migration" });
       }
       m.importCmdId = queueCommand(m.targetHost, {
         type: "importSession",
@@ -3680,24 +6334,58 @@ const server = http.createServer(async (req, res) => {
     }
 
     // GET /api/agents/<host>/migrations/<id>/blob — the TARGET agent pulling the
-    // bundle to unpack + resume. Agent-authed above.
+    // bundle to unpack + resume. Scoped to the migration's OWN target host
+    // (XERK-266), over a `<host>` the credential proves (XERK-268) — and here
+    // that binding is the ONLY thing that can work: uniform refusals cannot
+    // help a route whose success IS the disclosure, so while the segment was
+    // merely typed, a token-holder with the id could walk the host names until
+    // one returned the bytes. The bundle is another host's raw conversation.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const host = decodeURIComponent(parts[2]);
       const id = decodeURIComponent(parts[4]);
       const m = migrations.get(id);
-      if (!m || !m.blob) return json(res, 404, { error: "no bundle" });
-      res.writeHead(200, {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": m.blob.length,
-        "Cache-Control": "no-store",
+      if (!m || m.targetHost !== host || !m.blobPath)
+        return json(res, 404, { error: "no bundle" });
+      // SNAPSHOT the path and size together, before the first async hop. A
+      // concurrent settle (a heartbeat's handoff, the timeout sweep) calls
+      // dropMigrationBlob, which zeroes both — and since the unlink leaves this
+      // read's fd valid, reading the size later served the full body under a
+      // `Content-Length: 0`, which the agent's urllib read as an empty bundle.
+      const blobPath = m.blobPath;
+      const blobSize = m.blobSize;
+      // Streamed off the spool file, so handing a 65 MiB bundle down costs the
+      // hub a read buffer rather than a second copy of the whole thing.
+      const stream = fs.createReadStream(blobPath);
+      // Headers wait for `open`, so a spool file that was never written (or is
+      // unreadable) is still a clean 404 rather than a truncated 200.
+      stream.once("open", () => {
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": blobSize,
+          "Cache-Control": "no-store",
+        });
+        stream.pipe(res);
       });
-      return res.end(m.blob);
+      stream.on("error", (e) => {
+        if (res.headersSent) return res.destroy();
+        json(res, 404, { error: "no bundle" });
+        console.error(`migration ${id}: bundle read failed: ${e && e.message}`);
+      });
+      // The agent hanging up mid-download must not leave the read running.
+      res.on("close", () => stream.destroy());
+      return;
     }
 
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
-    // operator attached to a message (XERK-234). Agent-authed above. Scoped to
-    // the host the upload was staged for, so one host's agent token can't pull
-    // another host's pending attachment. The blob is NOT dropped on read: the
+    // operator attached to a message (XERK-234). Scoped to the host the upload
+    // was staged for, and since `<host>` is proved at the gate above (XERK-268)
+    // that now means what this line always claimed: one host's agent token
+    // cannot pull another host's pending attachment. Same shape as the
+    // migration GET above and closed the same way — a hit returns the bytes, so
+    // nothing but binding the segment could have stopped a token-holder who
+    // knew the upload id from walking the host names. The blob is NOT dropped
+    // on read: the
     // agent may be re-issued the command (at-least-once delivery), and letting it
     // expire on the TTL costs nothing a re-download doesn't.
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
@@ -3983,12 +6671,24 @@ const server = http.createServer(async (req, res) => {
           });
         // Single-flight: don't start a second move of the same session while one
         // is already exporting/importing (a double-click must not fan out).
+        let inFlight = 0;
         for (const m of migrations.values()) {
-          if (m.srcHost === key && m.srcSessionId === sessionId &&
-              (m.phase === "exporting" || m.phase === "importing")) {
+          if (m.phase !== "exporting" && m.phase !== "importing") continue;
+          inFlight++;
+          if (m.srcHost === key && m.srcSessionId === sessionId) {
             return json(res, 409, { error: "this session is already being moved" });
           }
         }
+        // Each in-flight move is a 65 MiB bundle already spooled onto /data or
+        // about to be (an `exporting` one is waiting on exactly that upload),
+        // and /data is shared with the archive — so cap how many can be in that
+        // state at once. Refusing HERE is safe in a way refusing the relay
+        // upload isn't: this is the operator's own click, and the web Move
+        // control shows the reason (see PARITY.md for the Android gap).
+        if (inFlight >= MIGRATE_INFLIGHT_MAX)
+          return json(res, 503, {
+            error: `too many moves in flight (${MIGRATE_INFLIGHT_MAX}) — wait for one to finish`,
+          });
         const m = startMigration(key, s, target);
         return json(res, 200, { ok: true, migrationId: m.id });
       }
@@ -4008,11 +6708,23 @@ const server = http.createServer(async (req, res) => {
         let bytes;
         try {
           bytes = await readRawBody(req, cap);
-        } catch {
-          return json(res, 413, {
+        } catch (e) {
+          // Same distinction the migration relay draws: "too big" is about the
+          // file and tells the operator to pick a smaller one; "busy" is about
+          // the hub and tells them to press send again.
+          if (e && e.stalled) return;
+          if (e && e.budgetExceeded) {
+            res.setHeader("Retry-After", "1");
+            res.setHeader("Connection", "close");
+            json(res, 503, { error: e.message, held: e.held, limit: e.limit });
+            return endRefusedConnection(req, res);
+          }
+          json(res, 413, {
             error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
             limit: cap,
           });
+          if (e.noDrain) endRefusedConnection(req, res);
+          return;
         }
         if (!bytes.length) return json(res, 400, { error: "empty file" });
         // Refuse rather than evict: the blobs already held belong to messages
@@ -4544,7 +7256,9 @@ const server = http.createServer(async (req, res) => {
     //
     // The reply is the queued cmdId, which the agent echoes back on the session it
     // mints as `spawnCmdId` — the same correlation handle the composer's spawn
-    // uses, since the session id doesn't exist yet at POST time.
+    // uses, since the session id doesn't exist yet at POST time. When the org has
+    // no free slot the reply is `{queued:true, position}` instead and there is no
+    // cmdId to correlate: nothing has been handed to a host yet (XERK-296).
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
         parts.length === 5 && parts[4] === "session") {
       const siteKey = decodeURIComponent(parts[2]);
@@ -4564,7 +7278,32 @@ const server = http.createServer(async (req, res) => {
       if (!repo) {
         return json(res, 409, { error: "that ticket has no triaged repo yet" });
       }
-      const { host, error, status, needsClone } = findTicketHost(siteKey, repo, issueKey);
+      const { host, error, status, needsClone, full } =
+        findTicketHost(siteKey, repo, issueKey, { requireFree: true });
+      // Every org host is up but none has a free slot — the ticket waits in the
+      // hub's queue (XERK-296) instead of being nailed to a host now and turned
+      // into a session that only waits. Whichever agent frees a slot first takes
+      // it; the operator can cancel it with the DELETE below. A HARD failure (no
+      // org, everything offline, a pinned host that's gone) still refuses here:
+      // queuing can't fix any of those, and a refusal has to reach the operator.
+      if (!host && full) {
+        const e = enqueueTicketStart(siteKey, issueKey, "manual");
+        if (!e) {
+          // Which line is full decides the wording, and there are two: this org's
+          // (the real resource — the queue drains per org) and the fleet's (the
+          // memory bound behind it). One org's backlog must never be reported as
+          // "the queue is full" to another org's operator.
+          return json(res, 429, {
+            error: ticketQueueAdmission(siteKey, issueKey, "manual") === "fleet-full"
+              ? "the hub's ticket queue is full"
+              : `that org already has ${TICKET_QUEUE_PER_ORG_MAX} tickets waiting to start`,
+          });
+        }
+        const pos = ticketQueuePayload().find(
+          (q) => q.siteKey === siteKey && q.issueKey === issueKey);
+        return json(res, 200, { ok: true, queued: true, repo,
+          position: (pos && pos.position) || 1 });
+      }
       if (!host) return json(res, status, { error });
       // Single-flight per ticket, like the jiraIssue fetch above: a double-click
       // (or a click while the first spawn is still riding the queue) must not
@@ -4579,9 +7318,42 @@ const server = http.createServer(async (req, res) => {
       const cmdId = pending ? pending.cmdId
         : queueCommand(host, { type: "spawnTicket", issueKey,
             ...(mpin ? { model: mpin.model } : {}) });
+      // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
+      // a board that hadn't seen the queue yet clicked Start). Its session is
+      // starting now, so its place in line is spent — leaving it there would
+      // dispatch it AGAIN on the next free slot, hours later and unasked.
+      dropQueuedTicket(siteKey, issueKey, "dispatched by a direct start");
+      rememberDispatch(siteKey, issueKey);
       // needsClone tells the board the chosen host doesn't have the repo yet, so
       // it will clone on demand and the session starts queued behind the clone.
       return json(res, 200, { ok: true, cmdId, host, repo, needsClone });
+    }
+
+    // DELETE /api/jira/<siteKey>/<issueKey>/session -> take a waiting ticket out
+    // of the hub queue (XERK-296). It can only ever remove a QUEUED TICKET —
+    // nothing has been dispatched, so there is no session, no worktree and no
+    // command to withdraw, and the ticket itself is untouched. Killing a session
+    // that has actually started is the Sessions page's job and stays there.
+    if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "session") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      if (!dropQueuedTicket(siteKey, issueKey, "cancelled by the operator")) {
+        // The entry is equally gone whether it was cancelled a moment ago or
+        // DISPATCHED a moment ago, and answering the second like the first told
+        // an operator their cancel worked while a session was starting. So a
+        // recent dispatch is refused in the hub's own words instead.
+        if (dispatchedRecently(siteKey, issueKey)) {
+          return json(res, 409, { error:
+            "that ticket just started — its session is coming up, so stop it from "
+            + "the Sessions page" });
+        }
+        return json(res, 404, { error: "that ticket isn't waiting in the queue" });
+      }
+      return json(res, 200, { ok: true });
     }
 
     // POST /api/jira/<siteKey>/<issueKey>/repo — the operator's own answer to
@@ -4777,6 +7549,23 @@ const server = http.createServer(async (req, res) => {
       const sessionId = decodeURIComponent(parts[1]);
       const loc = findSession(sessionId);
       if (!loc) return json(res, 404, { error: "unknown session" });
+      // ttyd runs with `-b /term/<id>`, so it answers the BARE base path with a
+      // 302 to that same path plus a trailing slash. A hop that normalizes the
+      // slash away therefore turns the terminal into a redirect to itself, and
+      // the browser gives up: cloudflared 2026.8.0 did exactly that (path.Clean
+      // in canonicalizeRequestPath, restored a release later), taking out every
+      // terminal on the fleet while the agents stayed connected. Every client
+      // asks for the slash form, so serve the document at the base path here
+      // rather than depending on the slash surviving every hop to us. Only the
+      // base path — assets and the WS below it never end in one.
+      // The slash is INSERTED into the original target, never rebuilt from the
+      // parsed URL: rebuilding re-encodes the query and would newly accept
+      // absolute-form, protocol-relative and backslash targets that reach ttyd
+      // as a 404 today. `startsWith` is what holds this to origin-form requests,
+      // so the only difference on the wire is the one character.
+      if (parts.length === 2 && !url.pathname.endsWith("/") && req.url.startsWith(url.pathname)) {
+        req.url = `${url.pathname}/${req.url.slice(url.pathname.length)}`;
+      }
       return proxyTerm(req, res, loc.host, loc.port);
     }
 
@@ -4787,10 +7576,48 @@ const server = http.createServer(async (req, res) => {
     // of destroying it (XERK-235).
     if (err && err.tooLarge) {
       if (!res.writableEnded) json(res, 413, { error: "body too large", limit: err.cap });
+      // Not drained (the hub is under an oversize flood), so nothing is coming
+      // to consume the rest of this body — close rather than let Node dump it.
+      if (err.noDrain) endRefusedConnection(req, res);
       return;
     }
+    // Not "your request is too big" — "the hub is momentarily holding as much as
+    // it safely can". A 503 so the caller retries instead of shrinking anything;
+    // the {error} body is what every client already toasts (XERK-264).
+    if (err && err.budgetExceeded) {
+      if (!res.writableEnded) {
+        res.setHeader("Retry-After", "1");
+        res.setHeader("Connection", "close");
+        json(res, 503, { error: err.message, held: err.held, limit: err.limit });
+      }
+      endRefusedConnection(req, res);
+      return;
+    }
+    // A stalled body's socket is already gone — there is nobody to answer.
+    if (err && err.stalled) return;
     json(res, 400, { error: err.message });
   }
+});
+
+// The cap counts every open socket, INCLUDING the upgraded WebSockets below —
+// they are the long-lived, most expensive ones, so leaving them out would let
+// the very connections this protects against accumulate uncounted. That is also
+// why the number has to clear steady-state WebSocket use with room to spare.
+server.maxConnections = MAX_CONNECTIONS;
+
+// Node destroys a connection over the cap before emitting `request`, so this is
+// the only place a refusal is observable. See MAX_CONNECTIONS for why it is
+// rate-limited rather than one line per drop.
+server.on("drop", () => {
+  dropsSinceLog++;
+  const now = Date.now();
+  if (now - dropLoggedAt < DROP_LOG_EVERY_MS) return;
+  console.warn(
+    `WARNING: connection cap reached (MAX_CONNECTIONS=${MAX_CONNECTIONS}) — ` +
+      `refused ${dropsSinceLog} connection(s); clients see a reset, not an HTTP error`
+  );
+  dropLoggedAt = now;
+  dropsSinceLog = 0;
 });
 
 // ---- WebSocket upgrades -----------------------------------------------------
@@ -4805,9 +7632,12 @@ server.on("upgrade", async (req, socket, head) => {
 
   // Agent control channel: persistent, carries {open:ch, port} requests to the agent.
   if (parts[0] === "agent" && parts[1] === "control") {
-    if (!agentWsAuthorized(url, req)) return socket.destroy();
+    // `name` is read BEFORE the auth check, because it is what the credential
+    // has to back (XERK-268) — registering another host's tunnel would route
+    // that host's terminals through the impostor.
     const name = url.searchParams.get("name");
     if (!name) return socket.destroy();
+    if (!agentWsAuthorized(url, req, name)) return socket.destroy();
     wsHandshake(socket, req);
     const send = (op, payload) => {
       try { socket.write(wsEncode(op, payload)); } catch {}
@@ -4884,12 +7714,18 @@ server.on("upgrade", async (req, socket, head) => {
       if (op !== 0x1) return;
       let msg;
       try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
-      if (msg && msg.tail && Array.isArray(msg.entries)) {
+      // The session id must be a STRING, not merely truthy (XERK-278). It is
+      // used as a property key in `liveFanout`, and coercing an object to a key
+      // runs the same ToPrimitive that `safeString` exists to survive — so an
+      // object id here threw out of this listener and killed the process, the
+      // moment any viewer socket was open on that host. Every real id is a
+      // string, so this only ever refuses a malformed frame.
+      if (msg && typeof msg.tail === "string" && msg.tail && Array.isArray(msg.entries)) {
         // `queued` = still-queued prompts typed mid-turn (foldQueueOp in
         // tunnel-agent.js); absent from agents predating it.
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
           queued: Array.isArray(msg.queued) ? msg.queued : [] });
-      } else if (msg && msg.turn && typeof msg.text === "string") {
+      } else if (msg && typeof msg.turn === "string" && msg.turn && typeof msg.text === "string") {
         // `agents` = the session's live agent list, which outlives the turn
         // (a background agent keeps running after the main one stops), so it
         // rides beside `status` rather than inside it; absent from agents
@@ -4916,12 +7752,14 @@ server.on("upgrade", async (req, socket, head) => {
 
   // Agent data channel: pair it with the pending openChannel() awaiting `ch`.
   if (parts[0] === "agent" && parts[1] === "data") {
-    if (!agentWsAuthorized(url, req)) return socket.destroy();
     const ch = url.searchParams.get("ch");
-    const resolver = pendingChannels[ch];
-    if (!resolver) return socket.destroy();
+    const pending = pendingChannels[ch];
+    if (!pending) return socket.destroy();
+    // Only the host this channel was opened for may answer it (XERK-268): the
+    // duplex becomes that host's terminal stream.
+    if (!agentWsAuthorized(url, req, pending.host)) return socket.destroy();
     wsHandshake(socket, req);
-    resolver(channelDuplex(socket));
+    pending.resolve(channelDuplex(socket));
     return;
   }
 
@@ -5108,7 +7946,7 @@ server.on("upgrade", async (req, socket, head) => {
     // 101 + WS frames flow straight back (its accept is keyed off the browser's
     // Sec-WebSocket-Key, which we forward verbatim).
     let reqLines = `${req.method} ${req.url} HTTP/1.1\r\n`;
-    const hdrs = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH };
+    const hdrs = { ...req.headers, host: "ttyd", authorization: ttydAuth(loc.host) };
     for (const [k, v] of Object.entries(hdrs)) reqLines += `${k}: ${v}\r\n`;
     channel.write(Buffer.from(reqLines + "\r\n"));
     if (head && head.length) channel.write(head);
@@ -5124,6 +7962,10 @@ server.on("upgrade", async (req, socket, head) => {
 
   socket.destroy();
 });
+
+// Nothing in the migration spool survives a restart usefully (the records that
+// name those files were in memory), so clear it before anything can relay.
+sweepMigrationSpool();
 
 // Test hooks: when TURMA_TEST is set (never in the image — the Dockerfile
 // runs `node server.js` with it unset), export the internals for the test
@@ -5152,10 +7994,43 @@ if (process.env.TURMA_TEST) {
     HEARTBEAT_KNOWN_KEYS,
     invalidateAgentsCache,
     serializeAgentsForSave,
+    // The in-flight body budget (XERK-258). Exported because the admission rule
+    // is the whole fix and is otherwise only reachable by actually flooding a
+    // memory-limited container: the ceilings so a test can hold the arithmetic
+    // that derives them from the container limit, and charge/release so the
+    // "idle hub admits anything, a busy one does not" rule can be held directly.
+    MEMORY_LIMIT, BODY_INFLIGHT_MAX, BODY_INFLIGHT_TOTAL_MAX, UPLOAD_TOTAL_MAX_BYTES,
+    bodyLaneFor, chargeBody, releaseBody, bodyInflightHeld, BODY_PARSE_COST,
+    DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
+    BIG_LANE_MAX_HOLD_MS, budgetUnderPressure,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
     HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
+    // XERK-272 registry bounds. Exported for the same reason as the group above:
+    // the per-record ceiling stayed green while an unbounded NUMBER of records
+    // OOM-killed the hub, so the aggregate has to be pinned by name too.
+    AGENTS_MAX, AGENTS_TOTAL_MAX, AGENT_EVICT_IDLE_MS, AGENT_FAIR_SHARE,
+    STATE_FILE_MAX, positiveEnv, logName, recordSizeWarned, shareWarned, fairShare,
+    registryBytes, makeRegistryRoom, trimRestoredAgents, containerMemoryLimit,
+    defaultRegistryBudget, recordBytes,
+    // Ingest coercion, exported for the same reason as the rest of this group:
+    // Android decodes /api/agents atomically, so one host's wrong-typed field
+    // hides the WHOLE fleet from that phone (XERK-246). `normalizeRecord` is
+    // the one both the ingest path and the state.json restore call.
+    normalizeRecord,
+    normalizeLocalModel,
+    // The KEY half of that pair, shared by the ingest and the restore for the
+    // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
+    // because a source-regex over the restore loop proves the CALL exists, not
+    // that it drops anything — two mutations of an inline loop kept the suite
+    // green while restoring the ghost. `hostKeyLabel` because a refused key is
+    // attacker-controlled and unbounded.
+    isPlainHostKey, dropUnusableHostKeys, hostKeyLabel,
+    // The holder the heartbeat's coercion step goes through, exported so a test
+    // can make it throw and hold the rollback that follows (XERK-262). See its
+    // declaration for why that rollback cannot be reached from the wire.
+    recordCoercion,
 
     queueCommand,
     findSession,
@@ -5174,8 +8049,20 @@ if (process.env.TURMA_TEST) {
     uploads,
     UPLOAD_MAX_PER_MESSAGE,
     userAuthorized,
-    agentAuthorized,
+    agentPresented,
+    agentBearerKind,
+    agentHostRefusal,
+    agentPresentedRefusal,
+    tokenHost,
+    // The reverse-tunnel maps, exported so their null prototype can be asserted
+    // directly. Reaching it through a socket instead means the regression is
+    // detected by the hub DYING mid-run, which reads as a CI timeout rather
+    // than a failing test (XERK-268).
+    controlChannels,
+    pendingChannels,
     agentWsAuthorized,
+    hostAgentToken,
+    ttydAuth,
     triggerAuthorized,
     safeEqual,
     credentialsMatch,
@@ -5207,16 +8094,97 @@ if (process.env.TURMA_TEST) {
     setTicketModel,
     orgModelAliases,
     findTicketHost,
+    hostHasFreeSlot,
+    // The hub-side ticket queue (XERK-296) — the array itself, so a test can see
+    // what is waiting and in what order.
+    ticketQueue,
+    ticketQueuePayload,
+    enqueueTicketStart,
+    dropQueuedTicket,
+    dropAutoQueuedTickets,
+    drainTicketQueue,
+    queuedTicket,
+    liveQueuedTicket,
+    liveQueueCount,
+    TICKET_QUEUE_NOTES_MAX,
+    ticketDispatchedAt,
+    holdQueued,
+    ticketQueueAdmission,
+    fleetTicketRows,
+    TICKET_QUEUE_MAX,
+    TICKET_QUEUE_PER_ORG_MAX,
+    TICKET_QUEUE_PER_ORG_AUTO_MAX,
+    TICKET_QUEUE_MAX_WAIT_MS,
+    TICKET_QUEUE_EXPIRED_TTL_MS,
+    logQueueState,
+    TICKET_LOG_THROTTLE_MS,
+    TICKET_QUEUE_ERROR_MAX,
+    TICKET_QUEUE_STALE_MS,
+    TICKET_QUEUE_BLOCKED_MAX_MS,
     migrations,
     advanceMigrations,
+    // The relay spools bundles here rather than holding them in the record
+    // (XERK-263); exported so a test can look at what is actually on disk.
+    MIGRATE_SPOOL_DIR,
+    sweepMigrationSpool,
+    dropMigrationBlob,
+    migrationSpoolPath,
     siteKeyOf,
   };
+} else if (process.argv[2] === "--agent-token") {
+  // `node turma/server.js --agent-token <host>` prints the token that host's
+  // agent must run with (XERK-268) — the value DockerOps sets as its TURMA_TOKEN.
+  // Run it on the hub, where the master lives; nothing is started or bound.
+  const host = process.argv[3];
+  if (!host) {
+    console.error("usage: node server.js --agent-token <host>   (the host name the agent reports as `device`)");
+    process.exit(2);
+  } else if (!TURMA_AGENT_TOKEN) {
+    console.error("TURMA_AGENT_TOKEN is not set — there is no master to derive from");
+    process.exit(2);
+  } else {
+    const token = hostAgentToken(host);
+    if (!token) {
+      // Say WHY. A blank line here sent the operator looking at the master, and
+      // the failure it prevents (a reconnect loop with no mention of the name)
+      // gives them nothing to go on either.
+      console.error(`refusing to mint a token for ${JSON.stringify(host)}: the hub cannot register that host name, so its agent would rename itself and this token would never match`);
+      process.exit(2);
+    }
+    console.log(token);
+  }
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
   if (!TURMA_AGENT_TOKEN) console.warn("WARNING: TURMA_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
+  // The fleet master proves only "some agent", never WHICH one, so until every
+  // host runs on its own derived token and TURMA_AGENT_STRICT is set, a host is
+  // still free to name another in `device` or a `<host>` segment (XERK-268).
+  // Said at boot rather than left to the docs — a half-finished rollover looks
+  // exactly like a finished one from the outside.
+  if (TURMA_AGENT_TOKEN && !TURMA_AGENT_STRICT) {
+    console.warn("WARNING: TURMA_AGENT_STRICT not set — the shared TURMA_AGENT_TOKEN is still accepted, so an agent can act as any host. Give each agent `node server.js --agent-token <host>` as its TURMA_TOKEN, then set TURMA_AGENT_STRICT=1");
+  }
   server.listen(PORT, () => {
-    console.log(`turma listening on :${PORT}`);
+    console.log(`turma listening on :${PORT} (max ${MAX_CONNECTIONS} concurrent connections)`);
+    // Every one of these is derived from the container limit, so print what they
+    // came out as: it is the only way to tell a hub that is correctly sized from
+    // one whose mem_limit moved under it, and it turns "why did that 503?" into
+    // one `docker logs` (XERK-258, XERK-273).
+    const mib = (n) => `${Math.round(n / (1 << 20))} MiB`;
+    console.log(
+      `memory limit ${mib(MEMORY_LIMIT)} -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
+        `${mib(BODY_INFLIGHT_TOTAL_MAX)} across both lanes; uploads held ` +
+        `${mib(UPLOAD_TOTAL_MAX_BYTES)}`
+    );
+    // The effective registry budget, printed for the same reason: it is DERIVED
+    // from this container's own cgroup limit rather than configured, so without
+    // this the only way to learn what the hub enforces is to be refused by it.
+    console.log(
+      `agent registry: <=${AGENTS_MAX} hosts, <=${AGENTS_TOTAL_MAX} bytes ` +
+        `(${AGENT_FAIR_SHARE}/host), container limit ` +
+        `${containerMemoryLimit() ?? "unknown"}`
+    );
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile
     // notifications (every notify() is a no-op), and that has silently bitten us

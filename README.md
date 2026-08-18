@@ -87,8 +87,9 @@ one [`.env.example`](examples/compose/.env.example):
 | [`agent.yaml`](examples/compose/agent.yaml) | An agent on its own. Run on each extra machine. |
 
 To add a machine, copy `agent.yaml` + `.env` to it, point `HUB_URL` at the hub's
-public URL, give it a distinct `AGENT_DEVICE_NAME`, and reuse the same
-`TURMA_AGENT_TOKEN`. Because agents dial out, that machine needs no inbound
+public URL, give it a distinct `AGENT_DEVICE_NAME`, and give it **its own**
+agent token — `node turma/server.js --agent-token <that device name>`, run on
+the hub, prints it. Because agents dial out, that machine needs no inbound
 exposure — only the hub does. Put the hub behind TLS (a reverse proxy or a
 Cloudflare tunnel) before exposing it: the login is single-user HTTP Basic and
 should not cross the internet in the clear.
@@ -99,6 +100,13 @@ The compose files are commented in full; the three things worth knowing up front
   boot rather than refusing to start. `TURMA_PASSWORD` unset means an
   unauthenticated dashboard; `TURMA_AGENT_TOKEN` unset means anyone can
   heartbeat. Set both. Generate the token with `openssl rand -hex 32`.
+- **`TURMA_AGENT_TOKEN` is the fleet MASTER, and no agent should hold it.** Each
+  agent gets only its own derived token (`node turma/server.js --agent-token
+  <device>`) as its `TURMA_TOKEN`; the hub re-derives it to check that the host
+  a request names is the host its credential is for. Handing every agent the
+  master instead still works — it is what a fleet mid-rollover looks like — but
+  then any agent can act as any other, so set **`TURMA_AGENT_STRICT=1`** on the
+  hub once every agent has rolled over, and the master stops being accepted.
 - **The hub's `/data` volume must persist.** It holds the archive — the
   transcript history of every ended session. The search index inside it is
   disposable and rebuilds from the files; the files are not.

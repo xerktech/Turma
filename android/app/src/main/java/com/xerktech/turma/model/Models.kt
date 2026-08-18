@@ -30,6 +30,11 @@ data class AgentsResponse(
     // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
     // 1..8 (presence = pinned). Hub-owned and durable; absent on older hubs.
     val orgColors: Map<String, Int> = emptyMap(),
+    // Tickets waiting for a free session slot (XERK-296). A queued ticket has no
+    // host and no session — the hub picks the host when one can actually start
+    // it — so this payload is the only place it exists. Absent on older hubs,
+    // which is indistinguishable from "nothing waiting" and reads the same.
+    val ticketQueue: List<QueuedTicket> = emptyList(),
     // Whether the hub can deliver mobile push at all — FCM configured (XERK-152).
     // Hub-wide, not per-agent. When false, every alert is silently dropped, so
     // the Dashboard shows a "push is off" banner. Defaults true so an older hub
@@ -44,6 +49,26 @@ data class TicketAgentPin(val host: String = "", val at: Long = 0)
 /** One ticket->model pin (the web board's Model row; hub ticket-models store). */
 @Serializable
 data class TicketModelPin(val model: String = "", val at: Long = 0)
+
+/**
+ * One ticket waiting in the hub's queue for a free session slot (XERK-296).
+ * [position] is its place in its OWN org's line (capacity is per org, so that is
+ * the only line that means anything). [reason] is why it is still waiting as of
+ * the hub's last pass — "capacity" clears itself; "blocked" needs the operator,
+ * and [error] is the hub's own wording for what to fix. [source] is "auto" (the
+ * org's auto-start sweep queued it) or "manual" (an operator pressed Start);
+ * only auto entries are swept away when the org's Auto switch goes off.
+ */
+@Serializable
+data class QueuedTicket(
+    val siteKey: String = "",
+    val issueKey: String = "",
+    val source: String = "auto",
+    val queuedAt: Long = 0,
+    val position: Int = 1,
+    val reason: String? = null,
+    val error: String? = null,
+)
 
 /**
  * The host login's real model list, probed from the CLI (hub-agent models
@@ -111,6 +136,14 @@ data class AgentInfo(
      * tell you", never "0% used".
      */
     val limits: LimitsInfo? = null,
+    /**
+     * Which Claude subscription this host's login is on (XERK-301), so hosts
+     * sharing an account share one set of limit bars. Null on an agent
+     * predating the field or one that can't read its own login — which means
+     * "can't tell you", and keeps that host on a card of its own rather than
+     * folded in with every other host that also can't say.
+     */
+    val subscription: SubscriptionInfo? = null,
     val github: GithubInfo? = null,
     // Extra clone sources beside GitHub (XERK-155): the agent's Azure DevOps /
     // GitLab listings. Empty on an agent predating the block.
@@ -131,6 +164,27 @@ data class AgentInfo(
     // which is what hides the composer's 📎 rather than letting the operator
     // attach into a void. See the hub's uploadCapFor.
     val uploadMaxBytes: Long = 0,
+    /**
+     * Whether this host can run a session against its own self-hosted model
+     * (XERK-246), and which one. Doubles as the capability flag, exactly like
+     * [uploadMaxBytes]: an agent predating the failover — or one with no
+     * LOCAL_MODEL_* env — reports nothing, and an ABSENT block means "that host
+     * cannot do it", never "assume it can". Clients hide the control rather than
+     * queue a command the host would ack and drop.
+     */
+    val localModel: LocalModelInfo? = null,
+)
+
+/**
+ * A host's self-hosted-model configuration (hub-agent's `localModel` block).
+ * [model] and [contextTokens] are null exactly when [available] is false, so
+ * nothing may read them as a fallback for an unconfigured host.
+ */
+@Serializable
+data class LocalModelInfo(
+    val available: Boolean = false,
+    val model: String? = null,
+    val contextTokens: Int? = null,
 )
 
 /** A host's session ceiling and live counts (hub-agent `_capacity_payload`). */
@@ -495,6 +549,15 @@ data class SessionInfo(
     val ttydPort: Int = 0,
     val model: String = "",
     val permissionMode: String = "",
+    /**
+     * Which model this session runs against (XERK-246): "subscription" (the
+     * host's shared Claude login) or "local" (its self-hosted model). An agent
+     * predating the failover reports nothing, which reads as the subscription —
+     * the only thing such a host can run.
+     */
+    val modelSource: String = "",
+    /** When it was last switched; "" for a session that never moved. */
+    val modelSourceAt: String = "",
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
     /**
@@ -627,6 +690,22 @@ data class UsageInfo(
     val lastActivity: String = "",
     /** Per-model token counts, biggest consumer first. */
     val models: List<ModelUsage> = emptyList(),
+    /**
+     * The part of this block spent by background agents its sessions delegated
+     * to (XERK-302) — a SLICE of [totals]/[today]/[week], never an addend, so
+     * nothing adds it back. Null from an agent predating the field, which means
+     * "this host can't tell you" and not "it delegated nothing": a host that
+     * can't answer is left OUT of the share rather than counted as a zero.
+     */
+    val subagent: SubagentUsage? = null,
+)
+
+/** The three windows of [UsageInfo.subagent]. */
+@Serializable
+data class SubagentUsage(
+    val today: UsageBucket = UsageBucket(),
+    val week: UsageBucket = UsageBucket(),
+    val totals: UsageBucket = UsageBucket(),
 )
 
 /**
@@ -666,6 +745,19 @@ data class LimitsInfo(
     val sevenDay: LimitWindow? = null,
     /** Epoch seconds the snapshot was taken. 0 from a malformed block. */
     val capturedAt: Long = 0,
+    val source: String = "",
+)
+
+/**
+ * The subscription a host's login belongs to (XERK-301). [key] is opaque on
+ * purpose — the agent hashes the account identity, since grouping only ever
+ * asks whether two hosts are equal. Blank means the same as a null block: this
+ * host can't say.
+ */
+@Serializable
+data class SubscriptionInfo(
+    val key: String = "",
+    /** "login" (read from the host's Claude config) or "env" (pinned by hand). */
     val source: String = "",
 )
 

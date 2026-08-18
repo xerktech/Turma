@@ -351,6 +351,20 @@ input:focus, textarea:focus, select:focus {
 @keyframes spin { to { transform: rotate(360deg); } }
 button:disabled .spin { border-top-color: var(--ink-2); }
 
+/* ---- Failure toast (nav.js TurmaNav.toast, every page) -------------------- */
+/* A transient bottom-centre notice, raised only when the hub REFUSED something
+   (XERK-264) — nothing announces success through it, so one on screen always
+   means a command did not run. Lives here, not in a page, because every page
+   fires commands. */
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  z-index: 50; max-width: min(92vw, 480px);
+  background: var(--critical); color: #fff; font-size: 13px;
+  padding: 10px 16px; border-radius: var(--radius-md); box-shadow: var(--shadow-md);
+  opacity: 0; pointer-events: none; transition: opacity .2s;
+}
+.toast.show { opacity: 1; }
+
 /* ---- Elevated surfaces (page-specific layout stays inline; look here) ----- */
 .tile, .host-card, .scard, .stopped-row, .host-block, .chart-card, .kanban-card {
   box-shadow: var(--shadow-sm);
@@ -486,6 +500,24 @@ button:disabled .spin { border-top-color: var(--ink-2); }
    to a "+" so it stops competing with the session chips for the card's width. */
 .kc-start.kc-start-more { padding: 1px 6px; font-weight: 600; color: var(--muted); }
 .kc-start.kc-start-busy { color: var(--muted); border-style: dashed; cursor: default; }
+/* A ticket waiting in the hub's queue for a free session slot (XERK-296). Same
+   chip metrics as the start button it replaces, dashed like the other "not a
+   thing yet" states; the ✕ beside it takes the ticket back out of the line. */
+.kc-queued {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px dashed var(--border); background: var(--page);
+  color: var(--muted); font-size: 10.5px; line-height: 1.5; white-space: nowrap;
+}
+.kc-queued.kc-queued-blocked { color: var(--warning); border-color: var(--warning); }
+.kc-unqueue {
+  padding: 1px 6px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--muted); font: inherit; font-size: 10.5px; line-height: 1.5;
+  cursor: pointer;
+}
+.kc-unqueue:hover { border-color: var(--critical); color: var(--critical); }
+.kc-unqueue:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
 .kc-start-err {
   color: var(--critical); font-size: 10.5px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22ch;
@@ -774,6 +806,9 @@ body.td-open { overflow: hidden; }
   .bottom-nav a svg { width: 21px; height: 21px; }
   .bottom-nav a.active { color: var(--accent); }
   body { padding-bottom: 68px; }
+  /* Clear the bottom nav: the toast is now on every page (XERK-264), and at its
+     desktop offset it lands on top of the tab bar on a phone. */
+  .toast { bottom: calc(76px + env(safe-area-inset-bottom)); }
 }
 @media (pointer: coarse) {
   button { padding: 9px 15px; }

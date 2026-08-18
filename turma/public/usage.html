@@ -19,9 +19,25 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 14px 16px 10px; position: relative;
   }
-  /* Claude subscription limits (XERK-247): the 5h/7d windows, one card per host
-     that reports them. Sits above the token chart because it answers a
-     different question — how much headroom is left, not what was spent. */
+  /* The headline token figures, at the very top: what the scoped fleet has
+     spent, before any of the breakdowns below take it apart. Laid out as a
+     plain stat row rather than the dashboard's tile grid — this page is a
+     breakdown, so the totals are its heading, not six cards of their own. */
+  .totals { display: flex; flex-wrap: wrap; gap: 4px 28px; margin: 2px 0 4px; }
+  .totals .stat { min-width: 88px; }
+  .totals .label { color: var(--ink-2); font-size: 12px; margin-bottom: 2px; }
+  .totals .value {
+    font-family: var(--font-display); font-size: 26px; font-weight: 600; letter-spacing: -0.01em;
+  }
+  .totals .cache { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+  @media (max-width: 600px) {
+    .totals { gap: 4px 20px; }
+    .totals .value { font-size: 21px; }
+  }
+  /* Claude subscription limits (XERK-247): the 5h/7d windows, one card per
+     SUBSCRIPTION reporting them (XERK-301). Sits above the token chart because
+     it answers a different question — how much headroom is left, not what was
+     spent. */
   .limits { margin: 2px 0 16px; }
   .limits h2 {
     font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 8px;
@@ -157,6 +173,12 @@
   .models-card table { font-size: 13px; }
   .models-card td:first-child { font-family: var(--font-mono); font-size: 12px; word-break: break-all; }
   .m-bar { height: 3px; border-radius: 2px; background: var(--s1); margin-top: 5px; min-width: 2px; }
+  /* "Delegated to sub-agents" reuses the models card, but its first column is
+     prose (window names), not a model id — so it keeps the body font. */
+  .models-card .note { color: var(--muted); font-size: 12px; margin: -4px 0 10px; }
+  .models-card.split-card td:first-child {
+    font-family: inherit; font-size: 13px; word-break: normal;
+  }
 
   @media (max-width: 600px) {
     .chart-card { padding: 12px 10px 8px; }
@@ -174,11 +196,12 @@
 <body>
 <header class="site-header" id="siteHeader" data-page="usage" data-sub="Subscription limits · token usage"></header>
 <div class="wrap">
+  <div class="totals" id="totals"></div>
   <div class="limits" id="limits"></div>
   <div class="viewbar" id="viewbar"></div>
   <div id="chart"></div>
   <div id="models"></div>
-  <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. Token figures below are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
+  <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. There is <b>one card per subscription</b>, not per host: hosts logged into the same Claude account are reading and spending the same pool, so they fold into one card listing them all, and each window shows the freshest reading any of them took. A host whose agent is too old to say which account it's on stays on a card of its own. The <b>token figures</b> — the Today / This week / All-time totals above the limits, and every breakdown of them below — are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
@@ -239,12 +262,53 @@ function renderViewbar() {
   }
 }
 
+// Compact token count: 1.2M / 3.4k / 850.
+//
+// NEVER returns anything but digits, a minus, a dot, a unit letter, or the "–"
+// sentinel. Several callers interpolate the result into innerHTML (tokenCell →
+// tableView and the by-model card), so a value that isn't a number has to be
+// narrowed HERE — returning it verbatim made any token field on the heartbeat a
+// stored XSS sink, and the hub serves most of the agent payload raw.
+//
+// A value that isn't a finite number renders "–", NOT "0". It reaches here as
+// NaN when a host reports a token count as a JSON string: addBucket's `+=` then
+// concatenates rather than adds, and the accumulator is a string from that host
+// onward. "0" would assert a measurement — an idle fleet and a fleet whose
+// arithmetic was poisoned would read identically, and this figure is now the
+// page's headline. "–" is what every client already reads as "can't tell you",
+// and what index.html's copy has always returned for the same case.
 function fmtTokens(n) {
+  n = Number(n);
+  if (!Number.isFinite(n)) return "–";
+  // Rounded BEFORE the unit test, not after: a token count is a whole number,
+  // and rounding on the way out instead let 999.6 escape the k scale and then
+  // round across it, rendering "1000" beside "1.0k" for 1000.
+  n = Math.round(n);
   if (!n) return "0";
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
-  return String(n);
+  for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
+    if (n >= unit) return scaleTokens(n, unit) + suffix;
+  }
+  // Below the smallest unit, and still owed digits: String() writes a
+  // negative-huge count in exponent form. Negatives never scale here, so
+  // Android — whose Long.toString cannot go exponential — renders the same.
+  return Math.abs(n) >= 1e21 ? BigInt(n).toString() : String(n);
+}
+
+// One decimal place, rounded HALF-UP on the exact value — which `(n /
+// unit).toFixed(1)` is not: it rounds the binary double, and 1150/1e3 is really
+// 1.14999…, so it renders 1.1k where Android's Java formatter renders 1.2k.
+// Two figures for one number, on a page whose whole point is that the phone and
+// the browser agree. Split into whole and remainder so neither the multiply nor
+// the division can lose precision on a fleet-sized count.
+function scaleTokens(n, unit) {
+  let whole = Math.floor(n / unit);
+  let tenths = Math.round((n % unit) * 10 / unit);
+  if (tenths === 10) { whole += 1; tenths = 0; }
+  // `String(whole)` switches to exponent form at 1e21 ("1e+21.6B"), which is
+  // not the shape this function promises its callers. Absurd, but the hub
+  // serves token counts raw, so it is reachable.
+  const digits = whole >= 1e21 ? BigInt(whole).toString() : String(whole);
+  return digits + "." + tenths;
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
@@ -293,8 +357,60 @@ function limitEntries(agents, nowSec) {
     .filter(a => a && a.limits
       && LIMIT_WINDOWS.some(([k]) => typeof (a.limits[k] || {}).usedPct === "number")
       && now - (a.limits.capturedAt || 0) <= LIMIT_MAX_AGE_SEC)
-    .map(a => ({ host: a.device || a.key, limits: a.limits }))
+    .map(a => ({
+      host: a.device || a.key,
+      // The subscription this host's login is on (XERK-301), or null when it
+      // can't say — see limitGroups.
+      subKey: subscriptionKeyOf(a),
+      limits: a.limits,
+    }))
     .sort((x, y) => (y.limits.capturedAt || 0) - (x.limits.capturedAt || 0));
+}
+
+function subscriptionKeyOf(agent) {
+  const key = agent && agent.subscription && agent.subscription.key;
+  return typeof key === "string" && key ? key : null;
+}
+
+// One card per SUBSCRIPTION, not per host (XERK-301). Hosts logged into one
+// Claude account read — and spend — the same 5h/7d pool, so their snapshots are
+// readings of a single thing and one set of bars is the honest rendering of it;
+// several was the same number drawn several times.
+//
+// Grouping is on the opaque `subscription.key` each agent reports. A host that
+// reports none keeps a card of ITS OWN and is never folded in with another
+// silent host: absent means "this host can't tell you", and two hosts that both
+// can't tell you are not thereby on one plan.
+//
+// Within a group each window takes its FRESHEST reading rather than any average
+// or maximum. Every host is reading the same server-side counter, so the newest
+// read is simply the most recent truth — and across a window's reset it is the
+// only right answer, where a maximum would keep the pre-reset figure alive.
+// Groups sort freshest-first, as the per-host cards did.
+function limitGroups(agents, nowSec) {
+  const now = nowSec ?? Math.floor(Date.now() / 1000);
+  const groups = [];
+  const byKey = new Map();
+  for (const entry of limitEntries(agents, now)) {
+    const capturedAt = entry.limits.capturedAt || 0;
+    let group = entry.subKey ? byKey.get(entry.subKey) : null;
+    if (!group) {
+      group = { key: entry.subKey, hosts: [], capturedAt: 0, windows: {} };
+      groups.push(group);
+      if (entry.subKey) byKey.set(entry.subKey, group);
+    }
+    group.hosts.push({ host: entry.host, capturedAt });
+    group.capturedAt = Math.max(group.capturedAt, capturedAt);
+    for (const [key] of LIMIT_WINDOWS) {
+      const win = entry.limits[key];
+      if (!win || typeof win.usedPct !== "number") continue;
+      const held = group.windows[key];
+      if (!held || capturedAt > held.capturedAt) {
+        group.windows[key] = { win, capturedAt, host: entry.host };
+      }
+    }
+  }
+  return groups.sort((x, y) => y.capturedAt - x.capturedAt);
 }
 
 // The state one window renders in. `expired` (the reset stamp has passed) beats
@@ -329,8 +445,27 @@ function sumDays(list) {
 // Each host reports per-repo and host-total usage aggregated from ALL its
 // transcripts (independent of live sessions), so nothing here depends on a
 // session still existing. "By repo" sums those per-repo blocks across hosts.
+// The three windows every usage block carries, as one mergeable unit.
+const WINDOWS = ["totals", "today", "week"];
+function blankSplit() {
+  return { totals: blankBucket(), today: blankBucket(), week: blankBucket() };
+}
+function addSplit(dst, src) {
+  if (!src) return;
+  for (const w of WINDOWS) addBucket(dst[w], src[w]);
+}
 function blankUsage() {
-  return { totals: blankBucket(), today: blankBucket(), week: blankBucket(), days: {}, models: new Map() };
+  return {
+    totals: blankBucket(), today: blankBucket(), week: blankBucket(), days: {}, models: new Map(),
+    // The sub-agent split (XERK-302) and, beside it, the spend of ONLY the
+    // contributors that reported one. `subagent` stays null until something
+    // reports it, so an older agent reads as "can't tell you" rather than as a
+    // host that delegated nothing — and `subagentOf` keeps that distinction
+    // through the merge: a fleet where one host is old must take its share
+    // against what the REPORTING hosts spent, not against a fleet total that
+    // includes spend no split was ever offered for.
+    subagent: null, subagentOf: blankSplit(),
+  };
 }
 function addBucket(dst, src) {
   if (!src) return;
@@ -338,7 +473,12 @@ function addBucket(dst, src) {
 }
 function mergeUsageInto(acc, u) {
   if (!u) return;
-  for (const w of ["totals", "today", "week"]) addBucket(acc[w], u[w]);
+  for (const w of WINDOWS) addBucket(acc[w], u[w]);
+  if (u.subagent) {
+    acc.subagent = acc.subagent || blankSplit();
+    addSplit(acc.subagent, u.subagent);
+    addSplit(acc.subagentOf, u);
+  }
   for (const [d, b] of Object.entries(u.days || {})) {
     acc.days[d] = acc.days[d] || blankBucket();
     addBucket(acc.days[d], b);
@@ -523,20 +663,74 @@ function paintSwatch(el, paint) {
   if (paint.texture !== "solid") el.classList.add("tx-" + paint.texture);
 }
 
-// The limits section: one card per reporting host, or a single line saying why
-// there's nothing to show. Rendered before the chart's own empty-state returns,
-// so a fleet that has spent no tokens yet still shows its headroom.
+// --- the headline totals ----------------------------------------------------
+// What the scoped fleet has spent in each window, above every breakdown of it.
+// A port of the Android Usage screen's stat row (`UsageViewModel.compute`),
+// which had it first; the two must keep agreeing, since an operator reading one
+// figure on the phone and another in the browser can't tell which is wrong.
+//
+// Per host it PREFERS the host-level `usage` block — the agent aggregates that
+// from every transcript on the box, including sessions long since killed — and
+// sums that host's per-repo blocks ONLY when it reports no aggregate. Never
+// both: the repo blocks are a partition of the same spend, so adding them to
+// the host block counts every token twice.
+function fleetTotals(agents) {
+  const out = blankSplit();
+  for (const a of agents || []) {
+    if (!a) continue;
+    if (a.usage) { addSplit(out, a.usage); continue; }
+    for (const ru of a.repoUsage || []) addSplit(out, ru && ru.usage);
+  }
+  return out;
+}
+
+// The strip itself. Rendered from the ORG-SCOPED agent list and before the
+// chart's empty-state returns, exactly like the limits below it: the totals are
+// the one thing on this page that should be readable the instant it loads, and
+// a fleet whose day series hasn't been built yet has still spent tokens.
+function renderTotals(agents) {
+  const $totals = document.getElementById("totals");
+  const totals = fleetTotals(agents);
+  $totals.replaceChildren();
+  for (const [label, w] of [["Today", "today"], ["This week", "week"], ["All-time", "totals"]]) {
+    const stat = document.createElement("div");
+    stat.className = "stat";
+    const name = document.createElement("div");
+    name.className = "label";
+    name.textContent = label;
+    const value = document.createElement("div");
+    value.className = "value";
+    value.textContent = fmtTokens(dayTokens(totals[w]));
+    stat.append(name, value);
+    $totals.append(stat);
+  }
+  // The all-time cache split, under the row: a total alone can't say what it
+  // cost, since a cache read is ~0.1x fresh input and a write ~1.25x. Absent
+  // when nothing reports cache traffic, rather than shown as zeroes.
+  const cache = cacheLineText(totals.totals);
+  if (cache) {
+    const line = document.createElement("div");
+    line.className = "cache";
+    line.textContent = cache;
+    $totals.append(line);
+  }
+}
+
+// The limits section: one card per reporting SUBSCRIPTION, or a single line
+// saying why there's nothing to show. Rendered before the chart's own
+// empty-state returns, so a fleet that has spent no tokens yet still shows its
+// headroom.
 function renderLimits(agents) {
   const $limits = document.getElementById("limits");
   $limits.replaceChildren();
   const nowSec = Math.floor(Date.now() / 1000);
-  const entries = limitEntries(agents, nowSec);
+  const entries = limitGroups(agents, nowSec);
   const h2 = document.createElement("h2");
   h2.textContent = "Claude subscription limits";
   const note = document.createElement("span");
   note.className = "note";
   note.textContent = entries.length
-    ? "one shared pool across claude.ai and Claude Code · snapshot per host"
+    ? "one shared pool across claude.ai and Claude Code · one card per subscription"
     : "";
   h2.append(note);
   $limits.append(h2);
@@ -561,7 +755,21 @@ function renderLimits(agents) {
   $limits.append(cards);
 }
 
-function limitCard(entry, nowSec) {
+// How many host names a card's heading spells out before it gives up and
+// counts them. Every name is still in the tooltip, with its own capture age.
+const LIMIT_HOSTS_SHOWN = 3;
+
+// The card's heading: the one host on this subscription, or the hosts sharing
+// it. There is no better name to give a subscription — the key is a hash by
+// design (XERK-301) — and the hosts are what the operator actually recognises.
+function limitHostLabel(group) {
+  const names = group.hosts.map(h => h.host);
+  if (names.length <= LIMIT_HOSTS_SHOWN) return names.join(" · ");
+  return names.slice(0, LIMIT_HOSTS_SHOWN).join(" · ")
+    + " +" + (names.length - LIMIT_HOSTS_SHOWN) + " more";
+}
+
+function limitCard(group, nowSec) {
   const card = document.createElement("div");
   card.className = "lim-card";
 
@@ -569,22 +777,31 @@ function limitCard(entry, nowSec) {
   head.className = "lim-head";
   const host = document.createElement("span");
   host.className = "lim-host";
-  host.textContent = entry.host;
+  host.textContent = limitHostLabel(group);
+  if (group.hosts.length > 1) {
+    host.title = "These hosts are logged into the same Claude account, so they "
+      + "share one 5-hour and 7-day pool. Each window below shows the freshest "
+      + "reading of it:\n"
+      + group.hosts
+        .map(h => h.host + " — captured " + fmtDuration(nowSec - h.capturedAt) + " ago")
+        .join("\n");
+  }
   const age = document.createElement("span");
-  const ageSec = nowSec - (entry.limits.capturedAt || 0);
+  const ageSec = nowSec - (group.capturedAt || 0);
   age.className = "lim-age" + (ageSec > LIMIT_STALE_SEC ? " stale" : "");
   // "captured", not "updated": this is when the host last READ the windows out
   // of Claude Code, not when the page last refreshed. (The header's own
   // last-refreshed stamp was removed fleet-wide; nav.test.js guards it.)
   age.textContent = "captured " + fmtDuration(ageSec) + " ago";
-  age.title = "Captured " + new Date((entry.limits.capturedAt || 0) * 1000).toLocaleString()
+  age.title = "Captured " + new Date((group.capturedAt || 0) * 1000).toLocaleString()
     + ". These numbers come from the host's own Claude Code, so they can trail "
     + "the real server-side counter.";
   head.append(host, age);
   card.append(head);
 
   for (const [key, label] of LIMIT_WINDOWS) {
-    const view = limitWindowView(entry.limits[key], nowSec);
+    const held = group.windows[key];
+    const view = limitWindowView(held && held.win, nowSec);
     if (!view) continue;
     const row = document.createElement("div");
     row.className = "lim-row" + (view.expired ? " expired" : "");
@@ -603,6 +820,17 @@ function limitCard(entry, nowSec) {
       reset.className = "lim-reset";
       reset.textContent = " · " + view.reset;
       right.append(reset);
+    }
+    // The head's stamp is the group's FRESHEST capture, so on a consolidated
+    // card a window sourced from an older host would otherwise be presented
+    // under an age that isn't its own. Each window discloses its own read when
+    // the two differ.
+    if (held.capturedAt < group.capturedAt) {
+      const from = document.createElement("span");
+      from.className = "lim-reset";
+      from.textContent = " · read " + fmtDuration(nowSec - held.capturedAt) + " ago";
+      from.title = "This window's freshest reading came from " + held.host + ".";
+      right.append(from);
     }
     line.append(name, right);
 
@@ -635,8 +863,10 @@ function renderInner(data) {
   TurmaOrg.update(data);
   TurmaNewTicket.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
-  // Before the series work, and before its empty-state returns below: limit
-  // headroom is worth showing on a fleet that has charted nothing yet.
+  // Before the series work, and before its empty-state returns below: the
+  // headline totals and the limit headroom are both worth showing on a fleet
+  // that has charted nothing yet.
+  renderTotals(agents);
   renderLimits(agents);
   const series = toSeries(agents);
   if (!series.length) {
@@ -674,7 +904,7 @@ function renderInner(data) {
   card.append(legendEl(byGroup, paintOf));
   buildChart(card, visible, dates, paintOf);
   $chart.append(card, tableView(visible, dates));
-  $models.append(modelsCard(visible));
+  $models.append(modelsCard(visible), subagentCard(visible));
 }
 
 // Legend = filter. Series items toggle one series; the group name toggles all
@@ -912,23 +1142,66 @@ function tableView(list, dates) {
 // Share of the PROMPT served from cache, as a percent. The denominator is the
 // input side only (fresh input + cache write + cache read = the whole prompt);
 // output never caches, so folding it in would understate the rate.
-// `null` when there is no input-side traffic to take a ratio of.
+//
+// `null` — "no rate to state" — whenever the arithmetic can't produce a real
+// one: no input-side traffic, a field that isn't a finite number (a token count
+// reported as a JSON string poisons the accumulator into NaN), or a negative
+// prompt. Each of those otherwise reaches the page as a percentage: "NaN% hit"
+// and "-20% hit" both rendered in the headline strip's cache line, which is the
+// last place a nonsense figure should appear.
 function cacheHitRate(b) {
   if (!b) return null;
-  const read = b.cacheRead || 0;
-  const prompt = read + (b.cacheWrite || 0) + (b.input || 0);
-  return prompt ? Math.round((read / prompt) * 100) : null;
+  // `v || 0` would be wrong here: it turns NaN into 0, which is exactly the
+  // value this has to notice. A field that is simply absent IS 0.
+  const num = (v) => {
+    if (v === null || v === undefined) return 0;
+    const x = Number(v);
+    return Number.isFinite(x) ? x : NaN;
+  };
+  const read = num(b.cacheRead), write = num(b.cacheWrite), input = num(b.input);
+  // EVERY part has to be a real, non-negative count before the division means
+  // anything — stated as the property rather than as the cases, because
+  // checking `read` alone let a negative `cacheWrite` or `input` shrink the
+  // denominator below the numerator and render "101% hit", "200% hit" and
+  // "Infinity% hit" in the page's headline. Written as `!(x >= 0)` so NaN,
+  // which fails every comparison, is refused by the same clause.
+  if (!(read >= 0) || !(write >= 0) || !(input >= 0)) return null;
+  const prompt = read + write + input;
+  // With all three non-negative, `read <= prompt` holds, so the result is in
+  // 0..100 by construction. Two things still have to be rejected: nothing to
+  // take a ratio of, and a sum that overflowed to Infinity — three finite
+  // fields can do that, and the division would then answer a confident "0%"
+  // for a bucket that was nothing but cache reads.
+  if (!(prompt > 0) || !Number.isFinite(prompt)) return null;
+  return Math.round((read / prompt) * 100);
 }
 
-// The cache half of a bucket. Omitted entirely when a bucket carries no cache
+// The cache half of a bucket, as text. Empty when the bucket carries no cache
 // traffic at all — an older agent reports none, and a bare "0 cached · 0
 // written" would read as caching being broken rather than unreported.
-function cacheSubLine(b) {
-  const read = b.cacheRead || 0, write = b.cacheWrite || 0;
-  if (!read && !write) return "";
+// Safe as markup only because every part of it is produced by fmtTokens or by
+// cacheHitRate, each of which narrows to a number before it formats; this
+// string is interpolated into innerHTML by cacheSubLine below, so it is never a
+// place to start passing text through.
+function cacheLineText(b) {
+  const read = fmtTokens(b.cacheRead || 0), write = fmtTokens(b.cacheWrite || 0);
+  // Presence is judged on the DISPLAYED figures, not the raw ones. A fractional
+  // count formats to "0", and "0 cached · 0 written · 40% hit" states that
+  // caching is broken and then quotes a rate for it — the exact contradiction
+  // the omission above exists to avoid. A value that is not a number formats to
+  // "–", which is present: it says the arithmetic was poisoned, not that
+  // nothing was cached.
+  if (read === "0" && write === "0") return "";
   const hit = cacheHitRate(b);
-  return `<span class="sub-tok">${fmtTokens(read)} cached · ${fmtTokens(write)} written` +
-    (hit === null ? "" : ` · ${hit}% hit`) + `</span>`;
+  return `${read} cached · ${write} written` + (hit === null ? "" : ` · ${hit}% hit`);
+}
+
+// The markup form, hung under a token figure in the tables. One definition of
+// the wording between here and the headline strip's own cache line, so the two
+// can't drift into saying the same thing differently.
+function cacheSubLine(b) {
+  const text = cacheLineText(b);
+  return text ? `<span class="sub-tok">${text}</span>` : "";
 }
 
 // One token figure: the bucket's total, with the in/out split and the cache
@@ -987,6 +1260,83 @@ function modelsCard(list) {
         Math.max(2, (dayTokens(m.totals) / max) * 100).toFixed(1)}%"></div></td>
       ${tokenCell(m.today)}${tokenCell(m.week)}${tokenCell(m.totals, "total-col")}
     </tr>`).join("")}</tbody>
+  </table>`;
+  card.append(scroll);
+  return card;
+}
+
+// "Delegated to sub-agents" — how much of the spend shown everywhere else on
+// this page went to the background agents a session launched, rather than to its
+// own turns (XERK-302). It is a SLICE of those figures and never an addition to
+// them, which the card says outright: a reader who adds it back double-counts.
+//
+// The share's denominator is `subagentOf` — what only the series that CAN report
+// a split spent — so a fleet with one older host shows the share among the hosts
+// that answered, rather than one diluted by a host that never could.
+function subagentCard(list) {
+  const card = document.createElement("div");
+  card.className = "models-card split-card";
+  const h = document.createElement("h2");
+  h.textContent = "Delegated to sub-agents";
+  card.append(h);
+
+  // `all` is every visible series' spend, `of` only the part that came with a
+  // split. Both are kept PER WINDOW: coverage differs window by window (a host
+  // that can't report may have spent nothing all-time and everything today), so
+  // one figure describing all three rows would contradict two of them.
+  const sub = blankSplit(), of = blankSplit(), all = blankSplit();
+  let reporting = 0;
+  for (const s of list) {
+    addSplit(all, s.usage);
+    if (!s.usage?.subagent) continue;
+    reporting++;
+    addSplit(sub, s.usage.subagent);
+    addSplit(of, s.usage.subagentOf);
+  }
+  if (!reporting) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = list.length
+      ? "No sub-agent breakdown reported yet (older agents don't separate delegated work)."
+      : "All series are toggled off.";
+    card.append(empty);
+    return card;
+  }
+
+  // The coverage caveat is measured in SPEND, not in series: a single series
+  // merges every host that ran that repo, so "1 of 2 series" can hide a series
+  // three quarters of whose tokens came from a host that cannot report a split.
+  // It is stated PER ROW rather than once for the card, because a single
+  // all-time figure claiming ~100% coverage sat above a Today row that was
+  // covered 0.001%.
+  const missing = (w) => dayTokens(all[w]) - dayTokens(of[w]);
+  const anyMissing = ["totals", "today", "week"].some((w) => missing(w) > 0);
+  const note = document.createElement("div");
+  note.className = "note";
+  note.textContent = anyMissing
+    ? "Already counted in every figure above. Each share is taken against the spend that came "
+      + "with a split; hosts that can't report one are left out of that row rather than counted "
+      + "as zero, and what they spent is named beside it."
+    : "Already counted in every figure above — this is the part of it spent by background agents.";
+  card.append(note);
+
+  const scroll = document.createElement("div");
+  scroll.className = "table-scroll";
+  scroll.innerHTML = `<table>
+    <thead><tr><th>Window</th><th>Delegated</th><th class="total-col">Share of spend</th></tr></thead>
+    <tbody>${[["Today", "today"], ["Last 7 days", "week"], ["All-time", "totals"]]
+      .map(([label, w]) => {
+        const spent = dayTokens(of[w]);
+        // No spend in the window is "nothing to take a share of", not 0%.
+        const share = spent ? (dayTokens(sub[w]) / spent) * 100 : null;
+        const gap = missing(w);
+        return `<tr><td>${label}</td>${tokenCell(sub[w])}` +
+          `<td class="total-col${share === null ? " zero" : ""}"><span class="tok">${
+            share === null ? "–" : share.toFixed(1) + "%"}</span>${
+            share === null ? "" : `<span class="sub-tok">of ${fmtTokens(spent)}</span>`}${
+            gap > 0 && fmtTokens(gap) !== "0"
+              ? `<span class="sub-tok">${fmtTokens(gap)} not covered</span>` : ""}</td></tr>`;
+      }).join("")}</tbody>
   </table>`;
   card.append(scroll);
   return card;

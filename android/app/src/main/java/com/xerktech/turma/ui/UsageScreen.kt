@@ -38,16 +38,34 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.util.Locale
 import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.UsageViewModel
 
-/** Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens. */
-fun fmtTokens(n: Long): String = when {
-    n >= 1_000_000_000 -> "%.1fB".format(n / 1e9)
-    n >= 1_000_000 -> "%.1fM".format(n / 1e6)
-    n >= 1_000 -> "%.1fk".format(n / 1e3)
-    else -> n.toString()
+/**
+ * Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens, and
+ * has to agree with it DIGIT FOR DIGIT — the same fleet totals are on the web
+ * Usage page's headline strip and the dashboard's tiles, and an operator
+ * reading 1.1k in the browser and 1.2k on the phone can't tell which is wrong.
+ *
+ * Two things it must not do, both of which `"%.1fk".format(n / 1e3)` did:
+ * round a Double (Java rounds its shortest decimal HALF_UP, JS `toFixed`
+ * rounds the binary value, and they disagree on every `.x5` boundary), and
+ * format in the default locale (which renders `1,2k` in de_DE and `١٫٢k` in
+ * ar_EG). Integer arithmetic settles both — and splitting whole from remainder
+ * keeps `n * 10` from overflowing on an absurd count off the wire.
+ */
+fun fmtTokens(n: Long): String {
+    for ((unit, suffix) in listOf(1_000_000_000L to "B", 1_000_000L to "M", 1_000L to "k")) {
+        if (n >= unit) {
+            var whole = n / unit
+            var tenths = (n % unit * 10 + unit / 2) / unit
+            if (tenths == 10L) { whole += 1; tenths = 0 }
+            return "$whole.$tenths$suffix"
+        }
+    }
+    return n.toString()
 }
 
 /** One chart/legend series — the selected grouping's rows in stable paint order. */
@@ -112,6 +130,9 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
             // Fleet-wide cache split: how much of the all-time prompt traffic was
             // served from cache rather than paid for fresh.
             CacheLine(ui.cache)
+            // …and how much of it went to background agents rather than to the
+            // sessions' own turns.
+            SubagentLine(ui.subagent)
         }
         TabRow(selectedTabIndex = tab, containerColor = MaterialTheme.colorScheme.background) {
             Tab(selected = tab == 0, onClick = { setTab(0) }, text = { Text("By repo") })
@@ -185,10 +206,10 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
 
 /**
  * The Claude subscription limits section (web usage.html `renderLimits`): one
- * card per host reporting the 5-hour and 7-day windows, each with the percentage
- * used, a bar coloured by headroom, the countdown to reset, and how long ago the
- * snapshot was captured. These are snapshots, not live numbers, which is why the
- * capture age is on every card rather than implied.
+ * card per SUBSCRIPTION reporting the 5-hour and 7-day windows, each with the
+ * percentage used, a bar coloured by headroom, the countdown to reset, and how
+ * long ago the snapshot was captured. These are snapshots, not live numbers,
+ * which is why the capture age is on every card rather than implied.
  */
 @Composable
 private fun LimitsSection(cards: List<UsageViewModel.LimitCard>, anyAgents: Boolean) {
@@ -213,7 +234,7 @@ private fun LimitsSection(cards: List<UsageViewModel.LimitCard>, anyAgents: Bool
             return
         }
         Text(
-            "one shared pool across claude.ai and Claude Code · snapshot per host",
+            "one shared pool across claude.ai and Claude Code · one card per subscription",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -237,13 +258,32 @@ private fun LimitCardView(card: UsageViewModel.LimitCard, nowSec: Long) {
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        LimitRow("Session (5h)", card.fiveHour)
-        LimitRow("Weekly (7d)", card.sevenDay)
+        // Only worth saying when the card IS a consolidation: with one host the
+        // heading already names it and its age is the line above.
+        if (card.hosts.size > 1) {
+            Text(
+                "shared by " + card.hosts.joinToString(", ") {
+                    "${it.host} (${UsageViewModel.fmtDuration(nowSec - it.capturedAt)} ago)"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        LimitRow("Session (5h)", card.fiveHour,
+            (nowSec - card.fiveHourAt).takeIf { card.fiveHourAt < card.capturedAt })
+        LimitRow("Weekly (7d)", card.sevenDay,
+            (nowSec - card.sevenDayAt).takeIf { card.sevenDayAt < card.capturedAt })
     }
 }
 
+/**
+ * One window's row. [readAgeSec] is this window's OWN age, passed only when the
+ * reading is older than the card's stamp — which happens on a consolidated card
+ * whose freshest host didn't report this window, where showing the figure under
+ * the head's age would be presenting somebody else's freshness as its own.
+ */
 @Composable
-private fun LimitRow(label: String, view: UsageViewModel.LimitView?) {
+private fun LimitRow(label: String, view: UsageViewModel.LimitView?, readAgeSec: Long? = null) {
     if (view == null) return
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val color = when {
@@ -256,7 +296,8 @@ private fun LimitRow(label: String, view: UsageViewModel.LimitView?) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(label, style = MaterialTheme.typography.bodySmall, color = muted)
             Text(
-                view.pctLabel + (if (view.reset.isEmpty()) "" else " · ${view.reset}"),
+                view.pctLabel + (if (view.reset.isEmpty()) "" else " · ${view.reset}") +
+                    (readAgeSec?.let { " · read ${UsageViewModel.fmtDuration(it)} ago" } ?: ""),
                 style = MaterialTheme.typography.bodySmall,
                 color = if (view.expired) muted else MaterialTheme.colorScheme.onSurface,
             )
@@ -389,7 +430,10 @@ private const val USAGE_FOOTER =
         "which is why every card carries the moment it was taken and goes amber once it ages. " +
         "Claude Code computes them from the sessions on that machine, so they can trail the real " +
         "server-side counter — read them as headroom at a glance, not as the authoritative " +
-        "balance. " +
+        "balance. There is one card per subscription, not per host: hosts logged into the same " +
+        "Claude account are reading and spending the same pool, so they fold into one card " +
+        "listing them all, and each window shows the freshest reading any of them took. A host " +
+        "whose agent is too old to say which account it's on stays on a card of its own. " +
         "Token figures are parsed from the Claude transcripts on each host and count every session it " +
         "has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed " +
         "sessions. A new session gets a randomly-named worktree checked out in detached HEAD off the " +
@@ -426,6 +470,44 @@ private fun CacheLine(cache: UsageViewModel.CacheSummary) {
     Text(
         "${fmtTokens(cache.read)} cached · ${fmtTokens(cache.write)} written" +
             (if (hit == null) "" else " · $hit% hit"),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/**
+ * The web card's three windows, in the one line the screen has room for. A
+ * window with no spend has no share to take, so it is dropped rather than drawn
+ * as 0% — the same distinction the card makes with a dash.
+ *
+ * Pulled out of the Composable purely so a test can reach it: `ui/` Composable
+ * bodies are ungated here (`testDebugUnitTest` is the only Android gate CI
+ * runs), and the Locale.US below is load-bearing — an ar-EG phone drew
+ * "today ٠٫٠%" beside a correct "9.0B" without it.
+ */
+internal fun subagentWindows(sub: UsageViewModel.SubagentSplit): List<String> = listOfNotNull(
+    sub.todayPct?.let { String.format(Locale.US, "today %.1f%%", it) },
+    sub.weekPct?.let { String.format(Locale.US, "7d %.1f%%", it) },
+    sub.totalPct?.let { String.format(Locale.US, "all-time %.1f%%", it) },
+)
+
+/**
+ * The delegated share of the figures above (web usage.html `subagentCard`,
+ * XERK-302). Says "of" rather than "plus" on purpose: these tokens are already
+ * inside every total on this screen, and a reader who adds them back
+ * double-counts.
+ *
+ * Omitted entirely when no host in view reports the split — an agent predating
+ * the field can't answer, and "0% delegated" would be an answer.
+ */
+@Composable
+private fun SubagentLine(sub: UsageViewModel.SubagentSplit) {
+    if (!sub.any) return
+    val windows = subagentWindows(sub)
+    if (windows.isEmpty()) return
+    Text(
+        "${fmtTokens(sub.total)} delegated to sub-agents · " + windows.joinToString(" · ") +
+            (if (sub.partial) " (${sub.reporting} of ${sub.hosts} hosts report it)" else ""),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
