@@ -1737,7 +1737,15 @@ const peerCell = (v) => String(v == null ? "" : v).slice(0, PEER_CELL_MAX);
 // answer to it: trust-on-first-use, hub-owned, persisted with the record, and
 // reset by the operator action that already exists — DELETE /api/agents/<host>.
 function boundOrgOf(a) {
-  return (a && a.orgBound) || "";
+  const v = a && a.orgBound;
+  // STRINGS only, for the same reason siteKeyOf coerces — and one more: this
+  // value is PERSISTED. An earlier build of this branch bound a non-string org
+  // (siteKeyOf did not coerce yet), so a hub upgrading over its own `/data`
+  // reads one back, and `.slice()` on it threw out of the heartbeat handler:
+  // 400 with the raw exception text on EVERY beat from that host, forever, with
+  // the recovery path throwing too. Nothing coerces `orgBound` on restore, so
+  // the guard has to live here.
+  return typeof v === "string" ? v : "";
 }
 
 // Warned once per host per drift, so a permanently misconfigured host does not
@@ -1771,7 +1779,16 @@ function warnOrgDrift(key, a) {
 // own, and it is excluded from everyone else's roster.
 function orgDrifted(a) {
   const bound = boundOrgOf(a);
-  return !!bound && siteKeyOf(a) !== bound;
+  const claimed = siteKeyOf(a);
+  // Drift is DECLARING A DIFFERENT ORG, not failing to declare one. A host that
+  // sends no `jira` block — tracker never configured, configuration removed, or
+  // simply a beat that omits it — asserts nothing, so there is nothing to
+  // disagree with: it keeps its binding and its peers. Treating "" as drift
+  // locked such a host out of its own roster AND out of migration on the beat
+  // its tracker went quiet, which is a self-inflicted outage, not a boundary.
+  // The attack this exists for still trips it: joining another org means
+  // declaring that org, which is non-empty and different.
+  return !!bound && !!claimed && claimed !== bound;
 }
 
 // One host's running sessions, appended until the roster is FULL. The cap has to
@@ -3443,6 +3460,27 @@ function normalizeRecord(a) {
   normalizeLocalModel(a);
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
+  normalizeJira(a);
+}
+
+/**
+ * `jira.siteKey` coerced to a string, or dropped (XERK-348).
+ *
+ * It is agent-supplied and was served RAW, while Android types it
+ * (`AgentInfo.jira.siteKey: String`) and a full `/api/agents` decode is atomic
+ * there — so one host beating an object key throws the whole fleet array on
+ * every phone. Per the heartbeat contract in CLAUDE.md, typing a field and
+ * adding its hub-side coercion are the same change, and `normalizeRecord` is
+ * where it goes so the `state.json` restore is covered as well as the ingest.
+ *
+ * Dropped rather than stringified: `siteKeyOf` already reads a non-string as
+ * "no org", and inventing `"[object Object]"` would make one up instead.
+ */
+function normalizeJira(a) {
+  if (!a || typeof a !== "object") return;
+  const j = a.jira;
+  if (!j || typeof j !== "object" || Array.isArray(j)) return;
+  if ("siteKey" in j && typeof j.siteKey !== "string") delete j.siteKey;
 }
 
 /**
@@ -7837,10 +7875,19 @@ const server = http.createServer(async (req, res) => {
         // session's raw transcript bytes to the target, so trusting a
         // self-asserted `jira.siteKey` here would hand them to a host the hub
         // has already decided is lying about its org — a strictly larger
-        // disclosure than the roster's. An unbound host has no org to match, so
-        // it can neither send nor receive a migration.
-        if (!boundOrgOf(src) || orgDrifted(src) || orgDrifted(tgt) ||
-            boundOrgOf(src) !== boundOrgOf(tgt))
+        // disclosure than the roster's.
+        //
+        // Two ORG-LESS hosts still match, exactly as they did when this compared
+        // `siteKeyOf`: a fleet with no tracker configured has always been able to
+        // move sessions, and refusing it is a regression rather than a tightening
+        // — the clients cannot even mirror such a rule, since `orgBound` is
+        // stripped from the served payload, so their Move menus would keep
+        // offering a host the hub then refuses.
+        if (orgDrifted(src) || orgDrifted(tgt))
+          return json(res, 409, {
+            error: "that agent's declared org doesn't match the one it is bound to",
+          });
+        if (boundOrgOf(src) !== boundOrgOf(tgt))
           return json(res, 409, { error: "the target agent is in a different org" });
         if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
           return json(res, 503, { error: "the target agent is offline" });
@@ -9232,6 +9279,7 @@ if (process.env.TURMA_TEST) {
     normalizeRecord,
     normalizeLocalModel,
     normalizeRetired,
+    normalizeJira,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported

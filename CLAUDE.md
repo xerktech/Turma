@@ -236,8 +236,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     join any org and read its whole roster — exposure no agent credential had, since `/api/agents`
     refuses one. Same objection XERK-268 makes to a self-asserted `<host>`. The binding is
     hub-owned, assigned AFTER the payload spread like `tokenBound`, persisted with the record, and
-    reset only by `DELETE /api/agents/<host>`; a host declaring a different org gets its own
-    sessions and nothing else, and is dropped from everyone else's roster.
+    reset only by `DELETE /api/agents/<host>`.
+  - **Drift is declaring a DIFFERENT org, never failing to declare one**, and the MIGRATION route
+    shares the predicate — it relays raw transcript bytes, the larger disclosure of the two.
+    Mechanics, and the coercions the binding needs, are in `.claude/rules/turma.md`.
   - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one.
     Nothing bounds `rcName` in the normalizers and the spawn route takes a 100k `label`, so
     capping one field of six built a 23.8 MB reply that OOM-killed a hub in a real 256 MiB cgroup.

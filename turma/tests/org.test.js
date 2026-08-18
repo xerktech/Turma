@@ -41,6 +41,12 @@ test("org: a host's org is its jira block's siteKey; no block means no org", () 
   assert.equal(Org.siteKeyOf(agent("b", null)), "");
   assert.equal(Org.siteKeyOf(null), "");
   assert.equal(Org.siteKeyOf({ jira: {} }), "");
+  // Non-strings are "no org", the same answer turma/server.js's siteKeyOf gives
+  // — the two are a mirror and an object key compared by reference here while
+  // the hub reads it as org-less is the two ends disagreeing about what an org is.
+  assert.equal(Org.siteKeyOf({ jira: { siteKey: { o: 1 } } }), "");
+  assert.equal(Org.siteKeyOf({ jira: { siteKey: ["a"] } }), "");
+  assert.equal(Org.siteKeyOf({ jira: { siteKey: 5 } }), "");
 });
 
 test("org: an empty filter is every host, incl. hosts with no org at all", () => {

@@ -135,7 +135,7 @@ const hub = require("../server.js");
 hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
-  orgDriftWarned, warnOrgDrift, siteKeyOf,
+  orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
@@ -8540,7 +8540,11 @@ const migHost = (device, site, {
     body: {
       device,
       repos: repos.map((name) => ({ name, path: `/git/${name}` })),
-      jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] },
+      // `site` null models a host with no tracker configured — the shape a
+      // Jira-less agent really sends, which has a `jira` block but no siteKey.
+      jira: site
+        ? { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] }
+        : { available: false, configured: false, tickets: [] },
       sessions: [
         {
           id: session, status, root, repo, transcriptId,
@@ -8606,6 +8610,131 @@ test("migrate: rejects a bad source, target, or org mismatch", async () => {
   assert.equal((await migrate("mSrc", "s1", { host: "ghost" })).status, 404);
   // different org
   assert.equal((await migrate("mSrc", "s1", { host: "mOther" })).status, 409);
+});
+
+test("a host that stops declaring an org keeps its binding, and is not drifted", () => {
+  // Drift is declaring a DIFFERENT org, not failing to declare one. Treating an
+  // absent `jira` block as drift locked a host out of its roster AND out of
+  // migration on the beat its tracker went quiet — an outage caused by the
+  // boundary rather than prevented by it. Real migrate tests beat exactly this
+  // shape, which is how it was caught.
+  assert.equal(orgDrifted({ orgBound: "acme", jira: { siteKey: "acme" } }), false);
+  assert.equal(orgDrifted({ orgBound: "acme" }), false);              // no jira at all
+  assert.equal(orgDrifted({ orgBound: "acme", jira: {} }), false);    // block, no key
+  assert.equal(orgDrifted({ orgBound: "acme", jira: { available: false } }), false);
+  // The attack still trips it: joining another org means naming that org.
+  assert.equal(orgDrifted({ orgBound: "acme", jira: { siteKey: "rival" } }), true);
+});
+
+test("orgPeers still serves a host that stopped declaring its org", () => {
+  peerHost("quietA", "acme.atlassian.net", [peerSession("q1")]);
+  peerHost("quietB", "acme.atlassian.net", [peerSession("q2")]);
+  delete agents.quietA.jira;              // its tracker went quiet this beat
+  try {
+    assert.deepEqual(orgPeers("quietA").map((p) => p.id).sort(), ["q1", "q2"]);
+  } finally {
+    dropPeerHosts("quietA", "quietB");
+  }
+});
+
+test("migrate: an ORG-LESS fleet can still move sessions", async () => {
+  // Parity with what this route did before it compared bound orgs: two hosts
+  // with no tracker configured are not "in a different org", they are in no
+  // org, and refusing them is a regression. The clients cannot mirror such a
+  // rule either — `orgBound` is stripped from the served payload — so their
+  // Move menus would keep offering a host the hub then refuses.
+  await migHost("mFreeA", null);
+  await migHost("mFreeB", null);
+  const r = await migrate("mFreeA", "s1", { host: "mFreeB" });
+  assert.notEqual(r.status, 409, JSON.stringify(r.body));
+  // A started move stays in flight until it settles, and the in-flight cap is
+  // shared with every other migrate test — drop it rather than leaking a slot.
+  if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+});
+
+test("migrate: refuses a host whose declared org isn't the one it is bound to", async () => {
+  // Asserted against the ROUTE, not a predicate copied into this file: the
+  // previous version of this test passed with the route reverted to comparing
+  // the claimed org, which is the bug it was supposed to pin.
+  await migHost("mDriftA", "d1.atlassian.net");
+  await migHost("mDriftB", "d1.atlassian.net");
+  // Same token, now claiming another org. The binding does not move, so it is
+  // drifted — and this route relays raw transcript bytes, so it must refuse.
+  await migHost("mDriftB", "d2.atlassian.net");
+  const asTarget = await migrate("mDriftA", "s1", { host: "mDriftB" });
+  assert.equal(asTarget.status, 409);
+  assert.match(asTarget.body.error, /bound/);
+  // And in the other direction: a drifted SOURCE may not push either.
+  const asSource = await migrate("mDriftB", "s1", { host: "mDriftA" });
+  assert.equal(asSource.status, 409);
+  assert.match(asSource.body.error, /bound/);
+});
+
+test("migrate: a genuine same-org move is not refused on the org check", async () => {
+  await migHost("mOkA", "ok1.atlassian.net");
+  await migHost("mOkB", "ok1.atlassian.net");
+  const r = await migrate("mOkA", "s1", { host: "mOkB" });
+  assert.notEqual(r.status, 409, JSON.stringify(r.body));
+  if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+});
+
+test("http: a persisted non-string orgBound cannot wedge a host's heartbeat", async () => {
+  // An earlier build of this branch bound a non-string org (siteKeyOf did not
+  // coerce yet) and PERSISTED it, so a hub upgrading over its own /data reads
+  // one back. Unguarded, `.slice()` on it threw out of the heartbeat handler:
+  // 400 with the raw exception text on every beat from that host, forever, with
+  // the recovery path throwing too. Nothing coerces orgBound on restore.
+  const host = "wedge-host";
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { siteKey: "acme.atlassian.net" } },
+      headers: agentHeaders,
+    });
+    agents[host].orgBound = { o: 1 };            // what the restore hands back
+    const r = await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { siteKey: "acme.atlassian.net" } },
+      headers: agentHeaders,
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    delete agents[host];
+    orgDriftWarned.delete(host);
+  }
+});
+
+test("http: a non-string siteKey is dropped before it is served", async () => {
+  // Android TYPES jira.siteKey and a full /api/agents decode is atomic there, so
+  // one host beating an object key throws the whole fleet array on every phone.
+  // The coercion belongs in normalizeRecord so the state.json restore is covered
+  // too — see the heartbeat contract in CLAUDE.md.
+  const host = "objkey-host";
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { available: true, siteKey: { o: 1 } } },
+      headers: agentHeaders,
+    });
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const served = res.body.agents.find((a) => a.device === host);
+    assert.ok(served);
+    assert.equal("siteKey" in (served.jira || {}), false);
+  } finally {
+    delete agents[host];
+  }
+});
+
+test("normalizeJira drops a non-string key and leaves a good one alone", () => {
+  const bad = { jira: { available: true, siteKey: ["a"] } };
+  normalizeJira(bad);
+  assert.deepEqual(bad.jira, { available: true });
+  const good = { jira: { siteKey: "acme" } };
+  normalizeJira(good);
+  assert.equal(good.jira.siteKey, "acme");
+  // Shapes that are not an object are left alone rather than thrown on — a
+  // throw here lands in the restore's silent catch and abandons every host
+  // after this one.
+  assert.doesNotThrow(() => normalizeJira({ jira: "nope" }));
+  assert.doesNotThrow(() => normalizeJira({ jira: null }));
+  assert.doesNotThrow(() => normalizeJira(null));
 });
 
 test("migrate: rejects a root session and one with no conversation yet", async () => {
@@ -11847,6 +11976,16 @@ test("the drift warning is one line per episode, and bounded in size", () => {
     warnOrgDrift("flip", agents.flip);
     assert.equal(lines.length, 1, "one warning per drift episode");
     assert.ok(lines[0].length < 500, `log line was ${lines[0].length} chars`);
+    // BOTH sides are interpolated, so both need the cap. Only the claimed side
+    // was covered, and deleting the bound-side slice escaped the suite.
+    lines.length = 0;
+    orgDriftWarned.delete("flip");
+    agents.flip.orgBound = "b".repeat(100000);
+    agents.flip.jira.siteKey = "short";
+    warnOrgDrift("flip", agents.flip);
+    assert.equal(lines.length, 1);
+    assert.ok(lines[0].length < 500, `bound-side line was ${lines[0].length} chars`);
+    agents.flip.orgBound = "bound.example";
     // Recovering and drifting again is a NEW episode and warns once more.
     agents.flip.jira.siteKey = "bound.example";
     warnOrgDrift("flip", agents.flip);

@@ -46,7 +46,12 @@
   // block and belongs to no org — so it shows under "All orgs" and under none
   // of the named ones, which is the truth about it.
   function siteKeyOf(agent) {
-    return (agent && agent.jira && agent.jira.siteKey) || "";
+    // STRINGS only, matching `siteKeyOf` in turma/server.js, which this mirrors
+    // and which that file cross-references by name. `jira` is agent-supplied and
+    // an object key would otherwise be compared by reference here while the hub
+    // reads it as "no org" — the two ends disagreeing about what an org IS.
+    const v = agent && agent.jira && agent.jira.siteKey;
+    return typeof v === "string" ? v : "";
   }
 
   // Normalize a selection — "", a single siteKey, an array or a Set — to an

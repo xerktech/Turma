@@ -97,6 +97,37 @@ which makes an `android/` change part of the same PR) live there.
   org).
 - Tests: `turma/tests/org.test.js`.
 
+## Org binding and the peer roster (XERK-348)
+
+The cross-component contract is in `CLAUDE.md` ("The peer roster IS the org boundary"); this is the
+hub half.
+
+- **`orgBound` is the org the hub bound a host to on its first declaring beat**, assigned AFTER the
+  payload spread (like `tokenBound`) so a heartbeat cannot assert its own, persisted with the
+  record, stripped from the served payload, and reset only by `DELETE /api/agents/<host>`.
+- **Drift is declaring a DIFFERENT org, never failing to declare one.** A host whose tracker goes
+  quiet asserts nothing, so it keeps its binding and its peers. Treating an absent `jira` block as
+  drift locked it out of its roster AND out of migration on that beat — an outage caused by the
+  boundary rather than prevented by it, and the real migrate tests beat exactly that shape. The
+  attack still trips it: joining another org means naming that org.
+- **The migrate route uses the same predicate**, since it relays a session's raw transcript bytes.
+  Two ORG-LESS hosts still match there, as they did when it compared `siteKeyOf`: clients cannot
+  mirror a rule keyed on `orgBound` (it is stripped from what they are served), so refusing them
+  only makes the Move menu offer hosts the hub then refuses. Pin it with a request against the
+  ROUTE — a test asserting a predicate copied into the test file passes with the route reverted.
+- **`boundOrgOf` and `siteKeyOf` both coerce to string.** `orgBound` is PERSISTED, so an uncoerced
+  one returns on restore and threw the heartbeat handler — 400 on every beat from that host,
+  forever, recovery path included. `normalizeJira` drops a non-string `siteKey` for the client-side
+  half of the same hazard, and `turma/public/org.js`'s `siteKeyOf` mirrors the coercion.
+- **`orgPeers` bounds what it BUILDS, not what it returns.** Nothing limits how many running
+  sessions a heartbeat declares (a ~3.8 MB record buys ~60,000), so building every row before
+  slicing to `PEERS_MAX_ROWS` OOM-killed a 256 MiB hub while the pre-roster hub served the same load.
+  Every cell is capped at `PEER_CELL_MAX` too — `rcName` is bounded by nothing else, and the spawn
+  route accepts a 100k `label` that the agent slugs into it.
+- `warnOrgDrift` de-dupes on WHETHER a host is drifting, not on the value: keying on the value let a
+  host alternating two site keys warn every beat. Both interpolated keys are capped.
+- Tests: the `orgPeers`/`orgDrifted`/`migrate:` cases in `server.test.js`, `org.test.js`.
+
 ## Dashboard (`index.html`)
 
 ### Fleet tree (host → repo → session)
