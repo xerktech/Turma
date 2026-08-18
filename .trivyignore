@@ -137,3 +137,36 @@ CVE-2026-69249 exp:2026-10-25
 # already choose. The expiry forces the revisit: bump TERRAFORM_VERSION once
 # HashiCorp ships a stable release built against x/net 0.56+.
 CVE-2026-46600 exp:2026-10-25
+
+# CVE-2026-33818 / CVE-2026-39821 / CVE-2026-56853 / CVE-2026-56858 /
+# CVE-2026-56859 / CVE-2026-56860 / CVE-2026-56862 — a batch of Go stdlib
+# HIGHs published 2026-08 (asn1 Unmarshal recursion DoS, x/net/idna Punycode
+# privilege escalation, unencrypted-HTTP/2 DoS, html/template XSS, encoding/xml
+# recursion DoS, net/url quadratic path parsing, crypto/tls KeyUpdate DoS).
+#
+# Carriers are the four bundled third-party Go binaries, none first-party:
+#   docker CLI 29.6.2  (Go 1.26.5)
+#   gh 2.96.0          (Go 1.26.4)
+#   glab 1.111.0       (Go 1.26.5)
+#   terraform 1.15.8   (Go 1.25.10)
+# The fixes are Go 1.25.13 / 1.26.6 / 1.27.0-rc.3.
+#
+# Checked 2026-08-18, and a version bump does NOT clear these — the newest
+# upstream releases are still built on an unpatched toolchain. Verified by
+# downloading each and reading its embedded Go version, not by assuming:
+#   gh 2.97.0 -> go1.26.5, docker 29.7.2 -> go1.26.5, glab 1.113.0 -> go1.26.5.
+# terraform 1.15.8 IS the newest stable, as the entries above already record.
+# So every pin either has nothing to move to or moves to an equally-affected
+# build; they clear on the next upstream rebuild against a patched Go.
+#
+# Not first-party code, and the reachable surface is a CLI a session runs by
+# hand against endpoints and files the operator already chose. The expiry forces
+# the revisit rather than letting the batch sit: by then Go 1.26.6 rebuilds of
+# all four should exist and the pins can move.
+CVE-2026-33818 exp:2026-10-25
+CVE-2026-39821 exp:2026-10-25
+CVE-2026-56853 exp:2026-10-25
+CVE-2026-56858 exp:2026-10-25
+CVE-2026-56859 exp:2026-10-25
+CVE-2026-56860 exp:2026-10-25
+CVE-2026-56862 exp:2026-10-25
