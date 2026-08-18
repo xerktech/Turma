@@ -357,12 +357,16 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
-  - **Three things share that volume's SPACE**, and each is bounded separately: the archive by
-    `ARCHIVE_TOTAL_MAX_BYTES` (`.claude/rules/turma.md`), the migration spool
+  - The archive holds **two layers**: the rendered entries every Turma surface reads, and a
+    byte-for-byte copy of each session's own files beside it (XERK-338) — roughly 5-10x the bytes,
+    and the only place anything Turma does not render today survives the host.
+  - **Three things share that volume's SPACE**, and each is bounded separately: the archive (both
+    layers, one ceiling) by `ARCHIVE_TOTAL_MAX_BYTES` (`.claude/rules/turma-archive.md`), the migration spool
     (`MIGRATE_SPOOL_DIR`, transient by design) by `MIGRATE_INFLIGHT_MAX`, and `state.json` by
     nothing at all — which is why the other two have ceilings. No compose change: all default
     under `/data`.
-  - `ARCHIVE_TRANSCRIPT_MAX_BYTES` bounds one transcript rather than the store. Neither archive
+  - `ARCHIVE_TRANSCRIPT_MAX_BYTES` bounds one transcript's rendered entries and
+    `ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES` its raw copy, rather than the store. Neither archive
     ceiling counts `index.db`, which lives on the same volume and is unbounded across fill/wipe
     cycles (XERK-332) — size the volume for that too.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /

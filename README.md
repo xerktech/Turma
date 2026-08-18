@@ -108,8 +108,9 @@ The compose files are commented in full; the three things worth knowing up front
   then any agent can act as any other, so set **`TURMA_AGENT_STRICT=1`** on the
   hub once every agent has rolled over, and the master stops being accepted.
 - **The hub's `/data` volume must persist.** It holds the archive — the
-  transcript history of every ended session. The search index inside it is
-  disposable and rebuilds from the files; the files are not.
+  transcript history of every ended session, plus a byte-for-byte copy of each
+  session's own files beside it. The search index inside it is disposable and
+  rebuilds from the files; the files are not.
 - **The `.env` inputs are named apart from the variables they set** — `HUB_URL`
   sets the container's `TURMA_URL`, `HOST_REPOS_ROOT` sets the `REPOS_ROOT`
   mount. That is deliberate: compose lets the calling shell override `.env`, and

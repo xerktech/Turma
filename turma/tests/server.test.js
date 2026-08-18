@@ -18,6 +18,7 @@ const path = require("path");
 const http = require("http");
 const net = require("net");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const { EventEmitter } = require("events");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -1894,6 +1895,137 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   // a hub too old to send them is the same case (XERK-267).
   assert.equal("archiveShed" in r2.body, false);
   assert.equal("archiveFull" in r2.body, false);
+});
+
+// ---- the archive's raw layer (XERK-338) -------------------------------------
+//
+// Beside the rendered entries above, agents push a byte-for-byte copy of the
+// session's OWN files. These hold the wire contract: who may push, what a path
+// may name, and that a body which could only be hostile is refused rather than
+// decompressed.
+
+// One raw push. The body is bytes, not JSON, so it can't go through request().
+function rawPush(host, tid, rel, start, buf, headers) {
+  const p = `/api/agents/${host}/archive/${encodeURIComponent(tid)}` +
+            `/raw/${encodeURIComponent(rel)}?start=${start}`;
+  return new Promise((resolve, reject) => {
+    const req = http.request(baseUrl + p, {
+      method: "POST",
+      headers: { "content-type": "application/gzip", ...(headers || {}) },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(data); } catch {}
+        resolve({ status: res.statusCode, body: parsed, raw: data });
+      });
+    });
+    req.on("error", reject);
+    req.end(buf);
+  });
+}
+const gz = (s) => zlib.gzipSync(Buffer.from(s));
+
+test("http: a raw push is agent-authed and lands byte for byte", async () => {
+  // tr1 was ingested by the rendered-layer test above, so its row (and the
+  // canonical file the raw directory hangs off) already exists.
+  const line = '{"type":"user","message":{"role":"user"},"costUSD":0.01}\n';
+  assert.equal((await rawPush("nas", "tr1", "tr1.jsonl", 0, gz(line))).status, 401);
+
+  const ok = await rawPush("nas", "tr1", "tr1.jsonl", 0, gz(line), agentHeaders);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.stored, Buffer.byteLength(line));
+
+  // Nested files keep their own layout — including the ones that are not
+  // .jsonl, which is precisely the half of a session nothing else carries.
+  const sub = '{"agentId":"a1"}\n';
+  const r2 = await rawPush("nas", "tr1", "tr1/subagents/agent-1.jsonl", 0, gz(sub), agentHeaders);
+  assert.equal(r2.body.stored, Buffer.byteLength(sub));
+  const r3 = await rawPush("nas", "tr1", "tr1/tool-results/b1.txt", 0, gz("overflow"), agentHeaders);
+  assert.equal(r3.body.stored, 8);
+
+  // A resume appends; a re-send of a stored range writes nothing and hands back
+  // the real cursor, which is what keeps a resumed session from duplicating.
+  const more = '{"type":"assistant"}\n';
+  const r4 = await rawPush("nas", "tr1", "tr1.jsonl", Buffer.byteLength(line), gz(more), agentHeaders);
+  assert.equal(r4.body.stored, Buffer.byteLength(line + more));
+  const r5 = await rawPush("nas", "tr1", "tr1.jsonl", 0, gz(line), agentHeaders);
+  assert.equal(r5.body.stored, Buffer.byteLength(line + more));
+
+  // Read it back: the list, then the file itself, byte for byte.
+  const listed = await request("GET", "/api/archive/tr1/raw", { headers: userHeaders });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body.files.map((f) => f.path).sort(),
+    ["tr1.jsonl", "tr1/subagents/agent-1.jsonl", "tr1/tool-results/b1.txt"]);
+  const got = await request("GET", `/api/archive/tr1/raw/${encodeURIComponent("tr1.jsonl")}`,
+    { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.equal(got.raw, line + more);
+  // Served as a download with nosniff: a transcript holds whatever was pasted
+  // into it, and rendering that inline behind the hub's login is stored XSS.
+  assert.equal(got.headers["x-content-type-options"], "nosniff");
+  assert.ok(/^attachment;/.test(got.headers["content-disposition"] || ""));
+  // Both read paths are user-authed and both refuse an unknown file.
+  assert.equal((await request("GET", "/api/archive/tr1/raw")).status, 401);
+  assert.equal((await request("GET", "/api/archive/nope/raw", { headers: userHeaders })).status, 404);
+  assert.equal((await request("GET", "/api/archive/tr1/raw/nope.jsonl", { headers: userHeaders })).status, 404);
+});
+
+test("http: a raw push cannot name anything outside its own session", async () => {
+  for (const bad of ["../../etc/passwd", "/etc/passwd", "..", "tr1/../../x", "a b.jsonl"]) {
+    const r = await rawPush("nas", "tr1", bad, 0, gz("x"), agentHeaders);
+    assert.equal(r.status, 400, `accepted: ${bad}`);
+  }
+  // ...and a hostile transcriptId is refused before any path is built.
+  assert.equal((await rawPush("nas", "..%2f..%2fetc", "x.jsonl", 0, gz("x"), agentHeaders)).status, 400);
+  // The same read-path allowlist, which is a separate call site.
+  assert.equal((await request("GET",
+    `/api/archive/tr1/raw/${encodeURIComponent("../../etc/passwd")}`,
+    { headers: userHeaders })).status, 404);
+});
+
+test("http: a raw body that is not gzip, or is a bomb, is refused not decompressed", async () => {
+  // Plain bytes where gzip was promised: a 400, not a stored chunk. It is NOT
+  // the cursor protocol's "no progress" — the agent has nothing to realign to.
+  const plain = await rawPush("nas", "tr1", "tr1.jsonl", 0, Buffer.from("not gzip"), agentHeaders);
+  assert.equal(plain.status, 400);
+
+  // A zip bomb is the shape that turns a small body into an OOM on a 256 MiB
+  // hub, so the decompression is BOUNDED rather than the body cap being trusted
+  // to imply a bound. 64 MiB of zeros gzips to ~64 KiB.
+  const bomb = zlib.gzipSync(Buffer.alloc(64 << 20));
+  assert.ok(bomb.length < (1 << 20), `bomb was ${bomb.length} bytes on the wire`);
+  const r = await rawPush("nas", "tr1", "tr1.jsonl", 0, bomb, agentHeaders);
+  assert.equal(r.status, 400);
+  // And nothing landed: the stored cursor is untouched.
+  const listed = await request("GET", "/api/archive/tr1/raw", { headers: userHeaders });
+  const f = listed.body.files.find((x) => x.path === "tr1.jsonl");
+  assert.ok(f.bytes < 1000, `a refused body still grew the file to ${f.bytes}`);
+});
+
+test("http: heartbeat carries the raw layer's per-file cursors back", async () => {
+  const beat = {
+    device: "nas",
+    archiveManifest: [{
+      transcriptId: "tr1", slug: "-w-ab", repo: "turma",
+      rawFiles: [["tr1.jsonl", 999], ["tr1/subagents/agent-1.jsonl", 999],
+                 ["tr1/never-pushed.jsonl", 5]],
+    }],
+  };
+  const r = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
+  assert.equal(r.status, 200);
+  const have = r.body.archiveRawHave.tr1;
+  assert.ok(have["tr1.jsonl"] > 0);
+  assert.ok(have["tr1/subagents/agent-1.jsonl"] > 0);
+  // A file this hub holds nothing of is simply absent — the agent reads that as
+  // zero and ships from the start, which is the same case as an older hub that
+  // sends no cursors at all.
+  assert.equal("tr1/never-pushed.jsonl" in have, false);
+  // Nothing is near the raw ceiling, so the skip list stays off the wire.
+  assert.equal("archiveRawSkip" in r.body, false);
+  // Still not persisted onto the record.
+  assert.equal(agents.nas.archiveManifest, undefined);
 });
 
 test("http: login page is public; /api/login sets a working session cookie", async () => {

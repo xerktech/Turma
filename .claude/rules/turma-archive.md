@@ -15,6 +15,43 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
   each renamed + dated `/data/archive/<repo>/<YYYY-MM-DD>__<summary>__<host>__<shortId>.jsonl` (+ a
   `.meta` sidecar), indexed in a **`node:sqlite` FTS5** DB (`/data/archive/index.db`, Node-core, no
   npm), rebuildable from the files.
+- **A second, RAW layer sits beside the rendered one** (XERK-338): a byte-for-byte copy of the
+  session's own files, under `<that .jsonl>.raw/`, laid out as the host had them —
+  `<id>.jsonl`, `<id>/subagents/…`, `<id>/workflows/…`, `<id>/tool-results/…`. Layer 1 is a
+  PROJECTION (one rendered line per displayable entry), so everything Claude Code wrote that Turma
+  does not render today — the model, token counts, tool-call ids, hook records, the overflow files —
+  died with the host. That material cannot be recovered after the fact, so it is kept whether or not
+  anything reads it yet.
+  - **The cursor is the STORED FILE'S OWN SIZE**, not a number kept beside it, so it agrees with what
+    an append will do and an operator deleting a raw file simply gets it re-synced — where the
+    rendered layer's indexed cursor appends onto the gap (XERK-280). A stat that fails with anything
+    but ENOENT reads as **"cannot tell"** and the file is skipped: read as 0 it would re-ship the
+    whole thing onto the copy still there, which is the duplication this layer exists to avoid.
+  - Append-only and forward-only per FILE, which is the whole **resumed-session** answer: a resume
+    appends to the same file under the same transcript id, so only the new bytes ever ship. It is
+    also what makes a MIGRATED session safe — the target carries the same id and a byte-identical
+    prefix, so its pushes continue the same file instead of starting a second copy.
+  - Chunks are **NOT line-aligned**, unlike the rendered layer's: this is a byte copy and half of
+    what it carries (`tool-results/*.txt`, the workflow records) is not line-oriented at all.
+  - The wire is **gzipped and the decompression is BOUNDED** (`ARCHIVE_RAW_CHUNK_MAX` via
+    `maxOutputLength`). Raw bytes are 3–14x the rendered entries and JSONL compresses ~5–8x, so
+    uncompressed this layer would cost more on the wire than everything else an agent sends; and a
+    body cap alone bounds only the COMPRESSED side, which is exactly what a zip bomb exploits.
+    On disk it is stored UNCOMPRESSED — greppable, and countable by the same walk.
+  - A path from an agent is **allowlisted component by component** (`safeRawRel`: `[A-Za-z0-9._-]+`,
+    never `.`/`..`, depth and length capped), not searched for `..`. The joined result is re-checked
+    against the raw directory; the allowlist is the guarantee, that check is the proof.
+  - `ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES` (128 MiB) bounds ONE session's raw copy — its whole directory
+    together. There is deliberately **no separate store-wide raw ceiling**: `ARCHIVE_TOTAL_MAX_BYTES`
+    exists to keep the volume writable for `state.json`, and two budgets that each pass individually
+    still fill the disk together. Past the per-session one that session's raw sync stops and the
+    rendered transcript carries on, so it stays readable and searchable.
+  - `GET /api/archive/<id>/raw` lists it and `GET /api/archive/<id>/raw/<file>` streams one file
+    (user-authed, `attachment` + `nosniff` — a transcript holds whatever was pasted into it, and
+    rendering that inline behind the hub's login is stored XSS). Bytes nothing can read back are not
+    archived, so both ship with the ingest.
+  - Sizing: measured on the reference host at 336 transcripts + their nested files = 53 MB, largest
+    single session directory 7.6 MB — roughly 5–10x the rendered layer.
 - The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
   `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
   browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest
@@ -37,7 +74,11 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
   - Budget spend is the `archiveBytes` column, **re-derived from the files by `rebuildIndex`** —
     the index is disposable, so reading it from a sidecar would drift (and every pre-XERK-267
     sidecar has no such field).
-  - **The store total is WALKED off the files, never summed from the index** (`totalArchiveBytes`).
+  - **The store total is WALKED off the files, never summed from the index** (`totalArchiveBytes`),
+    and inside a raw directory it counts **every regular file whatever its extension** — most of the
+    raw layer is not named `.jsonl`, and counting only those would leave most of its bytes outside
+    the ceiling. A raw directory is recognised as `<name>.jsonl.raw` at depth > 0 only, so a repo
+    literally named `x.jsonl.raw` cannot have its archive mis-measured (or skipped by the rebuild).
     Deleting archives is the operator's way out of a full store, and it works here because the
     bytes are simply gone — nothing has to notice a deletion.
     - The walk is the **baseline only**; `writtenSinceWalk` adds every byte appended since, and the
@@ -45,7 +86,8 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
       measured 4.85 GiB written past a 4 MiB ceiling in one window. Growth is therefore exact
       (overshoot ≤ one chunk) and only DELETION is stale, which is why `TOTAL_CACHE_MS` can be
       minutes: waiting one window to notice an operator freeing space costs nothing.
-    - It counts the **`.jsonl` files only — deliberately NOT `index.db`**, even though the index
+    - It counts the archive's own content — the rendered `.jsonl` files and everything inside a raw
+      directory — but **deliberately NOT `index.db`**, even though the index
       sits in the same directory and is ~2.4× their size. A ceiling enforced by REFUSING INGEST may
       only bound what refusing can reclaim, and refusing does not shrink a database: nothing reaps
       its rows for a deleted file and nothing VACUUMs, so counted, an operator who deleted every
@@ -84,4 +126,9 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
   - **A deleted `.jsonl` whose index row survives leaves the cursor alone** and the next delta
     appends onto the gap — pre-existing, tracked as XERK-280. Repairing it needs a reliable answer
     to "was this deleted", which is the thing above that cannot be had cheaply.
+- `rebuildIndex` derives `rawBytes` by walking the raw directory, exactly as it derives
+  `archiveBytes` from the file — never read back from a sidecar — and its file walk **skips a raw
+  directory whole**. Its contents carry no `.meta` so they would be skipped as rows anyway, but only
+  after a rebuild had read every one of them into memory. Tests: `__walkJsonl` is exported so the
+  SKIP is pinned rather than that backstop.
 - Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.

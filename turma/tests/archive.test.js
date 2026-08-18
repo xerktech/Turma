@@ -204,3 +204,176 @@ test.after(() => {
   archive.closeDb();
   fs.rmSync(TMP, { recursive: true, force: true });
 });
+
+// ---- the raw layer (XERK-338) ----------------------------------------------
+//
+// Beside the RENDERED entries the archive has always kept, it now holds a
+// byte-for-byte copy of the session's own files. What is held here is the
+// append-only rule — which is the whole reason a resumed session cannot
+// duplicate data — and the path allowlist, which is the one thing between a
+// heartbeating agent and an arbitrary write.
+
+const RAW_META = { ...META, summary: "Raw Layer", endedTs: "2026-07-11T01:00:00Z" };
+const rawRel = (tid) => archive.archiveRelPath(tid, { ...RAW_META, host: "nas" });
+const rawPath = (tid, rel) =>
+  path.join(process.env.ARCHIVE_DIR, rawRel(tid) + archive.RAW_DIR_SUFFIX, rel);
+
+function seedRaw(tid) {
+  // The rendered layer creates the row the raw directory hangs off.
+  archive.ingestChunk("nas", tid, { ...RAW_META }, 0, 10, [ent("u1", "user", "hi")]);
+}
+
+test("safeRawRel allowlists components rather than hunting for '..'", () => {
+  assert.equal(archive.safeRawRel("t1.jsonl"), "t1.jsonl");
+  assert.equal(archive.safeRawRel("t1/subagents/agent-1.jsonl"), "t1/subagents/agent-1.jsonl");
+  for (const bad of [
+    "", "..", "../x", "t1/../../x", "/etc/passwd", "t1//x", "./x",
+    "t1\\..\\x",                      // a Windows separator is not a component char
+    "t1/\u0000x",                      // NUL, which some syscalls truncate at
+    "a/".repeat(20) + "x",              // deeper than any real session
+    "t1/" + "x".repeat(500),            // longer than the length cap
+    "t1/sub agents/a.jsonl",            // a space is outside the allowlist
+  ]) {
+    assert.equal(archive.safeRawRel(bad), null, `accepted: ${JSON.stringify(bad)}`);
+  }
+});
+
+test("ingestRaw stores the session's own bytes, byte for byte", () => {
+  seedRaw("raw1");
+  const body = Buffer.from('{"type":"user","hookRecord":{"x":1}}\n');
+  const r = archive.ingestRaw("nas", "raw1", "raw1.jsonl", 0, body);
+  assert.equal(r.stored, body.length);
+  const full = rawPath("raw1", "raw1.jsonl");
+  assert.deepEqual(fs.readFileSync(full), body);
+  // Nested files keep their own layout, so the store reads like the host did.
+  const sub = Buffer.from('{"agent":"a"}\n');
+  archive.ingestRaw("nas", "raw1", "raw1/subagents/agent-1.jsonl", 0, sub);
+  assert.deepEqual(fs.readFileSync(rawPath("raw1", "raw1/subagents/agent-1.jsonl")), sub);
+  // ...including the ones that are not .jsonl at all, which is the half of a
+  // session no other surface carries.
+  const txt = Buffer.from("overflowed tool output");
+  archive.ingestRaw("nas", "raw1", "raw1/tool-results/b1.txt", 0, txt);
+  assert.deepEqual(fs.readFileSync(rawPath("raw1", "raw1/tool-results/b1.txt")), txt);
+});
+
+test("a resumed session appends and never re-stores what it already sent", () => {
+  seedRaw("raw2");
+  const a = Buffer.from("first turn\n");
+  const b = Buffer.from("second turn, after a resume\n");
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", 0, a).stored, a.length);
+  // The resume appends: the cursor is where the last chunk ended.
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", a.length, b).stored,
+               a.length + b.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw2", "raw2.jsonl")), Buffer.concat([a, b]));
+
+  // A re-send of a range already stored writes NOTHING and hands back the real
+  // cursor. Without this an agent that lost its place would append a second copy
+  // of the conversation into the same file — the exact duplication the ticket is
+  // about, and undetectable afterwards.
+  const before = fs.readFileSync(rawPath("raw2", "raw2.jsonl"));
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", 0, a).stored, before.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw2", "raw2.jsonl")), before);
+  // A chunk from BEYOND the cursor is refused too — it would leave a hole.
+  assert.equal(archive.ingestRaw("nas", "raw2", "raw2.jsonl", before.length + 99, b).stored,
+               before.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw2", "raw2.jsonl")), before);
+});
+
+test("the raw cursor is the FILE's size, so deleting one re-syncs it", () => {
+  seedRaw("raw3");
+  const a = Buffer.from("aaaa");
+  archive.ingestRaw("nas", "raw3", "raw3.jsonl", 0, a);
+  fs.unlinkSync(rawPath("raw3", "raw3.jsonl"));
+  // Nothing had to notice the deletion: the next push from 0 is simply correct,
+  // where the rendered layer's indexed cursor appends onto the gap (XERK-280).
+  assert.equal(archive.ingestRaw("nas", "raw3", "raw3.jsonl", 0, a).stored, a.length);
+  assert.deepEqual(fs.readFileSync(rawPath("raw3", "raw3.jsonl")), a);
+});
+
+test("ingestRaw cannot be talked into writing outside its own directory", () => {
+  seedRaw("raw4");
+  const dir = path.join(process.env.ARCHIVE_DIR, rawRel("raw4") + archive.RAW_DIR_SUFFIX);
+  const escapee = path.join(process.env.ARCHIVE_DIR, "escaped.jsonl");
+  for (const bad of ["../../escaped.jsonl", "/tmp/escaped.jsonl", "..", "raw4/../../escaped.jsonl"]) {
+    const r = archive.ingestRaw("nas", "raw4", bad, 0, Buffer.from("nope"));
+    assert.equal(r.skip, true, `not refused: ${bad}`);
+  }
+  assert.equal(fs.existsSync(escapee), false);
+  // And an unknown transcript has no directory to write into at all.
+  assert.equal(archive.ingestRaw("nas", "never-seen", "x.jsonl", 0, Buffer.from("x")).skip, true);
+  assert.equal(fs.existsSync(dir + path.sep + "x.jsonl"), false);
+});
+
+test("the per-transcript raw ceiling stops that session, not the archive", () => {
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-rawcap-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES = "32";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-07-11T00:00:00Z", summary: "s" };
+    a.ingestChunk("nas", "cap", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+    const out = [];
+    out.push(a.ingestRaw("nas", "cap", "cap.jsonl", 0, Buffer.alloc(40, 0x61)).stored);
+    // Now over the 32-byte ceiling: the next push is refused with \`skip\`...
+    out.push(a.ingestRaw("nas", "cap", "cap.jsonl", 40, Buffer.alloc(8, 0x62)).skip === true);
+    // ...and rawLimits tells the agent so before it puts bytes on the wire.
+    out.push(a.rawLimits(["cap"]).includes("cap"));
+    // The RENDERED transcript is untouched — the session stays readable.
+    out.push(a.getTranscript("cap").entries.length);
+    console.log(JSON.stringify(out));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.deepEqual(JSON.parse(fresh.stdout.trim().split("\n").pop()), [40, true, true, 1]);
+});
+
+test("the store total counts raw bytes of EVERY extension", () => {
+  // The ceiling exists to keep this volume writable for the hub's own state, so
+  // it has to see the raw layer — most of which is not named .jsonl.
+  seedRaw("raw5");
+  archive.__resetTotalCache();
+  const before = archive.totalArchiveBytes(Date.now(), 0);
+  archive.ingestRaw("nas", "raw5", "raw5/tool-results/big.txt", 0, Buffer.alloc(4096, 0x63));
+  archive.__resetTotalCache();
+  const after = archive.totalArchiveBytes(Date.now(), 0);
+  assert.ok(after - before >= 4096, `raw .txt bytes uncounted: ${before} -> ${after}`);
+});
+
+test("a rebuild derives rawBytes from disk and never indexes a raw file as a session", () => {
+  seedRaw("raw6");
+  archive.ingestRaw("nas", "raw6", "raw6.jsonl", 0, Buffer.from("x".repeat(50)));
+  archive.ingestRaw("nas", "raw6", "raw6/subagents/a.jsonl", 0, Buffer.from("y".repeat(25)));
+  const before = archive.listArchive({ limit: 500 }).sessions.length;
+  // The rebuild's file walk must not DESCEND a raw directory at all. Its
+  // contents are the session's own .jsonl files, which carry no `.meta` and so
+  // would be skipped as rows anyway — but only after the rebuild had read every
+  // one of them into memory, on a pass that already re-reads the whole store.
+  const walked = archive.__walkJsonl();
+  assert.equal(walked.filter((f) => f.includes(archive.RAW_DIR_SUFFIX + path.sep)).length, 0,
+    "the rebuild walk descended a raw directory");
+  assert.ok(walked.length, "the walk found the rendered files");
+  archive.rebuildIndex();
+  const after = archive.listArchive({ limit: 500 });
+  assert.equal(after.sessions.length, before, "a raw file was indexed as a session");
+  // rawBytes comes off the disk, like archiveBytes — so an operator's `rm -rf`
+  // of a raw directory actually gives the budget back.
+  const db = archive.openDb();
+  const row = db.prepare("SELECT rawBytes FROM sessions WHERE transcriptId=?").get("raw6");
+  assert.equal(row.rawBytes, 75);
+});
+
+test("listRawFiles and rawFileFor read the layer back", () => {
+  seedRaw("raw7");
+  archive.ingestRaw("nas", "raw7", "raw7.jsonl", 0, Buffer.from("abc"));
+  archive.ingestRaw("nas", "raw7", "raw7/tool-results/b.txt", 0, Buffer.from("de"));
+  const files = archive.listRawFiles("raw7");
+  assert.deepEqual(files.map((f) => f.path).sort(),
+    ["raw7.jsonl", "raw7/tool-results/b.txt"]);
+  assert.equal(files.find((f) => f.path === "raw7.jsonl").bytes, 3);
+  assert.ok(archive.rawFileFor("raw7", "raw7.jsonl"));
+  // The same allowlist guards the read path as the write path.
+  assert.equal(archive.rawFileFor("raw7", "../../etc/passwd"), null);
+  assert.equal(archive.rawFileFor("raw7", "nope.jsonl"), null);
+  assert.equal(archive.listRawFiles("never-seen"), null);
+});

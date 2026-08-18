@@ -12543,6 +12543,181 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             sm._archive_deltas({"t1": body["size"]})
         self.assertEqual(pushed, [])
 
+    # ---- the raw layer (XERK-338) -------------------------------------------
+    #
+    # Beside the RENDERED entries above, the agent ships a byte-for-byte copy of
+    # the session's own files. What is held here is the enumeration (which files
+    # belong to a session, and what must never be followed to reach one) and the
+    # append-only push — which is the whole answer to "a resumed session must not
+    # duplicate data", so it is pinned from both ends: nothing re-ships, and a
+    # source that has SHRUNK never truncates what the hub already holds.
+
+    def _nested(self, slug, tid, rel, data=b"x"):
+        """Write one file inside a session's own directory, e.g. a subagent."""
+        full = os.path.join(ha.PROJECTS_ROOT, slug, tid, *rel.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data)
+        return full
+
+    def test_session_files_lists_the_whole_session_directory(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/agent-1.jsonl", b"{}\n")
+        self._nested(slug, "t1", "subagents/agent-1.meta.json", b"{}")
+        self._nested(slug, "t1", "workflows/wf_abc.json", b"{}")
+        self._nested(slug, "t1", "tool-results/b1.txt", b"overflowed output")
+        # Belongs to the PROJECT, not this session: one copy per conversation
+        # would be storage with no owner.
+        os.makedirs(os.path.join(ha.PROJECTS_ROOT, slug, "memory"), exist_ok=True)
+        with open(os.path.join(ha.PROJECTS_ROOT, slug, "memory", "MEMORY.md"), "w") as f:
+            f.write("nope")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        rels = [rel for rel, _size in sm._session_files(proj, "t1")]
+        self.assertEqual(sorted(rels), sorted([
+            "t1.jsonl",
+            os.path.join("t1", "subagents", "agent-1.jsonl"),
+            os.path.join("t1", "subagents", "agent-1.meta.json"),
+            os.path.join("t1", "tool-results", "b1.txt"),
+            os.path.join("t1", "workflows", "wf_abc.json"),
+        ]))
+        # Sizes are the real ones — they are what the hub's cursor is compared to.
+        sizes = dict(sm._session_files(proj, "t1"))
+        self.assertEqual(sizes[os.path.join("t1", "tool-results", "b1.txt")],
+                         len(b"overflowed output"))
+
+    def test_session_files_never_follows_a_symlink_out(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/agent-1.jsonl", b"{}\n")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        outside = os.path.join(ha.PROJECTS_ROOT, "elsewhere")
+        os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "secret.jsonl"), "w") as f:
+            f.write("{}\n")
+        # A linked DIRECTORY inside the session, and a linked FILE beside it.
+        # Pointed at PROJECTS_ROOT either one drags the whole host's history into
+        # one session's archive.
+        try:
+            os.symlink(outside, os.path.join(ha.PROJECTS_ROOT, slug, "t1", "linked"))
+            os.symlink(os.path.join(outside, "secret.jsonl"),
+                       os.path.join(ha.PROJECTS_ROOT, slug, "t1", "linked.jsonl"))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        rels = [rel for rel, _s in sm._session_files(proj, "t1")]
+        self.assertNotIn(os.path.join("t1", "linked.jsonl"), rels)
+        self.assertFalse([r for r in rels if "secret" in r], rels)
+
+    def test_session_files_stops_at_its_cap(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        for i in range(12):
+            self._nested(slug, "t1", f"tool-results/b{i}.txt", b"x")
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        self.assertEqual(len(sm._session_files(proj, "t1", limit=4)), 4)
+
+    def test_manifest_carries_the_raw_file_list(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/agent-1.jsonl", b"{}\n")
+        self._ledger(sm, wt)
+        sm.registry = []
+        m = sm._archive_manifest()[0]
+        # Pairs, not objects — this rides every slow heartbeat.
+        self.assertTrue(all(isinstance(f, list) and len(f) == 2 for f in m["rawFiles"]))
+        self.assertIn("t1.jsonl", [rel for rel, _s in m["rawFiles"]])
+
+    def test_raw_deltas_push_then_resume_without_reshipping(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        path = os.path.join(ha.PROJECTS_ROOT, slug, "t1.jsonl")
+        first = os.path.getsize(path)
+
+        pushed = []
+        # Stands in for the hub: append-only, and it answers with the cursor.
+        stored = {}
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((tid, rel, start, raw))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        self.assertEqual([(t, r, s) for t, r, s, _ in pushed], [("t1", "t1.jsonl", 0)])
+        self.assertEqual(stored["t1.jsonl"], first)
+        # Byte-for-byte, not a rendering of it.
+        with open(path, "rb") as f:
+            self.assertEqual(pushed[0][3], f.read())
+
+        # Caught up: nothing moves.
+        pushed.clear()
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"t1": {"t1.jsonl": first}})
+        self.assertEqual(pushed, [])
+
+        # THE resumed-session case: `claude --resume` appends to the same file
+        # under the same transcript id, so only the appended bytes ship. A
+        # content-addressed or whole-file scheme would re-upload the lot here,
+        # every time the session was resumed.
+        with open(path, "ab") as f:
+            f.write(json.dumps(_text_entry("u2", "user", "and again")).encode() + b"\n")
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"t1": {"t1.jsonl": first}})
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(pushed[0][2], first)
+        self.assertEqual(stored["t1.jsonl"], os.path.getsize(path))
+
+    def test_raw_deltas_leave_a_shrunken_source_alone(self):
+        # The hub holds MORE than the host now has: the transcript was rewritten
+        # or replaced under us. Truncating the archive to match would throw away
+        # the only copy of the history — so nothing is pushed for that file.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+        with mock.patch.object(sm, "_post_archive_raw",
+                               lambda *a: pushed.append(a) or {"stored": 0}):
+            sm._archive_raw_deltas({"t1": {"t1.jsonl": 10 ** 9}})
+        self.assertEqual(pushed, [])
+
+    def test_raw_deltas_respect_the_hubs_verdict(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+        post = lambda *a: pushed.append(a) or {"stored": 0}
+        # A full store skips the pass outright...
+        with mock.patch.object(sm, "_post_archive_raw", post):
+            sm._archive_raw_deltas({}, store_full=True)
+        self.assertEqual(pushed, [])
+        # ...and a transcript over its own raw budget is skipped by id.
+        with mock.patch.object(sm, "_post_archive_raw", post):
+            sm._archive_raw_deltas({}, skip_ids=["t1"])
+        self.assertEqual(pushed, [])
+        # A `skip` in the REPLY stops that file too, rather than retrying it.
+        with mock.patch.object(sm, "_post_archive_raw",
+                               lambda *a: pushed.append(a) or {"skip": True}):
+            sm._archive_raw_deltas({})
+        self.assertEqual(len(pushed), 1)
+
     def test_deltas_ship_pr_link_marker_with_synthesized_uuid(self):
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/aaa"

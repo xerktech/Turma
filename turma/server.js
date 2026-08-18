@@ -27,6 +27,9 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { Duplex } = require("stream");
+// Only the archive's raw layer uses this (XERK-338): agents gzip a session's own
+// bytes on the wire, and the hub gunzips them under a hard output bound.
+const zlib = require("zlib");
 // Durable, searchable archive of ended sessions (organized files on /data + a
 // node:sqlite FTS index). See archive.js. Lazily opens its DB on first use, so
 // requiring it is cheap and side-effect-free.
@@ -1294,6 +1297,16 @@ const MIGRATIONS_MAX = 40; // backstop against unbounded growth
 // Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
 // legitimate at-cap bundle isn't rejected for framing overhead.
 const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
+
+// The archive's raw layer (XERK-338). CHUNK is the decompressed ceiling one push
+// may expand to — it bounds `gunzipSync`, so it is the number that actually
+// stops a zip bomb; BODY is the compressed body cap, sized so an ordinary chunk
+// never trips it (JSONL gzips ~5-8x, so 4 MiB of transcript is well under 1 MiB
+// on the wire) while a body that could only be a bomb is refused before it is
+// ever decompressed. The agent's own read window must stay at or under CHUNK, or
+// every push it makes is refused.
+const ARCHIVE_RAW_CHUNK_MAX = 1 << 22;   // 4 MiB decompressed
+const ARCHIVE_RAW_BODY_MAX = 1 << 22;    // 4 MiB on the wire
 // **The bundle NEVER rides in the record** (XERK-263). At 65 MiB a pair of
 // concurrent moves — two clicks of the Sessions page's Move control — would
 // retain 130 MiB in a hub running at mem_limit 256m, so the relay spools each
@@ -6456,9 +6469,14 @@ const server = http.createServer(async (req, res) => {
 
     // The archive-ingest endpoint is agent-pushed (bearer token), like the
     // heartbeat — it must not require the user login the rest of /api/* does.
+    // `.../archive/<tid>` is the rendered delta; `.../archive/<tid>/raw/<file>`
+    // is the byte-for-byte copy of one of that session's own files (XERK-338).
+    // Both are agent-pushed on the same credential, which is also what binds
+    // `<host>` (XERK-268).
     const isArchiveIngest =
       req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
-      parts[3] === "archive" && parts.length === 5;
+      parts[3] === "archive" &&
+      (parts.length === 5 || (parts.length === 7 && parts[5] === "raw"));
 
     // The expected-restart signal is agent-pushed (bearer token) like the
     // heartbeat: the agent fires it as it goes down, before it could ever hold
@@ -6780,7 +6798,7 @@ const server = http.createServer(async (req, res) => {
       // an archive/DB hiccup must never break the heartbeat.
       const archiveManifest = payload.archiveManifest;
       delete payload.archiveManifest;
-      let archiveHave, archiveShed, archiveFull;
+      let archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip;
       if (Array.isArray(archiveManifest) && archiveManifest.length) {
         try {
           archiveHave = archive.manifestCursors(key, archiveManifest);
@@ -6792,6 +6810,13 @@ const server = http.createServer(async (req, res) => {
           const limits = archive.archiveLimits(Object.keys(archiveHave));
           archiveShed = limits.shed.length ? limits.shed : undefined;
           archiveFull = limits.full || undefined;
+          // The raw layer's own cursors, per session-relative file (XERK-338).
+          // Computed AFTER manifestCursors, which is what creates the rows the
+          // raw directories hang off. Absent for every transcript this hub holds
+          // nothing of, which the agent reads as zero and ships from the start.
+          archiveRawHave = archive.rawCursors(archiveManifest);
+          const rawSkip = archive.rawLimits(Object.keys(archiveHave));
+          archiveRawSkip = rawSkip.length ? rawSkip : undefined;
         } catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
       }
       const next = (agents[key] = {
@@ -6991,7 +7016,8 @@ const server = http.createServer(async (req, res) => {
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
       return json(res, 200, archiveHave
-        ? { commands: reply, archiveHave, archiveShed, archiveFull }
+        ? { commands: reply, archiveHave, archiveShed, archiveFull,
+            archiveRawHave, archiveRawSkip }
         : { commands: reply });
     }
 
@@ -7041,6 +7067,55 @@ const server = http.createServer(async (req, res) => {
           Array.isArray(body.entries) ? body.entries : []
         );
         return json(res, 200, r);
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // POST /api/agents/<host>/archive/<transcriptId>/raw/<file>?start=<n> — an
+    // agent pushing one append-only byte range of one of a session's OWN files
+    // into the archive's raw layer (XERK-338). `<file>` is the session-relative
+    // path, percent-encoded into a single segment (so `subagents/agent-1.jsonl`
+    // arrives as `subagents%2Fagent-1.jsonl`), and is allowlisted component by
+    // component in `archive.safeRawRel` before it can name anything on disk.
+    //
+    // The body is the raw bytes, gzipped — these are 3-14x the size of the
+    // rendered entries beside them and JSONL compresses ~5-8x, so shipping them
+    // uncompressed would make the raw layer cost more on the wire than
+    // everything else the agent sends put together. Decompression is BOUNDED
+    // (`maxOutputLength`): the body cap alone bounds the compressed side, and a
+    // zip bomb is exactly the shape that turns a 1 MiB body into an OOM on a
+    // 256 MiB hub.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) {
+      const key = decodeURIComponent(parts[2]);
+      const transcriptId = decodeURIComponent(parts[4]);
+      if (!/^[A-Za-z0-9._-]+$/.test(transcriptId)) return json(res, 400, { error: "bad transcriptId" });
+      let rel;
+      try { rel = decodeURIComponent(parts[6]); } catch { return json(res, 400, { error: "bad file" }); }
+      if (!archive.safeRawRel(rel)) return json(res, 400, { error: "bad file" });
+      const start = Number(url.searchParams.get("start") || 0);
+      if (!Number.isSafeInteger(start) || start < 0) return json(res, 400, { error: "bad start" });
+      let gz;
+      try {
+        gz = await readRawBody(req, ARCHIVE_RAW_BODY_MAX);
+      } catch (e) {
+        if (e && e.tooLarge) return json(res, 413, { error: e.message });
+        if (e && e.overloaded) return json(res, 503, { error: e.message });
+        return json(res, 400, { error: "could not read body" });
+      }
+      let buf;
+      try {
+        buf = gz.length ? zlib.gunzipSync(gz, { maxOutputLength: ARCHIVE_RAW_CHUNK_MAX })
+                        : Buffer.alloc(0);
+      } catch (e) {
+        // A body that does not decompress is a broken or hostile push, not a
+        // chunk to retry — but it answers 400 rather than the cursor protocol's
+        // "no progress", because the agent has nothing to realign to.
+        return json(res, 400, { error: "body is not gzip within the size limit" });
+      }
+      try {
+        return json(res, 200, archive.ingestRaw(key, transcriptId, rel, start, buf));
       } catch (e) {
         return json(res, 500, { error: e.message });
       }
@@ -7279,6 +7354,50 @@ const server = http.createServer(async (req, res) => {
       const t = archive.getTranscript(transcriptId);
       if (!t) return json(res, 404, { error: "unknown transcript" });
       return json(res, 200, t);
+    }
+
+    // GET /api/archive/<transcriptId>/raw — what the raw layer holds for that
+    // session, as [{path, bytes}] (XERK-338). Storing bytes nothing can read
+    // back is not archiving them, so this and the download below ship with the
+    // ingest rather than waiting for a UI to want them; they are also how an
+    // operator confirms a session really did land.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "raw" && parts.length === 4) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const files = archive.listRawFiles(transcriptId);
+      if (!files) return json(res, 404, { error: "unknown transcript" });
+      return json(res, 200, { transcriptId, files });
+    }
+
+    // GET /api/archive/<transcriptId>/raw/<file> — one raw file, byte for byte.
+    // `<file>` is percent-encoded into a single segment like the ingest route's,
+    // and goes through the same allowlist before it names anything.
+    //
+    // Served as a DOWNLOAD, never inline: these are attacker-influenced bytes
+    // (a session transcript contains whatever was pasted into it), and a
+    // browser rendering them same-origin behind the hub's login is stored XSS.
+    // `text/plain` + `nosniff` + an attachment disposition is the same posture
+    // the rest of the app's file surfaces take.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "raw" && parts.length === 5) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      let rel;
+      try { rel = decodeURIComponent(parts[4]); } catch { return json(res, 400, { error: "bad file" }); }
+      const full = archive.rawFileFor(transcriptId, rel);
+      if (!full) return json(res, 404, { error: "unknown file" });
+      let size;
+      try { size = fs.statSync(full).size; } catch { return json(res, 404, { error: "unknown file" }); }
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": size,
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": `attachment; filename="${archive.slugify(rel, "raw")}"`,
+        "Cache-Control": "no-store",
+      });
+      if (req.method === "HEAD") return res.end();
+      return void fs.createReadStream(full)
+        .on("error", () => res.destroy())
+        .pipe(res);
     }
 
     // POST /api/agents/<host>/clone — queue a clone into the host's repos

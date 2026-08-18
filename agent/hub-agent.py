@@ -41,6 +41,7 @@ stdlib only — no pip installs in the image.
 
 import base64
 import datetime
+import gzip
 import hashlib
 import html
 import io
@@ -247,6 +248,26 @@ CLAUDE_CONFIG_PATHS = tuple(p for p in (
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
+
+# The archive's RAW layer (XERK-338): beside the rendered entries above, ship a
+# byte-for-byte copy of the session's OWN files, so what Claude Code wrote
+# survives this host even where Turma renders none of it today — the model and
+# token counts, tool-call ids, hook records, the `tool-results/` overflow files,
+# the workflow run records. Same append-only cursor protocol as the rendered
+# layer, per FILE rather than per transcript, which is what keeps a resumed
+# session from ever shipping a byte twice.
+#
+# Read window MUST stay at or under the hub's ARCHIVE_RAW_CHUNK_MAX, which
+# bounds its gunzip: a larger window is refused on every push, not truncated.
+ARCHIVE_RAW_CHUNK_BYTES = 1 << 22   # 4 MiB read per POST (~0.5-1 MiB gzipped)
+ARCHIVE_RAW_BEAT_BUDGET = 1 << 24   # ~16 MiB of raw bytes per sync pass
+# Files one transcript may offer, and across the whole manifest. A session's
+# directory holds one file per delegated agent and per overflowed tool result, so
+# it is unbounded in principle; the manifest rides the heartbeat, so it is capped
+# here rather than left to HEARTBEAT_MAX to refuse the whole beat. What is left
+# out is offered on a later pass, since the cap applies newest-transcript-first.
+ARCHIVE_RAW_FILES_MAX = 200
+ARCHIVE_RAW_MANIFEST_FILES_MAX = 2000
 def _byte_ceiling(raw, fallback):
     """A byte ceiling read from the environment, mirroring byteCeiling() in
     turma/archive.js — the two read the SAME variable, so they must agree that
@@ -13355,6 +13376,22 @@ class SessionManager:
                 })
         out.sort(key=lambda m: m["mtime"], reverse=True)
         out = out[:ARCHIVE_MANIFEST_MAX]
+        # The raw layer's file list (XERK-338), newest transcript first so the
+        # aggregate cap drops the oldest offers rather than a random slice of
+        # one session. Paid only for the capped survivors, like `endedTs` below.
+        raw_budget = ARCHIVE_RAW_MANIFEST_FILES_MAX
+        for m in out:
+            if raw_budget <= 0:
+                break
+            files = self._session_files(
+                os.path.join(PROJECTS_ROOT, m["slug"]), m["transcriptId"],
+                limit=min(ARCHIVE_RAW_FILES_MAX, raw_budget))
+            if files:
+                # Pairs, not objects: this rides every slow beat, and 200
+                # transcripts of {"path":...,"size":...} is several times the
+                # heartbeat cost of the same information as [rel, size].
+                m["rawFiles"] = [[rel, size] for rel, size in files]
+                raw_budget -= len(files)
         for m in out:
             # The last new message's own timestamp, not the file mtime (XERK-73) —
             # the archive orders and dates its rows by this, so a synced/restored
@@ -13365,6 +13402,160 @@ class SessionManager:
             m.pop("mtime", None)   # internal sort key; not part of the payload
             m.pop("path", None)
         return out
+
+    def _session_files(self, proj, tid, limit=None):
+        """Every file that belongs to one session, as [(relpath, size)] relative
+        to its PROJECT-SLUG dir — the same layout `_pack_transcript` tars for a
+        migration, so a raw archive and a migrated session describe a session the
+        same way:
+
+          <tid>.jsonl                        the conversation
+          <tid>/subagents/agent-x.jsonl      each delegated agent (+ its .meta.json)
+          <tid>/workflows/wf_<run>.json      the workflow run records (XERK-304)
+          <tid>/tool-results/<id>.txt        overflowed tool output
+          <tid>/...                          whatever Claude Code adds next
+
+        Deliberately NOT filtered to `*.jsonl`: the point of the raw layer is that
+        nobody has to have predicted what would be worth keeping, and the files
+        that are not `.jsonl` today are exactly the ones no other surface carries.
+
+        Excluded: `<slug>/memory/`, which belongs to the PROJECT and is shared by
+        every session in it — archiving it per session would store one copy per
+        conversation and still not say whose it was.
+
+        Only regular files, and never through a symlink — the same hardening
+        `_project_transcripts` applies, and for the same reason: a link pointed at
+        PROJECTS_ROOT would drag every transcript on the host into one session's
+        archive, and one named `*.jsonl` pointed at a device blocks a read
+        forever. Nothing raises; this runs on the heartbeat's critical path."""
+        out = []
+        main = os.path.join(proj, tid + ".jsonl")
+        try:
+            st = os.stat(main)
+            if stat.S_ISREG(st.st_mode) and not os.path.islink(main):
+                out.append((tid + ".jsonl", st.st_size))
+        except OSError:
+            pass
+        root = os.path.join(proj, tid)
+        try:
+            if not os.path.isdir(root) or os.path.islink(root):
+                return out
+        except OSError:
+            return out
+        cap = ARCHIVE_RAW_FILES_MAX if limit is None else limit
+        try:
+            for dirpath, dirs, files in os.walk(root, followlinks=False):
+                # `followlinks=False` stops os.walk DESCENDING a link, but it
+                # still lists it — and it always descends its own top, which the
+                # islink check above is what refuses.
+                dirs[:] = sorted(d for d in dirs
+                                 if not os.path.islink(os.path.join(dirpath, d)))
+                for name in sorted(files):
+                    full = os.path.join(dirpath, name)
+                    try:
+                        if os.path.islink(full):
+                            continue
+                        st = os.stat(full)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                    except OSError:
+                        continue
+                    out.append((os.path.relpath(full, proj), st.st_size))
+                    if len(out) >= cap:
+                        return out
+        except OSError:
+            pass
+        return out
+
+    def _archive_raw_deltas(self, raw_have, skip_ids=None, store_full=False):
+        """Push the append-only byte ranges the hub is missing from each session's
+        OWN files (XERK-338), gzipped, using the archiveRawHave cursors from the
+        same reply. Bounded per chunk and per pass like the rendered layer.
+
+        **This is where a resumed session stays de-duplicated.** A resume appends
+        to the same file under the same transcript id, so the cursor simply moves
+        and only the new bytes ship — however many times it is resumed, and across
+        a MIGRATION too, where the target host carries the same id and a
+        byte-identical prefix. Nothing here is content-addressed or re-uploaded.
+
+        Unlike the rendered layer these chunks are NOT line-aligned: the raw layer
+        is a byte copy and half of what it carries (`tool-results/*.txt`, the
+        workflow records) is not line-oriented at all. A turn caught mid-write
+        simply lands in two pieces, in order.
+
+        `skip_ids`/`store_full` are the hub's budget verdict; both absent from an
+        older hub, in which case the hub refuses on its own."""
+        if not self._archive_pending or store_full:
+            return
+        skip = set(skip_ids or ())
+        budget = ARCHIVE_RAW_BEAT_BUDGET
+        for tid, m in list(self._archive_pending.items()):
+            if budget <= 0:
+                return
+            if tid in skip:
+                continue
+            files = m.get("rawFiles") or []
+            if not files:
+                continue
+            proj = os.path.join(PROJECTS_ROOT, m["slug"])
+            cursors = (raw_have or {}).get(tid) or {}
+            for rel, size in files:
+                if budget <= 0:
+                    return
+                have = int(cursors.get(rel, 0) or 0)
+                if have >= size:
+                    continue
+                if have > size:
+                    # The source file is SHORTER than what the hub already holds:
+                    # this session's transcript was rewritten or replaced under
+                    # us. Never truncate the archive to match — the longer copy
+                    # is the one with the history in it. Left alone; the hub's
+                    # cursor keeps refusing the shorter push.
+                    log(f"archive raw: {tid} {rel} is {size} bytes but the hub "
+                        f"holds {have}; leaving the archived copy alone")
+                    continue
+                path = os.path.join(proj, rel)
+                while have < size and budget > 0:
+                    try:
+                        with open(path, "rb") as f:
+                            f.seek(have)
+                            raw = f.read(min(ARCHIVE_RAW_CHUNK_BYTES, budget))
+                    except OSError:
+                        break
+                    if not raw:
+                        break
+                    reply = self._post_archive_raw(tid, rel, have, raw)
+                    if reply is None:
+                        return   # POST failed; the next manifest re-offers it
+                    if reply.get("full"):
+                        log("archive store is full at the hub; stopping the raw pass")
+                        return
+                    if reply.get("skip"):
+                        break    # over its raw budget, or the hub cannot store it
+                    stored = int(reply.get("stored", have) or have)
+                    if stored <= have:
+                        break    # no forward progress (cursor realign) — stop
+                    budget -= stored - have
+                    have = stored
+
+    def _post_archive_raw(self, transcript_id, rel, start, raw):
+        """POST one gzipped raw byte range. Returns the parsed reply or None."""
+        try:
+            body = gzip.compress(raw, 6)
+            headers = {"Content-Type": "application/gzip",
+                       "User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/{urllib.parse.quote(self.device, safe='')}"
+                   f"/archive/{urllib.parse.quote(transcript_id, safe='')}"
+                   f"/raw/{urllib.parse.quote(rel, safe='')}?start={int(start)}")
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                reply = json.loads(resp.read().decode() or "{}")
+            return reply if isinstance(reply, dict) else {}
+        except Exception as e:
+            log(f"archive raw push failed for {transcript_id} {rel}: {e}")
+            return None
 
     def _archive_deltas(self, archive_have, shed_ids=None, store_full=False):
         """Push the byte-range deltas the hub is missing for each manifest entry,
@@ -16080,6 +16271,16 @@ class SessionManager:
                                              bool(reply.get("archiveFull")))
                     except Exception as e:
                         log(f"archive sync failed: {e}")
+                    # The raw layer rides the same reply and the same pending
+                    # map (XERK-338), in its own try: a raw push that fails must
+                    # never cost the rendered transcript, which is what every
+                    # other surface reads.
+                    try:
+                        self._archive_raw_deltas(reply.get("archiveRawHave"),
+                                                 reply.get("archiveRawSkip"),
+                                                 bool(reply.get("archiveFull")))
+                    except Exception as e:
+                        log(f"archive raw sync failed: {e}")
                 if self.handle_commands(reply.get("commands")):
                     # Fire an immediate extra heartbeat so the UI reflects the
                     # new session state fast (don't wait a whole interval). Its
