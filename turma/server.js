@@ -152,6 +152,16 @@ const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted 
 // the restore.
 const LIVE_AGENTS_MAX = 32;
 const LIVE_AGENT_FIELD_MAX = 400;
+// Up HERE with the live-agent caps rather than beside sanitizeWorkflowAgents
+// where they are used, and that placement is LOAD-BEARING (XERK-304). The
+// state.json restore calls normalizeRecord ~700 lines below this and ~1000
+// lines ABOVE that function, so a `const` declared next to it sits in the
+// temporal dead zone at restore time; the ReferenceError lands in the restore's
+// own catch, which swallows everything and boots the hub with an EMPTY
+// registry. The function itself hoists, so only its constants must live here.
+// Same trap the comment above that restore loop warns about.
+const WORKFLOW_AGENT_FIELD_MAX = 256;
+const WORKFLOW_AGENTS_MAX = 200;
 // How long a message typed into a session may be (XERK-227). The operator pastes
 // logs and specs into the chat composer and the raw terminal takes them at any
 // size, so this is a payload backstop — the agent delivers the text to the pane
@@ -1939,8 +1949,6 @@ const SUBAGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 // through to a decoder that will throw on it. Same shape as sanitizeLiveAgents:
 // non-array -> null (the field is then simply absent, which every client reads
 // as "not a run"), every value through safeString, length capped.
-const WORKFLOW_AGENT_FIELD_MAX = 256;
-const WORKFLOW_AGENTS_MAX = 200;
 function sanitizeWorkflowAgents(raw) {
   if (!Array.isArray(raw)) return null;
   const out = [];
@@ -2824,7 +2832,10 @@ function normalizeSubagentHistory(a) {
   if (!cache || typeof cache !== "object") return;
   for (const entry of Object.values(cache)) {
     if (!entry || typeof entry !== "object") continue;
-    if ("agents" in entry) entry.agents = sanitizeWorkflowAgents(entry.agents);
+    // Only touch entries that actually carry a run's list — a plain transcript
+    // has no business growing workflow keys on the way through.
+    if (!("agents" in entry)) continue;
+    entry.agents = sanitizeWorkflowAgents(entry.agents);
     entry.agentsTruncated = !!entry.agentsTruncated;
   }
 }

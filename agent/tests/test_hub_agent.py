@@ -4417,6 +4417,31 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
 
+    def test_pack_carries_the_workflow_run_records(self):
+        # The SIBLING workflows/ tree holds each run's record, which is the only
+        # place a workflow picker's row labels exist (XERK-304). Left behind, a
+        # moved session's rows fall back to prompt text on the target only.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfmig")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(os.path.join(runs, "scripts"))
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123", "workflowProgress": [
+                {"type": "workflow_agent", "index": 1, "agentId": "x",
+                 "label": "review:bugs", "state": "done"}]}, f)
+        with open(os.path.join(runs, "scripts", "s-wf_abc123.js"), "w") as f:
+            f.write("export const meta = {}\n")
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-wf")
+        os.makedirs(dest)
+        sm._unpack_transcript(sm._pack_transcript(path), dest)
+        rec = os.path.join(dest, "trans1", "workflows", "wf_abc123.json")
+        self.assertTrue(os.path.isfile(rec))
+        with open(rec) as f:
+            self.assertEqual(json.load(f)["workflowProgress"][0]["label"], "review:bugs")
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "workflows", "scripts", "s-wf_abc123.js")))
+
     def test_unpack_rejects_a_traversing_member(self):
         sm = self._manager()
         buf = io.BytesIO()
@@ -10659,6 +10684,80 @@ class TestResolveWorkflowRun(unittest.TestCase):
         self.assertRegex(rows[0]["startedAt"], r"^\d{4}-\d{2}-\d{2}T[\d:]{8}Z$")
         self.assertEqual(ha._epoch_ms_iso("not a number"), "")
         self.assertEqual(ha._epoch_ms_iso(None), "")
+
+    def test_a_partially_recorded_run_still_gets_status_from_the_journal(self):
+        # A record covering SOME agents must not suppress the journal for the
+        # rest: the journal on disk knew the answer for every one of them, and
+        # the run served rows with no status beside rows that had one.
+        self._write_main(self._launch("fixture", "wf_par111"))
+        run = self._run_dir("wf_par111")
+        for aid in ("p1", "p2", "p3"):
+            self._agent(run, aid, "prompt for " + aid, "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_par111", [("p1", "one", "done"), ("p2", "two", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_par111"))
+        by_id = {r["id"]: r for r in rows}
+        self.assertEqual(by_id["p3"].get("status"), "done",
+                         "the uncovered agent's status comes from the journal")
+
+    def test_a_fully_recorded_run_never_pays_for_the_journal_fold(self):
+        # The fold is lazy: covering every agent is the normal case and must not
+        # read the journal at all — it runs on the synchronous beat loop.
+        self._write_main(self._launch("fixture", "wf_par222"))
+        run = self._run_dir("wf_par222")
+        self._agent(run, "a1", "work", "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_par222", [("a1", "named", "done")])
+        rec = ha._workflow_run_record(self.main, "wf_par222")
+        with mock.patch.object(ha, "_workflow_finished_agents") as folded:
+            rows, _ = ha._workflow_agents(run, rec)
+        folded.assert_not_called()
+        self.assertEqual(rows[0]["status"], "done")
+
+    def test_a_record_that_is_not_an_object_is_refused(self):
+        # json.load happily returns a list; without the isinstance guard the
+        # progress read raises AttributeError and the drill-down never answers.
+        self._write_main(self._launch("fixture", "wf_bad111"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        for body in ("[1, 2, 3]", '"a string"', "null", "17"):
+            with open(os.path.join(d, "wf_bad111.json"), "w") as f:
+                f.write(body)
+            self.assertIsNone(ha._workflow_run_record(self.main, "wf_bad111"), body)
+
+    def test_a_deeply_nested_record_is_a_MISS_not_an_escape(self):
+        # json.load blows the stack on this, and RecursionError is not a
+        # ValueError — escaping leaves handle_commands' blanket catch to stage
+        # NOTHING, so the client polls to its timeout instead of being told.
+        self._write_main(self._launch("fixture", "wf_bad222"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "wf_bad222.json"), "w") as f:
+            f.write("[" * 100000 + "]" * 100000)
+        self.assertIsNone(ha._workflow_run_record(self.main, "wf_bad222"))
+
+    def test_a_forged_run_id_is_refused_by_the_record_read_ITSELF(self):
+        # Defence in depth: _resolve_workflow_run has already validated the id
+        # by the time this is called, so only a direct test pins the check here.
+        self._write_main(self._launch("fixture", "wf_bad333"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        # A real, readable file the forged id would otherwise reach.
+        with open(os.path.join(d, "secret.json"), "w") as f:
+            json.dump({"workflowProgress": []}, f)
+        for forged in ("../workflows/secret", "secret", "", "..", "wf_a/../b"):
+            self.assertIsNone(ha._workflow_run_record(self.main, forged), forged)
+
+    def test_record_derived_label_and_status_are_capped(self):
+        # They ride the heartbeat body, so their size is the agent's to bound —
+        # the hub's own 256-char cap is the second line of defence, not the first.
+        self._write_main(self._launch("fixture", "wf_cap111"))
+        run = self._run_dir("wf_cap111")
+        self._agent(run, "a1", "work", "2026-08-18T04:02:00.000Z", done=True)
+        self._record("wf_cap111", [("a1", "L" * 5000, "S" * 5000)])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_cap111"))
+        self.assertEqual(len(rows[0]["label"]), ha.WORKFLOW_AGENT_LABEL_CHARS)
+        self.assertEqual(len(rows[0]["status"]), ha.WORKFLOW_AGENT_LABEL_CHARS)
 
     def test_a_meta_description_beats_the_prompt_when_there_is_one(self):
         self._write_main(self._launch("fixture", "wf_eee555"))

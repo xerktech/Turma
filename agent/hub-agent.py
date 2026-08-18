@@ -5262,7 +5262,20 @@ def _workflow_agents(run_dir, record=None):
     can answer; an absent field means "can't tell", exactly as on the heartbeat."""
     files = _workflow_agent_files(run_dir)
     progress = _workflow_progress_rows(record)
-    done = None if progress else _workflow_finished_agents(run_dir)
+    # The journal is folded for whatever the record does not cover — NOT skipped
+    # whenever a record exists at all. A record covering some agents used to
+    # suppress it for the rest, so a partially-recorded run served rows with no
+    # status beside rows that had one, while the journal on disk knew the answer
+    # for every one of them. Still lazy: a record that covers everything (the
+    # normal case) never pays for the fold.
+    done = _MISSING = object()
+
+    def _journal():
+        nonlocal done
+        if done is _MISSING:
+            done = _workflow_finished_agents(run_dir)
+        return done
+
     rows = []
     for aid, path in files.items():
         known = progress.get(aid) or {}
@@ -5276,8 +5289,10 @@ def _workflow_agents(run_dir, record=None):
             # worth seeing, and flattening them to done/running hides an agent
             # that never produced anything.
             row["status"] = known["state"][:WORKFLOW_AGENT_LABEL_CHARS]
-        elif done is not None:
-            row["status"] = "done" if aid in done else "running"
+        else:
+            folded = _journal()
+            if folded is not None:
+                row["status"] = "done" if aid in folded else "running"
         idx = known.get("index")
         rows.append((idx if isinstance(idx, int) else None, row))
     rows.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0,
@@ -5302,7 +5317,12 @@ def _workflow_run_record(main_path, run_id):
             return None      # the script and every result preview live in here
         with open(path, errors="replace") as f:
             rec = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError is NOT hypothetical: json.load blows the stack on a
+        # deeply nested file, and it is not a ValueError. Escaping here leaves
+        # handle_commands' blanket catch to keep the beat alive while staging
+        # NOTHING, so the client's drill-down poll spins to its timeout instead
+        # of getting the "unavailable" this returns.
         return None
     return rec if isinstance(rec, dict) else None
 
@@ -11520,11 +11540,16 @@ class SessionManager:
                             extra=extra, migration_id=migration_id)
 
     def _pack_transcript(self, path):
-        """Bundle a transcript file (+ its subagents/ dir, if any) into gzipped
-        tar bytes, laid out relative to the project-slug dir so the target
-        unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and, when
-        present, `<id>/subagents/...`. The main file is truncated to its last
-        complete line."""
+        """Bundle a transcript file (+ its subagents/ and workflows/ dirs, if
+        any) into gzipped tar bytes, laid out relative to the project-slug dir so
+        the target unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and,
+        when present, `<id>/subagents/...` and `<id>/workflows/...`. The main
+        file is truncated to its last complete line.
+
+        `workflows/` is the SIBLING tree holding each run's record — the only
+        place the picker's row labels exist (XERK-304). Leaving it behind moved a
+        session whose workflow rows then fell back to prompt text, i.e. the
+        unpickable picker, on the target only."""
         tid = os.path.basename(path)[:-len(".jsonl")]
         with open(path, "rb") as f:
             raw = f.read()
@@ -11538,6 +11563,9 @@ class SessionManager:
             sub = _subagents_dir(path)
             if os.path.isdir(sub):
                 tar.add(sub, arcname=os.path.join(tid, "subagents"))
+            runs = os.path.join(path[:-len(".jsonl")], WORKFLOW_RUNS_SUBDIR)
+            if os.path.isdir(runs):
+                tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
         return buf.getvalue()
 
     def _unpack_transcript(self, blob, dest_dir):

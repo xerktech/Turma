@@ -43,13 +43,28 @@ is the run RECORD, never a nested agent dir.
   `agent-<id>.meta.json` is only `{"agentType":"workflow-subagent","spawnDepth":1}` — so a fan-out
   over one prompt template renders every row IDENTICALLY without it, which is a picker you cannot
   pick from. An earlier claim that the label "is persisted nowhere" was wrong; do not restore it.
+- **The record is written only when the run COMPLETES**, measured at ~80s on a two-agent run. So
+  for the whole time an operator is watching a live run, rows fall back to prompt text and status
+  comes from the journal — the labels arrive once nobody needs them. A recorded `state:"running"`
+  is therefore near-unreachable in practice. This is the honest limit of the naming fix; do not
+  describe it as naming rows live.
 - **Covering an agent from the record also means NOT reading its transcript.** `handle_commands`
   runs synchronously in the heartbeat loop, so a large fan-out's per-agent head reads are beat
   latency — measured at ~1s for 200 agents with 1 MiB prompts, and ~5.7s to fold a 514 MiB journal.
   Both sit inside `INTERVAL`, but they multiply on slow storage, and the record avoids them.
-- **The fallbacks are for a run whose record is missing**: a meta `description` (an ordinary
-  subagent carries one), then the agent's FIRST PROMPT, then the id; order then falls back to each
-  transcript's first timestamp. `state` likewise falls back to the journal fold below.
+- **The fallbacks are for a run whose record is missing OR incomplete**: a meta `description` (an
+  ordinary subagent carries one), then the agent's FIRST PROMPT, then the id; order then falls back
+  to each transcript's first timestamp.
+- **The journal is folded per-AGENT, for whatever the record does not cover — not skipped whenever a
+  record exists.** A record covering some agents used to suppress it for the rest, so a partly
+  recorded run served status-less rows beside status-carrying ones while the journal knew every
+  answer. The fold stays lazy, so the normal fully-covered case never pays for it.
+- **The record is packed into a MIGRATION bundle** (`_pack_transcript`), because it is the only
+  place the labels exist: without it a moved session's picker silently reverts to prompt text on the
+  target alone.
+- **`json.load` on it can raise `RecursionError`, which is not a `ValueError`.** Letting it escape
+  leaves `handle_commands`' blanket catch to keep the beat alive while staging NOTHING, so the
+  client polls to its timeout instead of being told the row is unavailable.
 - **A recorded `state` is passed through as the run wrote it** — "failed" and "skipped" are worth
   seeing, and flattening them to done/running hides an agent that never produced anything.
 - **`startedAt` is normalised to ISO.** The record times agents in epoch ms while the rest of this
