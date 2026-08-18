@@ -258,25 +258,41 @@ const TOTAL_CACHE_MS = 5 * 60 * 1000;
 // and this is what bounds how long an operator waits after freeing space.
 const FULL_RECHECK_MS = 30 * 1000;
 
-// Every byte under ARCHIVE_DIR, not just the .jsonl. `index.db` lives in this
-// directory and holds a full second copy of every entry's text (entries_fts is
-// FTS5 without `content=`), plus a WAL, plus a .meta per transcript — measured
-// at 2.4x the .jsonl total on realistic prose. A ceiling whose stated job is
-// keeping this volume writable for the hub's state.json has to count what is
-// actually on the volume, or an operator sizing it against free space still
-// fills the disk.
-function walkAllBytes(dir, seen) {
+// The archive's own per-transcript bytes under ARCHIVE_DIR: the `.jsonl` files.
+//
+// NOT `index.db`. It lives in this directory and is genuinely large — a second
+// full copy of every entry's text (`entries_fts` is FTS5 with no `content=`),
+// plus a WAL, measured at ~2.4x the .jsonl total — so counting it looks like the
+// more honest measure of the volume. It is not, because the ceiling is enforced
+// by REFUSING INGEST, and refusing ingest does not shrink a database. Counted,
+// it produced a store that could never be reopened: an operator who deleted
+// every transcript was still full, because the db and its WAL alone exceeded the
+// ceiling, and nothing reaps rows for a deleted file or VACUUMs (measured: 84
+// ingest attempts over 421s still refused, capacity per fill/delete cycle
+// ratcheting 429 transcripts down to 4). A budget may only bound what its
+// enforcement can actually reclaim.
+//
+// So the index is OVERHEAD the operator sizes the volume for, not budget. Size
+// ARCHIVE_TOTAL_MAX_BYTES at roughly a third of the space you can spare, or
+// measure it — the ratio moves with how much prose the transcripts carry. The
+// `.meta` sidecars are uncounted too: 267 bytes each, bounded by transcript
+// count, and rewritten in place rather than grown.
+//
+// A subdirectory we cannot read is SKIPPED, not fatal. It costs us that subtree
+// (an under-measure, which the ceiling errs toward anyway), where letting it
+// propagate froze the whole store: one over-long path or one root-owned
+// directory left the baseline latched and no deletion ever seen again. Only a
+// failure to read ARCHIVE_DIR ITSELF is a failed measurement — that is the whole
+// store being unreadable, not one corner of it.
+function walkJsonlBytes(dir, depth) {
   let names;
   try {
     names = fs.readdirSync(dir, { withFileTypes: true });
   } catch (e) {
-    // Distinguish "nothing here" from "couldn't look". ENOENT on ARCHIVE_DIR is
-    // the store being genuinely absent — 0 is the right answer and is what lets
-    // a removed directory be recreated instead of latching full forever.
-    // Anything else (EMFILE from fd exhaustion, EACCES, EIO) is a FAILED
-    // measurement, and must not be recorded as one: see the caller.
-    if (e.code === "ENOENT") return 0;
-    throw e;
+    // ENOENT at the root is the store genuinely absent: 0 is right, and is what
+    // lets a removed directory be recreated instead of latching full forever.
+    if (depth === 0 && e.code !== "ENOENT") throw e;
+    return 0;
   }
   let bytes = 0;
   for (const d of names) {
@@ -285,8 +301,8 @@ function walkAllBytes(dir, seen) {
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const full = path.join(dir, d.name);
     if (d.isDirectory()) {
-      bytes += walkAllBytes(full, seen);
-    } else if (d.isFile()) {
+      bytes += walkJsonlBytes(full, depth + 1);
+    } else if (d.isFile() && d.name.endsWith(".jsonl")) {
       // One unreadable file must not abandon the measurement and hand back a
       // total far under the truth — skip it and keep counting.
       try { bytes += fs.statSync(full).size; } catch { /* raced with a delete */ }
@@ -334,15 +350,20 @@ function totalArchiveBytes(now, maxAgeMs) {
   if (now - totalCache.at < age) return totalCache.bytes + writtenSinceWalk;
   let bytes;
   try {
-    bytes = walkAllBytes(ARCHIVE_DIR);
+    bytes = walkJsonlBytes(ARCHIVE_DIR, 0);
   } catch (e) {
     // A measurement we FAILED to take is not a measurement of zero. Recording
     // it would re-baseline to nothing and zero the charge, so each such blip
     // would hand out a whole fresh ceiling — measured amplifying to 6.2x the
     // ceiling over five blips, silently, with the store reading full throughout.
     // Keep the last real baseline and let the charge keep accruing on top.
+    // Advance the clock without touching the baseline: keep the last real
+    // measurement, but do NOT retry on every single call. Left un-stamped this
+    // re-walked per call — measured 20 synchronous walks per beat, on the one
+    // event loop, at exactly the moment the filesystem is sick and slow.
     console.error(`archive: could not measure ${ARCHIVE_DIR} (${e.code || e.message}); ` +
       `keeping the previous total of ${totalCache.bytes} bytes`);
+    totalCache = { at: now, bytes: totalCache.bytes };
     return totalCache.bytes + writtenSinceWalk;
   }
   totalCache = { at: now, bytes };
@@ -353,9 +374,13 @@ function totalArchiveBytes(now, maxAgeMs) {
 // The ceiling's own read of the total: once it says full, re-measure on the
 // short cadence so freeing space is noticed in seconds rather than minutes.
 function totalForCeiling(now) {
-  const total = totalArchiveBytes(now);
-  if (!ARCHIVE_TOTAL_MAX || total < ARCHIVE_TOTAL_MAX) return total;
-  return totalArchiveBytes(now, FULL_RECHECK_MS);
+  now = now || Date.now();
+  // Read on the short cadence when the last answer was "full", so freeing space
+  // is noticed in seconds. One call, not two: asking twice walked twice on the
+  // beat that flipped it.
+  const wasFull = ARCHIVE_TOTAL_MAX > 0 &&
+    totalCache.bytes + writtenSinceWalk >= ARCHIVE_TOTAL_MAX;
+  return totalArchiveBytes(now, wasFull ? FULL_RECHECK_MS : undefined);
 }
 
 // Test seam: drop the cache so a test observes a recovery without waiting out

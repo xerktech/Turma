@@ -203,16 +203,24 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
       measured 4.85 GiB written past a 4 MiB ceiling in one window. Growth is therefore exact
       (overshoot ≤ one chunk) and only DELETION is stale, which is why `TOTAL_CACHE_MS` can be
       minutes: waiting one window to notice an operator freeing space costs nothing.
-    - It counts **every file under `ARCHIVE_DIR`, not just the `.jsonl`**: `index.db` defaults to
-      living there and holds a second full copy of every entry's text (`entries_fts` is FTS5 with
-      no `content=`), plus a WAL and a `.meta` each — measured at 2.4× the `.jsonl` total. A
-      ceiling protecting this volume has to count what is on it.
+    - It counts the **`.jsonl` files only — deliberately NOT `index.db`**, even though the index
+      sits in the same directory and is ~2.4× their size. A ceiling enforced by REFUSING INGEST may
+      only bound what refusing can reclaim, and refusing does not shrink a database: nothing reaps
+      its rows for a deleted file and nothing VACUUMs, so counted, an operator who deleted every
+      transcript stayed full forever (measured: still refusing after 84 attempts / 421 s, capacity
+      per fill-delete cycle ratcheting 429 transcripts down to 4). The index and the `.meta`
+      sidecars are **overhead to size the volume for, not budget** — leave roughly 3× the ceiling.
     - **A walk that THROWS is not a measurement of zero** — only ENOENT on `ARCHIVE_DIR` is (that
       is the store genuinely absent, and what lets a removed directory be recreated instead of
       latching full). Anything else — EMFILE from fd exhaustion, EACCES, EIO — keeps the last
-      baseline, because recording the failure re-baselines to nothing AND zeroes the charge, so
-      each blip hands out a whole fresh ceiling: measured amplifying to 6.2× over five blips,
-      silently, with the store reading full throughout.
+      baseline **and stamps the cache** so it isn't retried per call, because recording the failure
+      re-baselines to nothing AND zeroes the charge, so each blip hands out a whole fresh ceiling:
+      measured amplifying to 6.2× over five blips, silently, with the store reading full throughout.
+    - That applies to **`ARCHIVE_DIR` itself only**. An unreadable SUBDIRECTORY is skipped and costs
+      its subtree — an under-measure, which this errs toward anyway. Propagating it froze the
+      baseline permanently, so no deletion was ever seen again and the store latched full with no
+      exit; one root-owned directory (an expected state per the run-as-identity rules) or one
+      over-long path was enough.
     - Once it reads full it re-measures on `FULL_RECHECK_MS` instead — precision is worth most
       exactly then, ingest is refusing anyway so a walk costs no throughput, and this is what
       bounds how long an operator waits after freeing space.

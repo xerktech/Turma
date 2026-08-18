@@ -18,11 +18,10 @@ const { DatabaseSync } = require("node:sqlite");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "turma-archive-budget-"));
 process.env.ARCHIVE_DIR = path.join(TMP, "archive");
-// Deliberately OUTSIDE ARCHIVE_DIR: the walk counts every file under it, and an
-// empty index.db is already ~185 KB, which would swamp the small ceilings these
-// tests use. That it IS counted in the production layout (ARCHIVE_DB defaults
-// inside ARCHIVE_DIR) is what the "counts every file" test below asserts.
-process.env.ARCHIVE_DB = path.join(TMP, "index.db");
+// INSIDE ARCHIVE_DIR, matching the production default — the ceiling must be
+// exercised in the layout it actually runs in. It works with these small
+// ceilings precisely because the index is NOT counted against them.
+process.env.ARCHIVE_DB = path.join(TMP, "archive", "index.db");
 // Tiny stand-ins for the 16 MiB / 64 GiB defaults. The store ceiling is set
 // above what the budget tests below write, so it engages only in the last test.
 process.env.ARCHIVE_TRANSCRIPT_MAX_BYTES = "4096";
@@ -454,18 +453,136 @@ test("a walk that FAILS keeps the last baseline, so blips can't hand out fresh c
   archive.__resetTotalCache();
 });
 
-test("the total counts EVERY file on the volume, not only the .jsonl", () => {
-  // index.db lives inside ARCHIVE_DIR in the production layout and holds a full
-  // second copy of every entry's text (entries_fts is FTS5 without content=),
-  // plus a WAL and a .meta per transcript — 2.4x the .jsonl total on realistic
-  // prose. A ceiling whose job is keeping THIS volume writable has to count it.
+test("an unreadable SUBDIRECTORY costs its subtree, never the whole store", (t) => {
+  // The asymmetry, deliberately: letting a nested error propagate froze the
+  // baseline forever, so no deletion was ever seen again and the store latched
+  // full with no exit. One root-owned or over-long directory is enough. Losing
+  // that subtree is an under-measure, which the ceiling errs toward anyway.
+  //
+  // A SECOND repo folder holds the unreadable part, so the expected answer is a
+  // specific non-zero number: "everything except that subtree". Asserting only
+  // "less than the real total" would pass on a frozen zero, which is the very
+  // failure this pins.
+  const otherDir = path.join(process.env.ARCHIVE_DIR, "otherrepo");
+  fs.mkdirSync(otherDir, { recursive: true });
+  fs.writeFileSync(path.join(otherDir, "x.jsonl"), "y".repeat(3333));
+  archive.__resetTotalCache();
+  const real = archive.totalArchiveBytes();
+  const withoutOther = real - 3333;
+  assert.ok(withoutOther > 0);
+
+  const realReaddir = fs.readdirSync;
+  t.mock.method(fs, "readdirSync", (p2, ...rest) => {
+    if (String(p2) === otherDir) {
+      const e = new Error("EACCES: permission denied");
+      e.code = "EACCES";
+      throw e;
+    }
+    return realReaddir(p2, ...rest);
+  });
+  archive.__resetTotalCache();
+  const measured = archive.totalArchiveBytes();
+  t.mock.restoreAll();
+
+  // Exactly the rest of the store — measured, not frozen and not thrown.
+  assert.equal(measured, withoutOther);
+  archive.__resetTotalCache();
+  assert.equal(archive.totalArchiveBytes(), real, "and it comes back when readable");
+  fs.rmSync(otherDir, { recursive: true });
+  archive.__resetTotalCache();
+});
+
+test("a failed walk is rate-limited, not retried on every call", (t) => {
+  // Synchronous, on the one event loop, at exactly the moment the filesystem is
+  // sick and slow — so a failure must not re-walk per call. Left un-stamped this
+  // measured 20 walks per beat.
+  archive.__resetTotalCache();
+  const t0 = Date.now();
+  archive.totalArchiveBytes(t0);
+  let reads = 0;
+  const realReaddir = fs.readdirSync;
+  t.mock.method(fs, "readdirSync", (p2, ...rest) => {
+    if (String(p2) === process.env.ARCHIVE_DIR) {
+      reads++;
+      const e = new Error("EIO");
+      e.code = "EIO";
+      throw e;
+    }
+    return realReaddir(p2, ...rest);
+  });
+  const at = t0 + 6 * 60_000;
+  for (let i = 0; i < 25; i++) archive.totalArchiveBytes(at);
+  t.mock.restoreAll();
+  archive.__resetTotalCache();
+  assert.equal(reads, 1, `re-walked ${reads} times on a failing store`);
+});
+
+test("the CALL SITES read through totalForCeiling, not the raw total", () => {
+  // Pinning the helper alone left both product call sites free to bypass it —
+  // reverting them failed no test at all. Each is checked on its own: seed a
+  // full baseline on the real clock, then jump past FULL_RECHECK_MS but nowhere
+  // near TOTAL_CACHE_MS, so only a call site that re-measures sees recovery.
+  const max = Number(process.env.ARCHIVE_TOTAL_MAX_BYTES);
+  const realNow = Date.now;
+  const jumpPast = (fn) => {
+    archive.__resetTotalCache(max + 5000);          // last walk said: full
+    const at = realNow() + 45_000;
+    Date.now = () => at;
+    try { return fn(); } finally { Date.now = realNow; }
+  };
+  try {
+    archive.__resetTotalCache(max + 5000);
+    assert.equal(archive.archiveLimits([]).full, true, "should start full");
+
+    assert.equal(jumpPast(() => archive.archiveLimits([]).full), false,
+      "archiveLimits bypassed the re-check");
+
+    // Exactly AT the ceiling counts as full for the re-check decision, same as
+    // for the refusal itself — otherwise a store sitting on the line never
+    // re-measures and never notices space being freed.
+    archive.__resetTotalCache(max);
+    const atLine = realNow() + 45_000;
+    Date.now = () => atLine;
+    try {
+      assert.ok(archive.totalForCeiling() < max, "a store exactly at the ceiling never re-checked");
+    } finally { Date.now = realNow; }
+
+    const r = jumpPast(() => archive.ingestChunk("nas", "recheck",
+      { ...META, summary: "Recheck" }, 0, 40,
+      [{ uuid: "rc1", role: "user", ts: "2026-07-10T00:13:00Z", text: "ok" }]));
+    assert.equal(r.full, undefined, "ingestChunk bypassed the re-check");
+    assert.equal(r.bytesStored, 40);
+  } finally {
+    Date.now = realNow;
+    archive.__resetTotalCache();
+  }
+});
+
+test("the index is NOT counted against the ceiling — refusing ingest can't shrink it", () => {
+  // The ceiling is enforced by refusing ingest, so it may only bound what that
+  // refusal can reclaim. index.db is on this volume and is ~2.4x the .jsonl
+  // total, but nothing reaps its rows for a deleted file and nothing VACUUMs —
+  // counted, an operator who deleted every transcript stayed full forever.
   archive.__resetTotalCache();
   const before = archive.totalArchiveBytes();
-  const stray = path.join(process.env.ARCHIVE_DIR, "index.db");
+  // db + WAL + sidecars: whatever SQLite has on disk right now, wherever it
+  // keeps it (WAL mode leaves most of it in index.db-wal until a checkpoint).
+  let overhead = 0;
+  const stack = [process.env.ARCHIVE_DIR];
+  while (stack.length) {
+    for (const d of fs.readdirSync(stack.pop(), { withFileTypes: true })) {
+      const full = path.join(d.parentPath || d.path, d.name);
+      if (d.isDirectory()) stack.push(full);
+      else if (!d.name.endsWith(".jsonl")) overhead += fs.statSync(full).size;
+    }
+  }
+  assert.ok(overhead > 100_000, `index+sidecars only ${overhead} bytes`);
+  // ...and a stray non-.jsonl file is not budget either.
+  const stray = path.join(process.env.ARCHIVE_DIR, "turma", "notes.txt");
   fs.writeFileSync(stray, Buffer.alloc(7777));
   try {
     archive.__resetTotalCache();
-    assert.equal(archive.totalArchiveBytes(), before + 7777);
+    assert.equal(archive.totalArchiveBytes(), before);
   } finally {
     fs.rmSync(stray);
     archive.__resetTotalCache();
@@ -521,7 +638,7 @@ test("a walk re-baselines: bytes counted once, not twice", () => {
     for (const d of fs.readdirSync(stack.pop(), { withFileTypes: true })) {
       const full = path.join(d.parentPath || d.path, d.name);
       if (d.isDirectory()) stack.push(full);
-      else if (d.isFile()) real += fs.statSync(full).size;   // every file, not just .jsonl
+      else if (d.isFile() && d.name.endsWith(".jsonl")) real += fs.statSync(full).size;
     }
   }
   assert.equal(walked, real, "the walk double-counted the window's writes");
