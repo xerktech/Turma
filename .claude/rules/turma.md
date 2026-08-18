@@ -227,8 +227,6 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
       "deleted" drops the row and resets the cursor, and since ingest APPENDS, the re-push writes a
       SECOND copy of the conversation into a file that was there all along; guessing "present"
       latches the ceiling shut with no exit. Both were built and both were reproduced.
-    - An unreadable `ARCHIVE_DIR` therefore measures **0, i.e. not full** — a store whose directory
-      was removed recreates it and carries on, rather than refusing fleet-wide forever.
   - **A deleted `.jsonl` whose index row survives leaves the cursor alone** and the next delta
     appends onto the gap — pre-existing, tracked as XERK-280. Repairing it needs a reliable answer
     to "was this deleted", which is the thing above that cannot be had cheaply.
