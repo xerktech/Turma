@@ -175,6 +175,14 @@ paths:
   every `/api/agents` body — and `USAGE_LEDGER_SERVE_MAX` (1 MiB) bounds what `retiredUsage` may add
   to one payload, newest-first. Both truncations and the `USAGE_LEDGER_REPOS` one are **logged**: a
   Usage page quietly missing history reads as a fleet that spent less, with nothing to say otherwise.
+  - **Rendering STOPS at the first drop**, because `retiredAgents` runs inside `buildAgentsCache` and
+    is therefore a hub-wide stall like every other synchronous step there: 32 retired hosts at the
+    day/repo ceilings measured 45.5 ms to render, of which 4 fit, against 13.6 ms once the loop stops.
+    Deliberately NOT "stop once `bytes` reaches the ceiling" — the total plateaus below it as soon as
+    every remaining host individually overflows what is left, so that version renders all 32 and saves
+    nothing (measured: no change). The cost is that a small old host can no longer squeeze in behind a
+    large newer one, which is the better rule anyway: what a truncation gives up is always the oldest
+    history rather than whatever happened to fit.
 - **The fold makes a host's SERVED block bigger than its stored one**, since the stored record stays
   the raw report: measured at 1.8x on a deliberately heavy host (40 repos x 60 days), 218 KB against
   its 123 KB record, and 1.8 ms to build. It is bounded by `USAGE_LEDGER_DAYS` x
