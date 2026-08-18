@@ -10469,6 +10469,25 @@ class TestResolveWorkflowRun(unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         return d
 
+    def _record(self, run_id, agents):
+        """The run's own record, a SIBLING of subagents/ at
+        <stem>/workflows/<runId>.json. `agents` is [(agentId, label, state)].
+        Shape taken from a real Claude Code 2.1 run record."""
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        progress = [{"type": "workflow_phase", "index": 1, "title": "Probe"}]
+        for i, (aid, label, state) in enumerate(agents, start=1):
+            progress.append({
+                "type": "workflow_agent", "index": i, "label": label,
+                "phaseIndex": 1, "phaseTitle": "Probe", "agentId": aid,
+                "state": state, "startedAt": 1787023867583 + i * 1000,
+                "promptPreview": "…", "attempt": 1,
+            })
+        with open(os.path.join(d, run_id + ".json"), "w") as f:
+            json.dump({"runId": run_id, "workflowName": "fixture",
+                       "status": "completed", "workflowProgress": progress}, f)
+        return os.path.join(self.tmp, "main.jsonl")
+
     def _agent(self, run_dir, aid, prompt, ts, meta=None, done=False):
         with open(os.path.join(run_dir, "agent-%s.jsonl" % aid), "w") as f:
             f.write(json.dumps({"type": "user", "uuid": "u-" + aid,
@@ -10551,6 +10570,95 @@ class TestResolveWorkflowRun(unittest.TestCase):
                          ["a7cee247530950375", "a6e2ac4a81e8d4ede"])
         self.assertEqual(rows[0]["label"], "Reply with exactly the word: alpha.")
         self.assertEqual([r["status"] for r in rows], ["running", "done"])
+
+    def test_the_run_record_names_the_rows(self):
+        # The whole point of the picker: a fan-out over ONE prompt template
+        # renders every row identically unless the script's own `label:` is
+        # used, and the run record is the only place on disk that has it.
+        self._write_main(self._launch("fixture", "wf_rec111"))
+        run = self._run_dir("wf_rec111")
+        prompt = "Write a thorough essay of approximately 900 words on "
+        for aid in ("ag1", "ag2", "ag3"):
+            self._agent(run, aid, prompt, "2026-08-18T03:31:07.583Z", done=True)
+        self._record("wf_rec111", [("ag1", "essay:compilers", "done"),
+                                   ("ag2", "essay:filesystems", "done"),
+                                   ("ag3", "essay:networking", "running")])
+        rec = ha._workflow_run_record(self.main, "wf_rec111")
+        rows, _ = ha._workflow_agents(run, rec)
+        self.assertEqual([r["label"] for r in rows],
+                         ["essay:compilers", "essay:filesystems", "essay:networking"])
+        # Without it every row is the same string — a picker you cannot pick from.
+        plain, _ = ha._workflow_agents(run)
+        self.assertEqual(len({r["label"] for r in plain}), 1)
+
+    def test_a_recorded_state_is_passed_through_not_flattened(self):
+        # "failed"/"skipped" are worth seeing; collapsing them to done/running
+        # hides an agent that never produced anything.
+        self._write_main(self._launch("fixture", "wf_rec222"))
+        run = self._run_dir("wf_rec222")
+        for aid in ("ag1", "ag2"):
+            self._agent(run, aid, "work", "2026-08-18T03:31:07.583Z", done=True)
+        self._record("wf_rec222", [("ag1", "one", "failed"), ("ag2", "two", "skipped")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec222"))
+        self.assertEqual([r["status"] for r in rows], ["failed", "skipped"])
+
+    def test_the_record_orders_the_rows_by_launch_index(self):
+        self._write_main(self._launch("fixture", "wf_rec333"))
+        run = self._run_dir("wf_rec333")
+        # Written with timestamps in the OPPOSITE order to the record's index,
+        # so only the index can produce the expected sequence.
+        self._agent(run, "late", "b", "2026-08-18T03:31:01.000Z", done=True)
+        self._agent(run, "early", "a", "2026-08-18T03:31:09.000Z", done=True)
+        self._record("wf_rec333", [("early", "first", "done"), ("late", "second", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec333"))
+        self.assertEqual([r["id"] for r in rows], ["early", "late"])
+
+    def test_an_agent_the_record_misses_still_gets_a_row(self):
+        # A partially-recorded run must stay deterministic and complete: the
+        # uncovered agent falls back to its prompt and sorts after the rest.
+        self._write_main(self._launch("fixture", "wf_rec444"))
+        run = self._run_dir("wf_rec444")
+        self._agent(run, "known", "recorded work", "2026-08-18T03:31:07.000Z", done=True)
+        self._agent(run, "orphan", "unrecorded work", "2026-08-18T03:31:08.000Z", done=True)
+        self._record("wf_rec444", [("known", "the recorded one", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec444"))
+        self.assertEqual([r["id"] for r in rows], ["known", "orphan"])
+        self.assertEqual(rows[1]["label"], "unrecorded work")
+
+    def test_a_missing_or_oversized_record_falls_back_to_the_transcripts(self):
+        self._write_main(self._launch("fixture", "wf_rec555"))
+        run = self._run_dir("wf_rec555")
+        self._agent(run, "ag1", "the prompt", "2026-08-18T03:31:07.583Z", done=True)
+        self.assertIsNone(ha._workflow_run_record(self.main, "wf_rec555"))
+        d = os.path.join(self.tmp, "main", "workflows")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "wf_rec555.json"), "w") as f:
+            f.write("x" * (ha.WORKFLOW_RECORD_MAX_BYTES + 1))
+        self.assertIsNone(ha._workflow_run_record(self.main, "wf_rec555"))
+        rows, _ = ha._workflow_agents(run, None)
+        self.assertEqual(rows[0]["label"], "the prompt")
+
+    def test_a_forged_run_id_cannot_name_a_record_either(self):
+        self._write_main(self._launch("fixture", "wf_rec666"))
+        for forged in ("../../../../etc/passwd", "..", "", "wf_../x"):
+            self.assertIsNone(ha._workflow_run_record(self.main, forged))
+
+    def test_the_records_epoch_startedAt_is_normalised_to_ISO(self):
+        # It times agents in epoch ms while the rest of this wire is ISO, and a
+        # field that is a string on one path and a number on the other is what
+        # breaks a typed client's decode.
+        self._write_main(self._launch("fixture", "wf_rec777"))
+        run = self._run_dir("wf_rec777")
+        self._agent(run, "ag1", "work", "2026-08-18T03:31:07.583Z", done=True)
+        self._record("wf_rec777", [("ag1", "named", "done")])
+        rows, _ = ha._workflow_agents(
+            run, ha._workflow_run_record(self.main, "wf_rec777"))
+        self.assertRegex(rows[0]["startedAt"], r"^\d{4}-\d{2}-\d{2}T[\d:]{8}Z$")
+        self.assertEqual(ha._epoch_ms_iso("not a number"), "")
+        self.assertEqual(ha._epoch_ms_iso(None), "")
 
     def test_a_meta_description_beats_the_prompt_when_there_is_one(self):
         self._write_main(self._launch("fixture", "wf_eee555"))

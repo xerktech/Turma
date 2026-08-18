@@ -3243,6 +3243,63 @@ test("XERK-304: a row with no status keeps its omission through the hub", async 
   assert.equal(got.body.agents[1].status, "done");
 });
 
+test("XERK-304: a whitespace-only status omits rather than splitting the clients", async () => {
+  // Web tests truthiness and would paint an empty chip; Android tests isNotBlank
+  // and would hide it. A value that says nothing must not reach either.
+  await request("POST", "/api/heartbeat", { body: { device: "wf6" }, headers: agentHeaders });
+  const url = "/api/agents/wf6/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf6",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], agents: [{ id: "a1", label: "x", status: "   " }],
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.ok(!("status" in got.body.agents[0]));
+});
+
+test("XERK-304: field values are capped, so one row cannot bloat the record", () => {
+  const a = { subagentHistory: { k: { agents: [
+    { id: "i".repeat(5000), label: "l".repeat(5000), status: "s".repeat(5000),
+      startedAt: "t".repeat(5000) },
+  ] } } };
+  hub.normalizeRecord(a);
+  const row = a.subagentHistory.k.agents[0];
+  for (const f of ["id", "label", "status", "startedAt"]) {
+    assert.equal(row[f].length, 256, `${f} must be capped`);
+  }
+});
+
+test("XERK-304: a state.json restore re-coerces the cached workflow rows", () => {
+  // The cache is PERSISTED, so a restart serves whatever was on disk — and the
+  // restore is the first thing a freshly-shipped coercion has to cover. Without
+  // this the typed Android decode meets `status: 99` straight off the volume.
+  const a = {
+    device: "h",
+    subagentHistory: {
+      k1: { agents: [
+        { id: "a1", label: { deep: "object" }, startedAt: 12345, status: 99 },
+        "not-an-object",
+      ], agentsTruncated: "yes" },
+      k2: { entries: [{ id: "1", role: "user", text: "hi" }] },  // a transcript
+      k3: { agents: "lots" },
+    },
+  };
+  hub.normalizeRecord(a);
+  // Every value becomes a string — `status: 99` is the one that throws Android's
+  // typed decode — and the bare string element is dropped for having no id.
+  assert.deepEqual(a.subagentHistory.k1.agents,
+    [{ id: "a1", label: "[object Object]", startedAt: "12345", status: "99" }]);
+  assert.equal(a.subagentHistory.k1.agentsTruncated, true);
+  assert.ok(!("agents" in a.subagentHistory.k2),
+    "a plain transcript must not grow an agents key on restore");
+  assert.equal(a.subagentHistory.k3.agents, null, "junk becomes 'not a run'");
+});
+
 test("XERK-304: a non-array `agents` leaves the reply a plain transcript", async () => {
   // `agents` present is what means "this is a run", so a junk value must not be
   // able to turn an ordinary transcript into a list.

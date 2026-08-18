@@ -1958,7 +1958,10 @@ function sanitizeWorkflowAgents(raw) {
     // "that agent can't tell" is the fleet-wide rule — normalizing every row to
     // a full shape would put that back as `""`, so the wire could no longer
     // express the difference the agent went to trouble to preserve.
-    const status = safeString(a.status).slice(0, WORKFLOW_AGENT_FIELD_MAX);
+    // Trimmed, so a whitespace-only value omits rather than becoming a status
+    // the web paints as an empty chip and Android hides — the two clients would
+    // disagree about a row that says nothing.
+    const status = safeString(a.status).trim().slice(0, WORKFLOW_AGENT_FIELD_MAX);
     if (status) row.status = status;
     out.push(row);
     if (out.length >= WORKFLOW_AGENTS_MAX) break;
@@ -2811,6 +2814,21 @@ function dropUnusableHostKeys(store) {
   return dropped;
 }
 
+// The workflow picker's rows are coerced at heartbeat ingest, but the cache they
+// land in is PERSISTED — so a restart serves whatever was on disk, uncoerced,
+// and the restore is the first thing a freshly-shipped coercion has to cover
+// (XERK-304). Same rule as every other typed field: it belongs in
+// normalizeRecord, which runs on the ingest AND the restore.
+function normalizeSubagentHistory(a) {
+  const cache = a && a.subagentHistory;
+  if (!cache || typeof cache !== "object") return;
+  for (const entry of Object.values(cache)) {
+    if (!entry || typeof entry !== "object") continue;
+    if ("agents" in entry) entry.agents = sanitizeWorkflowAgents(entry.agents);
+    entry.agentsTruncated = !!entry.agentsTruncated;
+  }
+}
+
 function normalizeRecord(a) {
   // Order is NOT load-bearing, and must not become so: each of these guards its
   // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
@@ -2818,6 +2836,7 @@ function normalizeRecord(a) {
   // this one, uncoerced, on every boot. Sessions first only because it is the
   // one that rewrites a shape the others iterate.
   normalizeSessions(a);
+  normalizeSubagentHistory(a);
   normalizeUsage(a);
   normalizeLimits(a);
   normalizeSubscription(a);

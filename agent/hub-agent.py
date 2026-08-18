@@ -4936,6 +4936,10 @@ VALID_WORKFLOW_RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]{1,64}$")
 # One run may legally spawn up to a thousand agents. The list is a picker, so it
 # is capped and flagged rather than served whole.
 WORKFLOW_AGENTS_MAX = 200
+# The run record embeds the whole script plus a preview per agent, so it grows
+# with the run. Bounded because it is read whole (json.load) on a memory-limited
+# container; past this the picker falls back to the transcripts.
+WORKFLOW_RECORD_MAX_BYTES = 1 << 24
 WORKFLOW_AGENT_LABEL_CHARS = 160
 # A workflow agent's transcript opens with its prompt, so the label read never
 # has to walk far in; these only bound a pathological one. The BYTE bound is the
@@ -5167,12 +5171,15 @@ def _workflow_finished_agents(run_dir):
 def _workflow_agent_label(path):
     """The name to show for one workflow agent, or "".
 
+    The FALLBACK path only — the run record's `workflowProgress` carries the
+    script's own `label:` and is tried first (see _workflow_agents). This is what
+    a run whose record is missing gets instead.
+
     A workflow agent's `agent-<id>.meta.json` carries only
-    `{"agentType":"workflow-subagent","spawnDepth":1}` — no description — and the
-    script's own `label:` option is persisted NOWHERE on disk, so the row is
-    named from the agent's FIRST PROMPT, the one thing written down that says
-    what it was asked to do. A meta `description` still wins when there is one,
-    so an ordinary subagent (whose meta does carry it) keeps naming itself."""
+    `{"agentType":"workflow-subagent","spawnDepth":1}`, with no description, so
+    there is nothing to read there and the row falls back to the agent's FIRST
+    PROMPT. A meta `description` still wins when there is one, so an ordinary
+    subagent (whose meta does carry it) keeps naming itself."""
     meta = path[:-len(".jsonl")] + ".meta.json"
     try:
         with open(meta, errors="replace") as f:
@@ -5199,25 +5206,105 @@ def _workflow_agent_started(path):
     return ""
 
 
-def _workflow_agents(run_dir):
-    """(rows, truncated) for a workflow run's agent picker, oldest launch first:
+def _epoch_ms_iso(ms):
+    """An epoch-milliseconds number as an ISO timestamp, or "" — the run record
+    times its agents in epoch ms while everything on this wire is ISO, and a
+    field that is a string on one path and a number on the other is exactly the
+    shape that breaks a typed client's decode."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ms) / 1000.0))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _workflow_progress_rows(record):
+    """{agentId: {label, state, index, startedAt}} from a run record's
+    `workflowProgress`, or {} — the run's OWN account of the agents it launched.
+
+    Phase rows and any entry without an agentId are skipped."""
+    out = {}
+    for row in (record or {}).get("workflowProgress") or []:
+        if not isinstance(row, dict) or row.get("type") != "workflow_agent":
+            continue
+        aid = str(row.get("agentId") or "").strip()
+        if not aid:
+            continue
+        out[aid] = {
+            "label": str(row.get("label") or "").strip(),
+            "state": str(row.get("state") or "").strip(),
+            "index": row.get("index"),
+            "startedAt": _epoch_ms_iso(row.get("startedAt")),
+        }
+    return out
+
+
+def _workflow_agents(run_dir, record=None):
+    """(rows, truncated) for a workflow run's agent picker, launch order first:
     ([{id, label, startedAt, status?}], bool).
 
-    Ordered by each transcript's FIRST timestamp — launch order — rather than by
-    mtime, which reorders itself live as the agents write. `status` is omitted
-    entirely when the run's journal can't answer (see _workflow_finished_agents);
-    an absent field means "can't tell", exactly as it does on the heartbeat."""
+    Named from the RUN RECORD wherever it covers an agent: its `workflowProgress`
+    carries the script's own `label:` (`review:bugs`, `essay:compilers`) and a
+    real per-agent `state`. **Nothing else on disk has that label**, so without
+    the record every row of a fan-out over one prompt template renders
+    IDENTICALLY — a picker you cannot pick from, which is the whole point of the
+    row. The fallbacks below are for a run whose record is missing.
+
+    Covering an agent from the record also means NOT READING ITS TRANSCRIPT AT
+    ALL, which is what keeps a large fan-out off the beat loop: `handle_commands`
+    runs synchronously in the heartbeat, so per-agent head reads are beat latency.
+
+    Order is the record's own `index` — launch order, which is what the operator
+    watched happen. Anything the record doesn't cover sorts after it by the
+    transcript's first timestamp (never mtime, which reorders live as agents
+    write), so a partially-recorded run stays deterministic.
+
+    `status` is omitted entirely when neither the record nor the run's journal
+    can answer; an absent field means "can't tell", exactly as on the heartbeat."""
     files = _workflow_agent_files(run_dir)
-    done = _workflow_finished_agents(run_dir)
+    progress = _workflow_progress_rows(record)
+    done = None if progress else _workflow_finished_agents(run_dir)
     rows = []
     for aid, path in files.items():
-        row = {"id": aid, "label": _workflow_agent_label(path),
-               "startedAt": _workflow_agent_started(path)}
-        if done is not None:
+        known = progress.get(aid) or {}
+        label = known.get("label") or ""
+        row = {"id": aid,
+               "label": label[:WORKFLOW_AGENT_LABEL_CHARS] if label
+               else _workflow_agent_label(path),
+               "startedAt": known.get("startedAt") or _workflow_agent_started(path)}
+        if known.get("state"):
+            # Passed through as the run recorded it — "failed" and "skipped" are
+            # worth seeing, and flattening them to done/running hides an agent
+            # that never produced anything.
+            row["status"] = known["state"][:WORKFLOW_AGENT_LABEL_CHARS]
+        elif done is not None:
             row["status"] = "done" if aid in done else "running"
-        rows.append(row)
-    rows.sort(key=lambda r: (r["startedAt"], r["id"]))
-    return rows[:WORKFLOW_AGENTS_MAX], len(rows) > WORKFLOW_AGENTS_MAX
+        idx = known.get("index")
+        rows.append((idx if isinstance(idx, int) else None, row))
+    rows.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0,
+                             t[1]["startedAt"], t[1]["id"]))
+    out = [r for _i, r in rows]
+    return out[:WORKFLOW_AGENTS_MAX], len(out) > WORKFLOW_AGENTS_MAX
+
+
+def _workflow_run_record(main_path, run_id):
+    """The run's own record, `<stem>/workflows/<runId>.json`, or None.
+
+    A SIBLING of `subagents/`, not a child of it — the workflow runtime keeps the
+    run's account (script, phases, `workflowProgress`, status) here while the
+    agents' transcripts go under `subagents/workflows/<runId>/`. Best-effort:
+    every fallback in _workflow_agents exists because this can be absent."""
+    if not VALID_WORKFLOW_RUN_ID_RE.match(run_id or ""):
+        return None
+    stem = main_path[:-len(".jsonl")] if main_path.endswith(".jsonl") else main_path
+    path = os.path.join(stem, WORKFLOW_RUNS_SUBDIR, run_id + ".json")
+    try:
+        if os.path.getsize(path) > WORKFLOW_RECORD_MAX_BYTES:
+            return None      # the script and every result preview live in here
+        with open(path, errors="replace") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
 
 
 def _workflow_agent_path(run_dir, agent_id):
@@ -12458,7 +12545,8 @@ class SessionManager:
                 self.subagent_history_results.append(result)
                 return
             if not (agent_id or "").strip():
-                agents, agents_truncated = _workflow_agents(run_dir)
+                agents, agents_truncated = _workflow_agents(
+                    run_dir, _workflow_run_record(main, os.path.basename(run_dir)))
                 result["agents"] = agents
                 result["agentsTruncated"] = agents_truncated
                 self.subagent_history_results.append(result)

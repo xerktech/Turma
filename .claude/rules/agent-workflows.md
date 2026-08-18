@@ -17,7 +17,13 @@ The layout Claude Code writes, one level deeper than an ordinary background agen
 <slug>/<transcript-id>/subagents/workflows/<runId>/agent-<x>.jsonl
                                                    agent-<x>.meta.json
                                                    journal.jsonl
+<slug>/<transcript-id>/workflows/<runId>.json        <- the RUN RECORD, a SIBLING
+<slug>/<transcript-id>/workflows/scripts/<name>-<runId>.js
 ```
+
+A child `workflow()` run writes its agents FLAT into the parent's run dir, sharing its journal —
+the walk in `_workflow_agent_files` is belt-and-braces, not a requirement. The sibling tree above
+is the run RECORD, never a nested agent dir.
 
 - **`agents` PRESENT — the empty list included — is what tells every client it got a list.**
   `_stage_subagent_history` answers a `workflow` row with `agents`, and only a second request
@@ -31,10 +37,24 @@ The layout Claude Code writes, one level deeper than an ordinary background agen
   untrusted input on a path join, and it is stale for a session MIGRATED to a host mounting
   `REPOS_ROOT` elsewhere, where the run id still resolves because the dir is rebuilt under this
   transcript's own tree.
-- **A workflow agent's name comes from its FIRST PROMPT.** Its `agent-<id>.meta.json` is only
-  `{"agentType":"workflow-subagent","spawnDepth":1}` — no description — and the script's own
-  `label:` option is persisted nowhere, so the prompt is the one thing on disk saying what it was
-  asked to do. A meta `description` still wins when present.
+- **A row is named from the RUN RECORD, and that is what makes the picker usable.** Its
+  `workflowProgress[]` carries the script's own `label:` (`review:bugs`, `essay:compilers`) plus a
+  per-agent `state`, `index` and `startedAt`. **Nothing else on disk has the label** —
+  `agent-<id>.meta.json` is only `{"agentType":"workflow-subagent","spawnDepth":1}` — so a fan-out
+  over one prompt template renders every row IDENTICALLY without it, which is a picker you cannot
+  pick from. An earlier claim that the label "is persisted nowhere" was wrong; do not restore it.
+- **Covering an agent from the record also means NOT reading its transcript.** `handle_commands`
+  runs synchronously in the heartbeat loop, so a large fan-out's per-agent head reads are beat
+  latency — measured at ~1s for 200 agents with 1 MiB prompts, and ~5.7s to fold a 514 MiB journal.
+  Both sit inside `INTERVAL`, but they multiply on slow storage, and the record avoids them.
+- **The fallbacks are for a run whose record is missing**: a meta `description` (an ordinary
+  subagent carries one), then the agent's FIRST PROMPT, then the id; order then falls back to each
+  transcript's first timestamp. `state` likewise falls back to the journal fold below.
+- **A recorded `state` is passed through as the run wrote it** — "failed" and "skipped" are worth
+  seeing, and flattening them to done/running hides an agent that never produced anything.
+- **`startedAt` is normalised to ISO.** The record times agents in epoch ms while the rest of this
+  wire is ISO, and a field that is a string on one path and a number on the other is the shape that
+  breaks a typed client's decode.
 - **Run status comes from `journal.jsonl`, and "unreadable" must return None, not an empty set.**
   An empty set claims every agent is still RUNNING, which is what an EACCES, an IO error, or an
   ordinary walk/read race would otherwise paint on a run that finished hours ago — permanently,

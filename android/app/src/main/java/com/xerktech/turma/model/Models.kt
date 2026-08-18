@@ -938,11 +938,13 @@ data class HistoryResponse(
 
 /**
  * One agent of a workflow run, as the picker lists it (XERK-304). [label] is the
- * agent's own description when it has one and otherwise its first prompt — a
- * workflow agent's meta carries no description and the script's `label:` option
- * is not persisted, so the prompt is the only thing on disk that says what it was
- * asked to do. [status] is absent when the run's journal cannot say, and is never
- * guessed.
+ * script's own `label:` for that agent, read from the run's record — without it a
+ * fan-out over one prompt template renders every row identically. It falls back
+ * to the agent's description or first prompt for a run with no record, and the
+ * picker falls back to [id] when even that is empty.
+ *
+ * [status] is the state the run recorded ("done", "running", "failed", …), and is
+ * absent — never guessed — when neither the record nor the run's journal can say.
  */
 @Serializable
 data class WorkflowAgent(
