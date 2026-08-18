@@ -11625,8 +11625,16 @@ class SessionManager:
                     # than a failed move, which is the opposite of the trade the
                     # records get. Blaming the records for it would also have
                     # cost a second full pack before the retry raised anyway.
+                    # UNATTRIBUTABLE ERRORS REFUSE. tarfile only sets
+                    # `filename` for path operations — its own short-read
+                    # ("unexpected end of data", from a file that shrank
+                    # mid-pack) carries none — and dropping on that would ship a
+                    # TRUNCATED subagent transcript with a log line blaming the
+                    # records. Wrongly refusing costs a visible, retryable failed
+                    # move; wrongly dropping loses conversation data silently, so
+                    # "can't tell which tree" resolves to refuse.
                     fn = str(getattr(e, "filename", "") or "")
-                    if fn and fn != runs and not fn.startswith(runs + os.sep):
+                    if not fn or (fn != runs and not fn.startswith(runs + os.sep)):
                         raise
                     log(f"migration: workflow records for {tid} unreadable "
                         f"({e}); not carrying them")

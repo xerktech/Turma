@@ -65,11 +65,15 @@ is the run RECORD, never a nested agent dir.
   session accumulates a record per run. The bundle is built WITH them and rebuilt WITHOUT them if
   the finished blob is over `MIGRATION_BLOB_MAX` or the tree could not be read — trading a working
   move for prettier labels is the wrong way round.
-  - **That drop is scoped to the records by the error's own filename.** An unreadable file under
-    `subagents/`, or an unreadable main transcript, is RE-RAISED so the move refuses loudly:
-    conversation data losing itself silently is worse than a failed move, which is the opposite of
-    the trade the records get. Swallowing it also bought a second full pack before the retry raised
-    anyway.
+  - **That drop is scoped to the records by the error's own filename, and an UNATTRIBUTABLE error
+    refuses.** A failure under `subagents/` or on the main transcript is re-raised so the move fails
+    loudly — conversation data losing itself silently is worse than a failed move, the opposite of
+    the trade the records get. `tarfile` sets `filename` only for path operations, so its own short
+    read (a file that shrank mid-pack) carries none; treating that as a records fault shipped a
+    TRUNCATED subagent transcript while the log blamed the records. Wrongly refusing costs a
+    visible, retryable failed move; wrongly dropping loses data silently — so "can't tell which
+    tree" resolves to refuse. Both clauses of the comparison are load-bearing: a vanished or
+    unreadable records DIR reports the tree itself as the filename, not a path under it.
   - **Measuring the TREE against a constant does not achieve that**, and was the first attempt: the
     ceiling is on the whole bundle, so any records tree — however small, however legal — can push a
     near-ceiling transcript over it. Only the FINISHED size can answer. `WORKFLOW_PACK_MAX_BYTES`

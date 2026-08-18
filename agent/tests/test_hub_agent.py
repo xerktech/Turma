@@ -4544,6 +4544,49 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertEqual(packed.call_count, 1,
                          "a failure outside the records must not buy a second pack")
 
+    def test_an_unreadable_records_DIR_drops_the_records_too(self):
+        # The error's filename is then the tree ITSELF, not something under it —
+        # the shape a vanished-mid-pack tree also produces. Without the equality
+        # clause both invert into refusing the move.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfdirperm")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        os.chmod(runs, 0)
+        self.addCleanup(os.chmod, runs, 0o755)
+        if os.access(runs, os.R_OK):
+            self.skipTest("running as root — an unreadable dir cannot be staged")
+        sm = self._manager()
+        dest = os.path.join(self.tmp, "dest-dirperm")
+        os.makedirs(dest)
+        sm._unpack_transcript(sm._pack_transcript(path), dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "trans1.jsonl")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+        self.assertFalse(os.path.isdir(os.path.join(dest, "trans1", "workflows")))
+
+    def test_an_UNATTRIBUTABLE_pack_error_refuses_rather_than_dropping(self):
+        # tarfile sets `filename` only for path operations; its own short read
+        # ("unexpected end of data", from a file that shrank mid-pack) carries
+        # none. Treating that as a records fault ships a TRUNCATED subagent
+        # transcript with a log line blaming the records — so "can't tell which
+        # tree" has to resolve to refuse: a failed move is visible and
+        # retryable, silent conversation-data loss is neither.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "wfnofn")
+        path = self._write_transcript(wt, "trans1", subagents=True)
+        runs = os.path.join(path[:-len(".jsonl")], "workflows")
+        os.makedirs(runs)
+        with open(os.path.join(runs, "wf_abc123.json"), "w") as f:
+            json.dump({"runId": "wf_abc123"}, f)
+        sm = self._manager()
+        with mock.patch.object(sm, "_pack_bytes",
+                               side_effect=OSError("unexpected end of data")) as packed:
+            with self.assertRaises(OSError):
+                sm._pack_transcript(path)
+        self.assertEqual(packed.call_count, 1, "and it does not buy a second pack")
+
     def test_dir_size_skips_what_it_cannot_read_rather_than_raising(self):
         # A walk/delete race, or a leftover root-owned file, must not raise out
         # of the measure — which would refuse the move it is meant to protect.
