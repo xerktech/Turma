@@ -10628,18 +10628,80 @@ class TestResolveWorkflowRun(unittest.TestCase):
         self.assertEqual(len(done), 40)
         self.assertIn("ag00", done, "the OLDEST result is the one a tail window drops")
 
-    def test_an_over_long_result_line_is_matched_by_its_head_not_buffered(self):
-        # Bounded memory, and the head stops before the result VALUE begins — so
-        # an agent that merely RETURNS the text of a journal record cannot retire
-        # some other agent.
+    def test_an_over_long_result_line_is_still_credited_to_its_own_agent(self):
+        # An agent whose RETURN VALUE contains the text of a journal record must
+        # not retire the agent that text names. JSON escaping is what does this —
+        # inside a string the nested record's quotes are backslash-escaped, so
+        # the unescaped pattern cannot match — and it holds at every length.
         self._write_main(self._launch("big", "wf_lll333"))
         run = self._run_dir("wf_lll333")
         forged = json.dumps({"type": "result", "agentId": "victim"})
         with open(os.path.join(run, "journal.jsonl"), "w") as f:
             f.write(json.dumps({"type": "result", "agentId": "real1",
                                 "result": forged + "y" * (1 << 19)}) + "\n")
+            # Same record with its fields REORDERED, so the forged text sits
+            # ahead of the real id. The anchored marker refuses this line rather
+            # than risk crediting the victim — the cost of the anchor, paid as a
+            # miss (the agent reads as still running), which is the safe way to
+            # be wrong. Real journals write `type` first, so this is the
+            # hypothetical half of the trade, not the live one.
+            f.write(json.dumps({"result": forged + "y" * (1 << 19),
+                                "type": "result", "agentId": "real2"}) + "\n")
         done = ha._workflow_finished_agents(run)
         self.assertEqual(done, {"real1"})
+        self.assertNotIn("victim", done, "never the agent named inside a return value")
+
+    def test_a_CORRUPT_over_long_line_cannot_retire_an_agent(self):
+        # The case JSON escaping does NOT cover: a half-written or corrupt line
+        # that is not valid JSON at all and carries a raw record inside it. The
+        # anchored marker is what refuses it — an unanchored search would find
+        # the record anywhere in the line and mark a live agent finished.
+        self._write_main(self._launch("big", "wf_ooo666"))
+        run = self._run_dir("wf_ooo666")
+        raw = b'{"type":"result","agentId":"victim"}'
+        with open(os.path.join(run, "journal.jsonl"), "wb") as f:
+            f.write(b'GARBAGE ' + raw + b'z' * (1 << 19) + b'\n')
+            f.write(json.dumps({"type": "result", "agentId": "real1"}).encode() + b'\n')
+        self.assertEqual(ha._workflow_finished_agents(run), {"real1"})
+
+    def test_a_journal_far_past_any_tail_reports_its_NEWEST_results_too(self):
+        # The read cap is a runaway backstop, not a working limit: reading
+        # forward means hitting it would drop the NEWEST results, so it has to
+        # sit far above any real journal.
+        self._write_main(self._launch("big", "wf_ppp777"))
+        run = self._run_dir("wf_ppp777")
+        payload = "x" * 500000
+        with open(os.path.join(run, "journal.jsonl"), "w") as f:
+            for i in range(200):
+                f.write(json.dumps({"type": "result", "agentId": "ag%03d" % i,
+                                    "result": payload}) + "\n")
+        self.assertGreater(os.path.getsize(os.path.join(run, "journal.jsonl")), 64 << 20)
+        done = ha._workflow_finished_agents(run)
+        self.assertEqual(len(done), 200)
+        self.assertIn("ag199", done, "the NEWEST result is the one a forward cap drops")
+
+    def test_a_prompt_past_the_label_bound_leaves_the_row_nameless_not_broken(self):
+        # The byte bound truncates rather than degrading, so an enormous first
+        # prompt yields no label at all. That is the accepted trade against an
+        # unbounded read on a memory-limited container — and the row must stay
+        # usable, which is why both clients fall back to the id.
+        self._write_main(self._launch("fixture", "wf_qqq888"))
+        run = self._run_dir("wf_qqq888")
+        self._agent(run, "huge", "P" * (ha.WORKFLOW_LABEL_MAX_BYTES + (1 << 16)),
+                    "2026-08-18T03:31:07.583Z", done=True)
+        rows, _ = ha._workflow_agents(run)
+        self.assertEqual(rows[0]["id"], "huge")
+        self.assertEqual(rows[0]["label"], "")
+
+    def test_a_realistically_large_prompt_is_still_named(self):
+        # The bound is generous on purpose: a prompt of a few hundred KB — a
+        # pasted diff, a long spec — is ordinary and must still name its row.
+        self._write_main(self._launch("fixture", "wf_rrr999"))
+        run = self._run_dir("wf_rrr999")
+        self._agent(run, "big1", "Review this diff: " + "d" * 300000,
+                    "2026-08-18T03:31:07.583Z", done=True)
+        rows, _ = ha._workflow_agents(run)
+        self.assertTrue(rows[0]["label"].startswith("Review this diff:"))
 
     def test_a_SYMLINKED_agent_transcript_is_not_followed(self):
         # isfile FOLLOWS links, so `agent-etc.jsonl -> /etc/passwd` showed up as a

@@ -3218,6 +3218,31 @@ test("XERK-304: a wrong-shaped agents list is coerced, never served raw", async 
   assert.equal(got.body.agentsTruncated, true, "coerced to a boolean");
 });
 
+test("XERK-304: a row with no status keeps its omission through the hub", async () => {
+  // The agent OMITS status when the run's journal cannot say. An absent field
+  // meaning "that agent can't tell" is the fleet-wide rule, so coercing every
+  // row to a full shape would put it back as "" and lose the distinction the
+  // agent went to trouble to preserve.
+  await request("POST", "/api/heartbeat", { body: { device: "wf5" }, headers: agentHeaders });
+  const url = "/api/agents/wf5/sessions/s1/subagents/history?type=workflow&label=x";
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "wf5",
+      subagentHistoryResults: [{
+        sessionId: "s1", type: "workflow", label: "x", agentId: "",
+        entries: [], truncated: false,
+        agents: [{ id: "a1", label: "no journal here", startedAt: "t" },
+                 { id: "a2", label: "knows", startedAt: "t", status: "done" }],
+      }],
+    },
+    headers: agentHeaders,
+  });
+  const got = await request("GET", url, { headers: userHeaders });
+  assert.equal(got.status, 200);
+  assert.ok(!("status" in got.body.agents[0]), "omission survives, never blanked to ''");
+  assert.equal(got.body.agents[1].status, "done");
+});
+
 test("XERK-304: a non-array `agents` leaves the reply a plain transcript", async () => {
   // `agents` present is what means "this is a run", so a junk value must not be
   // able to turn an ordinary transcript into a list.

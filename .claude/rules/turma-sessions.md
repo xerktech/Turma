@@ -154,6 +154,8 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
     session's host, so once that session leaves the cache `openSubagentView` early-returns on the
     missing host key and the press vanishes — the rung must fall through to the session rung, which
     already handles a session that ended, rather than consume it.
+- **The picker is a SNAPSHOT per fetch**, like `/history`: agents starting while it is open do not
+  appear until it is reopened. Acceptable for a finished run, visibly stale for a running one.
 - **An unresolved row must not be rendered as a transcript.** No `agents` and no entries means the
   row did not resolve; handing that to the chat engine paints its "This session's transcript is
   empty.", the wording for a conversation that exists and is empty, which reads as if the agent did

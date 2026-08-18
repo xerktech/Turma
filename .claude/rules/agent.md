@@ -262,9 +262,20 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   - **The journal is streamed WHOLE — never through a tail window.** A `result` line carries the
     agent's return value, so a few dozen agents push the journal past any fixed tail, and the
     records a tail drops are the OLDEST — which the launch-order sort puts at the TOP of the picker,
-    reading as "still running" forever. Memory stays bounded by folding each line as it completes;
-    one over-long line is matched by its HEAD instead, which also stops before the result VALUE
-    begins so an agent that merely RETURNS the text of a journal record cannot retire another agent.
+    reading as "still running" forever. Memory stays bounded by folding each line as it completes,
+    so `JOURNAL_READ_MAX` is a runaway backstop rather than a working limit and belongs far above
+    any real journal — reading forward, whatever it drops is the NEWEST.
+  - **What stops a returned journal record from retiring another agent is JSON ESCAPING, not the
+    head bound.** Inside a JSON string the nested record's quotes are backslash-escaped, so the
+    unescaped `"agentId":"…"` pattern cannot occur there — at any length. The head bound is a COST
+    limit; the correctness half is the ANCHOR on `JOURNAL_RESULT_RE`, which covers the one case
+    escaping does not: a corrupt or half-written line that is not valid JSON and carries a raw
+    record inside it. Do not restate the head bound as the safety mechanism — it isn't, and a test
+    written against that claim passes with the bound removed.
+  - **The label read is bounded by BYTES, and truncation costs a NAME, not a row.** A prompt past
+    `WORKFLOW_LABEL_MAX_BYTES` leaves the line unparseable and the label empty, and both clients
+    fall back to the agent id. Raise the bound before treating that fallback as the fix — it is the
+    accepted trade against an unbounded read on a memory-limited container, not a feature.
   - **A symlinked `agent-<id>.jsonl` is refused** (`islink` beside `isfile`, which follows): a link
     in a run dir would otherwise be a phantom agent whose "transcript" is whatever it points at.
     `os.walk` already declines to descend directory symlinks; this is the file half of that rule.

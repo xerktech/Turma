@@ -1948,12 +1948,19 @@ function sanitizeWorkflowAgents(raw) {
     if (!a || typeof a !== "object") continue;
     const id = safeString(a.id).slice(0, WORKFLOW_AGENT_FIELD_MAX);
     if (!id) continue;
-    out.push({
+    const row = {
       id,
       label: safeString(a.label).slice(0, WORKFLOW_AGENT_FIELD_MAX),
       startedAt: safeString(a.startedAt).slice(0, WORKFLOW_AGENT_FIELD_MAX),
-      status: safeString(a.status).slice(0, WORKFLOW_AGENT_FIELD_MAX),
-    });
+    };
+    // `status` is OMITTED, never blanked. The agent leaves it off when the run's
+    // journal cannot say whether an agent finished, and an absent field meaning
+    // "that agent can't tell" is the fleet-wide rule — normalizing every row to
+    // a full shape would put that back as `""`, so the wire could no longer
+    // express the difference the agent went to trouble to preserve.
+    const status = safeString(a.status).slice(0, WORKFLOW_AGENT_FIELD_MAX);
+    if (status) row.status = status;
+    out.push(row);
     if (out.length >= WORKFLOW_AGENTS_MAX) break;
   }
   return out;

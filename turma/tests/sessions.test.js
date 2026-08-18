@@ -1974,21 +1974,27 @@ test("XERK-304: Back is not eaten when the session left the cache", async () => 
   // The run list is fetched from the session's host, so once the session is
   // gone there is no list to return to. The middle rung used to consume the
   // press anyway and leave the pane exactly as it was, still labelled Workflow.
+  //
+  // setCache WITHOUT render is the real race and the only setup that reaches
+  // the guard: a render() of a fleet the session has left tears the stage down
+  // on its own, clearing both rungs before Back is ever pressed — so a beat()
+  // here would pass whether or not the guard exists.
   const page = liveWorkflowPage();
   page.setGet((url) => url.includes("agentId=ag1")
     ? { entries: [{ id: "1", role: "user", text: "review it" }] }
     : { entries: [], agents: [{ id: "ag1", label: "review:bugs", status: "done" }] });
   await page.openSubagentView("workflow", "code-review", "ag1");
   assert.equal(page.els.trBackLabel.textContent, " Workflow");
+  assert.equal(page.els.transcriptPane.hidden, false);
 
-  // The session ends while its agent transcript is open.
-  const { now, host: h } = host([]);
-  page.beat({ now, agents: [h] });
+  const { now, host: h } = host([]);   // the session ends; the stage still shows it
+  page.setCache({ now, agents: [h] });
 
   page.transcriptBack();
   await new Promise((r) => setImmediate(r));
-  assert.equal(page.els.trBackLabel.textContent, " Sessions",
-    "one press left the subagent stage rather than doing nothing");
+  assert.equal(page.els.transcriptPane.hidden, true,
+    "one press left the subagent stage rather than being swallowed");
+  assert.equal(page.els.trBackLabel.textContent, " Sessions");
 });
 
 test("XERK-304: an unresolved row reads as unavailable, not as an empty conversation", async () => {
@@ -2001,6 +2007,22 @@ test("XERK-304: an unresolved row reads as unavailable, not as an empty conversa
   await page.openSubagentView("workflow", "no-such-run");
   assert.equal(page.chat.rendered.length, 0, "nothing was handed to the chat engine");
   assert.match(page.els.trScroll.innerHTML, /Agent transcript unavailable/);
+});
+
+test("XERK-304: landing on a chat retires both subagent rungs", async () => {
+  // They point at the session just left, and the next route that reveals the
+  // transcript pane would follow them there.
+  const page = liveWorkflowPage();
+  page.setGet((url) => url.includes("agentId=ag1")
+    ? { entries: [{ id: "1", role: "user", text: "review it" }] }
+    : { entries: [], agents: [{ id: "ag1", label: "review:bugs", status: "done" }] });
+  await page.openSubagentView("workflow", "code-review", "ag1");
+
+  page.selectSession("s1");                 // back to the live chat
+  page.transcriptBack();                    // must NOT re-enter the run list
+  await new Promise((r) => setImmediate(r));
+  assert.doesNotMatch(page.els.trScroll.innerHTML, /review:bugs/,
+    "a retired rung must not reopen the run it pointed at");
 });
 
 test("XERK-304: an ordinary agent row is untouched — no picker, straight to its transcript", async () => {

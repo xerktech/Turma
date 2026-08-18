@@ -4941,8 +4941,15 @@ WORKFLOW_AGENT_LABEL_CHARS = 160
 # has to walk far in; these only bound a pathological one. The BYTE bound is the
 # load-bearing half: the picker reads a label per agent, and line-count alone
 # would still hold one enormous first line in the container's memory.
+#
+# The bound TRUNCATES rather than degrading: a prompt larger than it leaves the
+# line unparseable and the label empty, and the picker then shows the agent's id.
+# That is the accepted trade — a nameless row against an unbounded read on a
+# memory-limited container — and the reason the number is generous rather than
+# tight. Both clients already fall back to the id, so nothing breaks; it reads
+# worse. Raise this before reaching for the id fallback as a fix.
 WORKFLOW_LABEL_MAX_LINES = 50
-WORKFLOW_LABEL_MAX_BYTES = 1 << 18
+WORKFLOW_LABEL_MAX_BYTES = 1 << 20
 
 
 def _read_head_lines(path, max_bytes):
@@ -5037,8 +5044,17 @@ def _workflow_agent_files(run_dir):
 # matched by its head instead of being buffered whole.
 JOURNAL_LINE_MAX = 1 << 18
 JOURNAL_HEAD_BYTES = 1024
-JOURNAL_READ_MAX = 1 << 26
-JOURNAL_RESULT_RE = re.compile(rb'"type"\s*:\s*"result"')
+# Only a runaway backstop, not a working limit: memory is bounded per LINE, so
+# the whole file is affordable and the cap exists solely to stop an endless one.
+# Reading forward means hitting it drops the NEWEST results, so the agents it
+# loses read as still running — the safe direction, and the same one a miss
+# takes everywhere else here.
+JOURNAL_READ_MAX = 1 << 29
+# ANCHORED at the start of the record on purpose. A `result` marker found
+# anywhere in the line would also match one sitting inside a corrupt or
+# half-written line's text, and that is the only way this fallback could retire
+# an agent that has not finished.
+JOURNAL_RESULT_RE = re.compile(rb'^\s*\{\s*"type"\s*:\s*"result"')
 JOURNAL_AGENT_ID_RE = re.compile(rb'"agentId"\s*:\s*"([A-Za-z0-9_-]{1,64})"')
 
 
@@ -5047,11 +5063,20 @@ def _fold_journal_line(line, done):
 
     Parsed as JSON when it fits, which is exact and independent of field order.
     An over-long line is matched by REGEX over its first JOURNAL_HEAD_BYTES
-    instead — that head holds the record's own fields, and stopping before the
-    result VALUE begins is what keeps an agent that merely returned the text
-    `"type":"result"` from retiring some other agent. A head that doesn't carry
-    both markers is a miss, i.e. the agent reads as still running: the safe
-    direction, since the alternative is calling a live agent finished."""
+    instead, so a single unbounded record costs a bounded scan.
+
+    **What stops an agent that merely RETURNED the text of a journal record from
+    retiring some other agent is JSON escaping, not this head bound**: inside a
+    JSON string the nested record's quotes are backslash-escaped, so the
+    unescaped `"agentId":"…"` this matches cannot occur there. The head bound is
+    a cost limit; the ANCHOR on JOURNAL_RESULT_RE is the correctness half,
+    covering the one case escaping does not — a corrupt or half-written line
+    that is not valid JSON at all and carries a raw record inside it. Its cost is
+    that a record with REORDERED fields is refused rather than risked.
+
+    A line that fails either check is a miss, i.e. the agent reads as still
+    running: the safe direction, since the alternative is calling a live agent
+    finished."""
     if len(line) <= JOURNAL_LINE_MAX:
         try:
             rec = json.loads(line)
@@ -5061,7 +5086,7 @@ def _fold_journal_line(line, done):
             done.add(str(rec["agentId"]))
         return
     head = line[:JOURNAL_HEAD_BYTES]
-    if not JOURNAL_RESULT_RE.search(head):
+    if not JOURNAL_RESULT_RE.match(head):
         return
     m = JOURNAL_AGENT_ID_RE.search(head)
     if m:
