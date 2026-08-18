@@ -143,6 +143,8 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   ticketQueue, ticketQueuePayload, enqueueTicketStart, dropQueuedTicket,
   dropAutoQueuedTickets, drainTicketQueue, queuedTicket, hostHasFreeSlot, holdQueued,
+  liveQueueCount,
+  reclaimStrandedTicketSpawns,
   TICKET_QUEUE_PER_ORG_MAX, TICKET_QUEUE_PER_ORG_AUTO_MAX, TICKET_QUEUE_MAX_WAIT_MS,
   TICKET_QUEUE_EXPIRED_TTL_MS, logQueueState, TICKET_QUEUE_NOTES_MAX,
   ticketQueueAdmission, TICKET_QUEUE_MAX, TICKET_QUEUE_ERROR_MAX, TICKET_QUEUE_STALE_MS,
@@ -4635,8 +4637,11 @@ test("http: starting a ticket session queues spawnTicket on the org's host", asy
   assert.ok(res.body.cmdId);
   // Only the key travels: the agent re-derives repo, ticket text and branch from
   // its own state, so a stale board can't aim a spawn at the wrong repo.
+  // `ticketSource` is the hub's own note of what kind of work this was (XERK-303)
+  // and is stripped before the reply — the next test asserts that.
   assert.deepEqual(agents.ts1.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+      ticketSite: "t1.atlassian.net", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -4684,7 +4689,8 @@ test("http: no online host has the repo -> routes anyway and clones on demand", 
   assert.equal(res.body.host, "ts5");
   assert.equal(res.body.needsClone, true);
   assert.deepEqual(agents.ts5.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+      ticketSite: "t5.atlassian.net", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -4951,7 +4957,8 @@ test("http: a model-pinned ticket carries the model on its spawnTicket command",
     { headers: userHeaders });
   assert.equal(res.status, 200);
   assert.deepEqual(agents.tmSpawn.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", model: "opus", cmdId: res.body.cmdId },
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+      ticketSite: "tmSpawn.atlassian.net", model: "opus", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -4960,7 +4967,8 @@ test("http: an unpinned ticket spawns with no model on the command (unchanged)",
   const res = await request("POST", "/api/jira/tmNone.atlassian.net/ENG-5/session",
     { headers: userHeaders });
   assert.deepEqual(agents.tmNone.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+      ticketSite: "tmNone.atlassian.net", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -5931,7 +5939,12 @@ test("XERK-296: an entry whose ticket stops existing ages out of its org's line"
   queuedTicket("tq19.atlassian.net", "ENG-5").unknownSince =
     Date.now() - TICKET_QUEUE_STALE_MS - 1;
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0);
+  assert.equal(liveQueueCount(), 0, "out of the line…");
+  // …but a MANUAL click never leaves silently (XERK-303): it goes terminal, on
+  // the payload, with the ✕ — the same treatment the max-wait backstop gives.
+  const note = queuedTicket("tq19.atlassian.net", "ENG-5");
+  assert.equal(note.reason, "expired");
+  assert.match(note.error, /no agent reports that ticket any more/);
 });
 
 test("XERK-296: a permanently blocked entry ages out; an auto one leaves at once", async () => {
@@ -5948,12 +5961,17 @@ test("XERK-296: a permanently blocked entry ages out; an auto one leaves at once
   assert.match(e.error, /no triaged repo/);
   e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0, "a manual click is given a while, then let go");
-  // An AUTO entry is re-derivable, so it leaves the line the moment it can't be
+  assert.equal(liveQueueCount(), 0, "a manual click is given a while, then let go");
+  // Let go VISIBLY (XERK-303). It was survivable while only a click could reach
+  // this state and the operator was watching it; a reclaimed spawn arrives with
+  // nobody watching, so a silent drop is a click that vanishes 30 minutes later.
+  assert.equal(queuedTicket("tq20.atlassian.net", "ENG-5").reason, "expired");
+  // An AUTO entry is re-derivable, so it leaves outright the moment it can't be
   // routed — the sweep re-queues it as soon as it's eligible again.
+  dropQueuedTicket("tq20.atlassian.net", "ENG-5", null);
   assert.ok(enqueueTicketStart("tq20.atlassian.net", "ENG-5", "auto"));
   drainTicketQueue();
-  assert.equal(ticketQueue.length, 0);
+  assert.equal(ticketQueue.length, 0, "and leaves nothing behind");
 });
 
 test("XERK-296: the heartbeat itself drains the queue (a freed slot fills in a beat)", async () => {
@@ -5989,6 +6007,518 @@ test("XERK-296: a hold reason from the hub is length-capped on the entry", async
   holdQueued(e, "blocked", "x".repeat(TICKET_QUEUE_ERROR_MAX + 500));
   assert.equal(e.error.length, TICKET_QUEUE_ERROR_MAX);
   ticketQueue.length = 0;
+});
+
+// ---- reclaiming a spawn stranded on a dead host (XERK-303) ------------------
+// XERK-296's guarantee — any host in the org can take waiting work — ends at
+// DISPATCH. Past that the command belongs to one host, and nothing re-routed it
+// if that host died before taking it. The discriminator is `deliveredAt`, not
+// onlineness: undelivered is provably never run, delivered may be mid-spawn.
+
+// Dispatch ENG-5 to `a` and then take `a` offline, leaving `b` free. Returns
+// the command that is now stranded on `a`.
+const strandOn = async (site, a, b) => {
+  await asBeat(a, site, { autoStart: false, capacity: { ...ROOMY } });
+  await asBeat(b, site, { autoStart: false, capacity: { ...FULL } });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.host, a, "the only free host takes it");
+  agents[a].lastSeen = Date.now() - 10 * 60 * 1000;   // A goes dark, still holding it
+  agents[b].capacity = { ...ROOMY };                  // B finishes a session
+  return (agents[a].commands || [])[0];
+};
+
+test("XERK-303: an undelivered spawn on a dead host is reclaimed and re-routed", async () => {
+  resetAutoStart();
+  await strandOn("tq40.atlassian.net", "tqRecA", "tqRecB");
+  // Before the reclaim this is the bug: the queue is empty, the command is
+  // parked on a host that is never coming back to it, and the free host in the
+  // same org is handed nothing.
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0);
+  assert.equal((agents.tqRecB.commands || []).length, 0);
+
+  reclaimStrandedTicketSpawns();
+  assert.equal((agents.tqRecA.commands || []).length, 0, "withdrawn from the dead host");
+  const e = queuedTicket("tq40.atlassian.net", "ENG-5");
+  assert.ok(e, "and back in the hub's queue, where any org host can take it");
+  drainTicketQueue();
+  assert.deepEqual((agents.tqRecB.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]]);
+  assert.equal(queuedTicket("tq40.atlassian.net", "ENG-5"), null, "dispatched again");
+});
+
+test("XERK-303: a DELIVERED spawn is never withdrawn — a double start beats no start", async () => {
+  // The case the whole gate exists for: a host routinely goes silent BETWEEN
+  // delivery and ack, so "it is offline" is not evidence the command didn't run.
+  resetAutoStart();
+  const cmd = await strandOn("tq41.atlassian.net", "tqDelA", "tqDelB");
+  cmd.deliveredAt = Date.now();                  // the agent has seen it
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqDelA.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "it stays where it is — it re-delivers when that host returns");
+  assert.equal(ticketQueue.length, 0, "and it is NOT re-queued");
+  assert.equal((agents.tqDelB.commands || []).length, 0, "so no second session");
+});
+
+test("XERK-303: a reclaimed MANUAL click comes back as manual, not as auto", async () => {
+  // An auto entry is swept out of the queue when its org's switch is off, so
+  // re-queueing a click as auto would swallow it on the very next drain.
+  resetAutoStart();
+  await strandOn("tq42.atlassian.net", "tqKindA", "tqKindB");
+  assert.equal(autoStartOrgs["tq42.atlassian.net"], undefined, "auto-start is OFF here");
+  reclaimStrandedTicketSpawns();
+  assert.equal(queuedTicket("tq42.atlassian.net", "ENG-5").source, "manual");
+  drainTicketQueue();
+  assert.deepEqual((agents.tqKindB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-303: a reclaimed AUTO ticket comes back as auto, and spends a retry", async () => {
+  resetAutoStart();
+  await asBeat("tqAutoA", "tq43.atlassian.net", { capacity: { ...ROOMY } });
+  await asBeat("tqAutoB", "tq43.atlassian.net", { capacity: { ...FULL } });
+  autoStartRound();
+  const k = "tq43.atlassian.net\x00ENG-5";
+  assert.equal(autoStarted.get(k).attempts, 1, "dispatch spent one");
+  assert.deepEqual((agents.tqAutoA.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+
+  agents.tqAutoA.lastSeen = Date.now() - 10 * 60 * 1000;
+  agents.tqAutoB.capacity = { ...ROOMY };
+  autoStarted.set(k, { attempts: 1, nextAt: 0 });     // that attempt's backoff has elapsed
+  reclaimStrandedTicketSpawns();
+  assert.equal(queuedTicket("tq43.atlassian.net", "ENG-5").source, "auto");
+  drainTicketQueue();
+  assert.deepEqual((agents.tqAutoB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(autoStarted.get(k).attempts, 2,
+    "the rescue is an attempt of its own, not a free one");
+});
+
+test("XERK-303: a ticket nothing can route away is LEFT on the dead host", async () => {
+  // The one way this can be worse than the bug it fixes. A single-host org has
+  // nowhere to re-route to, so a withdrawn entry is held `blocked` and then
+  // dropped SILENTLY at TICKET_QUEUE_BLOCKED_MAX_MS: a click that would have run
+  // when its host came back ends up on no host and in no queue.
+  resetAutoStart();
+  await asBeat("tqSolo", "tq46.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  const r = await startTicket("tq46.atlassian.net", "ENG-5");
+  assert.equal(r.body.host, "tqSolo");
+  agents.tqSolo.lastSeen = Date.now() - 10 * 60 * 1000;
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqSolo.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "left where it is — today's behaviour, not destroyed");
+  assert.equal(ticketQueue.length, 0);
+  // Age it well past every queue timer: still there, because it never entered
+  // the queue to be aged by one.
+  for (let i = 0; i < 3; i++) { reclaimStrandedTicketSpawns(); drainTicketQueue(); }
+  assert.deepEqual((agents.tqSolo.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  // And it runs when the host comes back.
+  agents.tqSolo.lastSeen = Date.now();
+  const beat = await request("POST", "/api/heartbeat",
+    { body: { device: "tqSolo" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands.map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-303: a ticket pinned to the dead host is not withdrawn from it", async () => {
+  // The pin means findTicketHost can only ever return that host, so withdrawing
+  // takes the ticket off the only agent that will ever run it.
+  resetAutoStart();
+  await asBeat("tqPinA", "tq47.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  await asBeat("tqPinB", "tq47.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  hub.ticketAgents["tq47.atlassian.net/ENG-5"] = { host: "tqPinA", at: Date.now() };
+  const r = await startTicket("tq47.atlassian.net", "ENG-5");
+  assert.equal(r.body.host, "tqPinA");
+  agents.tqPinA.lastSeen = Date.now() - 10 * 60 * 1000;
+  reclaimStrandedTicketSpawns();
+  assert.deepEqual((agents.tqPinA.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(ticketQueue.length, 0, "and it is not put in a line it cannot leave");
+  delete hub.ticketAgents["tq47.atlassian.net/ENG-5"];
+});
+
+test("XERK-303: a free host that has NOT triaged the ticket is not withdrawn into", async () => {
+  // The reclaim's routability precondition passes issueKey to findTicketHost, so
+  // it inherits XERK-325's triage rule for free: a host that has not triaged the
+  // ticket would refuse the spawn (`spawn_ticket` re-derives from its OWN ledger),
+  // so withdrawing into it is a session that never starts. Dropping the issueKey
+  // to "simplify" that call silently removes this.
+  //
+  // A third host owns the fleet's row for the ticket (freshest fetchedAt, and it
+  // is online), so the repo the fleet resolves is NOT whatever the free host
+  // happens to have decided for itself — otherwise the free host's own triage
+  // becomes the thing being checked against.
+  resetAutoStart();
+  const site = "tq60.atlassian.net";
+  await strandOn(site, "tqTriA", "tqTriB");
+  await asBeat("tqTriRow", site, { autoStart: false, capacity: { ...FULL },
+    fetchedAt: "2026-07-14T13:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  // The free host has triaged this ticket to a DIFFERENT repo, so it cannot run
+  // the spawn even though it has the slot.
+  agents.tqTriB.jira.tickets = [{ key: "ENG-5", statusCategory: "todo",
+    repoGuess: { repo: "SomethingElse", cloned: true } }];
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqTriA.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "left on the dead host — the free host would only refuse it");
+  assert.equal((agents.tqTriB.commands || []).length, 0);
+  // Flip ONLY that: once the free host agrees with the board, the rescue lands.
+  agents.tqTriB.jira.tickets = [{ key: "ENG-5", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true } }];
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqTriB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.tqTriA.commands || []).length, 0, "and it leaves the dead host");
+});
+
+test("XERK-303: a merely BUSY org is not somewhere to withdraw INTO either", async () => {
+  // `full` is a wait that clears itself for a ticket already in line. For one
+  // that is NOT, withdrawing into it just trades a week on a dead host for four
+  // hours and a "gave up waiting" note. It waits where it is, and the 15s sweep
+  // rescues it the moment a slot actually exists.
+  resetAutoStart();
+  await strandOn("tq48.atlassian.net", "tqBusyA", "tqBusyB");
+  agents.tqBusyB.capacity = { ...FULL };            // nothing free anywhere, yet
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqBusyA.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "left on the dead host rather than put in a line it cannot leave");
+  assert.equal(ticketQueue.length, 0);
+  // A slot frees: the very next sweep rescues and dispatches it.
+  agents.tqBusyB.capacity = { ...ROOMY };
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqBusyB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-303: a command restored from state.json is never reclaimed", async () => {
+  // scheduleSave is a 30s debounce, so a save that landed between the queue and
+  // the delivery wrote the command WITHOUT deliveredAt. Restoring that as
+  // undelivered would re-route work the agent has already run, under a fresh
+  // cmdId its in-memory de-dup cannot catch — one ticket, two sessions.
+  resetAutoStart();
+  await strandOn("tq49.atlassian.net", "tqRstA", "tqRstB");
+  const blob = serializeAgentsForSave();            // the save that lands 30s later
+  // The agent takes delivery, then the hub restarts before the next save.
+  await request("POST", "/api/heartbeat",
+    { body: { device: "tqRstA" }, headers: agentHeaders });
+  const restored = JSON.parse(blob);
+  assert.equal("deliveredAt" in restored.tqRstA.commands[0], false,
+    "the copy on disk genuinely says 'never delivered'");
+  hub.sanitizeRestoredCommands(restored);             // what the boot restore does
+  agents.tqRstA.commands = restored.tqRstA.commands;
+  agents.tqRstA.lastSeen = Date.now() - 10 * 60 * 1000;
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.equal((agents.tqRstB.commands || []).length, 0, "no second spawn");
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-303: the BOOT restore is what stamps a restored command, not the caller", async () => {
+  // The stamping only protects anything if the restore actually runs it: a
+  // freshly-required module reading a state.json whose command has no
+  // deliveredAt must come up with that command marked delivered.
+  const f = path.join(os.tmpdir(), `turma-x303-restore-${process.pid}.json`);
+  fs.writeFileSync(f, JSON.stringify({
+    bootHost: {
+      device: "bootHost", lastSeen: Date.now(), sessions: [], repos: [],
+      commands: [{ type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+                   ticketSite: "boot.atlassian.net", cmdId: "boot1" }],
+    },
+  }));
+  const mod = freshServerModule((env) => { env.STATE_FILE = f; });
+  const c = mod.agents.bootHost.commands[0];
+  assert.ok(c.deliveredAt, "restored as delivered — the hub can no longer prove otherwise");
+  fs.unlinkSync(f);
+});
+
+test("XERK-303: junk in a restored command list is DROPPED, not carried", async () => {
+  // A corrupt state.json is the only door: nothing on the wire reaches this
+  // array, and queueCommand only pushes objects. Dropping it at the restore is
+  // what makes every c.type / c.cmdId read in the file safe.
+  const f = path.join(os.tmpdir(), `turma-x303-junk-${process.pid}.json`);
+  fs.writeFileSync(f, JSON.stringify({
+    junkHost: {
+      device: "junkHost", lastSeen: Date.now(), sessions: [], repos: [],
+      commands: [null, "not-an-object", 7, { type: "kill", sessionId: "s1", cmdId: "k1" }],
+    },
+  }));
+  const mod = freshServerModule((env) => { env.STATE_FILE = f; });
+  assert.deepEqual(mod.agents.junkHost.commands.map((c) => c.cmdId), ["k1"]);
+  assert.ok(mod.agents.junkHost.commands[0].deliveredAt, "and the survivor is stamped");
+  fs.unlinkSync(f);
+});
+
+test("XERK-303: an AUTO entry that reaches giveUp still leaves outright, with no note", async () => {
+  // The auto half of the XERK-296 blocked-timer test uses an UNTRIAGED ticket,
+  // which is dropped one `if` above giveUp — so nothing covered giveUp's own auto
+  // arm, and making it mint notes for auto entries too left the suite green.
+  // This drives the routing-failure timer, which is a path giveUp really governs.
+  resetAutoStart();
+  await asBeat("tqAutoNote", "tq58.atlassian.net", { tickets: [
+    { key: "ENG-7", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+  ] });
+  autoStartSweep();
+  const e = queuedTicket("tq58.atlassian.net", "ENG-7");
+  assert.equal(e.source, "auto");
+  agents.tqAutoNote.lastSeen = Date.now() - 10 * 60 * 1000;   // the whole org goes dark
+  drainTicketQueue();
+  assert.equal(e.reason, "blocked");
+  e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
+  drainTicketQueue();
+  assert.equal(queuedTicket("tq58.atlassian.net", "ENG-7"), null,
+    "re-derivable work leaves outright — a note for it would be noise nobody asked for");
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-303: a give-up note's text is capped like every other hold reason", async () => {
+  // It interpolates findTicketHost's wording, which carries a DEVICE NAME, and
+  // rides /api/agents to every client. The longest such reason — pinned to a host
+  // that no longer reports the org — plus this path's own prefix runs past the cap
+  // at a 200-char host, which is a name the door actually admits.
+  resetAutoStart();
+  const host = "tqLong" + "z".repeat(194);
+  await asBeat(host, "tq59.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  // A second host keeps REPORTING the ticket, so the entry stays on the routing
+  // path rather than ageing out as one nobody lists any more.
+  await asBeat("tq59Reporter", "tq59.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  hub.ticketAgents["tq59.atlassian.net/ENG-5"] = { host, at: Date.now() };
+  const r = await startTicket("tq59.atlassian.net", "ENG-5");
+  assert.equal(r.body.queued, true, "pinned-but-full is a wait, so it enters the queue");
+  // The pinned host now reports a DIFFERENT org: the longest refusal there is.
+  await asBeat(host, "tq59other.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  drainTicketQueue();
+  const e = queuedTicket("tq59.atlassian.net", "ENG-5");
+  assert.equal(e.reason, "blocked");
+  e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
+  drainTicketQueue();
+  const note = ticketQueuePayload().find((q) => q.issueKey === "ENG-5");
+  assert.equal(note.reason, "expired");
+  assert.equal(note.error.length, TICKET_QUEUE_ERROR_MAX,
+    "this case really does hit the cap, so the assertion below means something");
+  delete hub.ticketAgents["tq59.atlassian.net/ENG-5"];
+});
+
+test("XERK-303: a non-ARRAY commands list is rewritten, not skipped past", async () => {
+  // Fatal one line SOONER than a junk element: `(a.commands || []).some` is not
+  // a function, and `for…of` a plain object is not iterable — same setInterval,
+  // same no-handler exit. A string is a plausible hand-edit precisely because it
+  // looks scalar.
+  for (const junk of ['"junk"', "5", '{"0":{"type":"kill","cmdId":"k1"}}', "true"]) {
+    const f = path.join(os.tmpdir(), `turma-x303-arr-${process.pid}.json`);
+    fs.writeFileSync(f, `{"badHost":{"device":"badHost","lastSeen":${Date.now()},`
+      + `"sessions":[],"repos":[],"commands":${junk}}}`);
+    const mod = freshServerModule((env) => { env.STATE_FILE = f; });
+    assert.deepEqual(mod.agents.badHost.commands, [], `commands:${junk} rewritten`);
+    assert.doesNotThrow(() => { mod.autoStartSweep(); }, `sweep survives ${junk}`);
+    assert.doesNotThrow(() => { mod.reclaimStrandedTicketSpawns(); }, `reclaim survives ${junk}`);
+    fs.unlinkSync(f);
+  }
+});
+
+test("XERK-303: a MANUAL entry the hub gives up on never leaves the queue silently", async () => {
+  // The reclaim puts entries in the queue with nobody watching, so the blocked
+  // timer's silent drop became a click that vanishes 30 minutes later with
+  // nothing on the board. Every give-up path a manual entry can reach must leave
+  // a terminal note, exactly as the max-wait backstop does.
+  resetAutoStart();
+  await asBeat("tqGoneA", "tq57.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  await asBeat("tqGoneB", "tq57.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  const r = await startTicket("tq57.atlassian.net", "ENG-5");
+  assert.equal(r.body.host, "tqGoneA");
+  agents.tqGoneA.lastSeen = Date.now() - 10 * 60 * 1000;
+  agents.tqGoneB.capacity = { ...ROOMY };
+  reclaimStrandedTicketSpawns();                    // rescued into the queue…
+  assert.ok(queuedTicket("tq57.atlassian.net", "ENG-5"));
+  // …and then the whole fleet goes dark, which is the likeliest continuation of
+  // whatever killed the first host.
+  agents.tqGoneB.lastSeen = Date.now() - 10 * 60 * 1000;
+  drainTicketQueue();
+  const e = queuedTicket("tq57.atlassian.net", "ENG-5");
+  assert.equal(e.reason, "blocked");
+  e.blockedSince = Date.now() - TICKET_QUEUE_BLOCKED_MAX_MS - 1;
+  drainTicketQueue();
+  assert.equal(liveQueueCount(), 0, "out of the line");
+  const note = queuedTicket("tq57.atlassian.net", "ENG-5");
+  assert.ok(note, "but NOT gone without a word");
+  assert.equal(note.reason, "expired");
+  const payload = ticketQueuePayload().find((q) => q.issueKey === "ENG-5");
+  assert.equal(payload.reason, "expired", "and the board can see it");
+  assert.match(payload.error, /nothing could run it/);
+});
+
+test("XERK-303: a junk command cannot take the whole hub down via the 15s sweep", async () => {
+  // autoStartSweep reads c.type inside a setInterval, and nothing installs an
+  // uncaughtException handler — `null.type` there EXITS THE HUB, taking every
+  // host's control plane with it, and re-fires 15s after each restart. The
+  // heartbeat's ack filter does not save it: that only heals a host that BEATS,
+  // and an offline host holding a stranded spawn is the subject here.
+  resetAutoStart();
+  await asBeat("tqCrash", "tq56.atlassian.net", { capacity: { ...ROOMY } });
+  agents.tqCrash.commands = [null, "not-an-object",
+    { type: "spawnTicket", issueKey: "ENG-9", ticketSource: "auto",
+      ticketSite: "tq56.atlassian.net", cmdId: "c9", deliveredAt: Date.now() }];
+  agents.tqCrash.lastSeen = Date.now() - 10 * 60 * 1000;      // offline: never heals
+  assert.doesNotThrow(() => { autoStartSweep(); });
+  assert.doesNotThrow(() => { reclaimStrandedTicketSpawns(); });
+  assert.doesNotThrow(() => { drainTicketQueue(); });
+});
+
+test("XERK-303: a spawn whose deliveredAt is present but FALSY is still not reclaimed", async () => {
+  // publicCommands strips on presence, so the gate reads presence too. The two
+  // disagreeing is how a command gets hidden from the wire and reclaimed anyway.
+  resetAutoStart();
+  await strandOn("tq54.atlassian.net", "tqZeroA", "tqZeroB");
+  agents.tqZeroA.commands[0].deliveredAt = 0;
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqZeroA.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.tqZeroB.commands || []).length, 0);
+});
+
+test("XERK-303: a spawn missing only its SOURCE is not reclaimed either", async () => {
+  // Each of the two stamps stands alone: with the org known but the kind not,
+  // guessing is how an operator's click comes back as auto and is swept away.
+  resetAutoStart();
+  await strandOn("tq55.atlassian.net", "tqNoSrcA", "tqNoSrcB");
+  delete agents.tqNoSrcA.commands[0].ticketSource;    // ticketSite still present
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqNoSrcA.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-303: an unstamped spawn is never reclaimed — its kind can't be guessed", async () => {
+  // Every command an older hub queued is unstamped. Read as "auto" it is dropped
+  // by the very next drain when the org's switch is off; read as "manual" it
+  // escapes every auto guard. Neither is knowable, so it is left alone.
+  resetAutoStart();
+  await strandOn("tq50.atlassian.net", "tqBareA", "tqBareB");
+  const c = agents.tqBareA.commands[0];
+  delete c.ticketSource;
+  delete c.ticketSite;
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  assert.deepEqual((agents.tqBareA.commands || []).map((x) => x.issueKey), ["ENG-5"]);
+  assert.equal(ticketQueue.length, 0);
+});
+
+test("XERK-303: the org comes from the COMMAND, not the host record's jira block", async () => {
+  // `jira.siteKey` is self-reported and bound to no credential (XERK-268 proves
+  // the HOST, not the org), so the org a stranded spawn is re-queued under must
+  // come from the command. Reading it live off the record would let a host whose
+  // Jira config has moved re-queue another org's ticket into its own — and that
+  // org's host would then run it.
+  //
+  // Driven by mutating the record rather than over the wire, deliberately: a beat
+  // is what changes the reported org AND is what takes delivery, so the two
+  // cannot both happen to one undelivered command today. This pins the rule, not
+  // a live exploit.
+  resetAutoStart();
+  await asBeat("tqOrgA", "tq51a.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  await asBeat("tqOrgHome", "tq51a.atlassian.net", { autoStart: false, capacity: { ...FULL } });
+  await asBeat("tqOrgVictim", "tq51b.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  const r = await startTicket("tq51a.atlassian.net", "ENG-5");
+  assert.equal(r.body.host, "tqOrgA");
+  assert.equal(agents.tqOrgA.commands[0].ticketSite, "tq51a.atlassian.net");
+  agents.tqOrgA.jira.siteKey = "tq51b.atlassian.net";   // the record now claims org B
+  agents.tqOrgA.lastSeen = Date.now() - 10 * 60 * 1000;
+  agents.tqOrgHome.capacity = { ...ROOMY };
+  reclaimStrandedTicketSpawns();
+  assert.equal(queuedTicket("tq51a.atlassian.net", "ENG-5").source, "manual");
+  drainTicketQueue();
+  assert.equal((agents.tqOrgVictim.commands || []).length, 0,
+    "org B's host is never handed org A's ticket");
+  assert.deepEqual((agents.tqOrgHome.commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "it goes back to a host of the org it was dispatched for");
+});
+
+test("XERK-303: a non-object command element cannot throw out of publicCommands", async () => {
+  // `in` throws on a truthy primitive. Thrown here it 400s that host's every beat
+  // with the internal error text and serves every dashboard a stale payload —
+  // XERK-235's offline loop, from a one-word gap. Not reachable from the wire
+  // (the handler overwrites `commands` after the spread); a corrupt state.json is.
+  resetAutoStart();
+  await asBeat("tqPoison", "tq52.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  agents.tqPoison.commands = ["not-an-object", null,
+    { type: "kill", sessionId: "s1", cmdId: "c1" }];
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.status, 200);
+  const rec = list.body.agents.find((x) => x.key === "tqPoison");
+  assert.ok(rec, "the fleet payload still serializes");
+  const beat = await request("POST", "/api/heartbeat",
+    { body: { device: "tqPoison" }, headers: agentHeaders });
+  assert.equal(beat.status, 200, "and the host's beat is not refused");
+  assert.deepEqual(beat.body.commands.map((c) => c.cmdId), ["c1"],
+    "the junk is filtered out rather than tolerated");
+  assert.deepEqual(agents.tqPoison.commands.map((c) => c.cmdId), ["c1"],
+    "and the record self-heals in one round trip");
+});
+
+test("XERK-303: an AUTO rescue waits out the backoff, so a flapping pair cannot churn", async () => {
+  // Two hosts flapping alternately pass every other precondition forever: each
+  // bounce finds the other host up, so the ticket is reclaimed, re-dispatched,
+  // stranded again, and never starts — while the log, the payload and the board
+  // churn every OFFLINE_AFTER_MS. A rescue is an attempt that produced nothing,
+  // so it costs a retry and honours the backoff the dispatch spent.
+  resetAutoStart();
+  await asBeat("tqFlapA", "tq53.atlassian.net", { capacity: { ...ROOMY } });
+  await asBeat("tqFlapB", "tq53.atlassian.net", { capacity: { ...ROOMY } });
+  const k = "tq53.atlassian.net\x00ENG-5";
+  const dead = (h) => { agents[h].lastSeen = Date.now() - 10 * 60 * 1000; };
+  const alive = (h) => { agents[h].lastSeen = Date.now(); };
+
+  autoStartRound();
+  const first = ["tqFlapA", "tqFlapB"].find((h) => (agents[h].commands || []).length);
+  assert.ok(first, "dispatched somewhere");
+  assert.equal(autoStarted.get(k).attempts, 1);
+  dead(first);
+  // The backoff from that attempt has NOT elapsed, so the rescue holds.
+  reclaimStrandedTicketSpawns();
+  assert.deepEqual((agents[first].commands || []).map((c) => c.issueKey), ["ENG-5"],
+    "held: the attempt this ticket just spent is still backing off");
+  assert.equal(ticketQueue.length, 0);
+
+  // Once it elapses the rescue happens, and SPENDS another attempt rather than
+  // refunding one — which is what makes each bounce cost more than the last.
+  autoStarted.set(k, { attempts: 1, nextAt: 0 });
+  reclaimStrandedTicketSpawns();
+  drainTicketQueue();
+  const second = first === "tqFlapA" ? "tqFlapB" : "tqFlapA";
+  assert.deepEqual((agents[second].commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(autoStarted.get(k).attempts, 2, "the rescue cost a retry");
+  assert.ok(autoStarted.get(k).nextAt > Date.now(), "and the next one waits longer");
+
+  // Eight more bounces with no time passing buy nothing at all.
+  for (let i = 0; i < 8; i++) {
+    alive(first); dead(second);
+    reclaimStrandedTicketSpawns(); drainTicketQueue();
+  }
+  assert.equal(autoStarted.get(k).attempts, 2, "the loop is throttled, not spinning");
+  assert.deepEqual((agents[second].commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-303: ticketSource is hub-only — the agent and the fleet payload never see it", async () => {
+  // Same rule as deliveredAt: bookkeeping that rides the command must not become
+  // a client contract, and Android decodes the fleet payload atomically.
+  resetAutoStart();
+  await asBeat("tqSrc", "tq45.atlassian.net", { autoStart: false, capacity: { ...ROOMY } });
+  await startTicket("tq45.atlassian.net", "ENG-5");
+  assert.equal((agents.tqSrc.commands || [])[0].ticketSource, "manual",
+    "the hub keeps it");
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = list.body.agents.find((x) => x.key === "tqSrc");
+  for (const c of rec.commands || []) {
+    assert.equal("ticketSource" in c, false, "not on the fleet payload");
+  }
+  const beat = await request("POST", "/api/heartbeat",
+    { body: { device: "tqSrc" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands.map((c) => c.type), ["spawnTicket"]);
+  for (const c of beat.body.commands) {
+    assert.equal("ticketSource" in c, false, "nor in the agent's reply");
+  }
+  // Stripping must not cost the agent the fields it actually runs on.
+  assert.equal(beat.body.commands[0].issueKey, "ENG-5");
 });
 
 // ---- routing only to a host that has TRIAGED the ticket (XERK-325) ----------

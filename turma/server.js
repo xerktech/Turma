@@ -919,6 +919,23 @@ try {
     console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(key)}`);
   }
   for (const a of Object.values(agents)) normalizeRecord(a);
+  // A RESTORED command cannot be proven undelivered (XERK-303), so it is stamped
+  // as delivered here. `deliveredAt` is written when the reply hands the command
+  // over, and `scheduleSave` is a 30-SECOND DEBOUNCE: a save that landed between
+  // the queue and the delivery wrote that command WITHOUT the stamp, so the copy
+  // on disk says "never delivered" about work the agent has since run. Restoring
+  // that as undelivered is what turns a hub restart into a SECOND session for one
+  // ticket — the reclaim would withdraw it and re-route it under a fresh cmdId
+  // the agent's in-memory de-dup cannot catch.
+  //
+  // Past a restart the honest answer is "the hub cannot tell", and both readers
+  // of this stamp already have to treat that as delivered: the reclaim leaves it
+  // alone, and XERK-241's create poll says "it may have been created — check the
+  // board". The cost is a spawn genuinely lost to a restart becoming
+  // unreclaimable, which is a delay; the thing it buys is not a duplicate.
+  // Deliberately NOT inside `normalizeRecord`: that is shared with the ingest
+  // path, where these commands are live in memory and their stamps are the truth.
+  sanitizeRestoredCommands(agents);
   // Hold what we LOAD to the registry budget too — a flood that landed before
   // the restart is on disk, and restoring all of it is an OOM before the first
   // request (XERK-272).
@@ -1380,16 +1397,79 @@ function invalidateAgentsCache() { agentsCache = null; }
 // has its own route — plus the two time/tunnel-derived live flags.
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
-// A queued command as anyone outside the hub may see it. `deliveredAt` is the
-// hub's own record of having handed the command over (XERK-241) — it lives on
-// the command because that is exactly how long it is meaningful, but it is
-// internal bookkeeping, so neither the agent's reply nor the fleet payload
-// carries it. Returns the same array when there is nothing to strip.
+// A queued command as anyone outside the hub may see it. Both stripped fields
+// are the hub's own bookkeeping, riding on the command because that is exactly
+// how long each is meaningful — so neither the agent's reply nor the fleet
+// payload carries them, and neither becomes a client contract:
+//   - `deliveredAt`, the record of having handed the command over (XERK-241).
+//   - `ticketSource`, which queue entry a spawnTicket came from (XERK-303), so a
+//     reclaim can put the ticket back in line as the same kind of work.
+// Returns the same array when there is nothing to strip.
+// Everything a RESTORED command needs before anything else reads it (XERK-303).
+// A FUNCTION declaration on purpose — the restore runs far above this line and
+// reaches it only because declarations hoist.
+//
+// Two jobs, and the first is why `normalizeRecord` cannot do either: it is shared
+// with the ingest path, where these commands are live in memory and their stamps
+// are the truth.
+//
+//  1. REWRITE a non-array `commands`, and DROP any element that is not an
+//     object. `normalizeRecord` does not walk
+//     `commands`, and a corrupt or hand-edited state.json is the only way one
+//     gets in — nothing on the wire reaches this array, and `queueCommand` only
+//     ever pushes objects. Dropping it HERE is what makes every `c.type` /
+//     `c.cmdId` read in the file safe, and there are a dozen. The one that
+//     matters is `autoStartSweep`'s, which runs in a `setInterval` with no
+//     `uncaughtException` handler behind it: `null.type` there is not a failed
+//     request, it EXITS THE HUB, taking every host's control plane with it —
+//     and it re-fires 15s after each restart. The heartbeat's ack filter drops
+//     junk too, but only for a host that BEATS, and an offline host holding a
+//     stranded spawn is exactly the subject here and never will.
+//  2. STAMP what is left as delivered. `deliveredAt` cannot be reconstructed
+//     from disk, so past a restart the hub's honest answer is "cannot tell", and
+//     both readers of the stamp treat that as delivered.
+function sanitizeRestoredCommands(reg) {
+  const at = Date.now();
+  for (const a of Object.values(reg || {})) {
+    if (!a || typeof a !== "object" || !("commands" in a)) continue;
+    // The CONTAINER's type, checked before the elements'. Skipping a non-array
+    // leaves it in the registry, and it is fatal one line sooner than a junk
+    // element is: `(a.commands || []).some` is not a function, `for…of` a plain
+    // object is not iterable — the same `setInterval` with the same no-handler
+    // exit behind it, and `publicCommands`/the ack filter break identically. A
+    // string is a plausible shape for a hand-edited file precisely because it
+    // looks scalar. Rewritten, not skipped, for the same reason `normalizeSessions`
+    // rewrites a non-array `sessions`.
+    if (!Array.isArray(a.commands)) {
+      console.warn(`dropped a malformed queued command list restored for `
+        + `${logName(a.device)} (${typeof a.commands}, not an array)`);
+      a.commands = [];
+      continue;
+    }
+    const clean = a.commands.filter((c) => c && typeof c === "object");
+    if (clean.length !== a.commands.length) {
+      console.warn(`dropped ${a.commands.length - clean.length} malformed queued `
+        + `command(s) restored for ${logName(a.device)}`);
+      a.commands = clean;
+    }
+    for (const c of a.commands) if (!("deliveredAt" in c)) c.deliveredAt = at;
+  }
+}
+
+// The `typeof` is not decoration: `in` THROWS on a truthy primitive, and this
+// runs on both the fleet payload and the heartbeat reply. A `commands` array
+// holding a bare string (a corrupt or hand-edited state.json — `normalizeRecord`
+// does not walk commands) would 400 that host's every beat with the internal
+// error text, and serve every dashboard a stale payload from `lastGoodAgentsCache`
+// for as long as the record lived. That is XERK-235's loop, from a one-word gap.
+const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite"];
 function publicCommands(cmds) {
-  if (!cmds || !cmds.some((c) => c && c.deliveredAt)) return cmds;
+  const internal = (c) => c && typeof c === "object"
+    && INTERNAL_COMMAND_FIELDS.some((f) => f in c);
+  if (!cmds || !cmds.some(internal)) return cmds;
   return cmds.map((c) => {
-    if (!c || !c.deliveredAt) return c;
-    const { deliveredAt, ...rest } = c;
+    if (!internal(c)) return c;
+    const { deliveredAt, ticketSource, ticketSite, ...rest } = c;
     return rest;
   });
 }
@@ -5227,6 +5307,27 @@ function drainTicketQueue() {
       changed = true;
       if (why) console.log(`ticket queue: dropped ${logName(e.issueKey)} — ${why}`);
     };
+    // Every way the hub GIVES UP on an entry, as against the ways it stops being
+    // work (dispatched, cancelled, its ticket reached Done). An AUTO entry is
+    // re-derivable — the next sweep re-queues it if it still qualifies — so it
+    // just goes. A MANUAL one is an operator's click and must never leave the
+    // queue silently: it goes TERMINAL, on the payload, with the ✕, exactly as
+    // the max-wait backstop below does. The blocked timer used to `drop()` here,
+    // which was survivable while only a click could put an entry in this state
+    // and the operator was watching it; a reclaimed spawn (XERK-303) arrives
+    // without anyone watching, so a click could vanish 30 minutes later with
+    // nothing on the board — the class of thing this whole queue exists to stop.
+    const giveUp = (why, msg) => {
+      if (e.source !== "manual") { drop(why); return; }
+      e.expiredAt = now;
+      e.reason = "expired";
+      // Capped like every other hold reason: this one interpolates
+      // findTicketHost's text, which carries a device name, and it rides
+      // /api/agents to every client.
+      e.error = String(msg).slice(0, TICKET_QUEUE_ERROR_MAX);
+      changed = true;
+      console.log(`ticket queue: ${logName(e.issueKey)} gave up — ${why}`);
+    };
     // A terminal entry is a message to the operator, not work: it holds nothing,
     // dispatches nothing, and leaves once it has been on screen long enough to
     // be read (or the moment they dismiss it with the ✕).
@@ -5256,7 +5357,8 @@ function drainTicketQueue() {
     if (!row) {
       if (!e.unknownSince) { e.unknownSince = now; changed = true; }
       if (now - e.unknownSince > TICKET_QUEUE_STALE_MS) {
-        drop("no reporting org lists that ticket any more");
+        giveUp("no reporting org lists that ticket any more",
+          "no agent reports that ticket any more — it stopped waiting");
       }
       continue;
     }
@@ -5289,7 +5391,8 @@ function drainTicketQueue() {
       changed = holdQueued(e, "blocked", "that ticket has no triaged repo yet") || changed;
       if (!e.blockedSince) e.blockedSince = now;
       if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
-        drop("it stayed blocked with nothing the hub could do about it");
+        giveUp("it stayed blocked with nothing the hub could do about it",
+          "it waited 30 minutes with no triaged repo — triage it and start it again");
       }
       continue;
     }
@@ -5306,7 +5409,8 @@ function drainTicketQueue() {
       // does, and the blocked timer below is what ends it if nobody acts.
       if (!e.blockedSince) e.blockedSince = now;
       if (now - e.blockedSince > TICKET_QUEUE_BLOCKED_MAX_MS) {
-        drop("it stayed blocked with nothing the hub could do about it");
+        giveUp("it stayed blocked with nothing the hub could do about it",
+          `it waited 30 minutes and nothing could run it — ${error || "no host was available"}`);
       }
       continue;
     }
@@ -5317,7 +5421,13 @@ function drainTicketQueue() {
     // from the Start button — read at DISPATCH so a pin changed while the ticket
     // waited is the one that takes effect.
     const mpin = ticketModelPin(e.siteKey, e.issueKey);
+    // `ticketSource`/`ticketSite` ride the command as hub-only bookkeeping
+    // (stripped by publicCommands): the entry leaves the queue here, so they are
+    // the only record of what KIND of work this was and WHOSE org it was
+    // dispatched for, if the command has to be reclaimed from a host that dies
+    // before taking it (XERK-303).
     queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
+      ticketSource: e.source, ticketSite: e.siteKey,
       ...(mpin ? { model: mpin.model } : {}) });
     rememberDispatch(e.siteKey, e.issueKey);
     const wait = Math.round((now - e.at) / 1000);
@@ -5348,6 +5458,118 @@ function drainTicketQueue() {
   }
 }
 
+// A spawnTicket routed to a host that then went offline before it could be
+// handed over (XERK-303). The hub's queue guarantees that any host in the org can
+// take a waiting ticket, but that guarantee ENDS AT DISPATCH — the entry leaves
+// the queue there by design — so an undelivered command on a dead host was work
+// nothing re-routed. It sat until that host came back, up to PRUNE_AFTER_MS (a
+// week), showing nothing on the board: a dispatched ticket is neither a session
+// nor a queue entry, so there was no surface for it to be missing FROM.
+//
+// Three preconditions, and each of them is load-bearing:
+//
+// 1. **`deliveredAt` is absent** — never merely "the host is offline". Delivery
+//    is the line between "the agent never saw this" and "the agent may already
+//    have run it", and a host routinely goes silent BETWEEN delivery and ack,
+//    which is the very window this runs in. Withdrawing there gives the ticket a
+//    second session on top of the one already starting, and a double start is
+//    worse than a delay. A delivered command is left where it is: it re-delivers
+//    when the host returns (delivery is at-least-once) and runs then. A command
+//    RESTORED from state.json is stamped delivered at boot for the same reason —
+//    see the restore.
+// 2. **The command carries `ticketSite`/`ticketSource`** — the queue entry is
+//    gone, so they are the only record of whose org this was and what kind of
+//    work. The org must come from the COMMAND, not from `siteKeyOf(a)`: a host's
+//    `jira.siteKey` is self-reported and bound to no credential (XERK-268 proves
+//    the host, not the org), so reading it live lets a host that re-points its
+//    Jira config re-queue another org's ticket into its own — and a different
+//    org's host then runs it. An unstamped command (an older hub's, in memory
+//    across nothing) is simply not reclaimed: guessing its kind is how an
+//    operator's click comes back as auto and gets swept away by the org switch.
+// 3. **A host is free to take it RIGHT NOW.** Withdrawing is only an improvement
+//    if the very next drain can dispatch; a command withdrawn into a queue that
+//    cannot move it is destroyed on one of the queue's own timers, and it would
+//    have RUN when its host came back. A single-host org, an org that is entirely
+//    down and a ticket pinned to the dead host each hit that, and so does a
+//    merely BUSY org — `full` is a wait that clears itself for a ticket already
+//    in line, but for one that is not it just trades a week on a dead host for
+//    four hours and a "gave up waiting" note. None of them is withdrawn; the
+//    command waits, exactly as today, and this runs again in 15 seconds, so the
+//    rescue happens the moment a slot actually exists.
+//
+// One residue is deliberate: once reclaimed, the ticket is an ordinary queue
+// entry. If an older entry beats it to the slot it can wait, and can eventually
+// expire — VISIBLY, as the terminal note every queued ticket gets. That is the
+// queue's contract, not a silent loss.
+//
+// Admission is then checked BEFORE the withdrawal, never after: it can still
+// refuse (a full org line), and dropping a command we then fail to re-queue is
+// the same destruction by another route. Refused, the command stays put and the
+// next sweep retries.
+//
+// Runs ahead of `drainTicketQueue` in the same pass, so a reclaimed ticket is
+// dispatched in the tick it is rescued rather than sitting in the queue for one.
+// Its position relative to `autoStartSweep` is NOT load-bearing (the sweep skips
+// a ticket that is queued and equally one whose spawn is in flight); do not write
+// a rationale here that claims otherwise.
+function reclaimStrandedTicketSpawns() {
+  const now = Date.now();
+  for (const [host, a] of Object.entries(agents)) {
+    if (now - (a.lastSeen || 0) < OFFLINE_AFTER_MS) continue;
+    // Iterate a COPY: dropQueuedCommand rewrites a.commands underneath us.
+    for (const c of [...(a.commands || [])]) {
+      if (!c || typeof c !== "object" || c.type !== "spawnTicket") continue;
+      // Presence, not truthiness — the same test publicCommands strips on. A
+      // stamp the hub has written in any form means "handed over"; the two reads
+      // disagreeing is how a command gets stripped from the wire and reclaimed
+      // anyway.
+      if ("deliveredAt" in c) {
+        // Throttled, because this is a line about a CONDITION — true again on
+        // every 15s sweep for as long as the host stays down — and the whole
+        // point of it is that the hub is deliberately not going to act.
+        logQueueState(`held\x00${logName(host)}\x00${logName(c.issueKey)}`,
+          `ticket queue: ${logName(c.issueKey)} was already handed to `
+          + `${logName(host)}, which has since gone offline — it may be mid-spawn, `
+          + "so it waits for that host rather than risk a second session");
+        continue;
+      }
+      const siteKey = c.ticketSite;
+      const source = c.ticketSource;
+      if (!siteKey || !c.issueKey) continue;
+      if (source !== "manual" && source !== "auto") continue;
+      const repo = ticketRepo(siteKey, c.issueKey);
+      if (!repo) continue;
+      const { host: free } =
+        findTicketHost(siteKey, repo, c.issueKey, { requireFree: true });
+      if (!free) continue;
+      // An AUTO rescue is itself an attempt that produced nothing, so it waits
+      // out the backoff the dispatch spent, exactly like the sweep's own retry.
+      // Without this a pair of hosts flapping alternately reclaims forever: each
+      // bounce finds the other host up, passes every precondition, and the ticket
+      // never starts while the log, the payload and the board churn every
+      // OFFLINE_AFTER_MS. Costs the normal case nothing — the first backoff step
+      // is 60s and a host must be silent for 75s to get here at all.
+      if (source === "auto") {
+        const prior = autoStarted.get(ticketQueueKey(siteKey, c.issueKey));
+        if (prior && now < prior.nextAt) continue;
+      }
+      if (ticketQueueAdmission(siteKey, c.issueKey, source) !== "ok") continue;
+      if (!dropQueuedCommand(host, c.cmdId, "spawnTicket")) continue;
+      if (!enqueueTicketStart(siteKey, c.issueKey, source)) {
+        // Unreachable: admission answered "ok" one line ago and nothing between
+        // the two touches the queue. Said out loud anyway, because the one thing
+        // this function must never do quietly is lose the work.
+        console.error(`ticket queue: reclaimed ${logName(c.issueKey)} from `
+          + `${logName(host)} but could not re-queue it — start it again`);
+        continue;
+      }
+      console.log(`ticket queue: reclaimed ${logName(c.issueKey)} from `
+        + `${logName(host)} — it went offline before taking the spawn, so the `
+        + `ticket is back in line (${source})`);
+    }
+  }
+}
+
 function autoStartSweep() {
   const orgs = orgsWithAutoStart();
   if (!orgs.size) return;
@@ -5375,7 +5597,8 @@ function autoStartSweep() {
       // taken it yet, so there is nothing to conclude about it either way.
       const inFlight = Object.values(agents).some((a) =>
         a.jira && a.jira.siteKey === siteKey &&
-        (a.commands || []).some((c) => c.type === "spawnTicket" && c.issueKey === t.key));
+        (a.commands || []).some(
+          (c) => c && c.type === "spawnTicket" && c.issueKey === t.key));
       if (inFlight) continue;
       // Nothing in flight and still no session: the last attempt (if any) was
       // taken and produced nothing. Retry it once its backoff has elapsed — the
@@ -5495,6 +5718,10 @@ function autoStopSweep() {
 // stay pure, directly-callable units.)
 setInterval(() => {
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
+  // Work dispatched to a host that then died before taking it goes back in the
+  // queue (XERK-303), in time for the drain at the end of this same tick to hand
+  // it to a host that is actually up.
+  reclaimStrandedTicketSpawns();
   autoStartSweep();
   autoStopSweep();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
@@ -6488,7 +6715,13 @@ const server = http.createServer(async (req, res) => {
       // At-least-once command delivery: drop any queued command the agent
       // reports as executed; keep re-sending the rest until acked.
       const acked = new Set(payload.ackedCommands || []);
-      const commands = (prev.commands || []).filter((c) => !acked.has(c.cmdId));
+      // `c && typeof c === "object"` is the same guard publicCommands needs, and
+      // for the same reason: `null.cmdId` throws HERE, before a reply is built,
+      // 400ing this host's every beat with the internal error text — XERK-235's
+      // offline loop. Filtering rather than tolerating also self-heals the record
+      // on the first beat, so a junk element cannot outlive one round trip.
+      const commands = (prev.commands || []).filter(
+        (c) => c && typeof c === "object" && !acked.has(c.cmdId));
       delete payload.ackedCommands; // don't persist the transient ack list
       // On-demand session history the agent fetched since the last beat (see
       // the {type:"history"} command); ingested into the cache below, not
@@ -6709,9 +6942,10 @@ const server = http.createServer(async (req, res) => {
       // This beat is the fleet's capacity report, so it is exactly when a
       // waiting ticket may have become startable (XERK-296) — a session that
       // ended here frees a slot the queue can claim within one beat instead of
-      // up to a 15s sweep. A no-op unless something is queued. The dispatch
-      // rides the NEXT beat's reply (this one's command list is already built),
-      // which is the same one-beat handoff every other queued command takes.
+      // up to a 15s sweep. A no-op unless something is queued. `next.commands` IS
+      // the local `commands` array, so a dispatch made here rides THIS reply and
+      // is stamped delivered by the loop below — not the next beat's, as this
+      // said before XERK-303 went looking for the undelivered window.
       if (ticketQueue.length) drainTicketQueue();
       // Stamp what this reply hands over. Delivery is the line between "the
       // agent never saw this" and "the agent may already have run it" — the
@@ -7918,6 +8152,7 @@ const server = http.createServer(async (req, res) => {
       const mpin = ticketModelPin(siteKey, issueKey);
       const cmdId = pending ? pending.cmdId
         : queueCommand(host, { type: "spawnTicket", issueKey,
+            ticketSource: "manual", ticketSite: siteKey,
             ...(mpin ? { model: mpin.model } : {}) });
       // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
       // a board that hadn't seen the queue yet clicked Start). Its session is
@@ -8711,6 +8946,8 @@ if (process.env.TURMA_TEST) {
     dropQueuedTicket,
     dropAutoQueuedTickets,
     drainTicketQueue,
+    reclaimStrandedTicketSpawns,
+    sanitizeRestoredCommands,
     queuedTicket,
     liveQueuedTicket,
     liveQueueCount,
