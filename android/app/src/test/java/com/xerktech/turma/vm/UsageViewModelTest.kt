@@ -70,6 +70,24 @@ class UsageViewModelTest {
         assertEquals(11L, turma.week)
     }
 
+    @Test fun `a removed host still counts, and says it is gone`() {
+        // XERK-338: the hub keeps a durable usage ledger and serves what a host
+        // it no longer has spent as `retiredUsage`. The Usage screen charts those
+        // beside the live fleet, so the fleet's all-time figure must not drop
+        // when a host card is removed — and the series has to say the host is
+        // gone, or a name that exists nowhere else in the app reads as a live
+        // host that simply spent nothing today.
+        val live = AgentInfo(key = "live", usage = usage(today = 1, week = 1, all = 5))
+        val gone = AgentInfo(key = "gone", retired = true,
+            usage = usage(today = 0, week = 0, all = 7))
+        val ui = UsageViewModel.compute(FleetState(agents = listOf(live, gone)))
+        assertEquals(12L, ui.total)
+        assertEquals(listOf("gone (removed)", "live"), ui.byHost.map { it.label }.sorted())
+        // The key the legend toggles on is the host name, unchanged by the
+        // label — a host that is removed must not lose a toggle set before it was.
+        assertEquals(listOf("host::gone", "host::live"), ui.byHost.map { it.skey }.sorted())
+    }
+
     @Test fun `a repo with no remote falls back to its name as the key`() {
         val fleet = FleetState(agents = listOf(
             AgentInfo(key = "h1", repoUsage = listOf(

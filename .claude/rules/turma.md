@@ -148,90 +148,10 @@ which makes an `android/` change part of the same PR) live there.
   folded into `?session=`, whose wait only resolves a **running** session.
 - Tests: `sessions.test.js`, `TestHandleCommands`.
 
-## History page (`/history`)
+## Usage page (`/usage`)
 
-- Charts persistent daily/all-time cost from the agents' `repoUsage`/`usage` aggregates — not the
-  live session list, so killed/deleted/pruned work still counts. **By repo** unifies a repo's usage
-  across every host it runs on (matched by `remoteKey`); **By host** shows per-host totals.
-- The usage page renders `(root)` as **Root**, folding older agents' `(other)`/`?` in
-  (`normRepo`/`repoLabel`).
-- **"Delegated to sub-agents"** (`subagentCard`, XERK-302) names the share of those figures spent by
-  background agents. It is a slice of every other number on the page and says so — a reader who adds
-  it back double-counts.
-  - **The share's denominator is `subagentOf`, not the fleet total**: only the spend that came with a
-    split contributes to it, so one older host can't dilute the answer. A host reporting none is left
-    out entirely, and with no series reporting one the card shows no percentage at all.
-  - **`subagentOf` accumulates per CONTRIBUTION, not per series**, and the coverage caveat is
-    measured in SPEND for the same reason: a series merges every host that ran that repo, so a
-    series-level check reads full coverage on a series three quarters of whose tokens came from a
-    host that can't answer.
-  - Android's `SubagentLine` is the one-line rendering of the same three windows.
-- Above the chart it shows the **Claude subscription's 5h/7d windows** (XERK-247) from each agent's
-  `limits` block — the numbers exist only inside Claude Code (see `.claude/rules/agent-usage.md` for
-  how they're captured).
-  - **Every token figure on every usage block is coerced at ingest too** (`normalizeUsageTokens`,
-    XERK-306) — the host/repo/session windows, the `days` map and each model's windows, which are
-    Kotlin `Long`s on Android. Unlike `subagent` the bad FIGURE is zeroed rather than the block
-    dropped: absent totals is not a meaningful "can't tell you" when every client renders them
-    unconditionally. That understates the host instead of excluding it, so it is logged (throttled).
-    A window, `days` or `usage` that is not an object at all IS dropped, and a missing figure is
-    never filled in — this walk sits between the raw and coerced `AGENT_RECORD_MAX` measurements, so
-    `{}` → four invented zeros on an agent-sized `days` map is an expansion it must not make.
-  - **`normalizeLimits` coerces the block at ingest**, like the per-model usage lists beside it and
-    for the same reason: it fans out to web, Android and glasses, and Android decodes it into TYPED
-    fields, so a `usedPct` of `"lots"` from one buggy host would fail the decode of the WHOLE fleet
-    payload rather than just its own card.
-  - **A card is dropped past `LIMIT_MAX_AGE_SEC`, not just coloured** — the agent applies the same
-    rule before reporting, but the hub keeps an OFFLINE host's last heartbeat for days, so without
-    the client-side mirror a dead host shows a frozen 5-hour window that has since reset many times.
-  - Every card is a **SNAPSHOT, and says so**: it carries "captured <age> ago" (amber past
-    `LIMIT_STALE_SEC`), because a host only refreshes while it's working. Wording is "captured", not
-    "updated" — the header's fleet-wide last-refreshed stamp was removed, and `nav.test.js` guards
-    the page against re-growing one.
-  - **A window whose `resetsAt` has passed renders as `—`, not as its last percentage**
-    (`limitWindowView`'s `expired`): that window has since rolled over, so the stored figure
-    describes one that no longer exists. The bar colours by headroom (75% warn, 90% crit).
-  - A host reporting no window at all gets **no card** — an older agent, a non-subscription login and
-    an unprobed host all mean "can't tell you", never 0% used. The section renders before the
-    chart's empty-state returns, so headroom shows on a fleet that has charted nothing.
-  - **One card per SUBSCRIPTION, not per host** (XERK-301, `limitGroups`): hosts sharing a Claude
-    account are reading one pool, so several cards were one number drawn several times. Grouping is
-    on the agent's opaque `subscription.key` (`.claude/rules/agent-usage.md`), and a host reporting
-    none keeps a card of its own — **never folded in with another silent host**, since "can't tell
-    you" from two hosts does not make them one plan. The card is headed by its hosts; the key is a
-    hash, so there is no other name to give a subscription.
-    - Each window takes its **FRESHEST** reading, not an average or a maximum: every host reads the
-      same counter, and across a window's reset the newest read is the only right answer where a
-      maximum would keep the pre-reset figure alive. Per window, since the freshest snapshot need
-      not carry both — so a window sourced from an older host **discloses its own read age**, the
-      head's stamp being the group's freshest rather than that row's.
-    - **Both clients sort freshest-first before folding and replace only on a STRICTLY newer read.**
-      Fold in fleet order, or accept an equal `capturedAt`, and two hosts whose snapshots tie to the
-      second resolve to a different host on each client — one subscription showing two different
-      percentages. Tests: the tie cases in `usage.test.js` and `UsageViewModelTest`.
-    - `normalizeSubscription` coerces the block at ingest for the same reason `normalizeLimits`
-      does, and because the key is a MAP KEY on every client: anything unusable becomes null, never
-      a plausible default that would fold two subscriptions into one set of bars. Its bounds are
-      **literals, not module `const`s** — see the restore-TDZ rule below.
-  - **`normalizeSpawnRefusals` coerces the served refusal map** (XERK-325) because Android TYPES it,
-    and it is the first typed-and-served record field that is deliberately NOT stripped from the
-    payload. The heartbeat path cannot produce a bad one (`ingestSpawnFailures` is the only writer);
-    the `state.json` restore can, and it is served before any host re-beats. It keeps the ingest
-    path's PLAIN object shape — a null-prototype one would make a restored record differ from a
-    beaten one — so the explicit `__proto__`/`constructor`/`prototype` key filter is what stops
-    `out[id]`'s [[Set]] hitting the prototype setter, not the object's prototype.
-  - **Anything a `normalize*` closes over must be reachable from `loadState`'s line.** That loop
-    sits near the top of `server.js` and reaches each one only because function declarations hoist;
-    a module `const` declared below is in its TDZ there, the `ReferenceError` lands in the restore's
-    catch, and the WHOLE registry is emptied — then the 30s save timer rewrites `state.json` from
-    only the hosts that have re-beaten, losing every host offline at that moment. XERK-301 shipped
-    exactly that and it is invisible to `server.test.js`, which walks the loader's body rather than
-    booting; `registry-restore.test.js` boots a hub instead — over **two** records, one usable and
-    one unusable in every coerced field, since a `const` on an error BRANCH is invisible to a
-    fixture that only ever takes the happy one (and would then fire only on malformed records, in
-    production).
-  - Tests: `usage.test.js`, the `limits` and subscription-key heartbeat cases in `server.test.js`,
-    android `UsageViewModelTest`.
+See `.claude/rules/turma-usage.md` — the token chart, the durable usage ledger behind it, the
+sub-agent split, and the subscription-limit cards. The ingest coercions those rely on are there too.
 
 ## Board page (`/board`)
 

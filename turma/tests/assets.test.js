@@ -30,6 +30,8 @@ process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");
 process.env.AUTOSTART_ORGS_FILE = tmp("autostart-orgs");
 process.env.TICKET_MODELS_FILE = tmp("ticket-models");
 process.env.ORG_COLORS_FILE = tmp("org-colors");
+// Durable token-usage history (XERK-338), a /data file of its own.
+process.env.USAGE_LEDGER_FILE = tmp("usage-ledger");
 process.env.MIGRATE_SPOOL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-assets-migrations-"));
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-assets-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -249,4 +251,29 @@ test("assets: HEAD /login is answered, like the assets it links", async () => {
   assert.equal(head.status, 200);
   assert.equal(head.raw, "", "a HEAD must not carry the page");
   assert.equal(head.headers["cache-control"], get.headers["cache-control"]);
+});
+
+test("every module server.js requires is COPYd into the image", () => {
+  // A local require the Dockerfile does not copy is MODULE_NOT_FOUND at boot —
+  // the whole control plane down, on a container `restart: unless-stopped` loops
+  // forever, and nothing in this suite notices because the tests require from
+  // the source tree. Cheap to state, expensive to find in production.
+  const dir = path.join(__dirname, "..");
+  const dockerfile = fs.readFileSync(path.join(dir, "Dockerfile"), "utf8");
+  const copied = new Set(
+    dockerfile.split("\n")
+      .filter((l) => /^COPY\s/.test(l))
+      .flatMap((l) => l.replace(/^COPY\s+/, "").split(/\s+/))
+  );
+  const seen = new Set();
+  const walk = (file) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const src = fs.readFileSync(path.join(dir, file), "utf8");
+    for (const m of src.matchAll(/require\("\.\/([\w.-]+)"\)/g)) {
+      assert.ok(copied.has(m[1]), `${file} requires ./${m[1]}, which turma/Dockerfile does not COPY`);
+      walk(m[1]);
+    }
+  };
+  walk("server.js");
 });

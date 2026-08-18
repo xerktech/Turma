@@ -34,6 +34,12 @@ const archive = require("./archive.js");
 // Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
 // FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
 const push = require("./push.js");
+// Durable token-usage history (XERK-338): usage is an agent-derived aggregate
+// that lived only on the registry record, so deleting/pruning a host threw it
+// away and a wiped host overwrote its own past with near-zero. This keeps it on
+// /data, keyed by host, and folds it back into what /api/agents serves. Reads
+// its file at require time (like the other /data stores below).
+const usageLedger = require("./usage-ledger.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 
@@ -1484,9 +1490,16 @@ function serializeAgent(key, agent, now) {
   const { history, subagentHistory, jiraIssues, statusResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+  // Earlier epochs of this host's spend added back (XERK-338). Null — and so
+  // free — for every host that has never lost transcripts, which is all of them
+  // until one is wiped; only then does the served block stop being the agent's
+  // own. Applied HERE rather than at ingest so what is stored and size-budgeted
+  // stays the agent's raw report, and so a purge takes effect on the next read.
+  const durable = usageLedger.fold(key, a, now);
   return {
     key,
     ...a,
+    ...(durable || {}),
     commands: publicCommands(a.commands),
     online,
     // An expected restart in progress (XERK-29): only meaningful while the host
@@ -1518,6 +1531,13 @@ function buildAgentsCache() {
     // In-flight (and just-settled) session migrations, so the Sessions page can
     // follow a moved session onto its new host and surface a failure (XERK-101).
     migrations: migrationList(),
+    // Token usage for hosts the registry no longer has (XERK-338): deleted,
+    // pruned, or evicted. Agent-shaped records carrying nothing but `usage` /
+    // `repoUsage` / `jira.siteKey` and flagged `retired`, so the Usage page and
+    // the Android Usage screen chart them beside the live fleet with the code
+    // they already have — and so no OTHER page picks them up, since none of them
+    // reads this key. Empty from a hub predating the ledger.
+    retiredUsage: usageLedger.retiredAgents(Object.keys(agents), now),
     // Whether the hub can actually deliver mobile push (FCM configured). Surfaced
     // so a disabled/misconfigured push is VISIBLE on the dashboard instead of
     // silently swallowing every alert — the failure mode of XERK-152, whose only
@@ -6913,6 +6933,10 @@ const server = http.createServer(async (req, res) => {
           error: "agent registry full", bytes: AGENTS_TOTAL_MAX, share: AGENT_FAIR_SHARE,
         });
       }
+      // Durable usage history (XERK-338). Deliberately after EVERY gate that can
+      // still refuse this beat — a refused beat is not history, and a record
+      // rolled back to `prev` must not have been folded into the ledger first.
+      usageLedger.ingest(key, next);
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
@@ -7779,10 +7803,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "agents" && parts.length === 3) {
       const key = decodeURIComponent(parts[2]);
       delete agents[key];
+      // Removing the host does NOT remove what it spent (XERK-338) — that is the
+      // whole point of the ledger, and the Usage page keeps charting it as a
+      // retired host. `?usage=purge` is the deliberate second step for an
+      // operator who wants the history gone too; there is no way back from it,
+      // so it is never the default and never implied by removing the card.
+      const purged = url.searchParams.get("usage") === "purge"
+        ? usageLedger.forget(key) : false;
       scheduleSave();
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, usagePurged: purged });
     }
 
     // GET /api/jira/<siteKey>/create-meta[?project=<p>] -> the New-ticket form's
@@ -8874,6 +8905,11 @@ if (process.env.TURMA_TEST) {
     // can make it throw and hold the rollback that follows (XERK-262). See its
     // declaration for why that rollback cannot be reached from the wire.
     recordCoercion,
+
+    // Durable token-usage history (XERK-338). Exported so a wire test can clear
+    // it between cases: it is process-wide and outlives the registry by design,
+    // so a synthetic host left in it would ride every later /api/agents body.
+    usageLedger,
 
     queueCommand,
     findSession,

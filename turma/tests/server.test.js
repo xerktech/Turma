@@ -72,6 +72,12 @@ process.env.ORG_COLORS_FILE = path.join(
   os.tmpdir(),
   `turma-test-org-colors-${process.pid}.json`
 );
+// Durable token-usage history (XERK-338) is a /data file of its own, read at
+// require time like the stores above, so it gets a throwaway one too.
+process.env.USAGE_LEDGER_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-usage-ledger-${process.pid}.json`
+);
 // The migration relay spools transcript bundles to disk (XERK-263) and sweeps
 // its whole directory at boot, so it gets a throwaway one of its own — sharing
 // /data/migrations, or one dir across test files, would have each sweep delete
@@ -153,6 +159,7 @@ const {
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
+  usageLedger,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -2046,6 +2053,11 @@ test("http: a malformed sub-agent split is DROPPED, never repaired into zeros", 
     (await request("GET", "/api/agents", { headers: userHeaders }))
       .body.agents.find((a) => a.key === key);
   const beat = async (subagent) => {
+    // Cleared per case because the durable usage ledger (XERK-338) is a
+    // HIGH-WATER mark: once a valid split has been recorded for this host, a
+    // later zero one is served the recorded figure, which is the ledger working
+    // and would hide what this test is about — the coercion, on a fresh host.
+    usageLedger.forget("junk-split-host");
     await request("POST", "/api/heartbeat", {
       body: { device: "junk-split-host", usage: { totals: { input: 1 }, subagent } },
       headers: agentHeaders,
@@ -11228,4 +11240,148 @@ test("heartbeat: the same poison on the ingest path is dropped, not crashed on",
   assert.equal(r.status, 200);
   // The poisoned row is dropped; the beat is otherwise honoured.
   assert.deepEqual(agents["poison-ingest"].sessions[0].session.agents, []);
+});
+
+// ---- durable token usage (XERK-338) -----------------------------------------
+//
+// Usage is an agent-derived aggregate that used to live only on the registry
+// record, so removing a host threw its spend away and a host whose DISK was
+// wiped came back reporting near-zero and overwrote its own past in place. The
+// ledger's own arithmetic is unit-tested in usage-ledger.test.js; what is held
+// here is the WIRING — that the hub folds it into what /api/agents serves, that
+// a removed host keeps riding the payload, and that removing a host is not
+// silently a purge.
+
+// One host's usage half, shaped as the agent reports it (_finalize_usage).
+// `days` is {date: tokens}; the all-time total is their sum.
+function usageBeat(device, days, { repo = "r1" } = {}) {
+  const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+  const total = Object.values(days).reduce((a, n) => a + n, 0);
+  const block = () => ({
+    totals: b(total), today: b(0), week: b(total),
+    days: Object.fromEntries(Object.entries(days).map(([d, n]) => [d, b(n)])),
+    sessions: 1, lastActivity: "2026-08-18T11:00:00Z",
+    models: [{ model: "m1", totals: b(total), today: b(0), week: b(0) }],
+  });
+  return {
+    device,
+    usage: block(),
+    repoUsage: [{ repo, remoteKey: `rk-${repo}`, remote: "", usage: block() }],
+  };
+}
+const totalOf = (u) => (u ? u.totals.input : null);
+async function fleet() {
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(r.status, 200);
+  return r.body;
+}
+
+test("usage: a wiped host's history is added back to what it reports", async () => {
+  const host = "usage-wipe-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: usageBeat(host, { "2026-08-17": 900 }) });
+  let a = (await fleet()).agents.find((x) => x.key === host);
+  // Nothing lost yet, so the record is exactly the agent's own report.
+  assert.equal(totalOf(a.usage), 900);
+
+  // The box is re-imaged and rejoins under the same name: same host, near-empty
+  // projects dir, so the aggregate it reports collapses.
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 20 }) });
+  a = (await fleet()).agents.find((x) => x.key === host);
+  assert.equal(totalOf(a.usage), 920);
+  assert.equal(totalOf(a.repoUsage.find((r) => r.remoteKey === "rk-r1").usage), 920);
+  // The STORED record stays the agent's raw report — the fold is a serving-time
+  // view, so what is size-budgeted and saved is still what the agent sent.
+  assert.equal(agents[host].usage.totals.input, 20);
+
+  delete agents[host];
+  usageLedger.forget(host);
+});
+
+test("usage: transcripts aging out from under a live host are not double-counted", async () => {
+  // Claude Code deletes its own transcripts on `cleanupPeriodDays`, so a live,
+  // healthy host's reported all-time total drops routinely. Adding the old total
+  // to the new one would count every surviving transcript twice, every month —
+  // which is why the ledger is a per-DAY high-water mark and not a carry.
+  const host = "usage-prune-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: usageBeat(host, { "2026-08-16": 300, "2026-08-17": 700 }) });
+  const aged = usageBeat(host, { "2026-08-17": 700 });
+  for (let i = 0; i < 3; i++) {
+    await request("POST", "/api/heartbeat", { headers: agentHeaders, body: aged });
+    const a = (await fleet()).agents.find((x) => x.key === host);
+    assert.equal(totalOf(a.usage), 1000, `beat ${i}: the answer must be stable, not compounding`);
+  }
+  delete agents[host];
+  usageLedger.forget(host);
+});
+
+test("usage: removing a host keeps its spend, as a retired series", async () => {
+  const host = "usage-removed-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { ...usageBeat(host, { "2026-08-18": 400 }), jira: { siteKey: "XERK" } },
+  });
+  const del = await request("DELETE", `/api/agents/${host}`, { headers: userHeaders });
+  assert.equal(del.status, 200);
+  assert.equal(del.body.usagePurged, false);
+
+  const body = await fleet();
+  assert.equal(body.agents.some((x) => x.key === host), false);
+  const rec = body.retiredUsage.find((x) => x.key === host);
+  assert.ok(rec, "a removed host's usage still rides /api/agents");
+  assert.equal(rec.retired, true);
+  assert.equal(rec.online, false);
+  assert.equal(totalOf(rec.usage), 400);
+  // Carried so the header's org filter still applies to it on both clients.
+  assert.deepEqual(rec.jira, { siteKey: "XERK" });
+  // And it is NOT a host: nothing outside the Usage page may treat it as one.
+  assert.equal("sessions" in rec, false);
+
+  usageLedger.forget(host);
+});
+
+test("usage: purging is a separate, deliberate step from removing the host", async () => {
+  const host = "usage-purge-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 700 }) });
+  const del = await request("DELETE", `/api/agents/${host}?usage=purge`, { headers: userHeaders });
+  assert.equal(del.status, 200);
+  assert.equal(del.body.usagePurged, true);
+  assert.equal(usageLedger.has(host), false);
+  const body = await fleet();
+  assert.equal(body.retiredUsage.some((x) => x.key === host), false);
+});
+
+test("usage: a host that returns intact is never counted twice", async () => {
+  const host = "usage-return-host";
+  usageLedger.forget(host);
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 500 }) });
+  // Removed from the registry — the operator tidying a card, or prune()/eviction
+  // — and then back with its transcripts untouched.
+  delete agents[host];
+  invalidateAgentsCache();
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: usageBeat(host, { "2026-08-18": 500 }) });
+  const a = (await fleet()).agents.find((x) => x.key === host);
+  assert.equal(totalOf(a.usage), 500);
+  delete agents[host];
+  usageLedger.forget(host);
+});
+
+test("usage: a refused beat is not history", async () => {
+  // The ingest sits behind every gate that can still refuse the beat: a record
+  // rolled back to `prev` must not have been banked into the ledger first.
+  const host = "usage-refused-host";
+  usageLedger.forget(host);
+  const fat = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { ...usageBeat(host, { "2026-08-18": 300 }), sessions: "A".repeat(AGENT_RECORD_MAX + 1024) },
+  });
+  assert.equal(fat.status, 413);
+  assert.equal(usageLedger.has(host), false);
 });

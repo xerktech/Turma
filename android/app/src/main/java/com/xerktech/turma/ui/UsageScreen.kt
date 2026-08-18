@@ -87,7 +87,10 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
     // so both groupings stay consistent: "By host" drops the other orgs' hosts,
     // and "By repo" charts only what the scoped org's hosts spent — a repo two
     // orgs share reads as that org's share of it, which is the point of scoping.
-    val scoped = remember(fleet, org) { scopedAgents(fleet.agents, org) }
+    // Live hosts PLUS the usage of hosts the hub no longer has (XERK-338) — the
+    // only place a deleted, pruned or wiped host's spend still exists. Scoped by
+    // the same org rule; a retired entry carries the siteKey it last reported.
+    val scoped = remember(fleet, org) { scopedAgents(fleet.agents + fleet.retiredUsage, org) }
     val ui = remember(scoped) { UsageViewModel.compute(fleet.copy(agents = scoped)) }
     // Grouping pick + legend toggles persist across visits (web usage.html's
     // localStorage `turma-usage-mode` / `turma-hidden-sessions`).
@@ -106,7 +109,7 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
             // Chartable groupings sort by (label, key) — the stable paint order.
             0 -> ui.byRepo.map { UsageSeries(it.skey, it.label, it.today, it.total, it.days, it.cache) }
                 .sortedWith(compareBy({ it.label }, { it.skey }))
-            1 -> ui.byHost.map { UsageSeries(it.skey, it.host, it.today, it.total, it.days, it.cache) }
+            1 -> ui.byHost.map { UsageSeries(it.skey, it.label, it.today, it.total, it.days, it.cache) }
                 .sortedWith(compareBy({ it.label }, { it.skey }))
             // Models keep biggest-consumer-first (no chart, no legend).
             else -> ui.byModel.map { UsageSeries("model::" + it.model, it.model, it.today, it.total, emptyMap(), it.cache) }

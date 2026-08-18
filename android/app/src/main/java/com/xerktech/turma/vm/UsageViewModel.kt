@@ -72,8 +72,15 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val total: Long,
         val days: Map<String, Long> = emptyMap(),
         val cache: CacheSummary = CacheSummary(),
+        /**
+         * A host the hub no longer has (XERK-338) — deleted, pruned or evicted —
+         * on this screen only because its spend outlived it. Web `hostLabel`.
+         */
+        val retired: Boolean = false,
     ) {
         val skey: String get() = "host::$host"
+        /** What the legend and the chart call it; see [retired]. */
+        val label: String get() = if (retired) "$host (removed)" else host
     }
 
     /** One model's fleet-wide token counts. */
@@ -245,7 +252,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 val hostDays = LinkedHashMap<String, Long>()
                 a.usage?.let { addDays(hostDays, it) }
                     ?: a.repoUsage.forEach { addDays(hostDays, it.usage) }
-                hosts.add(HostTotal(a.key, hostToday, hostWeek, hostTotal, hostDays, hostCache))
+                hosts.add(HostTotal(a.key, hostToday, hostWeek, hostTotal, hostDays, hostCache,
+                                    retired = a.retired))
                 today += hostToday
                 week += hostWeek
                 total += hostTotal

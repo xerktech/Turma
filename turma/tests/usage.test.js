@@ -90,7 +90,8 @@ function loadHelpers() {
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheLineText, cacheHitRate,
     blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView,
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
-    blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render };`;
+    blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
+    hostLabel, hostSeries, repoSeries };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
   return Object.assign(new Function(...keys, body)(...keys.map((k) => stubs[k])), { els });
@@ -907,4 +908,97 @@ test("subagentCard distinguishes an empty window from a zero share", () => {
 test("subagentCard reads as a share of the page, never as an addition to it", () => {
   const html = cardHtml([series(usage(1000, 250))]);
   assert.match(html, /Already counted in every figure above/);
+});
+
+// --- retired hosts (XERK-338) ------------------------------------------------
+// Usage outlives the host that spent it: the hub keeps a durable ledger and
+// serves what a removed, pruned or evicted host spent as `retiredUsage`. This
+// page is the only one that reads that key, so these hold that it does.
+
+const retiredHost = (key, n, siteKey) => ({
+  key, device: key, retired: true, online: false,
+  ...(siteKey ? { jira: { siteKey } } : {}),
+  usage: hostUsage(n, n, n),
+  repoUsage: [{ repo: "r1", remoteKey: "rk-r1", usage: hostUsage(n, n, n) }],
+});
+
+test("hostLabel says a host is gone rather than letting it read as idle", () => {
+  assert.equal(H.hostLabel({ key: "k", device: "truenas" }), "truenas");
+  assert.equal(H.hostLabel({ key: "k", device: "truenas", retired: true }), "truenas (removed)");
+  // No device (a record that only ever had a key) still names something.
+  assert.equal(H.hostLabel({ key: "k", retired: true }), "k (removed)");
+});
+
+test("a retired host is a series of its own in both groupings", () => {
+  const [host] = H.hostSeries([retiredHost("gone", 10)]);
+  assert.equal(host.label, "gone (removed)");
+  assert.equal(host.skey, "host::gone");
+  const [repo] = H.repoSeries([retiredHost("gone", 10)]);
+  // "By repo" unifies across hosts, so the host context line has to say which of
+  // the contributors no longer exists.
+  assert.equal(repo.device, "gone (removed)");
+});
+
+test("the headline totals count what a removed host spent", () => {
+  // The whole point of the ticket: the fleet's all-time figure must not drop
+  // when a host card is removed.
+  H.render({ agents: [{ key: "live", device: "live", usage: hostUsage(1, 1, 5) }],
+             retiredUsage: [retiredHost("gone", 7)] });
+  const stats = H.els.totals.children.filter((c) => c.className === "stat");
+  assert.equal(stats[2].children[1].textContent, H.fmtTokens(12));
+});
+
+test("retired usage is scoped by the org filter like any other host", () => {
+  const prev = orgFilter;
+  orgFilter = (agents) => agents.filter((a) => (a.jira || {}).siteKey === "ACME");
+  try {
+    H.render({
+      agents: [{ key: "live", device: "live", jira: { siteKey: "ACME" }, usage: hostUsage(1, 1, 3) }],
+      retiredUsage: [retiredHost("acme-gone", 4, "ACME"), retiredHost("other-gone", 100, "XERK")],
+    });
+    const stats = H.els.totals.children.filter((c) => c.className === "stat");
+    assert.equal(stats[2].children[1].textContent, H.fmtTokens(7));
+  } finally { orgFilter = prev; }
+});
+
+test("a hub with no ledger at all renders exactly as before", () => {
+  // `retiredUsage` is absent from an older hub, which is indistinguishable from
+  // a fleet that has never removed a host and must read the same.
+  H.render({ agents: [{ key: "live", device: "live", usage: hostUsage(1, 1, 5) }] });
+  const stats = H.els.totals.children.filter((c) => c.className === "stat");
+  assert.equal(stats[2].children[1].textContent, H.fmtTokens(5));
+});
+
+test("the chart itself is drawn from the retired spend too", () => {
+  // The whole page, through `render`, with a removed host in the payload: it
+  // paints a chart rather than its empty state, and the y-axis is scaled to the
+  // COMBINED spend — 12 tokens rounds the axis to 20, where the live host's 5
+  // alone would top it out at 5. That is the retired series reaching the plot,
+  // not just the headline strip above it.
+  const dayed = (n) => ({ ...hostUsage(n, n, n), days: { "2026-08-18": bucket({ input: n }) } });
+  const agent = (key, n, retired) => ({
+    key, device: key, ...(retired ? { retired: true } : {}),
+    usage: dayed(n),
+    repoUsage: [{ repo: "Turma", remoteKey: "gh/x/turma", usage: dayed(n) }],
+  });
+  const seen = () => {
+    const out = [];
+    const walk = (el) => {
+      if (!el || typeof el !== "object") return;
+      if (typeof el.textContent === "string" && el.textContent) out.push(el.textContent);
+      for (const c of el.children || []) walk(c);
+    };
+    walk(H.els.chart);
+    return out;
+  };
+  H.render({ agents: [agent("live", 5)], retiredUsage: [agent("gone", 7, true)] });
+  const withRetired = seen();
+  assert.ok(!withRetired.some((t) => t.startsWith("No per-day usage")), "the chart is drawn");
+  assert.ok(withRetired.includes("20"), `axis not scaled to the retired spend: ${withRetired}`);
+
+  // The same payload with the ledger's contribution removed tops out lower —
+  // which is what makes the assertion above about the retired host and not about
+  // the axis happening to read 20.
+  H.render({ agents: [agent("live", 5)] });
+  assert.ok(!seen().includes("20"), "the axis must not read 20 without the retired host");
 });
