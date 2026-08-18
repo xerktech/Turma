@@ -209,7 +209,10 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
       its rows for a deleted file and nothing VACUUMs, so counted, an operator who deleted every
       transcript stayed full forever (measured: still refusing after 84 attempts / 421 s, capacity
       per fill-delete cycle ratcheting 429 transcripts down to 4). The index and the `.meta`
-      sidecars are **overhead to size the volume for, not budget** — leave roughly 3× the ceiling.
+      sidecars are **overhead to size the volume for, not budget** — and that overhead is **at least 3×
+      the ceiling and unbounded across fill/wipe cycles** (measured 3.0–3.2× at first fill, then
+      ~13 MB of index per cycle to 61× by cycle 38, unreclaimed by a restart; XERK-332 tracks
+      reclaiming it). Size the volume for the churn, not for one fill.
     - **A walk that THROWS is not a measurement of zero** — only ENOENT on `ARCHIVE_DIR` is (that
       is the store genuinely absent, and what lets a removed directory be recreated instead of
       latching full). Anything else — EMFILE from fd exhaustion, EACCES, EIO — keeps the last
@@ -220,7 +223,8 @@ working-status bar, ready-for-review, ended sessions, the composer and the termi
       its subtree — an under-measure, which this errs toward anyway. Propagating it froze the
       baseline permanently, so no deletion was ever seen again and the store latched full with no
       exit; one root-owned directory (an expected state per the run-as-identity rules) or one
-      over-long path was enough.
+      over-long path was enough. The subtree's cost is one-time only while it is also UNWRITABLE,
+      which is the realistic shape; unreadable-but-writable under-measures without bound.
     - Once it reads full it re-measures on `FULL_RECHECK_MS` instead — precision is worth most
       exactly then, ingest is refusing anyway so a walk costs no throughput, and this is what
       bounds how long an operator waits after freeing space.

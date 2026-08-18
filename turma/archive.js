@@ -272,11 +272,16 @@ const FULL_RECHECK_MS = 30 * 1000;
 // ratcheting 429 transcripts down to 4). A budget may only bound what its
 // enforcement can actually reclaim.
 //
-// So the index is OVERHEAD the operator sizes the volume for, not budget. Size
-// ARCHIVE_TOTAL_MAX_BYTES at roughly a third of the space you can spare, or
-// measure it — the ratio moves with how much prose the transcripts carry. The
-// `.meta` sidecars are uncounted too: 267 bytes each, bounded by transcript
-// count, and rewritten in place rather than grown.
+// So the index is OVERHEAD the operator sizes the volume for, not budget — and
+// that overhead is AT LEAST 3x the ceiling and is NOT bounded. Measured 3.0-3.2x
+// at first fill, but nothing reaps a deleted file's rows and rebuildIndex() only
+// runs on a schema bump or an empty table, so a store that is repeatedly filled
+// and wiped keeps growing the index: ~13 MB per fill/wipe cycle at an 8 MiB
+// ceiling, reaching 61x by cycle 38, with the .jsonl total pinned at the ceiling
+// throughout, and a hub restart does not reclaim it. Reclaiming that is XERK-332;
+// until then, size the volume for the churn, not for one fill. The `.meta`
+// sidecars are uncounted too: 267 bytes each, bounded by transcript count, and
+// rewritten in place rather than grown.
 //
 // A subdirectory we cannot read is SKIPPED, not fatal. It costs us that subtree
 // (an under-measure, which the ceiling errs toward anyway), where letting it
@@ -284,6 +289,12 @@ const FULL_RECHECK_MS = 30 * 1000;
 // directory left the baseline latched and no deletion ever seen again. Only a
 // failure to read ARCHIVE_DIR ITSELF is a failed measurement — that is the whole
 // store being unreadable, not one corner of it.
+//
+// "Costs us that subtree" is one-time only while the subtree is also unwritable,
+// which is the realistic case (a root-owned 0700 folder fails both readdir and
+// append; a 0755 one readdirs fine). Unreadable-but-WRITABLE — mode 0333, or an
+// ACL — under-measures without bound instead, since each walk both misses those
+// bytes and zeroes the charge that would have carried them.
 function walkJsonlBytes(dir, depth) {
   let names;
   try {
