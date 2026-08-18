@@ -229,11 +229,14 @@ test("newticket: every page feeds it the heartbeat via TurmaNewTicket.update", (
 });
 
 test("newticket: the hub actually serves every /*.js the pages load", () => {
-  // A shared script that isn't in server.js's STATIC_ASSETS 404s in the browser,
+  // A shared script that isn't in server.js's HASHED_ASSETS 404s in the browser,
   // taking its whole module (and every page's render) down — nav.js/org.js are
   // registered by hand, so a new one is easy to forget. Guard the whole class.
+  // HASHED_ASSETS specifically, not the STATIC_ASSETS map it feeds: that list is
+  // also what gives a script its fingerprinted URL, and one registered only as a
+  // plain entry is served under a mutable name again (XERK-312).
   const server = fs.readFileSync(path.join(PUBLIC, "..", "server.js"), "utf8");
-  const served = new Set([...server.matchAll(/"(\/[\w-]+\.js)":/g)].map(m => m[1]));
+  const served = new Set([...server.matchAll(/\["(\/[\w-]+\.js)",/g)].map(m => m[1]));
   for (const f of PAGE_FILES) {
     const html = fs.readFileSync(path.join(PUBLIC, f), "utf8");
     for (const m of html.matchAll(/<script src="(\/[\w-]+\.js)">/g)) {

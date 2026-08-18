@@ -5149,40 +5149,158 @@ setInterval(() => {
   if (migrations.size) advanceMigrations();
 }, 10 * 1000).unref();
 
-const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
-const USAGE = fs.readFileSync(path.join(__dirname, "public", "usage.html"));
-const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
-const BOARD = fs.readFileSync(path.join(__dirname, "public", "board.html"));
-const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
-
 // Branded static assets: the shared stylesheet, self-hosted UI fonts (Inter +
 // Space Grotesk), and the icon/favicon set + web manifest. Read once into memory
 // and served UNAUTHENTICATED from an explicit allowlist (see the router) — the
 // login page must render its CSS/fonts/icon before any session cookie exists,
-// and none of this leaks anything (same rationale as /healthz). Icons/fonts are
-// content-hash-stable so they cache hard; app.css uses a short TTL so UI edits
-// propagate on the next deploy without a stale cache.
+// and none of this leaks anything (same rationale as /healthz). Icons and fonts
+// are content-stable under their own names, so they cache hard; the stylesheet
+// and scripts change every deploy and are fingerprinted instead (below).
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
+// The BARE name of a fingerprinted asset revalidates on every request: the only
+// thing still asking for it is an HTML page a cache handed back from before the
+// deploy, and that page is precisely the one that must not be given a stale
+// body. `no-cache` is store-and-revalidate, not don't-store, so with the ETag
+// below the usual answer is a 304 (XERK-312).
+const REVALIDATE_CACHE = "public, no-cache";
+// A fingerprint no release ever minted is still a 200 (see `supersededAsset`),
+// and an unauthenticated caller can ask for 2^48 of them. `private` keeps a
+// shared cache in front of the hub from storing a distinct entry per guess;
+// the bare names it falls back to are a fixed set of six, so they stay public.
+const SUPERSEDED_CACHE = "private, no-cache";
+// The HTML shells name their assets BY fingerprint, so a shell held without
+// asking would keep pointing at last release's URLs — the same stale window one
+// level up. `private` keeps the logged-in pages out of shared caches (the CDN
+// in front of the hub included); the login page sets its own `no-store`.
+const HTML_CACHE = "private, no-cache";
+
+// Content hash of a body — the identity a fingerprinted URL and an ETag are
+// both built from. Truncated to 12 hex (48 bits): short enough to read in a
+// URL, far past any collision worth reasoning about for a handful of files.
+const assetFingerprint = (body) =>
+  crypto.createHash("sha256").update(body).digest("hex").slice(0, 12);
+
+const readAsset = (...file) => fs.readFileSync(path.join(__dirname, "public", ...file));
+const staticAsset = (body, type, cache) => ({ body, type, cache, etag: `"${assetFingerprint(body)}"` });
+
 // Filenames are hardcoded string literals (no request data reaches path.join) so
 // there's no path-traversal surface; the request only ever indexes this fixed map.
 const STATIC_ASSETS = {
-  "/app.css":              { body: fs.readFileSync(path.join(__dirname, "public", "app.css")),             type: "text/css; charset=utf-8",                  cache: "public, max-age=300" },
-  "/chat.js":              { body: fs.readFileSync(path.join(__dirname, "public", "chat.js")),             type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
-  "/board.js":             { body: fs.readFileSync(path.join(__dirname, "public", "board.js")),            type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
-  "/nav.js":               { body: fs.readFileSync(path.join(__dirname, "public", "nav.js")),              type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
-  "/org.js":               { body: fs.readFileSync(path.join(__dirname, "public", "org.js")),              type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
-  "/newticket.js":         { body: fs.readFileSync(path.join(__dirname, "public", "newticket.js")),        type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
-  "/favicon.svg":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.svg")),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
-  "/favicon.ico":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.ico")),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
-  "/favicon-16.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-16.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/favicon-32.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-32.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/apple-touch-icon.png": { body: fs.readFileSync(path.join(__dirname, "public", "apple-touch-icon.png")), type: "image/png",                               cache: IMMUTABLE_CACHE },
-  "/icon-192.png":         { body: fs.readFileSync(path.join(__dirname, "public", "icon-192.png")),        type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/icon-512.png":         { body: fs.readFileSync(path.join(__dirname, "public", "icon-512.png")),        type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/site.webmanifest":     { body: fs.readFileSync(path.join(__dirname, "public", "site.webmanifest")),    type: "application/manifest+json; charset=utf-8", cache: "public, max-age=3600" },
-  "/fonts/inter-latin-wght-normal.woff2":         { body: fs.readFileSync(path.join(__dirname, "public", "fonts", "inter-latin-wght-normal.woff2")),         type: "font/woff2", cache: IMMUTABLE_CACHE },
-  "/fonts/space-grotesk-latin-wght-normal.woff2": { body: fs.readFileSync(path.join(__dirname, "public", "fonts", "space-grotesk-latin-wght-normal.woff2")), type: "font/woff2", cache: IMMUTABLE_CACHE },
+  "/favicon.svg":          staticAsset(readAsset("favicon.svg"),          "image/svg+xml",                            IMMUTABLE_CACHE),
+  "/favicon.ico":          staticAsset(readAsset("favicon.ico"),          "image/x-icon",                             IMMUTABLE_CACHE),
+  "/favicon-16.png":       staticAsset(readAsset("favicon-16.png"),       "image/png",                                IMMUTABLE_CACHE),
+  "/favicon-32.png":       staticAsset(readAsset("favicon-32.png"),       "image/png",                                IMMUTABLE_CACHE),
+  "/apple-touch-icon.png": staticAsset(readAsset("apple-touch-icon.png"), "image/png",                                IMMUTABLE_CACHE),
+  "/icon-192.png":         staticAsset(readAsset("icon-192.png"),         "image/png",                                IMMUTABLE_CACHE),
+  "/icon-512.png":         staticAsset(readAsset("icon-512.png"),         "image/png",                                IMMUTABLE_CACHE),
+  "/site.webmanifest":     staticAsset(readAsset("site.webmanifest"),     "application/manifest+json; charset=utf-8", "public, max-age=3600"),
+  "/fonts/inter-latin-wght-normal.woff2":         staticAsset(readAsset("fonts", "inter-latin-wght-normal.woff2"),         "font/woff2", IMMUTABLE_CACHE),
+  "/fonts/space-grotesk-latin-wght-normal.woff2": staticAsset(readAsset("fonts", "space-grotesk-latin-wght-normal.woff2"), "font/woff2", IMMUTABLE_CACHE),
 };
+
+// The shared stylesheet and scripts are MUTABLE — they change with every deploy
+// — so no TTL under their own name is correct: a warm browser serves the NEW
+// html against the OLD app.css until it expires, which is a site that renders
+// unstyled for that whole window (XERK-312). A short TTL only shortens it.
+// So each is ALSO published under a content-hashed name, which a new body
+// changes, and the HTML below is rewritten at boot to link that name. Nothing
+// can hold a stale copy of a URL that no longer exists.
+//
+// Any new shared /*.js belongs HERE, not in the map above — the pages link
+// whatever `withHashedAssets` rewrites, and an entry missing from the allowlist
+// 404s and takes that page's whole render down.
+const HASHED_ASSETS = [
+  ["/app.css",       "app.css",       "text/css; charset=utf-8"],
+  ["/chat.js",       "chat.js",       "text/javascript; charset=utf-8"],
+  ["/board.js",      "board.js",      "text/javascript; charset=utf-8"],
+  ["/nav.js",        "nav.js",        "text/javascript; charset=utf-8"],
+  ["/org.js",        "org.js",        "text/javascript; charset=utf-8"],
+  ["/newticket.js",  "newticket.js",  "text/javascript; charset=utf-8"],
+];
+
+// Bare URL -> fingerprinted URL, the map the HTML rewrite runs on.
+const ASSET_URLS = {};
+// The same bodies again, for a fingerprint a previous release minted.
+const SUPERSEDED_ASSETS = {};
+for (const [urlPath, file, type] of HASHED_ASSETS) {
+  const body = readAsset(file);
+  const hashed = urlPath.replace(/\.([^.]+)$/, `.${assetFingerprint(body)}.$1`);
+  ASSET_URLS[urlPath] = hashed;
+  STATIC_ASSETS[hashed] = staticAsset(body, type, IMMUTABLE_CACHE);
+  // The bare name keeps serving the same body, revalidating: browsers holding a
+  // pre-deploy HTML page still link it, and 404ing them would take the styling
+  // off a page that was working a moment ago — the very failure being fixed.
+  STATIC_ASSETS[urlPath] = staticAsset(body, type, REVALIDATE_CACHE);
+  SUPERSEDED_ASSETS[urlPath] = staticAsset(body, type, SUPERSEDED_CACHE);
+}
+
+// A fingerprinted name this build does NOT know: `/app.<some old hash>.css`,
+// asked for by an HTML page a cache handed back from before the deploy. It must
+// resolve to the CURRENT body rather than 404 — a 404 here is the unstyled page
+// this whole mechanism exists to prevent, and a worse one than the stale
+// stylesheet it replaced. Revalidating, because it is by definition not the
+// version whose URL was minted. The base name is matched against the allowlist,
+// so this widens what is served by exactly nothing.
+const HASHED_NAME_RE = /^\/([\w-]+)\.[0-9a-f]{12}\.(css|js)$/;
+function supersededAsset(pathname) {
+  const m = HASHED_NAME_RE.exec(pathname);
+  if (!m) return null;
+  const bare = `/${m[1]}.${m[2]}`;
+  if (!Object.prototype.hasOwnProperty.call(ASSET_URLS, bare)) return null;
+  if (ASSET_URLS[bare] === pathname) return null; // the current one; served above
+  return SUPERSEDED_ASSETS[bare];
+}
+
+// Point a page at the fingerprinted URLs. Only real attribute references are
+// rewritten (href="/app.css", src="/nav.js"); the pages' own comments name these
+// files in prose constantly, and those must be left alone.
+function withHashedAssets(buf) {
+  let html = buf.toString("utf8");
+  for (const [bare, hashed] of Object.entries(ASSET_URLS)) {
+    html = html.split(`="${bare}"`).join(`="${hashed}"`);
+  }
+  return Buffer.from(html, "utf8");
+}
+const htmlPage = (file) => {
+  const body = withHashedAssets(readAsset(file));
+  return { body, etag: `"${assetFingerprint(body)}"` };
+};
+
+const INDEX = htmlPage("index.html");
+const USAGE = htmlPage("usage.html");
+const SESSIONS = htmlPage("sessions.html");
+const BOARD = htmlPage("board.html");
+// Not an `htmlPage`: the login form is served `no-store` (a cached login page
+// is its own problem), so it has no conditional-GET path to carry an ETag for.
+const LOGIN = withHashedAssets(readAsset("login.html"));
+
+// Does this conditional request already hold the body we would send? The header
+// is a comma-separated list and either side may weaken an entry (`W/"..."`); a
+// cache or proxy in front of the hub is entitled to do both.
+function etagMatches(req, etag) {
+  const header = req.headers["if-none-match"];
+  if (!header || !etag) return false;
+  return header
+    .split(",")
+    .some((t) => { const v = t.trim(); return v === "*" || v.replace(/^W\//, "") === etag; });
+}
+
+// Serve one of the HTML shells. They revalidate every time (they name
+// fingerprinted assets, so a stale shell re-opens XERK-312 one level up), and
+// the ETag makes the common answer a 304 rather than the whole page.
+function sendPage(req, res, page) {
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": HTML_CACHE,
+    ETag: page.etag,
+  };
+  if (etagMatches(req, page.etag)) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+  res.writeHead(200, headers);
+  return res.end(page.body);
+}
 
 // Bundled web font served to the live terminal. ttyd's page is same-origin
 // (proxied under /term/<name>/), so its xterm.js can load this from the hub;
@@ -5685,10 +5803,37 @@ const server = http.createServer(async (req, res) => {
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):
     // public and served before the auth gate so the login page renders before a
     // session exists. Explicit allowlist — no arbitrary path -> file mapping.
-    if (req.method === "GET" && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+    // HEAD as well as GET: these are public, and a HEAD falling through to the
+    // auth gate answered 401 for the very stylesheet the login page renders with
+    // — which is what a CDN or an uptime check asks for.
+    const isAssetRead = req.method === "GET" || req.method === "HEAD";
+    if (isAssetRead && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
       const asset = STATIC_ASSETS[url.pathname];
-      res.writeHead(200, { "Content-Type": asset.type, "Cache-Control": asset.cache });
-      return res.end(asset.body);
+      const headers = { "Content-Type": asset.type, "Cache-Control": asset.cache, ETag: asset.etag };
+      // The bare names revalidate on every request (XERK-312); the 304 is what
+      // keeps that from re-sending the stylesheet on every navigation.
+      if (etagMatches(req, asset.etag)) {
+        res.writeHead(304, headers);
+        return res.end();
+      }
+      res.writeHead(200, headers);
+      // A HEAD gets the headers and no body; node still sets Content-Length off
+      // the body it never writes if we hand it one, so end it empty.
+      return res.end(req.method === "HEAD" ? undefined : asset.body);
+    }
+
+    // Same, for a fingerprint a previous release minted (XERK-312).
+    if (isAssetRead) {
+      const stale = supersededAsset(url.pathname);
+      if (stale) {
+        const headers = { "Content-Type": stale.type, "Cache-Control": stale.cache, ETag: stale.etag };
+        if (etagMatches(req, stale.etag)) {
+          res.writeHead(304, headers);
+          return res.end();
+        }
+        res.writeHead(200, headers);
+        return res.end(req.method === "HEAD" ? undefined : stale.body);
+      }
     }
 
     // Public routes: the login page and its API need no session, and the
@@ -5776,7 +5921,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Login form (public). Already-authenticated visitors skip straight in.
-    if (req.method === "GET" && (url.pathname === "/login" || url.pathname === "/login.html")) {
+    // HEAD as well as GET, for the same reason the asset routes take it: this is
+    // the one unauthenticated HTML surface, so it is what a CDN or an uptime
+    // check probes, and a HEAD used to fall through to a 404.
+    if (isAssetRead && (url.pathname === "/login" || url.pathname === "/login.html")) {
       if (userAuthorized(req)) {
         res.writeHead(302, { Location: "/", "Cache-Control": "no-store" });
         return res.end();
@@ -5810,13 +5958,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(INDEX);
+      return sendPage(req, res, INDEX);
     }
 
     if (req.method === "GET" && (url.pathname === "/usage" || url.pathname === "/usage.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(USAGE);
+      return sendPage(req, res, USAGE);
     }
 
     // The page was /history until it dropped cost and became token-only. Keep
@@ -5827,15 +5973,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && (url.pathname === "/sessions" || url.pathname === "/sessions.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(SESSIONS);
+      return sendPage(req, res, SESSIONS);
     }
 
     // Unified Jira Kanban across every agent's org (the agents' `jira`
     // heartbeat blocks; merging happens client-side in board.js).
     if (req.method === "GET" && (url.pathname === "/board" || url.pathname === "/board.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(BOARD);
+      return sendPage(req, res, BOARD);
     }
 
     // Web font for the live terminal (referenced by the @font-face proxyTerm
@@ -6020,10 +6164,19 @@ const server = http.createServer(async (req, res) => {
       // an archive/DB hiccup must never break the heartbeat.
       const archiveManifest = payload.archiveManifest;
       delete payload.archiveManifest;
-      let archiveHave;
+      let archiveHave, archiveShed, archiveFull;
       if (Array.isArray(archiveManifest) && archiveManifest.length) {
-        try { archiveHave = archive.manifestCursors(key, archiveManifest); }
-        catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
+        try {
+          archiveHave = archive.manifestCursors(key, archiveManifest);
+          // The budget state that goes back with the cursors (XERK-267): which
+          // transcripts have spent their per-transcript budget, so the agent
+          // strips the inline file payloads before shipping them, and whether
+          // the store is full, so it doesn't push at all this pass. Advisory —
+          // archive.ingestChunk enforces both on its own.
+          const limits = archive.archiveLimits(Object.keys(archiveHave));
+          archiveShed = limits.shed.length ? limits.shed : undefined;
+          archiveFull = limits.full || undefined;
+        } catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
       }
       const next = (agents[key] = {
         ...payload,
@@ -6216,8 +6369,9 @@ const server = http.createServer(async (req, res) => {
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
-      return json(res, 200,
-        archiveHave ? { commands: reply, archiveHave } : { commands: reply });
+      return json(res, 200, archiveHave
+        ? { commands: reply, archiveHave, archiveShed, archiveFull }
+        : { commands: reply });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
@@ -8076,6 +8230,12 @@ if (process.env.TURMA_TEST) {
     // flags in it directly: dropping `localModel` would make the failover
     // control vanish fleet-wide with every suite still green (XERK-246).
     HEARTBEAT_KNOWN_KEYS,
+    // Asset fingerprinting (XERK-312). Exported so a test can hold the map
+    // itself: the wire tests prove one page links a hashed URL, this proves
+    // EVERY mutable asset got a hashed twin AND kept its bare name served —
+    // dropping either half is a silent regression the pages still render past.
+    STATIC_ASSETS, ASSET_URLS, IMMUTABLE_CACHE, REVALIDATE_CACHE, HTML_CACHE, SUPERSEDED_CACHE,
+    supersededAsset,
     invalidateAgentsCache,
     serializeAgentsForSave,
     // The in-flight body budget (XERK-258). Exported because the admission rule
