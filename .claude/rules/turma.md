@@ -42,9 +42,26 @@ which makes an `android/` change part of the same PR) live there.
     transcript `repaint` (stick-to-bottom vs hold-place + selection-guard), and `sessions.html`'s
     sidebar (its `scrollTop` restore is ordered against a focus/caret restore that can itself
     scroll). New recurring repaints without such a special case should use `preserveScroll`.
-- **Any new shared `/*.js` must be in `server.js`'s `STATIC_ASSETS`** (an allowlist, not a directory
+- **Any new shared `/*.js` must be in `server.js`'s `HASHED_ASSETS`** (an allowlist, not a directory
   serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module, and
   every page's render, down. Guarded by `newticket.test.js`.
+- **The shared stylesheet and scripts are served under a CONTENT-HASHED name, and the pages are
+  rewritten at boot to link it** (XERK-312) — under any TTL a warm browser pairs the new HTML with
+  the old `app.css` and the site renders unstyled for that whole window after every deploy. So:
+  - `HASHED_ASSETS` is the mutable set; `STATIC_ASSETS` is the served map, holding BOTH the hashed
+    name (immutable, 1y) and the bare one. **The bare name must keep being served** — a page a cache
+    handed back from before the deploy still links it — and must stay `no-cache`, never a TTL.
+  - **A fingerprint a PREVIOUS release minted still serves the current body** (`supersededAsset`),
+    revalidating — a 404 there is a fully unstyled page, i.e. worse than the stale sheet this
+    replaced. It reconstructs the bare name and looks it up in the same allowlist, so it serves
+    nothing new.
+  - `withHashedAssets` rewrites only `="/app.css"`-shaped attribute references, so the pages' prose
+    naming these files is untouched. A page that builds an asset URL in JS would be missed.
+  - The HTML shells therefore revalidate too (`private, no-cache` + ETag → 304): a shell held
+    without asking keeps pointing at the previous release's hashed URLs.
+  - Every static asset carries an ETag and answers a conditional GET with 304; `etagMatches` handles
+    the weak (`W/"…"`), list and `*` forms a CDN is entitled to send.
+  - Tests: `assets.test.js`.
 - Tests: `nav.test.js`.
 
 ## The org filter (`turma/public/org.js`, XERK-62)
