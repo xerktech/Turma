@@ -6,7 +6,9 @@ paths:
 # `agent/` — per-host headless agent image
 
 Currently Claude Code; the name is agent-generic so it can host other agents later. Read `CLAUDE.md`
-first — session model, cross-cutting contracts and safety-guard policy live there.
+first — the session model and the cross-cutting contracts live there. The session runtime (queue,
+kill/resume, launch flags, local-model failover) is in `.claude/rules/agent-sessions.md`; the
+safety-guard policy is in `.claude/rules/agent-hooks.md`.
 
 ## `hub-agent.py` — session manager and heartbeat in one process
 
@@ -102,8 +104,9 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
 ### `setModelSource` — failover to the self-hosted model (XERK-246)
 
 - Moves a RUNNING session between the `~/.claude` subscription and this host's local model, keeping
-  its conversation. See `CLAUDE.md`'s "Local-model failover" for why this is env-repointing rather
-  than a second coding agent, and `docs/local-model-failover.md` for the bake-off behind it.
+  its conversation. See `.claude/rules/agent-sessions.md`'s "Local-model failover" for why this is
+  env-repointing rather than a second coding agent, and `docs/local-model-failover.md` for the
+  bake-off behind it.
 - `local_model_configured()` is the single gate — **both** endpoint and key, plus a charset-checked
   model name (it is interpolated into a launch command line). Half-configured reads as "no": a
   session launched at an endpoint with no key dies on its first request.
@@ -419,7 +422,7 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
 
 See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_settings()` writes
 `~/.turma/guard-settings.json`, passed to every launch as `--settings`, wiring both hooks plus the
-`permissions.deny` credential-store rules. Policy is in `CLAUDE.md`.
+`permissions.deny` credential-store rules. Policy is in that same file.
 
 ## `entrypoint.sh` and the bundled toolchains
 

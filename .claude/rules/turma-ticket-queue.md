@@ -17,8 +17,9 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
 
 - **Every ticket spawn goes through it** — Start button and auto-start sweep alike, both via
   `findTicketHost(..., {requireFree:true})`. A host with a free slot is used at once; only a fleet
-  with none queues. The agent-side session queue (XERK-14) keeps the cases where the host IS the
-  decision: "+ New session", and a ticket session waiting on its clone.
+  with none queues. The agent-side session queue (XERK-14, `.claude/rules/agent-sessions.md`) keeps
+  the cases where the host IS the decision: "+ New session", and a ticket session waiting on its
+  clone.
 - `drainTicketQueue()` runs on **every heartbeat** (the beat IS the capacity report, so a freed slot
   is claimed within a beat) and on the 15s sweep after `autoStartSweep`/`autoStopSweep`. **At most
   one dispatch per host per pass**, mirroring the agent's one-per-beat drain — the shared

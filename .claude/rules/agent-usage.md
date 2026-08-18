@@ -91,9 +91,9 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
   claude.ai. There is no API behind it (the Usage & Cost API is org-scoped, admin-keyed, and reports
   API spend), so the numbers exist **only in the blob Claude Code hands a `statusLine` command**.
 - It is the early warning for the condition the **local-model failover** exists to handle (XERK-246,
-  `CLAUDE.md`): running out of Claude usage stops every session on a host at once. Reading the
-  headroom and failing a session over are deliberately separate controls — nothing here switches a
-  session automatically.
+  `.claude/rules/agent-sessions.md`): running out of Claude usage stops every session on a host at
+  once. Reading the headroom and failing a session over are deliberately separate controls —
+  nothing here switches a session automatically.
 - The probe runs against the **mounted subscription login, never the failover's endpoint** — a local
   model has no such windows, so every probe would time out having spent a real turn. That holds
   because the failover's credentials are sourced into one session's launch line rather than exported

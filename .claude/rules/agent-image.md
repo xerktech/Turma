@@ -10,9 +10,29 @@ paths:
 Split out of `.claude/rules/agent.md` to keep that file (which loads for ALL of `agent/**`) under
 the size ceiling. Everything here is about what the CONTAINER does at boot and what it ships.
 
+## Run-as identity (host permission parity)
+
+- The container writes into bind-mounted HOST dirs — the git root and the Claude login (`~/.claude`)
+  — so the uid it runs as is the uid those files end up owned by on the host.
+- `entrypoint.sh` resolves an identity BEFORE anything starts and `setpriv`s down to it: **`PUID`/
+  `PGID` if set, else auto-detected from the owner of `REPOS_ROOT`**. A root-owned git root
+  (TrueNAS) resolves to `0:0`; a user-owned one (WSL/desktop) drops to that uid, so nothing lands
+  root-owned in the operator's repo or `~/.claude`. `PUID=0` forces always-root.
+- Because it drops, the entrypoint also reuses an existing passwd/group entry for the id (the node
+  base image ships `node` at `1000:1000`); `chown`s `/root` **non-recursively** (its children are
+  the host's own bind mounts) since **HOME stays `/root`**, which every mount target and
+  `PROJECTS_ROOT`/`~/.turma` path depends on; joins the group owning `/var/run/docker.sock`; and
+  **self-heals on boot**, `chown`ing leftover uid-0 paths under `REPOS_ROOT`/`~/.claude`.
+- That heal only ever touches uid-0 paths, so a mis-set `PUID` can misplace root-owned files but
+  never take the host user's own files away.
+- Verified by building the entrypoint on the real base image against root-owned / user-owned /
+  `PUID`-override / `PUID=0` roots (`test_entrypoint.sh`).
+
+## Boot sequence and the bundled toolchains
+
 - Creds preflight, then launches the tunnel (a simple respawn loop, XERK-34) and `exec`s the session
-  manager as PID 1 — the container stays up with zero sessions. Uid resolution is in `CLAUDE.md`'s
-  "Run-as identity". Tests: `test_entrypoint.sh`.
+  manager as PID 1 — the container stays up with zero sessions. Uid resolution is above. Tests:
+  `test_entrypoint.sh`.
 - **Every start re-checks Claude Code** (XERK-254), otherwise frozen at the image's
   `CLAUDE_CODE_VERSION` for the life of the tag. The agent can't self-update here — it IS the image,
   and the Watchtower pull's recreate re-runs this code. A version COMPARE; never downgrades;
