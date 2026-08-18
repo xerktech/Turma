@@ -2008,6 +2008,20 @@ test("http: a full chunk of INCOMPRESSIBLE bytes still fits the wire cap", async
   assert.equal(r.body.stored, chunk.length);
 });
 
+test("http: an over-long transcriptId is refused at the route", async () => {
+  // The id is a DIRECTORY COMPONENT of the raw layer's path, so one past the
+  // filesystem's 255-byte name limit made every push for that session fail at
+  // the syscall and report `skip` with no diagnostic at all (XERK-338 QA F6).
+  // Nothing turned red if the length bound were dropped back to `+` (QA G5).
+  const long = "a".repeat(300);
+  const r = await rawPush("nas", long, "x.jsonl", 0, gz("x"), agentHeaders);
+  assert.equal(r.status, 400);
+  assert.match(r.body.error, /transcriptId/);
+  // 255 is still fine — the bound must not have been tightened past the limit.
+  const ok = await rawPush("nas", "b".repeat(255), "x.jsonl", 0, gz("x"), agentHeaders);
+  assert.equal(ok.status, 200);
+});
+
 test("http: a raw push cannot name anything outside its own session", async () => {
   for (const bad of ["../../etc/passwd", "/etc/passwd", "..", "tr1/../../x", "a b.jsonl"]) {
     const r = await rawPush("nas", "tr1", bad, 0, gz("x"), agentHeaders);

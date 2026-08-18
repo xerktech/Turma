@@ -181,6 +181,16 @@ paths:
   - **The BYTE ceiling evicts the BIGGEST host; only the COUNT ceiling evicts the stalest.** Least
     -recently-seen is right for "too many hosts" and wrong for "too many bytes": it destroyed a small
     innocent host's durable history while the host that caused the overflow stayed.
+  - The **save path must never throw**: `evictOverflow` runs inside `writeNow`, which runs in a
+    `setTimeout`, so an exception there is uncaught on the main loop and the hub process EXITS —
+    a crash loop under `restart: unless-stopped`, taking the fleet's whole control plane. A dead
+    variable reference on the last-host-still-over branch did exactly that. A rarely-reached branch
+    that THROWS when reached is worse than no branch; that one is now covered by a test that
+    actually reaches it (`USAGE_LEDGER_MAX` below what one host can serialize to).
+  - **Per-beat scratch lives OFF the persisted objects** (a `WeakSet`), never as a field filtered out
+    of `serialize` by name: a `JSON.stringify` replacer keyed on a bare name matches at EVERY depth,
+    so it also deleted a repo whose `remoteKey` was that name — present in memory, absent from
+    `/data`, gone after a restart, with no log line.
   - It runs only on a beat that ADDED a day, repo or model. It stringifies the whole entry (4.6 ms at
     100 repos), and a beat that merely raises existing numbers grows the entry by digits.
 - Every ceiling is a **fraction of the container limit** (`USAGE_LEDGER_MAX`, a 32nd, clamped

@@ -284,7 +284,14 @@ ARCHIVE_RAW_FILES_MAX = 200
 #
 # The two must agree. A file this rejects is simply never archived, so widening
 # the hub's rule without widening this one silently keeps files out.
-ARCHIVE_RAW_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# `fullmatch`, never `match(...$)`: **Python's `$` matches before a trailing
+# newline and JavaScript's does not**, so `^[A-Za-z0-9._-]+$` accepted "a.jsonl\n"
+# here while the hub's identical-looking regex rejected it. A trailing newline is
+# a legal Linux filename, and the disagreement meant such a file was offered,
+# refused forever, and — worse — left OUT of the "cannot be named" log below,
+# which is the one thing making an unarchivable file visible. Any agent/hub regex
+# pair has this trap.
+ARCHIVE_RAW_COMPONENT_RE = re.compile(r"[A-Za-z0-9._-]+")
 ARCHIVE_RAW_COMPONENT_MAX = 255
 ARCHIVE_RAW_REL_DEPTH_MAX = 10
 ARCHIVE_RAW_REL_LEN_MAX = 400
@@ -298,7 +305,7 @@ def _archivable_rel(rel):
     if not parts or len(parts) > ARCHIVE_RAW_REL_DEPTH_MAX:
         return False
     for p in parts:
-        if p in (".", "..") or not ARCHIVE_RAW_COMPONENT_RE.match(p):
+        if p in (".", "..") or not ARCHIVE_RAW_COMPONENT_RE.fullmatch(p):
             return False
         if len(p.encode("utf-8", "surrogatepass")) > ARCHIVE_RAW_COMPONENT_MAX:
             return False
@@ -9639,6 +9646,9 @@ class SessionManager:
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
         self._archive_pending = {}
+        # Throttle for the "cannot be named by the archive" line (see
+        # _session_files): the manifest is rebuilt every beat.
+        self._unnameable_logged_at = 0.0
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -13510,9 +13520,20 @@ class SessionManager:
             pass
         if skipped:
             # Named, not silent: these files are never archived, and "which ones"
-            # is the only thing that makes that actionable.
-            log(f"archive raw: {len(skipped)} file(s) under {tid} cannot be named "
-                f"by the archive and will not be shipped: {sorted(skipped)[:5]}")
+            # is the only thing that makes that actionable. Throttled to 1/hour
+            # like every other warn on this path — the manifest is rebuilt every
+            # beat, so a host with one unnameable file logged this forever.
+            # getattr, not attribute access: this runs on the heartbeat's
+            # critical path, where "nothing below raises" is the contract for
+            # this whole walk — and an AttributeError here would take the beat
+            # down over a LOG LINE. (Caught by a harness whose manager stub
+            # predates the field; a real one always has it.)
+            now = time.time()
+            if now - getattr(self, "_unnameable_logged_at", 0) > 3600:
+                self._unnameable_logged_at = now
+                log(f"archive raw: {len(skipped)} file(s) under {tid} cannot be "
+                    f"named by the archive and will not be shipped: "
+                    f"{sorted(skipped)[:5]}")
         return out
 
     def _archive_raw_deltas(self, raw_have, skip_ids=None, store_full=False):

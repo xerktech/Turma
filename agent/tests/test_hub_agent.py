@@ -12679,6 +12679,116 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(pushed[0][2], first)
         self.assertEqual(stored["t1.jsonl"], os.path.getsize(path))
 
+    def test_session_files_skips_what_the_hub_could_never_name(self):
+        """The hub's allowlist is [A-Za-z0-9._-]; a name outside it is a
+        PERMANENT 400. Offering one is not harmless: three of them exhausted the
+        pass's failure budget on every beat and starved every other transcript on
+        the host. Reachable with no malice — a workflow's script is named after
+        the workflow, and a name with a space or an accent is ordinary."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._nested(slug, "t1", "subagents/good.jsonl", b"{}\n")
+        for bad in ["tool-results/agent one.jsonl", "tool-results/a@b.txt",
+                    "tool-results/caf\u00e9.txt"]:
+            self._nested(slug, "t1", bad, b"x")
+        rels = [rel for rel, _s in sm._session_files(os.path.join(ha.PROJECTS_ROOT, slug), "t1")]
+        self.assertIn(os.path.join("t1", "subagents", "good.jsonl"), rels)
+        for bad in ["agent one.jsonl", "a@b.txt", "caf\u00e9.txt"]:
+            self.assertFalse([r for r in rels if bad in r], f"{bad} was offered: {rels}")
+
+    def test_archivable_rel_agrees_with_the_hub_on_a_trailing_newline(self):
+        """Python's `$` matches before a trailing newline and JavaScript's does
+        not, so `^[A-Za-z0-9._-]+$` accepted "a.jsonl\n" here while the hub's
+        identical-looking regex refused it. A trailing newline is a legal Linux
+        filename. Any agent/hub regex pair has this trap."""
+        self.assertTrue(ha._archivable_rel("a.jsonl"))
+        self.assertFalse(ha._archivable_rel("a.jsonl\n"))
+        self.assertFalse(ha._archivable_rel("abc\n"))
+        self.assertFalse(ha._archivable_rel("a\tb"))
+        self.assertFalse(ha._archivable_rel("a b.txt"))
+        self.assertFalse(ha._archivable_rel("caf\u00e9.txt"))
+        self.assertFalse(ha._archivable_rel(".."))
+        self.assertFalse(ha._archivable_rel("/x"))
+        self.assertFalse(ha._archivable_rel("a" * 256))
+        self.assertTrue(ha._archivable_rel("a" * 255))
+        self.assertFalse(ha._archivable_rel("n/" * 10 + "f.txt"))   # too deep
+
+    def test_raw_push_refused_permanently_does_not_spend_the_failure_budget(self):
+        """A 4xx is the hub saying THIS FILE is unacceptable. Counted as a
+        failure, three of them ended the pass every beat — which is how one bad
+        file starved every other transcript on the host."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        for i in range(4):
+            self._nested(slug, "t1", f"subagents/a{i}.jsonl", b"{}\n")
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        seen = []
+
+        def refuse_first_four(tid, rel, start, raw):
+            seen.append(rel)
+            # Everything but the conversation itself is refused permanently.
+            if rel.endswith(".jsonl") and "/" in rel:
+                return {"skip": True}
+            return {"stored": start + len(raw)}
+
+        with mock.patch.object(sm, "_post_archive_raw", refuse_first_four):
+            sm._archive_raw_deltas({})
+        # All five were attempted: a permanent refusal must not end the pass.
+        self.assertEqual(len(seen), 5, seen)
+        self.assertIn("t1.jsonl", seen)
+
+    def test_post_archive_raw_distinguishes_a_permanent_refusal(self):
+        """The REAL _post_archive_raw, not a mock of it: a 4xx is the hub saying
+        THIS FILE is unacceptable, and must come back as `skip` so the delta loop
+        leaves it. Returned as a transport failure it spent the pass's budget,
+        and three such files starved every other transcript on the host.
+
+        The test above mocks _post_archive_raw wholesale, so it cannot see this —
+        mutating the 4xx branch left that test green."""
+        sm = self.make_manager()
+
+        def raising(code):
+            def fake(req, timeout=None):
+                raise urllib.error.HTTPError(req.full_url, code, "no", {}, None)
+            return fake
+
+        with mock.patch.object(ha.urllib.request, "urlopen", raising(400)):
+            self.assertEqual(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"),
+                             {"skip": True})
+        with mock.patch.object(ha.urllib.request, "urlopen", raising(413)):
+            self.assertEqual(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"),
+                             {"skip": True})
+        # A 5xx is transient — the hub is unwell, not the file. That one MUST
+        # stay a failure, or a down hub gets every file on the host thrown at it.
+        with mock.patch.object(ha.urllib.request, "urlopen", raising(503)):
+            self.assertIsNone(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"))
+        # ...as is a dead socket.
+        def boom(req, timeout=None):
+            raise OSError("connection refused")
+        with mock.patch.object(ha.urllib.request, "urlopen", boom):
+            self.assertIsNone(sm._post_archive_raw("t1", "a.jsonl", 0, b"x"))
+
+    def test_raw_deltas_stop_after_repeated_transport_failures(self):
+        """...but a hub that is genuinely down must not have every file on the
+        host thrown at it. `None` (transport) still spends the budget."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        slug = self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        for i in range(9):
+            self._nested(slug, "t1", f"subagents/a{i}.jsonl", b"{}\n")
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        seen = []
+        with mock.patch.object(sm, "_post_archive_raw",
+                               lambda *a: seen.append(a[1]) or None):
+            sm._archive_raw_deltas({})
+        self.assertEqual(len(seen), ha.ARCHIVE_RAW_FAILURES_MAX, seen)
+
     def test_raw_deltas_leave_a_shrunken_source_alone(self):
         # The hub holds MORE than the host now has: the transcript was rewritten
         # or replaced under us. Truncating the archive to match would throw away

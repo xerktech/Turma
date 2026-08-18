@@ -440,6 +440,79 @@ test("the byte ceiling drops the BIGGEST host, never an innocent bystander", () 
   assert.ok(out.bytes <= 200000, `file left at ${out.bytes}, over its own ceiling`);
 });
 
+test("the save path survives a store that cannot be trimmed under its ceiling", () => {
+  // `evictOverflow` runs inside `writeNow`, which runs in a setTimeout — so a
+  // throw there is an uncaught exception on the MAIN LOOP and the hub process
+  // EXITS, which `restart: unless-stopped` turns into a crash loop taking the
+  // fleet's whole control plane. A dead-variable reference sat on the
+  // last-host-still-over branch and did exactly that (XERK-338 QA G1). A rarely
+  // reached branch that THROWS when reached is worse than no branch.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    process.env.USAGE_LEDGER_FILE = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "turma-tiny-")), "l.json");
+    // Smaller than a single host can serialize to, so eviction runs out of hosts
+    // and the last-host-still-over branch is genuinely REACHED. At 1000 the store
+    // fits once one host is dropped and the branch never runs — that fixture
+    // passed with the bug reintroduced.
+    process.env.USAGE_LEDGER_MAX = "120";
+    process.env.USAGE_LEDGER_HOSTS = "2";
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const blk = () => ({ totals: b(5), today: b(0), week: b(5),
+      days: { "2026-08-18": b(5) }, sessions: 1, models: [] });
+    for (const h of ["h1", "h2"]) l.ingest(h, { device: h, usage: blk(),
+      repoUsage: [{ repo: "r", remoteKey: "rk", remote: "", usage: blk() }] });
+    l._internals.writeNow(() => console.log("SURVIVED"));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, `the save path threw: ${fresh.stderr}`);
+  assert.match(fresh.stdout, /SURVIVED/);
+  assert.doesNotMatch(fresh.stderr, /ReferenceError/);
+});
+
+test("a repo or model literally named `added` still persists", () => {
+  // The per-beat scratch flag was a field on the series, filtered out of
+  // `serialize` by a replacer keyed on the name — and a JSON.stringify replacer
+  // matches at EVERY depth, so it silently deleted a repo whose remoteKey was
+  // `added` (a repo directory of that name produces exactly that key) and a
+  // model of that name: present in memory, absent from /data, gone after a
+  // restart, with no log line (XERK-338 QA G2).
+  ledger.ingest("addedhost", {
+    device: "addedhost",
+    usage: usage({ [DAY]: 5 }, { models: { added: 1, "claude-opus-5": 4 } }),
+    repoUsage: [
+      { repo: "added", remoteKey: "added", remote: "", usage: usage({ [DAY]: 5 }) },
+      { repo: "normal", remoteKey: "normal", remote: "", usage: usage({ [DAY]: 5 }) },
+    ],
+  }, now);
+  // Through the MODULE's own serializer and off the disk — asserting on a
+  // JSON.stringify written HERE would not exercise the replacer at all.
+  return new Promise((resolve, reject) => writeNow((err) => {
+    try {
+      assert.equal(err, null);
+      const onDisk = JSON.parse(fs.readFileSync(LEDGER, "utf8")).hosts.addedhost;
+      assert.deepEqual(Object.keys(onDisk.repos).sort(), ["added", "normal"]);
+      assert.ok("added" in onDisk.host.models, "a model named `added` was dropped");
+      // ...and the scratch flag itself is NOT a stored field.
+      assert.equal("added" in onDisk.host, false, "per-beat scratch reached the file");
+      resolve();
+    } catch (e) { reject(e); }
+  }));
+});
+
+test("hostShare leaves room for the JSON envelope", () => {
+  // An EXACT even split means a store of hosts each perfectly inside their share
+  // still overflows on the wrapper alone (XERK-338 QA F3). Nothing turned red if
+  // someone tidied the 0.9 away (QA G5).
+  // A MEANINGFUL margin, not just `<`: an exact even split still satisfies `<`
+  // on the integer floor alone (8,388,606 < 8,388,608), so that assertion passed
+  // with the 0.9 removed.
+  const full = ledger.hostShare() * ledger.LEDGER_HOSTS;
+  assert.ok(full <= ledger.LEDGER_MAX * 0.95 || ledger.hostShare() === 64 << 10,
+    `share x hosts = ${full}, only ${ledger.LEDGER_MAX - full} bytes under ` +
+    `LEDGER_MAX ${ledger.LEDGER_MAX} — no room for the JSON envelope`);
+});
+
 test("a host that has spent nothing never takes a ledger slot", () => {
   ledger.ingest("empty", { device: "empty", usage: null, repoUsage: [] }, now);
   assert.deepEqual(Object.keys(hosts()), []);

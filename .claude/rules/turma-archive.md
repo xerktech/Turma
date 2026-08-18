@@ -81,7 +81,11 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
     files ended the pass on every beat — starving every other transcript on the host. Reachable with
     no malice: a workflow's script is named after the workflow, and a name with a space or an accent
     is ordinary. **The two allowlists must agree** — widening the hub's without widening the agent's
-    silently keeps files out.
+    silently keeps files out, and a file the agent wrongly believes is nameable is left out of the
+    "cannot be named" log too, which is the one thing making it visible. The agent uses
+    `re.fullmatch`, never `match(...$)`: **Python's `$` matches before a trailing newline and
+    JavaScript's does not**, so two identical-looking regexes disagreed on `"a.jsonl\n"` — a legal
+    Linux filename. Any agent/hub regex pair has this trap; there is a differential test.
   - **The wire cap CLEARS the worst case of gzipping a chunk, never equals it.** gzip expands
     incompressible input (~+0.03%), so an equal cap made any session file holding 4 MiB of
     already-compressed bytes unpushable — and, since a failed push aborted the whole pass, it stopped

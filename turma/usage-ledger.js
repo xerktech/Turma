@@ -272,6 +272,18 @@ function reposOf(list) {
 //
 // { pre, days, models, subagent, sessions, lastActivity } — see the header.
 
+// Per-beat scratch: which series gained a day or a model on THIS beat (see the
+// `enforceHostShare` call in `ingest`). Deliberately NOT a field on the series.
+//
+// It was one, filtered out of `serialize` by a replacer keyed on the name
+// `added` — and a JSON.stringify replacer matches at EVERY depth, so it also
+// silently deleted a repo whose remoteKey was `added` (a repo directory of that
+// name produces exactly that key) and a model literally named `added`: present
+// in memory, absent from /data, gone after a restart, with no log line. A scratch
+// value that must not persist belongs off the persisted object, not filtered out
+// of it by name.
+const grewSeries = new WeakSet();
+
 function blankSeries() {
   return {
     // `cutoff` is the newest date this series has ever folded into `pre`.
@@ -385,7 +397,7 @@ function absorb(s, u) {
     // Already inside `pre` (see blankSeries' note on `cutoff`). Re-admitting it
     // would have the next trim add it to `pre` a second time.
     if (s.cutoff && d <= s.cutoff) continue;
-    if (!s.days[d]) s.added = true;
+    if (!s.days[d]) grewSeries.add(s);
     const cur = s.days[d] || (s.days[d] = blankBucket());
     if (bucketExceeds(cur, b)) augments = true; // that day was bigger once
     raiseBucket(cur, b);
@@ -393,7 +405,7 @@ function absorb(s, u) {
   trimDays(s);
 
   for (const [m, mu] of Object.entries(u.models)) {
-    if (!s.models[m]) s.added = true;
+    if (!s.models[m]) grewSeries.add(s);
     const cur = s.models[m] || (s.models[m] = blankBucket());
     if (bucketExceeds(cur, mu.totals)) augments = true;
     raiseBucket(cur, mu.totals);
@@ -581,17 +593,21 @@ function enforceHostShare(key, entry) {
   // 3. The smallest REPOS. This is the first step that loses spend, which is why
   // it is last — and the host block is never dropped, so the host's own total
   // survives whatever happens to its per-repo breakdown.
+  let lostRepos = 0;
+  let lostTokens = 0;
   while (now > share) {
     const keys = Object.keys(entry.repos);
     if (!keys.length) break;
     keys.sort((a, b) =>
       bucketTokens(seriesTotals(entry.repos[a].series)) -
       bucketTokens(seriesTotals(entry.repos[b].series)));
+    lostTokens += bucketTokens(seriesTotals(entry.repos[keys[0]].series));
+    lostRepos += 1;
     delete entry.repos[keys[0]];
     now = size();
   }
   const fits = now <= share;
-  warnHostShare(key, before, now, fits);
+  warnHostShare(key, before, now, fits, lostRepos, lostTokens);
   return fits;
 }
 
@@ -600,16 +616,23 @@ function enforceHostShare(key, entry) {
 // what actually happened: the old line claimed a remediation while printing
 // `before == after`, which is worse than silence.
 let lastShareWarnAt = 0;
-function warnHostShare(key, before, after, fits) {
+function warnHostShare(key, before, after, fits, lostRepos, lostTokens) {
   const now = Date.now();
   if (now - lastShareWarnAt < 60 * 60 * 1000) return;
   lastShareWarnAt = now;
+  // Quantified, because this is throttled to an hour and step 3 is the only one
+  // that loses anything: without the numbers, an operator seeing /usage's "By
+  // repo" view under-count has one vague line an hour as the entire trace.
+  const lost = lostRepos
+    ? ` Dropped ${lostRepos} of its smallest repo(s), taking ${lostTokens} tokens out of the ` +
+      `PER-REPO breakdown — its host-level all-time total is unaffected.`
+    : ` No repo was dropped, so nothing left the breakdown.`;
   console.warn(
     `usage ledger: ${logName(key)} was ${before} bytes, over its ${hostShare()}-byte ` +
       (fits ? `share — trimmed to ${after} (day detail, then the per-model breakdown, `
-            + `then its smallest repos). All-time totals are unchanged for everything kept.`
+            + `then its smallest repos).${lost}`
             : `share and could NOT be trimmed to fit (now ${after}). Its history is at risk `
-            + `of eviction; raise ARCHIVE/USAGE_LEDGER_MAX or lower USAGE_LEDGER_REPOS.`)
+            + `of eviction; raise USAGE_LEDGER_MAX or lower USAGE_LEDGER_REPOS.`)
   );
 }
 
@@ -642,11 +665,21 @@ function evictOverflow() {
     dropped += 1;
     blob = serialize();
   }
-  // Down to the last host and STILL over: give up its day detail rather than
-  // write a file the next boot will refuse outright. Reachable only from a
-  // restored file that predates the per-host share above.
-  if (blob !== null && blob.length > LEDGER_MAX && keys.length === 1) {
-    enforceHostShare(keys[0], hosts[keys[0]]);
+  // Down to the last host and STILL over: give up its detail rather than write a
+  // file the next boot will refuse outright. Reached when one host cannot be
+  // trimmed under LEDGER_MAX at all — which the 64 KiB floor under `hostShare`
+  // makes possible for a very small configured LEDGER_MAX.
+  //
+  // This branch once referenced a variable that had been renamed out from under
+  // it. `evictOverflow` runs inside `writeNow`, which runs in a setTimeout, so
+  // the ReferenceError was an uncaught exception on the main loop: the hub
+  // EXITED, and `restart: unless-stopped` made that a crash loop taking the
+  // fleet's whole control plane (the exact failure this file's `serialize`
+  // comment warns about). A rarely-reached branch that THROWS when reached is
+  // worse than no branch at all, which is why it is now covered by a test.
+  const last = Object.keys(hosts);
+  if (blob !== null && blob.length > LEDGER_MAX && last.length === 1) {
+    enforceHostShare(last[0], hosts[last[0]]);
     blob = serialize();
   }
   if (dropped) warnEvicted(dropped);
@@ -670,9 +703,7 @@ function warnEvicted(dropped) {
 
 function serialize() {
   try {
-    // `added` is per-beat scratch (see the enforceHostShare call) and must never
-    // reach the file — a persisted one would be read back as a stored field.
-    return JSON.stringify({ version: 1, hosts }, (k, v) => (k === "added" ? undefined : v));
+    return JSON.stringify({ version: 1, hosts });
   } catch (e) {
     // Failing to save is survivable; throwing out of a save TIMER is not — that
     // is an uncaught exception on the main loop and the whole hub exits, taking
@@ -779,9 +810,9 @@ function ingest(key, record, now = Date.now()) {
   let grew = fresh;
   if (usage) {
     entry.host = entry.host || blankSeries();
-    entry.host.added = false;
+    grewSeries.delete(entry.host);
     if (absorb(entry.host, usage)) augments = true;
-    if (entry.host.added) grew = true;
+    if (grewSeries.has(entry.host)) grew = true;
     noteShortfall(key, bucketTokens(seriesTotals(entry.host)), bucketTokens(usage.totals), now);
   }
   const reported = new Set();
@@ -794,9 +825,9 @@ function ingest(key, record, now = Date.now()) {
     // its current name, not the one it carried when it was first recorded.
     if (r.repo) slot.repo = r.repo;
     if (r.remote) slot.remote = r.remote;
-    slot.series.added = false;
+    grewSeries.delete(slot.series);
     if (absorb(slot.series, r.usage)) augments = true;
-    if (slot.series.added) grew = true;
+    if (grewSeries.has(slot.series)) grew = true;
   }
   // A repo this host has stopped reporting keeps its history — that is the whole
   // point — which also means this host can never again be served raw.
