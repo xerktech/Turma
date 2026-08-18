@@ -777,10 +777,20 @@ function rawCursors(manifest) {
   // truncation drops the oldest history rather than the live sessions.
   let budget = ARCHIVE_RAW_CURSOR_MAX;
   let dropped = 0;
+  // Prepared ONCE. It was recompiled per iteration inside the loop below.
+  const lookup = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?");
   for (const m of Array.isArray(manifest) ? manifest : []) {
     if (!m || !m.transcriptId || !Array.isArray(m.rawFiles) || !m.rawFiles.length) continue;
     if (budget <= 0) { dropped += m.rawFiles.length; continue; }
-    const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(m.transcriptId);
+    // Charged for the LOOKUP, before it happens. Charging only entries that
+    // resolve to a row left the outer loop uncharged, so a manifest of unknown
+    // ids — or of ids whose row has no `filePath`, which is every transcript
+    // that has never had a rendered chunk — did a SELECT apiece and moved the
+    // stall here instead of removing it: 2,985 ms for 470,051 entries, against
+    // 4.2 ms for the same entries with `rawFiles` omitted (QA F4). Same rule as
+    // the inner loop: the budget bounds the WORK, and a lookup is work.
+    budget -= 1;
+    const row = lookup.get(m.transcriptId);
     if (!row || !row.filePath) continue;
     const have = {};
     for (const f of m.rawFiles) {

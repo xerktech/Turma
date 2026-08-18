@@ -7132,7 +7132,13 @@ const server = http.createServer(async (req, res) => {
         parts[3] === "archive" && parts[5] === "raw" && parts.length === 7) {
       const key = decodeURIComponent(parts[2]);
       const transcriptId = decodeURIComponent(parts[4]);
-      if (!/^[A-Za-z0-9._-]+$/.test(transcriptId)) return json(res, 400, { error: "bad transcriptId" });
+      // Length-bounded as well as allowlisted: since XERK-338 the id is a
+      // DIRECTORY COMPONENT of the raw layer's path, so an id past the
+      // filesystem's 255-byte name limit made every push for that session fail
+      // at the syscall and report `skip` with no diagnostic at all (QA F6).
+      if (!/^[A-Za-z0-9._-]{1,255}$/.test(transcriptId)) {
+        return json(res, 400, { error: "bad transcriptId" });
+      }
       let rel;
       try { rel = decodeURIComponent(parts[6]); } catch { return json(res, 400, { error: "bad file" }); }
       if (!archive.safeRawRel(rel)) return json(res, 400, { error: "bad file" });
@@ -7149,16 +7155,17 @@ const server = http.createServer(async (req, res) => {
         if (e && e.budgetExceeded) return json(res, 503, { error: e.message });
         return json(res, 400, { error: "could not read body" });
       }
-      // The DECOMPRESSED buffer is charged to the in-flight body budget for its
-      // lifetime. `readRawBody` released its own charge the moment the socket
-      // finished, so without this the peak is `in-flight + held uploads + N
-      // concurrent gunzip outputs` — the same unaccounted-third-term shape
-      // CLAUDE.md already records as XERK-287, and the reason a bounded
-      // `maxOutputLength` alone is not a bound on the HUB (it bounds one call).
-      // Refused, not queued: a 503 is what an agent retries.
-      const lane = bodyLaneFor(ARCHIVE_RAW_CHUNK_MAX);
-      if (!lane) return json(res, 503, { error: "hub is busy; retry" });
-      chargeBody(ARCHIVE_RAW_CHUNK_MAX, lane);
+      // `gunzipSync` is SYNCHRONOUS, so the decompressed buffer is not a
+      // concurrent term: nothing else runs on this loop between the allocation
+      // and the last line that reads it, and at most ONE such buffer exists at a
+      // time. The peak this adds to the hub is therefore ARCHIVE_RAW_CHUNK_MAX,
+      // flat, not N times it.
+      //
+      // An earlier version charged it to the in-flight body budget to bound "N
+      // concurrent gunzips". That was inert — the charge and release sit in one
+      // synchronous run, so 64 concurrent pushes all saw an empty budget and not
+      // one 503 — and the comment asserted a guarantee that does not exist. If
+      // this ever becomes async, the charge has to come back for real.
       let buf;
       try {
         buf = gz.length ? zlib.gunzipSync(gz, { maxOutputLength: ARCHIVE_RAW_CHUNK_MAX })
@@ -7168,8 +7175,6 @@ const server = http.createServer(async (req, res) => {
         // chunk to retry — but it answers 400 rather than the cursor protocol's
         // "no progress", because the agent has nothing to realign to.
         return json(res, 400, { error: "body is not gzip within the size limit" });
-      } finally {
-        releaseBody(ARCHIVE_RAW_CHUNK_MAX, lane);
       }
       try {
         return json(res, 200, archive.ingestRaw(key, transcriptId, rel, start, buf));

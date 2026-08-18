@@ -1995,6 +1995,19 @@ test("http: a raw push is agent-authed and lands byte for byte", async () => {
   assert.equal((await request("GET", "/api/archive/tr1/raw/nope.jsonl", { headers: userHeaders })).status, 404);
 });
 
+test("http: a full chunk of INCOMPRESSIBLE bytes still fits the wire cap", async () => {
+  // gzip EXPANDS incompressible input, so a wire cap equal to the chunk size made
+  // any session file holding a full chunk of already-compressed bytes impossible
+  // to push — permanently, and it took every other transcript on that host down
+  // with it (QA D2). The cap has to CLEAR the worst case, not equal it.
+  const chunk = crypto.randomBytes(1 << 22);          // 4 MiB, incompressible
+  const gzipped = zlib.gzipSync(chunk);
+  assert.ok(gzipped.length > chunk.length, "the fixture compressed; it must not");
+  const r = await rawPush("nas", "tr1", "tr1/tool-results/blob.bin", 0, gzipped, agentHeaders);
+  assert.equal(r.status, 200, `a full incompressible chunk was refused: ${r.raw}`);
+  assert.equal(r.body.stored, chunk.length);
+});
+
 test("http: a raw push cannot name anything outside its own session", async () => {
   for (const bad of ["../../etc/passwd", "/etc/passwd", "..", "tr1/../../x", "a b.jsonl"]) {
     const r = await rawPush("nas", "tr1", bad, 0, gz("x"), agentHeaders);

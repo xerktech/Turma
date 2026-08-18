@@ -272,6 +272,37 @@ ARCHIVE_RAW_BEAT_BUDGET = 1 << 24   # ~16 MiB of raw bytes per sync pass
 # host thrown at it either.
 ARCHIVE_RAW_FAILURES_MAX = 3
 ARCHIVE_RAW_FILES_MAX = 200
+# The hub's own allowlist for a session-relative path (turma/archive.js
+# `safeRawRel`), mirrored so a file it could NEVER accept is not offered in the
+# first place. Offering one is not harmless: the hub answers a permanent 400,
+# the agent cannot tell that from a transient failure, and three such files
+# exhausted the pass's failure budget every beat — which stopped the raw sync
+# for every OTHER transcript on the host, forever (XERK-338 QA F1). Reachable
+# with no malice at all: a workflow's script is named after the workflow
+# (`<slug>/<tid>/workflows/scripts/<name>-<runId>.js`), and a name with a space
+# or an accent is ordinary.
+#
+# The two must agree. A file this rejects is simply never archived, so widening
+# the hub's rule without widening this one silently keeps files out.
+ARCHIVE_RAW_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+ARCHIVE_RAW_COMPONENT_MAX = 255
+ARCHIVE_RAW_REL_DEPTH_MAX = 10
+ARCHIVE_RAW_REL_LEN_MAX = 400
+
+
+def _archivable_rel(rel):
+    """Whether the hub's allowlist can name this session-relative path."""
+    if not rel or len(rel.encode("utf-8", "surrogatepass")) > ARCHIVE_RAW_REL_LEN_MAX:
+        return False
+    parts = rel.split(os.sep) if os.sep != "/" else rel.split("/")
+    if not parts or len(parts) > ARCHIVE_RAW_REL_DEPTH_MAX:
+        return False
+    for p in parts:
+        if p in (".", "..") or not ARCHIVE_RAW_COMPONENT_RE.match(p):
+            return False
+        if len(p.encode("utf-8", "surrogatepass")) > ARCHIVE_RAW_COMPONENT_MAX:
+            return False
+    return True
 ARCHIVE_RAW_MANIFEST_FILES_MAX = 2000
 def _byte_ceiling(raw, fallback):
     """A byte ceiling read from the environment, mirroring byteCeiling() in
@@ -13434,6 +13465,7 @@ class SessionManager:
         archive, and one named `*.jsonl` pointed at a device blocks a read
         forever. Nothing raises; this runs on the heartbeat's critical path."""
         out = []
+        skipped = []
         main = os.path.join(proj, tid + ".jsonl")
         try:
             st = os.stat(main)
@@ -13465,11 +13497,22 @@ class SessionManager:
                             continue
                     except OSError:
                         continue
-                    out.append((os.path.relpath(full, proj), st.st_size))
+                    rel = os.path.relpath(full, proj)
+                    if not _archivable_rel(rel):
+                        skipped.append(rel)
+                        continue
+                    out.append((rel, st.st_size))
                     if len(out) >= cap:
-                        return out
+                        break
+                if len(out) >= cap:
+                    break
         except OSError:
             pass
+        if skipped:
+            # Named, not silent: these files are never archived, and "which ones"
+            # is the only thing that makes that actionable.
+            log(f"archive raw: {len(skipped)} file(s) under {tid} cannot be named "
+                f"by the archive and will not be shipped: {sorted(skipped)[:5]}")
         return out
 
     def _archive_raw_deltas(self, raw_have, skip_ids=None, store_full=False):
@@ -13571,6 +13614,18 @@ class SessionManager:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
             return reply if isinstance(reply, dict) else {}
+        except urllib.error.HTTPError as e:
+            # A 4xx is the hub saying THIS FILE is not acceptable — a name it
+            # cannot express, a body it will not take. Retrying it is pointless
+            # and, counted as a failure, three of them ended the pass every beat
+            # and starved every other transcript on the host (XERK-338 QA F1).
+            # `skip` is what the delta loop already reads as "leave this file".
+            if 400 <= e.code < 500:
+                log(f"archive raw: the hub refused {transcript_id} {rel} "
+                    f"permanently (HTTP {e.code}); not retrying it")
+                return {"skip": True}
+            log(f"archive raw push failed for {transcript_id} {rel}: {e}")
+            return None
         except Exception as e:
             log(f"archive raw push failed for {transcript_id} {rel}: {e}")
             return None

@@ -107,7 +107,10 @@ const LEDGER_MODELS = positiveEnv("USAGE_LEDGER_MODELS", 64);
 // bloated host pushed the file past LEDGER_MAX, took the INNOCENT hosts with it
 // (least-recently-seen first), refused to drop itself (`keys.length > 1`), and
 // left an over-limit file that the next boot discarded entirely (QA D3).
-const hostShare = () => Math.max(64 << 10, Math.floor(LEDGER_MAX / LEDGER_HOSTS));
+// 90% of an even split: `LEDGER_HOSTS * share === LEDGER_MAX` exactly leaves
+// nothing for the JSON envelope, so a fully-populated store of hosts each
+// perfectly inside their share still overflowed (QA F3).
+const hostShare = () => Math.max(64 << 10, Math.floor((LEDGER_MAX * 0.9) / LEDGER_HOSTS));
 const LEDGER_NAME_MAX = positiveEnv("USAGE_LEDGER_NAME_MAX", 200);
 
 // The ledger is held in memory and serialized whole on every save, so it is
@@ -382,6 +385,7 @@ function absorb(s, u) {
     // Already inside `pre` (see blankSeries' note on `cutoff`). Re-admitting it
     // would have the next trim add it to `pre` a second time.
     if (s.cutoff && d <= s.cutoff) continue;
+    if (!s.days[d]) s.added = true;
     const cur = s.days[d] || (s.days[d] = blankBucket());
     if (bucketExceeds(cur, b)) augments = true; // that day was bigger once
     raiseBucket(cur, b);
@@ -389,6 +393,7 @@ function absorb(s, u) {
   trimDays(s);
 
   for (const [m, mu] of Object.entries(u.models)) {
+    if (!s.models[m]) s.added = true;
     const cur = s.models[m] || (s.models[m] = blankBucket());
     if (bucketExceeds(cur, mu.totals)) augments = true;
     raiseBucket(cur, mu.totals);
@@ -521,29 +526,31 @@ function load() {
 }
 
 /**
- * Hold ONE host to its share of the store, by giving up day GRANULARITY.
+ * Hold ONE host to its share of the store.
  *
- * Trimmed days fold into `pre`, so what a host over its share loses is the shape
- * of its history, never the all-time total — which is the figure the ticket is
- * actually about. That is why this trims instead of evicting: a host being large
- * is not a reason to forget what it spent.
+ * Gives up detail in the order it is least missed, and does not stop until the
+ * host fits: day GRANULARITY first (trimmed days fold into `pre`, so the
+ * all-time total is untouched), then MODELS (a breakdown of totals kept in full
+ * elsewhere), then the smallest REPOS. Trimming days alone was not enough — a
+ * host with 100 repos, 64 models and long names has almost no day bytes to give
+ * and sat at 6.8x its share forever, which is how one host could still push the
+ * store past LEDGER_MAX and get an innocent one evicted (QA F2/F3).
  *
- * Bounded by construction (the day window at least halves each round), and it
- * measures the SERIALIZED size because that is what the file and the ceiling are
- * denominated in.
+ * Returns whether it fits, so the caller can tell "trimmed" from "cannot".
  */
 function enforceHostShare(key, entry) {
   const share = hostShare();
-  let size;
-  try { size = JSON.stringify(entry).length; } catch { return; }
-  if (size <= share) return;
-  const before = size;
-  const seriesOfEntry = () =>
+  const size = () => { try { return JSON.stringify(entry).length; } catch { return 0; } };
+  let now = size();
+  if (now <= share) return true;
+  const before = now;
+  const allSeries = () =>
     [entry.host, ...Object.values(entry.repos).map((r) => r.series)].filter(Boolean);
-  let guard = 0;
-  while (size > share && guard++ < 40) {
+
+  // 1. Day granularity. Bounded: the window at least halves each round.
+  for (let guard = 0; now > share && guard < 40; guard++) {
     let trimmed = false;
-    for (const s of seriesOfEntry()) {
+    for (const s of allSeries()) {
       const days = Object.keys(s.days).sort();
       if (!days.length) continue;
       for (const d of days.slice(0, Math.max(1, Math.ceil(days.length / 2)))) {
@@ -553,13 +560,56 @@ function enforceHostShare(key, entry) {
         trimmed = true;
       }
     }
-    if (!trimmed) break;   // nothing left to give up
-    try { size = JSON.stringify(entry).length; } catch { return; }
+    if (!trimmed) break;
+    now = size();
   }
+  // 2. The per-model breakdown, smallest first. Its totals live in `totals`.
+  for (let guard = 0; now > share && guard < 40; guard++) {
+    let trimmed = false;
+    for (const s of allSeries()) {
+      const models = Object.keys(s.models);
+      if (!models.length) continue;
+      models.sort((a, b) => bucketTokens(s.models[a]) - bucketTokens(s.models[b]));
+      for (const m of models.slice(0, Math.max(1, Math.ceil(models.length / 2)))) {
+        delete s.models[m];
+        trimmed = true;
+      }
+    }
+    if (!trimmed) break;
+    now = size();
+  }
+  // 3. The smallest REPOS. This is the first step that loses spend, which is why
+  // it is last — and the host block is never dropped, so the host's own total
+  // survives whatever happens to its per-repo breakdown.
+  while (now > share) {
+    const keys = Object.keys(entry.repos);
+    if (!keys.length) break;
+    keys.sort((a, b) =>
+      bucketTokens(seriesTotals(entry.repos[a].series)) -
+      bucketTokens(seriesTotals(entry.repos[b].series)));
+    delete entry.repos[keys[0]];
+    now = size();
+  }
+  const fits = now <= share;
+  warnHostShare(key, before, now, fits);
+  return fits;
+}
+
+// Throttled like every other warn on this path — an over-share host is a STEADY
+// state, and this fired 16 times from a handful of beats. It also has to report
+// what actually happened: the old line claimed a remediation while printing
+// `before == after`, which is worse than silence.
+let lastShareWarnAt = 0;
+function warnHostShare(key, before, after, fits) {
+  const now = Date.now();
+  if (now - lastShareWarnAt < 60 * 60 * 1000) return;
+  lastShareWarnAt = now;
   console.warn(
-    `usage ledger: ${logName(key)} was ${before} bytes, over its ${share}-byte ` +
-      `share — dropped per-day detail down to ${size}. Its all-time totals are ` +
-      `unchanged (trimmed days fold into the running total).`
+    `usage ledger: ${logName(key)} was ${before} bytes, over its ${hostShare()}-byte ` +
+      (fits ? `share — trimmed to ${after} (day detail, then the per-model breakdown, `
+            + `then its smallest repos). All-time totals are unchanged for everything kept.`
+            : `share and could NOT be trimmed to fit (now ${after}). Its history is at risk `
+            + `of eviction; raise ARCHIVE/USAGE_LEDGER_MAX or lower USAGE_LEDGER_REPOS.`)
   );
 }
 
@@ -568,11 +618,27 @@ function enforceHostShare(key, entry) {
 // retired history — the only thing here that can be given up.
 function evictOverflow() {
   let dropped = 0;
-  const keys = Object.keys(hosts).sort((a, b) => (hosts[a].lastSeen || 0) - (hosts[b].lastSeen || 0));
-  while (keys.length > LEDGER_HOSTS) { delete hosts[keys.shift()]; dropped += 1; }
+  // The COUNT ceiling is a recency question: too many hosts, drop the stalest.
+  const byAge = Object.keys(hosts).sort((a, b) => (hosts[a].lastSeen || 0) - (hosts[b].lastSeen || 0));
+  while (byAge.length > LEDGER_HOSTS) { delete hosts[byAge.shift()]; dropped += 1; }
+
   let blob = serialize();
-  while (blob !== null && blob.length > LEDGER_MAX && keys.length > 1) {
-    delete hosts[keys.shift()];
+  if (blob === null || blob.length <= LEDGER_MAX) { if (dropped) warnEvicted(dropped); return blob; }
+
+  // The BYTE ceiling is not. Least-recently-seen is the wrong victim here: the
+  // host that pushed the store over is the one that should pay, and dropping the
+  // stalest instead destroyed an INNOCENT host's durable history while the
+  // culprit stayed (QA F3). So trim the biggest first, and only evict once
+  // trimming cannot help.
+  for (const key of Object.keys(hosts).sort((a, b) => sizeOf(b) - sizeOf(a))) {
+    enforceHostShare(key, hosts[key]);
+    blob = serialize();
+    if (blob !== null && blob.length <= LEDGER_MAX) break;
+  }
+  while (blob !== null && blob.length > LEDGER_MAX && Object.keys(hosts).length > 1) {
+    // Still over with everything trimmed: now the biggest goes, not the oldest.
+    const biggest = Object.keys(hosts).sort((a, b) => sizeOf(b) - sizeOf(a))[0];
+    delete hosts[biggest];
     dropped += 1;
     blob = serialize();
   }
@@ -583,18 +649,30 @@ function evictOverflow() {
     enforceHostShare(keys[0], hosts[keys[0]]);
     blob = serialize();
   }
-  if (dropped) {
-    console.warn(
-      `usage ledger over its ${LEDGER_HOSTS}-host / ${LEDGER_MAX}-byte budget — ` +
-        `dropped the ${dropped} least-recently-seen host(s)`
-    );
-  }
+  if (dropped) warnEvicted(dropped);
   return blob;
+}
+
+function sizeOf(key) {
+  try { return JSON.stringify(hosts[key]).length; } catch { return 0; }
+}
+let lastEvictWarnAt = 0;
+function warnEvicted(dropped) {
+  const now = Date.now();
+  if (now - lastEvictWarnAt < 60 * 60 * 1000) return;
+  lastEvictWarnAt = now;
+  console.warn(
+    `usage ledger over its ${LEDGER_HOSTS}-host / ${LEDGER_MAX}-byte budget — ` +
+      `dropped ${dropped} host(s): the stalest for the count ceiling, the largest ` +
+      `for the byte one.`
+  );
 }
 
 function serialize() {
   try {
-    return JSON.stringify({ version: 1, hosts });
+    // `added` is per-beat scratch (see the enforceHostShare call) and must never
+    // reach the file — a persisted one would be read back as a stored field.
+    return JSON.stringify({ version: 1, hosts }, (k, v) => (k === "added" ? undefined : v));
   } catch (e) {
     // Failing to save is survivable; throwing out of a save TIMER is not — that
     // is an uncaught exception on the main loop and the whole hub exits, taking
@@ -696,27 +774,40 @@ function ingest(key, record, now = Date.now()) {
   if (siteKey) entry.siteKey = siteKey;
 
   let augments = false;
+  // Whether this beat added a day, a model or a repo — i.e. whether the entry can
+  // have grown by more than a few digits. See the enforceHostShare call below.
+  let grew = fresh;
   if (usage) {
     entry.host = entry.host || blankSeries();
+    entry.host.added = false;
     if (absorb(entry.host, usage)) augments = true;
+    if (entry.host.added) grew = true;
     noteShortfall(key, bucketTokens(seriesTotals(entry.host)), bucketTokens(usage.totals), now);
   }
   const reported = new Set();
   for (const r of repos) {
     reported.add(r.remoteKey);
+    if (!entry.repos[r.remoteKey]) grew = true;
     const slot = entry.repos[r.remoteKey] ||
       (entry.repos[r.remoteKey] = { repo: r.repo, remote: r.remote, series: blankSeries() });
     // The LIVE report wins the labels: a repo renamed on disk should read under
     // its current name, not the one it carried when it was first recorded.
     if (r.repo) slot.repo = r.repo;
     if (r.remote) slot.remote = r.remote;
+    slot.series.added = false;
     if (absorb(slot.series, r.usage)) augments = true;
+    if (slot.series.added) grew = true;
   }
   // A repo this host has stopped reporting keeps its history — that is the whole
   // point — which also means this host can never again be served raw.
   for (const k of Object.keys(entry.repos)) if (!reported.has(k)) augments = true;
   trimRepos(key, entry);
-  enforceHostShare(key, entry);
+  // Only when this beat ADDED structure. `enforceHostShare` stringifies the whole
+  // entry — 4.6 ms for a 100-repo host — and running it on every beat put that on
+  // the heartbeat path for nothing: a beat that merely raises existing numbers
+  // grows the entry by digits (QA F9). `grew` is set wherever a new day, repo or
+  // model appears.
+  if (grew) enforceHostShare(key, entry);
   entry.augments = augments;
   if (augments || fresh) scheduleSave(); else scheduleSnapshot();
 }
@@ -856,6 +947,7 @@ load();
 module.exports = {
   ingest, fold, retiredAgents, forget, has,
   LEDGER_FILE, LEDGER_MAX, LEDGER_DAYS, LEDGER_HOSTS, LEDGER_REPOS, RETIRED_MAX,
+  LEDGER_MODELS, LEDGER_NAME_MAX, hostShare,
   // Test seams: the pure reducers, and a way to start from an empty store.
   _internals: {
     hosts: () => hosts,

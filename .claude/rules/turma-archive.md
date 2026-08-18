@@ -47,7 +47,11 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
     still fill the disk together. Past the per-session one that session's raw sync stops and the
     rendered transcript carries on, so it stays readable and searchable.
   - **The per-beat cursor loop is bounded by the HUB** (`ARCHIVE_RAW_CURSOR_MAX`, 2000), and the
-    budget is charged BEFORE a path is validated, not after. Validation is not free — a max-length
+    budget is charged for the manifest ENTRY's row lookup as well as each file's stat, BEFORE either
+    happens. Charging only what survives validation — or only what resolves to a row — left the OUTER
+    loop free, so a manifest of unknown ids (or of ids whose row has no `filePath`, which is every
+    transcript that has never had a rendered chunk) did a SELECT apiece and simply moved the stall:
+    2,985 ms for 470,051 entries, against 4.2 ms for the same entries with `rawFiles` omitted. Validation is not free — a max-length
     depth-10 path failing on its last character measured 700 ms per 780k entries against 30 ms for
     valid ones — so charging only the survivors let a caller walk straight around the cap by offering
     paths the allowlist rejects. **The budget bounds the WORK, and every offer costs work.**
@@ -71,14 +75,27 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
     session and have them served back as part of that host's record. A migration still works, because
     the rendered delta re-points `sessions.host` and the beat pushes the rendered layer first.
     (`ingestChunk` has no such check — pre-existing, XERK-344.)
+  - **The agent never OFFERS a file the hub cannot name** (`_archivable_rel` mirrors `safeRawRel`),
+    and a permanent 4xx does not spend the pass's failure budget. Offering one is not harmless: the
+    hub answers 400 forever, the agent cannot tell that from a transient failure, and three such
+    files ended the pass on every beat — starving every other transcript on the host. Reachable with
+    no malice: a workflow's script is named after the workflow, and a name with a space or an accent
+    is ordinary. **The two allowlists must agree** — widening the hub's without widening the agent's
+    silently keeps files out.
   - **The wire cap CLEARS the worst case of gzipping a chunk, never equals it.** gzip expands
     incompressible input (~+0.03%), so an equal cap made any session file holding 4 MiB of
     already-compressed bytes unpushable — and, since a failed push aborted the whole pass, it stopped
     the raw sync for every OTHER transcript on that host, every beat, forever. A failed push now skips
     that FILE (`ARCHIVE_RAW_FAILURES_MAX` still ends a pass against a hub that is genuinely down).
-  - **The decompressed buffer is charged to the in-flight body budget** for its lifetime.
-    `readRawBody` releases its charge when the socket finishes, so `maxOutputLength` bounds one call
-    and nothing bounded N concurrent ones — the unaccounted-third-term shape of XERK-287.
+  - **The decompressed buffer is NOT a concurrent term.** `gunzipSync` is synchronous, so at most one
+    exists at a time and the peak it adds is `ARCHIVE_RAW_CHUNK_MAX`, flat. An earlier version
+    charged it to the in-flight body budget to bound "N concurrent gunzips"; that was inert (charge
+    and release sit in one synchronous run — 64 concurrent pushes saw an empty budget and not one
+    503) and the comment asserted a guarantee that did not exist. **If this ever becomes async, the
+    charge has to come back for real.**
+  - The `transcriptId` is length-bounded at the route, not just allowlisted: since the raw directory
+    is keyed on it, an id past the filesystem's 255-byte name limit made every push for that session
+    fail at the syscall and report `skip` with no diagnostic.
   - `GET /api/archive/<id>/raw` lists it and `GET /api/archive/<id>/raw/<file>` streams one file
     (user-authed, `attachment` + `nosniff` — a transcript holds whatever was pasted into it, and
     rendering that inline behind the hub's login is stored XSS). Bytes nothing can read back are not

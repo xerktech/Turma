@@ -335,6 +335,111 @@ test("the serve budget truncates newest-first, loudly, without rendering the res
   assert.match(fresh.stderr, /USAGE_LEDGER_SERVE_MAX/);
 });
 
+// ---- the size guards (XERK-338 QA F8) ---------------------------------------
+//
+// Each of these pins a guard that shipped with NOTHING turning red if it were
+// deleted. The store grows on agent-supplied STRINGS across BEATS, where the
+// per-record ceiling bounds only one beat — so every one of them is what stands
+// between a single host and the whole fleet's history.
+
+test("the per-model breakdown is capped", () => {
+  ledger.ingest("many", beat({ [DAY]: 10 }, null,
+    { models: Object.fromEntries(Array.from({ length: 500 }, (_, i) => ["m" + i, 1])) }), now);
+  const models = Object.keys(hosts()["many"].host.models);
+  assert.ok(ledger.LEDGER_MODELS > 0, "the cap is not exported to assert against");
+  assert.ok(models.length <= ledger.LEDGER_MODELS,
+    `${models.length} models kept, cap is ${ledger.LEDGER_MODELS}`);
+  // The biggest survive: what is dropped is a row of detail, never spend.
+  assert.equal(totalOf(served("many", beat({ [DAY]: 10 }, null,
+    { models: { m0: 1 } })).usage), 10);
+});
+
+test("every agent-supplied name is length-bounded", () => {
+  const long = "m" + "x".repeat(5000);
+  ledger.ingest("longname", beat({ [DAY]: 10 }, { ["r" + "y".repeat(5000)]: { [DAY]: 10 } },
+    { models: { [long]: 1 } }), now);
+  const e = hosts()["longname"];
+  for (const name of Object.keys(e.host.models)) {
+    assert.ok([...name].length <= 200, `model name kept at ${[...name].length} code points`);
+  }
+  for (const [rk, slot] of Object.entries(e.repos)) {
+    assert.ok([...rk].length <= 200, `remoteKey kept at ${[...rk].length}`);
+    assert.ok([...slot.repo].length <= 200, `repo kept at ${[...slot.repo].length}`);
+  }
+});
+
+test("a host is trimmed to its share of the store, keeping its all-time total", () => {
+  // Days alone were not enough to trim to: a host with many repos, many models
+  // and long names has almost no day bytes to give and sat 6.8x over its share
+  // forever — which is how it pushed the store past LEDGER_MAX and got an
+  // INNOCENT host evicted (QA F2/F3).
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    process.env.USAGE_LEDGER_FILE = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "turma-share-")), "l.json");
+    // Pinned explicitly: this subprocess INHERITS the parent's env, where
+    // USAGE_LEDGER_HOSTS is wound down to 3 — so leaving it out silently changes
+    // the share this is asserting against.
+    process.env.USAGE_LEDGER_MAX = "3000000";
+    process.env.USAGE_LEDGER_HOSTS = "32";
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const N = "x".repeat(200);
+    const blk = () => ({ totals: b(1000), today: b(0), week: b(0),
+      days: { "2026-08-18": b(1000) }, sessions: 1,
+      models: Array.from({ length: 64 }, (_, i) => (
+        { model: "m" + i + N, totals: b(1), today: b(0), week: b(0) })) });
+    l.ingest("fat", { device: "fat", usage: blk(),
+      repoUsage: Array.from({ length: 100 }, (_, i) => (
+        { repo: "r" + i + N, remoteKey: "rk" + i + N, remote: N, usage: blk() })) });
+    const e = l._internals.hosts().fat;
+    const total = l._internals.bucketTokens(l._internals.seriesTotals(e.host));
+    console.log(JSON.stringify({ size: JSON.stringify(e).length, total, share: l.hostShare() }));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const out = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  // Against the share the child actually computed, not a number copied here that
+  // a later change to the derivation would quietly invalidate.
+  assert.ok(out.size <= out.share, `host kept at ${out.size} bytes, share is ${out.share}`);
+  assert.ok(out.size > 0);
+  // The point of trimming rather than evicting: the all-time total is untouched.
+  assert.equal(out.total, 1000);
+  assert.match(fresh.stderr, /over its .* share/);
+});
+
+test("the byte ceiling drops the BIGGEST host, never an innocent bystander", () => {
+  // Least-recently-seen is the right victim for the COUNT ceiling and the wrong
+  // one for the BYTE ceiling: it destroyed a small innocent host's durable
+  // history while the host that caused the overflow stayed (QA F3).
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    process.env.USAGE_LEDGER_FILE = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "turma-evict-")), "l.json");
+    process.env.USAGE_LEDGER_MAX = "200000";
+    process.env.USAGE_LEDGER_HOSTS = "2";         // inherited otherwise; see above
+    process.env.USAGE_LEDGER_REPOS = "400";       // let one host get genuinely fat
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const blk = () => ({ totals: b(5), today: b(0), week: b(5),
+      days: { "2026-08-18": b(5) }, sessions: 1, models: [] });
+    const rec = (dev, repos) => ({ device: dev, usage: blk(),
+      repoUsage: Array.from({ length: repos }, (_, i) =>
+        ({ repo: "r" + i, remoteKey: "rk" + i, remote: "", usage: blk() })) });
+    // The innocent one is the OLDEST, i.e. exactly what the old rule dropped.
+    l.ingest("innocent", rec("innocent", 1), 1000);
+    l.ingest("hog", rec("hog", 400), 9000);
+    l._internals.writeNow(() => {
+      console.log(JSON.stringify({
+        innocent: l.has("innocent"), hog: l.has("hog"),
+        bytes: fs.statSync(process.env.USAGE_LEDGER_FILE).size }));
+    });
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const out = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  assert.equal(out.innocent, true, "the innocent host's history was destroyed");
+  assert.ok(out.bytes <= 200000, `file left at ${out.bytes}, over its own ceiling`);
+});
+
 test("a host that has spent nothing never takes a ledger slot", () => {
   ledger.ingest("empty", { device: "empty", usage: null, repoUsage: [] }, now);
   assert.deepEqual(Object.keys(hosts()), []);

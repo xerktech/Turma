@@ -167,14 +167,22 @@ paths:
 
 ### Bounds
 
-- **`models` is capped (`USAGE_LEDGER_MODELS`) and every agent-supplied NAME is length-bounded**, and
-  each host is held to a **share of the store** (`LEDGER_MAX / LEDGER_HOSTS`) by giving up day
-  GRANULARITY — trimmed days fold into `pre`, so a host over its share loses the shape of its history
-  and never its all-time total. Without all three, the store grew on agent strings across BEATS while
-  the per-record ceiling only ever bounded ONE beat: 56,000 distinct model names over 40 legal beats
-  took the file past `LEDGER_MAX`, and `evictOverflow` — which can drop only whole hosts, and refuses
-  to drop the last one — sacrificed the INNOCENT hosts and then left an over-limit file that the next
-  boot discarded entirely. One host destroyed the whole fleet's history.
+- **`models` is capped (`USAGE_LEDGER_MODELS`), every agent-supplied NAME is length-bounded, and each
+  host is held to a SHARE of the store** (90% of an even split — an exact split leaves nothing for the
+  JSON envelope). Without all of it the store grew on agent strings across BEATS while the per-record
+  ceiling bounded only ONE beat: 56,000 distinct model names over 40 legal beats took the file past
+  `LEDGER_MAX`, and one host destroyed the whole fleet's history.
+  - **`enforceHostShare` gives up detail in the order it is least missed, and does not stop until the
+    host fits**: day granularity (trimmed days fold into `pre`, so the all-time total is untouched),
+    then the per-model breakdown (kept in full as `totals` anyway), then the smallest repos. Days
+    ALONE were not enough — a host with 100 repos, 64 models and long names has almost no day bytes
+    to give and sat at 6.8x its share forever, with the warning cheerfully reporting `before ==
+    after`.
+  - **The BYTE ceiling evicts the BIGGEST host; only the COUNT ceiling evicts the stalest.** Least
+    -recently-seen is right for "too many hosts" and wrong for "too many bytes": it destroyed a small
+    innocent host's durable history while the host that caused the overflow stayed.
+  - It runs only on a beat that ADDED a day, repo or model. It stringifies the whole entry (4.6 ms at
+    100 repos), and a beat that merely raises existing numbers grows the entry by digits.
 - Every ceiling is a **fraction of the container limit** (`USAGE_LEDGER_MAX`, a 32nd, clamped
   2–8 MiB), like every other hub bound: the ledger is held in memory and re-serialized whole on each
   save, so a flat number above `mem_limit` could never refuse anything before the OOM killer fires.

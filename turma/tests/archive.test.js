@@ -409,8 +409,11 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   // host. The agent's own cap is not this bound; a bound the receiving path does
   // not enforce is not a bound (XERK-235).
   //
-  // Held deterministically rather than by wall clock: with a cap of 3, the FOURTH
-  // stored file gets no cursor even though it is on disk.
+  // The budget covers the manifest ENTRY's row lookup as well as the per-file
+  // stats — charging only the files left the outer loop free, which just moved
+  // the stall (QA F4). Held deterministically rather than by wall clock: with a
+  // cap of 3, one entry lookup plus two stats spends it, so the THIRD stored
+  // file gets no cursor even though it is on disk.
   const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
     const os = require("os"), fs = require("fs"), path = require("path");
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-statcap-"));
@@ -427,7 +430,7 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   `], { encoding: "utf8" });
   assert.equal(fresh.status, 0, fresh.stderr);
   const covered = JSON.parse(fresh.stdout.trim().split("\n").pop());
-  assert.deepEqual(covered, ["a.jsonl", "b.jsonl", "c.jsonl"],
+  assert.deepEqual(covered, ["a.jsonl", "b.jsonl"],
     "the cap did not stop the stat loop");
   // And the truncation is LOUD: silence would read as "the hub holds nothing",
   // which is a re-ship rather than a refusal.
@@ -471,6 +474,68 @@ test("a repo folder named like a raw directory is still archived", () => {
   const walked = archive.__walkJsonl();
   assert.ok(walked.some((f) => f.endsWith(rel)),
     "the rebuild walk skipped a REPO folder that merely looks like a raw directory");
+});
+
+test("safeRawRel bounds a COMPONENT, not just the whole path", () => {
+  // Every common filesystem caps one name at 255 bytes, so a longer component
+  // passed the allowlist and then failed at the syscall — an unthrottled error
+  // per attempt, per beat (QA D10). The 400-byte whole-path cap does not imply
+  // it: a two-component path can be 260/130 and pass that one.
+  assert.ok(archive.safeRawRel("a".repeat(255) + "/b.txt"));
+  assert.equal(archive.safeRawRel("a".repeat(256) + "/b.txt"), null);
+  assert.equal(archive.safeRawRel("a".repeat(300)), null);
+});
+
+test("manifestCursors is capped, and the cap bounds ROWS WRITTEN", () => {
+  // Pre-existing, and the costlier of the two per-beat loops: a SELECT plus an
+  // INSERT per entry, measured at 6.9 SECONDS of blocked event loop for 973,677
+  // ids in one beat — which also wrote 973,682 rows and grew index.db to 161 MB,
+  // outside ARCHIVE_TOTAL_MAX (QA D7). The agent's ARCHIVE_MANIFEST_MAX is not
+  // this bound.
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-mancap-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_MANIFEST_CURSOR_MAX = "5";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    a.manifestCursors("nas", Array.from({ length: 500 },
+      (_, i) => ({ transcriptId: "m" + i, repo: "r", remoteKey: "rk" })));
+    const db = a.openDb();
+    console.log(JSON.stringify(db.prepare("SELECT COUNT(*) AS n FROM sessions").get().n));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.equal(JSON.parse(fresh.stdout.trim().split("\n").pop()), 5,
+    "the manifest cap did not stop the row writes");
+  assert.match(fresh.stderr, /ARCHIVE_MANIFEST_CURSOR_MAX/);
+});
+
+test("the cursor budget is charged for REJECTED paths and unknown ids too", () => {
+  // The budget bounds WORK, and validating a path costs work — a max-length
+  // depth-10 path failing on its last character measured 700 ms per 780k entries.
+  // Charging only what survives validation (or only what resolves to a row) left
+  // the cap walk-around-able and just moved the stall (QA D4/F4).
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turma-charge-"));
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_CURSOR_MAX = "4";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-08-18T00:00:00Z", summary: "s" };
+    a.ingestChunk("nas", "chg", meta, 0, 10, [{ uuid: "u", role: "user", text: "hi" }]);
+    a.ingestRaw("nas", "chg", "real.jsonl", 0, Buffer.from("xx"));
+    // Three ids the hub has never seen (each costs a lookup), then the real one
+    // with its stored file last. With the budget charged for the lookups, the
+    // real file's cursor is never reached.
+    const manifest = ["nope1", "nope2", "nope3"].map((t) => (
+      { transcriptId: t, rawFiles: [["a.jsonl", 1]] }));
+    manifest.push({ transcriptId: "chg", rawFiles: [["real.jsonl", 2]] });
+    console.log(JSON.stringify(a.rawCursors(manifest) || {}));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const out = JSON.parse(fresh.stdout.trim().split("\n").pop());
+  assert.deepEqual(out, {}, "unknown ids were not charged, so the cap did not bind");
 });
 
 test("listRawFiles and rawFileFor read the layer back", () => {
