@@ -6083,6 +6083,66 @@ test("XERK-325: the sweep and drain honour the newer `updated` too, not just the
   ticketQueue.length = 0;
 });
 
+test("XERK-325: an UNTRIAGED copy winning on `updated` is still untriaged", async () => {
+  // The third divergence class, and the intersection of the two above: the
+  // pinned cases are untriaged-winner-by-BLOCK-RANK and triaged-differently-by-
+  // `updated`. A resolver preferring a triaged older copy over an untriaged newer
+  // one satisfies both and still dispatches a repo the card shows as untriaged.
+  //
+  // Ordinary fleet shape, not an edge case: a ticket is edited in Jira, the host
+  // that re-polled first has not triaged the new copy yet, and the other still
+  // holds the older triaged one.
+  resetAutoStart();
+  const site = "tq325t.atlassian.net";
+  await asBeat("tq325tFresh", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T11:00:00Z",
+    tickets: [{ key: "ENG-9", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000+0000" }] });   // newer, untriaged
+  await asBeat("tq325tStale", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",
+    tickets: [{ key: "ENG-9", statusCategory: "todo",
+                updated: "2026-07-14T08:00:00.000+0000",
+                repoGuess: { repo: "RepoOld", cloned: true } }] });
+  // The POST refuses it, because the card shows no chip.
+  const r = await startTicket(site, "ENG-9");
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /no triaged repo/);
+  // And the DRAIN holds it rather than reviving the older triaged copy.
+  assert.ok(enqueueTicketStart(site, "ENG-9", "manual"));
+  drainTicketQueue();
+  for (const h of ["tq325tFresh", "tq325tStale"]) {
+    assert.deepEqual((agents[h].commands || []).map((c) => c.type), [], h);
+  }
+  const e = queuedTicket(site, "ENG-9");
+  assert.equal(e && e.reason, "blocked");
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: `updated` is compared as a STRING, like both client mirrors", async () => {
+  // `Date.parse` is the plausible "compare timestamps properly" edit and it
+  // escapes every other test here: it disagrees on mixed `+0000`/`Z` spellings,
+  // and on an absent `updated` it yields NaN, so every comparison goes false and
+  // the override silently stops firing. Both client mirrors string-compare.
+  resetAutoStart();
+  const site = "tq325u.atlassian.net";
+  // Same instant, two spellings. As strings "2026-07-14T12:00:00.000+0000" sorts
+  // BELOW "2026-07-14T12:00:00.000Z" ('+' < 'Z'), so the Z copy is the row;
+  // Date.parse calls them equal and first-wins by block rank would give Offset.
+  await asBeat("tq325uZ", site, { autoStart: false, capacity: ROOMY, user: "a@x.com",
+    fetchedAt: "2026-07-14T11:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000Z",
+                repoGuess: { repo: "Zulu", cloned: true } }] });
+  await asBeat("tq325uOffset", site, { autoStart: false, capacity: ROOMY, user: "b@x.com",
+    fetchedAt: "2026-07-14T12:30:00Z",                       // fresher block
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                updated: "2026-07-14T12:00:00.000+0000",
+                repoGuess: { repo: "Offset", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.body.repo, "Zulu",
+    "string order decides, not Date.parse — which would call these equal");
+});
+
 test("XERK-325: `fetchedAt` is compared with `>`, and the board agrees", async () => {
   // Nothing pinned the OPERATOR, so reverting either side to localeCompare
   // passed every test and silently re-opened the divergence. The two disagree on
@@ -6218,12 +6278,17 @@ test("XERK-325: only the shared resolvers may read a block's ticket list", () =>
   // arrow-`const`, an `async`/`export`/indented `function` (each of which used to
   // be invisible to the declaration scan and got its read blamed on the previous
   // declaration), a divergent walk added BESIDE a legitimate `fleetTicketRows()`
-  // call, and a re-rank smuggled into an allow-listed function. Still open, each
-  // one MEASURED rather than assumed: a COMPUTED key (`j["tick" + "ets"]`), a
-  // resolver in a NEW FILE (this greps `server.js` alone), and — when placed
-  // directly after an allow-listed declaration, so the attribution lands on it —
-  // an object-literal METHOD, a CLASS method, and an object-literal arrow
-  // PROPERTY. All three are caught in any other position.
+  // call, and a re-rank smuggled into an allow-listed function.
+  //
+  // Still open, stated as the CLASS rather than a list of instances — the list
+  // was enumerated twice and was incomplete both times, so it will age again:
+  //   - a COMPUTED key (`j["tick" + "ets"]`), which escapes in EVERY position;
+  //   - a resolver in ANOTHER FILE, since this greps `server.js` alone;
+  //   - **any declaration form `DECL` does not match, sitting directly after an
+  //     allow-listed declaration** so the attribution lands on that name.
+  //     Measured examples: an object-literal method, a class method, an
+  //     object-literal arrow property, a bare `x = function …` assignment, an
+  //     IIFE, and a getter. All are caught in any other position.
   //
   // So it is a tripwire for the honest edit, not a proof. **The guarantee lives
   // in the behavioural tests above** — the two-user, ghost, auto-stop,
