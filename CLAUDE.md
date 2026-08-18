@@ -26,6 +26,7 @@ that component's files.
 | `.claude/rules/turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `.claude/rules/turma-board.md` | `turma/public/board.*`, `turma/server.js` | Kanban, ticket panel, routing, auto-start/stop |
 | `.claude/rules/turma-ticket-queue.md` | `turma/public/board.*`, `turma/server.js` | the hub's ticket queue: admission, drain, expiries, caps |
+| `.claude/rules/board-ticket-view.md` | `turma/server.js`, `agent/hub-agent.py`, `board.js` + its vendored copies, `core/Board.kt` | routing a ticket to a host that can run it, and the hub resolving a ticket as the board does |
 | `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |

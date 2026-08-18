@@ -169,6 +169,14 @@ which makes an `android/` change part of the same PR) live there.
 - Above the chart it shows the **Claude subscription's 5h/7d windows** (XERK-247) from each agent's
   `limits` block — the numbers exist only inside Claude Code (see `.claude/rules/agent-usage.md` for
   how they're captured).
+  - **Every token figure on every usage block is coerced at ingest too** (`normalizeUsageTokens`,
+    XERK-306) — the host/repo/session windows, the `days` map and each model's windows, which are
+    Kotlin `Long`s on Android. Unlike `subagent` the bad FIGURE is zeroed rather than the block
+    dropped: absent totals is not a meaningful "can't tell you" when every client renders them
+    unconditionally. That understates the host instead of excluding it, so it is logged (throttled).
+    A window, `days` or `usage` that is not an object at all IS dropped, and a missing figure is
+    never filled in — this walk sits between the raw and coerced `AGENT_RECORD_MAX` measurements, so
+    `{}` → four invented zeros on an agent-sized `days` map is an expansion it must not make.
   - **`normalizeLimits` coerces the block at ingest**, like the per-model usage lists beside it and
     for the same reason: it fans out to web, Android and glasses, and Android decodes it into TYPED
     fields, so a `usedPct` of `"lots"` from one buggy host would fail the decode of the WHOLE fleet
@@ -205,6 +213,13 @@ which makes an `android/` change part of the same PR) live there.
       does, and because the key is a MAP KEY on every client: anything unusable becomes null, never
       a plausible default that would fold two subscriptions into one set of bars. Its bounds are
       **literals, not module `const`s** — see the restore-TDZ rule below.
+  - **`normalizeSpawnRefusals` coerces the served refusal map** (XERK-325) because Android TYPES it,
+    and it is the first typed-and-served record field that is deliberately NOT stripped from the
+    payload. The heartbeat path cannot produce a bad one (`ingestSpawnFailures` is the only writer);
+    the `state.json` restore can, and it is served before any host re-beats. It keeps the ingest
+    path's PLAIN object shape — a null-prototype one would make a restored record differ from a
+    beaten one — so the explicit `__proto__`/`constructor`/`prototype` key filter is what stops
+    `out[id]`'s [[Set]] hitting the prototype setter, not the object's prototype.
   - **Anything a `normalize*` closes over must be reachable from `loadState`'s line.** That loop
     sits near the top of `server.js` and reaches each one only because function declarations hoist;
     a module `const` declared below is in its TDZ there, the `ReferenceError` lands in the restore's

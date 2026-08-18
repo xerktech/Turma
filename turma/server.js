@@ -732,6 +732,13 @@ function registryBytes() {
 const REFUSED_LOG_EVERY_MS = 60 * 1000;
 let refusedLogAt = 0;
 let refusedSinceLog = 0;
+// The usage-coercion throttle (XERK-306), declared here rather than beside
+// logUsageCoercion for the reason that comment gives: `loadState`'s restore
+// runs the coercions from ABOVE this file's later declarations, so a binding
+// down there is read in its TDZ and empties the whole registry on boot.
+const USAGE_COERCION_LOG_EVERY_MS = 60 * 1000;
+let usageCoercionLogAt = 0;
+let usageCoercionSuppressed = 0;
 function logRegistryFull(detail) {
   refusedSinceLog += 1;
   const now = Date.now();
@@ -906,8 +913,8 @@ try {
   // `dropUnusableHostKeys` and `isPlainHostKey` are FUNCTION declarations far
   // below this line and are reached only because those hoist. Do not convert
   // either to a `const`: the TDZ ReferenceError would land in this block's
-  // catch, which swallows everything, and the hub would boot with no agents
-  // and no error printed anywhere.
+  // catch, which swallows everything, and the hub would boot with no agents —
+  // its one `state restore skipped:` line the only sign anything went wrong.
   for (const key of dropUnusableHostKeys(agents)) {
     console.warn(`dropping restored agent under unusable device name ${hostKeyLabel(key)}`);
   }
@@ -1743,17 +1750,107 @@ function normalizeSubagentUsage(usage) {
   usage.subagent = out;
 }
 
+// The token FIGURES themselves (XERK-306). A bucket's four counts are Kotlin
+// `Long`s on Android (UsageBucket) and a full /api/agents decode is ATOMIC
+// there, so ONE host reporting `1.5` or `1e308` for a single figure throws for
+// the WHOLE array: every OTHER host silently vanishes from that phone's fleet
+// list while the tile still reads "N / N online". XERK-302 closed this for the
+// `subagent` block alone; these are its siblings — the host/repo/session
+// windows, the per-day buckets, and each model's windows.
+//
+// A figure must be a NON-NEGATIVE SAFE INTEGER, the rule normalizeSubagentUsage
+// established. But an unusable one here is REWRITTEN to 0 rather than
+// invalidating its block: absent totals is not a meaningful "can't tell you"
+// the way an absent `subagent` is — every client renders these unconditionally
+// and an agent that reports usage at all reports all three windows. That
+// silently UNDERSTATES the host, which is why it is logged.
+//
+// Nothing is ever filled IN. A missing key stays missing (every client defaults
+// it to 0), because this walk runs before the SECOND AGENT_RECORD_MAX
+// measurement and `{}` → `{"input":0,"output":0,"cacheWrite":0,"cacheRead":0}`
+// is a ~25x expansion on a `days` map whose size the agent chooses. Rewriting a
+// figure that is PRESENT can only shrink the record: no JSON number that fails
+// the test above is shorter than `0`.
+//
+// The key list is a LITERAL in each walk below, never a module `const`: this
+// runs from `loadState`, which is above any such declaration and would read it
+// in its TDZ — a ReferenceError there lands in the restore's catch and empties
+// the WHOLE registry on boot (the restore-TDZ rule in .claude/rules/turma.md).
+
+// One `owner[key]` bucket, in place. A bucket that is not an object at all is
+// DELETED rather than rebuilt: it holds no figure worth keeping, deleting can
+// never expand the record, and every client already reads an absent window as
+// zeros. A stringified figure ("9") counts as unusable on purpose — it is what
+// the wire type says it isn't, and the web's `+=` would concatenate it.
+function normalizeTokenBucket(owner, key, tally) {
+  if (!objectish(owner) || !(key in owner)) return;
+  const bucket = owner[key];
+  if (!objectish(bucket)) {
+    delete owner[key];
+    noteUsageCoercion(tally, key);
+    return;
+  }
+  for (const k of ["input", "output", "cacheWrite", "cacheRead"]) {
+    if (!(k in bucket)) continue;
+    if (Number.isSafeInteger(bucket[k]) && bucket[k] >= 0) continue;
+    bucket[k] = 0;
+    noteUsageCoercion(tally, `${key}.${k}`);
+  }
+}
+
+// Every bucket one usage block carries.
+function normalizeUsageTokens(usage, tally) {
+  if (!objectish(usage)) return;
+  for (const w of ["totals", "today", "week"]) normalizeTokenBucket(usage, w, tally);
+  // `days` is a `Map<String, UsageBucket>` on Android, so a non-object (an
+  // ARRAY, say) is decode-fatal on its own, before any figure inside it counts.
+  if ("days" in usage) {
+    if (!objectish(usage.days)) {
+      delete usage.days;
+      noteUsageCoercion(tally, "days");
+    } else {
+      for (const d of Object.keys(usage.days)) normalizeTokenBucket(usage.days, d, tally);
+    }
+  }
+  // Runs after normalizeModelUsage, which has already dropped every entry that
+  // is not an object with a name.
+  if (Array.isArray(usage.models)) {
+    for (const m of usage.models) {
+      for (const w of ["totals", "today", "week"]) normalizeTokenBucket(m, w, tally);
+    }
+  }
+  // Typed `String` on Android — a number here is as decode-fatal as a float
+  // figure, and it rides the same block.
+  if ("lastActivity" in usage && typeof usage.lastActivity !== "string") {
+    delete usage.lastActivity;
+    noteUsageCoercion(tally, "lastActivity");
+  }
+}
+
 // Every coercion a usage block needs, wherever one rides the heartbeat.
-function normalizeUsageBlock(usage) {
+function normalizeUsageBlock(usage, tally) {
   normalizeModelUsage(usage);
   normalizeSubagentUsage(usage);
+  normalizeUsageTokens(usage, tally);
+}
+
+// A usage block hangs off its owner under a known key; a non-object one is
+// decode-fatal on Android (`UsageInfo`), so it is DROPPED — deleting shrinks the
+// record where rewriting it to `null` would grow it.
+function dropUnusableUsage(owner, tally) {
+  if (!objectish(owner) || !("usage" in owner)) return;
+  if (objectish(owner.usage)) return;
+  delete owner.usage;
+  noteUsageCoercion(tally, "usage");
 }
 
 // Every place a usage block rides the heartbeat: the host-wide aggregate, the
 // per-repo ones, and each live session's own.
 function normalizeUsage(payload) {
   if (!payload || typeof payload !== "object") return;
-  normalizeUsageBlock(payload.usage);
+  const tally = { count: 0, first: "" };
+  dropUnusableUsage(payload, tally);
+  normalizeUsageBlock(payload.usage, tally);
   // `Array.isArray`, not `|| []`: a non-iterable `repoUsage`/`sessions` (an
   // OBJECT, say) makes a bare `for…of` THROW, and a throw here is uniquely
   // costly — on the restore path it lands in a silent `catch {}` and abandons
@@ -1765,11 +1862,63 @@ function normalizeUsage(payload) {
   if (!Array.isArray(payload.repoUsage)) {
     if ("repoUsage" in payload) payload.repoUsage = [];
   } else {
-    for (const r of payload.repoUsage) normalizeUsageBlock(r && r.usage);
+    // `List<RepoUsage>` on Android, so a `null` or a bare string IN the list is
+    // as fatal as a bad figure inside one — the same drop normalizeSessions
+    // makes over `sessions`.
+    if (!payload.repoUsage.every(objectish)) {
+      payload.repoUsage = payload.repoUsage.filter(objectish);
+      noteUsageCoercion(tally, "repoUsage[]");
+    }
+    for (const r of payload.repoUsage) {
+      // Typed `String` on both, and deleting is what every client already reads
+      // as "unnamed" — rewriting to `String(r.repo)` could grow the record.
+      for (const k of ["repo", "remoteKey"]) {
+        if (k in r && typeof r[k] !== "string") {
+          delete r[k];
+          noteUsageCoercion(tally, `repoUsage.${k}`);
+        }
+      }
+      dropUnusableUsage(r, tally);
+      normalizeUsageBlock(r.usage, tally);
+    }
   }
   if (Array.isArray(payload.sessions)) {
-    for (const s of payload.sessions) normalizeUsageBlock(s && s.usage);
+    // Guarded rather than assuming normalizeSessions ran first: order in
+    // normalizeRecord is deliberately NOT load-bearing.
+    for (const s of payload.sessions) {
+      dropUnusableUsage(s, tally);
+      normalizeUsageBlock(s && s.usage, tally);
+    }
   }
+  logUsageCoercion(payload, tally);
+}
+
+function noteUsageCoercion(tally, where) {
+  if (!tally) return;
+  tally.count += 1;
+  if (!tally.first) tally.first = where;
+}
+
+// Coercing a figure to 0 UNDERSTATES the host rather than excluding it, so it
+// must not be silent. Throttled process-wide (a beat arrives every few seconds
+// and a host reporting one bad figure reports it forever) — the throttle's own
+// state is declared with the other log throttles, above `loadState`, because
+// the restore reaches this too. The example path goes through logName: a `days`
+// key is agent-authored text that would otherwise forge a log line.
+function logUsageCoercion(payload, tally) {
+  if (!tally.count) return;
+  usageCoercionSuppressed += 1;
+  const now = Date.now();
+  if (now - usageCoercionLogAt < USAGE_COERCION_LOG_EVERY_MS) return;
+  const also = usageCoercionSuppressed > 1
+    ? ` (+${usageCoercionSuppressed - 1} more beats coerced since the last line)` : "";
+  usageCoercionLogAt = now;
+  usageCoercionSuppressed = 0;
+  console.warn(
+    `heartbeat from ${logName(payload.device || payload.agentId || "?")}: ` +
+      `${tally.count} unusable usage field(s) coerced (first ${logName(tally.first)}) — ` +
+      `this host's token figures understate what it really spent${also}`
+  );
 }
 
 // The subscription-limit snapshot (XERK-247), coerced to numbers or dropped, for
@@ -2062,6 +2211,9 @@ const SPAWN_FAILURE_MAX = 40;
 // the record past AGENT_RECORD_MAX, and then 413 every following beat from that
 // host, including the ones that would have swept it. The agent truncates too;
 // this is the boundary that makes a buggy or hostile one survivable (XERK-235).
+// Mirrored as a LITERAL in normalizeSpawnRefusals, which runs on the state.json
+// restore declared far above this line and so cannot close over this const
+// without a TDZ ReferenceError. Move one, move the other.
 const SPAWN_FAILURE_ERROR_MAX = 500;
 const SPAWN_FAILURE_CMDID_MAX = 200;
 
@@ -2455,21 +2607,70 @@ function rememberCreateInFlight(fields, cmdId, host) {
   }
 }
 
+// The ONE tie-break every cross-host resolution of a tracker block uses
+// (XERK-325): an ONLINE host's block outranks any offline one, freshness
+// deciding only WITHIN a tier.
+//
+// It is a shared function rather than the same three lines written out at each
+// site because writing it out is exactly how this went wrong twice: the ranking
+// was changed in `ticketRepo` while `autoStartSweep`, `autoStopSweep` and
+// `fleetTicketRows` each kept their own copy, and every divergence was silent
+// and user-visible — a killed session for a ticket the board showed as To Do, a
+// queued Start click dropped without a word, auto-start queueing tickets no card
+// displays while ignoring the ones it does.
+//
+// The rule itself: the hub can only ACT through an online host, and the board
+// ranks the same way (`mergeSites`, its two vendored copies, and `Board.kt`), so
+// resolving against an offline host's fresher block makes the hub act on a copy
+// the operator was never shown. Hosts poll the tracker independently — ~10
+// minutes apart on this fleet — so an offline host holding the newest block is
+// ordinary, not an edge case. Offline blocks are still eligible, last, or a
+// wholly-offline org would resolve nothing at all.
+//
+// Anything that resolves a ticket or a block across hosts belongs here. Grep
+// `blockOutranks` for the full set; do not add a site with its own compare.
+function agentBlockOnline(a, now) {
+  return now - ((a && a.lastSeen) || 0) < OFFLINE_AFTER_MS;
+}
+function compareBlocks(x, y) {   // rank order, best first
+  if (x.online !== y.online) return x.online ? -1 : 1;
+  // Plain `>`/`<`, NOT localeCompare — the comparison every mirror uses, in both
+  // its group pick and its sort. They disagree only on spellings that differ by
+  // case or separator, which no real agent emits (one `now_iso()` format
+  // fleet-wide); the reason to keep them identical anyway is that the last
+  // attempt to "match mergeSites exactly" used localeCompare here and merely
+  // MOVED the divergence from the two-user shape onto the common same-user one.
+  return x.at > y.at ? -1 : x.at < y.at ? 1 : 0;   // fresher first
+}
+function blockOutranks(cand, best) {
+  return !best || compareBlocks(cand, best) < 0;
+}
+
 // The repo an org's board says a ticket belongs in, as triaged by whichever host
 // reported it (see the Jira -> repo triage section in hub-agent.py). null when no
 // host reports the ticket, or none has triaged it yet, or the model declined it.
-// The FRESHEST reporting block wins, matching how board.js merges the same
-// tickets for display — the hub must resolve against what the operator clicked.
-function ticketRepo(siteKey, issueKey) {
-  let best = null, bestAt = "";
-  for (const a of Object.values(agents)) {
-    if (!a.jira || a.jira.siteKey !== siteKey) continue;
-    const t = (a.jira.tickets || []).find((x) => x && x.key === issueKey);
-    if (!t || !t.repoGuess || !t.repoGuess.repo) continue;
-    const at = String(a.jira.fetchedAt || "");
-    if (!best || at > bestAt) { best = t.repoGuess.repo; bestAt = at; }
-  }
-  return best;
+// Read off the ROW `fleetTicketRows` resolved, so it is by construction the same
+// copy the card renders. Ranking blocks here on its own was subtly different and
+// therefore wrong twice over: it ignored the newer-`updated` override, so a board
+// showing RepoA (the newer copy) dispatched against RepoB (the better-ranked
+// block); and where the winning copy carried no `repoGuess` at all, the card
+// showed the ticket untriaged while the hub started it off a losing block's
+// guess. `rows` is optional and exists only so a caller already holding the map
+// — the auto-start sweep, per ticket — does not rebuild it per call.
+//
+// **An ONLINE host's answer outranks any offline one, however stale** (XERK-325).
+// Every caller is a ROUTING decision, and `findTicketHost` can only route to an
+// online host that agrees with this repo — so an offline host winning on
+// freshness names a repo nothing can be dispatched against, and a ticket an
+// online host had triaged and could run stalls as "no online host has triaged
+// that ticket". Hosts poll Jira independently (~10 min apart in this fleet), so
+// an offline host holding the newest block is ordinary, not an edge case.
+// Freshness still decides WITHIN each tier; the offline tier is the fallback that
+// keeps a wholly-offline org resolving a repo at all, which is what lets the
+// queue hold the ticket rather than drop it.
+function ticketRepo(siteKey, issueKey, rows) {
+  const r = (rows || fleetTicketRows()).get(ticketQueueKey(siteKey, issueKey));
+  return (r && r.row.repoGuess && r.row.repoGuess.repo) || null;
 }
 
 // How many more sessions a host can take RIGHT NOW, as the hub sees it — the
@@ -2546,16 +2747,45 @@ function hostHasFreeSlot(a) {
 // decision rather than an enqueue-time one. Returns `{full:true}` with that
 // refusal so the caller can tell "wait, this will clear" from "this can't work".
 // Returns {host, needsClone} | {error, status, full?}.
+//
+// Does THIS host's own triage answer the question the board asked? Triage is
+// per-host (each agent's ~/.turma/jira-repos.json, decided by its own model run
+// over its own candidate repos), while `ticketRepo` shows the freshest host's
+// answer — so a fleet routinely holds hosts that have not triaged a ticket the
+// board already displays a chip for, and hosts that triaged it somewhere else.
+// `spawn_ticket` re-derives the repo from the LOCAL ledger and refuses what it
+// has no decision for, so dispatching to either kind is a spawn that cannot run.
+// Eligibility therefore has to be the agent's own accept condition, and matching
+// `repo` is part of it: a host that answered a different repo would spawn against
+// THAT one, which is not the repo the operator was shown.
+//
+// Mirrors `_apply_triage`: no entry (or an undecided one) publishes no repoGuess,
+// and a "nothing fits" verdict publishes `repo: null` — both of which the agent
+// refuses, and both of which fail this test.
+function hostTriagedTicket(a, issueKey, repo) {
+  const t = ((a.jira && a.jira.tickets) || []).find((x) => x && x.key === issueKey);
+  return !!(t && t.repoGuess && t.repoGuess.repo && t.repoGuess.repo === repo);
+}
 function findTicketHost(siteKey, repo, issueKey, opts) {
   const requireFree = !!(opts && opts.requireFree);
   const now = Date.now();
   let anyOrg = false, anyOnline = false;
+  // Vacuously satisfied when there is no ticket to have triaged.
+  let anyTriaged = !issueKey;
   const cloned = [], uncloned = [];
   for (const [key, a] of Object.entries(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
     anyOrg = true;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     anyOnline = true;
+    // Ahead of the capacity filter so `anyTriaged` counts hosts that could run
+    // this ticket if they had room, which is what separates the two refusals
+    // below: "nothing can run it" (blocked — a freed slot would not help) from
+    // "what can run it is busy" (full — clears itself). Filtering after capacity
+    // would collapse a full agreeing host into the first, and the ticket would
+    // age out on the blocked timer instead of waiting for the slot it needs.
+    if (issueKey && !hostTriagedTicket(a, issueKey, repo)) continue;
+    anyTriaged = true;
     // A host with no room is out of the running entirely under requireFree —
     // including out of the "has the repo cloned" preference, so a full cloned
     // host never holds the ticket back from a free one that can clone on demand.
@@ -2579,15 +2809,46 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       return { status: 503, full: true, error:
         `this ticket is pinned to agent "${pin.host}", which has no free session slot` };
     }
+    // The pin says WHICH host, never that the host can run it — reported rather
+    // than routed around, exactly like every other pin refusal.
+    //
+    // Deliberately AFTER the capacity refusal, and not because either reason
+    // clears itself — neither does, and a pinned host that is full AND untriaged
+    // is reported as merely full until a slot frees. That is the better trade:
+    // `full` is what makes the POST QUEUE the click instead of losing it, and
+    // being untriaged is usually the minutes-long gap before a host's triage
+    // batch returns, which a queued entry then dispatches on its own. The
+    // permanent case (a decided `repo: null`) holds as blocked once capacity
+    // clears and ages out with the queue's visible "gave up" note, which is
+    // XERK-296's answer for exactly this. Refusing here instead would throw away
+    // the click for the common transient case.
+    if (!hostTriagedTicket(a, issueKey, repo)) {
+      return { status: 503, error:
+        `this ticket is pinned to agent "${pin.host}", which has not triaged it to ${repo}` };
+    }
     return { host: pin.host,
       needsClone: !(a.repos || []).some((r) => r && r.name === repo) };
   }
   if (!anyOnline) {
     return { status: 503, error: "every host reporting that Jira org is offline" };
   }
+  // Not `full`: a slot coming free does not give a host a triage decision, so
+  // this holds on the queue as `blocked` and ages out rather than waiting for a
+  // capacity change that would not help.
+  if (!anyTriaged) {
+    return { status: 503, error:
+      `no online host has triaged that ticket to ${repo}` };
+  }
   if (requireFree && !cloned.length && !uncloned.length) {
-    return { status: 503, full: true, error:
-      "every host reporting that Jira org has its session slots full" };
+    // The pool is the hosts that TRIAGED this ticket to `repo`, not the org's
+    // hosts, so say that — a free host that answered a different repo is not a
+    // slot this ticket can use, and reporting the org as full while one sits
+    // idle sends the operator to look at capacity they don't have a problem
+    // with. Still `full`: every host that could run it is genuinely full, so
+    // this is the reason that clears itself.
+    return { status: 503, full: true, error: issueKey
+      ? `every host that has triaged that ticket to ${repo} has its session slots full`
+      : "every host reporting that Jira org has its session slots full" };
   }
   const pool = cloned.length ? cloned : uncloned;
   const needsClone = cloned.length === 0;
@@ -2840,6 +3101,75 @@ function normalizeSubagentHistory(a) {
   }
 }
 
+/**
+ * Coerce the served `spawnRefusals` map (XERK-325). Android TYPES it as
+ * `Map<String, SpawnRefusal>` with a `String` error and a `Long` at, and a full
+ * `/api/agents` decode is atomic there — so one bad value fails the whole fleet
+ * array, not just its own host.
+ *
+ * The heartbeat path cannot produce one: `ingestSpawnFailures` is the only
+ * writer, it substitutes a default for a missing reason and slices the length,
+ * and an agent that puts `spawnRefusals` on its own beat is overwritten. The
+ * RESTORE path can — `state.json` is served before any host re-beats — and
+ * unlike every other on-demand cache this one is deliberately NOT stripped from
+ * the payload, which is what makes it the first typed-and-served record field
+ * needing this. So: defence in depth, and the rule that typing a field on a
+ * client and adding its hub-side coercion are the same change.
+ *
+ * Coerces to the "can't tell you" value every client already handles — an absent
+ * entry, never a plausible default — since a fabricated reason would end an
+ * operator's spawn wait with text no agent ever said.
+ */
+function normalizeSpawnRefusals(a) {
+  if (!a || typeof a !== "object") return;
+  const raw = a.spawnRefusals;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    if ("spawnRefusals" in a) a.spawnRefusals = {};
+    return;
+  }
+  // A PLAIN object, matching exactly what the ingest path builds — a
+  // null-prototype one here would make a restored record a different shape from
+  // a beaten one, which `deepStrictEqual` sees and clients need not.
+  const out = {};
+  for (const [id, e] of Object.entries(raw)) {
+    // So the key filter is what does the work, and it is not optional: `out[id]`
+    // uses [[Set]], so a `__proto__` key would invoke the prototype setter
+    // rather than store an entry — silently dropping the refusal AND re-pointing
+    // this map's prototype at agent-influenced data. JSON can express all three
+    // names and this input is a file we exist to distrust; a cmdId is hub-minted
+    // hex, so none of them can be real. Same names `ingestSpawnFailures` refuses.
+    if (id === "__proto__" || id === "constructor" || id === "prototype") continue;
+    if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+    // `at` ages entries out and must be a finite number; `error` is what the UI
+    // shows, so an empty or non-string one becomes the same default the ingest
+    // uses rather than being dropped — the refusal itself is still the answer.
+    if (typeof e.at !== "number" || !Number.isFinite(e.at)) continue;
+    // The bound is a LITERAL, not `SPAWN_FAILURE_ERROR_MAX`, for the same reason
+    // normalizeSubscription's are: that const is declared far below the
+    // state.json restore that calls this, so closing over it would be a TDZ
+    // ReferenceError landing in the restore's own `catch {}` — booting the hub
+    // with an empty registry, its one `state restore skipped:` line the only
+    // sign anything went wrong. Keep the two in step by hand; they are both 500.
+    const error = typeof e.error === "string" && e.error
+      ? e.error.slice(0, 500)
+      : "the agent refused it";
+    out[id] = { error, at: e.at };
+  }
+  // The ingest bounds this map two ways — an age sweep and SPAWN_FAILURE_MAX —
+  // and the restore has to apply the count bound too, or the one path this
+  // coercion exists for is the one that leaves it unbounded: a state.json map is
+  // served on every /api/agents until that host next beats, and a host that
+  // never beats again serves it forever. Oldest-first, like the ingest's own
+  // eviction. A literal for the TDZ reason above; it mirrors SPAWN_FAILURE_MAX.
+  const ids = Object.keys(out);
+  if (ids.length > 40) {
+    ids.sort((x, y) => out[x].at - out[y].at)
+      .slice(0, ids.length - 40)
+      .forEach((id) => delete out[id]);
+  }
+  a.spawnRefusals = out;
+}
+
 function normalizeRecord(a) {
   // Order is NOT load-bearing, and must not become so: each of these guards its
   // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
@@ -2852,6 +3182,7 @@ function normalizeRecord(a) {
   normalizeLimits(a);
   normalizeSubscription(a);
   normalizeLocalModel(a);
+  normalizeSpawnRefusals(a);
 }
 
 /**
@@ -4783,17 +5114,56 @@ function dropAutoQueuedTickets(siteKey) {
 // Jira user can see look like a ticket that no longer exists — dispatch-blocked
 // while it "waited", then aged out and deleted. Freshest-wins is only the
 // tie-break for a key two hosts BOTH report.
+// One org's rows out of `fleetTicketRows()`.
+function ticketRowsForSite(rows, siteKey) {
+  return [...rows.values()].filter((r) => r && r.siteKey === siteKey);
+}
+
+// The fleet's ticket rows, resolved the way the BOARD resolves them. This is a
+// port of `board.js::mergeSites`, and it is the hub's only ticket-row view —
+// everything that acts "on what the board shows" reads it rather than walking
+// `agents` itself.
+//
+// TWO stages, and getting either alone wrong has shipped a user-visible bug:
+//
+//  1. GROUP by (siteKey, user) and keep that group's best block. A host polls as
+//     `assignee = currentUser()`, so an org whose hosts authenticate as different
+//     Jira users legitimately reports different ticket lists. Collapsing an org to
+//     ONE block dropped every ticket belonging to the other user — they sat on the
+//     board in To Do and were never started, and a Done only the other user could
+//     see never stopped its session.
+//  2. UNION those winners, one row per ticket key. Unioning across raw HOSTS
+//     instead — skipping the grouping — resurrects the losing block of a
+//     same-user pair, so a ticket an offline host still lists but the board has
+//     dropped comes back to life and gets auto-started.
+//
+// Within a group, and between two groups reporting one key, `blockOutranks`
+// decides: online first, then freshest. Between two copies of a key the newer
+// `updated` wins outright, block rank only breaking that tie — which is
+// `mergeSites`' rule, and matters because the two hosts' copies of a ticket
+// normally carry an IDENTICAL `updated` (it is the tracker's own field).
 function fleetTicketRows() {
-  const rows = new Map();   // key -> {row, at}
+  const now = Date.now();
+  const byUser = new Map();   // siteKey \x00 user -> winning block
   for (const a of Object.values(agents)) {
     const j = a && a.jira;
     if (!j || !j.siteKey) continue;
-    const at = String(j.fetchedAt || "");
-    for (const t of j.tickets || []) {
+    const cand = { block: j, siteKey: j.siteKey, online: agentBlockOnline(a, now),
+                   at: String(j.fetchedAt || "") };
+    const k = j.siteKey + "\x00" + (j.user || "");
+    if (blockOutranks(cand, byUser.get(k))) byUser.set(k, cand);
+  }
+  const rows = new Map();     // ticketQueueKey -> {row, siteKey, key, online, at}
+  for (const w of [...byUser.values()].sort(compareBlocks)) {
+    for (const t of w.block.tickets || []) {
       if (!t || !t.key) continue;
-      const k = ticketQueueKey(j.siteKey, t.key);
+      const k = ticketQueueKey(w.siteKey, t.key);
       const cur = rows.get(k);
-      if (!cur || at > cur.at) rows.set(k, { row: t, at });
+      // Best-ranked group first, so first-wins IS block rank; a strictly newer
+      // `updated` still overrides it.
+      if (cur && String(t.updated || "") <= String(cur.row.updated || "")) continue;
+      rows.set(k, { row: t, siteKey: w.siteKey, key: t.key,
+                    online: w.online, at: w.at });
     }
   }
   return rows;
@@ -4910,7 +5280,7 @@ function drainTicketQueue() {
       // into progress is being handled and shouldn't gain a session behind them.
       if (cat && cat !== "todo") { drop("its ticket left To Do"); continue; }
     }
-    const repo = ticketRepo(e.siteKey, e.issueKey);
+    const repo = ticketRepo(e.siteKey, e.issueKey, rows);
     if (!repo) {
       // An AUTO entry leaves at once: the sweep only ever queues a ticket that
       // HAS a repo, so it cannot re-queue this one until the triage comes back —
@@ -4983,20 +5353,15 @@ function autoStartSweep() {
   if (!orgs.size) return;
   const now = Date.now();
   const started = startedTicketKeys();
+  const rows = fleetTicketRows();
   for (const siteKey of orgs) {
-    // The freshest reporting block owns the ticket list and its repo guesses, the
-    // same copy ticketRepo/mergeSites resolve against — so the hub auto-starts on
-    // what the board would show, not a lagging host's older view.
-    let block = null, bestAt = "";
-    for (const a of Object.values(agents)) {
-      if (!a.jira || a.jira.siteKey !== siteKey) continue;
-      const at = String(a.jira.fetchedAt || "");
-      if (!block || at > bestAt) { block = a.jira; bestAt = at; }
-    }
-    for (const t of (block && block.tickets) || []) {
+    // The board's own view of this org's tickets — see `fleetTicketRows`. Never
+    // walk `agents` for a ticket list here: this sweep STARTS work, so acting on
+    // a copy the operator was not shown is a session nobody asked for.
+    for (const { row: t } of ticketRowsForSite(rows, siteKey)) {
       if (!t || !t.key) continue;
       if (t.statusCategory !== "todo") continue;      // only "To Do" tickets
-      const repo = ticketRepo(siteKey, t.key);         // a repo must be assigned
+      const repo = ticketRepo(siteKey, t.key, rows);   // a repo must be assigned
       if (!repo) continue;
       const k = siteKey + "\x00" + t.key;
       // A session exists on some channel — the work is under way (or was, and
@@ -5087,22 +5452,20 @@ const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
 
 function autoStopSweep() {
   // The set of now-Done tickets across EVERY reporting org — no opt-in gate —
-  // each taken from that org's freshest block, the same copy the board renders,
-  // so the hub stops on what the board shows, not a lagging host's view.
-  const freshest = new Map(); // siteKey -> { block, at }
-  for (const a of Object.values(agents)) {
-    const j = a && a.jira;
-    if (!j || !j.siteKey) continue;
-    const at = String(j.fetchedAt || "");
-    const cur = freshest.get(j.siteKey);
-    if (!cur || at > cur.at) freshest.set(j.siteKey, { block: j, at });
-  }
+  // read off `fleetTicketRows()`, the same union-and-rank the board renders, so
+  // the hub stops on what the board shows rather than on one host's view.
+  //
+  // This sweep KILLS, so both halves of that agreement are load-bearing and each
+  // has already broken once. Ranked on freshness alone it ended a live session
+  // over a Done only an OFFLINE host reported, while the card still showed the
+  // ticket in To Do. Grouped one-block-per-ORG it did the opposite, missing a
+  // Done the board plainly displayed whenever an org's hosts poll as different
+  // Jira users. Withholding a stop is the better failure of the two, but neither
+  // is correct.
   const doneKeys = new Set(); // "<siteKey>\x00<issueKey>"
-  for (const { block } of freshest.values()) {
-    for (const t of block.tickets || []) {
-      if (t && t.key && t.statusCategory === "done") {
-        doneKeys.add(block.siteKey + "\x00" + t.key);
-      }
+  for (const { row: t, siteKey } of fleetTicketRows().values()) {
+    if (t && t.key && t.statusCategory === "done") {
+      doneKeys.add(ticketQueueKey(siteKey, t.key));
     }
   }
   if (!doneKeys.size) return;
@@ -8264,6 +8627,7 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
     // because a source-regex over the restore loop proves the CALL exists, not

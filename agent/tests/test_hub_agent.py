@@ -568,6 +568,42 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
     def test_missing_project_dir_returns_none(self):
         self.assertIsNone(ha.usage_report("/does/not/exist"))
 
+    def test_unusable_token_figures_count_as_zero(self):
+        """XERK-306: whatever the transcript says travels untouched to the hub,
+        the web UI and a Kotlin `Long` on Android, where a float or an
+        out-of-range figure fails the decode of the WHOLE /api/agents array and
+        empties every OTHER host from that phone's fleet list. A string is worse
+        still here — it raised out of the beat's own aggregation on the first
+        `+=`, costing this host its entire usage report. Each unusable figure
+        counts as 0 — a FRACTIONAL one is truncated rather than discarded, since
+        the count is real and only its type is wrong — and the rest of the
+        entry, and every other entry, still count."""
+        write_jsonl(os.path.join(self.proj, "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1", "sonnet",
+                        1.5, "9", cw=-5, cr=10 ** 400),
+            usage_entry("2026-07-01T11:00:00.000Z", "m2", "r2", "sonnet",
+                        100, 200, cw=300, cr=400),
+            usage_entry("2026-07-01T12:00:00.000Z", "m3", "r3", "sonnet",
+                        True, None, cw=float("nan"), cr=2.0),
+        ])
+        rep = ha.usage_report(self.WORKDIR)
+        # A bool is not a count (isinstance(True, int) is True, so it would
+        # otherwise fold in as 1); a whole-valued float is one, truncated.
+        self.assertEqual(rep["totals"],
+                         {"input": 101, "output": 200, "cacheWrite": 300, "cacheRead": 402})
+        self.assertEqual(rep["days"]["2026-07-01"], rep["totals"])
+        for bucket in (rep["totals"], rep["models"][0]["totals"]):
+            for k, v in bucket.items():
+                self.assertIsInstance(v, int, k)
+                self.assertNotIsInstance(v, bool, k)
+
+    def test_token_count_accepts_only_plausible_figures(self):
+        for v in (0, 5, 2 ** 53 - 1, 2.0, 1.5):
+            self.assertEqual(ha._token_count(v), int(v), v)
+        for v in (-1, -0.5, True, False, None, "9", [], {},
+                  2 ** 53, 10 ** 400, float("nan"), float("inf")):
+            self.assertEqual(ha._token_count(v), 0, v)
+
     def test_aggregation_dedup_and_model_tokens(self):
         today = ha._utc_today()
         opus = usage_entry(
@@ -17178,6 +17214,62 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         cmd = self._launches()[-1][-1]
         self.assertIn("Work Azure DevOps work item #1234", cmd)
         self.assertIn("Name the branch you create for it exactly: Proj-1234", cmd)
+
+    # --- refusals are REPORTED, not just logged (XERK-325 / XERK-265) --------
+
+    def test_an_untriaged_ticket_is_reported_to_the_hub_not_only_logged(self):
+        """The bug this class of refusal caused: the command is ACKed either way,
+        so a refusal that only log()s is indistinguishable from a slow spawn — the
+        board's start button spun out its follow window and then cleared, exactly
+        as it does for a spawn that WORKED, and the operator clicked again."""
+        sm = self.make_ticket_manager(decided=False)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c1")
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c1"])
+        # Operator-facing: it has to say WHY, since it is the whole answer for a
+        # click that did nothing.
+        self.assertIn("no triaged repo", sm.spawn_failures[0]["error"])
+
+    def test_a_decided_but_repo_less_verdict_refuses_the_same_way(self):
+        """_apply_triage publishes a declined ticket as repoGuess.repo = None, and
+        the entry stays that way (_triage_stale never re-triages a decided one).
+        That is the PERMANENT half of the divergence, so it must report too."""
+        sm = self.make_ticket_manager(decided=False)
+        sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")] = {
+            "decided": True, "repo": None, "cloned": False, "reason": ""}
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c2")
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c2"])
+
+    def test_a_bad_key_reports_without_spending_a_board_fetch(self):
+        fetched = []
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: fetched.append(k)):
+            sm.spawn_ticket("not a key", cmd_id="c3")
+        self.assertEqual(fetched, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c3"])
+
+    def test_an_uncloneable_repo_reports_which_repo_and_why(self):
+        """Not cloned here AND no owner recorded to clone it from — the one
+        clone-path refusal that is terminal rather than queued behind a clone."""
+        sm = self.make_ticket_manager(repo="Elsewhere")
+        sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")]["nameWithOwner"] = None
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c4")
+        self.assertEqual(sm.registry, [])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["c4"])
+        self.assertIn("Elsewhere", sm.spawn_failures[0]["error"])
+
+    def test_a_refusal_with_no_cmd_id_stays_a_log_line(self):
+        """The cmdId IS the correlation, so a refusal with nothing to report
+        against is logged only — the auto-start sweep's own path, and the rule
+        _refuse_start already applies to every other caller."""
+        sm = self.make_ticket_manager(decided=False)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.spawn_failures, [])
 
 
 class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):

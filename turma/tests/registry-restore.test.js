@@ -192,7 +192,12 @@ test("every field the restore coerces is reachable from the restore's own line",
     solo: {
       key: "solo", device: "solo", lastSeen: Date.now(), repos: [],
       sessions: [{ id: "s1", usage: { models: [{ model: "m", totals: {} }] } }],
-      usage: { models: [{ model: "m", totals: {} }] },
+      usage: {
+        totals: { input: 5 }, days: { "2026-08-01": { input: 5 } },
+        lastActivity: "2026-08-01T00:00:00Z",
+        models: [{ model: "m", totals: {} }],
+      },
+      repoUsage: [{ repo: "Turma", usage: { totals: { input: 5 } } }],
       limits: { fiveHour: { usedPct: 12 }, sevenDay: { usedPct: 30, resetsAt: 1_786_950_000 },
                 capturedAt: 1_786_400_000, source: "statusline" },
       subscription: { key: "abc123", source: "login" },
@@ -201,7 +206,14 @@ test("every field the restore coerces is reachable from the restore's own line",
     junk: {
       key: "junk", device: "junk", lastSeen: Date.now(), repos: [],
       sessions: [{ id: "s2", usage: { models: "nope" } }],
-      usage: { models: [{ model: 7 }] },
+      // Every branch of the token-figure walk (XERK-306), including the one
+      // that LOGS: its throttle state is a module binding too, so a record that
+      // only ever coerces silently would not prove it is reachable.
+      usage: {
+        totals: { input: 1.5 }, days: { "2026-08-01": "nope" }, lastActivity: 5,
+        models: [{ model: 7 }],
+      },
+      repoUsage: [null, { repo: 5, usage: 3 }],
       limits: { fiveHour: { usedPct: "lots" }, capturedAt: "soon" },
       subscription: { key: 7, source: 9 },
       localModel: { available: "yes", contextTokens: "many" },
@@ -216,6 +228,8 @@ test("every field the restore coerces is reachable from the restore's own line",
       sub: hub.agents.solo && hub.agents.solo.subscription,
       junkSub: hub.agents.junk && hub.agents.junk.subscription,
       junkLimits: hub.agents.junk && hub.agents.junk.limits,
+      junkUsage: hub.agents.junk && hub.agents.junk.usage,
+      junkRepoUsage: hub.agents.junk && hub.agents.junk.repoUsage,
     }) + ">>");
   `;
   const r = require("child_process").spawnSync(process.execPath, ["-e", probe], {
@@ -230,4 +244,8 @@ test("every field the restore coerces is reachable from the restore's own line",
   // And the unusable half really did go through the coercions' other branch.
   assert.equal(out.junkSub, null);
   assert.equal(out.junkLimits, null);
+  // The float zeroed, the unusable day and the non-string lastActivity gone,
+  // the nameless model dropped — and `days` kept as the empty map it became.
+  assert.deepEqual(out.junkUsage, { totals: { input: 0 }, days: {}, models: [] });
+  assert.deepEqual(out.junkRepoUsage, [{}]);
 });

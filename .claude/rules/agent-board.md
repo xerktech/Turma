@@ -185,6 +185,19 @@ lives in `hub-agent.py`; the hub/UI half is `.claude/rules/turma-board.md`.
 - `{type:"spawnTicket", issueKey}` → `spawn_ticket()`. **The hub only ROUTES**, sending just the
   issue key; everything else is re-derived from LOCAL state — the repo from this host's triage
   ledger (still in `scan_repos()`), the ticket from a fresh fetch.
+- **The triage ledger is per-HOST, so it is a routing input, not just a lookup** (XERK-325). The
+  hub filters its pool by each host's published `repoGuess` before choosing (`hostTriagedTicket` in
+  `findTicketHost`), which is this same accept condition — decided, with a repo, matching the repo
+  the board showed. Reaching a refusal here therefore means the two disagreed, which is ordinary
+  timing rather than operator error: a new ticket is untriaged for the minutes its batch takes.
+  - **`_apply_triage`'s three published states are that contract**, so a change to which of them
+    carries a `repoGuess` silently changes fleet routing. No entry or an undecided one publishes
+    none; a "nothing fits" verdict publishes `repo: null`; only a decided repo is dispatchable.
+- **Every refusal in `spawn_ticket` goes through `_refuse_start`, never a bare `log()`** — the
+  command is ACKed either way, so one that only logs is indistinguishable from a slow spawn and the
+  board's start button spins out its follow window and then clears exactly as it does for a spawn
+  that worked. That is XERK-265's failure class; re-introducing a `log()`-only refusal on this path
+  re-opens it. Tests: the refusal cases in `TestSpawnTicket`.
 - The fetched ticket becomes the **initial prompt** (`build_ticket_prompt`: fields, description, the
   newest `TICKET_PROMPT_COMMENTS` comments, its attachments) — the session has no board creds of its
   own, so that text is all it sees, which the prompt says.

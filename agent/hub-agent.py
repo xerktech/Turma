@@ -1909,6 +1909,40 @@ def _usage_bucket():
     return {k: 0 for k in TOKEN_KEYS}
 
 
+# The largest token figure that survives the whole chain: JavaScript's
+# Number.MAX_SAFE_INTEGER, which is also what the hub's coercion accepts and
+# what a Kotlin `Long` decodes. A real per-message count is six digits.
+TOKEN_MAX = 2 ** 53 - 1
+
+
+def _token_count(v):
+    """One token figure off a transcript's usage block, as a non-negative int.
+
+    Whatever the transcript says travels untouched to the hub, the web UI and a
+    Kotlin `Long` on Android, where a float or an out-of-range value fails the
+    decode of the WHOLE /api/agents array and empties every OTHER host from that
+    phone's fleet list (XERK-306). The hub coerces at its own boundary because
+    it must survive any agent; this stops it at the source, and keeps THIS
+    host's own arithmetic sane — a float would poison every total it is folded
+    into, and a string raises straight out of the beat on the first `+=`.
+
+    Anything unusable counts as 0 rather than aborting the parse: one odd entry
+    must not cost a host its entire usage report. A FRACTIONAL figure is
+    truncated instead — the count is real and only its type is wrong, and the
+    hub cannot make that distinction from the wire, which is why its own
+    coercion zeroes what reaches it. A bool is not a count (`isinstance(True,
+    int)` is True, so it would otherwise fold in as 1)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    # isfinite BEFORE the comparisons: NaN compares False against both bounds,
+    # and math.isfinite of a huge int raises rather than answering.
+    if isinstance(v, float) and not math.isfinite(v):
+        return 0
+    if v < 0 or v > TOKEN_MAX:
+        return 0
+    return int(v)
+
+
 def _add_tokens(bucket, tok):
     """Fold one message's (input, output, cacheWrite, cacheRead) into `bucket`."""
     for k, n in zip(TOKEN_KEYS, tok):
@@ -1981,12 +2015,12 @@ def _accumulate_usage(lines, acc, subagent=False):
             acc.last_ts = ts
         model = msg.get("model") or "unknown"
 
-        tok = (
-            usage.get("input_tokens", 0) or 0,
-            usage.get("output_tokens", 0) or 0,
-            usage.get("cache_creation_input_tokens", 0) or 0,
-            usage.get("cache_read_input_tokens", 0) or 0,
-        )
+        tok = tuple(_token_count(usage.get(k)) for k in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ))
         # Transcript timestamps are UTC ISO; date-prefix bucketing is close
         # enough for a dashboard.
         day = ts[:10] if len(ts) >= 10 else ""
@@ -11087,25 +11121,36 @@ class SessionManager:
 
         The repo NOT being cloned here is no longer a refusal: this host was
         chosen precisely because it could clone it, so we start the clone and
-        queue the session behind it (see spawn's await_clone). Refusals that
-        remain log and return — a bad key, no creds, no triaged repo, or a repo
-        with no known owner to clone — each one the board's button already
-        prevents. A fetch that fails raises to handle_commands, which logs and
-        acks."""
+        queue the session behind it (see spawn's await_clone). The refusals that
+        remain — a bad key, no creds, no triaged repo, or a repo with no known
+        owner to clone — all go through `_refuse_start` (XERK-265): the command is
+        ACKed either way, so one that only logged was indistinguishable from a
+        slow spawn and left the board's button spinning out its follow window with
+        nothing to show. A fetch that fails raises to handle_commands, which logs
+        and acks."""
+        def refuse(reason):
+            self._refuse_start(reason, cmd_id=cmd_id, context="spawnTicket")
+
         key = (issue_key or "").strip()
         if not valid_issue_key(key):
-            log(f"spawnTicket refused: {key[:50]!r} is not a valid issue key")
+            refuse(f"{key[:50]!r} is not a valid issue key")
             return
         # Re-checked here (the hub already targets a host reporting this org) to
         # keep "unset creds = zero board HTTP, ever" a property of the agent rather
         # than of hub-side targeting — same stance as refreshJira.
         if not board_configured():
-            log(f"spawnTicket refused: no board credentials on this host ({key})")
+            refuse(f"no board credentials on this host ({key})")
             return
         site_key = board_site_key()
         entry = self.triage_ledger.get(_triage_key(site_key, key))
         if not isinstance(entry, dict) or not entry.get("decided") or not entry.get("repo"):
-            log(f"spawnTicket refused: {key} has no triaged repo on this host")
+            # The hub now filters the pool by each host's own published repoGuess
+            # (findTicketHost's hostTriagedTicket), which is this same condition,
+            # so reaching here means the two disagreed — a triage that landed or
+            # moved between the beat the hub routed from and this command. Worth
+            # reporting rather than logging: it is the operator's whole answer for
+            # why the click did nothing.
+            refuse(f"{key} has no triaged repo on this host")
             return
         repo_name = entry["repo"]
         # The ledger's `cloned` is as of triage time; scan_repos() is now.
@@ -11121,8 +11166,8 @@ class SessionManager:
             # clone, so refuse before spending a Jira fetch.
             nwo = entry.get("nameWithOwner")
             if not nwo:
-                log(f"spawnTicket refused: {key}'s repo {repo_name!r} is not "
-                    "cloned here and no owner is known to clone it")
+                refuse(f"{key}'s repo {repo_name!r} is not cloned here and no "
+                       "owner is known to clone it")
                 return
             job = self.clones.get(repo_name)
             if not job or job.get("status") == "error":
