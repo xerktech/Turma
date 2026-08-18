@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import { HubClient, REFUSAL_BODY_TIMEOUT_MS } from "./hub-client.ts";
+import { HubClient, BODY_TIMEOUT_MS, REFUSAL_BODY_TIMEOUT_MS } from "./hub-client.ts";
 import { fakeTimers } from "../test-utils/fake-timers.ts";
 import type { Config } from "./config.ts";
 
@@ -222,6 +222,51 @@ describe("HubClient", () => {
     } finally {
       fakeTimers.useRealTimers();
     }
+  });
+
+  // The SUCCESS body stalls the same way and is the likelier route — listAgents
+  // runs every poll. Bounding only the refusal read left the freeze intact one
+  // route over, which is the whole point of the guard.
+  it("gives up on a 200 whose body never arrives, not just a refusal's", async () => {
+    fakeTimers.useFakeTimers();
+    try {
+      const stalled = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: () => new Promise(() => {}),
+      })) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: stalled });
+
+      const pending = client.listAgents();
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await fakeTimers.advanceTimersByTimeAsync(BODY_TIMEOUT_MS - 1);
+      expect(settled).not.toHaveBeenCalled();
+
+      await fakeTimers.advanceTimersByTimeAsync(2);
+      await expect(pending).rejects.toThrow(/timed out/);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+  });
+
+  // The hub's text reaches render.ts's wrapText, which is quadratic in an
+  // unbroken word — a megabyte refusal would stall the render loop for seconds.
+  it("clamps a huge refusal so it can't stall the renderer", async () => {
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: "x".repeat(200_000) }, 413) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({
+      status: 413,
+      message: `${"x".repeat(300)}…`,
+    });
+  });
+
+  it("leaves a refusal that already fits completely alone", async () => {
+    const said = "the target agent is in a different org";
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: said }, 409) });
+
+    await expect(client.listAgents()).rejects.toMatchObject({ status: 409, message: said });
   });
 
   it("reads the hub's words on getHistory and jiraDetail too, not just request()", async () => {

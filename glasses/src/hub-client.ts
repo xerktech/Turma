@@ -43,8 +43,22 @@ export class HttpError extends Error {
 // so the same refusal reads the same on all three.
 export function refusalText(status: number, body: unknown): string {
   const said = (body as { error?: unknown } | null)?.error;
-  const words = typeof said === "string" ? said.trim() : "";
+  const words = typeof said === "string" ? clamp(said.trim()) : "";
   return words || `the hub answered HTTP ${status}`;
+}
+
+// A refusal is a sentence for a 10-line display, so it is clamped HERE, at the
+// point the hub's text becomes ours, rather than at each surface that shows it.
+//
+// This text now reaches `render.ts`'s `wrapText`, which is quadratic in an
+// unbroken word: 50k chars measured at 263ms and 200k at 4s, i.e. a hub or an
+// edge that answers a refusal with a megabyte of text would stall the render
+// loop rather than the socket. The clamp also bounds the session screen, where
+// the same string wraps in full.
+const REFUSAL_TEXT_MAX = 300;
+
+function clamp(words: string): string {
+  return words.length <= REFUSAL_TEXT_MAX ? words : `${words.slice(0, REFUSAL_TEXT_MAX)}…`;
 }
 
 // How long the refusal path waits for the error body itself.
@@ -59,6 +73,15 @@ export function refusalText(status: number, body: unknown): string {
 // stall. When it does the wearer gets the bare status instead of the hub's
 // words: a worse message, but a far better outcome than a frozen display.
 export const REFUSAL_BODY_TIMEOUT_MS = 5_000;
+
+// The same ceiling for a SUCCESS body, which stalls exactly the same way and is
+// the likelier route: `listAgents` runs every poll, and a 200 whose body never
+// arrives froze the display just as dead as a refused one.
+//
+// Generous rather than sharp, because unlike a refusal a success body can be
+// genuinely large (a session's history) on a genuinely slow link — this is the
+// "the socket is gone" ceiling, not a latency budget.
+export const BODY_TIMEOUT_MS = 30_000;
 
 /** Settle `work` or give up after `ms`, so one stalled read can't hang a caller. */
 function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
@@ -75,16 +98,25 @@ function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// EVERY body read in this file goes through here. `timeoutFetch` bounds the
+// RESPONSE and cannot reach the body that follows it, so an unwrapped
+// `res.json()` is an unbounded await on a live socket — and since App.poll()
+// re-arms only in its `finally`, one such await freezes the glasses on stale
+// content permanently. On a polyfilled Response `json` may not even be a
+// function, so the call itself is inside the promise chain to catch a
+// SYNCHRONOUS throw as well as a rejection.
+function readJson<T = unknown>(res: Response, ms: number): Promise<T> {
+  return withDeadline(Promise.resolve().then(() => res.json() as Promise<T>), ms);
+}
+
 /** The same reading for a response whose body hasn't been consumed yet. */
 export async function refusal(res: Response): Promise<HttpError> {
   // The body may be empty, HTML from an edge, unreadable on a torn socket, or
-  // never arrive at all — and on a polyfilled Response `json` may not even be a
-  // function. Every one of those means "the hub sent no words", never a failure
-  // of its own, so this has to cover a SYNCHRONOUS throw, a rejection, and a
-  // read that simply never settles.
+  // never arrive at all. Every one of those means "the hub sent no words",
+  // never a failure of its own, so none of them may escape as a throw.
   let body: unknown = {};
   try {
-    body = await withDeadline(res.json(), REFUSAL_BODY_TIMEOUT_MS);
+    body = await readJson(res, REFUSAL_BODY_TIMEOUT_MS);
   } catch {
     body = {};
   }
@@ -192,7 +224,7 @@ export class HubClient {
       headers: { ...this.headers(), ...(init.headers as Record<string, string> | undefined) },
     });
     if (!res.ok) throw await refusal(res);
-    return (await res.json()) as T;
+    return (await readJson(res, BODY_TIMEOUT_MS)) as T;
   }
 
   listAgents(): Promise<AgentsResponse> {
@@ -268,7 +300,7 @@ export class HubClient {
     const path = `/api/agents/${encodeURIComponent(host)}/sessions/${encodeURIComponent(id)}/history`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
     if (!res.ok) throw await refusal(res);
-    const body = await res.json();
+    const body = await readJson(res, BODY_TIMEOUT_MS);
     if (res.status === 202) return { status: 202, body: body as HistoryPending };
     return { status: 200, body: body as HistoryResponse };
   }
@@ -288,7 +320,7 @@ export class HubClient {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
     if (!res.ok) throw await refusal(res);
-    const body = await res.json();
+    const body = await readJson<Record<string, unknown> & { pending: true; cmdId: string }>(res, BODY_TIMEOUT_MS);
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
 
@@ -343,7 +375,7 @@ export class HubClient {
     const q = project ? `?project=${encodeURIComponent(project)}` : "";
     const path = `/api/jira/${encodeURIComponent(siteKey)}/create-meta${q}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    const body = await res.json().catch(() => ({}));
+    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS).catch(() => ({}) as Record<string, unknown>);
     if (!res.ok && res.status !== 202) throw new HttpError(res.status, refusalText(res.status, body));
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
@@ -360,7 +392,7 @@ export class HubClient {
   ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: Record<string, unknown> }> {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/tickets/${encodeURIComponent(cmdId)}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    const body = await res.json().catch(() => ({}));
+    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS).catch(() => ({}) as Record<string, unknown>);
     if (!res.ok && res.status !== 202) throw new HttpError(res.status, refusalText(res.status, body));
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
