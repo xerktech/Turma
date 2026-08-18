@@ -184,6 +184,13 @@ which makes an `android/` change part of the same PR) live there.
       does, and because the key is a MAP KEY on every client: anything unusable becomes null, never
       a plausible default that would fold two subscriptions into one set of bars. Its bounds are
       **literals, not module `const`s** — see the restore-TDZ rule below.
+  - **`normalizeSpawnRefusals` coerces the served refusal map** (XERK-325) because Android TYPES it,
+    and it is the first typed-and-served record field that is deliberately NOT stripped from the
+    payload. The heartbeat path cannot produce a bad one (`ingestSpawnFailures` is the only writer);
+    the `state.json` restore can, and it is served before any host re-beats. It keeps the ingest
+    path's PLAIN object shape — a null-prototype one would make a restored record differ from a
+    beaten one — so the explicit `__proto__`/`constructor`/`prototype` key filter is what stops
+    `out[id]`'s [[Set]] hitting the prototype setter, not the object's prototype.
   - **Anything a `normalize*` closes over must be reachable from `loadState`'s line.** That loop
     sits near the top of `server.js` and reaches each one only because function declarations hoist;
     a module `const` declared below is in its TDZ there, the `ReferenceError` lands in the restore's

@@ -1295,11 +1295,13 @@
   //
   // `p` is {cmdId, host, sawCmd, ageMs}; `sessions` are the ticket's sessions,
   // `cmd` whether the host's queue still holds this cmdId right now, `known`
-  // whether the host is in the fleet payload at all.
-  //   - "hold"  keep showing ⏳ (also mutates p.sawCmd once the command appears)
-  //   - "clear" drop it: a session reported this cmdId (landed), or the command
-  //             we WATCHED land has since drained (the agent ran or refused it)
-  //   - "error" the backstop for a host that stopped beating mid-spawn
+  // whether the host is in the fleet payload at all, `refusal` this cmdId's entry
+  // in the host's `spawnRefusals` (XERK-265), if the agent declined it.
+  //   - "hold"    keep showing ⏳ (also mutates p.sawCmd once the command appears)
+  //   - "clear"   drop it: a session reported this cmdId (landed), or the command
+  //               we WATCHED land has since drained with nothing else to say
+  //   - "refused" the agent declined it and said why — the caller shows the reason
+  //   - "error"   the backstop for a host that stopped beating mid-spawn
   //
   // The load-bearing subtlety is `sawCmd`: "command absent" only means "acked"
   // once we've actually seen it PRESENT. A cache too stale to have seen it land
@@ -1307,9 +1309,18 @@
   // too, and treating that as acked sweeps the pending the instant it's set —
   // the bug where the ⏳ never appeared at all. A cmdId-less pending (POST not
   // back yet) always holds; its own fetch resolves it.
-  function startSweepVerdict(p, sessions, cmd, known, timeoutMs) {
+  //
+  // `refusal` is checked AFTER the landed-session test, so a spawn that actually
+  // came up always wins the tie — the same ordering the hub applies on the
+  // migration side and sessions.html applies on its own follow. It is checked
+  // BEFORE the sawCmd/timeout heuristics because those only ever guess at what a
+  // drained command meant, and this is the agent saying it outright: without it a
+  // refused ticket start cleared silently, which is indistinguishable from the
+  // session having started and is what left the operator clicking Start again.
+  function startSweepVerdict(p, sessions, cmd, known, timeoutMs, refusal) {
     if (!p || !p.cmdId) return "hold";
     if ((sessions || []).some(s => s.spawnCmdId === p.cmdId)) return "clear";
+    if (refusal) return "refused";
     if (!known) return (p.ageMs > timeoutMs) ? "error" : "hold";  // host gone: only time out
     if (cmd) { p.sawCmd = true; return "hold"; }                  // command still queued
     if (p.sawCmd) return "clear";                                 // watched it land, now drained

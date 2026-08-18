@@ -155,10 +155,27 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
     host that answered a different repo would spawn against THAT one, giving the operator a session
     on a repo the card never showed. Candidate sets differ per host (cloned repos + that host's `gh`
     reach), so hosts legitimately disagree.
+  - **`ticketRepo` ranks an ONLINE host's answer above any offline one**, freshness deciding only
+    within a tier. It and `findTicketHost` must resolve against the SAME pool: every caller is a
+    routing decision and routing reaches only online hosts, so an offline host winning on freshness
+    names a repo nothing can be dispatched against and stalls a ticket an online host had triaged
+    and could run. Hosts poll the tracker independently (~10 min apart here), so an offline host
+    holding the newest block is ordinary. The offline tier stays as the fallback, or a wholly-offline
+    org resolves no repo at all and the sweep drops the ticket instead of holding it.
   - **It is a `blocked` hold, never `full`.** A freed slot does not give a host a triage decision,
     so reporting it as capacity promises a wait that clears itself; the blocked timer bounds it and
-    the reason says what is actually wrong. A PIN to an untriaged host refuses for the same reason
-    — after its own capacity check, so the self-clearing verdict still wins a tie.
+    the reason says what is actually wrong.
+  - **`full` still means full — but of the hosts that AGREE**, and the wording says so. The pool is
+    the hosts that triaged this ticket to this repo, so reporting the ORG as full while a host that
+    answered a different repo sits idle sends the operator to look at capacity they do not have a
+    problem with. The triage filter runs BEFORE the capacity one precisely so the two refusals stay
+    distinguishable; filtering after it would collapse a full agreeing host into `blocked` and age
+    the ticket out instead of waiting for the slot it needs.
+  - **A PIN to an untriaged host is checked AFTER that host's capacity check**, and not because
+    either reason clears itself — neither does. `full` is what makes the POST queue the click rather
+    than lose it, and being untriaged is usually the minutes-long gap before a triage batch returns,
+    which a queued entry dispatches on its own; the permanent case ages out with the queue's visible
+    "gave up" note. Refusing there would throw away the click for the common transient case.
   - The common case is a RACE, not a permanent split: a new ticket is untriaged on a host for the
     minutes its batch takes, and the drainer re-checks every beat. The permanent case is a decided
     `repo: null` — `_triage_stale` never re-triages that — which is what makes the symptom look

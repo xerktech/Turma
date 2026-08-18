@@ -2005,6 +2005,9 @@ const SPAWN_FAILURE_MAX = 40;
 // the record past AGENT_RECORD_MAX, and then 413 every following beat from that
 // host, including the ones that would have swept it. The agent truncates too;
 // this is the boundary that makes a buggy or hostile one survivable (XERK-235).
+// Mirrored as a LITERAL in normalizeSpawnRefusals, which runs on the state.json
+// restore declared far above this line and so cannot close over this const
+// without a TDZ ReferenceError. Move one, move the other.
 const SPAWN_FAILURE_ERROR_MAX = 500;
 const SPAWN_FAILURE_CMDID_MAX = 200;
 
@@ -2403,14 +2406,31 @@ function rememberCreateInFlight(fields, cmdId, host) {
 // host reports the ticket, or none has triaged it yet, or the model declined it.
 // The FRESHEST reporting block wins, matching how board.js merges the same
 // tickets for display — the hub must resolve against what the operator clicked.
+//
+// **An ONLINE host's answer outranks any offline one, however stale** (XERK-325).
+// Every caller is a ROUTING decision, and `findTicketHost` can only route to an
+// online host that agrees with this repo — so an offline host winning on
+// freshness names a repo nothing can be dispatched against, and a ticket an
+// online host had triaged and could run stalls as "no online host has triaged
+// that ticket". Hosts poll Jira independently (~10 min apart in this fleet), so
+// an offline host holding the newest block is ordinary, not an edge case.
+// Freshness still decides WITHIN each tier; the offline tier is the fallback that
+// keeps a wholly-offline org resolving a repo at all, which is what lets the
+// queue hold the ticket rather than drop it.
 function ticketRepo(siteKey, issueKey) {
-  let best = null, bestAt = "";
+  const now = Date.now();
+  let best = null, bestAt = "", bestOnline = false;
   for (const a of Object.values(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
     const t = (a.jira.tickets || []).find((x) => x && x.key === issueKey);
     if (!t || !t.repoGuess || !t.repoGuess.repo) continue;
+    const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
     const at = String(a.jira.fetchedAt || "");
-    if (!best || at > bestAt) { best = t.repoGuess.repo; bestAt = at; }
+    // Online beats offline outright; freshness only breaks ties inside a tier.
+    if (!best || (online && !bestOnline) ||
+        (online === bestOnline && at > bestAt)) {
+      best = t.repoGuess.repo; bestAt = at; bestOnline = online;
+    }
   }
   return best;
 }
@@ -2520,9 +2540,12 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
     anyOrg = true;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     anyOnline = true;
-    // Ahead of the capacity filter, so an untriaged host is never the reason the
-    // ticket is reported as "waiting for a slot" — the two hold for different
-    // lengths of time and only one of them clears itself.
+    // Ahead of the capacity filter so `anyTriaged` counts hosts that could run
+    // this ticket if they had room, which is what separates the two refusals
+    // below: "nothing can run it" (blocked — a freed slot would not help) from
+    // "what can run it is busy" (full — clears itself). Filtering after capacity
+    // would collapse a full agreeing host into the first, and the ticket would
+    // age out on the blocked timer instead of waiting for the slot it needs.
     if (issueKey && !hostTriagedTicket(a, issueKey, repo)) continue;
     anyTriaged = true;
     // A host with no room is out of the running entirely under requireFree —
@@ -2548,9 +2571,19 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       return { status: 503, full: true, error:
         `this ticket is pinned to agent "${pin.host}", which has no free session slot` };
     }
-    // The pin says WHICH host, never that the host can run it. Checked after the
-    // capacity refusal above so the self-clearing reason wins a tie, and reported
-    // rather than routed around, exactly like every other pin refusal.
+    // The pin says WHICH host, never that the host can run it — reported rather
+    // than routed around, exactly like every other pin refusal.
+    //
+    // Deliberately AFTER the capacity refusal, and not because either reason
+    // clears itself — neither does, and a pinned host that is full AND untriaged
+    // is reported as merely full until a slot frees. That is the better trade:
+    // `full` is what makes the POST QUEUE the click instead of losing it, and
+    // being untriaged is usually the minutes-long gap before a host's triage
+    // batch returns, which a queued entry then dispatches on its own. The
+    // permanent case (a decided `repo: null`) holds as blocked once capacity
+    // clears and ages out with the queue's visible "gave up" note, which is
+    // XERK-296's answer for exactly this. Refusing here instead would throw away
+    // the click for the common transient case.
     if (!hostTriagedTicket(a, issueKey, repo)) {
       return { status: 503, error:
         `this ticket is pinned to agent "${pin.host}", which has not triaged it to ${repo}` };
@@ -2569,8 +2602,15 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       `no online host has triaged that ticket to ${repo}` };
   }
   if (requireFree && !cloned.length && !uncloned.length) {
-    return { status: 503, full: true, error:
-      "every host reporting that Jira org has its session slots full" };
+    // The pool is the hosts that TRIAGED this ticket to `repo`, not the org's
+    // hosts, so say that — a free host that answered a different repo is not a
+    // slot this ticket can use, and reporting the org as full while one sits
+    // idle sends the operator to look at capacity they don't have a problem
+    // with. Still `full`: every host that could run it is genuinely full, so
+    // this is the reason that clears itself.
+    return { status: 503, full: true, error: issueKey
+      ? `every host that has triaged that ticket to ${repo} has its session slots full`
+      : "every host reporting that Jira org has its session slots full" };
   }
   const pool = cloned.length ? cloned : uncloned;
   const needsClone = cloned.length === 0;
@@ -2805,6 +2845,63 @@ function dropUnusableHostKeys(store) {
   return dropped;
 }
 
+/**
+ * Coerce the served `spawnRefusals` map (XERK-325). Android TYPES it as
+ * `Map<String, SpawnRefusal>` with a `String` error and a `Long` at, and a full
+ * `/api/agents` decode is atomic there — so one bad value fails the whole fleet
+ * array, not just its own host.
+ *
+ * The heartbeat path cannot produce one: `ingestSpawnFailures` is the only
+ * writer, it substitutes a default for a missing reason and slices the length,
+ * and an agent that puts `spawnRefusals` on its own beat is overwritten. The
+ * RESTORE path can — `state.json` is served before any host re-beats — and
+ * unlike every other on-demand cache this one is deliberately NOT stripped from
+ * the payload, which is what makes it the first typed-and-served record field
+ * needing this. So: defence in depth, and the rule that typing a field on a
+ * client and adding its hub-side coercion are the same change.
+ *
+ * Coerces to the "can't tell you" value every client already handles — an absent
+ * entry, never a plausible default — since a fabricated reason would end an
+ * operator's spawn wait with text no agent ever said.
+ */
+function normalizeSpawnRefusals(a) {
+  if (!a || typeof a !== "object") return;
+  const raw = a.spawnRefusals;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    if ("spawnRefusals" in a) a.spawnRefusals = {};
+    return;
+  }
+  // A PLAIN object, matching exactly what the ingest path builds — a
+  // null-prototype one here would make a restored record a different shape from
+  // a beaten one, which `deepStrictEqual` sees and clients need not.
+  const out = {};
+  for (const [id, e] of Object.entries(raw)) {
+    // So the key filter is what does the work, and it is not optional: `out[id]`
+    // uses [[Set]], so a `__proto__` key would invoke the prototype setter
+    // rather than store an entry — silently dropping the refusal AND re-pointing
+    // this map's prototype at agent-influenced data. JSON can express all three
+    // names and this input is a file we exist to distrust; a cmdId is hub-minted
+    // hex, so none of them can be real. Same names `ingestSpawnFailures` refuses.
+    if (id === "__proto__" || id === "constructor" || id === "prototype") continue;
+    if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+    // `at` ages entries out and must be a finite number; `error` is what the UI
+    // shows, so an empty or non-string one becomes the same default the ingest
+    // uses rather than being dropped — the refusal itself is still the answer.
+    if (typeof e.at !== "number" || !Number.isFinite(e.at)) continue;
+    // The bound is a LITERAL, not `SPAWN_FAILURE_ERROR_MAX`, for the same reason
+    // normalizeSubscription's are: that const is declared far below the
+    // state.json restore that calls this, so closing over it would be a TDZ
+    // ReferenceError landing in the restore's own `catch {}` — booting the hub
+    // with an empty registry and no error printed anywhere. Keep the two in
+    // step by hand; they are both 500.
+    const error = typeof e.error === "string" && e.error
+      ? e.error.slice(0, 500)
+      : "the agent refused it";
+    out[id] = { error, at: e.at };
+  }
+  a.spawnRefusals = out;
+}
+
 function normalizeRecord(a) {
   // Order is NOT load-bearing, and must not become so: each of these guards its
   // own input shape (`Array.isArray`, not `|| []`), because a throw anywhere in
@@ -2816,6 +2913,7 @@ function normalizeRecord(a) {
   normalizeLimits(a);
   normalizeSubscription(a);
   normalizeLocalModel(a);
+  normalizeSpawnRefusals(a);
 }
 
 /**
@@ -8050,6 +8148,7 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
     // because a source-regex over the restore loop proves the CALL exists, not

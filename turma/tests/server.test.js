@@ -5808,6 +5808,113 @@ test("XERK-325: an agent PIN to a host that hasn't triaged it is refused, not ro
     "the pin still forbids routing elsewhere");
 });
 
+test("XERK-325: an OFFLINE host's fresher triage never dictates the repo", async () => {
+  // ticketRepo and findTicketHost have to resolve against the SAME pool. The
+  // freshest block routinely belongs to a host that is down (hosts poll Jira
+  // ~10 min apart), and routing can only reach an online host that AGREES — so
+  // ranking on freshness alone named a repo nothing could be dispatched against
+  // and stalled a ticket an online host had triaged and could run.
+  resetAutoStart();
+  const site = "tq325g.atlassian.net";
+  await asBeat("tq325gDown", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:30:00Z",                                // freshest
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  agents.tq325gDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  await asBeat("tq325gUp", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",                                // staler
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.queued, undefined, "it starts — it does not stall as blocked");
+  assert.equal(r.body.repo, "Turma", "the online host's answer is the one routed on");
+  assert.deepEqual((agents.tq325gUp.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("XERK-325: a wholly OFFLINE org still resolves a repo, so the ticket can wait", async () => {
+  // The online tier is a preference, not a filter: with nothing online the
+  // offline answer still stands, so the queue holds the ticket instead of the
+  // sweep dropping it for having no triaged repo at all.
+  resetAutoStart();
+  const site = "tq325h.atlassian.net";
+  await asBeat("tq325hDown", site, { autoStart: false, capacity: ROOMY,
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  agents.tq325hDown.lastSeen = Date.now() - 10 * 60 * 1000;
+  const r = await startTicket(site, "ENG-5");
+  assert.equal(r.status, 503);
+  assert.match(r.body.error, /offline/,
+    "the refusal is about the org being down, not about triage");
+});
+
+test("XERK-325: 'slots full' names the hosts that can actually run it", async () => {
+  // The pool is the hosts that triaged this ticket to this repo, so reporting
+  // the ORG as full while a host with four free slots sits idle sends the
+  // operator to look at capacity they do not have a problem with.
+  resetAutoStart();
+  const site = "tq325i.atlassian.net";
+  await asBeat("tq325iAgreesFull", site, { autoStart: false, capacity: FULL,
+    fetchedAt: "2026-07-14T12:05:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Turma", cloned: true } }] });
+  await asBeat("tq325iDisagreesFree", site, { autoStart: false, capacity: ROOMY,
+    fetchedAt: "2026-07-14T12:00:00Z",
+    tickets: [{ key: "ENG-5", statusCategory: "todo",
+                repoGuess: { repo: "Veiller", cloned: true } }] });
+  const r = await startTicket(site, "ENG-5");
+  // Still a capacity wait — the one host that can run it really is full, and
+  // that reason clears itself — but worded truthfully.
+  assert.equal(r.body.queued, true);
+  const e = queuedTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.ok(e, "it waits on the agreeing host rather than being refused");
+  assert.deepEqual((agents.tq325iDisagreesFree.commands || []).map((c) => c.issueKey), []);
+  // And the wording says WHICH hosts are full.
+  const { error, full } = hub.findTicketHost(site, "Turma", "ENG-5", { requireFree: true });
+  assert.equal(full, true);
+  assert.match(error, /has triaged that ticket to Turma has its session slots full/);
+  ticketQueue.length = 0;
+});
+
+test("XERK-325: spawnRefusals is coerced, since Android types it", async () => {
+  // A full /api/agents decode is atomic on Android, so one bad entry from the
+  // state.json restore (served before any host re-beats, and NOT stripped from
+  // the payload like the other caches) would fail the whole fleet array.
+  // Driven through normalizeRecord, not the leaf: the wiring is the half that
+  // can go missing, and calling the coercion directly passes with it unhooked.
+  const bad = { device: "old", spawnRefusals: "not-a-map" };
+  hub.normalizeRecord(bad);
+  assert.deepEqual(bad.spawnRefusals, {});
+
+  const mixed = { device: "old", spawnRefusals: {
+    ok: { error: "no triaged repo", at: 123 },
+    numericError: { error: 12345, at: 5 },        // reason unusable, refusal real
+    badAt: { error: "x", at: "yesterday" },       // cannot be aged out — dropped
+    notAnObject: 7,
+  } };
+  hub.normalizeRecord(mixed);
+  assert.deepEqual(Object.keys(mixed.spawnRefusals).sort(), ["numericError", "ok"]);
+  assert.deepEqual(mixed.spawnRefusals.ok, { error: "no triaged repo", at: 123 });
+  // Coerced to the default the ingest uses, never to a fabricated reason.
+  assert.equal(mixed.spawnRefusals.numericError.error, "the agent refused it");
+  // A dangerous key name never becomes an entry, and never re-points the
+  // record's prototype — the keys come off a file this coercion exists to
+  // distrust, and JSON can express any of them.
+  const proto = { device: "old", spawnRefusals: JSON.parse(
+    '{"__proto__":{"error":"x","at":1},"constructor":{"error":"y","at":1},' +
+    '"c9":{"error":"real","at":2}}') };
+  hub.normalizeRecord(proto);
+  assert.deepEqual(Object.keys(proto.spawnRefusals), ["c9"]);
+  assert.equal(Object.getPrototypeOf(proto.spawnRefusals), Object.prototype,
+    "same shape as the ingest path builds, not a null-prototype special case");
+  assert.equal(typeof ({}).error, "undefined", "Object.prototype is untouched");
+  // The reason is length-capped here as well as at the ingest.
+  const long = { device: "old", spawnRefusals: { c: { error: "x".repeat(5000), at: 1 } } };
+  hub.normalizeRecord(long);
+  assert.equal(long.spawnRefusals.c.error.length, 500);
+});
+
 test("XERK-325: the drainer re-checks triage, so a decision landing later dispatches", async () => {
   // The common case is a race, not a permanent disagreement: a new ticket is
   // untriaged on a host for the few minutes its batch takes. The queue must pick
