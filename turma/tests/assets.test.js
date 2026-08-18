@@ -35,7 +35,7 @@ process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-assets-ar
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 
 const hub = require("../server.js");
-const { STATIC_ASSETS, ASSET_URLS, IMMUTABLE_CACHE, REVALIDATE_CACHE, HTML_CACHE } = hub;
+const { STATIC_ASSETS, ASSET_URLS, IMMUTABLE_CACHE, REVALIDATE_CACHE, HTML_CACHE, SUPERSEDED_CACHE } = hub;
 
 const PUBLIC = path.join(__dirname, "..", "public");
 const PAGES = ["/", "/usage", "/sessions", "/board", "/login"];
@@ -49,9 +49,9 @@ test.before(async () => {
 });
 test.after(() => hub.server.close());
 
-function request(pathName, headers = {}) {
+function request(pathName, headers = {}, method = "GET") {
   return new Promise((resolve, reject) => {
-    const req = http.request(baseUrl + pathName, { method: "GET", headers }, (res) => {
+    const req = http.request(baseUrl + pathName, { method, headers }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
       res.on("end", () => resolve({ status: res.statusCode, raw: data, headers: res.headers }));
@@ -185,7 +185,9 @@ test("assets: a superseded fingerprint serves the current body, never a 404", as
   // A 404 there is a fully unstyled page — the exact failure being fixed.
   const stale = await request("/app.000000000000.css");
   assert.equal(stale.status, 200);
-  assert.equal(stale.headers["cache-control"], REVALIDATE_CACHE, "a guessed URL must not cache hard");
+  // `private`: a caller can mint 2^48 of these, and a shared cache in front of
+  // the hub must not store an entry for each guess.
+  assert.equal(stale.headers["cache-control"], SUPERSEDED_CACHE);
   assert.equal(stale.raw, (await request(ASSET_URLS["/app.css"])).raw);
   assert.equal((await request("/nav.abcdef123456.js")).status, 200);
 });
@@ -206,4 +208,28 @@ test("assets: the fallback widens the allowlist by nothing", async () => {
   }
   assert.equal(hub.supersededAsset(ASSET_URLS["/app.css"]), null, "the current URL is not superseded");
   assert.equal(hub.supersededAsset("/constructor.000000000000.js"), null);
+});
+
+test("assets: HEAD is answered like GET, not by the auth gate", async () => {
+  // These are public — the login page renders before any cookie exists — but the
+  // allowlist matched GET only, so a CDN or uptime check HEADing the stylesheet
+  // got a 401 for a file it can freely GET.
+  for (const p of [ASSET_URLS["/app.css"], "/app.css", "/app.000000000000.css", "/favicon.svg"]) {
+    const head = await request(p, {}, "HEAD");
+    const get = await request(p);
+    assert.equal(head.status, 200, p);
+    assert.equal(head.raw, "", `${p} sent a body on a HEAD`);
+    assert.equal(head.headers["cache-control"], get.headers["cache-control"], p);
+    assert.equal(head.headers.etag, get.headers.etag, p);
+  }
+});
+
+test("assets: the login page is served, and links hashed URLs, without an ETag", async () => {
+  // It is `no-store` on purpose, so it has no conditional-GET path — and must
+  // not have picked one up from the shells' helper.
+  const res = await request("/login");
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["cache-control"], "no-store");
+  assert.equal(res.headers.etag, undefined);
+  assert.ok(res.raw.includes(`="${ASSET_URLS["/app.css"]}"`));
 });

@@ -5087,6 +5087,11 @@ const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 // body. `no-cache` is store-and-revalidate, not don't-store, so with the ETag
 // below the usual answer is a 304 (XERK-312).
 const REVALIDATE_CACHE = "public, no-cache";
+// A fingerprint no release ever minted is still a 200 (see `supersededAsset`),
+// and an unauthenticated caller can ask for 2^48 of them. `private` keeps a
+// shared cache in front of the hub from storing a distinct entry per guess;
+// the bare names it falls back to are a fixed set of six, so they stay public.
+const SUPERSEDED_CACHE = "private, no-cache";
 // The HTML shells name their assets BY fingerprint, so a shell held without
 // asking would keep pointing at last release's URLs — the same stale window one
 // level up. `private` keeps the logged-in pages out of shared caches (the CDN
@@ -5139,6 +5144,8 @@ const HASHED_ASSETS = [
 
 // Bare URL -> fingerprinted URL, the map the HTML rewrite runs on.
 const ASSET_URLS = {};
+// The same bodies again, for a fingerprint a previous release minted.
+const SUPERSEDED_ASSETS = {};
 for (const [urlPath, file, type] of HASHED_ASSETS) {
   const body = readAsset(file);
   const hashed = urlPath.replace(/\.([^.]+)$/, `.${assetFingerprint(body)}.$1`);
@@ -5148,6 +5155,7 @@ for (const [urlPath, file, type] of HASHED_ASSETS) {
   // pre-deploy HTML page still link it, and 404ing them would take the styling
   // off a page that was working a moment ago — the very failure being fixed.
   STATIC_ASSETS[urlPath] = staticAsset(body, type, REVALIDATE_CACHE);
+  SUPERSEDED_ASSETS[urlPath] = staticAsset(body, type, SUPERSEDED_CACHE);
 }
 
 // A fingerprinted name this build does NOT know: `/app.<some old hash>.css`,
@@ -5164,7 +5172,7 @@ function supersededAsset(pathname) {
   const bare = `/${m[1]}.${m[2]}`;
   if (!Object.prototype.hasOwnProperty.call(ASSET_URLS, bare)) return null;
   if (ASSET_URLS[bare] === pathname) return null; // the current one; served above
-  return STATIC_ASSETS[bare];
+  return SUPERSEDED_ASSETS[bare];
 }
 
 // Point a page at the fingerprinted URLs. Only real attribute references are
@@ -5186,7 +5194,9 @@ const INDEX = htmlPage("index.html");
 const USAGE = htmlPage("usage.html");
 const SESSIONS = htmlPage("sessions.html");
 const BOARD = htmlPage("board.html");
-const LOGIN = htmlPage("login.html");
+// Not an `htmlPage`: the login form is served `no-store` (a cached login page
+// is its own problem), so it has no conditional-GET path to carry an ETag for.
+const LOGIN = withHashedAssets(readAsset("login.html"));
 
 // Does this conditional request already hold the body we would send? The header
 // is a comma-separated list and either side may weaken an entry (`W/"..."`); a
@@ -5717,7 +5727,11 @@ const server = http.createServer(async (req, res) => {
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):
     // public and served before the auth gate so the login page renders before a
     // session exists. Explicit allowlist — no arbitrary path -> file mapping.
-    if (req.method === "GET" && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+    // HEAD as well as GET: these are public, and a HEAD falling through to the
+    // auth gate answered 401 for the very stylesheet the login page renders with
+    // — which is what a CDN or an uptime check asks for.
+    const isAssetRead = req.method === "GET" || req.method === "HEAD";
+    if (isAssetRead && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
       const asset = STATIC_ASSETS[url.pathname];
       const headers = { "Content-Type": asset.type, "Cache-Control": asset.cache, ETag: asset.etag };
       // The bare names revalidate on every request (XERK-312); the 304 is what
@@ -5727,11 +5741,13 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
       res.writeHead(200, headers);
-      return res.end(asset.body);
+      // A HEAD gets the headers and no body; node still sets Content-Length off
+      // the body it never writes if we hand it one, so end it empty.
+      return res.end(req.method === "HEAD" ? undefined : asset.body);
     }
 
     // Same, for a fingerprint a previous release minted (XERK-312).
-    if (req.method === "GET") {
+    if (isAssetRead) {
       const stale = supersededAsset(url.pathname);
       if (stale) {
         const headers = { "Content-Type": stale.type, "Cache-Control": stale.cache, ETag: stale.etag };
@@ -5740,7 +5756,7 @@ const server = http.createServer(async (req, res) => {
           return res.end();
         }
         res.writeHead(200, headers);
-        return res.end(stale.body);
+        return res.end(req.method === "HEAD" ? undefined : stale.body);
       }
     }
 
@@ -5835,7 +5851,7 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-      return res.end(LOGIN.body);
+      return res.end(LOGIN);
     }
 
     // Validate credentials and hand back the session cookie.
@@ -8111,7 +8127,7 @@ if (process.env.TURMA_TEST) {
     // itself: the wire tests prove one page links a hashed URL, this proves
     // EVERY mutable asset got a hashed twin AND kept its bare name served —
     // dropping either half is a silent regression the pages still render past.
-    STATIC_ASSETS, ASSET_URLS, IMMUTABLE_CACHE, REVALIDATE_CACHE, HTML_CACHE,
+    STATIC_ASSETS, ASSET_URLS, IMMUTABLE_CACHE, REVALIDATE_CACHE, HTML_CACHE, SUPERSEDED_CACHE,
     supersededAsset,
     invalidateAgentsCache,
     serializeAgentsForSave,

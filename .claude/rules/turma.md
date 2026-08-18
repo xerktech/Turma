@@ -54,7 +54,11 @@ which makes an `android/` change part of the same PR) live there.
   - **A fingerprint a PREVIOUS release minted still serves the current body** (`supersededAsset`),
     revalidating — a 404 there is a fully unstyled page, i.e. worse than the stale sheet this
     replaced. It reconstructs the bare name and looks it up in the same allowlist, so it serves
-    nothing new.
+    nothing new. Its cache line is **`private`**, unlike the bare names': a caller can mint 2^48 of
+    those URLs, and a shared cache must not keep an entry per guess.
+  - **The asset routes answer HEAD as well as GET.** They are public, so a HEAD falling through to
+    the auth gate 401s the very stylesheet the login page renders with — which is what a CDN or an
+    uptime check asks for.
   - `withHashedAssets` rewrites only `="/app.css"`-shaped attribute references, so the pages' prose
     naming these files is untouched. A page that builds an asset URL in JS would be missed.
   - The HTML shells therefore revalidate too (`private, no-cache` + ETag → 304): a shell held
