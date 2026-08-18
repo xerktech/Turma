@@ -108,9 +108,13 @@ function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
 // RESPONSE and cannot reach the body that follows it, so an unwrapped
 // `res.json()` is an unbounded await on a live socket — and since App.poll()
 // re-arms only in its `finally`, one such await freezes the glasses on stale
-// content permanently. On a polyfilled Response `json` may not even be a
-// function, so the call itself is inside the promise chain to catch a
-// SYNCHRONOUS throw as well as a rejection.
+// content permanently. That deadline is what this exists for.
+//
+// The `Promise.resolve().then()` is only belt-and-braces for a polyfilled
+// Response whose `json` isn't a function: every caller today is `async`, so the
+// async boundary already turns such a synchronous throw into a rejection. Keep
+// it for a future non-async caller, but don't credit it with the behaviour —
+// removing it changes nothing observable.
 function readJson<T = unknown>(res: Response, ms: number): Promise<T> {
   return withDeadline(Promise.resolve().then(() => res.json() as Promise<T>), ms);
 }

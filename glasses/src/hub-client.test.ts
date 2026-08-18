@@ -373,6 +373,22 @@ describe("HubClient", () => {
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(message)).toBe(false);
   });
 
+  // The other side of the boundary: a pair sitting entirely INSIDE the clamp
+  // must survive intact. Widening the surrogate check to 0xdfff would back the
+  // cut off here too and split this one the other way — an escape the straddle
+  // case alone does not catch.
+  it("keeps an emoji that ends exactly on the boundary rather than splitting it", async () => {
+    const said = `${"b".repeat(298)}\u{1F600}tail`;
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: said }, 409) });
+
+    let message = "";
+    await client.listAgents().catch((e: unknown) => { message = (e as Error).message; });
+
+    expect(message).toBe(`${"b".repeat(298)}\u{1F600}…`);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(message)).toBe(false);
+    expect(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(message)).toBe(false);
+  });
+
   it("reads the hub's words on getHistory and jiraDetail too, not just request()", async () => {
     const refused = { error: "that agent is in a different org" };
     const history = new HubClient({ config, fetchFn: fakeFetch(refused, 409) });
