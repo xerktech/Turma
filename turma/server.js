@@ -918,7 +918,7 @@ try {
   // unreclaimable, which is a delay; the thing it buys is not a duplicate.
   // Deliberately NOT inside `normalizeRecord`: that is shared with the ingest
   // path, where these commands are live in memory and their stamps are the truth.
-  restoreCommandDelivery(agents);
+  sanitizeRestoredCommands(agents);
   // Hold what we LOAD to the registry budget too — a flood that landed before
   // the restart is on disk, and restoring all of it is an OOM before the first
   // request (XERK-272).
@@ -1388,18 +1388,39 @@ function invalidateAgentsCache() { agentsCache = null; }
 //   - `ticketSource`, which queue entry a spawnTicket came from (XERK-303), so a
 //     reclaim can put the ticket back in line as the same kind of work.
 // Returns the same array when there is nothing to strip.
-// Stamp every restored command as delivered (XERK-303). See the restore block
-// for why: `deliveredAt` cannot be reconstructed from disk, so past a restart the
-// hub's honest answer is "cannot tell", and both readers of the stamp treat that
-// as delivered. A FUNCTION declaration on purpose — the restore runs far above
-// this line and reaches it only because declarations hoist.
-function restoreCommandDelivery(reg) {
+// Everything a RESTORED command needs before anything else reads it (XERK-303).
+// A FUNCTION declaration on purpose — the restore runs far above this line and
+// reaches it only because declarations hoist.
+//
+// Two jobs, and the first is why `normalizeRecord` cannot do either: it is shared
+// with the ingest path, where these commands are live in memory and their stamps
+// are the truth.
+//
+//  1. DROP any element that is not an object. `normalizeRecord` does not walk
+//     `commands`, and a corrupt or hand-edited state.json is the only way one
+//     gets in — nothing on the wire reaches this array, and `queueCommand` only
+//     ever pushes objects. Dropping it HERE is what makes every `c.type` /
+//     `c.cmdId` read in the file safe, and there are a dozen. The one that
+//     matters is `autoStartSweep`'s, which runs in a `setInterval` with no
+//     `uncaughtException` handler behind it: `null.type` there is not a failed
+//     request, it EXITS THE HUB, taking every host's control plane with it —
+//     and it re-fires 15s after each restart. The heartbeat's ack filter drops
+//     junk too, but only for a host that BEATS, and an offline host holding a
+//     stranded spawn is exactly the subject here and never will.
+//  2. STAMP what is left as delivered. `deliveredAt` cannot be reconstructed
+//     from disk, so past a restart the hub's honest answer is "cannot tell", and
+//     both readers of the stamp treat that as delivered.
+function sanitizeRestoredCommands(reg) {
   const at = Date.now();
   for (const a of Object.values(reg || {})) {
     if (!a || !Array.isArray(a.commands)) continue;
-    for (const c of a.commands) {
-      if (c && typeof c === "object" && !("deliveredAt" in c)) c.deliveredAt = at;
+    const clean = a.commands.filter((c) => c && typeof c === "object");
+    if (clean.length !== a.commands.length) {
+      console.warn(`dropped ${a.commands.length - clean.length} malformed queued `
+        + `command(s) restored for ${logName(a.device)}`);
+      a.commands = clean;
     }
+    for (const c of a.commands) if (!("deliveredAt" in c)) c.deliveredAt = at;
   }
 }
 
@@ -4980,15 +5001,21 @@ function drainTicketQueue() {
 //    org's host then runs it. An unstamped command (an older hub's, in memory
 //    across nothing) is simply not reclaimed: guessing its kind is how an
 //    operator's click comes back as auto and gets swept away by the org switch.
-// 3. **The queue can actually route it** — a free host in the org now, or a full
-//    org that will free one (`full`). Withdrawing from a host the ticket can
-//    never leave is the one way this can be WORSE than the bug it fixes: a manual
-//    entry that nothing can route is held `blocked` and then SILENTLY dropped at
-//    TICKET_QUEUE_BLOCKED_MAX_MS, so a click that would have run when its host
-//    came back instead ends up on no host and in no queue. A single-host org, an
-//    org that is entirely down, and a ticket pinned to the dead host are all that
-//    case. They keep today's behaviour — the command waits — which is exactly
-//    what "never destroy the work" has to mean here.
+// 3. **A host is free to take it RIGHT NOW.** Withdrawing is only an improvement
+//    if the very next drain can dispatch; a command withdrawn into a queue that
+//    cannot move it is destroyed on one of the queue's own timers, and it would
+//    have RUN when its host came back. A single-host org, an org that is entirely
+//    down and a ticket pinned to the dead host each hit that, and so does a
+//    merely BUSY org — `full` is a wait that clears itself for a ticket already
+//    in line, but for one that is not it just trades a week on a dead host for
+//    four hours and a "gave up waiting" note. None of them is withdrawn; the
+//    command waits, exactly as today, and this runs again in 15 seconds, so the
+//    rescue happens the moment a slot actually exists.
+//
+// One residue is deliberate: once reclaimed, the ticket is an ordinary queue
+// entry. If an older entry beats it to the slot it can wait, and can eventually
+// expire — VISIBLY, as the terminal note every queued ticket gets. That is the
+// queue's contract, not a silent loss.
 //
 // Admission is then checked BEFORE the withdrawal, never after: it can still
 // refuse (a full org line), and dropping a command we then fail to re-queue is
@@ -5027,9 +5054,20 @@ function reclaimStrandedTicketSpawns() {
       if (source !== "manual" && source !== "auto") continue;
       const repo = ticketRepo(siteKey, c.issueKey);
       if (!repo) continue;
-      const { host: free, full } =
+      const { host: free } =
         findTicketHost(siteKey, repo, c.issueKey, { requireFree: true });
-      if (!free && !full) continue;
+      if (!free) continue;
+      // An AUTO rescue is itself an attempt that produced nothing, so it waits
+      // out the backoff the dispatch spent, exactly like the sweep's own retry.
+      // Without this a pair of hosts flapping alternately reclaims forever: each
+      // bounce finds the other host up, passes every precondition, and the ticket
+      // never starts while the log, the payload and the board churn every
+      // OFFLINE_AFTER_MS. Costs the normal case nothing — the first backoff step
+      // is 60s and a host must be silent for 75s to get here at all.
+      if (source === "auto") {
+        const prior = autoStarted.get(ticketQueueKey(siteKey, c.issueKey));
+        if (prior && now < prior.nextAt) continue;
+      }
       if (ticketQueueAdmission(siteKey, c.issueKey, source) !== "ok") continue;
       if (!dropQueuedCommand(host, c.cmdId, "spawnTicket")) continue;
       if (!enqueueTicketStart(siteKey, c.issueKey, source)) {
@@ -5039,23 +5077,6 @@ function reclaimStrandedTicketSpawns() {
         console.error(`ticket queue: reclaimed ${logName(c.issueKey)} from `
           + `${logName(host)} but could not re-queue it — start it again`);
         continue;
-      }
-      // The auto-start retry that dispatch spent bought nothing — the agent never
-      // saw the command — so give it back rather than letting an offline host eat
-      // this ticket's backoff budget. `nextAt: 0` because nothing actually failed.
-      // A host that flaps therefore holds `attempts` at 1 instead of backing off,
-      // and that is correct: the backoff's whole subject is a spawn that WAS
-      // acked and left no session (XERK-61/109). What bounds the churn is
-      // precondition 3 — a flap only reclaims while some other host is free to
-      // take the work, and once one does, `started` retires the ticket.
-      if (source === "auto") {
-        const k = ticketQueueKey(siteKey, c.issueKey);
-        const prior = autoStarted.get(k);
-        if (prior && prior.attempts > 1) {
-          autoStarted.set(k, { attempts: prior.attempts - 1, nextAt: 0 });
-        } else {
-          autoStarted.delete(k);
-        }
       }
       console.log(`ticket queue: reclaimed ${logName(c.issueKey)} from `
         + `${logName(host)} — it went offline before taking the spawn, so the `
@@ -5096,7 +5117,8 @@ function autoStartSweep() {
       // taken it yet, so there is nothing to conclude about it either way.
       const inFlight = Object.values(agents).some((a) =>
         a.jira && a.jira.siteKey === siteKey &&
-        (a.commands || []).some((c) => c.type === "spawnTicket" && c.issueKey === t.key));
+        (a.commands || []).some(
+          (c) => c && c.type === "spawnTicket" && c.issueKey === t.key));
       if (inFlight) continue;
       // Nothing in flight and still no session: the last attempt (if any) was
       // taken and produced nothing. Retry it once its backoff has elapsed — the
@@ -8268,7 +8290,7 @@ if (process.env.TURMA_TEST) {
     dropAutoQueuedTickets,
     drainTicketQueue,
     reclaimStrandedTicketSpawns,
-    restoreCommandDelivery,
+    sanitizeRestoredCommands,
     queuedTicket,
     liveQueuedTicket,
     liveQueueCount,

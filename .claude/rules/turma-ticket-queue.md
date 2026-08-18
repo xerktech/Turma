@@ -83,13 +83,18 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
     the org), so reading it live lets a host whose Jira config moved re-queue another org's ticket
     into its own. An unstamped command is **not reclaimed at all** — guessing its kind is how an
     operator's click comes back as `auto` and the org switch sweeps it away.
-  - **The queue can actually route it** — `findTicketHost(..., {requireFree:true})` returns a host,
-    or the org is `full` (a wait that clears itself). Withdrawing from a host the ticket can never
-    leave is the one way this is WORSE than the bug: a manual entry nothing can route is held
-    `blocked` and then **silently dropped** at `TICKET_QUEUE_BLOCKED_MAX_MS`, so a click that would
-    have run when its host came back ends up on no host and in no queue. A single-host org, an org
-    that is entirely down, and a ticket pinned to the dead host are all that case, and all keep
-    today's behaviour.
+  - **A host is free to take it RIGHT NOW** — `findTicketHost(..., {requireFree:true})` returns a
+    host. Withdrawing is only an improvement if the very next drain can dispatch; a command
+    withdrawn into a queue that cannot move it is destroyed on one of the queue's own timers, and it
+    would have RUN when its host came back. A single-host org, an org entirely down and a ticket
+    pinned to the dead host each hit that, and so does a merely BUSY one — **`full` is deliberately
+    NOT enough**: it is a wait that clears itself for a ticket already in line, but for one that is
+    not it only trades a week on a dead host for four hours and a "gave up waiting" note. Nothing is
+    withdrawn in any of those; the sweep runs again in 15s, so the rescue lands the moment a slot
+    exists.
+  - One residue is deliberate: once reclaimed the ticket is an **ordinary queue entry**, so an older
+    entry can beat it to the slot and it can eventually expire — VISIBLY, as the terminal note every
+    queued ticket gets. That is the queue's contract, not a silent loss.
   - Admission is then checked BEFORE the withdrawal — `enqueueTicketStart` can still refuse a full
     org line, and dropping a command that then fails to re-queue is the same destruction by another
     route.
@@ -101,16 +106,24 @@ Read this before touching `findTicketHost`, the `/session` routes or the sweeps.
   the reclaim, and XERK-241's create poll — already treat that as delivered. Deliberately NOT in
   `normalizeRecord`, which is shared with the ingest path where the stamps are the truth. The cost is
   a spawn genuinely lost to a restart becoming unreclaimable: a delay, bought against a duplicate.
-- **A reclaimed AUTO ticket gets its `autoStarted` attempt back** — the dispatch spent a retry on a
-  command the agent never saw. A flapping host therefore holds `attempts` at 1 rather than backing
-  off, which is correct: the backoff's subject is a spawn that WAS acked and left no session
-  (XERK-61/109). The churn bound is the routability precondition, not the backoff.
-- **Nothing that walks `commands` may assume the elements are objects.** `in` throws on a truthy
-  primitive and `null.cmdId` throws on a null, and both run per beat: thrown there, a host's every
-  heartbeat 400s with the internal error text while every dashboard is served a stale payload from
-  `lastGoodAgentsCache` — XERK-235's offline loop from a one-word gap. `normalizeRecord` does not
-  walk `commands`, so a corrupt `state.json` is the reachable source; the heartbeat's ack filter
-  drops such elements so the record self-heals in one round trip.
+- **An AUTO rescue SPENDS a retry and waits out the backoff**, exactly like the sweep's own. A
+  rescue is an attempt that produced nothing, and refunding it instead let a pair of hosts flapping
+  ALTERNATELY reclaim forever: each bounce finds the other host up, passes every precondition, and
+  the ticket never starts while the log, the payload and the board churn every `OFFLINE_AFTER_MS`.
+  The routability precondition does not bound that — it only bounds the single-host case. Costs the
+  normal path nothing: the first backoff step is 60s and a host must be silent for 75s to qualify.
+- **Junk in a restored `commands` list is dropped at the restore** (`sanitizeRestoredCommands`),
+  which is what makes the dozen `c.type`/`c.cmdId` reads across the file safe. `normalizeRecord`
+  does not walk `commands`, and a corrupt or hand-edited `state.json` is the only door — nothing on
+  the wire reaches the array and `queueCommand` only pushes objects.
+  - **The read that matters is `autoStartSweep`'s**, because it runs in a `setInterval` with no
+    `uncaughtException` handler behind it: `null.type` there is not a failed request, it EXITS THE
+    HUB — every host's control plane — and re-fires 15s after each restart.
+  - **Do not rely on the heartbeat's ack filter for this.** It drops junk too, but only for a host
+    that BEATS, and an offline host holding a stranded spawn is exactly this feature's subject and
+    never will. Per-beat reads (`publicCommands`' `in`, the ack filter's `c.cmdId`) still guard
+    themselves: thrown there, a host's every heartbeat 400s with the internal error text while every
+    dashboard is served a stale payload from `lastGoodAgentsCache` — XERK-235's offline loop.
   - Tests: the `XERK-303:` block in `server.test.js`.
 - **A direct dispatch RETIRES that ticket's entry** (`/session` when a host is free), and
   `rememberDispatch` records it. The entry and the dispatch are one intent: left in place it fired
