@@ -137,3 +137,26 @@ CVE-2026-69249 exp:2026-10-25
 # already choose. The expiry forces the revisit: bump TERRAFORM_VERSION once
 # HashiCorp ships a stable release built against x/net 0.56+.
 CVE-2026-46600 exp:2026-10-25
+
+# CVE-2026-33818 / CVE-2026-39821 / CVE-2026-56853 / CVE-2026-56858 /
+# CVE-2026-56859 / CVE-2026-56860 / CVE-2026-56862 — seven HIGH Go stdlib
+# issues (asn1 recursion, x/net/idna Punycode handling, cleartext HTTP/2,
+# html/template XSS, encoding/xml recursion, net/url quadratic parsing,
+# crypto/tls KeyUpdate flooding), all fixed in Go 1.25.13 / 1.26.6.
+# Carriers are the four bundled third-party Go CLIs and nothing else:
+# /usr/local/bin/{docker,gh,glab,terraform}. Checked 2026-08-17 by downloading
+# the newest upstream release of each and scanning it — gh 2.97.0, docker
+# 29.7.2 and glab 1.113.0 are all built with Go 1.26.5, and terraform 1.15.8
+# (still the newest stable) with Go 1.25.10, so every one of them still carries
+# all seven and DOCKER_CLI_VERSION / GH_VERSION / GLAB_VERSION /
+# TERRAFORM_VERSION have nothing to bump to. Not first-party code, and each is
+# a CLI a session runs by hand against endpoints it already chose. The expiry
+# forces the revisit: the first upstream rebuild on Go 1.25.13+/1.26.6+ clears
+# the lot with a pin bump.
+CVE-2026-33818 exp:2026-10-17
+CVE-2026-39821 exp:2026-10-17
+CVE-2026-56853 exp:2026-10-17
+CVE-2026-56858 exp:2026-10-17
+CVE-2026-56859 exp:2026-10-17
+CVE-2026-56860 exp:2026-10-17
+CVE-2026-56862 exp:2026-10-17
