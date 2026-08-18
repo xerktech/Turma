@@ -58,7 +58,13 @@ export function refusalText(status: number, body: unknown): string {
 const REFUSAL_TEXT_MAX = 300;
 
 function clamp(words: string): string {
-  return words.length <= REFUSAL_TEXT_MAX ? words : `${words.slice(0, REFUSAL_TEXT_MAX)}…`;
+  if (words.length <= REFUSAL_TEXT_MAX) return words;
+  // Never cut BETWEEN the halves of a surrogate pair: `slice` counts UTF-16
+  // code units, so an emoji straddling the boundary would leave a lone
+  // surrogate on the display, which renders as a replacement box.
+  const last = words.charCodeAt(REFUSAL_TEXT_MAX - 1);
+  const straddles = last >= 0xd800 && last <= 0xdbff;
+  return `${words.slice(0, straddles ? REFUSAL_TEXT_MAX - 1 : REFUSAL_TEXT_MAX)}…`;
 }
 
 // How long the refusal path waits for the error body itself.
@@ -339,8 +345,12 @@ export class HubClient {
     const q = project ? `?project=${encodeURIComponent(project)}` : "";
     const path = `/api/jira/${encodeURIComponent(siteKey)}/create-meta${q}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS).catch(() => ({}) as Record<string, unknown>);
-    if (!res.ok && res.status !== 202) throw new HttpError(res.status, refusalText(res.status, body));
+    // Refuse through the same door as every other call: a swallowed body used
+    // to resolve `{}`, which `createResult`'s caller renders as a ticket created
+    // with no key — a false success on a write, for a request whose real fate
+    // is unknown. 202 is a normal "still fetching" return, not a refusal.
+    if (!res.ok) throw await refusal(res);
+    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS);
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
   createTicket(siteKey: string, body: { project: string; issueType: string; summary: string; description?: string; labels?: string[] }): Promise<QueuedResponse> {
@@ -356,8 +366,12 @@ export class HubClient {
   ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: Record<string, unknown> }> {
     const path = `/api/jira/${encodeURIComponent(siteKey)}/tickets/${encodeURIComponent(cmdId)}`;
     const res = await this.fetchFn(this.url(path), { headers: this.headers() });
-    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS).catch(() => ({}) as Record<string, unknown>);
-    if (!res.ok && res.status !== 202) throw new HttpError(res.status, refusalText(res.status, body));
+    // Refuse through the same door as every other call: a swallowed body used
+    // to resolve `{}`, which `createResult`'s caller renders as a ticket created
+    // with no key — a false success on a write, for a request whose real fate
+    // is unknown. 202 is a normal "still fetching" return, not a refusal.
+    if (!res.ok) throw await refusal(res);
+    const body = await readJson<Record<string, unknown>>(res, BODY_TIMEOUT_MS);
     return res.status === 202 ? { status: 202, body } : { status: 200, body };
   }
 

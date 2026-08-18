@@ -269,6 +269,72 @@ describe("HubClient", () => {
     await expect(client.listAgents()).rejects.toMatchObject({ status: 409, message: said });
   });
 
+  // A body that can't be read on a SUCCESS must throw, not resolve empty. The
+  // swallowed `{}` here rendered as a ticket created with no key — a false
+  // success on a write whose real fate is unknown.
+  it("throws rather than reporting an empty success when a 200 body is unreadable", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+    })) as unknown as typeof fetch;
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.createResult("SITE", "cmd1")).rejects.toThrow();
+  });
+
+  // The refusal deadline has to reach the create endpoints too — they build
+  // their own HttpError rather than going through request(), and a refused
+  // create that hung for the full success budget is the phone form freezing.
+  it("holds a refused create to the refusal deadline, not the success one", async () => {
+    fakeTimers.useFakeTimers();
+    try {
+      const stalled = vi.fn(async () => ({
+        ok: false,
+        status: 403,
+        json: () => new Promise(() => {}),
+      })) as unknown as typeof fetch;
+      const client = new HubClient({ config, fetchFn: stalled });
+
+      const pending = client.createMeta("SITE");
+      const settled = vi.fn();
+      void pending.then(settled, settled);
+
+      await fakeTimers.advanceTimersByTimeAsync(REFUSAL_BODY_TIMEOUT_MS + 1);
+      await expect(pending).rejects.toMatchObject({
+        status: 403,
+        message: "the hub answered HTTP 403",
+      });
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+  });
+
+  // A polyfilled Response may not have `json` as a function at all, so the call
+  // itself sits inside readJson's promise chain. Covered here rather than only
+  // through refusal(), whose own try/catch would mask a regression.
+  it("turns a synchronously-throwing json() into a rejection, not a raised throw", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: () => { throw new TypeError("json is not a function"); },
+    })) as unknown as typeof fetch;
+    const client = new HubClient({ config, fetchFn });
+
+    await expect(client.listAgents()).rejects.toThrow(/json is not a function/);
+  });
+
+  it("clamps without splitting an emoji that straddles the boundary", async () => {
+    const said = `${"b".repeat(299)}😀tail`;
+    const client = new HubClient({ config, fetchFn: fakeFetch({ error: said }, 409) });
+
+    let message = "";
+    await client.listAgents().catch((e: unknown) => { message = (e as Error).message; });
+
+    expect(message).toBe(`${"b".repeat(299)}…`);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(message)).toBe(false);
+  });
+
   it("reads the hub's words on getHistory and jiraDetail too, not just request()", async () => {
     const refused = { error: "that agent is in a different org" };
     const history = new HubClient({ config, fetchFn: fakeFetch(refused, 409) });
