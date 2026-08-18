@@ -6330,8 +6330,11 @@ test("XERK-325: only the shared resolvers may read a block's ticket list", () =>
   //     IIFE, and a getter. All are caught in any other position;
   //   - a divergent re-rank written INSIDE an allow-listed function, where the
   //     attribution is correct and simply permissive. Not a `DECL` miss, so no
-  //     amount of pattern work reaches it — measured, 12 behavioural tests catch
-  //     it and this one does not.
+  //     amount of pattern work reaches it. Measured on two shapes — a
+  //     freshest-block-wins re-rank inside `fleetTicketRows`, and a
+  //     grouping-kept freshness-only one — this test passes both while 8-9
+  //     behavioural tests fail. The same re-rank inside a NON-allow-listed
+  //     function does trip it, so the boundary is the allow-list, not the read.
   //
   // So it is a tripwire for the honest edit, not a proof. **The guarantee lives
   // in the behavioural tests above** — the two-user, ghost, auto-stop,
