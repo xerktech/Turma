@@ -46,7 +46,11 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
     exists to keep the volume writable for `state.json`, and two budgets that each pass individually
     still fill the disk together. Past the per-session one that session's raw sync stops and the
     rendered transcript carries on, so it stays readable and searchable.
-  - **The per-beat cursor loop is bounded by the HUB** (`ARCHIVE_RAW_CURSOR_MAX`, 2000).
+  - **The per-beat cursor loop is bounded by the HUB** (`ARCHIVE_RAW_CURSOR_MAX`, 2000), and the
+    budget is charged BEFORE a path is validated, not after. Validation is not free — a max-length
+    depth-10 path failing on its last character measured 700 ms per 780k entries against 30 ms for
+    valid ones — so charging only the survivors let a caller walk straight around the cap by offering
+    paths the allowlist rejects. **The budget bounds the WORK, and every offer costs work.**
     `rawCursors` stats one file per offer, synchronously, on the heartbeat path — the same hub-wide
     stall budget the store-total walk is sized against. Measured ~5.6 µs per stat: the 40,000 files an
     agent may offer under its OWN caps cost 223 ms, and the ~780,000 that fit in a 32 MiB
@@ -56,6 +60,25 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
     cursor, the agent pushes from 0, and `ingestRaw`'s offset check refuses: the stored data is safe
     and the cost is one wasted small POST, only ever for an agent already over its own cap. Logged,
     throttled, because silence reads as "the hub holds nothing" and provokes a re-ship.
+  - **The raw directory is keyed on the FULL transcript id** (`<file>.jsonl.raw/<id>/…`), not on the
+    canonical file name — that name carries only the first 8 alnum characters of the id, so two
+    transcripts agreeing on repo/date/summary/host and that prefix share one `.jsonl`, and sharing a
+    raw directory too made each one's `/raw` listing return the OTHER's files through the read-back
+    route. `transcriptId` is agent-chosen, so it can be forced.
+  - **Only the session's OWN host may write its raw files.** `<host>` being proved by the credential
+    (XERK-268) says who is calling, not whose session they may write into: with a properly bound
+    token any agent could otherwise create arbitrary named files inside another host's archived
+    session and have them served back as part of that host's record. A migration still works, because
+    the rendered delta re-points `sessions.host` and the beat pushes the rendered layer first.
+    (`ingestChunk` has no such check — pre-existing, XERK-344.)
+  - **The wire cap CLEARS the worst case of gzipping a chunk, never equals it.** gzip expands
+    incompressible input (~+0.03%), so an equal cap made any session file holding 4 MiB of
+    already-compressed bytes unpushable — and, since a failed push aborted the whole pass, it stopped
+    the raw sync for every OTHER transcript on that host, every beat, forever. A failed push now skips
+    that FILE (`ARCHIVE_RAW_FAILURES_MAX` still ends a pass against a hub that is genuinely down).
+  - **The decompressed buffer is charged to the in-flight body budget** for its lifetime.
+    `readRawBody` releases its charge when the socket finishes, so `maxOutputLength` bounds one call
+    and nothing bounded N concurrent ones — the unaccounted-third-term shape of XERK-287.
   - `GET /api/archive/<id>/raw` lists it and `GET /api/archive/<id>/raw/<file>` streams one file
     (user-authed, `attachment` + `nosniff` — a transcript holds whatever was pasted into it, and
     rendering that inline behind the hub's login is stored XSS). Bytes nothing can read back are not
@@ -136,6 +159,12 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
   - **A deleted `.jsonl` whose index row survives leaves the cursor alone** and the next delta
     appends onto the gap — pre-existing, tracked as XERK-280. Repairing it needs a reliable answer
     to "was this deleted", which is the thing above that cannot be had cheaply.
+- **`manifestCursors` is bounded too** (`ARCHIVE_MANIFEST_CURSOR_MAX`, 2000). Pre-existing, and the
+  costlier of the two (a SELECT + an INSERT per entry against one stat): 973,677 new ids in one
+  26.9 MiB beat measured **6.9 SECONDS** of blocked event loop and wrote 973,682 rows, growing
+  `index.db` + WAL to 161 MB — every beat, and `index.db` sits outside `ARCHIVE_TOTAL_MAX`
+  (XERK-332). Uncapped it also made the raw cursor cap nearly pointless, since the same caller could
+  send manifest entries instead for 20x the stall.
 - `rebuildIndex` derives `rawBytes` by walking the raw directory, exactly as it derives
   `archiveBytes` from the file — never read back from a sidecar — and its file walk **skips a raw
   directory whole**. Its contents carry no `.meta` so they would be skipped as rows anyway, but only

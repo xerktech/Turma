@@ -134,6 +134,11 @@ const ARCHIVE_RAW_TRANSCRIPT_MAX = byteCeiling(
 // data is safe and the cost is one small wasted POST per over-cap file per pass.
 // That only ever happens to an agent already ignoring its own cap.
 const ARCHIVE_RAW_CURSOR_MAX = positiveEnvInt("ARCHIVE_RAW_CURSOR_MAX", 2000);
+// The same bound for the RENDERED layer's manifest, which is the costlier of the
+// two (a SELECT + an INSERT per entry, against one stat). The agent sends at most
+// ARCHIVE_MANIFEST_MAX (200); this is generous headroom over that and still ~35x
+// under the point where the stall is measurable in seconds.
+const ARCHIVE_MANIFEST_CURSOR_MAX = positiveEnvInt("ARCHIVE_MANIFEST_CURSOR_MAX", 2000);
 
 // The suffix that marks a raw directory, so both walks below can tell one from a
 // rendered archive without consulting the index.
@@ -200,8 +205,18 @@ function archiveRelPath(transcriptId, meta) {
 // repo stays the whole organisation, and deleting a repo's archive takes its raw
 // bytes with it — which is what makes the store total's WALK the honest measure
 // of both layers at once.
-function rawDirFor(relPath) {
-  return filePaths(relPath).jsonl + RAW_DIR_SUFFIX;
+function rawDirFor(relPath, transcriptId) {
+  // Keyed on the FULL transcript id, not the canonical file name. That name
+  // carries only the first 8 alnum characters of the id, so two transcripts
+  // agreeing on repo/date/summary/host and that prefix share one canonical file
+  // — and, without this, one raw directory: each one's `/raw` listing returned
+  // the OTHER's files, and the read-back route served them (XERK-338 QA D6, hit
+  // accidentally by a QA fixture, and `transcriptId` is agent-chosen so it can
+  // be forced). The id is allowlisted `[A-Za-z0-9._-]+` at the route before it
+  // reaches here, and re-checked here so no other caller can widen that.
+  const id = String(transcriptId || "");
+  if (!id || !/^[A-Za-z0-9._-]+$/.test(id) || id === "." || id === "..") return null;
+  return filePaths(relPath).jsonl + RAW_DIR_SUFFIX + path.sep + id;
 }
 
 // The most components a session-relative path may have, and the most bytes.
@@ -209,6 +224,12 @@ function rawDirFor(relPath) {
 // at 5; the headroom is for a shape it grows later, not for anything to lean on.
 const RAW_REL_DEPTH_MAX = 10;
 const RAW_REL_LEN_MAX = 400;
+// Per COMPONENT, because 400 total is not the binding limit: every common
+// filesystem caps one name at 255 bytes, so a longer component passed the
+// allowlist and then failed at the syscall with ENAMETOOLONG — an unthrottled
+// error line per attempt, per beat, forever (XERK-338 QA D10). Refusing it here
+// makes it one quiet skip instead, and the file was never storable either way.
+const RAW_REL_COMPONENT_MAX = 255;
 
 /**
  * Validate an agent-supplied, session-relative file path. Returns the normalized
@@ -229,16 +250,18 @@ function safeRawRel(rel) {
   if (!parts.length || parts.length > RAW_REL_DEPTH_MAX) return null;
   for (const p of parts) {
     if (!p || p === "." || p === "..") return null;
+    if (Buffer.byteLength(p) > RAW_REL_COMPONENT_MAX) return null;
     if (!/^[A-Za-z0-9._-]+$/.test(p)) return null;
   }
   return parts.join("/");
 }
 
 // The absolute path one raw file lands at, or null if `rel` is not nameable.
-function rawFilePath(relPath, rel) {
+function rawFilePath(relPath, transcriptId, rel) {
   const safe = safeRawRel(rel);
   if (!safe) return null;
-  const dir = rawDirFor(relPath);
+  const dir = rawDirFor(relPath, transcriptId);
+  if (!dir) return null;
   // safeRawRel has already made every component a plain token, so this cannot
   // escape `dir`; the check below is the belt to that braces.
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
@@ -762,10 +785,16 @@ function rawCursors(manifest) {
     const have = {};
     for (const f of m.rawFiles) {
       if (budget <= 0) { dropped += 1; continue; }
+      // Charged BEFORE validation, not after. Validation is not free — a
+      // max-length depth-10 path that fails on its last character measured
+      // 700 ms per 780k entries, against 30 ms for valid ones — so charging only
+      // the survivors let a caller offer millions of REJECTED paths and walk
+      // straight around this cap (XERK-338 QA D4). The budget bounds the WORK,
+      // and every offer costs work whether or not it names anything.
+      budget -= 1;
       const rel = Array.isArray(f) ? f[0] : (f && f.path);
-      const full = rawFilePath(row.filePath, rel);
+      const full = rawFilePath(row.filePath, m.transcriptId, rel);
       if (!full) continue;
-      budget -= 1;                // charged for the STAT, which is what costs
       const n = rawCursor(full);
       if (n === null) continue;   // cannot tell — say nothing rather than "0"
       if (n > 0) have[safeRawRel(rel)] = n;
@@ -774,6 +803,17 @@ function rawCursors(manifest) {
   }
   if (dropped) warnRawCursorCap(dropped);
   return Object.keys(out).length ? out : undefined;
+}
+
+let lastManifestWarnAt = 0;
+function warnManifestCap(dropped) {
+  const now = Date.now();
+  if (now - lastManifestWarnAt < 60 * 60 * 1000) return;
+  lastManifestWarnAt = now;
+  console.error(
+    `archive: a manifest carried more than ${ARCHIVE_MANIFEST_CURSOR_MAX} entries ` +
+    `(ARCHIVE_MANIFEST_CURSOR_MAX); ${dropped} were ignored this beat. An agent ` +
+    `inside ARCHIVE_MANIFEST_MAX never reaches this.`);
 }
 
 // One line an hour: an agent ignoring its own cap does so on every beat, so an
@@ -827,11 +867,19 @@ let lastRawOverWarnAt = 0;
 function ingestRaw(host, transcriptId, rel, start, buf) {
   openDb();
   const row = db.prepare(
-    "SELECT filePath, rawBytes FROM sessions WHERE transcriptId=?").get(transcriptId);
+    "SELECT filePath, rawBytes, host FROM sessions WHERE transcriptId=?").get(transcriptId);
   // No row means no canonical file to hang the raw directory off. The manifest
   // creates the row a beat before any raw push, so this is a stale offer.
   if (!row || !row.filePath) return { stored: 0, skip: true };
-  const full = rawFilePath(row.filePath, rel);
+  // THE SESSION'S OWN HOST, or nobody. `<host>` is proved by the credential at
+  // the gate (XERK-268), but proving WHO is calling says nothing about WHOSE
+  // session they may write into: with a properly bound token, any agent could
+  // create arbitrary named files inside another host's archived session and
+  // serve them back through the read-back route as part of that host's
+  // "byte-for-byte record" (XERK-338 QA D5). A row with no host recorded is
+  // pre-raw-layer history and is not writable by anyone.
+  if (!row.host || row.host !== host) return { stored: 0, skip: true };
+  const full = rawFilePath(row.filePath, transcriptId, rel);
   if (!full) return { stored: 0, skip: true };
 
   const have = rawCursor(full);
@@ -887,7 +935,8 @@ function listRawFiles(transcriptId) {
   openDb();
   const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
   if (!row || !row.filePath) return null;
-  const dir = rawDirFor(row.filePath);
+  const dir = rawDirFor(row.filePath, transcriptId);
+  if (!dir) return null;
   const out = [];
   const walk = (d, prefix) => {
     let names;
@@ -911,7 +960,7 @@ function rawFileFor(transcriptId, rel) {
   openDb();
   const row = db.prepare("SELECT filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
   if (!row || !row.filePath) return null;
-  const full = rawFilePath(row.filePath, rel);
+  const full = rawFilePath(row.filePath, transcriptId, rel);
   if (!full) return null;
   try { return fs.statSync(full).isFile() ? full : null; } catch { return null; }
 }
@@ -921,7 +970,21 @@ function rawFileFor(transcriptId, rel) {
 function manifestCursors(host, manifest) {
   openDb();
   const have = {};
-  const list = Array.isArray(manifest) ? manifest : [];
+  // Capped like the raw cursors beside it, and for the same reason — it is the
+  // same handler, the same beat and the same single event loop. Pre-existing but
+  // strictly worse: one SELECT + INSERT per entry, measured at 6.9 SECONDS of
+  // blocked loop for 973,677 new ids in one 26.9 MiB beat, which also wrote
+  // 973,682 rows and grew index.db + WAL to 161 MB on /data — repeatable every
+  // beat, and index.db is outside ARCHIVE_TOTAL_MAX (XERK-332). Left uncapped it
+  // also made ARCHIVE_RAW_CURSOR_MAX nearly pointless: anyone who could send
+  // 780k rawFiles could send 780k manifest entries instead for 20x the stall
+  // (XERK-338 QA D7). The agent caps itself at ARCHIVE_MANIFEST_MAX; that is not
+  // this bound.
+  let list = Array.isArray(manifest) ? manifest : [];
+  if (list.length > ARCHIVE_MANIFEST_CURSOR_MAX) {
+    warnManifestCap(list.length - ARCHIVE_MANIFEST_CURSOR_MAX);
+    list = list.slice(0, ARCHIVE_MANIFEST_CURSOR_MAX);
+  }
   const upsert = db.prepare(`INSERT INTO sessions(
       transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
       summary, updatedAt)
@@ -1121,6 +1184,8 @@ function rebuildIndex() {
     // Same rule for the raw layer's budget: walked off its directory, never read
     // back from a sidecar. It is also what makes an operator's `rm -rf` of a raw
     // directory actually give the budget back, rather than only the disk.
+    // The whole suffix directory: it now holds one subdirectory per transcript
+    // (see rawDirFor), and a collided canonical file legitimately has two.
     const rawBytes = walkAllBytes(jsonl + RAW_DIR_SUFFIX);
     tx(() => {
       let msgCount = 0;
@@ -1145,7 +1210,8 @@ function rebuildIndex() {
 
 module.exports = {
   ARCHIVE_DIR, ARCHIVE_DB, ARCHIVE_TRANSCRIPT_MAX, ARCHIVE_TOTAL_MAX,
-  ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, RAW_DIR_SUFFIX,
+  ARCHIVE_RAW_TRANSCRIPT_MAX, ARCHIVE_RAW_CURSOR_MAX, ARCHIVE_MANIFEST_CURSOR_MAX,
+  RAW_DIR_SUFFIX,
   slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
   ingestChunk, manifestCursors, archiveLimits,

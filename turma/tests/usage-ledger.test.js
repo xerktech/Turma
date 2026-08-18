@@ -298,6 +298,38 @@ test("the serve budget truncates newest-first, loudly, without rendering the res
   const served = JSON.parse(fresh.stdout.trim().split("\n").pop());
   // The NEWEST survives a truncation: what is given up is the oldest history.
   assert.deepEqual(served, ["new"]);
+
+  // And rendering STOPS at the first drop rather than carrying on to see what
+  // else might fit. The observable difference needs THREE hosts: one that fits,
+  // one that overflows, and behind it a small old one that would fit in what is
+  // left. With the early exit the third is never reached; without it, it squeezes
+  // in. A two-host fixture cannot tell them apart (the first host is always kept,
+  // so the drop lands on the last one either way) — which is why deleting the
+  // guard left the suite green (XERK-338 QA D8).
+  //
+  // Sizes are measured, not guessed: 751 / 5088 / 419 bytes at these shapes, so
+  // a 1500-byte budget fits the first, is overflowed by the second, and has room
+  // for the third.
+  const squeeze = require("child_process").spawnSync(process.execPath, ["-e", `
+    const os = require("os"), fs = require("fs"), path = require("path");
+    process.env.USAGE_LEDGER_FILE = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "turma-squeeze-")), "l.json");
+    process.env.USAGE_LEDGER_SERVE_MAX = "1500";
+    const l = require(${JSON.stringify(path.join(__dirname, "..", "usage-ledger.js"))});
+    const b = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
+    const blk = () => ({ totals: b(5), today: b(0), week: b(5),
+      days: { "2026-08-18": b(5) }, sessions: 1, models: [] });
+    const rec = (dev, repos) => ({ device: dev, usage: blk(),
+      repoUsage: Array.from({ length: repos }, (_, i) =>
+        ({ repo: "r" + i, remoteKey: "rk" + i, remote: "", usage: blk() })) });
+    l.ingest("h3-old", rec("h3-old", 0), 1000);     // oldest, tiny, would fit
+    l.ingest("h2-mid", rec("h2-mid", 14), 5000);    // overflows the budget
+    l.ingest("h1-new", rec("h1-new", 1), 9000);     // newest, fits
+    console.log(JSON.stringify(l.retiredAgents([]).map((a) => a.device)));
+  `], { encoding: "utf8" });
+  assert.equal(squeeze.status, 0, squeeze.stderr);
+  assert.deepEqual(JSON.parse(squeeze.stdout.trim().split("\n").pop()), ["h1-new"],
+    "a small older host squeezed in behind a large newer one — the loop did not stop");
   // And it says so — a Usage page quietly missing a host reads as a fleet that
   // spent less, with nothing on screen to say otherwise.
   assert.match(fresh.stderr, /USAGE_LEDGER_SERVE_MAX/);

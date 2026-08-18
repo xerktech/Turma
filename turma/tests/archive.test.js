@@ -216,7 +216,7 @@ test.after(() => {
 const RAW_META = { ...META, summary: "Raw Layer", endedTs: "2026-07-11T01:00:00Z" };
 const rawRel = (tid) => archive.archiveRelPath(tid, { ...RAW_META, host: "nas" });
 const rawPath = (tid, rel) =>
-  path.join(process.env.ARCHIVE_DIR, rawRel(tid) + archive.RAW_DIR_SUFFIX, rel);
+  path.join(process.env.ARCHIVE_DIR, rawRel(tid) + archive.RAW_DIR_SUFFIX, tid, rel);
 
 function seedRaw(tid) {
   // The rendered layer creates the row the raw directory hangs off.
@@ -302,6 +302,44 @@ test("ingestRaw cannot be talked into writing outside its own directory", () => 
   // And an unknown transcript has no directory to write into at all.
   assert.equal(archive.ingestRaw("nas", "never-seen", "x.jsonl", 0, Buffer.from("x")).skip, true);
   assert.equal(fs.existsSync(dir + path.sep + "x.jsonl"), false);
+});
+
+test("only the session's OWN host may write its raw files", () => {
+  // `<host>` is proved by the credential at the gate, but proving WHO is calling
+  // says nothing about WHOSE session they may write into. With a properly bound
+  // token any agent could create arbitrary named files inside another host's
+  // archived session — and serve them back through the read-back route as part
+  // of that host's "byte-for-byte record" (XERK-338 QA D5).
+  seedRaw("owned");            // ingested as host "nas"
+  const evil = archive.ingestRaw("evil-host", "owned", "owned.jsonl", 0, Buffer.from("x"));
+  assert.equal(evil.skip, true);
+  assert.equal(fs.existsSync(rawPath("owned", "owned.jsonl")), false);
+  assert.equal(archive.ingestRaw("nas", "owned", "owned.jsonl", 0, Buffer.from("x")).stored, 1);
+});
+
+test("a MIGRATED session keeps writing raw as its new host", () => {
+  // The host that owns a transcript legitimately changes on a migration, so the
+  // ownership check above must not wedge the target out. The rendered delta is
+  // what re-points the row (`ingestChunk` sets `host`), and the beat pushes the
+  // rendered layer BEFORE the raw one — so by the time the target's raw push
+  // lands, the row is already its own. Held here so the ordering cannot drift.
+  archive.ingestChunk("srchost", "moved", { ...RAW_META, summary: "Moved" }, 0, 10,
+    [ent("u1", "user", "before the move")]);
+  const a = Buffer.from("first half\n");
+  assert.equal(archive.ingestRaw("srchost", "moved", "moved.jsonl", 0, a).stored, a.length);
+  // The move: the target carries the same transcript id and a byte-identical
+  // prefix, and its rendered push re-points the row.
+  assert.equal(archive.ingestRaw("tgthost", "moved", "moved.jsonl", a.length,
+    Buffer.from("x")).skip, true, "the target must not write before it owns the row");
+  archive.ingestChunk("tgthost", "moved", { ...RAW_META, summary: "Moved" }, 10, 20,
+    [ent("u2", "user", "after the move")]);
+  const b = Buffer.from("second half\n");
+  assert.equal(archive.ingestRaw("tgthost", "moved", "moved.jsonl", a.length, b).stored,
+    a.length + b.length);
+  // One file, continued — not a second copy.
+  const rel = archive.archiveRelPath("moved", { ...RAW_META, summary: "Moved", host: "srchost" });
+  const full = path.join(process.env.ARCHIVE_DIR, rel + archive.RAW_DIR_SUFFIX, "moved", "moved.jsonl");
+  assert.deepEqual(fs.readFileSync(full), Buffer.concat([a, b]));
 });
 
 test("the per-transcript raw ceiling stops that session, not the archive", () => {
@@ -394,6 +432,45 @@ test("the per-beat cursor stat loop is bounded by the HUB, not by the agent", ()
   // And the truncation is LOUD: silence would read as "the hub holds nothing",
   // which is a re-ship rather than a refusal.
   assert.match(fresh.stderr, /ARCHIVE_RAW_CURSOR_MAX/);
+});
+
+test("two transcripts sharing a canonical file do not share a raw directory", () => {
+  // `archiveRelPath` keeps only the first 8 alnum characters of the id, so two
+  // transcripts agreeing on repo/date/summary/host and that prefix land on ONE
+  // canonical .jsonl. Their raw layers must still be separate, or each one's
+  // /raw listing returns the other's files and the read-back route serves them
+  // (XERK-338 QA D6). `transcriptId` is agent-chosen, so this can be forced.
+  const A = "collide1-aaaa-bbbb-cccc-000000000001";
+  const B = "collide1-aaaa-bbbb-cccc-000000000002";
+  for (const tid of [A, B]) {
+    archive.ingestChunk("nas", tid, { ...RAW_META, summary: "Collide" }, 0, 10,
+      [ent("u1", "user", "hi")]);
+    archive.ingestRaw("nas", tid, `${tid}.jsonl`, 0, Buffer.from(tid));
+  }
+  // Same canonical file — the collision is real, not hypothetical.
+  const db = archive.openDb();
+  const rows = db.prepare("SELECT filePath FROM sessions WHERE transcriptId IN (?,?)").all(A, B);
+  assert.equal(rows[0].filePath, rows[1].filePath, "the fixture no longer collides");
+  // ...but each raw layer holds only its own file.
+  assert.deepEqual(archive.listRawFiles(A).map((f) => f.path), [`${A}.jsonl`]);
+  assert.deepEqual(archive.listRawFiles(B).map((f) => f.path), [`${B}.jsonl`]);
+  assert.deepEqual(fs.readFileSync(archive.rawFileFor(A, `${A}.jsonl`)), Buffer.from(A));
+  assert.equal(archive.rawFileFor(A, `${B}.jsonl`), null, "A served B's file");
+});
+
+test("a repo folder named like a raw directory is still archived", () => {
+  // `isRawDir` is `<name>.jsonl.raw` AND depth > 0. The depth half matters
+  // because a REPO FOLDER is a slugified repo name at depth 0 — a repo literally
+  // called `x.jsonl.raw` would otherwise have its whole archive skipped by the
+  // rebuild's walk and its bytes counted under the wrong rule. Dropping the
+  // depth check left the suite green before this (XERK-338 QA D9).
+  const meta = { ...RAW_META, repo: "x.jsonl.raw", summary: "Edge Repo" };
+  archive.ingestChunk("nas", "edgerepo", meta, 0, 10, [ent("u1", "user", "hi")]);
+  const rel = archive.archiveRelPath("edgerepo", { ...meta, host: "nas" });
+  assert.equal(rel.split(path.sep)[0], "x.jsonl.raw", "the fixture no longer names the edge case");
+  const walked = archive.__walkJsonl();
+  assert.ok(walked.some((f) => f.endsWith(rel)),
+    "the rebuild walk skipped a REPO folder that merely looks like a raw directory");
 });
 
 test("listRawFiles and rawFileFor read the layer back", () => {

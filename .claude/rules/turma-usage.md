@@ -167,6 +167,14 @@ paths:
 
 ### Bounds
 
+- **`models` is capped (`USAGE_LEDGER_MODELS`) and every agent-supplied NAME is length-bounded**, and
+  each host is held to a **share of the store** (`LEDGER_MAX / LEDGER_HOSTS`) by giving up day
+  GRANULARITY — trimmed days fold into `pre`, so a host over its share loses the shape of its history
+  and never its all-time total. Without all three, the store grew on agent strings across BEATS while
+  the per-record ceiling only ever bounded ONE beat: 56,000 distinct model names over 40 legal beats
+  took the file past `LEDGER_MAX`, and `evictOverflow` — which can drop only whole hosts, and refuses
+  to drop the last one — sacrificed the INNOCENT hosts and then left an over-limit file that the next
+  boot discarded entirely. One host destroyed the whole fleet's history.
 - Every ceiling is a **fraction of the container limit** (`USAGE_LEDGER_MAX`, a 32nd, clamped
   2–8 MiB), like every other hub bound: the ledger is held in memory and re-serialized whole on each
   save, so a flat number above `mem_limit` could never refuse anything before the OOM killer fires.

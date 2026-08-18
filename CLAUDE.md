@@ -210,6 +210,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   `/api/agents`; a live host that has lost transcripts is served the recorded history raised by its
   own report. It spans `turma/usage-ledger.js`, `turma/server.js`, `turma/public/usage.html` and
   `android/`, so no `paths:`-scoped file sees every side of it.
+  - **`retired` is HUB-OWNED and coerced off every heartbeat** (`normalizeRetired`). Android TYPES it,
+    and a full `/api/agents` decode is atomic there, so an agent putting `retired:"yes"` on its own
+    beat emptied every OTHER host from every phone's fleet list — and it persisted into `state.json`.
+    Typing a field on `AgentInfo` and adding its hub-side coercion are the SAME change.
   - **Only the Usage surfaces may read `retiredUsage`.** Its entries are agent-SHAPED so those two
     can chart them with the code they already have, and they carry no sessions, repos or commands —
     anything else treating one as a host invents a host that does not exist.

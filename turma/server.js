@@ -1306,7 +1306,13 @@ const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
 // ever decompressed. The agent's own read window must stay at or under CHUNK, or
 // every push it makes is refused.
 const ARCHIVE_RAW_CHUNK_MAX = 1 << 22;   // 4 MiB decompressed
-const ARCHIVE_RAW_BODY_MAX = 1 << 22;    // 4 MiB on the wire
+// The wire cap has to clear the worst case of gzipping a full chunk, not equal
+// it. gzip EXPANDS incompressible input (~+0.03%: a measured 4 MiB of urandom
+// came out at 4,195,602 bytes), so an equal cap made any session file holding
+// 4 MiB of already-compressed bytes impossible to push — permanently, and,
+// because a failed push aborted the whole pass, it stopped the raw sync for
+// every OTHER transcript on that host too (XERK-338 QA D2).
+const ARCHIVE_RAW_BODY_MAX = ARCHIVE_RAW_CHUNK_MAX + (1 << 16);
 // **The bundle NEVER rides in the record** (XERK-263). At 65 MiB a pair of
 // concurrent moves — two clicks of the Sessions page's Move control — would
 // retain 130 MiB in a hub running at mem_limit 256m, so the relay spools each
@@ -3296,6 +3302,27 @@ function normalizeRecord(a) {
   normalizeSubscription(a);
   normalizeLocalModel(a);
   normalizeSpawnRefusals(a);
+  normalizeRetired(a);
+}
+
+/**
+ * `retired` is a HUB-OWNED flag, never an agent's to set (XERK-338).
+ *
+ * It exists on `AgentsResponse.retiredUsage` entries, which the hub builds
+ * itself; a record that came off the wire is by definition a live host and must
+ * carry `false`. Android TYPES it (`AgentInfo.retired: Boolean`), and typing a
+ * field and adding its hub-side coercion are the SAME change — without this an
+ * agent putting `retired: "yes"` on its own beat had that value served verbatim,
+ * and since a full `/api/agents` decode is ATOMIC on Android, ONE host threw for
+ * the WHOLE array and emptied every other host from every phone's fleet list.
+ * It persisted into `state.json` too, so it survived a restart.
+ *
+ * Deleted rather than coerced to `false`: the field is not part of an agent
+ * record's shape at all, and `false` is already what an absent one decodes to.
+ */
+function normalizeRetired(a) {
+  if (!a || typeof a !== "object") return;
+  if ("retired" in a) delete a.retired;
 }
 
 /**
@@ -3924,7 +3951,12 @@ function readRawBody(req, cap) {
         if (len > drainLimit) req.destroy();
         return;
       }
-      if (len > cap) return refuse(new Error("body too large"));
+      // BodyTooLarge, like readBody (and spoolRawBody): callers test `.tooLarge`
+      // to tell "your body is too big, send less" (413) from "the hub is
+      // momentarily full, send it again" (503), and those must not collapse.
+      // A plain Error left BOTH this reader's callers — the archive raw ingest
+      // and the migration blob relay — answering 400 for an oversized body.
+      if (len > cap) return refuse(new BodyTooLarge(cap));
       if (len > held) {
         const next = laneForCharge(lane, len - held);
         if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
@@ -7059,6 +7091,16 @@ const server = http.createServer(async (req, res) => {
       const key = decodeURIComponent(parts[2]);
       const transcriptId = decodeURIComponent(parts[4]);
       if (!/^[A-Za-z0-9._-]+$/.test(transcriptId)) return json(res, 400, { error: "bad transcriptId" });
+      // A raw push whose <file> segment was an unencoded `.`/`..` has had that
+      // segment normalised away by the URL parser and arrives HERE, on the
+      // rendered route, with a gzip body. No privilege is gained (the auth gate
+      // reads the same normalised path), but answering the JSON parser's
+      // complaint about a binary body is a confusing way to say "you built that
+      // URL wrong" — so name it (XERK-338 QA).
+      if ((req.headers["content-type"] || "").includes("gzip")) {
+        return json(res, 400, { error: "gzip body on the rendered archive route — " +
+          "percent-encode the raw file path into a single segment" });
+      }
       const body = JSON.parse((await readBody(req)) || "{}");
       try {
         const r = archive.ingestChunk(
@@ -7100,10 +7142,23 @@ const server = http.createServer(async (req, res) => {
       try {
         gz = await readRawBody(req, ARCHIVE_RAW_BODY_MAX);
       } catch (e) {
+        // 413 and 503 mean opposite things and must not be collapsed: on a 503
+        // the agent retries, on a 413 it must not. `budgetExceeded` is the flag
+        // the reader actually sets — `overloaded` was never set by anything.
         if (e && e.tooLarge) return json(res, 413, { error: e.message });
-        if (e && e.overloaded) return json(res, 503, { error: e.message });
+        if (e && e.budgetExceeded) return json(res, 503, { error: e.message });
         return json(res, 400, { error: "could not read body" });
       }
+      // The DECOMPRESSED buffer is charged to the in-flight body budget for its
+      // lifetime. `readRawBody` released its own charge the moment the socket
+      // finished, so without this the peak is `in-flight + held uploads + N
+      // concurrent gunzip outputs` — the same unaccounted-third-term shape
+      // CLAUDE.md already records as XERK-287, and the reason a bounded
+      // `maxOutputLength` alone is not a bound on the HUB (it bounds one call).
+      // Refused, not queued: a 503 is what an agent retries.
+      const lane = bodyLaneFor(ARCHIVE_RAW_CHUNK_MAX);
+      if (!lane) return json(res, 503, { error: "hub is busy; retry" });
+      chargeBody(ARCHIVE_RAW_CHUNK_MAX, lane);
       let buf;
       try {
         buf = gz.length ? zlib.gunzipSync(gz, { maxOutputLength: ARCHIVE_RAW_CHUNK_MAX })
@@ -7113,6 +7168,8 @@ const server = http.createServer(async (req, res) => {
         // chunk to retry — but it answers 400 rather than the cursor protocol's
         // "no progress", because the agent has nothing to realign to.
         return json(res, 400, { error: "body is not gzip within the size limit" });
+      } finally {
+        releaseBody(ARCHIVE_RAW_CHUNK_MAX, lane);
       }
       try {
         return json(res, 200, archive.ingestRaw(key, transcriptId, rel, start, buf));
@@ -7394,7 +7451,6 @@ const server = http.createServer(async (req, res) => {
         "Content-Disposition": `attachment; filename="${archive.slugify(rel, "raw")}"`,
         "Cache-Control": "no-store",
       });
-      if (req.method === "HEAD") return res.end();
       return void fs.createReadStream(full)
         .on("error", () => res.destroy())
         .pipe(res);
@@ -9012,6 +9068,7 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    normalizeRetired,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported

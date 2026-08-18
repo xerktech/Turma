@@ -266,6 +266,11 @@ ARCHIVE_RAW_BEAT_BUDGET = 1 << 24   # ~16 MiB of raw bytes per sync pass
 # it is unbounded in principle; the manifest rides the heartbeat, so it is capped
 # here rather than left to HEARTBEAT_MAX to refuse the whole beat. What is left
 # out is offered on a later pass, since the cap applies newest-transcript-first.
+# Failed pushes tolerated in one pass before it gives up until the next beat.
+# One unpushable file must not cost the other transcripts (a `return` here did
+# exactly that), and a hub that is actually down must not have every file on the
+# host thrown at it either.
+ARCHIVE_RAW_FAILURES_MAX = 3
 ARCHIVE_RAW_FILES_MAX = 200
 ARCHIVE_RAW_MANIFEST_FILES_MAX = 2000
 def _byte_ceiling(raw, fallback):
@@ -13489,6 +13494,7 @@ class SessionManager:
             return
         skip = set(skip_ids or ())
         budget = ARCHIVE_RAW_BEAT_BUDGET
+        failures = 0
         for tid, m in list(self._archive_pending.items()):
             if budget <= 0:
                 return
@@ -13526,7 +13532,19 @@ class SessionManager:
                         break
                     reply = self._post_archive_raw(tid, rel, have, raw)
                     if reply is None:
-                        return   # POST failed; the next manifest re-offers it
+                        # This FILE failed. Move to the next one rather than
+                        # abandoning the pass: a file the hub can never accept
+                        # (it was over the wire cap once — XERK-338 QA D2) sits
+                        # newest-first in the manifest, so aborting here stopped
+                        # the raw sync for every OTHER transcript on this host,
+                        # every beat, forever. A genuinely down hub trips the
+                        # budget below instead and stops the pass anyway.
+                        failures += 1
+                        if failures >= ARCHIVE_RAW_FAILURES_MAX:
+                            log("archive raw: too many failed pushes this pass; "
+                                "stopping until the next beat")
+                            return
+                        break
                     if reply.get("full"):
                         log("archive store is full at the hub; stopping the raw pass")
                         return

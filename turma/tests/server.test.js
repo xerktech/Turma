@@ -160,7 +160,7 @@ const {
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
-  usageLedger,
+  usageLedger, normalizeRetired,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -1926,6 +1926,29 @@ function rawPush(host, tid, rel, start, buf, headers) {
   });
 }
 const gz = (s) => zlib.gzipSync(Buffer.from(s));
+
+test("http: an agent cannot put `retired` on its own record (XERK-338)", async () => {
+  // `retired` marks a hub-BUILT `retiredUsage` entry. Android types it as a
+  // Boolean and a full /api/agents decode is ATOMIC there, so one host serving
+  // `retired:"yes"` threw for the WHOLE array — every OTHER host vanished from
+  // every phone's fleet list, and it persisted into state.json so a restart did
+  // not clear it. Typing a field and coercing it hub-side are one change.
+  for (const bad of ["yes", 1, 0, {}, [], null, true]) {
+    const r = await request("POST", "/api/heartbeat", {
+      body: { device: "retired-forger", retired: bad }, headers: agentHeaders,
+    });
+    assert.equal(r.status, 200);
+    const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+      .body.agents.find((a) => a.key === "retired-forger");
+    assert.equal("retired" in rec, false, `served retired for ${JSON.stringify(bad)}`);
+  }
+  // The restore runs the same coercion, since state.json is served before any
+  // host re-beats and a restart is exactly when a coercion ships.
+  const restored = { device: "retired-forger", retired: "yes" };
+  normalizeRetired(restored);
+  assert.equal("retired" in restored, false);
+  delete agents["retired-forger"];
+});
 
 test("http: a raw push is agent-authed and lands byte for byte", async () => {
   // tr1 was ingested by the rendered-layer test above, so its row (and the

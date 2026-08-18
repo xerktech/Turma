@@ -89,6 +89,26 @@ const LEDGER_REPOS = positiveEnv("USAGE_LEDGER_REPOS", 100);
 // ceiling below is the bound that actually holds — a count so high that the bytes
 // always decide it first is not a second bound, just a slower one.
 const LEDGER_HOSTS = positiveEnv("USAGE_LEDGER_HOSTS", 32);
+// Models kept per series, and the longest a model/repo name may be.
+//
+// These are the ONLY things here that grow on agent-supplied STRINGS, and the
+// per-record ceiling does not bound them: it bounds one beat, where this store
+// accumulates across beats forever. Measured: 56,000 distinct model names over
+// 40 beats — each beat well inside the record cap — grew the file to 9.8 MB,
+// past LEDGER_MAX, and `evictOverflow` can only drop WHOLE HOSTS, so it
+// sacrificed the innocent ones and then refused to load at all on the next boot.
+// One host destroyed the entire fleet's durable history (XERK-338 QA D3).
+//
+// A real login reports a handful of models; 64 is far past any of them.
+const LEDGER_MODELS = positiveEnv("USAGE_LEDGER_MODELS", 64);
+// One host's share of the store, derived like the registry's AGENT_FAIR_SHARE.
+// This is what makes the aggregate hold BY CONSTRUCTION: without it the only
+// backstop was `evictOverflow`, which can drop whole hosts only — so a single
+// bloated host pushed the file past LEDGER_MAX, took the INNOCENT hosts with it
+// (least-recently-seen first), refused to drop itself (`keys.length > 1`), and
+// left an over-limit file that the next boot discarded entirely (QA D3).
+const hostShare = () => Math.max(64 << 10, Math.floor(LEDGER_MAX / LEDGER_HOSTS));
+const LEDGER_NAME_MAX = positiveEnv("USAGE_LEDGER_NAME_MAX", 200);
 
 // The ledger is held in memory and serialized whole on every save, so it is
 // bounded as a FRACTION OF THE CONTAINER, like every other hub ceiling — a flat
@@ -189,6 +209,15 @@ function weekWindow(now) {
 // One usage block reduced to what this store reads. Built fresh throughout: the
 // input is the live registry record, which must never be aliased, let alone
 // mutated, by anything downstream.
+// An agent-supplied name, bounded. Cut on CODE POINTS so a slice cannot
+// manufacture a lone surrogate out of an astral pair, and refused outright for
+// `__proto__` — this value is used as a MAP KEY on both sides of the wire.
+function boundedName(v) {
+  if (typeof v !== "string" || !v) return "";
+  const out = [...v].slice(0, LEDGER_NAME_MAX).join("");
+  return out === "__proto__" ? "" : out;
+}
+
 function usageOf(u) {
   if (!u || typeof u !== "object") return null;
   const days = {};
@@ -199,8 +228,9 @@ function usageOf(u) {
   if (Array.isArray(u.models)) {
     for (const m of u.models) {
       if (!m || typeof m !== "object" || typeof m.model !== "string" || !m.model) continue;
-      if (m.model === "__proto__") continue;
-      models[m.model] = { totals: bucketOf(m.totals), today: bucketOf(m.today), week: bucketOf(m.week) };
+      const name = boundedName(m.model);
+      if (!name) continue;
+      models[name] = { totals: bucketOf(m.totals), today: bucketOf(m.today), week: bucketOf(m.week) };
     }
   }
   return {
@@ -227,12 +257,10 @@ function reposOf(list) {
     if (!r || typeof r !== "object") continue;
     const usage = usageOf(r.usage);
     if (!usage) continue;
-    const repo = typeof r.repo === "string" ? r.repo : "";
-    const remoteKey = (typeof r.remoteKey === "string" && r.remoteKey) || repo;
-    if (!remoteKey || remoteKey === "__proto__") continue;
-    out.push({
-      repo, remoteKey, remote: typeof r.remote === "string" ? r.remote : "", usage,
-    });
+    const repo = boundedName(r.repo);
+    const remoteKey = boundedName(r.remoteKey) || repo;
+    if (!remoteKey) continue;
+    out.push({ repo, remoteKey, remote: boundedName(r.remote), usage });
   }
   return out;
 }
@@ -262,8 +290,12 @@ function seriesOf(raw) {
     for (const [d, b] of Object.entries(raw.days)) if (isoDay(d)) s.days[d] = bucketOf(b);
   }
   if (raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)) {
-    for (const [m, b] of Object.entries(raw.models)) if (m && m !== "__proto__") s.models[m] = bucketOf(b);
+    for (const [m, b] of Object.entries(raw.models)) {
+      const name = boundedName(m);
+      if (name) s.models[name] = bucketOf(b);
+    }
   }
+  trimModels(s);
   if (raw.subagent) s.subagent = bucketOf(raw.subagent);
   if (isoDay(raw.cutoff)) s.cutoff = raw.cutoff;
   s.sessions = num(raw.sessions);
@@ -297,6 +329,19 @@ function cloneSeries(s) {
   out.sessions = s.sessions;
   out.lastActivity = s.lastActivity;
   return out;
+}
+
+// Hold a series' model map to its cap, biggest spender first. Unlike a trimmed
+// DAY, a dropped model is not folded anywhere: it is a BREAKDOWN of totals that
+// are kept in full elsewhere, so dropping the smallest loses a row of detail and
+// no spend. Silent by design — at 64 models the breakdown is already unreadable,
+// and this fires on every beat from a host that got there.
+function trimModels(s) {
+  const keys = Object.keys(s.models);
+  if (keys.length <= LEDGER_MODELS) return s;
+  keys.sort((a, b) => bucketTokens(s.models[b]) - bucketTokens(s.models[a]));
+  for (const m of keys.slice(LEDGER_MODELS)) delete s.models[m];
+  return s;
 }
 
 function seriesTotals(s) {
@@ -355,6 +400,7 @@ function absorb(s, u) {
     if (bucketExceeds(s.subagent, u.subagent.totals)) augments = true;
     raiseBucket(s.subagent, u.subagent.totals);
   }
+  trimModels(s);
   if (u.sessions > s.sessions) s.sessions = u.sessions;
   else if (u.sessions < s.sessions) augments = true;
   if (u.lastActivity && (!s.lastActivity || u.lastActivity > s.lastActivity)) {
@@ -474,6 +520,49 @@ function load() {
   }
 }
 
+/**
+ * Hold ONE host to its share of the store, by giving up day GRANULARITY.
+ *
+ * Trimmed days fold into `pre`, so what a host over its share loses is the shape
+ * of its history, never the all-time total — which is the figure the ticket is
+ * actually about. That is why this trims instead of evicting: a host being large
+ * is not a reason to forget what it spent.
+ *
+ * Bounded by construction (the day window at least halves each round), and it
+ * measures the SERIALIZED size because that is what the file and the ceiling are
+ * denominated in.
+ */
+function enforceHostShare(key, entry) {
+  const share = hostShare();
+  let size;
+  try { size = JSON.stringify(entry).length; } catch { return; }
+  if (size <= share) return;
+  const before = size;
+  const seriesOfEntry = () =>
+    [entry.host, ...Object.values(entry.repos).map((r) => r.series)].filter(Boolean);
+  let guard = 0;
+  while (size > share && guard++ < 40) {
+    let trimmed = false;
+    for (const s of seriesOfEntry()) {
+      const days = Object.keys(s.days).sort();
+      if (!days.length) continue;
+      for (const d of days.slice(0, Math.max(1, Math.ceil(days.length / 2)))) {
+        addBucket(s.pre, s.days[d]);
+        delete s.days[d];
+        if (!s.cutoff || d > s.cutoff) s.cutoff = d;
+        trimmed = true;
+      }
+    }
+    if (!trimmed) break;   // nothing left to give up
+    try { size = JSON.stringify(entry).length; } catch { return; }
+  }
+  console.warn(
+    `usage ledger: ${logName(key)} was ${before} bytes, over its ${share}-byte ` +
+      `share — dropped per-day detail down to ${size}. Its all-time totals are ` +
+      `unchanged (trimmed days fold into the running total).`
+  );
+}
+
 // Least-recently-seen first, until both the count and the byte ceilings hold. A
 // host still beating has `lastSeen` of now, so what goes is always the oldest
 // retired history — the only thing here that can be given up.
@@ -485,6 +574,13 @@ function evictOverflow() {
   while (blob !== null && blob.length > LEDGER_MAX && keys.length > 1) {
     delete hosts[keys.shift()];
     dropped += 1;
+    blob = serialize();
+  }
+  // Down to the last host and STILL over: give up its day detail rather than
+  // write a file the next boot will refuse outright. Reachable only from a
+  // restored file that predates the per-host share above.
+  if (blob !== null && blob.length > LEDGER_MAX && keys.length === 1) {
+    enforceHostShare(keys[0], hosts[keys[0]]);
     blob = serialize();
   }
   if (dropped) {
@@ -620,6 +716,7 @@ function ingest(key, record, now = Date.now()) {
   // point — which also means this host can never again be served raw.
   for (const k of Object.keys(entry.repos)) if (!reported.has(k)) augments = true;
   trimRepos(key, entry);
+  enforceHostShare(key, entry);
   entry.augments = augments;
   if (augments || fresh) scheduleSave(); else scheduleSnapshot();
 }
