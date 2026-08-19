@@ -63,16 +63,31 @@ process model and the command table.
   **A ticket spawn waiting for a SLOT is not one of those**: it waits in the hub's ticket queue
   (`CLAUDE.md`), so a host takes one only when it can start it. One can still land here if a host
   fills between the hub's capacity read and its next beat — a race, not the normal path.
-- **A repo is forkable when its HEAD RESOLVES, never when `.git` exists** (XERK-343). `git clone`
-  creates `<dest>/.git` with an unborn HEAD before it fetches an object, so a repo is in
+- **A repo is forkable when it has a commit to detach at, never when `.git` exists** (XERK-343).
+  `git clone` creates `<dest>/.git` with an unborn HEAD before it fetches an object, so a repo is in
   `scan_repos()` — and offerable in the composer — for the whole length of its own clone, and
-  detaching a worktree in that window dies with `fatal: invalid reference: HEAD`. `repo_head_ready`
-  is the gate, at the spawn (queue as **awaiting-clone**, whether or not the clone is ours) and at
-  the drain (hold until it resolves). It fails OPEN — "can't tell" must degrade to git's own error,
-  never to a session queued forever — and `awaitCloneSince` bounds a wait no clone job of ours is
-  driving, so an empty repo ends as an error card instead.
+  detaching a worktree in that window dies with `fatal: invalid reference: HEAD`. `repo_forkable`
+  gates the spawn and the drain release.
+  - **It is not `repo_head_ready`, and the difference is a regression that already happened**: a
+    repo whose local HEAD is unborn over a live `origin/<default>` — an orphan checkout, a
+    hand-bootstrapped `init`+`fetch` — forks fine, and gating on HEAD refused it. `repo_forkable`
+    mirrors `resolve_base_ref` minus its fetch. `_worktree_add`'s pre-flight is the one place
+    `repo_head_ready` is right, because it only fires when it is about to detach at HEAD.
+  - **Only a clone of OURS turns unforkable into a wait** (`_cloning`). Nothing the agent does fixes
+    an empty repo, and `awaiting-clone` renders as "cloning the repo first" on all five clients — a
+    lie for anything else. The rest fall through to that pre-flight and land as an error card
+    naming the cause.
+  - `repo_head_ready` fails OPEN: "can't tell" must degrade to git's own error, never to a session
+    queued forever.
+  - **In the drain, the deadline is checked BEFORE the re-clone**, and neither runs while a clone
+    job is live (`_poll_clones` bounds that one). `clone()` files a refusal under `slugify(spec)`,
+    so a 3-segment GitLab/ADO spec lands under a key the job lookup can't see — behind an `elif`
+    that retried every beat and `awaitCloneSince` never bounded anything.
+  - **A clone dir already on disk is waited on, never re-triggered.** A clone outlives the manager
+    that launched it, so the restart-mid-clone case finishes by itself; `clone()` refuses an
+    existing dest, which turned it into a failed session plus a bogus clone-error card per beat.
 - **`scan_repos()` deliberately still lists a repo mid-clone**: the check costs a `git` per repo per
-  beat and the wait above already covers it. Don't move it there.
+  beat and the gates above already cover it. Don't move it there.
 - Tests: `TestSessionLifecycle`, `TestSpawnTicket`, `TestSpawnDuringAnUnfinishedClone`,
   `TestRepoHeadReady` in `test_hub_agent.py`; `sessions.test.js`.
 

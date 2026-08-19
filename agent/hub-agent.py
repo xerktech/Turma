@@ -939,6 +939,10 @@ def local_model_env_pairs():
 # anything matching is also validated below for the few remaining git rules.
 _REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
+# C0 controls and DEL, minus nothing: git_error_text has already split on
+# newlines, so anything left here is an escape sequence or a stray NUL.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
 
 def valid_ref_name(ref):
     """Defensive allowlist for a git branch/ref name we interpolate into a
@@ -1958,14 +1962,50 @@ def repo_head_ready(repo_path):
     return rc == 0 and bool(out)
 
 
+def repo_forkable(repo_path, base_ref=None):
+    """Whether a session on this repo would have a commit to detach at, asked
+    WITHOUT the network — the same question `_worktree_add` is about to ask, so
+    the spawn gate and the worktree add can't disagree (XERK-343).
+
+    Mirrors resolve_base_ref minus its fetch: an explicit base has to resolve,
+    and a blank one falls back exactly as default_base_ref does. A resolving
+    HEAD alone is enough (that is what `--detach` with no ref takes), but it is
+    NOT required — a repo whose local HEAD is unborn while origin/<default> sits
+    right there forks fine, and gating on HEAD alone refused it. Skipping the
+    fetch only ever under-counts refs a fetch would ADD, and naming a default
+    branch at all already needs origin/HEAD or a local main/master."""
+    base_ref = (base_ref or "").strip()
+    if base_ref and base_ref != "HEAD":
+        # A badly-NAMED base is a bad option, not an unready repo — hand it
+        # straight to resolve_base_ref, which fails it as an error card. One
+        # that is merely absent still waits: a clone lands it.
+        if not valid_ref_name(base_ref):
+            return True
+        return branch_exists(repo_path, base_ref)
+    if repo_head_ready(repo_path):
+        return True
+    name = default_branch_name(repo_path)
+    if not name or not valid_ref_name(name):
+        return False
+    return (branch_exists(repo_path, f"refs/remotes/origin/{name}")
+            or branch_exists(repo_path, f"refs/heads/{name}"))
+
+
 def git_error_text(err, limit=300):
     """git's stderr with its advice block stripped, for an error an operator
     reads. `hint:` lines are guidance for a human at a terminal — seven of them
     buried the one line that mattered ("fatal: invalid reference: HEAD") in the
-    message Turma showed for a failed session start (XERK-343)."""
+    message Turma showed for a failed session start (XERK-343).
+
+    Over-length keeps the TAIL: git states the cause last, so trimming the head
+    is what preserves the `fatal:` line. Control bytes go too — this string ends
+    up in an operator-facing record, and git interpolates paths into it."""
     lines = [ln.strip() for ln in (err or "").splitlines()
              if ln.strip() and not ln.lstrip().startswith("hint:")]
-    return " ".join(lines)[:limit] or "no error output"
+    text = _CONTROL_CHARS_RE.sub(" ", " ".join(lines)).strip()
+    if limit is not None and limit >= 0 and len(text) > limit:
+        text = ("…" + text[-(limit - 1):]) if limit else ""
+    return text or "no error output"
 
 
 def branch_sync(repo_path, branch, base_ref):
@@ -11429,13 +11469,20 @@ class SessionManager:
                 else:
                     log(f"spawn refused: unknown repo {repo_name!r}")
                     return
-            elif not repo_head_ready(repo["path"]):
-                # The dir IS a git repo but not a forkable one yet — all but
-                # always a clone still running, since git creates <dest>/.git
-                # first and writes the branch ref last, putting the repo in the
-                # scan (and in the composer) for the whole clone (XERK-343).
-                # Wait for it exactly like a session whose repo hasn't landed at
-                # all, instead of provisioning into `invalid reference: HEAD`.
+            elif self._cloning(repo_name) and not repo_forkable(repo["path"],
+                                                                base_ref):
+                # The dir IS a git repo but has nothing to fork from yet, and a
+                # clone of ours is why: git creates <dest>/.git before it fetches
+                # an object, so the repo is in the scan (and in the composer) for
+                # the whole clone (XERK-343). Wait for it exactly like a session
+                # whose repo hasn't landed at all, instead of provisioning into
+                # `invalid reference: HEAD`.
+                #
+                # A not-forkable repo with no clone of ours behind it is NOT this
+                # case and must not borrow the wait: nothing here will fix an
+                # empty repo, and "cloning the repo first" is a lie about a clone
+                # run outside Turma. Those fall through to _worktree_add's
+                # pre-flight, which says what is wrong on an error card now.
                 awaiting_clone = True
         # Decide run-now vs queue HERE, before the record is appended, so the
         # counts don't include the session we're about to add (a root session
@@ -11583,7 +11630,7 @@ class SessionManager:
             sess["status"] = "running"
             # Shed the queue markers — the record is a live session now.
             for k in ("queuedReason", "queuedAt", "awaitClone",
-                      "awaitCloneOwner", "awaitCloneSince"):
+                      "awaitCloneOwner", "awaitCloneSince", "awaitCloneRetried"):
                 sess.pop(k, None)
             if ticket_detail is not None:
                 # A ticket session's prompt is built HERE rather than at spawn,
@@ -11637,12 +11684,14 @@ class SessionManager:
                 if self._root_running():
                     continue  # the one root slot is still taken
             elif sess.get("awaitClone"):
-                # Readiness is a HEAD that RESOLVES, never the .git entry: git
-                # clone creates that first and writes the branch ref last, so a
-                # `.git`-only check released the session mid-clone and provisioned
-                # it into `fatal: invalid reference: HEAD` (XERK-343).
-                if not repo_head_ready(sess["repoPath"]):
+                # Readiness is "has this repo something to fork from", never the
+                # .git entry: git clone creates that before it fetches an object,
+                # so a `.git`-only check released the session mid-clone and
+                # provisioned it into `fatal: invalid reference: HEAD` (XERK-343).
+                if not repo_forkable(sess["repoPath"],
+                                     sess.get("_pendingBaseRef")):
                     job = self.clones.get(sess["awaitClone"])
+                    cloning = (job or {}).get("status") == "cloning"
                     if job and job.get("status") == "error":
                         # The repo will never arrive — fail the session rather
                         # than wait forever. (A terminal clone job lingers briefly
@@ -11650,20 +11699,34 @@ class SessionManager:
                         self._set_error(
                             sess, f"clone of {sess['awaitClone']} failed: "
                                   f"{job.get('error') or 'unknown error'}")
-                    elif not job and sess.get("awaitCloneOwner"):
-                        # No job at all: the clone was lost to a manager restart
-                        # mid-flight. Re-trigger it from the owner we stored.
-                        self.clone(sess["awaitCloneOwner"])
-                    elif not job and self._await_clone_expired(sess):
-                        # Nothing of ours is bringing this repo up (a clone run by
-                        # hand outside Turma, or a repo with no commits at all),
-                        # and it still isn't forkable. A live clone job needs no
-                        # deadline here — _poll_clones reaps it and the error
-                        # branch above ends the wait.
+                    elif not cloning and self._await_clone_expired(sess):
+                        # Nothing of ours is actively bringing this repo up and it
+                        # still isn't forkable. Checked BEFORE the re-trigger
+                        # below, not after: `clone()` files a refusal under
+                        # slugify(spec), so a 3-segment GitLab/ADO spec lands
+                        # under a key this lookup can't see — and behind an elif,
+                        # that retried forever and this bound never ran.
+                        # A LIVE clone job needs no deadline of its own:
+                        # _poll_clones reaps it and the error branch ends the wait.
                         self._set_error(
                             sess, f"{sess['awaitClone']} still has no commit to "
                                   f"fork from — an unfinished clone, or a repo "
                                   f"with no commits yet")
+                    elif (not job and sess.get("awaitCloneOwner")
+                          and not sess.get("awaitCloneRetried")
+                          and not os.path.exists(sess["repoPath"])):
+                        # No job and nothing on disk: the clone was lost to a
+                        # manager restart before it wrote anything. Re-trigger it
+                        # from the owner we stored, ONCE.
+                        #
+                        # With the dir already there we WAIT instead. A clone
+                        # outlives the manager that launched it (it is its own
+                        # process), so the common restart-mid-clone case finishes
+                        # by itself — while `clone()` refuses a dest that exists,
+                        # which turned that survivable case into a failed session
+                        # and a bogus clone-error card every single beat.
+                        sess["awaitCloneRetried"] = True
+                        self.clone(sess["awaitCloneOwner"])
                     continue
             self._provision_session(sess)
             return  # one per beat
@@ -11788,7 +11851,8 @@ class SessionManager:
         # (when the repo already exists) reserve the branch name against it.
         detail = fetch_board_issue(key)
         branch_base = ticket_branch_base(key, detail)
-        branch = self._reserve_ticket_branch(repo["path"], branch_base) if repo else None
+        branch = (self._reserve_ticket_branch(repo["path"], branch_base)
+                  if repo and repo_forkable(repo["path"]) else None)
         ticket = {
             "key": key,
             "siteKey": site_key,
@@ -14904,6 +14968,11 @@ class SessionManager:
             log(f"cloned {job['repo']} -> {job['name']}")
         else:
             log(f"clone failed for {job['repo']}: {job.get('error')}")
+
+    def _cloning(self, repo_name):
+        """Whether a clone THIS manager launched is running for <repo_name>. The
+        only thing that makes an unforkable repo a wait rather than an error."""
+        return (self.clones.get(repo_name) or {}).get("status") == "cloning"
 
     def _poll_clones(self):
         """Reap finished `git clone` subprocesses and drop stale terminal jobs.
