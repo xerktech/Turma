@@ -11319,6 +11319,22 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
         self.assertIn("cloned with no commits", sess["errorMsg"])
         self.assertNotIn("remove it", sess["errorMsg"])
 
+    def test_a_failed_clone_reports_its_own_error(self):
+        # The operator's only accurate cause for a failed clone. Unpinned, the
+        # branch could go and the session would silently degrade to a re-clone
+        # and a 600s deadline instead.
+        sm = self._manager()
+        sm.clones["gdt-files"].update(status="error",
+                                      error="repository not found")
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("clone of gdt-files failed", sess["errorMsg"])
+        self.assertIn("repository not found", sess["errorMsg"])
+
     def test_a_wait_with_no_owner_never_takes_the_re_clone_branches(self):
         # Without an owner there is nothing to re-clone from, so neither the
         # refused-re-clone message nor a clone(None) may fire — it waits out
