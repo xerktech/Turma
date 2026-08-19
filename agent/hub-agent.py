@@ -699,6 +699,83 @@ def _pid_alive(pid):
         return False
 
 
+# --- leaked Claude Code inbox sockets (XERK-341) -------------------------------
+# Claude Code binds one cross-session inbox socket per session at
+# <sockets-dir>/<pid>.sock and unlinks it on a CLEAN shutdown only, so every
+# session that is killed, OOMed or stopped with its container leaves the file
+# behind for good. A host that multiplexes sessions for months accumulates one
+# dead entry per session it has ever run — 9,236 dead against 9 live on the
+# first host that was looked at. Nothing is functionally broken by it (Claude's
+# own registry under ~/.claude/sessions self-heals, and a stale socket is never
+# adopted), but the directory sits on the path every NEW session's bind walks
+# and costs lookups and inodes on /tmp, so the manager sweeps it on the slow
+# cadence exactly as it already sweeps uploads.
+CC_SOCK_SWEEP = os.environ.get("TURMA_CC_SOCK_SWEEP", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+# Only "<pid>.sock" is ever a candidate, and only directly inside one of
+# cc_socket_dirs(). The name IS the pid, and the pid is the whole liveness test.
+CC_SOCK_NAME_RE = re.compile(r"^(\d{1,10})\.sock$")
+# Wall-clock bound, because this runs on the manager's one loop — every blocking
+# step there has one (see TICKET_ATTACH_DEADLINE_SEC for the reasoning). The
+# ~9k backlog this was written for clears well inside it; a directory big enough
+# to exhaust the budget just finishes on the next slow beat.
+CC_SOCK_SWEEP_DEADLINE_SEC = float(
+    os.environ.get("TURMA_CC_SOCK_SWEEP_DEADLINE_SEC", "5"))
+# How long the confirming connect() may wait. A refused connect answers at once,
+# and anything slower is a socket we KEEP, so this only bounds the pathological
+# case rather than the normal one.
+CC_SOCK_PROBE_TIMEOUT_SEC = float(
+    os.environ.get("TURMA_CC_SOCK_PROBE_TIMEOUT_SEC", "0.25"))
+
+
+def cc_socket_dirs():
+    """The directories Claude Code may have bound inbox sockets in on this host.
+
+    Mirrors its own resolution — $XDG_RUNTIME_DIR, else $CLAUDE_CODE_TMPDIR,
+    else the system temp dir, with "cc-socks" under it — plus the
+    /tmp/cc-socks-<uid> it drops to when that path would pass the ~104-byte
+    sun_path limit. BOTH are swept: which one a given session used depends on
+    how long its runtime dir's name was, and the manager cannot know that after
+    the fact.
+
+    Reading OUR environment is reading the sessions': they are launched from
+    this process and tmux inherits it. TURMA_CC_SOCKS_DIR overrides the lot for
+    a host that arranges things differently.
+    """
+    override = os.environ.get("TURMA_CC_SOCKS_DIR")
+    if override:
+        return [os.path.normpath(override)]
+    base = (os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("CLAUDE_CODE_TMPDIR")
+            or os.environ.get("TMPDIR") or os.environ.get("TMP")
+            or os.environ.get("TEMP") or "/tmp")
+    dirs = [os.path.normpath(os.path.join(base, "cc-socks"))]
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:      # not POSIX, so there are no unix sockets to sweep
+        return dirs
+    fallback = os.path.normpath("/tmp/cc-socks-%d" % getuid())
+    if fallback not in dirs:
+        dirs.append(fallback)
+    return dirs
+
+
+def _unix_socket_is_dead(path):
+    """Whether nothing is accepting on this AF_UNIX socket.
+
+    ONLY a refused or vanished connect counts as dead. Every other outcome — a
+    timeout, EACCES, a full listen backlog — is "cannot tell", and cannot-tell
+    KEEPS the file: leaving one costs an inode, unlinking a live session's inbox
+    costs that session its messaging with nothing to show why."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(CC_SOCK_PROBE_TIMEOUT_SEC)
+            s.connect(path)
+    except (ConnectionRefusedError, FileNotFoundError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 # Short bound for the two network `git fetch`es that run synchronously inside a
 # command handler on the main heartbeat loop (default_base_ref on spawn,
 # prune_repo). A fetch is best-effort — both already fall open to local refs —
@@ -12694,6 +12771,80 @@ class SessionManager:
             except Exception as e:
                 log(f"uploads: sweep of {path} failed: {e}")
 
+    def _sweep_claude_sockets(self):
+        """Unlink Claude Code inbox sockets whose owning process is gone
+        (XERK-341). CC_SOCK_SWEEP above says why this leak is the manager's to
+        clean up even though it is not the manager's to cause.
+
+        TWO independent readings of "dead" must agree before anything is
+        unlinked, and any disagreement KEEPS the file:
+
+        * /proc/<pid> does not exist. Pid EXISTENCE is the whole test — never
+          "is it a claude" — because pids are reused: a live pid is hands-off
+          whatever is running under it, and the stale entry simply waits for the
+          sweep after that pid exits. Deliberately not signal 0 / _pid_alive,
+          which reads EPERM (another user's LIVE process) as dead; that is a
+          fine answer for adopting a ttyd and a bad one for a deletion.
+        * connect() is refused. /proc is only the right authority if the sockets
+          were bound in THIS pid namespace, and the manager cannot prove that of
+          a directory it did not create — a shared /tmp would otherwise turn one
+          sweep into mass deletion of other namespaces' live inboxes. The probe
+          costs one refused connect per file we were about to unlink and nothing
+          at all on the steady-state path, since a live in-namespace session
+          never gets past the first test.
+
+        Neither the name nor the directory entry is trusted beyond that: the
+        entry must be an actual socket inode (lstat, so a symlink is never
+        followed) named <pid>.sock, directly inside one of cc_socket_dirs()."""
+        if not CC_SOCK_SWEEP:
+            return
+        # Without /proc the first test answers "dead" for every pid on the host.
+        # Refuse the whole sweep rather than act on an answer we cannot get.
+        if not os.path.isdir("/proc/self"):
+            return
+        deadline = time.monotonic() + CC_SOCK_SWEEP_DEADLINE_SEC
+        swept = held = 0
+        for dirpath in cc_socket_dirs():
+            try:
+                names = os.listdir(dirpath)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                log(f"cc-socks: cannot read {dirpath}: {e}")
+                continue
+            for name in names:
+                m = CC_SOCK_NAME_RE.match(name)
+                if not m:
+                    continue
+                if time.monotonic() > deadline:
+                    log(f"cc-socks: swept {swept} dead inbox socket(s) before "
+                        f"the {CC_SOCK_SWEEP_DEADLINE_SEC}s budget ran out with "
+                        f"{dirpath} unfinished; the rest goes next slow beat")
+                    return
+                path = os.path.join(dirpath, name)
+                # int() first: "/proc/007" is not pid 7, and a socket named
+                # that must not read as dead just because the path missed.
+                if os.path.exists(os.path.join("/proc", str(int(m.group(1))))):
+                    held += 1
+                    continue
+                try:
+                    if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                        continue
+                except OSError:
+                    continue
+                if not _unix_socket_is_dead(path):
+                    held += 1
+                    continue
+                try:
+                    os.unlink(path)
+                    swept += 1
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    log(f"cc-socks: unlink of {path} failed: {e}")
+        if swept:
+            log(f"cc-socks: swept {swept} dead inbox socket(s), left {held} live")
+
     def send_input(self, sid, text, uploads=None):
         """Type free-text into a running session's Claude TUI and submit it.
         This is the plain "type a message into the session" path (the chat
@@ -16160,6 +16311,11 @@ class SessionManager:
             self._sweep_uploads()
         except Exception as e:
             log(f"uploads sweep failed: {e}")
+        # Claude Code's own leaked inbox sockets, likewise (XERK-341).
+        try:
+            self._sweep_claude_sockets()
+        except Exception as e:
+            log(f"cc-socks sweep failed: {e}")
 
     def _session_git(self, sess, refresh):
         """(git-info dict | None, branch-sync work dict) for a session's payload.
