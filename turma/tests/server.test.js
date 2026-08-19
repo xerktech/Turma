@@ -8655,7 +8655,26 @@ test("migrate: an ORG-LESS fleet can still move sessions", async () => {
   if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
 });
 
-test("migrate: matches on the CLAIMED org, and the clients agree", async () => {
+test("migrate: a DRIFTED host is still a legal target — the binding is not here", async () => {
+  // Pins the REVERT, in the one direction it can regress. Two attempts to
+  // bind-gate this route were made and reverted (see .claude/rules/turma.md);
+  // re-inserting `if (orgDrifted(src) || orgDrifted(tgt)) return 409` above the
+  // claim compare escaped the whole suite, so a future session could ship the
+  // thing the docs warn against, green.
+  //
+  // A drifted host that still CLAIMS the source's org is the only case the two
+  // candidate predicates disagree on, so it is the only case that pins this.
+  // Refusing it is not wrong on its own — it is wrong without XERK-349, because
+  // no client can mirror it and every Move menu would keep offering this host.
+  await migHost("mDriftT", "dt1.atlassian.net");     // binds dt1
+  await migHost("mDriftT", "dt2.atlassian.net");     // now claims dt2: drifted
+  await migHost("mDriftS", "dt2.atlassian.net");     // claims dt2 too
+  const r = await migrate("mDriftS", "s1", { host: "mDriftT" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+});
+
+test("migrate: matches on the CLAIMED org, and the client predicate agrees", async () => {
   // The org binding gates the peer roster and NOT this route. No client can
   // mirror a rule keyed on `orgBound` — it is stripped from the served payload,
   // so `eligibleMoveTargets` and its Android/glasses twins see only
@@ -8671,13 +8690,13 @@ test("migrate: matches on the CLAIMED org, and the clients agree", async () => {
   await migHost("mQuietB", null);          // still bound to q1, declaring nothing
   const toQuiet = await migrate("mQuietA", "s1", { host: "mQuietB" });
   assert.equal(toQuiet.status, 409, JSON.stringify(toQuiet.body));
-  // The client predicate, applied to what the client is actually served, agrees.
+  // `sessions.html`'s own predicate, verbatim, over what the client is really
+  // served — the test was titled "the clients agree" while running no client
+  // code at all. `eligibleMoveTargets` keys on this, so if it disagrees with the
+  // hub the Move menu offers a host that 409s (or hides a legal one).
   const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents;
-  const keyOf = (d) => {
-    const a = served.find((x) => x.device === d) || {};
-    const v = a.jira && a.jira.siteKey;
-    return typeof v === "string" ? v : "";
-  };
+  const siteKeyOfAgent = (a) => (a && a.jira && a.jira.siteKey) || "";
+  const keyOf = (d) => siteKeyOfAgent(served.find((x) => x.device === d));
   assert.notEqual(keyOf("mQuietA"), keyOf("mQuietB"));   // the UI hides it too
   // And the org-less pair the clients DO offer is allowed, so agreement holds
   // in both directions.

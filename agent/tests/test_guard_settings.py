@@ -397,6 +397,17 @@ class TestOperatorLocalPermissions(unittest.TestCase):
             list(ha._GUARD_DENY_PATH_RULES) + ha._GUARD_DENY_TOOL_RULES
             + ha.runtime_code_deny_rules())
 
+    def test_the_peer_roster_is_readable_but_not_writable(self):
+        # The roster lives outside every repo, so without an allow rule reading
+        # it costs a permission prompt on exactly the file the session's own
+        # directive points at — and with `ListAgents` denied outright, a session
+        # that never gets that approval has NO address book at all.
+        s = ha.build_guard_settings()
+        self.assertIn("Read(~/.turma/peers.tsv)", s["permissions"]["allow"])
+        # Read only. It is the org boundary, so a session must not append rows
+        # to its own address book.
+        self.assertIn("Edit(~/.turma/peers.tsv)", s["permissions"]["deny"])
+
     def test_listagents_is_denied_and_sendmessage_is_not(self):
         # XERK-348. `ListAgents` enumerates the whole ACCOUNT — every org's hosts
         # and every cloud session — so it is org-blind by construction and no

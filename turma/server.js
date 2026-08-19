@@ -7875,13 +7875,6 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "a different target host is required" });
         const tgt = agents[target];
         if (!tgt) return json(res, 404, { error: "unknown target host" });
-        // The BOUND org on both sides, never the claimed one, and the same
-        // predicate the peer roster uses (XERK-348). This route relays a
-        // session's raw transcript bytes to the target, so trusting a
-        // self-asserted `jira.siteKey` here would hand them to a host the hub
-        // has already decided is lying about its org — a strictly larger
-        // disclosure than the roster's.
-        //
         // The CLAIMED org on both sides, deliberately UNCHANGED by XERK-348's
         // org binding, which gates the peer roster and nothing else.
         //
