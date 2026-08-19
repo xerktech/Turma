@@ -63,7 +63,18 @@ process model and the command table.
   **A ticket spawn waiting for a SLOT is not one of those**: it waits in the hub's ticket queue
   (`CLAUDE.md`), so a host takes one only when it can start it. One can still land here if a host
   fills between the hub's capacity read and its next beat — a race, not the normal path.
-- Tests: `TestSessionLifecycle`, `TestSpawnTicket` in `test_hub_agent.py`; `sessions.test.js`.
+- **A repo is forkable when its HEAD RESOLVES, never when `.git` exists** (XERK-343). `git clone`
+  creates `<dest>/.git` with an unborn HEAD before it fetches an object, so a repo is in
+  `scan_repos()` — and offerable in the composer — for the whole length of its own clone, and
+  detaching a worktree in that window dies with `fatal: invalid reference: HEAD`. `repo_head_ready`
+  is the gate, at the spawn (queue as **awaiting-clone**, whether or not the clone is ours) and at
+  the drain (hold until it resolves). It fails OPEN — "can't tell" must degrade to git's own error,
+  never to a session queued forever — and `awaitCloneSince` bounds a wait no clone job of ours is
+  driving, so an empty repo ends as an error card instead.
+- **`scan_repos()` deliberately still lists a repo mid-clone**: the check costs a `git` per repo per
+  beat and the wait above already covers it. Don't move it there.
+- Tests: `TestSessionLifecycle`, `TestSpawnTicket`, `TestSpawnDuringAnUnfinishedClone`,
+  `TestRepoHeadReady` in `test_hub_agent.py`; `sessions.test.js`.
 
 ## Kill, resume, delete
 
