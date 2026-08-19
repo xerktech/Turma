@@ -422,7 +422,7 @@ TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000")
 # assistant/thinking block is ~18k chars). Tool inputs and outputs keep tighter
 # caps: a build log or a whole-file Read is not a message, and it is what these
 # ceilings exist to bound. The `history` read's own aggregate is bounded
-# separately by HISTORY_MAX_CHARS.
+# separately by HISTORY_MAX_BYTES.
 BLOCK_TEXT_CHARS = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS", "100000"))
 BLOCK_TOOL_INPUT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS", "4000"))
 BLOCK_TOOL_RESULT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS", "8000"))
@@ -466,15 +466,28 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # over-long message with an error the composer shows rather than truncating it.
 INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "100000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
-# Aggregate ceiling on ONE `history` delivery, in characters across every row's
-# text and blocks (a SendUserFile preview's base64 included). The per-block caps
-# bound a BLOCK, never the reply: the window is HISTORY_MAX_MSGS entries and the
-# operator-message fold below scans the WHOLE transcript, so at the block
-# ceilings one reply could reach tens of MiB — and a staged history result rides
-# the heartbeat, which the hub refuses past HEARTBEAT_MAX, taking the host
-# offline in a re-send loop (XERK-235). Oldest rows go first and the reply is
-# flagged truncated, exactly as the entry-count window does.
-HISTORY_MAX_CHARS = int(os.environ.get("SESSION_HISTORY_MAX_CHARS", str(8 << 20)))
+# Ceiling on ONE `history` delivery, in the BYTES it will occupy on the wire.
+# The per-block caps bound a BLOCK, never the reply: the window is
+# HISTORY_MAX_MSGS entries and the operator-message fold below scans the WHOLE
+# transcript, so at the block ceilings one reply reaches tens of MiB — and a
+# staged history result rides the heartbeat, which the hub refuses past
+# HEARTBEAT_MAX, after which post() holds the identical body and re-sends it
+# every beat forever (XERK-235's offline loop). Oldest rows go first and the
+# reply is flagged truncated, exactly as the entry-count window does.
+#
+# **Bytes, never characters.** The payload is serialized with json.dumps(), i.e.
+# ensure_ascii, so one CJK char costs 6 bytes on the wire and an astral one 12:
+# a character budget under-states a non-ASCII transcript by up to 12x, and a
+# reply comfortably "inside" such a ceiling still blew HEARTBEAT_MAX. _json_bytes
+# measures the serialized form, which is exactly what post() will send.
+HISTORY_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_MAX_BYTES", str(6 << 20)))
+# ...and the ceiling on EVERYTHING one beat has staged, across sessions. The
+# per-delivery bound above says nothing about three sessions' histories landing
+# on one beat, which reaches the same refusal and the same permanent loop. The
+# oldest staged results are DROPPED rather than held: the hub answers a fetch it
+# has no result for with its "not ready" 202 and the client asks again, whereas
+# an oversize body is refused whole, forever.
+HISTORY_STAGED_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_STAGED_MAX_BYTES", str(12 << 20)))
 
 # File attachments (XERK-234). The operator attaches an image or a document in
 # the chat composer; the hub stages the bytes and names them on the `input`
@@ -5128,36 +5141,32 @@ def _operator_entries(path):
     return rows
 
 
-def _row_chars(row):
-    """Rough character weight of one history row: its flat text plus every
-    string its blocks carry — a SendUserFile preview's base64 `src` included,
-    which is the single heaviest thing one row can hold."""
-    total = [len(row.get("text") or "")]
-
-    def walk(value):
-        if isinstance(value, str):
-            total[0] += len(value)
-        elif isinstance(value, dict):
-            for v in value.values():
-                walk(v)
-        elif isinstance(value, list):
-            for v in value:
-                walk(v)
-
-    walk(row.get("blocks") or [])
-    return total[0]
+def _json_bytes(value):
+    """What `value` will cost on the wire: the length of its serialized form,
+    which is what post() sends. json.dumps() is ensure_ascii, so the result is
+    ASCII and its length IS its byte count — including the six bytes a JSON
+    escape costs for one CJK character. Never substitute len(text): that is the
+    measure that let a reply inside its ceiling blow HEARTBEAT_MAX."""
+    try:
+        return len(json.dumps(value))
+    except (TypeError, ValueError):
+        return len(str(value))
 
 
 def _fit_history_budget(rows):
-    """Trim a history window to HISTORY_MAX_CHARS, oldest rows first. Returns
-    (rows, dropped_any). The NEWEST row always survives however big it is —
-    it is what the operator is reading, and the per-block caps already bound
-    one row."""
+    """Trim a history window to HISTORY_MAX_BYTES of wire bytes, oldest rows
+    first. Returns (rows, dropped_any).
+
+    The NEWEST row survives however big it is — it is what the operator opened
+    the chat to read, and returning nothing would be a blank chat rather than a
+    short one. One row is not bounded by the block caps alone: a SendUserFile
+    turn carries SEND_FILE_MAX_FILES previews of SEND_FILE_MAX_BYTES each, so
+    it can weigh ~11 MB on its own (XERK-355)."""
     total = 0
     keep = 0
     for row in reversed(rows):
-        total += _row_chars(row)
-        if keep and total > HISTORY_MAX_CHARS:
+        total += _json_bytes(row)
+        if keep and total > HISTORY_MAX_BYTES:
             break
         keep += 1
     if keep >= len(rows):
@@ -5171,7 +5180,7 @@ def _history_entries(path):
     ~128 KB, tolerant JSONL parse, entries mapped through _history_row (no
     duplicated entry->text logic). Returns (entries, truncated, queued) —
     entries oldest first, capped to the last HISTORY_MAX_MSGS and then to
-    HISTORY_MAX_CHARS of content; truncated is True when older content was cut
+    HISTORY_MAX_BYTES of wire bytes; truncated is True when older content was cut
     (the file outgrew the byte window, or either cap dropped entries); queued is
     the still-queued prompt texts (see _fold_queue_op).
 
@@ -13170,6 +13179,38 @@ class SessionManager:
         except OSError as e:
             log(f"answer_question write failed for {sid}: {e}")
 
+    def _fit_staged_history(self):
+        """Bound EVERYTHING this beat has staged from `history` /
+        `subagentHistory` to HISTORY_STAGED_MAX_BYTES, newest first.
+
+        Each delivery is already bounded on its own (HISTORY_MAX_BYTES), which
+        says nothing about several sessions' histories landing on ONE beat —
+        that reaches the same refusal, and post() holds a refused body and
+        re-sends it every beat forever. The oldest staged results are DROPPED:
+        the hub answers a fetch it holds no result for with its "not ready" 202
+        and the client asks again, which is a re-fetch rather than a host that
+        never comes back. The newest result survives whatever it weighs, for the
+        same reason the newest history row does.
+        """
+        remaining = HISTORY_STAGED_MAX_BYTES
+        for attr in ("history_results", "subagent_history_results"):
+            staged = getattr(self, attr)
+            if not staged:
+                continue
+            keep = []
+            for result in reversed(staged):
+                size = _json_bytes(result)
+                if keep and size > remaining:
+                    break
+                remaining -= size
+                keep.append(result)
+            if len(keep) < len(staged):
+                log(f"heartbeat: dropped {len(staged) - len(keep)} staged {attr} "
+                    f"past HISTORY_STAGED_MAX_BYTES ({HISTORY_STAGED_MAX_BYTES}); "
+                    "the client re-requests them")
+                keep.reverse()
+                setattr(self, attr, keep)
+
     def _stage_history(self, sid):
         """Handle a {type:"history"} command: locate sid's newest transcript
         the same way session_report does and stage a bounded read of it for
@@ -16518,6 +16559,7 @@ class SessionManager:
         # Purely additive, and only present when something is staged — mirrors
         # how pending_prs stays out of a session's payload until there's
         # something to report.
+        self._fit_staged_history()
         if self.history_results:
             payload["historyResults"] = list(self.history_results)
         if self.subagent_history_results:
@@ -16593,6 +16635,22 @@ class SessionManager:
             # strict). A rollover that goes wrong otherwise reads as a bare
             # "HTTP Error 403: Forbidden" and a host that silently vanishes.
             log(f"heartbeat failed: {_http_error_detail(e)}")
+            if getattr(e, "code", None) == 413:
+                # 413 is the ONE failure re-sending cannot fix: every staged
+                # result is held until a beat succeeds, so an oversize body is
+                # re-posted verbatim every beat and the host never comes back
+                # (XERK-235). Drop the on-demand deliveries — they are what
+                # makes a beat big, and each one is a fetch the client will ask
+                # for again — and keep the beat itself, which is how the host
+                # stays online while its operator sees a history that did not
+                # arrive rather than a card that went dark.
+                dropped = (len(self.history_results) + len(self.subagent_history_results)
+                           + len(self.jira_issue_results))
+                self.history_results.clear()
+                self.subagent_history_results.clear()
+                self.jira_issue_results.clear()
+                log(f"heartbeat refused as too large: dropped {dropped} staged on-demand "
+                    "result(s) rather than re-sending them forever")
             return None
         except Exception as e:
             log(f"heartbeat failed: {e}")

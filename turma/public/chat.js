@@ -641,9 +641,10 @@
 
   // ---- merge (transcript.ts mergeTail port) ---------------------------------
   // Weight = total displayable chars; a richer/longer copy of an entry wins, so
-  // the text-only heartbeat seed is replaced by the rich live tail, and the live
-  // tail (tight caps) is replaced by /history (looser caps). Grow-only, so a
-  // truncated preview never clobbers a fuller copy.
+  // the text-only heartbeat seed (a 500-char preview) is replaced by the rich
+  // live tail or /history — which read at the SAME block caps as each other
+  // (XERK-347), so neither can shrink the other. Grow-only, so a truncated
+  // preview never clobbers a fuller copy.
   //
   // EVERY block payload field counts, not just text/input: a command block
   // carries its content in name/args (a task_notification in summary/result),

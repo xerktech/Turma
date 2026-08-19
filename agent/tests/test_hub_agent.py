@@ -3066,21 +3066,31 @@ class TestHistoryBudget(ProjectDirMixin, unittest.TestCase):
     whole — the window is 200 entries and the operator fold reads the entire
     transcript, and an oversized staged result is XERK-235's offline loop."""
 
-    def _rows(self, n, chars):
+    def _rows(self, n, chars, char="x"):
         return [{"id": f"e{i}", "role": "assistant", "text": "",
-                 "blocks": [{"t": "text", "text": "x" * chars}]} for i in range(n)]
+                 "blocks": [{"t": "text", "text": char * chars}]} for i in range(n)]
 
-    def test_row_chars_counts_every_string_a_row_carries(self):
-        row = {"id": "e1", "role": "assistant", "text": "abc", "blocks": [
-            {"t": "tool_use", "name": "SendUserFile", "input": "x" * 10,
-             "files": [{"kind": "image", "name": "s.png", "src": "y" * 100}]}]}
-        # text + name + input + kind + name + src, i.e. every string, nested ones
-        # included — the base64 preview is the heaviest thing one row can hold.
-        self.assertEqual(ha._row_chars(row), 3 + len("tool_use") + len("SendUserFile") + 10
-                         + len("image") + len("s.png") + 100)
+    def test_weight_is_WIRE_bytes_not_characters(self):
+        # The payload is serialized with ensure_ascii, so one CJK char costs six
+        # bytes on the wire. Counting characters under-states a non-ASCII
+        # transcript by 6x, which is how a reply "inside" its ceiling still blew
+        # HEARTBEAT_MAX and wedged the host offline.
+        row = {"t": "text", "text": "話" * 100}
+        self.assertGreaterEqual(ha._json_bytes(row), 600)
+        self.assertEqual(ha._json_bytes(row), len(json.dumps(row).encode()))
+
+    def test_a_non_ascii_window_is_trimmed_on_its_real_size(self):
+        # Same character count as an ASCII window that fits; 6x the bytes.
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 3000):
+            ascii_kept, ascii_dropped = ha._fit_history_budget(self._rows(4, 400))
+            cjk_kept, cjk_dropped = ha._fit_history_budget(self._rows(4, 400, "話"))
+        self.assertFalse(ascii_dropped)
+        self.assertEqual(len(ascii_kept), 4)
+        self.assertTrue(cjk_dropped)
+        self.assertEqual([r["id"] for r in cjk_kept], ["e3"])
 
     def test_oldest_rows_go_first_and_the_reply_is_flagged(self):
-        with mock.patch.object(ha, "HISTORY_MAX_CHARS", 3000):
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 3000):
             kept, dropped = ha._fit_history_budget(self._rows(10, 1000))
         self.assertTrue(dropped)
         self.assertEqual([r["id"] for r in kept], ["e8", "e9"])
@@ -3092,7 +3102,9 @@ class TestHistoryBudget(ProjectDirMixin, unittest.TestCase):
         self.assertIs(kept, rows)
 
     def test_the_newest_row_survives_however_big_it_is(self):
-        with mock.patch.object(ha, "HISTORY_MAX_CHARS", 100):
+        # A blank chat is worse than a short one, and one row is not bounded by
+        # the block caps alone (a SendUserFile turn's previews — XERK-355).
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 100):
             kept, dropped = ha._fit_history_budget(self._rows(2, 5000))
         self.assertTrue(dropped)
         self.assertEqual([r["id"] for r in kept], ["e1"])
@@ -3107,12 +3119,36 @@ class TestHistoryBudget(ProjectDirMixin, unittest.TestCase):
         # 6000: a row weighs its flat text AND its blocks (a deliberate
         # over-count — both ride the wire), so two 2000-char turns fit and three
         # do not.
-        with mock.patch.object(ha, "HISTORY_MAX_CHARS", 6000):
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 6000):
             entries, capped, _ = ha._history_entries(path)
         # Nothing else cut this read — the whole-reply budget is what did, and it
         # says so, because the client renders `truncated` as "older history above".
         self.assertTrue(capped)
         self.assertEqual([e["id"] for e in entries], ["a1", "a2"])
+
+
+class TestBlockCapsPinned(unittest.TestCase):
+    """The cap VALUES are the ticket (XERK-347), so they are asserted, not just
+    used: every earlier test compares a clip against BLOCK_CAPS itself, so
+    re-introducing the tight live caps — the thing that put a "Show more…"
+    button under every long message — left the whole suite green."""
+
+    def test_text_is_capped_at_what_an_operator_can_type(self):
+        # A message is shown WHOLE: nothing the operator can send (the composer
+        # caps at INPUT_MAX_CHARS) and nothing a model realistically emits is
+        # clipped.
+        self.assertEqual(ha.BLOCK_CAPS["text"], ha.INPUT_MAX_CHARS)
+        self.assertEqual(ha.BLOCK_CAPS["text"], 100000)
+
+    def test_tool_payloads_keep_their_own_tighter_caps(self):
+        # A build log or a whole-file Read is not a message; these are what the
+        # payload ceilings exist to bound.
+        self.assertEqual(ha.BLOCK_CAPS["input"], 4000)
+        self.assertEqual(ha.BLOCK_CAPS["result"], 8000)
+
+    def test_one_cap_set_serves_every_path(self):
+        # No live/full split to re-create: a tighter live cap IS the button.
+        self.assertFalse([n for n in dir(ha) if n.startswith("BLOCK_CAPS_")])
 
 
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
@@ -10364,6 +10400,76 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(
             [r["sessionId"] for r in payload["historyResults"]], ["s1", "s2"],
         )
+
+
+class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
+    """XERK-347: a beat that the hub refuses as too large is the ONE failure
+    re-sending cannot fix — every staged result is held until a POST succeeds,
+    so the identical oversize body goes back up every beat and the host never
+    comes back (XERK-235's offline loop). Both halves are tested: the beat is
+    kept under the ceiling, and a 413 that happens anyway ends the loop."""
+
+    def _result(self, sid, chars):
+        return {"sessionId": sid, "truncated": False, "queued": [],
+                "entries": [{"id": "e1", "role": "assistant", "text": "",
+                             "blocks": [{"t": "text", "text": "x" * chars}]}]}
+
+    def test_several_sessions_histories_are_trimmed_to_the_aggregate(self):
+        sm = self.make_manager()
+        for sid in ("s1", "s2", "s3"):
+            sm.history_results.append(self._result(sid, 4000))
+        with mock.patch.object(ha, "HISTORY_STAGED_MAX_BYTES", 9000):
+            payload = sm.build_payload(0)
+        # Newest kept, oldest dropped — and dropped from the staged list too, or
+        # the next beat rebuilds the same oversize body.
+        self.assertEqual([r["sessionId"] for r in payload["historyResults"]], ["s2", "s3"])
+        self.assertEqual([r["sessionId"] for r in sm.history_results], ["s2", "s3"])
+
+    def test_the_newest_result_rides_however_big_it_is(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 50000))
+        with mock.patch.object(ha, "HISTORY_STAGED_MAX_BYTES", 100):
+            payload = sm.build_payload(0)
+        self.assertEqual([r["sessionId"] for r in payload["historyResults"]], ["s1"])
+
+    def test_a_beat_within_the_aggregate_is_untouched(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+        sm.subagent_history_results.append(self._result("s2", 10))
+        payload = sm.build_payload(0)
+        self.assertEqual(len(payload["historyResults"]), 1)
+        self.assertEqual(len(payload["subagentHistoryResults"]), 1)
+
+    def test_a_413_drops_the_on_demand_deliveries_instead_of_looping(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+        sm.subagent_history_results.append(self._result("s2", 10))
+        sm.jira_issue_results.append({"issueKey": "X-1"})
+        # ...while a refusal that re-sending CAN fix keeps everything staged.
+        sm.spawn_failures.append({"cmdId": "c1", "error": "no"})
+        payload = sm.build_payload(0)
+        err = ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", 413, "Payload Too Large", {},
+            io.BytesIO(b'{"error":"body too large"}'))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+            self.assertIsNone(sm.post(payload))
+        self.assertEqual(sm.history_results, [])
+        self.assertEqual(sm.subagent_history_results, [])
+        self.assertEqual(sm.jira_issue_results, [])
+        # The beat itself still rides — the host stays online, and its operator
+        # sees a history that did not arrive rather than a card that went dark.
+        self.assertEqual(len(sm.spawn_failures), 1)
+        self.assertNotIn("historyResults", sm.build_payload(1))
+
+    def test_any_other_refusal_still_HOLDS_the_staged_results(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+        payload = sm.build_payload(0)
+        err = ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", 503, "Service Unavailable", {}, io.BytesIO(b"{}"))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+            self.assertIsNone(sm.post(payload))
+        self.assertEqual(len(sm.history_results), 1)
 
 
 class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):

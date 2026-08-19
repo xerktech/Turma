@@ -1683,3 +1683,28 @@ test("deviceName refuses a dot-segment DEVICE_NAME override", () => {
     process.env.PATH = saved.p;
   }
 });
+
+// --- block caps: parity with hub-agent.py's BLOCK_CAPS ----------------------
+// CLAUDE.md declares the two modules a parity contract for everything both
+// parse, and entryBlocks is the biggest thing on that list — but every other
+// assertion here clips against BLOCK_CAPS itself, so re-introducing the tight
+// live caps (4000/1000/2000) left both suites green. That split IS the "Show
+// more…" button XERK-347 removed: a live tail that clips harder than /history
+// is a message the reader has to press something to finish.
+test("BLOCK_CAPS matches hub-agent.py's, value for value", () => {
+  const py = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
+  const pyCap = (name) => {
+    const m = py.match(new RegExp(`^${name} = int\\(os\\.environ\\.get\\("[A-Z_]+", "(\\d+)"\\)\\)`, "m"));
+    assert.ok(m, `hub-agent.py no longer declares ${name} the way this parity check reads it`);
+    return Number(m[1]);
+  };
+  assert.deepEqual(BLOCK_CAPS, {
+    text: pyCap("BLOCK_TEXT_CHARS"),
+    input: pyCap("BLOCK_TOOL_INPUT_CHARS"),
+    result: pyCap("BLOCK_TOOL_RESULT_CHARS"),
+  });
+  // Pinned, not just mirrored: two files drifting together is still the bug.
+  assert.deepEqual(BLOCK_CAPS, { text: 100000, input: 4000, result: 8000 });
+  // A message caps at what the composer accepts, so it is never clipped.
+  assert.equal(BLOCK_CAPS.text, pyCap("INPUT_MAX_CHARS"));
+});
