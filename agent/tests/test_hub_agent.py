@@ -12,6 +12,7 @@ docker/tmux/git needed.
 import base64
 import contextlib
 import datetime
+import errno
 import gzip
 import http.server
 import importlib.util
@@ -7524,14 +7525,25 @@ class TestSweepClaudeSockets(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.exists(keep))
 
     def test_only_pid_dot_sock_is_a_candidate(self):
+        # Every decoy is a REAL abandoned socket owned by a dead pid, so the
+        # NAME is the only thing keeping it: built as plain files instead, the
+        # S_ISSOCK gate would spare them whatever the pattern did, and an
+        # unanchored pattern would sail through this test.
         sm = self.make_manager()
-        keep = []
-        for name in ("claude.sock", "12345.sock.bak", "12345.txt", ".12345.sock",
-                     "12345.sock.tmp", "12345678901.sock"):
-            path = os.path.join(self.socks, name)
-            with open(path, "w"):
-                pass
-            keep.append(path)
+        dead = self._dead_pid()
+        keep = [self._leak(name) for name in (
+            "claude.sock",
+            "%d.sock.bak" % dead,
+            "%d.sock.tmp" % dead,
+            "x%d.sock" % dead,
+            ".%d.sock" % dead,
+            "%d.txt" % dead,
+            "12345678901.sock",             # eleven digits is not a pid
+            # `$` would match before a trailing newline; `\d` would match
+            # Arabic-Indic digits. Neither is a name claude ever wrote.
+            "%d.sock\n" % dead,
+            "\u0664\u0661\u0669\u0664\u0663\u0660\u0663.sock",
+        )]
         sub = os.path.join(self.socks, "nested")
         os.makedirs(sub)
         sm._sweep_claude_sockets()
@@ -7613,6 +7625,72 @@ class TestSweepClaudeSockets(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha.SessionManager, "_sweep_claude_sockets",
                                side_effect=OSError("boom")):
             sm._refresh_repo_usage()        # no raise
+
+    def test_a_probe_that_cannot_tell_keeps_the_file(self):
+        # The rule the whole "never delete a live inbox" claim rests on. Only a
+        # REFUSED connect is dead; a busy listen backlog (EAGAIN), a socket we
+        # may not connect to (EACCES), a timeout — every one of those is "cannot
+        # tell", and cannot-tell keeps the file.
+        sm = self.make_manager()
+        for err in (BlockingIOError(errno.EAGAIN, "backlog full"),
+                    PermissionError(errno.EACCES, "denied"),
+                    TimeoutError("no answer"),
+                    OSError(errno.EIO, "io error")):
+            with self.subTest(err=err):
+                keep = self._leak("%d.sock" % self._dead_pid())
+                with mock.patch.object(ha.socket, "socket") as sock:
+                    sock.return_value.__enter__.return_value.connect.side_effect = err
+                    sm._sweep_claude_sockets()
+                self.assertTrue(os.path.exists(keep))
+                os.unlink(keep)
+
+    def test_only_a_refused_or_vanished_connect_reads_as_dead(self):
+        sm = self.make_manager()
+        for err in (ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+                    FileNotFoundError(errno.ENOENT, "gone")):
+            with self.subTest(err=err):
+                gone = self._leak("%d.sock" % self._dead_pid())
+                with mock.patch.object(ha.socket, "socket") as sock:
+                    sock.return_value.__enter__.return_value.connect.side_effect = err
+                    sm._sweep_claude_sockets()
+                self.assertFalse(os.path.exists(gone))
+
+    @unittest.skipIf(os.geteuid() == 0, "root connects to a mode-000 socket")
+    def test_a_socket_we_may_not_connect_to_is_kept_for_real(self):
+        # The same rule against the filesystem rather than a mock, so the errno
+        # mapping in _unix_socket_is_dead is exercised end to end.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        os.chmod(keep, 0)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_the_budget_is_checked_before_the_name_is(self):
+        # The bound has to cover EVERY entry, not just the candidates: a
+        # directory of a million names that match nothing costs the same per
+        # entry as one full of sockets, and checking the budget only after the
+        # pattern made it no bound at all.
+        sm = self.make_manager()
+        for i in range(5):
+            with open(os.path.join(self.socks, "not-a-socket-%d" % i), "w"):
+                pass
+        lines = []
+        with mock.patch.object(ha, "log", lines.append), \
+                mock.patch.object(ha, "CC_SOCK_SWEEP_DEADLINE_SEC", -1):
+            sm._sweep_claude_sockets()
+        self.assertTrue([ln for ln in lines if "budget ran out" in ln], lines)
+
+    def test_the_directories_it_resolved_are_named_once(self):
+        # Silence is what let 9,245 files pile up unnoticed, so a host where
+        # this resolves somewhere claude never binds has to say so.
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lines.append):
+            sm._sweep_claude_sockets()
+            sm._sweep_claude_sockets()
+        named = [ln for ln in lines if ln.startswith("cc-socks: sweeping ")]
+        self.assertEqual(len(named), 1, lines)
+        self.assertIn(self.socks, named[0])
 
 
 class TestPendingScan(ProjectDirMixin, unittest.TestCase):

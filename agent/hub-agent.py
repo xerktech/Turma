@@ -714,7 +714,10 @@ CC_SOCK_SWEEP = os.environ.get("TURMA_CC_SOCK_SWEEP", "1").strip().lower() not i
     "0", "false", "no", "off")
 # Only "<pid>.sock" is ever a candidate, and only directly inside one of
 # cc_socket_dirs(). The name IS the pid, and the pid is the whole liveness test.
-CC_SOCK_NAME_RE = re.compile(r"^(\d{1,10})\.sock$")
+# `\Z`, never `$`, which also matches before a trailing newline — "123.sock\n"
+# is a different file. `[0-9]`, never `\d`, which is Unicode-wide: an
+# Arabic-Indic "٤١٩٤٣٠٣.sock" is not a pid claude ever wrote.
+CC_SOCK_NAME_RE = re.compile(r"^([0-9]{1,10})\.sock\Z")
 # Wall-clock bound, because this runs on the manager's one loop — every blocking
 # step there has one (see TICKET_ATTACH_DEADLINE_SEC for the reasoning). The
 # ~9k backlog this was written for clears well inside it; a directory big enough
@@ -10062,6 +10065,9 @@ class SessionManager:
         # Worktrees the worker removed, drained by _poll_prunes. self.closed is
         # the BEAT's to mutate — the worker only ever names paths for it.
         self._prune_swept = []
+        # One-shot: the socket sweep names the directories it resolved on its
+        # first run of the process (XERK-341), so a misresolution is visible.
+        self._cc_socks_announced = False
         # Worktrees a `git worktree remove` is running against RIGHT NOW. The
         # resume paths refuse a cwd listed here (_claim_worktree), so a session
         # can't be launched into a directory that is halfway unlinked.
@@ -12795,7 +12801,14 @@ class SessionManager:
 
         Neither the name nor the directory entry is trusted beyond that: the
         entry must be an actual socket inode (lstat, so a symlink is never
-        followed) named <pid>.sock, directly inside one of cc_socket_dirs()."""
+        followed) named <pid>.sock, directly inside one of cc_socket_dirs().
+
+        The one hole left is an unlink-by-path race: a pid reused AND a new
+        claude binding that same path between the refused connect and the
+        unlink loses its inbox. Not closed, because it cannot be — there is no
+        unlink-if-still-this-inode — and the window is microseconds wide behind
+        a precondition (that exact pid, reused, right then) that makes it far
+        rarer than the leak it cleans up."""
         if not CC_SOCK_SWEEP:
             return
         # Without /proc the first test answers "dead" for every pid on the host.
@@ -12803,45 +12816,60 @@ class SessionManager:
         if not os.path.isdir("/proc/self"):
             return
         deadline = time.monotonic() + CC_SOCK_SWEEP_DEADLINE_SEC
+        dirs = cc_socket_dirs()
+        if not self._cc_socks_announced:
+            # Once per process, so a host where this resolved somewhere claude
+            # never binds says so instead of going quiet — silence is what let
+            # 9,245 files pile up unnoticed in the first place.
+            self._cc_socks_announced = True
+            log(f"cc-socks: sweeping {', '.join(dirs)} on the slow cadence")
         swept = held = 0
-        for dirpath in cc_socket_dirs():
+        for dirpath in dirs:
             try:
-                names = os.listdir(dirpath)
+                # scandir, not listdir: the budget below cannot bound a call
+                # that has already materialised every name in the directory,
+                # and the entries carry their own lstat.
+                with os.scandir(dirpath) as entries:
+                    for entry in entries:
+                        # FIRST in the body, before the name is even looked at:
+                        # a directory of a million non-matching entries costs
+                        # the same per entry as a matching one.
+                        if time.monotonic() > deadline:
+                            log(f"cc-socks: swept {swept} dead inbox socket(s) "
+                                f"before the {CC_SOCK_SWEEP_DEADLINE_SEC}s "
+                                f"budget ran out with {dirpath} unfinished; "
+                                f"the rest goes next slow beat")
+                            return
+                        m = CC_SOCK_NAME_RE.match(entry.name)
+                        if not m:
+                            continue
+                        try:
+                            if not stat.S_ISSOCK(
+                                    entry.stat(follow_symlinks=False).st_mode):
+                                continue
+                        except OSError:     # vanished under us, or unreadable
+                            continue
+                        # int() first: "/proc/007" is not pid 7, and a socket
+                        # named that must not read as dead on a missed path.
+                        if os.path.exists(
+                                os.path.join("/proc", str(int(m.group(1))))):
+                            held += 1
+                            continue
+                        if not _unix_socket_is_dead(entry.path):
+                            held += 1
+                            continue
+                        try:
+                            os.unlink(entry.path)
+                            swept += 1
+                        except FileNotFoundError:
+                            pass
+                        except OSError as e:
+                            log(f"cc-socks: unlink of {entry.path} failed: {e}")
             except FileNotFoundError:
                 continue
             except OSError as e:
                 log(f"cc-socks: cannot read {dirpath}: {e}")
                 continue
-            for name in names:
-                m = CC_SOCK_NAME_RE.match(name)
-                if not m:
-                    continue
-                if time.monotonic() > deadline:
-                    log(f"cc-socks: swept {swept} dead inbox socket(s) before "
-                        f"the {CC_SOCK_SWEEP_DEADLINE_SEC}s budget ran out with "
-                        f"{dirpath} unfinished; the rest goes next slow beat")
-                    return
-                path = os.path.join(dirpath, name)
-                # int() first: "/proc/007" is not pid 7, and a socket named
-                # that must not read as dead just because the path missed.
-                if os.path.exists(os.path.join("/proc", str(int(m.group(1))))):
-                    held += 1
-                    continue
-                try:
-                    if not stat.S_ISSOCK(os.lstat(path).st_mode):
-                        continue
-                except OSError:
-                    continue
-                if not _unix_socket_is_dead(path):
-                    held += 1
-                    continue
-                try:
-                    os.unlink(path)
-                    swept += 1
-                except FileNotFoundError:
-                    pass
-                except OSError as e:
-                    log(f"cc-socks: unlink of {path} failed: {e}")
         if swept:
             log(f"cc-socks: swept {swept} dead inbox socket(s), left {held} live")
 
