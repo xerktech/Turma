@@ -405,29 +405,34 @@ TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
 TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000"))
 # Rich-block caps (native chat UI). _entry_blocks() preserves the thinking,
 # tool_use inputs and tool_result outputs that _entry_text() flattens away, so
-# the web chat can show/hide each component by verbosity. The live tail
-# (tunnel-agent.js) pushes these ~1s, so it uses the tight LIVE caps; on-demand
-# `history` uses the looser FULL caps so an "Expand" reveals genuinely more. A
-# block cut to its cap is flagged truncated:true. Keep these mirrored in
-# tunnel-agent.js.
-BLOCK_TEXT_CHARS = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS", "4000"))
-BLOCK_TOOL_INPUT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS", "1000"))
-BLOCK_TOOL_RESULT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS", "2000"))
-BLOCK_TEXT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS_FULL", "16000"))
-BLOCK_TOOL_INPUT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS_FULL", "4000"))
-BLOCK_TOOL_RESULT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS_FULL", "8000"))
+# the web chat can show/hide each component by verbosity. A block cut to its cap
+# is flagged truncated:true. Keep these mirrored in tunnel-agent.js.
+#
+# ONE set of caps, shared by the live tail and the on-demand `history` read
+# (XERK-347). They used to differ — the live path clipped to a quarter of what
+# history returned, and every block cut that way carried a "Show more…" button
+# to re-fetch the fuller copy. A message that arrives cut off mid-sentence, with
+# a button to press before it can be read, is not what the chat is for; and the
+# split bought nothing, because a live frame is bounded by the ~128 KB
+# transcript window it is parsed from (TAIL_READ_BYTES), not by these numbers.
+# Never re-introduce a tighter live cap: it puts the button back.
+#
+# The text cap is INPUT_MAX_CHARS, so nothing an operator can type and nothing a
+# model realistically emits is ever clipped (over this host's corpus the longest
+# assistant/thinking block is ~18k chars). Tool inputs and outputs keep tighter
+# caps: a build log or a whole-file Read is not a message, and it is what these
+# ceilings exist to bound. The `history` read's own aggregate is bounded
+# separately by HISTORY_MAX_BYTES.
+BLOCK_TEXT_CHARS = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS", "100000"))
+BLOCK_TOOL_INPUT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS", "4000"))
+BLOCK_TOOL_RESULT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS", "8000"))
 # Defensive per-entry block cap so one pathological turn can't blow the tail
 # frame (each block is already char-capped above).
 BLOCK_MAX_PER_ENTRY = int(os.environ.get("SESSION_BLOCK_MAX_PER_ENTRY", "48"))
-BLOCK_CAPS_LIVE = {
+BLOCK_CAPS = {
     "text": BLOCK_TEXT_CHARS,
     "input": BLOCK_TOOL_INPUT_CHARS,
     "result": BLOCK_TOOL_RESULT_CHARS,
-}
-BLOCK_CAPS_FULL = {
-    "text": BLOCK_TEXT_CHARS_FULL,
-    "input": BLOCK_TOOL_INPUT_CHARS_FULL,
-    "result": BLOCK_TOOL_RESULT_CHARS_FULL,
 }
 # SendUserFile inline preview (XERK-221): the agent reads the image/SVG/HTML files
 # a session delivers via SendUserFile and embeds them ON the tool_use block (a
@@ -461,6 +466,73 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # over-long message with an error the composer shows rather than truncating it.
 INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "100000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
+# Ceiling on ONE `history` delivery, in the BYTES it will occupy on the wire.
+# The per-block caps bound a BLOCK, never the reply: the window is
+# HISTORY_MAX_MSGS entries and the operator-message fold below scans the WHOLE
+# transcript, so at the block ceilings one reply reaches tens of MiB — and a
+# staged history result rides the heartbeat, which the hub refuses past
+# HEARTBEAT_MAX, after which post() holds the identical body and re-sends it
+# every beat forever (XERK-235's offline loop). Oldest rows go first and the
+# reply is flagged truncated, exactly as the entry-count window does.
+#
+# **Bytes, never characters.** The payload is serialized with json.dumps(), i.e.
+# ensure_ascii, so one CJK char costs 6 bytes on the wire and an astral one 12:
+# a character budget under-states a non-ASCII transcript by up to 12x, and a
+# reply comfortably "inside" such a ceiling still blew HEARTBEAT_MAX. _json_bytes
+# measures the serialized form, which is exactly what post() will send.
+HISTORY_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_MAX_BYTES", str(6 << 20)))
+# ...and the ceiling on EVERYTHING one beat has staged, across sessions. The
+# per-delivery bound above says nothing about three sessions' histories landing
+# on one beat, which reaches the same refusal and the same permanent loop. The
+# oldest staged results are DROPPED rather than held: the hub answers a fetch it
+# has no result for with its "not ready" 202 and the client asks again, whereas
+# an oversize body is refused whole, forever.
+HISTORY_STAGED_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_STAGED_MAX_BYTES", str(12 << 20)))
+# The biggest body this agent will POST at all. The hub answers an oversize body
+# with 413 only NEAR its ceiling: measured, roughly to 1.1x, a coin flip at 1.5x
+# and never at 2x — past that Node destroys the socket under a request still
+# being written, so urllib (which is what this posts with) sees a broken pipe
+# and NOT a status. That is XERK-235's failure exactly: post() holds staged
+# results until a beat succeeds, so a body no status ever came back for is
+# re-sent verbatim every beat and the host never returns. A handler for 413
+# alone cannot close it, because the bodies big enough to matter never get one.
+#
+# So the agent refuses its own body BEFORE sending it: the on-demand deliveries
+# are shed (each is a fetch the client repeats) and the beat itself still goes
+# out.
+#
+# **The number comes from the HUB, not from here** (`bodyMax` on the beat reply,
+# HEARTBEAT_BODY_MARGIN under it). Its ceiling is a fraction of its container
+# limit, so a hub given less memory has a smaller one — and a fixed agent-side
+# number re-opens the loop on exactly those deployments, besides contradicting
+# the rule that these ceilings are never fixed numbers. This constant is only
+# the floor used before the first reply lands, and the cap on what a hub can
+# talk us into.
+# Bounded on read: the derivation below divides by the margin, and a float
+# division of an absurd override raises at IMPORT — a process that will not
+# start rather than one that heartbeats badly. 1 GiB is far above any hub.
+HEARTBEAT_BODY_MAX = min(int(os.environ.get("TURMA_HEARTBEAT_BODY_MAX", str(24 << 20))),
+                         1 << 30)
+# How much of the hub's stated ceiling to actually use. A body AT the ceiling is
+# refused; the margin keeps the last beat before the cliff a 413 we can read
+# rather than a socket that dies unread.
+HEARTBEAT_BODY_MARGIN = 0.75
+# ...and a FLOOR under whatever it claims. `bodyMax` is untrusted wire input: a
+# tiny one would shed every on-demand delivery on every beat while every beat
+# still returned 200, so the operator's chat would simply never load its history
+# and nothing anywhere would look wrong. Below this the hub cannot serve a
+# session at all, so treating the value as nonsense is the honest reading.
+HEARTBEAT_BODY_MIN = int(os.environ.get("TURMA_HEARTBEAT_BODY_MIN", str(1 << 20)))
+# The largest stated ceiling worth REMEMBERING. Past this the margin already
+# lands on HEARTBEAT_BODY_MAX, so a bigger number changes nothing — and it keeps
+# an unbounded int off the arithmetic below (see _note_body_max).
+HEARTBEAT_BODY_STATED_MAX = int(HEARTBEAT_BODY_MAX / HEARTBEAT_BODY_MARGIN) + 1
+# How many CONSECUTIVE beats may fail while on-demand deliveries are staged
+# before they are shed. A beat that gets no status at all cannot be told from a
+# network outage on its own, so one failure proves nothing — but a body the hub
+# will not take is re-sent verbatim every beat, and that is XERK-235's loop. Two
+# is enough to tell them apart at INTERVAL cadence.
+HEARTBEAT_FAILURES_BEFORE_SHED = 2
 
 # File attachments (XERK-234). The operator attaches an image or a document in
 # the chat composer; the hub stages the bytes and names them on the `input`
@@ -4155,7 +4227,8 @@ def _tool_use_detail(block, name, inp, caps):
     """Attach the reviewable payload of a known tool call to its tool_use block,
     beyond the one-line `input` summary — the part an operator otherwise opens
     the raw terminal to see. Returns True when a payload was clipped by its cap
-    (the caller flags the block truncated so "Show more" refetches the FULL copy).
+    (the caller flags the block truncated, which the chat renders as a static
+    "clipped" mark — there is no fuller copy to fetch).
 
       Edit          -> edit: {old, new, replaceAll?}   (the actual change, as a diff)
       Write         -> content: the file body written
@@ -4556,8 +4629,8 @@ def _entry_blocks(entry, caps):
     it PRESERVES the thinking text, tool_use inputs and tool_result outputs that
     _entry_text() flattens away, so the native chat UI can show/hide each
     component by verbosity. `caps` is a {text, input, result} char-limit dict
-    (BLOCK_CAPS_LIVE for the ~1s tail, BLOCK_CAPS_FULL for on-demand history); a
-    block cut to its cap gets truncated:true. Blocks:
+    (BLOCK_CAPS on every path — the live tail and on-demand history read at the
+    same fidelity); a block cut to its cap gets truncated:true. Blocks:
       {t:"text",           text}
       {t:"thinking",       text, truncated?}
       {t:"tool_use",       id, name, input, truncated?}
@@ -5052,7 +5125,7 @@ def _history_row(entry):
     and is kept, so the chat UI can show tool output. transcript_tail keeps the
     old drop-when-None rule (heartbeat/archive stay lean)."""
     text = _entry_text(entry)
-    blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
+    blocks = _entry_blocks(entry, BLOCK_CAPS)
     if text is None and not blocks:
         return None
     return {
@@ -5113,15 +5186,92 @@ def _operator_entries(path):
     return rows
 
 
+def _json_bytes(value):
+    """What `value` will cost on the wire: the length of its serialized form,
+    which is what post() sends. json.dumps() is ensure_ascii, so the result is
+    ASCII and its length IS its byte count — including the six bytes a JSON
+    escape costs for one CJK character. Never substitute len(text): that is the
+    measure that let a reply inside its ceiling blow HEARTBEAT_MAX."""
+    try:
+        return len(json.dumps(value))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _shed_row_previews(row, budget):
+    """Drop one row's inline SendUserFile payloads, heaviest block first, until
+    the row fits `budget` wire bytes. Returns True if anything was dropped.
+
+    The block caps do NOT bound a row: a preview is read from DISK, not from the
+    transcript, so one turn carries SEND_FILE_MAX_FILES x SEND_FILE_MAX_BYTES of
+    base64 — ~11 MB per turn, and a delivery no size ceiling can honour
+    (XERK-355). Shedding reuses the ARCHIVE path's `_shed_block_payloads`, so a
+    row degrades to exactly the `shed:True` name chip the archive already
+    produces: the conversation still says what was delivered, and the reply
+    becomes something the hub will actually accept. Better than exempting the
+    row, which produced a body nothing could deliver at all, and better than
+    dropping it, which is a hole in the conversation.
+
+    Sizes are measured ONCE per block and subtracted, never by re-measuring the
+    row per block: a turn may carry BLOCK_MAX_PER_ENTRY deliveries, and
+    re-serializing a multi-hundred-MB row 48 times cost 18s on the beat loop —
+    latency against OFFLINE_AFTER_MS, on the thread the heartbeat runs on."""
+    heavy = []
+    for block in row.get("blocks") or []:
+        if not isinstance(block, dict) or not isinstance(block.get("files"), list):
+            continue
+        size = _json_bytes(block["files"])
+        if size:
+            heavy.append((size, block))
+    if not heavy:
+        return False
+    heavy.sort(key=lambda pair: pair[0], reverse=True)
+    remaining = _json_bytes(row)
+    shed = False
+    for size, block in heavy:
+        if remaining <= budget:
+            break
+        if not _shed_block_payloads([block]):
+            continue          # nothing embedded on it after all
+        remaining -= size - _json_bytes(block["files"])
+        block["truncated"] = True
+        shed = True
+    return shed
+
+
+def _fit_history_budget(rows):
+    """Trim a history window to HISTORY_MAX_BYTES of wire bytes, oldest rows
+    first. Returns (rows, dropped_any).
+
+    The NEWEST row survives — it is what the operator opened the chat to read,
+    and returning nothing would be a blank chat rather than a short one — but it
+    survives SHED, not exempt: a row over the budget on its own has its previews
+    dropped first (see above), so "the newest always fits" stays true of the
+    bytes as well as the row."""
+    total = 0
+    keep = 0
+    for row in reversed(rows):
+        size = _json_bytes(row)
+        if size > HISTORY_MAX_BYTES and _shed_row_previews(row, HISTORY_MAX_BYTES):
+            size = _json_bytes(row)
+        total += size
+        if keep and total > HISTORY_MAX_BYTES:
+            break
+        keep += 1
+    if keep >= len(rows):
+        return rows, False
+    return rows[len(rows) - keep:], True
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
     ~128 KB, tolerant JSONL parse, entries mapped through _history_row (no
     duplicated entry->text logic). Returns (entries, truncated, queued) —
-    entries oldest first, already capped to the last HISTORY_MAX_MSGS;
-    truncated is True when older content was cut (the file outgrew the byte
-    window, or the entry cap dropped entries); queued is the still-queued
-    prompt texts (see _fold_queue_op).
+    entries oldest first, capped to the last HISTORY_MAX_MSGS and then to
+    HISTORY_MAX_BYTES of wire bytes; truncated is True when older content was cut
+    (the file outgrew the byte window, or either cap dropped entries); queued is
+    the still-queued prompt texts (see _fold_queue_op).
 
     One exemption from the window (XERK-186): OPERATOR MESSAGES. Whenever the
     window cut anything, every operator text turn older than the window is
@@ -5157,7 +5307,8 @@ def _history_entries(path):
         older = [row for row in _operator_entries(path)
                  if row.get("id") and row["id"] not in shown]
         window = older[-HISTORY_USER_MSGS:] + window
-    return window, truncated, _queued_display(queued)
+    window, over_budget = _fit_history_budget(window)
+    return window, truncated or over_budget, _queued_display(queued)
 
 
 # The Task tool's result text carries the spawned agent's id ("agentId: <id>"),
@@ -9761,6 +9912,11 @@ class SessionManager:
         # Staged `history` command results awaiting the next heartbeat payload
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
+        # What the hub last said it will take as a body (`bodyMax` on the beat
+        # reply). 0 until a beat succeeds — see _body_max.
+        self._hub_body_max = 0
+        # Consecutive failed beats — see _note_beat_failure.
+        self._beat_failures = 0
         self.history_results = []
         # Staged `subagentHistory` results (one background agent's transcript,
         # fetched when an operator clicks a live agent-list row) — same
@@ -13117,6 +13273,99 @@ class SessionManager:
         except OSError as e:
             log(f"answer_question write failed for {sid}: {e}")
 
+    def _body_max(self):
+        """The biggest body to POST: what the hub last said it takes, less
+        HEARTBEAT_BODY_MARGIN, and never above our own HEARTBEAT_BODY_MAX.
+
+        Bounded on BOTH sides deliberately. Below, because a hub sized smaller
+        than the deployed 256 MiB has a smaller ceiling and a fixed agent-side
+        number would post straight into the band where no status comes back.
+        Above, because `bodyMax` arrives over the wire: a hub that reports a
+        preposterous one must not be able to talk this agent into building a
+        body its own process cannot hold."""
+        stated = getattr(self, "_hub_body_max", 0)
+        if not stated:
+            return HEARTBEAT_BODY_MAX
+        return max(HEARTBEAT_BODY_MIN,
+                   min(HEARTBEAT_BODY_MAX, int(stated * HEARTBEAT_BODY_MARGIN)))
+
+    def _note_body_max(self, reply):
+        """Remember the hub's stated body ceiling off a beat reply. Absent (an
+        older hub) leaves the conservative default in place — never zero, which
+        would refuse every beat this agent ever sends."""
+        if not isinstance(reply, dict):
+            return
+        stated = reply.get("bodyMax")
+        if isinstance(stated, bool) or not isinstance(stated, (int, float)):
+            return
+        # The float check comes FIRST and is guarded by isinstance, exactly as
+        # `_token_count` does (and for the reason its comment gives): `1e999` is
+        # legal JSON and parses to inf, on which int() raises — but so does
+        # `math.isfinite` of a huge INT, which is just as legal on the wire. Both
+        # raise INSIDE post()'s try, so every beat is logged as failed while the
+        # hub answers 200: commands dropped, peers never ingested, the host dead
+        # to its operator. NaN compares False against every bound and would slip
+        # a zero through.
+        if isinstance(stated, float) and not math.isfinite(stated):
+            return
+        if stated <= 0:
+            return
+        # Clamped BEFORE it is stored, so no arithmetic ever touches an unbounded
+        # int: `int(10**400 * HEARTBEAT_BODY_MARGIN)` overflows exactly as
+        # isfinite does. The bound is EXACT rather than arbitrary — at
+        # HEARTBEAT_BODY_MAX / HEARTBEAT_BODY_MARGIN the derived ceiling is
+        # already our own maximum, so anything above it decides nothing.
+        self._hub_body_max = int(min(stated, HEARTBEAT_BODY_STATED_MAX))
+
+    def _drop_on_demand_results(self, payload=None):
+        """Drop the staged on-demand deliveries — and them alone — from the
+        staged lists and, when given, from the payload already built.
+
+        They are what makes a beat big, and each is a FETCH the client repeats:
+        the hub answers a request it holds no result for with its "not ready"
+        202, so a dropped delivery costs a re-ask. Everything else staged
+        (ticket status, spawn refusals, create results) is an EVENT that exists
+        nowhere else, is small, and stays held."""
+        for attr in ("history_results", "subagent_history_results", "jira_issue_results"):
+            getattr(self, attr).clear()
+        if payload is not None:
+            for key in ("historyResults", "subagentHistoryResults", "jiraIssueResults"):
+                payload.pop(key, None)
+
+    def _fit_staged_history(self):
+        """Bound EVERYTHING this beat has staged from `history` /
+        `subagentHistory` to HISTORY_STAGED_MAX_BYTES, newest first.
+
+        Each delivery is already bounded on its own (HISTORY_MAX_BYTES), which
+        says nothing about several sessions' histories landing on ONE beat —
+        that reaches the same refusal, and post() holds a refused body and
+        re-sends it every beat forever. The oldest staged results are DROPPED:
+        the hub answers a fetch it holds no result for with its "not ready" 202
+        and the client asks again, which is a re-fetch rather than a host that
+        never comes back. The newest result survives whatever it weighs, for the
+        same reason the newest history row does.
+        """
+        remaining = HISTORY_STAGED_MAX_BYTES
+        admitted = False   # ONE exemption for the whole beat, not one per list
+        for attr in ("history_results", "subagent_history_results"):
+            staged = getattr(self, attr)
+            if not staged:
+                continue
+            keep = []
+            for result in reversed(staged):
+                size = _json_bytes(result)
+                if admitted and size > remaining:
+                    break
+                remaining -= size
+                admitted = True
+                keep.append(result)
+            if len(keep) < len(staged):
+                log(f"heartbeat: dropped {len(staged) - len(keep)} staged {attr} "
+                    f"past HISTORY_STAGED_MAX_BYTES ({HISTORY_STAGED_MAX_BYTES}); "
+                    "the client re-requests them")
+                keep.reverse()
+                setattr(self, attr, keep)
+
     def _stage_history(self, sid):
         """Handle a {type:"history"} command: locate sid's newest transcript
         the same way session_report does and stage a bounded read of it for
@@ -14031,7 +14280,7 @@ class SessionManager:
                     # copy; the archive has no /history to expand into). Inclusion
                     # widens like _history_entries: a tool_result-only turn (text
                     # is None) still has blocks and is kept.
-                    blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
+                    blocks = _entry_blocks(entry, BLOCK_CAPS)
                     if text is None and not blocks:
                         continue
                     # ...except the SendUserFile payloads, once this transcript
@@ -16465,6 +16714,7 @@ class SessionManager:
         # Purely additive, and only present when something is staged — mirrors
         # how pending_prs stays out of a session's payload until there's
         # something to report.
+        self._fit_staged_history()
         if self.history_results:
             payload["historyResults"] = list(self.history_results)
         if self.subagent_history_results:
@@ -16509,9 +16759,18 @@ class SessionManager:
             headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
             if TURMA_TOKEN:
                 headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            body = json.dumps(payload).encode()
+            if len(body) > self._body_max():
+                # Measured, not guessed — this is the exact body about to go up.
+                # Past the hub's ceiling it answers no status at all, so this is
+                # the only place the loop can be stopped (see HEARTBEAT_BODY_MAX).
+                log(f"heartbeat body is {len(body)} bytes, past what this hub takes "
+                    f"({self._body_max()}); shedding its on-demand deliveries")
+                self._drop_on_demand_results(payload)
+                body = json.dumps(payload).encode()
             req = urllib.request.Request(
                 f"{TURMA_URL}/api/heartbeat",
-                data=json.dumps(payload).encode(),
+                data=body,
                 headers=headers,
                 method="POST",
             )
@@ -16524,6 +16783,8 @@ class SessionManager:
                 # read fails the JSON parse, which this method already treats as
                 # "no reply" — a skipped beat rather than a wedged agent.
                 reply = json.loads(resp.read(HEARTBEAT_REPLY_MAX).decode() or "{}")
+            self._note_body_max(reply)
+            self._beat_failures = 0
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
             self.subagent_history_results.clear()  # delivered — same lifecycle
@@ -16540,10 +16801,47 @@ class SessionManager:
             # strict). A rollover that goes wrong otherwise reads as a bare
             # "HTTP Error 403: Forbidden" and a host that silently vanishes.
             log(f"heartbeat failed: {_http_error_detail(e)}")
+            self._note_beat_failure()
+            if getattr(e, "code", None) == 413:
+                # A body our own ceiling let through — the first beat runs
+                # before any `bodyMax` has arrived, and a hub can shrink. This
+                # branch is the near-ceiling case only: further past it the hub
+                # sends no status at all, which is why _body_max exists rather
+                # than this handler carrying the whole burden.
+                self._drop_on_demand_results()
+                log("heartbeat refused as too large; dropped the staged on-demand "
+                    "result(s) rather than re-sending them forever")
             return None
         except Exception as e:
             log(f"heartbeat failed: {e}")
+            self._note_beat_failure()
             return None
+
+    def _note_beat_failure(self):
+        """Count a failed beat and, past HEARTBEAT_FAILURES_BEFORE_SHED in a
+        row, shed the on-demand deliveries it is carrying.
+
+        The 413 branch and _body_max between them cover a body the hub REFUSES
+        and a body we can measure — this covers the one that gets NO answer at
+        all. A hub restarted with less memory, or an agent repointed at a
+        smaller one, has a ceiling below the one we learned (which is only
+        refreshed on a SUCCESSFUL beat, and there are none), so the same body
+        goes up every beat and the host never comes back: XERK-235 again, from
+        the one direction the other two guards cannot see.
+
+        The learned ceiling is forgotten with them, so the next beats run on the
+        conservative default until the hub states its own again. A failure with
+        nothing staged is just an outage — nothing to shed, and nothing done."""
+        self._beat_failures = getattr(self, "_beat_failures", 0) + 1
+        if self._beat_failures < HEARTBEAT_FAILURES_BEFORE_SHED:
+            return
+        if not (self.history_results or self.subagent_history_results
+                or self.jira_issue_results):
+            return
+        log(f"{self._beat_failures} beats in a row failed while carrying on-demand "
+            "deliveries; shedding them rather than re-sending the same body forever")
+        self._drop_on_demand_results()
+        self._hub_body_max = 0
 
     def _read_updating_flag(self):
         """Consume the native updater's hint file (reason + target version) if it

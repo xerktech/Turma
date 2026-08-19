@@ -19,7 +19,14 @@
   const LIVE_TURN_ID = "__live";
   const POLL_MS = 6000;             // /history fallback cadence when the WS is down
   const HISTORY_RETRY_MS = 1200;    // poll cadence while /history returns 202
-  const HISTORY_MAX_RETRIES = 12;
+  // The retry window must outlast a HEARTBEAT, not just a fetch (XERK-347). A
+  // 202 means "the agent hasn't delivered it yet", and a delivery can be shed —
+  // by the agent's own body ceiling, or after two failed beats — in which case
+  // the NEXT beat is the earliest it can arrive, and the beat interval is 20s.
+  // At 12 retries this gave up after 14.4s and the scrollback then never came:
+  // the poll fallback only re-asks while the socket is DOWN, so a session with a
+  // healthy live tail sat on an empty history until it was reopened.
+  const HISTORY_MAX_RETRIES = 40;   // ~48s
   const STOP_SUPPRESS_MS = 4000;    // how long a clicked Stop overrides the busy read
   const ACTION_FAIL_MS = 2000;      // how long the compose button shows a failure
   // Files one message may carry (XERK-234). Mirrors the hub's
@@ -602,21 +609,33 @@
   }
 
   // ---- /history fallback (initial scrollback + WS-down updates) -------------
+  // One 202-retry chain at a time. The poll fallback ticks every POLL_MS while
+  // the socket is down and each tick used to start its own chain, which the
+  // longer window above turns from 12 overlapping requests into 40 (measured:
+  // 156 GETs in 45s against 86). The chain that is already waiting is the one
+  // that will deliver.
+  let historyChain = false;
   async function loadHistory(myGen, retries) {
     retries = retries || 0;
+    if (retries === 0) {
+      if (historyChain) return;
+      historyChain = true;
+    }
     // A closed view has no URL to fetch: close() nulls hostKey/sessionId, and a
     // 202-retry timer already in flight would otherwise build (and 404 on)
     // `/api/agents/null/sessions/null/history`. The gen check downstream only
     // discards the RESULT — this is what stops the request.
-    if (myGen !== gen || !hostKey || !sessionId) return;
+    if (myGen !== gen || !hostKey || !sessionId) { historyChain = false; return; }
     let r;
     try { r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/history"); }
-    catch { return; }
-    if (myGen !== gen) return;
+    catch { historyChain = false; return; }
+    if (myGen !== gen) { historyChain = false; return; }
     if (r.status === 202) {
       if (retries < HISTORY_MAX_RETRIES) setTimeout(() => loadHistory(myGen, retries + 1), HISTORY_RETRY_MS);
+      else historyChain = false;   // gave up — the next tick may start over
       return;
     }
+    historyChain = false;
     if (!r.ok) return;
     let j;
     try { j = await r.json(); } catch { return; }
@@ -641,9 +660,10 @@
 
   // ---- merge (transcript.ts mergeTail port) ---------------------------------
   // Weight = total displayable chars; a richer/longer copy of an entry wins, so
-  // the text-only heartbeat seed is replaced by the rich live tail, and the live
-  // tail (tight caps) is replaced by /history (looser caps). Grow-only, so a
-  // truncated preview never clobbers a fuller copy.
+  // the text-only heartbeat seed (a 500-char preview) is replaced by the rich
+  // live tail or /history — which read at the SAME block caps as each other
+  // (XERK-347), so neither can shrink the other. Grow-only, so a truncated
+  // preview never clobbers a fuller copy.
   //
   // EVERY block payload field counts, not just text/input: a command block
   // carries its content in name/args (a task_notification in summary/result),
@@ -767,8 +787,9 @@
           items.push(openCmd);
         } else if (b.t === "command_output") {
           flush();
-          // resultId, not the card's id: the output is its OWN transcript entry,
-          // so that's the entry "Show more" has to re-fetch a fuller copy of.
+          // resultId, not the card's id: the output is its OWN transcript
+          // entry, so that is the entry a hit scrolls to, not the card it is
+          // drawn in.
           const result = {
             text: b.text || "", isError: !!b.isError, truncated: !!b.truncated, entryId: eid,
           };
@@ -842,18 +863,20 @@
   }
 
   // ---- rendering ------------------------------------------------------------
-  // Static (archived) renders have no /history to expand into — the stored
-  // transcript is already the fullest copy — so the "Show more…" affordance is
-  // suppressed there; the live view keeps it.
-  let noExpand = false;
-  function truncBtn(entryId, truncated) {
-    return (truncated && !noExpand) ? '<button class="trunc" data-eid="' + esc(entryId) + '">Show more…</button>' : "";
+  // A block the agent had to clip to its cap: a build log, a whole-file Read —
+  // never an ordinary message, whose cap is the operator's own input ceiling
+  // (agent BLOCK_CAPS). A static mark, never a control: the live tail and
+  // /history read at the SAME fidelity now (XERK-347), so there is no fuller
+  // copy to fetch and a "Show more…" button could only be a dead end. Don't put
+  // one back — that is the ticket.
+  function clipMark(truncated) {
+    return truncated ? '<span class="clipped">… clipped to fit</span>' : "";
   }
 
   function renderMsg(it) {
     const cls = it.role === "user" ? "user" : "assistant";
     return '<div class="tr-msg ' + cls + '" data-uuid="' + esc(it.id) + '"><span class="role">' + cls + "</span>" +
-      renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div>";
+      renderProse(it.text) + clipMark(it.truncated) + "</div>";
   }
 
   function renderThought(it) {
@@ -861,7 +884,7 @@
     const key = "th:" + it.id;
     return '<details class="thought" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' + openAttr(key, true) +
       "><summary>💭 Thought</summary>" +
-      '<div class="thought-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="thought-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
   }
 
   // ` open` when this card should be expanded: the user's explicit toggle wins,
@@ -895,7 +918,12 @@
           ' loading="lazy" title="' + name + '" srcdoc="' + esc(f.html) + '"></iframe>' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else {
-        out += '<div class="tool-file file"><span class="tool-file-name">📎 ' + name + "</span></div>";
+        // `shed` distinguishes "dropped to fit the reply" (agent
+        // _shed_row_previews / _shed_block_payloads) from a file that was never
+        // renderable in the first place — without it the operator sees a bare
+        // chip and no reason why their screenshot isn't there.
+        out += '<div class="tool-file file"><span class="tool-file-name">📎 ' + name + "</span>" +
+          (f.shed ? '<span class="clipped">… preview dropped to fit</span>' : "") + "</div>";
       }
     }
     out += "</div>";
@@ -920,7 +948,7 @@
     if (it.files) body += renderToolFiles(it.files, it.caption);
     if (it.input && !it.plan && !it.files) {
       body += '<div class="tool-block"><div class="tool-label">input</div><pre>' +
-        esc(it.input) + "</pre>" + truncBtn(it.entryId, it.inputTrunc) + "</div>";
+        esc(it.input) + "</pre>" + clipMark(it.inputTrunc) + "</div>";
     }
     // The reviewable payloads (agent _tool_use_detail): an Edit's actual old →
     // new change as a −/+ diff, a Write's file body, an ExitPlanMode plan as
@@ -939,12 +967,12 @@
     if (it.plan) {
       body += '<div class="tool-block"><div class="tool-label">plan</div>' +
         '<div class="tool-plan">' + renderProse(it.plan) + "</div>" +
-        truncBtn(it.entryId, it.inputTrunc) + "</div>";
+        clipMark(it.inputTrunc) + "</div>";
     }
     if (it.result) {
       body += '<div class="tool-block"><div class="tool-label">' + (it.result.isError ? "error" : "output") +
         '</div><pre class="tool-result">' + esc(it.result.text || "(no output)") + "</pre>" +
-        truncBtn(it.entryId, it.result.truncated) + "</div>";
+        clipMark(it.result.truncated) + "</div>";
     }
     if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
     const taskCls = it.task ? " task" : "";
@@ -969,12 +997,12 @@
       (it.args ? '<span class="cmd-args">' + esc(it.args.split("\n")[0]) + "</span>" : "");
     if (!it.result) {
       return '<div class="cmd-card" data-uuid="' + esc(it.id) + '">' + head +
-        truncBtn(it.id, it.argsTrunc) + "</div>";
+        clipMark(it.argsTrunc) + "</div>";
     }
     return '<details class="cmd-card' + (it.result.isError ? " err" : "") + '" data-dkey="' + esc(key) +
       '" data-uuid="' + esc(it.id) + '"' + openAttr(key, false) + "><summary>" + head + "</summary>" +
       '<div class="cmd-body"><pre>' + esc(it.result.text || "(no output)") + "</pre>" +
-      truncBtn(it.result.entryId || it.id, it.result.truncated) + "</div></details>";
+      clipMark(it.result.truncated) + "</div></details>";
   }
 
   // The summary Claude writes when the context is compacted. The transcript
@@ -985,7 +1013,7 @@
     const key = "cmp:" + it.id;
     return '<details class="compact-card" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' +
       openAttr(key, false) + "><summary>↺ Context compacted — summary of the conversation so far</summary>" +
-      '<div class="compact-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="compact-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
   }
 
   // "[Request interrupted by user…]" as a centred, muted status marker — the
@@ -1023,7 +1051,7 @@
     const key = "away:" + it.id;
     return '<details class="away-card" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' +
       openAttr(key, false) + "><summary>☾ While you were away — recap</summary>" +
-      '<div class="away-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="away-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
   }
 
   function itemsToHtml(items) {
@@ -1904,22 +1932,6 @@
     }
   }
 
-  // ---- expand a truncated block via /history --------------------------------
-  let expandInFlight = false;
-  async function expandEntry(entryId) {
-    if (expandInFlight) return;
-    expandInFlight = true;
-    const myGen = gen;
-    try {
-      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/history");
-      if (myGen !== gen || !r.ok) return;
-      const j = await r.json();
-      if (myGen !== gen || !j || !Array.isArray(j.entries)) return;
-      buffer = mergeTail(buffer, j.entries); // looser caps -> the block grows
-      repaint();
-    } catch {} finally { expandInFlight = false; }
-  }
-
   // ---- file attachments (XERK-234) ------------------------------------------
   // Files the operator staged for the NEXT message. Each is uploaded to the hub
   // the moment it is picked — so Send is instant, and a file too big or a host
@@ -2217,16 +2229,12 @@
     }
   }
 
-  // Delegated clicks for expand-more buttons inside the scroll.
+  // Delegated clicks inside the scroll (code-block copy buttons).
   function wireScrollDelegation() {
     const scroll = $("chatScroll");
     if (!scroll || scroll.dataset.wired) return;
     scroll.dataset.wired = "1";
-    scroll.addEventListener("click", (e) => {
-      if (copyCodeClick(e)) return;
-      const b = e.target.closest && e.target.closest(".trunc[data-eid]");
-      if (b) { e.preventDefault(); expandEntry(b.getAttribute("data-eid")); }
-    });
+    scroll.addEventListener("click", copyCodeClick);
     // Follow the reader: parked at the bottom → keep auto-scrolling (and hide the
     // jump pill); scrolled up → stop pinning and reveal it. Scroll events are
     // coalesced to the settled position, so a programmatic scroll-to-bottom in
@@ -2303,7 +2311,6 @@
     stVerbHost = opts.verbHost || null;
     stTranscriptId = opts.transcriptId || null;
     stEntries = Array.isArray(opts.entries) ? opts.entries : [];
-    noExpand = true;  // no /history to expand into
     detailsOpen.clear();
     loadStaticVerbosity(stTranscriptId);
     renderStaticVerbosity();
@@ -2343,13 +2350,13 @@
     hostKey = hk; sessionId = id; sess = s; agent = a;
     // The switch has landed once the host reports the source we asked for.
     if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
+    historyChain = false;   // a chain from the PREVIOUS session must not block this one
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
     backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
-    noExpand = false;
     detailsOpen.clear();
     loadVerbosity(id);
     setHeader(s, a);
@@ -2468,7 +2475,6 @@
       __setQuestionActive: (v) => { questionActive = v; },
       __setPanePromptActive: (v) => { panePromptActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
-      __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },
       __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; },

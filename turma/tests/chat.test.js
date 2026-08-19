@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -462,23 +462,21 @@ test("render: HTML in a command / compact turn is escaped (no injection)", () =>
   assert.match(html, /&lt;script&gt;/);
 });
 
-test("render: a truncated command output / compact summary offers Show more", () => {
+test("render: a clipped command output / compact summary is MARKED, never a button (XERK-347)", () => {
   const html = withVerbosity("normal", () => itemsToHtml(buildItems([
     { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
     { id: "o1", role: "user", blocks: [{ t: "command_output", text: "cut", truncated: true }] },
     { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "cut", truncated: true }] },
   ])));
-  // The output folds into c1's card but is o1's entry — Show more must re-fetch
-  // the entry the text actually came from, not the card it's drawn in.
-  assert.match(html, /<button class="trunc" data-eid="o1">/);
-  assert.match(html, /<button class="trunc" data-eid="s1">/);
+  assert.equal(html.match(/class="clipped"/g).length, 2);
+  assert.doesNotMatch(html, /<button/);
 });
 
-test("render: a folded card's truncated ARGS still expand the invocation entry", () => {
+test("render: a folded card's clipped ARGS are marked too", () => {
   const html = withVerbosity("normal", () => itemsToHtml(buildItems([
     { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "cut", truncated: true }] },
   ])));
-  assert.match(html, /<button class="trunc" data-eid="c1">/);
+  assert.match(html, /class="clipped"/);
 });
 
 // ---- verbosity-driven HTML rendering -------------------------------------
@@ -529,23 +527,44 @@ test("render: an error result gets the .err class on its card", () => {
   assert.match(html, /class="action-card err"/);
 });
 
-test("render: a truncated block emits a Show more button carrying its entry id", () => {
+// XERK-347: a message is shown WHOLE, every time. The agent's block caps are
+// the same on the live tail as on /history, so a clipped block has no fuller
+// copy anywhere — it gets a static mark, and nothing the operator must press
+// before they can read a message.
+// XERK-347: the /history 202-retry window must outlast a HEARTBEAT, because a
+// delivery the agent shed (its own body ceiling, or two failed beats) can only
+// arrive on the NEXT beat — and the poll fallback re-asks only while the socket
+// is down, so a session with a healthy live tail that gives up early sits on an
+// empty scrollback until it is reopened. Read off the source: these are module
+// constants with no export, and the window is the thing that must not regress.
+test("chat: the /history retry window outlasts the agent's beat interval", () => {
+  const src = require("fs").readFileSync(require.resolve("../public/chat.js"), "utf8");
+  const num = (name) => {
+    const m = src.match(new RegExp(`const ${name} = (\\d+)`));
+    assert.ok(m, `${name} is no longer a plain constant in chat.js`);
+    return Number(m[1]);
+  };
+  const BEAT_MS = 20000;   // hub-agent.py INTERVAL
+  assert.ok(num("HISTORY_MAX_RETRIES") * num("HISTORY_RETRY_MS") > BEAT_MS * 2,
+    "the window must cover the beat that sheds a delivery AND the one that re-delivers it");
+});
+
+test("render: a clipped block gets a static mark, not a Show more button", () => {
   const items = buildItems([
     { id: "a9", role: "assistant", blocks: [{ t: "text", text: "loooong", truncated: true }] },
   ]);
   const html = withVerbosity("verbose", () => itemsToHtml(items));
-  assert.match(html, /class="trunc" data-eid="a9"/);
+  assert.match(html, /class="clipped"/);
+  assert.doesNotMatch(html, /<button/);
+  assert.doesNotMatch(html, /Show more/);
 });
 
-test("render: noExpand (archived view) suppresses the Show more button", () => {
+test("render: an un-clipped block carries no mark at all", () => {
   const items = buildItems([
-    { id: "a9", role: "assistant", blocks: [{ t: "text", text: "loooong", truncated: true }] },
+    { id: "a9", role: "assistant", blocks: [{ t: "text", text: "short" }] },
   ]);
-  __setNoExpand(true);
-  try {
-    const html = withVerbosity("verbose", () => itemsToHtml(items));
-    assert.doesNotMatch(html, /class="trunc"/); // no /history to expand into in the archive
-  } finally { __setNoExpand(false); }
+  const html = withVerbosity("verbose", () => itemsToHtml(items));
+  assert.doesNotMatch(html, /class="clipped"/);
 });
 
 test("render: bubbles, thinking, and tool cards carry data-uuid for scroll-to-hit", () => {
@@ -725,6 +744,25 @@ test("render: a SendUserFile HTML file renders in a fully sandboxed iframe (srcd
   // allow-scripts) means it never executes even after the browser decodes it.
   assert.match(html, /srcdoc="&lt;h1&gt;Hi&lt;\/h1&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;"/);
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
+});
+
+test("render: a preview DROPPED to fit says so; one that never rendered does not (XERK-347)", () => {
+  // The agent sheds SendUserFile payloads to keep a reply under the hub's body
+  // ceiling. Without this the operator sees a bare 📎 chip and no reason why
+  // the screenshot they were sent isn't there.
+  const shedHtml = withVerbosity("verbose", () => itemsToHtml(buildItems([
+    { id: "a1", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "SendUserFile",
+      files: [{ name: "shot.png", kind: "file", shed: true }] }] },
+  ])));
+  assert.match(shedHtml, /📎 shot\.png/);
+  assert.match(shedHtml, /preview dropped to fit/);
+
+  const plainHtml = withVerbosity("verbose", () => itemsToHtml(buildItems([
+    { id: "a1", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "SendUserFile",
+      files: [{ name: "notes.bin", kind: "file" }] }] },
+  ])));
+  assert.match(plainHtml, /📎 notes\.bin/);
+  assert.doesNotMatch(plainHtml, /preview dropped/);
 });
 
 test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {

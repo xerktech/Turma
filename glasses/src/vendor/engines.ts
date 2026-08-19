@@ -51,7 +51,6 @@ interface ChatEngine {
   // phone accumulates history + live deltas exactly as the web does.
   mergeTail(existing: RichEntry[], incoming: RichEntry[]): RichEntry[];
   __setVerbosity(v: Verbosity): void;
-  __setNoExpand(on: boolean): void;
 }
 
 // The pure subset of board.js the phone uses.
@@ -106,10 +105,10 @@ export const Chat = chatMod as ChatEngine;
 export const Board = boardMod as BoardEngine;
 
 // Render a rich transcript to HTML at a given verbosity — the exact web/Android
-// output (bubbles, tool cards, thinking, code, PR/interrupt marks). `noExpand`
-// hides the "Show more…" buttons (there's no lazy /history to expand into here).
+// output (bubbles, tool cards, thinking, code, PR/interrupt marks). Nothing here
+// is interactive: a clipped block carries a static mark, never a "Show more…"
+// button (XERK-347).
 export function renderTranscript(entries: RichEntry[], verbosity: Verbosity): string {
   Chat.__setVerbosity(verbosity);
-  Chat.__setNoExpand(true);
   return Chat.itemsToHtml(Chat.buildItems(entries));
 }

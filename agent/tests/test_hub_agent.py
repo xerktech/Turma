@@ -2142,7 +2142,7 @@ class TestEntryBlocks(unittest.TestCase):
 
     def test_string_content_one_text_block(self):
         self.assertEqual(
-            ha._entry_blocks({"type": "user", "message": {"content": "hi"}}, ha.BLOCK_CAPS_LIVE),
+            ha._entry_blocks({"type": "user", "message": {"content": "hi"}}, ha.BLOCK_CAPS),
             [{"t": "text", "text": "hi"}],
         )
 
@@ -2152,7 +2152,7 @@ class TestEntryBlocks(unittest.TestCase):
             {"type": "text", "text": "answer"},
             {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls -la", "timeout": 5}},
         ]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "thinking", "text": "ponder"},
             {"t": "text", "text": "answer"},
             {"t": "tool_use", "name": "Bash", "input": "ls -la", "id": "toolu_1"},
@@ -2166,7 +2166,7 @@ class TestEntryBlocks(unittest.TestCase):
             {"type": "tool_result", "tool_use_id": "toolu_1",
              "content": [{"type": "text", "text": "boom"}], "is_error": True},
         ]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "tool_result", "text": "boom", "forId": "toolu_1", "isError": True},
         ])
         self.assertIsNone(ha._entry_text(entry))  # unchanged: tool_result-only -> None
@@ -2175,28 +2175,28 @@ class TestEntryBlocks(unittest.TestCase):
         blocks = ha._entry_blocks(
             {"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "name": "X", "input": {"a": 1, "b": "z"}}]}},
-            ha.BLOCK_CAPS_LIVE,
+            ha.BLOCK_CAPS,
         )
         self.assertEqual(blocks, [{"t": "tool_use", "name": "X", "input": '{"a":1,"b":"z"}'}])
 
     def test_over_cap_text_and_result_truncated(self):
-        big = "x" * (ha.BLOCK_CAPS_LIVE["text"] + 500)
-        tb = ha._entry_blocks({"type": "assistant", "message": {"content": big}}, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(tb["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        big = "x" * (ha.BLOCK_CAPS["text"] + 500)
+        tb = ha._entry_blocks({"type": "assistant", "message": {"content": big}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(tb["text"]), ha.BLOCK_CAPS["text"])
         self.assertTrue(tb["truncated"])
 
-        big_out = "y" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big_out = "y" * (ha.BLOCK_CAPS["result"] + 500)
         rb = ha._entry_blocks(
             {"type": "user", "message": {"content": [{"type": "tool_result", "content": big_out}]}},
-            ha.BLOCK_CAPS_LIVE,
+            ha.BLOCK_CAPS,
         )[0]
-        self.assertEqual(len(rb["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertEqual(len(rb["text"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(rb["truncated"])
 
     def test_wrong_type_and_no_message_return_none_empty_content_empty_list(self):
-        self.assertIsNone(ha._entry_blocks({"type": "summary", "message": {"content": "x"}}, ha.BLOCK_CAPS_LIVE))
-        self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS_LIVE))
-        self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS_LIVE), [])
+        self.assertIsNone(ha._entry_blocks({"type": "summary", "message": {"content": "x"}}, ha.BLOCK_CAPS))
+        self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS))
+        self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS), [])
 
     def test_edit_tool_use_carries_the_actual_change_as_a_diff(self):
         entry = {"type": "assistant", "message": {"content": [
@@ -2204,25 +2204,25 @@ class TestEntryBlocks(unittest.TestCase):
                 "file_path": "/repo/a.py", "old_string": "x = 1", "new_string": "x = 2",
                 "replace_all": True}},
         ]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "tool_use", "name": "Edit", "input": "/repo/a.py", "id": "toolu_e",
              "edit": {"old": "x = 1", "new": "x = 2", "replaceAll": True}},
         ])
 
     def test_edit_diff_over_cap_flags_the_block_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 100)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 100)
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Edit", "input": {
                 "file_path": "/repo/a.py", "old_string": "x", "new_string": big}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["edit"]["new"]), ha.BLOCK_CAPS_LIVE["result"])
+        ]}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["edit"]["new"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_write_tool_use_carries_the_file_body(self):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Write", "input": {
                 "file_path": "/repo/new.txt", "content": "hello\nworld"}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["input"], "/repo/new.txt")
         self.assertEqual(block["content"], "hello\nworld")
 
@@ -2230,7 +2230,7 @@ class TestEntryBlocks(unittest.TestCase):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "ExitPlanMode", "input": {
                 "plan": "## Plan\n1. do it", "allowedPrompts": []}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["plan"], "## Plan\n1. do it")
 
     def test_send_user_file_embeds_images_svg_html_and_degrades_the_rest(self):
@@ -2249,7 +2249,7 @@ class TestEntryBlocks(unittest.TestCase):
                    "display": "render", "caption": "the set"}
             block = ha._entry_blocks({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": "SendUserFile", "input": inp},
-            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            ]}}, ha.BLOCK_CAPS)[0]
             self.assertEqual(block["caption"], "the set")
             b64 = base64.b64encode(b"<svg><rect/></svg>").decode()
             self.assertEqual(block["files"], [
@@ -2262,7 +2262,7 @@ class TestEntryBlocks(unittest.TestCase):
             b2 = ha._entry_blocks({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t2", "name": "SendUserFile",
                  "input": {"files": [html], "display": "attach"}},
-            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            ]}}, ha.BLOCK_CAPS)[0]
             self.assertEqual(b2["files"], [{"name": "p.html", "kind": "file"}])
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -2277,7 +2277,7 @@ class TestEntryBlocks(unittest.TestCase):
             block = ha._entry_blocks({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": "SendUserFile",
                  "input": {"files": [big], "display": "render"}},
-            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            ]}}, ha.BLOCK_CAPS)[0]
             self.assertEqual(block["files"], [{"name": "big.png", "kind": "file"}])
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -2286,7 +2286,7 @@ class TestEntryBlocks(unittest.TestCase):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Bash", "input": {
                 "command": "ls", "description": "List files"}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["input"], "ls")
         self.assertEqual(block["desc"], "List files")
 
@@ -2295,25 +2295,25 @@ class TestEntryBlocks(unittest.TestCase):
             {"type": "tool_use", "name": "AskUserQuestion", "input": {
                 "questions": [{"question": "Ship it?", "options": [{"label": "yes"}]},
                               {"question": "Which env?"}]}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["input"], "Ship it? · Which env?")
 
     def test_compact_boundary_becomes_a_status_marker_block(self):
         entry = {"type": "system", "subtype": "compact_boundary",
                  "content": "Conversation compacted", "uuid": "u1",
                  "compactMetadata": {"trigger": "auto", "preTokens": 123380, "postTokens": 5920}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "compact_boundary", "trigger": "auto", "preTokens": 123380, "postTokens": 5920},
         ])
         # Other system subtypes still drop, and the text feed still skips it.
         self.assertIsNone(ha._entry_text(entry))
         self.assertIsNone(ha._entry_blocks(
-            {"type": "system", "subtype": "turn_duration", "durationMs": 5}, ha.BLOCK_CAPS_LIVE))
+            {"type": "system", "subtype": "turn_duration", "durationMs": 5}, ha.BLOCK_CAPS))
 
     def test_pr_link_becomes_a_marker_block_with_a_synthesized_id(self):
         entry = {"type": "pr-link", "prNumber": 230, "prUrl": "https://github.com/o/r/pull/230",
                  "prRepository": "o/r", "timestamp": "2026-07-17T04:25:18.299Z"}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "pr_link", "url": "https://github.com/o/r/pull/230", "number": 230, "repo": "o/r"},
         ])
         # No uuid on the wire entry: the feeds synthesize a stable id so the
@@ -2325,7 +2325,7 @@ class TestEntryBlocks(unittest.TestCase):
         self.assertEqual(ha._entry_id(restamp), ha._entry_id(entry))
         other = dict(entry, prUrl="https://github.com/o/r/pull/231")
         self.assertNotEqual(ha._entry_id(other), ha._entry_id(entry))
-        self.assertIsNone(ha._entry_blocks({"type": "pr-link"}, ha.BLOCK_CAPS_LIVE))
+        self.assertIsNone(ha._entry_blocks({"type": "pr-link"}, ha.BLOCK_CAPS))
         self.assertEqual(ha._entry_id({"type": "user", "uuid": "u9"}), "u9")
 
 
@@ -2584,7 +2584,7 @@ class TestTaskNotification(unittest.TestCase):
 
     def test_blocks_emit_task_notification_from_string_content(self):
         entry = {"type": "user", "message": {"content": TASK_NOTIFICATION}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [{
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [{
             "t": "task_notification",
             "summary": 'Agent "Confirm merge semantics" finished',
             "status": "completed",
@@ -2594,7 +2594,7 @@ class TestTaskNotification(unittest.TestCase):
     def test_blocks_emit_task_notification_from_list_text_block(self):
         entry = {"type": "user", "message": {"content": [
             {"type": "text", "text": TASK_NOTIFICATION}]}}
-        blocks = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)
+        blocks = ha._entry_blocks(entry, ha.BLOCK_CAPS)
         self.assertEqual(blocks[0]["t"], "task_notification")
         self.assertEqual(blocks[0]["summary"], 'Agent "Confirm merge semantics" finished')
 
@@ -2604,7 +2604,7 @@ class TestTaskNotification(unittest.TestCase):
             "<summary>Background command finished (exit code 0)</summary>\n"
             "</task-notification>"
         )
-        blocks = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS_LIVE)
+        blocks = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS)
         self.assertEqual(blocks, [{
             "t": "task_notification",
             "summary": "Background command finished (exit code 0)",
@@ -2612,10 +2612,10 @@ class TestTaskNotification(unittest.TestCase):
         }])
 
     def test_long_result_is_capped_and_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 500)
         text = f"<task-notification>\n<summary>done</summary>\n<result>{big}</result>\n</task-notification>"
-        block = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["result"]), ha.BLOCK_CAPS_LIVE["result"])
+        block = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["result"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_flattens_to_summary_and_result(self):
@@ -2696,50 +2696,50 @@ class TestLocalCommand(unittest.TestCase):
 
     def test_blocks_drop_the_caveat_entirely(self):
         entry = {"type": "user", "isMeta": True, "message": {"content": COMMAND_CAVEAT}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [])
         self.assertIsNone(ha._entry_text(entry))
 
     def test_blocks_emit_command_from_string_and_list_content(self):
         expected = [{"t": "command", "name": "/compact", "args": "summaries appear as user text"}]
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {"content": COMMAND_INVOCATION}},
-                             ha.BLOCK_CAPS_LIVE),
+                             ha.BLOCK_CAPS),
             expected)
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {"content": [
-                {"type": "text", "text": COMMAND_INVOCATION}]}}, ha.BLOCK_CAPS_LIVE),
+                {"type": "text", "text": COMMAND_INVOCATION}]}}, ha.BLOCK_CAPS),
             expected)
 
     def test_blocks_omit_empty_args(self):
         text = "<command-name>/clear</command-name>\n<command-args></command-args>"
         self.assertEqual(ha._entry_blocks({"type": "user", "message": {"content": text}},
-                                          ha.BLOCK_CAPS_LIVE),
+                                          ha.BLOCK_CAPS),
                          [{"t": "command", "name": "/clear"}])
 
     def test_blocks_emit_command_output(self):
         entry = {"type": "user", "message": {"content": COMMAND_STDOUT}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "command_output", "text": "Compacted (ctrl+o to see full summary)"}])
 
     def test_blocks_flag_stderr_output_as_an_error(self):
         entry = {"type": "user", "message": {"content":
                  "<local-command-stderr>Error: No messages to compact</local-command-stderr>"}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "command_output", "text": "Error: No messages to compact",
                            "isError": True}])
 
     def test_empty_output_yields_no_block(self):
         entry = {"type": "user", "message": {"content":
                  "<local-command-stdout></local-command-stdout>"}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [])
         self.assertIsNone(ha._entry_text(entry))
 
     def test_long_output_is_capped_and_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 500)
         entry = {"type": "user", "message": {"content":
                  f"<local-command-stdout>{big}</local-command-stdout>"}}
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_flattens_command_and_output(self):
@@ -2773,20 +2773,20 @@ class TestCompactSummary(unittest.TestCase):
                          "assistant")
 
     def test_blocks_emit_a_compact_summary_block(self):
-        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS),
                          [{"t": "compact_summary", "text": self.SUMMARY}])
 
     def test_an_ordinary_user_turn_stays_a_text_block(self):
         entry = {"type": "user", "message": {"content": self.SUMMARY}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "text", "text": self.SUMMARY}])
 
     def test_long_summary_is_capped_and_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["text"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["text"] + 500)
         entry = {"type": "user", "isCompactSummary": True, "message": {"content": big}}
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["t"], "compact_summary")
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["text"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_keeps_the_summary_prose(self):
@@ -2820,23 +2820,23 @@ class TestSkillBody(unittest.TestCase):
             {"type": "assistant", "sourceToolUseID": "toolu_01ABC", "message": {"content": "hi"}}))
 
     def test_blocks_emit_the_body_as_its_skill_calls_tool_result(self):
-        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS),
                          [{"t": "tool_result", "text": self.BODY, "forId": "toolu_01ABC"}])
 
     def test_the_same_body_typed_by_a_human_stays_a_text_block(self):
         # Only the tool tag makes it tool output — pasting a skill body by hand
         # is the operator talking, and must still read as a user bubble.
         entry = {"type": "user", "message": {"content": [{"type": "text", "text": self.BODY}]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "text", "text": self.BODY}])
 
     def test_a_long_body_is_capped_and_truncated(self):
         entry = self._entry()
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 500)
         entry["message"]["content"] = [{"type": "text", "text": big}]
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["t"], "tool_result")
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_drops_it_like_any_tool_result(self):
@@ -2882,11 +2882,11 @@ class TestBashPassthrough(unittest.TestCase):
     def test_blocks_emit_command_and_output(self):
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {
-                "content": "<bash-input> ls -la</bash-input>"}}, ha.BLOCK_CAPS_LIVE),
+                "content": "<bash-input> ls -la</bash-input>"}}, ha.BLOCK_CAPS),
             [{"t": "command", "name": "!", "args": "ls -la"}])
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {
-                "content": "<bash-stderr>boom</bash-stderr>"}}, ha.BLOCK_CAPS_LIVE),
+                "content": "<bash-stderr>boom</bash-stderr>"}}, ha.BLOCK_CAPS),
             [{"t": "command_output", "text": "boom", "isError": True}])
 
     def test_text_feed_flattens_like_a_slash_command(self):
@@ -2912,7 +2912,7 @@ class TestInterruptMarker(unittest.TestCase):
             for content in (text, [{"type": "text", "text": text}]):
                 self.assertEqual(
                     ha._entry_blocks({"type": "user", "message": {"content": content}},
-                                     ha.BLOCK_CAPS_LIVE),
+                                     ha.BLOCK_CAPS),
                     [{"t": "interrupt", "text": text}])
 
     def test_text_feed_keeps_the_raw_line(self):
@@ -2927,7 +2927,7 @@ class TestInterruptMarker(unittest.TestCase):
         text = "the log said [Request interrupted by user] at 3pm"
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {"content": text}},
-                             ha.BLOCK_CAPS_LIVE),
+                             ha.BLOCK_CAPS),
             [{"t": "text", "text": text}])
 
 
@@ -2942,7 +2942,7 @@ class TestAwaySummary(unittest.TestCase):
              "content": "Fixed the bug and opened a PR. (disable recaps in /config)"}
 
     def test_becomes_an_away_summary_block(self):
-        self.assertEqual(ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS_LIVE),
+        self.assertEqual(ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS),
                          [{"t": "away_summary", "text": "Fixed the bug and opened a PR."}])
 
     def test_text_feed_and_role(self):
@@ -2952,20 +2952,20 @@ class TestAwaySummary(unittest.TestCase):
     def test_other_system_subtypes_stay_dropped(self):
         for sub in ("turn_duration", "bridge_status", "stop_hook_summary", None):
             entry = {"type": "system", "subtype": sub, "content": "x"}
-            self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+            self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS))
             self.assertIsNone(ha._entry_text(entry))
 
     def test_empty_recap_drops(self):
         entry = {"type": "system", "subtype": "away_summary",
                  "content": " (disable recaps in /config)"}
-        self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+        self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS))
         self.assertIsNone(ha._entry_text(entry))
 
     def test_long_recap_is_capped_and_truncated(self):
         entry = {"type": "system", "subtype": "away_summary",
-                 "content": "z" * (ha.BLOCK_CAPS_LIVE["text"] + 100)}
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+                 "content": "z" * (ha.BLOCK_CAPS["text"] + 100)}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["text"])
         self.assertTrue(block["truncated"])
 
 
@@ -3059,6 +3059,170 @@ class TestQueuedPrompts(ProjectDirMixin, unittest.TestCase):
         _, _, queued = ha._history_entries(path)
         self.assertEqual(len(queued), ha.QUEUED_PROMPTS_MAX)
         self.assertEqual(queued[-1], f"p{ha.QUEUED_PROMPTS_MAX + 4}")
+
+
+class TestHistoryBudget(ProjectDirMixin, unittest.TestCase):
+    """XERK-347: the per-block caps bound a BLOCK, so one reply is bounded as a
+    whole — the window is 200 entries and the operator fold reads the entire
+    transcript, and an oversized staged result is XERK-235's offline loop."""
+
+    def _rows(self, n, chars, char="x"):
+        return [{"id": f"e{i}", "role": "assistant", "text": "",
+                 "blocks": [{"t": "text", "text": char * chars}]} for i in range(n)]
+
+    def test_weight_is_WIRE_bytes_not_characters(self):
+        # The payload is serialized with ensure_ascii, so one CJK char costs six
+        # bytes on the wire. Counting characters under-states a non-ASCII
+        # transcript by 6x, which is how a reply "inside" its ceiling still blew
+        # HEARTBEAT_MAX and wedged the host offline.
+        row = {"t": "text", "text": "話" * 100}
+        self.assertGreaterEqual(ha._json_bytes(row), 600)
+        self.assertEqual(ha._json_bytes(row), len(json.dumps(row).encode()))
+
+    def test_a_non_ascii_window_is_trimmed_on_its_real_size(self):
+        # Same character count as an ASCII window that fits; 6x the bytes.
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 3000):
+            ascii_kept, ascii_dropped = ha._fit_history_budget(self._rows(4, 400))
+            cjk_kept, cjk_dropped = ha._fit_history_budget(self._rows(4, 400, "話"))
+        self.assertFalse(ascii_dropped)
+        self.assertEqual(len(ascii_kept), 4)
+        self.assertTrue(cjk_dropped)
+        self.assertEqual([r["id"] for r in cjk_kept], ["e3"])
+
+    def test_oldest_rows_go_first_and_the_reply_is_flagged(self):
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 3000):
+            kept, dropped = ha._fit_history_budget(self._rows(10, 1000))
+        self.assertTrue(dropped)
+        self.assertEqual([r["id"] for r in kept], ["e8", "e9"])
+
+    def test_a_reply_within_budget_is_untouched(self):
+        rows = self._rows(3, 10)
+        kept, dropped = ha._fit_history_budget(rows)
+        self.assertFalse(dropped)
+        self.assertIs(kept, rows)
+
+    def test_the_newest_row_survives_however_big_it_is(self):
+        # A blank chat is worse than a short one, and one row is not bounded by
+        # the block caps alone (a SendUserFile turn's previews — XERK-355).
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 100):
+            kept, dropped = ha._fit_history_budget(self._rows(2, 5000))
+        self.assertTrue(dropped)
+        self.assertEqual([r["id"] for r in kept], ["e1"])
+
+    def _preview_row(self, rid, files, chars):
+        # A SendUserFile turn: previews are read from DISK, not the transcript,
+        # so they are the one thing the block caps do not bound (XERK-355).
+        return {"id": rid, "role": "assistant", "text": "here you go",
+                "blocks": [{"t": "tool_use", "name": "SendUserFile", "input": "x",
+                            "files": [{"name": f"f{i}.png", "kind": "image",
+                                       "src": "data:image/png;base64," + "A" * chars}
+                                      for i in range(files)]}]}
+
+    def test_a_row_too_heavy_to_deliver_sheds_its_PREVIEWS_not_the_row(self):
+        # Exempting it produced a body nothing could deliver — the hub answers
+        # no status past its ceiling, so the beat looped forever. Dropping it
+        # would be a hole in the conversation. Shedding degrades the delivery to
+        # the name chip an oversize file already gets.
+        rows = [self._preview_row("e1", 4, 2000)]
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 3000):
+            kept, dropped = ha._fit_history_budget(rows)
+        self.assertEqual([r["id"] for r in kept], ["e1"])
+        self.assertLessEqual(ha._json_bytes(kept[0]), 3000)
+        block = kept[0]["blocks"][0]
+        self.assertTrue(block["truncated"])
+        self.assertEqual([f["kind"] for f in block["files"]], ["file"] * 4)
+        # The names survive: the card still says what was delivered.
+        self.assertEqual([f["name"] for f in block["files"]],
+                         ["f0.png", "f1.png", "f2.png", "f3.png"])
+        self.assertTrue(dropped or True)  # shedding alone need not flag the reply
+
+    def test_shedding_takes_the_heaviest_block_first_and_stops_there(self):
+        # Two deliveries in one turn: shedding the big one is enough, so the
+        # small one keeps its inline previews.
+        row = self._preview_row("e1", 1, 4000)
+        row["blocks"].append(self._preview_row("e2", 1, 200)["blocks"][0])
+        self.assertTrue(ha._shed_row_previews(row, 3000))
+        self.assertEqual(row["blocks"][0]["files"][0]["kind"], "file")   # heavy: shed
+        self.assertEqual(row["blocks"][1]["files"][0]["kind"], "image")  # light: kept
+        self.assertLessEqual(ha._json_bytes(row), 3000)
+
+    def test_shedding_is_LINEAR_in_the_blocks_it_sheds(self):
+        # A turn may carry BLOCK_MAX_PER_ENTRY deliveries. Re-measuring the whole
+        # row per block cost 18s on the beat loop for one 48-block turn — beat
+        # latency against OFFLINE_AFTER_MS, on the thread the heartbeat runs on.
+        # Counted, not timed: a timing assertion in CI is a flake.
+        row = self._preview_row("e1", 1, 500)
+        for _ in range(11):
+            row["blocks"].append(self._preview_row("x", 1, 500)["blocks"][0])
+        calls = []
+        real = ha._json_bytes
+        with mock.patch.object(ha, "_json_bytes",
+                               lambda v: (calls.append(1), real(v))[1]):
+            ha._shed_row_previews(row, 100)
+        # One row + at most two per block (sized before, re-sized after shedding).
+        self.assertLessEqual(len(calls), 1 + 2 * len(row["blocks"]))
+
+    def test_shedding_marks_the_chip_as_DROPPED_not_never_captured(self):
+        # Same `shed:True` the archive path sets, so the client can say which.
+        row = self._preview_row("e1", 2, 2000)
+        self.assertTrue(ha._shed_row_previews(row, 100))
+        for f in row["blocks"][0]["files"]:
+            self.assertTrue(f["shed"])
+            self.assertEqual(f["kind"], "file")
+            self.assertNotIn("src", f)
+
+    def test_a_hostile_files_shape_cannot_break_the_beat(self):
+        # `files` is only ever built as a list by _send_user_file_detail, but this
+        # runs inside the heartbeat: a shape that raises here takes the host down.
+        for files in (5, True, "x", {"a": 1}, [None, 7, "s"], []):
+            row = {"id": "e1", "role": "assistant", "text": "t",
+                   "blocks": [{"t": "tool_use", "files": files}]}
+            ha._shed_row_previews(row, 1)   # must not raise
+
+    def test_a_row_with_no_previews_sheds_nothing(self):
+        row = {"id": "e1", "role": "assistant", "text": "x" * 100, "blocks": []}
+        self.assertFalse(ha._shed_row_previews(row, 10))
+
+    def test_history_entries_applies_the_budget_and_reports_truncated(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "x" * 2000}},
+            {"uuid": "a1", "type": "assistant", "message": {"content": "y" * 2000}},
+            {"uuid": "a2", "type": "assistant", "message": {"content": "tail"}},
+        ])
+        # 6000: a row weighs its flat text AND its blocks (a deliberate
+        # over-count — both ride the wire), so two 2000-char turns fit and three
+        # do not.
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 6000):
+            entries, capped, _ = ha._history_entries(path)
+        # Nothing else cut this read — the whole-reply budget is what did, and it
+        # says so, because the client renders `truncated` as "older history above".
+        self.assertTrue(capped)
+        self.assertEqual([e["id"] for e in entries], ["a1", "a2"])
+
+
+class TestBlockCapsPinned(unittest.TestCase):
+    """The cap VALUES are the ticket (XERK-347), so they are asserted, not just
+    used: every earlier test compares a clip against BLOCK_CAPS itself, so
+    re-introducing the tight live caps — the thing that put a "Show more…"
+    button under every long message — left the whole suite green."""
+
+    def test_text_is_capped_at_what_an_operator_can_type(self):
+        # A message is shown WHOLE: nothing the operator can send (the composer
+        # caps at INPUT_MAX_CHARS) and nothing a model realistically emits is
+        # clipped.
+        self.assertEqual(ha.BLOCK_CAPS["text"], ha.INPUT_MAX_CHARS)
+        self.assertEqual(ha.BLOCK_CAPS["text"], 100000)
+
+    def test_tool_payloads_keep_their_own_tighter_caps(self):
+        # A build log or a whole-file Read is not a message; these are what the
+        # payload ceilings exist to bound.
+        self.assertEqual(ha.BLOCK_CAPS["input"], 4000)
+        self.assertEqual(ha.BLOCK_CAPS["result"], 8000)
+
+    def test_one_cap_set_serves_every_path(self):
+        # No live/full split to re-create: a tighter live cap IS the button.
+        self.assertFalse([n for n in dir(ha) if n.startswith("BLOCK_CAPS_")])
 
 
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
@@ -10310,6 +10474,263 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(
             [r["sessionId"] for r in payload["historyResults"]], ["s1", "s2"],
         )
+
+
+class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
+    """XERK-347: a beat that the hub refuses as too large is the ONE failure
+    re-sending cannot fix — every staged result is held until a POST succeeds,
+    so the identical oversize body goes back up every beat and the host never
+    comes back (XERK-235's offline loop). Both halves are tested: the beat is
+    kept under the ceiling, and a 413 that happens anyway ends the loop."""
+
+    def _result(self, sid, chars):
+        return {"sessionId": sid, "truncated": False, "queued": [],
+                "entries": [{"id": "e1", "role": "assistant", "text": "",
+                             "blocks": [{"t": "text", "text": "x" * chars}]}]}
+
+    def test_several_sessions_histories_are_trimmed_to_the_aggregate(self):
+        sm = self.make_manager()
+        for sid in ("s1", "s2", "s3"):
+            sm.history_results.append(self._result(sid, 4000))
+        with mock.patch.object(ha, "HISTORY_STAGED_MAX_BYTES", 9000):
+            payload = sm.build_payload(0)
+        # Newest kept, oldest dropped — and dropped from the staged list too, or
+        # the next beat rebuilds the same oversize body.
+        self.assertEqual([r["sessionId"] for r in payload["historyResults"]], ["s2", "s3"])
+        self.assertEqual([r["sessionId"] for r in sm.history_results], ["s2", "s3"])
+
+    def test_the_newest_result_rides_however_big_it_is(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 50000))
+        with mock.patch.object(ha, "HISTORY_STAGED_MAX_BYTES", 100):
+            payload = sm.build_payload(0)
+        self.assertEqual([r["sessionId"] for r in payload["historyResults"]], ["s1"])
+
+    def test_only_ONE_result_on_the_whole_beat_is_exempt(self):
+        # One exemption per LIST let two oversize deliveries share a beat, which
+        # is a body the hub answers with no status at all.
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 40000))
+        sm.subagent_history_results.append(self._result("s2", 40000))
+        with mock.patch.object(ha, "HISTORY_STAGED_MAX_BYTES", 100):
+            payload = sm.build_payload(0)
+        self.assertEqual([r["sessionId"] for r in payload["historyResults"]], ["s1"])
+        self.assertNotIn("subagentHistoryResults", payload)
+
+    def test_a_body_past_HEARTBEAT_BODY_MAX_is_shed_BEFORE_it_is_sent(self):
+        # The hub 413s only up to a point; past it Node destroys the socket and
+        # urllib sees a broken pipe, so no status handler can fire. Measuring
+        # the body we are about to send is the only place this can be caught.
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 200000))
+        payload = sm.build_payload(0)
+        self.assertIn("historyResults", payload)
+        sent = {}
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            sent["bytes"] = len(req.data)
+            return FakeResp()
+
+        before = len(json.dumps(payload))
+        with mock.patch.object(ha, "HEARTBEAT_BODY_MAX", 5000), \
+                mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(sm.post(payload), {})
+        # What went on the wire is the SHED body, not the one handed to post().
+        self.assertLess(sent["bytes"], before)
+        self.assertLess(sent["bytes"], 200000)
+        # ...and shed for good: the next beat is not the same body again.
+        self.assertEqual(sm.history_results, [])
+        self.assertNotIn("historyResults", sm.build_payload(1))
+
+    def test_the_beat_itself_still_rides_when_its_deliveries_are_shed(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 200000))
+        sm.spawn_failures.append({"cmdId": "c1", "error": "no"})
+        payload = sm.build_payload(0)
+        with mock.patch.object(ha, "HEARTBEAT_BODY_MAX", 5000):
+            sm._drop_on_demand_results(payload)
+        self.assertNotIn("historyResults", payload)
+        # An EVENT that exists nowhere else is not a fetch — it stays held.
+        self.assertEqual(payload["spawnFailures"], [{"cmdId": "c1", "error": "no"}])
+        self.assertEqual(len(sm.spawn_failures), 1)
+
+    def test_the_body_ceiling_comes_from_the_HUB_not_a_fixed_number(self):
+        # The hub's ceiling is a fraction of its container limit, so a hub given
+        # less memory has a smaller one — and a fixed agent-side number posts
+        # straight into the band where no status ever comes back.
+        sm = self.make_manager()
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)   # before any reply
+        sm._note_body_max({"commands": [], "bodyMax": 8 << 20})
+        self.assertEqual(sm._body_max(), int((8 << 20) * ha.HEARTBEAT_BODY_MARGIN))
+
+    def test_a_preposterous_or_broken_bodyMax_cannot_talk_us_up(self):
+        sm = self.make_manager()
+        sm._note_body_max({"bodyMax": 1 << 40})
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)   # our own cap holds
+        for bad in ({"bodyMax": 0}, {"bodyMax": -1}, {"bodyMax": True},
+                    {"bodyMax": "8"}, {}, None):
+            sm2 = self.make_manager()
+            sm2._note_body_max(bad)
+            self.assertEqual(sm2._body_max(), ha.HEARTBEAT_BODY_MAX)
+
+    def test_a_smaller_hub_sheds_a_body_a_bigger_one_would_have_taken(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 3 << 20))
+        sm._note_body_max({"bodyMax": 2 << 20})   # a hub with a 2 MiB ceiling
+        payload = sm.build_payload(0)
+        sent = {}
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            sent["bytes"] = len(req.data)
+            return FakeResp()
+
+        with mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(sm.post(payload), {})
+        self.assertNotIn("historyResults", payload)
+        self.assertEqual(sm.history_results, [])
+        self.assertLess(sent["bytes"], sm._body_max())
+
+    def test_a_beat_that_gets_NO_status_still_stops_repeating_itself(self):
+        # The hub answers no status past its ceiling, and the learned ceiling is
+        # only refreshed on a SUCCESSFUL beat — so a hub restarted with less
+        # memory (or an agent repointed at a smaller one) would re-post the same
+        # body every beat forever with nothing able to notice.
+        sm = self.make_manager()
+        # A ceiling whose DERIVED value differs from the default, or the reset
+        # below is invisible: 32 MiB x the margin lands exactly on it.
+        sm._note_body_max({"bodyMax": 8 << 20})
+        sm.history_results.append(self._result("s1", 2000))
+        payload = sm.build_payload(0)
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=BrokenPipeError("broken pipe")):
+            self.assertIsNone(sm.post(payload))
+            self.assertEqual(len(sm.history_results), 1)   # one failure proves nothing
+            self.assertIsNone(sm.post(payload))
+        self.assertEqual(sm.history_results, [])           # ...two does
+        # The stale ceiling goes with them: the next beats run on the
+        # conservative default until this hub states its own.
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)
+
+    def test_an_ordinary_outage_sheds_nothing(self):
+        sm = self.make_manager()
+        sm.spawn_failures.append({"cmdId": "c1", "error": "no"})
+        sm._note_body_max({"bodyMax": 8 << 20})
+        learned = sm._body_max()
+        payload = sm.build_payload(0)
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("network down")):
+            for _ in range(5):
+                self.assertIsNone(sm.post(payload))
+        self.assertEqual(len(sm.spawn_failures), 1)
+        # An outage is not a size problem: it must not throw away what the hub
+        # told us either, or a flapping tunnel silently reverts this agent to
+        # the permissive default against a hub that cannot take it.
+        self.assertEqual(sm._body_max(), learned)
+
+    def test_a_successful_beat_clears_the_failure_streak(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b"{}"
+
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("blip")):
+            self.assertIsNone(sm.post(sm.build_payload(0)))
+        with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
+            self.assertEqual(sm.post(sm.build_payload(1)), {})
+        sm.history_results.append(self._result("s2", 10))
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("blip")):
+            self.assertIsNone(sm.post(sm.build_payload(2)))
+        # One failure since the success — a streak that reset, not two in a row.
+        self.assertEqual(len(sm.history_results), 1)
+
+    def test_an_infinite_or_absurd_bodyMax_cannot_break_every_beat(self):
+        # `1e999` is legal JSON and parses to inf; int(inf) RAISES, inside the
+        # try — so every beat would log as failed while every beat succeeded.
+        sm = self.make_manager()
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            sm._note_body_max({"bodyMax": bad})
+            self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)
+
+    def test_a_huge_INT_bodyMax_is_as_dangerous_as_inf(self):
+        # A 400-digit integer is legal JSON too, and `math.isfinite` RAISES on it
+        # rather than answering — the same beat-always-failed symptom by the
+        # other type. Clamped, not just rejected, because the multiply in
+        # _body_max would overflow next.
+        sm = self.make_manager()
+        sm._note_body_max({"bodyMax": 10 ** 400})
+        self.assertEqual(sm._hub_body_max, ha.HEARTBEAT_BODY_STATED_MAX)
+        # Clamping loses nothing: a hub stating more than this already gets our
+        # own maximum, which is what a generous hub got before the clamp.
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)
+        # ...and a beat carrying it still succeeds, which is the whole point.
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b'{"commands":[],"bodyMax":' + b"1" * 400 + b"}"
+
+        with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
+            self.assertEqual(sm.post(sm.build_payload(0)), {"commands": [], "bodyMax": int("1" * 400)})
+
+    def test_a_tiny_bodyMax_cannot_silently_disable_history_forever(self):
+        # Every beat 200, every delivery shed, nothing anywhere looking wrong —
+        # the operator's chat just never loads. Below the floor it is nonsense.
+        sm = self.make_manager()
+        sm._note_body_max({"bodyMax": 1})
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MIN)
+
+    def test_a_beat_within_the_aggregate_is_untouched(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+        sm.subagent_history_results.append(self._result("s2", 10))
+        payload = sm.build_payload(0)
+        self.assertEqual(len(payload["historyResults"]), 1)
+        self.assertEqual(len(payload["subagentHistoryResults"]), 1)
+
+    def test_a_413_drops_the_on_demand_deliveries_instead_of_looping(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+        sm.subagent_history_results.append(self._result("s2", 10))
+        sm.jira_issue_results.append({"issueKey": "X-1"})
+        # ...while a refusal that re-sending CAN fix keeps everything staged.
+        sm.spawn_failures.append({"cmdId": "c1", "error": "no"})
+        payload = sm.build_payload(0)
+        err = ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", 413, "Payload Too Large", {},
+            io.BytesIO(b'{"error":"body too large"}'))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+            self.assertIsNone(sm.post(payload))
+        self.assertEqual(sm.history_results, [])
+        self.assertEqual(sm.subagent_history_results, [])
+        self.assertEqual(sm.jira_issue_results, [])
+        # The beat itself still rides — the host stays online, and its operator
+        # sees a history that did not arrive rather than a card that went dark.
+        self.assertEqual(len(sm.spawn_failures), 1)
+        self.assertNotIn("historyResults", sm.build_payload(1))
+
+    def test_any_other_refusal_still_HOLDS_the_staged_results(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+        payload = sm.build_payload(0)
+        err = ha.urllib.error.HTTPError(
+            "http://hub/api/heartbeat", 503, "Service Unavailable", {}, io.BytesIO(b"{}"))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err):
+            self.assertIsNone(sm.post(payload))
+        self.assertEqual(len(sm.history_results), 1)
 
 
 class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):

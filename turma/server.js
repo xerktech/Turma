@@ -3155,9 +3155,9 @@ function findSession(sessionId) {
 const BODY_MAX = 1 << 20; // 1 MiB
 
 // A heartbeat is not a user request: it carries the agent's on-demand
-// `historyResults`, which at the documented FULL block caps (HISTORY_MAX_MSGS
-// entries × BLOCK_TEXT_CHARS_FULL, plus base64 SendUserFile images) reaches
-// ~5 MiB on an ordinary "open the chat history" click. At 1 MiB the hub
+// `historyResults`, which at the agent's own ceilings (HISTORY_MAX_BYTES per
+// delivery, HISTORY_STAGED_MAX_BYTES per beat, plus base64 SendUserFile images)
+// reaches several MiB on an ordinary "open the chat history" click. At 1 MiB the hub
 // destroyed the socket, the agent saw ECONNRESET rather than a status code,
 // and — because it holds staged results until a POST succeeds — re-sent the
 // same oversized body every beat, so the host stayed offline forever with
@@ -7240,10 +7240,19 @@ const server = http.createServer(async (req, res) => {
       // their next beat rather than the one after.
       warnOrgDrift(key, next);
       const peers = orgPeers(key);
+      // Tell the agent how big a body this hub will actually take (XERK-347).
+      // It is a FRACTION OF THE CONTAINER LIMIT, so only the hub knows it — and
+      // an agent guessing a fixed number guesses wrong on any hub sized smaller
+      // than the deployed 256 MiB. It matters because past roughly this ceiling
+      // Node destroys the socket under a request still being written, so the
+      // agent gets no status at all: it must refuse its own oversize body
+      // BEFORE sending, and it can only do that against a number it was told.
+      // An agent that predates this keeps its own conservative default.
+      const bodyMax = HEARTBEAT_MAX;
       return json(res, 200, archiveHave
-        ? { commands: reply, peers, archiveHave, archiveShed, archiveFull,
+        ? { commands: reply, peers, bodyMax, archiveHave, archiveShed, archiveFull,
             archiveRawHave, archiveRawSkip }
-        : { commands: reply, peers });
+        : { commands: reply, peers, bodyMax });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart

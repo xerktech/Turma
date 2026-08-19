@@ -75,7 +75,7 @@ import kotlinx.coroutines.delay
 fun ChatItemView(item: ChatItem) {
     when (item) {
         is ChatItem.Bubble -> TranscriptBubble(item)
-        is ChatItem.Thinking -> TranscriptThinking(item.text)
+        is ChatItem.Thinking -> TranscriptThinking(item.text, item.clipped)
         is ChatItem.Tool -> TranscriptTool(item)
         is ChatItem.TaskNote -> Pill("⚑ ${item.summary} (${item.status})")
     }
@@ -88,6 +88,22 @@ fun ChatItemView(item: ChatItem) {
  */
 @Composable
 private fun scaledSp(base: Float): TextUnit = (base * LocalTextSize.current.current.scale).sp
+
+/**
+ * A block the agent had to clip to its cap — the web's `.clipped` span (XERK-347).
+ * A static mark, never a control: the live tail and /history read at the same
+ * fidelity, so nothing holds a fuller copy for a tap to fetch.
+ */
+@Composable
+private fun ClippedMark(modifier: Modifier = Modifier, label: String = "… clipped to fit") {
+    Text(
+        label,
+        modifier,
+        fontSize = scaledSp(11f),
+        fontStyle = FontStyle.Italic,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
 
 // The bubble keeps a max width so a long turn doesn't run edge to edge, but the
 // leftover gutter (available width − BASE_BUBBLE_MAX) is halved (XERK-74): the cap
@@ -118,33 +134,38 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
                 // (a grey) as its content color, so agent text read grey in dark
                 // mode while the user bubble — whose color isn't a theme token, so
                 // it keeps the ambient onSurface — read white (XERK-136).
-                ProseBlocks(
-                    blocks,
-                    Modifier.padding(10.dp, 6.dp),
-                    fontSize = scaledSp(13f),
-                    lineHeight = scaledSp(18f),
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
+                Column(Modifier.padding(10.dp, 6.dp)) {
+                    ProseBlocks(
+                        blocks,
+                        fontSize = scaledSp(13f),
+                        lineHeight = scaledSp(18f),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (b.clipped) ClippedMark(Modifier.padding(top = 2.dp))
+                }
             }
         }
     }
 }
 
 @Composable
-private fun TranscriptThinking(text: String) {
+private fun TranscriptThinking(text: String, clipped: Boolean = false) {
     var open by remember { mutableStateOf(false) }
     val blocks = remember(text) { parseProse(text) }
     Column(Modifier.fillMaxWidth().clickable { open = !open }) {
         Text("💭 thinking", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
         // The web renders the thinking trace through renderProse too (italic).
-        if (open) ProseBlocks(
-            blocks,
-            Modifier.padding(start = 8.dp, top = 2.dp),
-            fontSize = scaledSp(12f),
-            lineHeight = scaledSp(16f),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            italic = true,
-        )
+        if (open) {
+            ProseBlocks(
+                blocks,
+                Modifier.padding(start = 8.dp, top = 2.dp),
+                fontSize = scaledSp(12f),
+                lineHeight = scaledSp(16f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                italic = true,
+            )
+            if (clipped) ClippedMark(Modifier.padding(start = 8.dp))
+        }
     }
 }
 
@@ -349,6 +370,7 @@ private fun TranscriptTool(t: ChatItem.Tool) {
             if (open && t.result.isNotBlank()) {
                 Text(t.result, Modifier.padding(top = 5.dp), fontSize = scaledSp(11f), lineHeight = scaledSp(15f), fontFamily = FontFamily.Monospace)
             }
+            if (open && t.clipped) ClippedMark(Modifier.padding(top = 3.dp))
         }
     }
 }
@@ -369,7 +391,7 @@ private fun SendFileView(f: SendFile) {
                     else -> null
                 }
             }
-            if (model == null) { FileChip(f.name); return }
+            if (model == null) { FileChip(f.name, f.shed); return }
             Column {
                 // A DEFINITE height, not heightIn(max): AsyncImage's painter starts
                 // with an unknown intrinsic size, so a max-only height constraint
@@ -399,13 +421,16 @@ private fun SendFileView(f: SendFile) {
                 .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(6.dp)))
             Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
         }
-        else -> FileChip(f.name)
+        else -> FileChip(f.name, f.shed)
     }
 }
 
 @Composable
-private fun FileChip(name: String) {
-    Text("📎 $name", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun FileChip(name: String, shed: Boolean = false) {
+    Column {
+        Text("📎 $name", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (shed) ClippedMark(label = "… preview dropped to fit")
+    }
 }
 
 // A SendUserFile HTML page in a FULLY sandboxed WebView (web parity: the

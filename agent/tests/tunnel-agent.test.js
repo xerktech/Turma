@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -51,7 +51,7 @@ test("entryText: string content, ANSI-stripped list content, tool_use, drops", (
 });
 
 test("entryBlocks: string content -> one text block", () => {
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: "hi" } }, BLOCK_CAPS_LIVE), [{ t: "text", text: "hi" }]);
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: "hi" } }, BLOCK_CAPS), [{ t: "text", text: "hi" }]);
 });
 
 test("entryBlocks: preserves thinking, tool_use input, tool_result output that entryText drops", () => {
@@ -65,7 +65,7 @@ test("entryBlocks: preserves thinking, tool_use input, tool_result output that e
       ],
     },
   };
-  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE), [
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS), [
     { t: "thinking", text: "ponder" },
     { t: "text", text: "answer" },
     { t: "tool_use", name: "Bash", input: "ls -la", id: "toolu_1" },
@@ -81,13 +81,13 @@ test("entryBlocks: tool_result pairs via forId, flags isError, flattens list con
       ],
     },
   };
-  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE), [
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS), [
     { t: "tool_result", text: "boom", forId: "toolu_1", isError: true },
   ]);
 });
 
 test("entryBlocks: tool_use with unknown input falls back to compact JSON", () => {
-  const blocks = entryBlocks({ type: "assistant", message: { content: [{ type: "tool_use", name: "X", input: { a: 1, b: "z" } }] } }, BLOCK_CAPS_LIVE);
+  const blocks = entryBlocks({ type: "assistant", message: { content: [{ type: "tool_use", name: "X", input: { a: 1, b: "z" } }] } }, BLOCK_CAPS);
   assert.deepEqual(blocks, [{ t: "tool_use", name: "X", input: '{"a":1,"b":"z"}' }]);
 });
 
@@ -102,7 +102,7 @@ test("entryBlocks: SendUserFile embeds image/SVG/HTML files, degrades the rest (
   };
   const [b] = entryBlocks(
     { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "SendUserFile", input: inp }] } },
-    BLOCK_CAPS_LIVE);
+    BLOCK_CAPS);
   assert.equal(b.caption, "the set");
   assert.deepEqual(b.files, [
     { name: "a.svg", kind: "image", src: "data:image/svg+xml;base64," + Buffer.from("<svg><rect/></svg>").toString("base64") },
@@ -113,27 +113,27 @@ test("entryBlocks: SendUserFile embeds image/SVG/HTML files, degrades the rest (
   // display:"attach" turns an HTML file into a download chip (not an iframe).
   const [b2] = entryBlocks(
     { type: "assistant", message: { content: [{ type: "tool_use", id: "t2", name: "SendUserFile",
-      input: { files: [path.join(dir, "p.html")], display: "attach" } }] } }, BLOCK_CAPS_LIVE);
+      input: { files: [path.join(dir, "p.html")], display: "attach" } }] } }, BLOCK_CAPS);
   assert.deepEqual(b2.files, [{ name: "p.html", kind: "file" }]);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("entryBlocks: over-cap text/result get truncated:true and are clipped", () => {
-  const big = "x".repeat(BLOCK_CAPS_LIVE.text + 500);
-  const [tb] = entryBlocks({ type: "assistant", message: { content: big } }, BLOCK_CAPS_LIVE);
-  assert.equal(tb.text.length, BLOCK_CAPS_LIVE.text);
+  const big = "x".repeat(BLOCK_CAPS.text + 500);
+  const [tb] = entryBlocks({ type: "assistant", message: { content: big } }, BLOCK_CAPS);
+  assert.equal(tb.text.length, BLOCK_CAPS.text);
   assert.equal(tb.truncated, true);
 
-  const bigOut = "y".repeat(BLOCK_CAPS_LIVE.result + 500);
-  const [rb] = entryBlocks({ type: "user", message: { content: [{ type: "tool_result", content: bigOut }] } }, BLOCK_CAPS_LIVE);
-  assert.equal(rb.text.length, BLOCK_CAPS_LIVE.result);
+  const bigOut = "y".repeat(BLOCK_CAPS.result + 500);
+  const [rb] = entryBlocks({ type: "user", message: { content: [{ type: "tool_result", content: bigOut }] } }, BLOCK_CAPS);
+  assert.equal(rb.text.length, BLOCK_CAPS.result);
   assert.equal(rb.truncated, true);
 });
 
 test("entryBlocks: wrong type / no message -> null; empty content -> []", () => {
-  assert.equal(entryBlocks({ type: "system", message: { content: "x" } }, BLOCK_CAPS_LIVE), null);
-  assert.equal(entryBlocks({ type: "user" }, BLOCK_CAPS_LIVE), null);
-  assert.deepEqual(entryBlocks({ type: "assistant", message: { content: "" } }, BLOCK_CAPS_LIVE), []);
+  assert.equal(entryBlocks({ type: "system", message: { content: "x" } }, BLOCK_CAPS), null);
+  assert.equal(entryBlocks({ type: "user" }, BLOCK_CAPS), null);
+  assert.deepEqual(entryBlocks({ type: "assistant", message: { content: "" } }, BLOCK_CAPS), []);
 });
 
 // Mirror of test_hub_agent.py TestTaskNotification — keep in lockstep.
@@ -166,9 +166,9 @@ test("entryBlocks: task-notification -> one task_notification block (string + li
     status: "completed",
     result: "The --settings file is merged as a higher-precedence layer.",
   }];
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: TASK_NOTIFICATION } }, BLOCK_CAPS_LIVE), want);
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: TASK_NOTIFICATION } }, BLOCK_CAPS), want);
   assert.deepEqual(
-    entryBlocks({ type: "user", message: { content: [{ type: "text", text: TASK_NOTIFICATION }] } }, BLOCK_CAPS_LIVE),
+    entryBlocks({ type: "user", message: { content: [{ type: "text", text: TASK_NOTIFICATION }] } }, BLOCK_CAPS),
     want);
   // entryText flattens it to summary + result (the text-only tail form).
   assert.equal(
@@ -178,13 +178,13 @@ test("entryBlocks: task-notification -> one task_notification block (string + li
 
 test("entryBlocks: background-command task-notification has no result; long result truncates", () => {
   const bg = "<task-notification>\n<status>completed</status>\n<summary>Background command finished</summary>\n</task-notification>";
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: bg } }, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: bg } }, BLOCK_CAPS),
     [{ t: "task_notification", summary: "Background command finished", status: "completed" }]);
-  const big = "z".repeat(BLOCK_CAPS_LIVE.result + 500);
+  const big = "z".repeat(BLOCK_CAPS.result + 500);
   const [block] = entryBlocks(
     { type: "user", message: { content: `<task-notification>\n<summary>done</summary>\n<result>${big}</result>\n</task-notification>` } },
-    BLOCK_CAPS_LIVE);
-  assert.equal(block.result.length, BLOCK_CAPS_LIVE.result);
+    BLOCK_CAPS);
+  assert.equal(block.result.length, BLOCK_CAPS.result);
   assert.equal(block.truncated, true);
 });
 
@@ -221,18 +221,18 @@ test("parseLocalCommand: caveat / invocation / stdout / stderr, ignores non-comm
 
 test("entryBlocks: slash-command turns -> command / command_output blocks, caveat dropped", () => {
   const want = [{ t: "command", name: "/compact", args: "summaries appear as user text" }];
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: COMMAND_INVOCATION } }, BLOCK_CAPS_LIVE), want);
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: COMMAND_INVOCATION } }, BLOCK_CAPS), want);
   assert.deepEqual(
-    entryBlocks({ type: "user", message: { content: [{ type: "text", text: COMMAND_INVOCATION }] } }, BLOCK_CAPS_LIVE),
+    entryBlocks({ type: "user", message: { content: [{ type: "text", text: COMMAND_INVOCATION }] } }, BLOCK_CAPS),
     want);
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: COMMAND_STDOUT } }, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: COMMAND_STDOUT } }, BLOCK_CAPS),
     [{ t: "command_output", text: "Compacted (ctrl+o to see full summary)" }]);
   assert.deepEqual(
-    entryBlocks({ type: "user", message: { content: "<local-command-stderr>No messages</local-command-stderr>" } }, BLOCK_CAPS_LIVE),
+    entryBlocks({ type: "user", message: { content: "<local-command-stderr>No messages</local-command-stderr>" } }, BLOCK_CAPS),
     [{ t: "command_output", text: "No messages", isError: true }]);
   // The caveat and an empty output contribute nothing.
-  assert.deepEqual(entryBlocks({ type: "user", isMeta: true, message: { content: COMMAND_CAVEAT } }, BLOCK_CAPS_LIVE), []);
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: "<local-command-stdout></local-command-stdout>" } }, BLOCK_CAPS_LIVE), []);
+  assert.deepEqual(entryBlocks({ type: "user", isMeta: true, message: { content: COMMAND_CAVEAT } }, BLOCK_CAPS), []);
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: "<local-command-stdout></local-command-stdout>" } }, BLOCK_CAPS), []);
   // entryText flattens to the invocation line / the raw output; the caveat drops.
   assert.equal(entryText({ type: "user", message: { content: COMMAND_INVOCATION } }),
     "/compact summaries appear as user text");
@@ -257,7 +257,7 @@ test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes",
   assert.equal(parseLocalCommand("talk about <bash-input> inline"), null);
   // The blocks + text feeds treat it exactly like a slash command.
   assert.deepEqual(
-    entryBlocks({ type: "user", message: { content: "<bash-input> ls -la</bash-input>" } }, BLOCK_CAPS_LIVE),
+    entryBlocks({ type: "user", message: { content: "<bash-input> ls -la</bash-input>" } }, BLOCK_CAPS),
     [{ t: "command", name: "!", args: "ls -la" }]);
   assert.equal(entryText({ type: "user", message: { content: "<bash-input> ls</bash-input>" } }), "! ls");
 });
@@ -266,7 +266,7 @@ test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes",
 test("entryBlocks: an interrupt marker is a status block, not a user bubble", () => {
   for (const text of ["[Request interrupted by user]", "[Request interrupted by user for tool use]"]) {
     for (const content of [text, [{ type: "text", text }]]) {
-      assert.deepEqual(entryBlocks({ type: "user", message: { content } }, BLOCK_CAPS_LIVE),
+      assert.deepEqual(entryBlocks({ type: "user", message: { content } }, BLOCK_CAPS),
         [{ t: "interrupt", text }]);
     }
   }
@@ -275,7 +275,7 @@ test("entryBlocks: an interrupt marker is a status block, not a user bubble", ()
     "[Request interrupted by user]");
   // Prose that merely mentions one stays prose.
   const prose = "the log said [Request interrupted by user] at 3pm";
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: prose } }, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: prose } }, BLOCK_CAPS),
     [{ t: "text", text: prose }]);
 });
 
@@ -283,19 +283,19 @@ test("entryBlocks: an interrupt marker is a status block, not a user bubble", ()
 test("entryBlocks/entryText/entryRole: the away recap surfaces; other system entries drop", () => {
   const entry = { type: "system", subtype: "away_summary",
     content: "Fixed the bug and opened a PR. (disable recaps in /config)" };
-  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS),
     [{ t: "away_summary", text: "Fixed the bug and opened a PR." }]);
   assert.equal(entryText(entry), "Fixed the bug and opened a PR.");
   assert.equal(entryRole(entry), "assistant");
   assert.equal(awaySummaryText(entry), "Fixed the bug and opened a PR.");
   for (const subtype of ["turn_duration", "bridge_status", "stop_hook_summary", undefined]) {
     const other = { type: "system", subtype, content: "x" };
-    assert.equal(entryBlocks(other, BLOCK_CAPS_LIVE), null);
+    assert.equal(entryBlocks(other, BLOCK_CAPS), null);
     assert.equal(entryText(other), null);
   }
   // An empty recap (hint only) drops.
   assert.equal(entryBlocks({ type: "system", subtype: "away_summary",
-    content: " (disable recaps in /config)" }, BLOCK_CAPS_LIVE), null);
+    content: " (disable recaps in /config)" }, BLOCK_CAPS), null);
 });
 
 // Mirror of test_hub_agent.py TestEntryBlocks' tool-detail cases — keep in lockstep.
@@ -303,38 +303,38 @@ test("entryBlocks: known tool calls carry their reviewable payload (edit/content
   const [edit] = entryBlocks({ type: "assistant", message: { content: [
     { type: "tool_use", id: "toolu_e", name: "Edit", input: {
       file_path: "/repo/a.py", old_string: "x = 1", new_string: "x = 2", replace_all: true } },
-  ] } }, BLOCK_CAPS_LIVE);
+  ] } }, BLOCK_CAPS);
   assert.deepEqual(edit, { t: "tool_use", name: "Edit", input: "/repo/a.py", id: "toolu_e",
     edit: { old: "x = 1", new: "x = 2", replaceAll: true } });
 
-  const big = "z".repeat(BLOCK_CAPS_LIVE.result + 100);
+  const big = "z".repeat(BLOCK_CAPS.result + 100);
   const [clippedEdit] = entryBlocks({ type: "assistant", message: { content: [
     { type: "tool_use", name: "Edit", input: { file_path: "/a", old_string: "x", new_string: big } },
-  ] } }, BLOCK_CAPS_LIVE);
-  assert.equal(clippedEdit.edit.new.length, BLOCK_CAPS_LIVE.result);
+  ] } }, BLOCK_CAPS);
+  assert.equal(clippedEdit.edit.new.length, BLOCK_CAPS.result);
   assert.equal(clippedEdit.truncated, true);
 
   const [write] = entryBlocks({ type: "assistant", message: { content: [
     { type: "tool_use", name: "Write", input: { file_path: "/repo/new.txt", content: "hello\nworld" } },
-  ] } }, BLOCK_CAPS_LIVE);
+  ] } }, BLOCK_CAPS);
   assert.equal(write.input, "/repo/new.txt");
   assert.equal(write.content, "hello\nworld");
 
   const [plan] = entryBlocks({ type: "assistant", message: { content: [
     { type: "tool_use", name: "ExitPlanMode", input: { plan: "## Plan\n1. do it", allowedPrompts: [] } },
-  ] } }, BLOCK_CAPS_LIVE);
+  ] } }, BLOCK_CAPS);
   assert.equal(plan.plan, "## Plan\n1. do it");
 
   const [bash] = entryBlocks({ type: "assistant", message: { content: [
     { type: "tool_use", name: "Bash", input: { command: "ls", description: "List files" } },
-  ] } }, BLOCK_CAPS_LIVE);
+  ] } }, BLOCK_CAPS);
   assert.equal(bash.input, "ls");
   assert.equal(bash.desc, "List files");
 
   const [ask] = entryBlocks({ type: "assistant", message: { content: [
     { type: "tool_use", name: "AskUserQuestion", input: {
       questions: [{ question: "Ship it?", options: [{ label: "yes" }] }, { question: "Which env?" }] } },
-  ] } }, BLOCK_CAPS_LIVE);
+  ] } }, BLOCK_CAPS);
   assert.equal(ask.input, "Ship it? · Which env?");
 });
 
@@ -342,11 +342,11 @@ test("entryBlocks: known tool calls carry their reviewable payload (edit/content
 test("entryBlocks: compact_boundary and pr-link entries become status marker blocks", () => {
   assert.deepEqual(entryBlocks({ type: "system", subtype: "compact_boundary", uuid: "u1",
     content: "Conversation compacted",
-    compactMetadata: { trigger: "auto", preTokens: 123380, postTokens: 5920 } }, BLOCK_CAPS_LIVE),
+    compactMetadata: { trigger: "auto", preTokens: 123380, postTokens: 5920 } }, BLOCK_CAPS),
     [{ t: "compact_boundary", trigger: "auto", preTokens: 123380, postTokens: 5920 }]);
   const pr = { type: "pr-link", prNumber: 230, prUrl: "https://github.com/o/r/pull/230",
     prRepository: "o/r", timestamp: "2026-07-17T04:25:18.299Z" };
-  assert.deepEqual(entryBlocks(pr, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks(pr, BLOCK_CAPS),
     [{ t: "pr_link", url: "https://github.com/o/r/pull/230", number: 230, repo: "o/r" }]);
   // pr-link entries carry no uuid: the tail synthesizes a stable id so the
   // chat's id-keyed merge doesn't drop them. It keys on the URL ALONE, so the
@@ -356,14 +356,14 @@ test("entryBlocks: compact_boundary and pr-link entries become status marker blo
     "a re-stamp of the same PR must share the first one's id");
   assert.notEqual(entryId({ ...pr, prUrl: "https://github.com/o/r/pull/231" }), entryId(pr));
   assert.equal(entryId({ type: "user", uuid: "u9" }), "u9");
-  assert.equal(entryBlocks({ type: "pr-link" }, BLOCK_CAPS_LIVE), null);
+  assert.equal(entryBlocks({ type: "pr-link" }, BLOCK_CAPS), null);
 });
 
 // Mirror of test_hub_agent.py TestToolReferenceResult — keep in lockstep.
 test("entryBlocks: tool_reference blocks in a tool_result flatten to named lines", () => {
   const entry = { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1",
     content: [{ type: "text", text: "loaded:" }, { type: "tool_reference", tool_name: "WebFetch" }] }] } };
-  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS),
     [{ t: "tool_result", text: "loaded:\n[tool: WebFetch]", forId: "t1" }]);
 });
 
@@ -412,12 +412,12 @@ test("transcriptTail: a queued task-notification keeps its FIFO slot but never d
 
 test("entryBlocks: command args omitted when empty; long output truncates", () => {
   assert.deepEqual(
-    entryBlocks({ type: "user", message: { content: "<command-name>/clear</command-name>\n<command-args></command-args>" } }, BLOCK_CAPS_LIVE),
+    entryBlocks({ type: "user", message: { content: "<command-name>/clear</command-name>\n<command-args></command-args>" } }, BLOCK_CAPS),
     [{ t: "command", name: "/clear" }]);
-  const big = "z".repeat(BLOCK_CAPS_LIVE.result + 500);
+  const big = "z".repeat(BLOCK_CAPS.result + 500);
   const [block] = entryBlocks(
-    { type: "user", message: { content: `<local-command-stdout>${big}</local-command-stdout>` } }, BLOCK_CAPS_LIVE);
-  assert.equal(block.text.length, BLOCK_CAPS_LIVE.result);
+    { type: "user", message: { content: `<local-command-stdout>${big}</local-command-stdout>` } }, BLOCK_CAPS);
+  assert.equal(block.text.length, BLOCK_CAPS.result);
   assert.equal(block.truncated, true);
 });
 
@@ -427,9 +427,9 @@ test("entryRole/entryBlocks: a compact summary is the assistant's, not the user'
   assert.equal(entryRole(entry), "assistant");
   assert.equal(entryRole({ type: "user", message: { content: "hi" } }), "user");
   assert.equal(entryRole({ type: "assistant", message: { content: "hi" } }), "assistant");
-  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE), [{ t: "compact_summary", text: summary }]);
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS), [{ t: "compact_summary", text: summary }]);
   // The same text on an ordinary user turn stays a plain text block.
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: summary } }, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: summary } }, BLOCK_CAPS),
     [{ t: "text", text: summary }]);
   // The text feed keeps the prose; only the role moved.
   assert.equal(entryText(entry), summary);
@@ -445,23 +445,23 @@ test("entryToolSource/entryBlocks: a skill body is its Skill call's result, not 
   assert.equal(entryToolSource({ type: "user", message: { content: "hi" } }), null);
   // An assistant turn is never tool-authored, whatever it carries.
   assert.equal(entryToolSource({ type: "assistant", sourceToolUseID: "toolu_01ABC", message: {} }), null);
-  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS),
     [{ t: "tool_result", text: body, forId: "toolu_01ABC" }]);
   // The same body typed by a human is the operator talking: still a text block.
-  assert.deepEqual(entryBlocks({ type: "user", message: { content: [{ type: "text", text: body }] } }, BLOCK_CAPS_LIVE),
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: [{ type: "text", text: body }] } }, BLOCK_CAPS),
     [{ t: "text", text: body }]);
   // The text feed carries no tool results, so it drops the wall.
   assert.equal(entryText(entry), null);
 });
 
 test("entryBlocks: a long skill body is capped and truncated", () => {
-  const big = "z".repeat(BLOCK_CAPS_LIVE.result + 500);
+  const big = "z".repeat(BLOCK_CAPS.result + 500);
   const [block] = entryBlocks({
     type: "user", sourceToolUseID: "toolu_01ABC",
     message: { content: [{ type: "text", text: big }] },
-  }, BLOCK_CAPS_LIVE);
+  }, BLOCK_CAPS);
   assert.equal(block.t, "tool_result");
-  assert.equal(block.text.length, BLOCK_CAPS_LIVE.result);
+  assert.equal(block.text.length, BLOCK_CAPS.result);
   assert.equal(block.truncated, true);
 });
 
@@ -1681,5 +1681,74 @@ test("deviceName refuses a dot-segment DEVICE_NAME override", () => {
     else process.env.DEVICE_NAME = saved.d;
     if (saved.c !== undefined) process.env.COMPUTERNAME = saved.c;
     process.env.PATH = saved.p;
+  }
+});
+
+// --- block caps: parity with hub-agent.py's BLOCK_CAPS ----------------------
+// CLAUDE.md declares the two modules a parity contract for everything both
+// parse, and entryBlocks is the biggest thing on that list — but every other
+// assertion here clips against BLOCK_CAPS itself, so re-introducing the tight
+// live caps (4000/1000/2000) left both suites green. That split IS the "Show
+// more…" button XERK-347 removed: a live tail that clips harder than /history
+// is a message the reader has to press something to finish.
+test("BLOCK_CAPS matches hub-agent.py's, value for value", () => {
+  const py = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
+  const pyCap = (name) => {
+    const m = py.match(new RegExp(`^${name} = int\\(os\\.environ\\.get\\("[A-Z_]+", "(\\d+)"\\)\\)`, "m"));
+    assert.ok(m, `hub-agent.py no longer declares ${name} the way this parity check reads it`);
+    return Number(m[1]);
+  };
+  assert.deepEqual(BLOCK_CAPS, {
+    text: pyCap("BLOCK_TEXT_CHARS"),
+    input: pyCap("BLOCK_TOOL_INPUT_CHARS"),
+    result: pyCap("BLOCK_TOOL_RESULT_CHARS"),
+  });
+  // Pinned, not just mirrored: two files drifting together is still the bug.
+  assert.deepEqual(BLOCK_CAPS, { text: 100000, input: 4000, result: 8000 });
+  // A message caps at what the composer accepts, so it is never clipped.
+  assert.equal(BLOCK_CAPS.text, pyCap("INPUT_MAX_CHARS"));
+});
+
+// --- an unserializable tail skips its frame, it does not kill the process ---
+// A turn holding BLOCK_MAX_PER_ENTRY SendUserFile deliveries builds a frame past
+// V8's ~512 MB string ceiling (previews come off DISK, so no transcript window
+// bounds them — XERK-355). This runs in a setInterval with no uncaughtException
+// handler in this file, so the throw took the whole tunnel process down and
+// entrypoint.sh restarted it in a loop for as long as the session was watched —
+// every terminal, live tail and heartbeat poke on the host with it.
+test("pollWatcher survives a tail JSON.stringify cannot produce", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wire-throw-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "99999999-8888-7777-6666-555555555555";
+  fs.appendFileSync(path.join(proj, `${tid}.jsonl`),
+    JSON.stringify({ type: "user", message: { content: "go" } }) + "\n");
+
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  const realStringify = JSON.stringify;
+  let boom = true;
+  JSON.stringify = function (value, ...rest) {
+    // Only the tail frame — the module serializes other things too.
+    if (boom && value && Array.isArray(value.entries)) throw new RangeError("Invalid string length");
+    return realStringify.call(this, value, ...rest);
+  };
+  try {
+    mod.startWatch("sess-throw", work, tid);
+    mod.pollWatcher("sess-throw");   // must not throw
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(frames.filter((f) => f.tail === "sess-throw").length, 0, "the bad frame was skipped");
+    // ...and the watcher is still alive: the next poll delivers normally.
+    boom = false;
+    mod.pollWatcher("sess-throw");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(frames.some((f) => f.tail === "sess-throw"), "a later frame still sends");
+  } finally {
+    JSON.stringify = realStringify;
+    mod.stopWatch("sess-throw");
+    mod.__setControlSink(null);
   }
 });

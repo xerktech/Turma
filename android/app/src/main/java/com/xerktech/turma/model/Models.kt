@@ -857,6 +857,9 @@ data class SendFile(
     val kind: String = "",
     val src: String = "",
     val html: String = "",
+    // Dropped to fit the reply (agent `_shed_block_payloads`), rather than never
+    // renderable — the chip says which, as the web's does (XERK-347).
+    val shed: Boolean = false,
 )
 
 @Serializable

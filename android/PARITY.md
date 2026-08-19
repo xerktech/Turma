@@ -63,11 +63,15 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   it as small as possible in the narrow phone header and because a ＋ there would collide with the "New
   session" ＋ the Sessions/Dashboard headers already carry. Same modal (`CreateTicketSheet`), same
   behavior.
-- **Auto history-upgrade instead of the "Show more…" button** (XERK-77). The web chat marks a
-  cap-truncated block with a manual "Show more…" that refetches `/history` (looser caps). Android
-  refetches `/history` automatically when a truncated block arrives on the live tail (once per entry,
-  `ChatViewModel.maybeUpgradeTruncated`) — a tap-target that small earns its keep less on a phone than
-  just showing the full text. Both clients also poll `/history` while the live socket is down.
+- **Neither client expands a clipped block any more** (XERK-347, superseding XERK-77's split). The
+  agent reads at ONE fidelity now — the live tail and `/history` share `BLOCK_CAPS` — so the web's
+  "Show more…" button and Android's automatic re-fetch behind it (`maybeUpgradeTruncated`) both had
+  nothing left to fetch, and both are gone. A block still over its cap carries the same static
+  "… clipped to fit" mark on both — though Android's shows only once a thinking trace or tool card
+  is expanded, since it collapses cards the web opens by default. A SendUserFile preview the agent
+  dropped to fit the reply carries "… preview dropped to fit" on its name chip on both, so it reads
+  differently from a file that never rendered. Both clients still poll `/history` while the live
+  socket is down, and still page older entries through it.
 
 ## Done (this pass — first installment)
 

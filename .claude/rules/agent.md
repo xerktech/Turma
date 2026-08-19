@@ -403,10 +403,20 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   survivors as `queued[]`. A window opening mid-sequence errs toward hiding; older agents send no
   `queued`. Tooling payloads ride the same queue, so **display filtering happens at REPORT time**
   (`_queued_display` / `queuedDisplay`), never at fold time, which desyncs the dequeues.
-- Blocks ride the live tail (tight caps), on-demand `history` and the archive push (both
-  `BLOCK_CAPS_FULL`) — the one place inclusion widens: a tool_result-only turn, dropped by
-  `_entry_text`, is kept when it has blocks. Only `transcript_tail` stays text-only.
-  Already-archived bytes are never re-parsed.
+- Blocks ride the live tail, on-demand `history` and the archive push at ONE fidelity —
+  `BLOCK_CAPS`, mirrored in `tunnel-agent.js` — the one place inclusion widens: a tool_result-only
+  turn, dropped by `_entry_text`, is kept when it has blocks. Only `transcript_tail` stays
+  text-only. Already-archived bytes are never re-parsed.
+  - **Never give the live path tighter caps again** (XERK-347): that split is what put a "Show
+    more…" button under every long message, and it bought nothing — a frame is bounded by the
+    ~128 KB window it is parsed from. Text caps at `INPUT_MAX_CHARS`: a message is shown WHOLE.
+  - **`history` is bounded in WIRE BYTES, never chars**: `HISTORY_MAX_BYTES` per delivery
+    (`_fit_history_budget`), `HISTORY_STAGED_MAX_BYTES` across one beat (`_fit_staged_history`,
+    dropping the OLDEST — the hub 202s a missing result and the client re-asks). `json.dumps` is
+    ensure_ascii, so a CJK char is six bytes and a char budget under-states it 6x. The block caps
+    bound a BLOCK, and the operator fold reads the whole file.
+  - **A 413 on the beat DROPS those staged results** (`post`): they are held until a POST succeeds,
+    so a refused body is otherwise re-sent verbatim forever and the host never returns (XERK-235).
 - Tests: `TestEntryBlocks`, the tool-detail/marker cases in `tunnel-agent.test.js`.
 
 ## Archive sync
