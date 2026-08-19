@@ -110,20 +110,24 @@ hub half.
   drift locked it out of its roster AND out of migration on that beat — an outage caused by the
   boundary rather than prevented by it, and the real migrate tests beat exactly that shape. The
   attack still trips it: joining another org means naming that org.
-- **The migrate route refuses a DRIFTED host on either side but MATCHES on the claimed org.** It
-  relays raw transcript bytes, so the drift refusal belongs there; the match must stay on
-  `siteKeyOf` because **no client can mirror a rule keyed on `orgBound`** — it is stripped from the
-  served payload, so `eligibleMoveTargets` (`sessions.html`), its Android twin (`core/Sessions.kt`)
-  and the glasses fork see only `jira.siteKey`. Matching on the binding is not a tightening either:
-  a host that is not drifting claims its bound org or claims nothing, so every pair the drift check
-  lets through gets the same answer from both. It measurably broke the UI in BOTH directions —
-  menus offering hosts the hub then 409s, and a legal target no menu would show.
-  - **Known gap: a DRIFTED host still diverges** — the menus offer it, the hub refuses with its own
-    message. Closing it means serving the decided org (a derived field the clients read), which is a
-    three-mirror parity change and its own ticket.
-  - Pin it with a request against the ROUTE. A test asserting a predicate copied into the test file
-    passes with the route reverted — that happened here twice, and the copy then went stale against
-    the rule it claimed to document.
+- **The migrate route is UNCHANGED by the binding: it compares the claimed org.** Two attempts to
+  bind-gate it were reverted, and neither should be retried without the missing piece.
+  - Comparing `orgBound` broke the UI in BOTH directions — menus offering a host the hub then 409s,
+    and a legal target no menu would show — because **no client can mirror a rule keyed on
+    `orgBound`**: it is stripped from the served payload, so `eligibleMoveTargets`
+    (`sessions.html`), its Android twin (`core/Sessions.kt`) and the glasses fork see only
+    `jira.siteKey`.
+  - Refusing a DRIFTED host on top of a claim match was the fallback, and it buys almost nothing:
+    the refusal is **one beat deep** (a drifted host that omits its `jira` block next beat is a
+    legal target again) while being the only surviving hub/client divergence.
+  - **Neither closes the real hole**, which predates all of this: two hosts that both declare NO
+    org match each other whatever they are bound to, so a session's raw transcript bytes can be
+    relayed across a binding boundary with no drift anywhere — driven end to end to `phase: done`.
+    That, and the derived org that would close it, are **XERK-349**.
+  - Pin this route with a REQUEST against it, and assert the status you mean: a test asserting a
+    predicate copied into the test file passes with the route reverted (it happened twice, and the
+    copy then went stale), and `notEqual(409)` passes on the 503 the shared in-flight cap really
+    returns.
 - **There are THREE client mirrors of "an agent's org", not one**: `turma/public/org.js`'s
   `siteKeyOf`, `sessions.html`'s own `siteKeyOfAgent` (the one the Move menu actually uses), and
   Android's. Only the first mirrors the hub's coercion today; the server-side `normalizeJira` is

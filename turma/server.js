@@ -7882,23 +7882,24 @@ const server = http.createServer(async (req, res) => {
         // has already decided is lying about its org — a strictly larger
         // disclosure than the roster's.
         //
-        // The MATCH compares the CLAIMED org, as it always has, and the binding
-        // is used only to refuse a host that is lying about it. That is not a
-        // weakening: a host that is not drifting either claims its bound org or
-        // claims nothing, so for any pair this pass allows, comparing claims and
-        // comparing bindings give the same answer.
+        // The CLAIMED org on both sides, deliberately UNCHANGED by XERK-348's
+        // org binding, which gates the peer roster and nothing else.
         //
-        // It has to be the claimed org because **no client can mirror a rule
-        // keyed on `orgBound`** — it is stripped from the served payload, so
-        // `eligibleMoveTargets` (and its Android and glasses twins) can only
-        // reason about `jira.siteKey`. Comparing bindings here made the hub and
-        // every Move menu disagree in BOTH directions: menus offering a host the
-        // hub then 409s, and a legal target no menu would ever show. Only a
-        // DRIFTED host still diverges, which is the narrow residual below.
-        if (orgDrifted(src) || orgDrifted(tgt))
-          return json(res, 409, {
-            error: "that agent's declared org doesn't match the one it is bound to",
-          });
+        // Two attempts to bind-gate this route were reverted, and neither should
+        // be retried without the missing piece. Comparing `orgBound` made the hub
+        // and every Move menu disagree in both directions, because `orgBound` is
+        // stripped from the served payload and no client can mirror a rule keyed
+        // on it. Refusing a DRIFTED host on top of a claim match is what is left
+        // of that, and it buys almost nothing: the refusal is one beat deep — a
+        // drifted host that simply omits its `jira` block on the next beat is a
+        // legal target again — while being the only surviving hub/client
+        // divergence. It also does not close the real hole, which predates this
+        // and is measured in XERK-349: two hosts that BOTH declare no org match
+        // each other whatever they are bound to, so a session can be relayed
+        // across a binding boundary with no drift anywhere.
+        //
+        // Closing that means serving the DECIDED org so the three client mirrors
+        // can agree with the hub. That is a parity change, and it is XERK-349.
         if (siteKeyOf(src) !== siteKeyOf(tgt))
           return json(res, 409, { error: "the target agent is in a different org" });
         if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)

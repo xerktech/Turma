@@ -8646,18 +8646,26 @@ test("migrate: an ORG-LESS fleet can still move sessions", async () => {
   await migHost("mFreeA", null);
   await migHost("mFreeB", null);
   const r = await migrate("mFreeA", "s1", { host: "mFreeB" });
-  assert.notEqual(r.status, 409, JSON.stringify(r.body));
+  // `notEqual(409)` passes on ANY other status — including the 503 the fleet-wide
+  // in-flight cap really returns, since every migrate test holds a slot. Assert
+  // the success, or this pins nothing.
+  assert.equal(r.status, 200, JSON.stringify(r.body));
   // A started move stays in flight until it settles, and the in-flight cap is
   // shared with every other migrate test — drop it rather than leaking a slot.
   if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
 });
 
-test("migrate: matches on the CLAIMED org, so the clients can mirror it", async () => {
-  // No client can mirror a rule keyed on `orgBound` — it is stripped from the
-  // served payload, so `eligibleMoveTargets` and its Android/glasses twins can
-  // only reason about `jira.siteKey`. A host BOUND to an org but declaring none
-  // this beat is where the two predicates diverge, and comparing bindings made
-  // the hub allow a move no Move menu would ever offer (and refuse ones they did).
+test("migrate: matches on the CLAIMED org, and the clients agree", async () => {
+  // The org binding gates the peer roster and NOT this route. No client can
+  // mirror a rule keyed on `orgBound` — it is stripped from the served payload,
+  // so `eligibleMoveTargets` and its Android/glasses twins see only
+  // `jira.siteKey`. A host BOUND to an org but declaring none this beat is where
+  // a binding-keyed rule would diverge from every Move menu.
+  //
+  // The hole this leaves is real and deliberate (XERK-349): two hosts that both
+  // declare NO org match each other whatever they are bound to. The second half
+  // of this test asserts that, so the day it is closed this test fails loudly
+  // rather than the behaviour changing unnoticed.
   await migHost("mQuietA", "q1.atlassian.net");
   await migHost("mQuietB", "q1.atlassian.net");
   await migHost("mQuietB", null);          // still bound to q1, declaring nothing
@@ -8675,35 +8683,18 @@ test("migrate: matches on the CLAIMED org, so the clients can mirror it", async 
   // in both directions.
   await migHost("mQuietC", null);
   const bothQuiet = await migrate("mQuietC", "s1", { host: "mQuietB" });
-  assert.notEqual(bothQuiet.status, 409, JSON.stringify(bothQuiet.body));
+  assert.equal(bothQuiet.status, 200, JSON.stringify(bothQuiet.body));
   assert.equal(keyOf("mQuietC"), keyOf("mQuietB"));
   if (bothQuiet.body && bothQuiet.body.migrationId)
     migrations.delete(bothQuiet.body.migrationId);
 });
 
-test("migrate: refuses a host whose declared org isn't the one it is bound to", async () => {
-  // Asserted against the ROUTE, not a predicate copied into this file: the
-  // previous version of this test passed with the route reverted to comparing
-  // the claimed org, which is the bug it was supposed to pin.
-  await migHost("mDriftA", "d1.atlassian.net");
-  await migHost("mDriftB", "d1.atlassian.net");
-  // Same token, now claiming another org. The binding does not move, so it is
-  // drifted — and this route relays raw transcript bytes, so it must refuse.
-  await migHost("mDriftB", "d2.atlassian.net");
-  const asTarget = await migrate("mDriftA", "s1", { host: "mDriftB" });
-  assert.equal(asTarget.status, 409);
-  assert.match(asTarget.body.error, /bound/);
-  // And in the other direction: a drifted SOURCE may not push either.
-  const asSource = await migrate("mDriftB", "s1", { host: "mDriftA" });
-  assert.equal(asSource.status, 409);
-  assert.match(asSource.body.error, /bound/);
-});
 
 test("migrate: a genuine same-org move is not refused on the org check", async () => {
   await migHost("mOkA", "ok1.atlassian.net");
   await migHost("mOkB", "ok1.atlassian.net");
   const r = await migrate("mOkA", "s1", { host: "mOkB" });
-  assert.notEqual(r.status, 409, JSON.stringify(r.body));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
   if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
 });
 
@@ -12022,6 +12013,14 @@ test("the drift warning is rate-limited per host, and capped on both sides", () 
     }
     assert.equal(lines.length, 1, `warned ${lines.length} times in 20 beats`);
     assert.ok(lines[0].length < 500, `log line was ${lines[0].length} chars`);
+    // The SUBSTANCE of the line, not just its length. It is the only thing that
+    // tells an operator what happened, and it once claimed the only recovery was
+    // deleting the host — which is false, since the binding never moves. Without
+    // this the whole sentence can be replaced and the suite stays green.
+    assert.match(lines[0], /declares org/);
+    assert.match(lines[0], /but is bound to/);
+    assert.match(lines[0], /no peers beyond its own sessions/);
+    assert.match(lines[0], /declares the bound org again is served normally/);
 
     // BOTH interpolated sides need the cap. Only the claimed side was covered,
     // and deleting the bound-side slice escaped the suite.

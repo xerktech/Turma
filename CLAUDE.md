@@ -237,13 +237,15 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     refuses one. Same objection XERK-268 makes to a self-asserted `<host>`. The binding is
     hub-owned, assigned AFTER the payload spread like `tokenBound`, persisted with the record, and
     reset only by `DELETE /api/agents/<host>`.
-  - **Drift is declaring a DIFFERENT org, never failing to declare one**, and the MIGRATION route
-    refuses a drifted host on either side — it relays raw transcript bytes, the larger disclosure of
-    the two. But it MATCHES on the claimed org, because **no client can mirror a rule keyed on
-    `orgBound`**: it is stripped from the served payload, so `eligibleMoveTargets` and its Android
-    and glasses twins see only `jira.siteKey`. Keying the match on the binding made the hub and every
-    Move menu disagree in both directions. Mechanics and the coercions are in
-    `.claude/rules/turma.md`.
+  - **Drift is declaring a DIFFERENT org, never failing to declare one** — a host whose tracker goes
+    quiet keeps its binding and its peers.
+  - **The binding gates the peer roster and NOTHING else.** The MIGRATION route still compares the
+    claimed org, unchanged. Two attempts to bind-gate it were reverted: **no client can mirror a
+    rule keyed on `orgBound`** (it is stripped from the served payload, so `eligibleMoveTargets` and
+    its Android and glasses twins see only `jira.siteKey`), so the hub and every Move menu
+    disagreed. Don't retry it without serving the decided org to the clients — that is **XERK-349**,
+    which also carries the pre-existing hole it would close: two hosts that both declare NO org
+    match each other whatever they are bound to. Mechanics in `.claude/rules/turma.md`.
   - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one.
     Nothing bounds `rcName` in the normalizers and the spawn route takes a 100k `label`, so
     capping one field of six built a 23.8 MB reply that OOM-killed a hub in a real 256 MiB cgroup.
