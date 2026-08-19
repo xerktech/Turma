@@ -5,6 +5,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import com.xerktech.turma.core.ChatItem
 import org.junit.Assert.assertNull
 import org.junit.Rule
@@ -47,6 +48,33 @@ class TranscriptClippedMarkTest {
         }
         compose.onNodeWithText("the whole answer").assertIsDisplayed()
         compose.onAllNodesWithText(mark).assertCountEquals(0)
+    }
+
+    /**
+     * The tool card and the thinking trace carry their own call sites — a gate
+     * on the bubble alone left both free to be deleted with every Android test
+     * green. Both render COLLAPSED by default, so the mark appears once the card
+     * is opened (the web's thought card opens by default; PARITY.md records it).
+     */
+    @Test fun `a clipped tool card shows the mark once opened`() {
+        compose.setContent {
+            ChatItemView(
+                ChatItem.Tool("a1", name = "Bash", input = "ls", result = "out",
+                    isError = false, clipped = true)
+            )
+        }
+        compose.onAllNodesWithText(mark).assertCountEquals(0)  // collapsed
+        compose.onNodeWithText("🔧 Bash").performClick()
+        compose.onNodeWithText(mark).assertIsDisplayed()
+    }
+
+    @Test fun `a clipped thinking trace shows the mark once opened`() {
+        compose.setContent {
+            ChatItemView(ChatItem.Thinking("a1", "a long thought", clipped = true))
+        }
+        compose.onAllNodesWithText(mark).assertCountEquals(0)  // collapsed
+        compose.onNodeWithText("💭 thinking").performClick()
+        compose.onNodeWithText(mark).assertIsDisplayed()
     }
 
     /**

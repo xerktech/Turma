@@ -3155,9 +3155,9 @@ function findSession(sessionId) {
 const BODY_MAX = 1 << 20; // 1 MiB
 
 // A heartbeat is not a user request: it carries the agent's on-demand
-// `historyResults`, which at the agent's own ceiling (HISTORY_MAX_CHARS, plus
-// base64 SendUserFile images) reaches several MiB on an ordinary "open the chat
-// history" click. At 1 MiB the hub
+// `historyResults`, which at the agent's own ceilings (HISTORY_MAX_BYTES per
+// delivery, HISTORY_STAGED_MAX_BYTES per beat, plus base64 SendUserFile images)
+// reaches several MiB on an ordinary "open the chat history" click. At 1 MiB the hub
 // destroyed the socket, the agent saw ECONNRESET rather than a status code,
 // and — because it holds staged results until a POST succeeds — re-sent the
 // same oversized body every beat, so the host stayed offline forever with

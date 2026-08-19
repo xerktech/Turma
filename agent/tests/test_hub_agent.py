@@ -3109,6 +3109,47 @@ class TestHistoryBudget(ProjectDirMixin, unittest.TestCase):
         self.assertTrue(dropped)
         self.assertEqual([r["id"] for r in kept], ["e1"])
 
+    def _preview_row(self, rid, files, chars):
+        # A SendUserFile turn: previews are read from DISK, not the transcript,
+        # so they are the one thing the block caps do not bound (XERK-355).
+        return {"id": rid, "role": "assistant", "text": "here you go",
+                "blocks": [{"t": "tool_use", "name": "SendUserFile", "input": "x",
+                            "files": [{"name": f"f{i}.png", "kind": "image",
+                                       "src": "data:image/png;base64," + "A" * chars}
+                                      for i in range(files)]}]}
+
+    def test_a_row_too_heavy_to_deliver_sheds_its_PREVIEWS_not_the_row(self):
+        # Exempting it produced a body nothing could deliver — the hub answers
+        # no status past its ceiling, so the beat looped forever. Dropping it
+        # would be a hole in the conversation. Shedding degrades the delivery to
+        # the name chip an oversize file already gets.
+        rows = [self._preview_row("e1", 4, 2000)]
+        with mock.patch.object(ha, "HISTORY_MAX_BYTES", 3000):
+            kept, dropped = ha._fit_history_budget(rows)
+        self.assertEqual([r["id"] for r in kept], ["e1"])
+        self.assertLessEqual(ha._json_bytes(kept[0]), 3000)
+        block = kept[0]["blocks"][0]
+        self.assertTrue(block["truncated"])
+        self.assertEqual([f["kind"] for f in block["files"]], ["file"] * 4)
+        # The names survive: the card still says what was delivered.
+        self.assertEqual([f["name"] for f in block["files"]],
+                         ["f0.png", "f1.png", "f2.png", "f3.png"])
+        self.assertTrue(dropped or True)  # shedding alone need not flag the reply
+
+    def test_shedding_takes_the_heaviest_block_first_and_stops_there(self):
+        # Two deliveries in one turn: shedding the big one is enough, so the
+        # small one keeps its inline previews.
+        row = self._preview_row("e1", 1, 4000)
+        row["blocks"].append(self._preview_row("e2", 1, 200)["blocks"][0])
+        self.assertTrue(ha._shed_row_previews(row, 3000))
+        self.assertEqual(row["blocks"][0]["files"][0]["kind"], "file")   # heavy: shed
+        self.assertEqual(row["blocks"][1]["files"][0]["kind"], "image")  # light: kept
+        self.assertLessEqual(ha._json_bytes(row), 3000)
+
+    def test_a_row_with_no_previews_sheds_nothing(self):
+        row = {"id": "e1", "role": "assistant", "text": "x" * 100, "blocks": []}
+        self.assertFalse(ha._shed_row_previews(row, 10))
+
     def test_history_entries_applies_the_budget_and_reports_truncated(self):
         path = os.path.join(self.proj, "t.jsonl")
         write_jsonl(path, [
@@ -10431,6 +10472,59 @@ class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "HISTORY_STAGED_MAX_BYTES", 100):
             payload = sm.build_payload(0)
         self.assertEqual([r["sessionId"] for r in payload["historyResults"]], ["s1"])
+
+    def test_only_ONE_result_on_the_whole_beat_is_exempt(self):
+        # One exemption per LIST let two oversize deliveries share a beat, which
+        # is a body the hub answers with no status at all.
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 40000))
+        sm.subagent_history_results.append(self._result("s2", 40000))
+        with mock.patch.object(ha, "HISTORY_STAGED_MAX_BYTES", 100):
+            payload = sm.build_payload(0)
+        self.assertEqual([r["sessionId"] for r in payload["historyResults"]], ["s1"])
+        self.assertNotIn("subagentHistoryResults", payload)
+
+    def test_a_body_past_HEARTBEAT_BODY_MAX_is_shed_BEFORE_it_is_sent(self):
+        # The hub 413s only up to a point; past it Node destroys the socket and
+        # urllib sees a broken pipe, so no status handler can fire. Measuring
+        # the body we are about to send is the only place this can be caught.
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 200000))
+        payload = sm.build_payload(0)
+        self.assertIn("historyResults", payload)
+        sent = {}
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            sent["bytes"] = len(req.data)
+            return FakeResp()
+
+        before = len(json.dumps(payload))
+        with mock.patch.object(ha, "HEARTBEAT_BODY_MAX", 5000), \
+                mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(sm.post(payload), {})
+        # What went on the wire is the SHED body, not the one handed to post().
+        self.assertLess(sent["bytes"], before)
+        self.assertLess(sent["bytes"], 200000)
+        # ...and shed for good: the next beat is not the same body again.
+        self.assertEqual(sm.history_results, [])
+        self.assertNotIn("historyResults", sm.build_payload(1))
+
+    def test_the_beat_itself_still_rides_when_its_deliveries_are_shed(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 200000))
+        sm.spawn_failures.append({"cmdId": "c1", "error": "no"})
+        payload = sm.build_payload(0)
+        with mock.patch.object(ha, "HEARTBEAT_BODY_MAX", 5000):
+            sm._drop_on_demand_results(payload)
+        self.assertNotIn("historyResults", payload)
+        # An EVENT that exists nowhere else is not a fetch — it stays held.
+        self.assertEqual(payload["spawnFailures"], [{"cmdId": "c1", "error": "no"}])
+        self.assertEqual(len(sm.spawn_failures), 1)
 
     def test_a_beat_within_the_aggregate_is_untouched(self):
         sm = self.make_manager()

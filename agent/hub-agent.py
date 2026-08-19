@@ -488,6 +488,20 @@ HISTORY_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_MAX_BYTES", str(6 << 20)
 # has no result for with its "not ready" 202 and the client asks again, whereas
 # an oversize body is refused whole, forever.
 HISTORY_STAGED_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_STAGED_MAX_BYTES", str(12 << 20)))
+# The biggest body this agent will POST at all. The hub answers an oversize body
+# with 413 only up to a point: past ~36 MiB (measured) Node destroys the socket
+# under a request still being written, so urllib — which is what this posts with
+# — sees a broken pipe and NOT a status. That is XERK-235's failure exactly:
+# post() holds staged results until a beat succeeds, so a body no status ever
+# came back for is re-sent verbatim every beat and the host never returns. A
+# handler for 413 alone cannot close it, because the bodies big enough to matter
+# are the ones that never get a 413.
+#
+# So the agent refuses its own body BEFORE sending it: the on-demand deliveries
+# are shed (each is a fetch the client repeats) and the beat itself still goes
+# out. Deliberately under the hub's BODY_INFLIGHT_MAX (32 MiB at the deployed
+# 256 MiB), which moves with the hub's memory and can be smaller than this.
+HEARTBEAT_BODY_MAX = int(os.environ.get("TURMA_HEARTBEAT_BODY_MAX", str(24 << 20)))
 
 # File attachments (XERK-234). The operator attaches an image or a document in
 # the chat composer; the hub stages the bytes and names them on the `input`
@@ -5153,19 +5167,50 @@ def _json_bytes(value):
         return len(str(value))
 
 
+def _shed_row_previews(row, budget):
+    """Drop one row's inline SendUserFile previews, heaviest first, until it
+    fits `budget`. Returns True if anything was dropped.
+
+    The block caps do NOT bound a row: a preview is read from DISK, not from the
+    transcript, so one turn carries SEND_FILE_MAX_FILES x SEND_FILE_MAX_BYTES of
+    base64 — ~11 MB per turn, and a delivery no size ceiling can honour
+    (XERK-355). Shedding degrades that turn to the NAME CHIP the agent already
+    shows for a file too big to embed: the conversation still says what was
+    delivered, and the reply becomes something the hub will actually accept.
+    Better than exempting the row, which produced a body nothing could deliver
+    at all, and better than dropping it, which is a hole in the conversation."""
+    heavy = [b for b in (row.get("blocks") or [])
+             if isinstance(b, dict) and b.get("files")]
+    if not heavy:
+        return False
+    heavy.sort(key=lambda b: _json_bytes(b.get("files")), reverse=True)
+    shed = False
+    for block in heavy:
+        if _json_bytes(row) <= budget:
+            break
+        block["files"] = [{"name": f.get("name") or "file", "kind": "file"}
+                          for f in block["files"] if isinstance(f, dict)]
+        block["truncated"] = True
+        shed = True
+    return shed
+
+
 def _fit_history_budget(rows):
     """Trim a history window to HISTORY_MAX_BYTES of wire bytes, oldest rows
     first. Returns (rows, dropped_any).
 
-    The NEWEST row survives however big it is — it is what the operator opened
-    the chat to read, and returning nothing would be a blank chat rather than a
-    short one. One row is not bounded by the block caps alone: a SendUserFile
-    turn carries SEND_FILE_MAX_FILES previews of SEND_FILE_MAX_BYTES each, so
-    it can weigh ~11 MB on its own (XERK-355)."""
+    The NEWEST row survives — it is what the operator opened the chat to read,
+    and returning nothing would be a blank chat rather than a short one — but it
+    survives SHED, not exempt: a row over the budget on its own has its previews
+    dropped first (see above), so "the newest always fits" stays true of the
+    bytes as well as the row."""
     total = 0
     keep = 0
     for row in reversed(rows):
-        total += _json_bytes(row)
+        size = _json_bytes(row)
+        if size > HISTORY_MAX_BYTES and _shed_row_previews(row, HISTORY_MAX_BYTES):
+            size = _json_bytes(row)
+        total += size
         if keep and total > HISTORY_MAX_BYTES:
             break
         keep += 1
@@ -13179,6 +13224,21 @@ class SessionManager:
         except OSError as e:
             log(f"answer_question write failed for {sid}: {e}")
 
+    def _drop_on_demand_results(self, payload=None):
+        """Drop the staged on-demand deliveries — and them alone — from the
+        staged lists and, when given, from the payload already built.
+
+        They are what makes a beat big, and each is a FETCH the client repeats:
+        the hub answers a request it holds no result for with its "not ready"
+        202, so a dropped delivery costs a re-ask. Everything else staged
+        (ticket status, spawn refusals, create results) is an EVENT that exists
+        nowhere else, is small, and stays held."""
+        for attr in ("history_results", "subagent_history_results", "jira_issue_results"):
+            getattr(self, attr).clear()
+        if payload is not None:
+            for key in ("historyResults", "subagentHistoryResults", "jiraIssueResults"):
+                payload.pop(key, None)
+
     def _fit_staged_history(self):
         """Bound EVERYTHING this beat has staged from `history` /
         `subagentHistory` to HISTORY_STAGED_MAX_BYTES, newest first.
@@ -13193,6 +13253,7 @@ class SessionManager:
         same reason the newest history row does.
         """
         remaining = HISTORY_STAGED_MAX_BYTES
+        admitted = False   # ONE exemption for the whole beat, not one per list
         for attr in ("history_results", "subagent_history_results"):
             staged = getattr(self, attr)
             if not staged:
@@ -13200,9 +13261,10 @@ class SessionManager:
             keep = []
             for result in reversed(staged):
                 size = _json_bytes(result)
-                if keep and size > remaining:
+                if admitted and size > remaining:
                     break
                 remaining -= size
+                admitted = True
                 keep.append(result)
             if len(keep) < len(staged):
                 log(f"heartbeat: dropped {len(staged) - len(keep)} staged {attr} "
@@ -16604,9 +16666,18 @@ class SessionManager:
             headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
             if TURMA_TOKEN:
                 headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            body = json.dumps(payload).encode()
+            if len(body) > HEARTBEAT_BODY_MAX:
+                # Measured, not guessed — this is the exact body about to go up.
+                # Past the hub's ceiling it answers no status at all, so this is
+                # the only place the loop can be stopped (see HEARTBEAT_BODY_MAX).
+                log(f"heartbeat body is {len(body)} bytes, past HEARTBEAT_BODY_MAX "
+                    f"({HEARTBEAT_BODY_MAX}); shedding its on-demand deliveries")
+                self._drop_on_demand_results(payload)
+                body = json.dumps(payload).encode()
             req = urllib.request.Request(
                 f"{TURMA_URL}/api/heartbeat",
-                data=json.dumps(payload).encode(),
+                data=body,
                 headers=headers,
                 method="POST",
             )
@@ -16636,20 +16707,11 @@ class SessionManager:
             # "HTTP Error 403: Forbidden" and a host that silently vanishes.
             log(f"heartbeat failed: {_http_error_detail(e)}")
             if getattr(e, "code", None) == 413:
-                # 413 is the ONE failure re-sending cannot fix: every staged
-                # result is held until a beat succeeds, so an oversize body is
-                # re-posted verbatim every beat and the host never comes back
-                # (XERK-235). Drop the on-demand deliveries — they are what
-                # makes a beat big, and each one is a fetch the client will ask
-                # for again — and keep the beat itself, which is how the host
-                # stays online while its operator sees a history that did not
-                # arrive rather than a card that went dark.
-                dropped = (len(self.history_results) + len(self.subagent_history_results)
-                           + len(self.jira_issue_results))
-                self.history_results.clear()
-                self.subagent_history_results.clear()
-                self.jira_issue_results.clear()
-                log(f"heartbeat refused as too large: dropped {dropped} staged on-demand "
+                # The hub refused a body HEARTBEAT_BODY_MAX let through — its
+                # ceiling moves with its memory and can be below ours. Same
+                # remedy: re-sending is what cannot fix it.
+                self._drop_on_demand_results()
+                log("heartbeat refused as too large; dropped the staged on-demand "
                     "result(s) rather than re-sending them forever")
             return None
         except Exception as e:
