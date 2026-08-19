@@ -122,7 +122,11 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
         // `setGet` lets a test answer one specific GET (the subagent-history
         // poll, say) while every other read stays inert.
         const body = getReply && getReply(url);
-        if (body) return Promise.resolve({ ok: true, status: 200, json: async () => body });
+        // A plain object is the 200 it always was; one carrying its own `json`
+        // is a full response stub, which is how a test drives a REFUSAL (a 404
+        // with a body) rather than only the happy path.
+        if (body) return Promise.resolve(
+          typeof body.json === "function" ? body : { ok: true, status: 200, json: async () => body });
       }
       return new Promise(() => {});
     },
@@ -1700,6 +1704,38 @@ test("opening an ended session shows PRs + Resume and never a terminal or compos
   // through to GitHub, which is often the reason to open an ended session at all.
   assert.match(els.trPrs.innerHTML, /<a href="https:\/\/github.com\/o\/r\/pull\/7"/);
   assert.match(els.trPrs.innerHTML, /#7 Open/);
+});
+
+// XERK-356. A refused archive push never arrives, so the reassuring "it syncs
+// within a few minutes of ending" is a promise nothing will keep — and the
+// operator waits for a conversation that is not coming. The hub says WHY on the
+// 404; this pane is where that reaches a person.
+test("an archive push the hub refused is worded as a refusal, not as 'not yet'", async () => {
+  const { beat, openEndedSession, els, setGet } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z", { transcriptId: "t-abc" })];
+  beat({ now, agents: [h] });
+
+  // First the ordinary case: a 404 with nothing to say is still "not here yet".
+  setGet((url) => url.startsWith("/api/archive/")
+    ? { ok: false, status: 404, json: async () => ({ error: "unknown transcript" }) } : null);
+  openEndedSession("33333");
+  await new Promise((r) => setImmediate(r));
+  assert.match(els.trScroll.innerHTML, /hasn't reached the archive yet/);
+
+  // Then the refusal: the hub's own words, and no promise that it will sync.
+  setGet((url) => url.startsWith("/api/archive/")
+    ? { ok: false, status: 404, json: async () => ({
+        error: "unknown transcript",
+        refused: { host: "nas", at: 1, error: "archive chunk is larger than this hub takes (1048576 bytes)" },
+      }) } : null);
+  openEndedSession("33333");
+  await new Promise((r) => setImmediate(r));
+  assert.match(els.trScroll.innerHTML, /nas&rsquo;s last push/);
+  assert.match(els.trScroll.innerHTML, /larger than this hub takes/);
+  assert.doesNotMatch(els.trScroll.innerHTML, /within a few minutes/);
+  // Resume is unaffected — the worktree is still there whatever the archive holds.
+  assert.match(els.trScroll.innerHTML, /Resume still works/);
 });
 
 test("the ended-session bar is cleared when the pane is reused for an archive transcript", () => {

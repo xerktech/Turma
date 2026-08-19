@@ -2777,6 +2777,26 @@ function prBadgeLinkHtml(pr) {
 // exactly the surface an ended session should get — scrollable history, a
 // verbosity control, and NO terminal toggle or compose box, because there is no
 // live pty to attach to and nothing to type at.
+// Why an archived transcript is missing, in the HUB's own words when it has any
+// (XERK-356). A refused archive push was otherwise invisible here: the agent
+// logged a line and moved on, while this pane told the operator the conversation
+// "syncs within a few minutes of ending" — a promise the hub cannot keep once it
+// has refused the push, and one it never stops making. `refused` rides the 404
+// body; without it the wording below is unchanged.
+function archiveRefusalNote(body) {
+  const r = body && body.refused;
+  if (!r || !r.error) return "";
+  return `${r.host ? esc(r.host) + "&rsquo;s" : "The agent&rsquo;s"} last push of this ` +
+    `conversation to the archive was refused: ${esc(r.error)}.`;
+}
+
+// The 404 body, when there is one to read. A refusal note is worth a parse; a
+// body that isn't JSON just means the ordinary "not here yet".
+async function archiveMissingNote(res) {
+  if (res.status !== 404) return "";
+  try { return archiveRefusalNote(await res.json()); } catch { return ""; }
+}
+
 async function openEndedSession(id) {
   const e = findEnded(id);
   if (!e) return;
@@ -2824,19 +2844,22 @@ async function openEndedSession(id) {
       `<div class="tr-empty">No conversation recorded for this session.</div>`;
     return;
   }
-  let t;
+  let t, note = "";
   try {
     const r = await fetch(`/api/archive/${enc(tid)}`);
     if (r.status === 401) return void (location.href = "/login");
-    if (!r.ok) throw new Error(String(r.status));
+    if (!r.ok) { note = await archiveMissingNote(r); throw new Error(String(r.status)); }
     t = await r.json();
   } catch {
     if (endedViewId !== id) return;
     // The agent ships ended transcripts to the archive on its slow usage
     // cadence, so a just-killed session is legitimately not there yet. Say that,
-    // rather than the flat "unavailable" that reads as history lost.
-    document.getElementById("trScroll").innerHTML =
-      `<div class="tr-empty">This session's conversation hasn't reached the archive yet — it syncs within a few minutes of ending. Resume still works.</div>`;
+    // rather than the flat "unavailable" that reads as history lost — unless the
+    // hub knows the push was REFUSED, in which case waiting is exactly what the
+    // operator must not do.
+    document.getElementById("trScroll").innerHTML = note
+      ? `<div class="tr-empty">${note} Resume still works.</div>`
+      : `<div class="tr-empty">This session's conversation hasn't reached the archive yet — it syncs within a few minutes of ending. Resume still works.</div>`;
     return;
   }
   if (endedViewId !== id) return; // superseded by another click
@@ -2884,14 +2907,15 @@ async function openTranscript(id, title, hi) {
   navFrame("about:blank"); // ensure no live-terminal WebSocket lingers
   enterStage();
   renderSearch();
-  let t;
+  let t, note = "";
   try {
     const r = await fetch(`/api/archive/${enc(id)}`);
     if (r.status === 401) return void (location.href = "/login");
-    if (!r.ok) throw new Error("not found");
+    if (!r.ok) { note = await archiveMissingNote(r); throw new Error("not found"); }
     t = await r.json();
   } catch {
-    document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Transcript unavailable.</div>`;
+    document.getElementById("trScroll").innerHTML =
+      `<div class="tr-empty">${note || "Transcript unavailable."}</div>`;
     return;
   }
   if (currentTranscriptId !== id) return; // superseded by another click

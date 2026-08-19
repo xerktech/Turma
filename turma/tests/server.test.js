@@ -162,6 +162,7 @@ const {
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
   usageLedger, normalizeRetired,
+  ARCHIVE_CHUNK_BODY_MAX, archiveRefusals,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -1896,6 +1897,68 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   // a hub too old to send them is the same case (XERK-267).
   assert.equal("archiveShed" in r2.body, false);
   assert.equal("archiveFull" in r2.body, false);
+});
+
+// XERK-356. The rendered archive route read with `readBody`'s DEFAULT 1 MiB
+// while the agent builds each delta out of an 8 MiB window — and archival
+// excludes RUNNING sessions, so an ended session's FIRST delta is its whole
+// transcript. Every real one was refused, and the durable archive held nothing
+// but trivially small conversations.
+test("http: the archive route takes a multi-MB delta, and states its ceiling", async () => {
+  const filler = "x".repeat(200_000);
+  const entries = Array.from({ length: 12 }, (_, i) => ({
+    uuid: `big${i}`, role: "assistant", ts: "2026-07-11T00:00:00Z", text: filler,
+  }));
+  const meta = { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-big",
+    summary: "A Real Sized Session" };
+  const body = { startOffset: 0, endOffset: 2_400_000, size: 2_400_000, meta, entries };
+  assert.ok(JSON.stringify(body).length > (1 << 20), "the delta clears the old 1 MiB default");
+  const r = await request("POST", "/api/agents/nas/archive/trbig", { body, headers: agentHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.bytesStored, 2_400_000);
+  assert.equal((await request("GET", "/api/archive/trbig", { headers: userHeaders })).status, 200);
+
+  // And the agent is TOLD the ceiling on the beat it pushes off, because the
+  // number is a fraction of THIS container's limit: an agent guessing it guesses
+  // wrong on any hub sized differently, and past the ceiling it may get no
+  // status at all to learn from (the same reasoning as `bodyMax`, XERK-347).
+  const beat = { device: "nas", archiveManifest: [{ transcriptId: "trbig", slug: "-w-big", repo: "turma" }] };
+  const hb = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
+  assert.equal(hb.body.archiveChunkMax, ARCHIVE_CHUNK_BODY_MAX);
+  assert.ok(ARCHIVE_CHUNK_BODY_MAX > (1 << 20), "the ceiling clears a real first delta");
+});
+
+test("http: a refused archive chunk is 413 AND recorded for the operator", async () => {
+  const body = {
+    startOffset: 0, endOffset: 10, size: 10, meta: { repo: "turma", slug: "-w-ov" },
+    entries: [{ uuid: "e1", role: "user", ts: null,
+      text: "y".repeat(ARCHIVE_CHUNK_BODY_MAX + (1 << 16)) }],
+  };
+  const r = await request("POST", "/api/agents/nas/archive/trover", { body, headers: agentHeaders });
+  // 413, not the 503 a full hub answers: the agent must SHRINK this, never
+  // re-send it (the two are opposite instructions — see readRawBody's callers).
+  assert.equal(r.status, 413);
+  assert.equal(r.body.limit, ARCHIVE_CHUNK_BODY_MAX);
+
+  // ...and the operator who goes looking for that conversation is told why it is
+  // not there, instead of "it syncs within a few minutes of ending" — which is a
+  // promise nothing will keep once a push has been refused.
+  const view = await request("GET", "/api/archive/trover", { headers: userHeaders });
+  assert.equal(view.status, 404);
+  assert.equal(view.body.error, "unknown transcript");   // unchanged for older readers
+  assert.equal(view.body.refused.host, "nas");
+  assert.match(view.body.refused.error, /larger than this hub takes/);
+
+  // A chunk that lands clears it: the record answers "why is this missing", so
+  // it must not outlive the missing.
+  const ok = await request("POST", "/api/agents/nas/archive/trover", {
+    body: { startOffset: 0, endOffset: 5, size: 5, meta: { repo: "turma", slug: "-w-ov" },
+      entries: [{ uuid: "e1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(archiveRefusals.has("trover"), false);
+  assert.equal((await request("GET", "/api/archive/trover", { headers: userHeaders })).status, 200);
 });
 
 // ---- the archive's raw layer (XERK-338) -------------------------------------

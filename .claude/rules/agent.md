@@ -421,51 +421,8 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
 
 ## Archive sync
 
-- The agent **ships every INACTIVE session's transcript to the hub's durable archive** so history
-  survives this host being wiped/offline. `_archive_manifest()` enumerates ended transcripts (every
-  ledger slug's `*.jsonl`, minus any backing a running session); the hub replies with per-transcript
-  byte cursors (`archiveHave`), and `_archive_deltas()` POSTs the missing append-only deltas
-  (pre-parsed through `_entry_text`), bounded per chunk/beat.
-- Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
-  file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
-  back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,
-  `TestResumableReport`.
-- **The archive is the ONE place a SendUserFile preview is shed** (`_shed_block_payloads`,
-  XERK-267): the payloads are bounded per delivery but unbounded relative to the transcript, so a
-  screenshot-heavy session archives orders of magnitude larger than what it records (measured:
-  28 KB of transcript → 447 MB archived). Past `ARCHIVE_PAYLOAD_MAX` the rest of that transcript
-  ships as name-only chips flagged `shed`. The live tail and `history` keep their previews — those
-  are re-read from the transcript on demand and cost nothing durable.
-- **The hub owns the ceiling, this is only an early stop.** `archiveShed`/`archiveFull` on the
-  heartbeat reply are the hub's verdict (`turma/archive.js`), which the agent applies to keep the
-  bytes off the wire and to skip a pass at a full store; the hub re-applies both itself, since an
-  agent too old to read either flag pushes regardless. Counting differs on purpose: the hub spends
-  STORED bytes and the agent only sheddable PAYLOAD bytes (charging a long but ordinary conversation
-  for its prose would degrade it for nothing), and the agent's counter is **per sync pass**, since
-  it restarts each beat — only the hub's verdict makes a shed stick across passes. Both read the
-  same `ARCHIVE_TRANSCRIPT_MAX_BYTES`, so `_byte_ceiling` must agree with `byteCeiling` that 0
-  disables and that a non-numeric value is a typo to reject. Tests: `TestArchivePayloadBudget`.
-- A refused delta comes back as **the hub's real cursor plus a flag, never an error status** — the
-  agent must read it as no forward progress and drop it, not as a chunk to re-send forever
-  (XERK-255).
-- **Beside the rendered entries it ships the session's OWN FILES, byte for byte** (XERK-338):
-  `_session_files()` enumerates `<id>.jsonl` plus everything under `<id>/` — `subagents/`,
-  `workflows/`, `tool-results/`, and whatever Claude Code adds next — and `_archive_raw_deltas()`
-  pushes each as gzipped, append-only ranges against a PER-FILE cursor (`archiveRawHave`).
-  - **Deliberately not filtered to `*.jsonl`.** The point of the raw layer is that nobody has to have
-    predicted what would be worth keeping, and the files that are not `.jsonl` are exactly the ones
-    no other surface carries. `<slug>/memory/` is excluded — it belongs to the PROJECT, so one copy
-    per conversation would be storage with no owner.
-  - Only regular files, and **never through a symlink** (dir or file), the same hardening
-    `_project_transcripts` applies: a link pointed at `PROJECTS_ROOT` drags every transcript on the
-    host into one session's archive.
-  - A source file SHORTER than the hub's cursor means the transcript was rewritten under us: it is
-    logged and left alone. **Never truncate the archive to match** — the longer copy is the one with
-    the history in it.
-  - The raw pass runs in its **own try/except** off the same reply: a raw failure must never cost the
-    rendered transcript, which is what every other surface reads. Its read window must stay at or
-    under the hub's `ARCHIVE_RAW_CHUNK_MAX`, which bounds its gunzip — a larger window is refused on
-    every push, not truncated. Tests: the raw cases in `TestArchiveSync`.
+See `.claude/rules/agent-archive.md` (scoped to `agent/hub-agent.py`): the manifest, the
+append-only rendered deltas and what bounds one, the SendUserFile shed, and the raw layer.
 
 ## Hooks
 

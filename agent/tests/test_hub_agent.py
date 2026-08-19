@@ -13907,6 +13907,146 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
             sm._archive_deltas({})
         self.assertEqual(len(calls), 1)
 
+    # ---- the delta's BODY, not the read window (XERK-356) -------------------
+    #
+    # The hub reads this route with an archive-specific ceiling it states on the
+    # beat. Before this the agent posted 8 MiB deltas at a route reading 1 MiB,
+    # and since archival excludes RUNNING sessions, an ended session's FIRST
+    # delta is its whole transcript — so every real session was refused and the
+    # durable archive held nothing but trivially small ones.
+
+    def test_archive_body_max_is_the_hubs_number_bounded_both_ways(self):
+        sm = self.make_manager()
+        # Before any reply: the conservative default, which is UNDER an old
+        # hub's 1 MiB route cap — that is what makes the archive work against a
+        # hub that has not been upgraded yet.
+        self.assertEqual(sm._archive_body_max(), ha.ARCHIVE_BODY_MAX_DEFAULT)
+        self.assertLess(ha.ARCHIVE_BODY_MAX_DEFAULT, 1 << 20)
+        sm._note_archive_chunk_max({"archiveChunkMax": 8 << 20})
+        self.assertEqual(sm._archive_body_max(), int((8 << 20) * ha.ARCHIVE_BODY_MARGIN))
+        # A tiny or broken one cannot cut every delta down to nothing while each
+        # POST still answers 200 — an archive that trickles never finishes, and
+        # nothing anywhere would look wrong.
+        for bad in ({"archiveChunkMax": 12}, {"archiveChunkMax": 0},
+                    {"archiveChunkMax": -1}, {"archiveChunkMax": True},
+                    {"archiveChunkMax": "8"}, {"archiveChunkMax": float("inf")},
+                    {"archiveChunkMax": float("nan")}, {}, None):
+            sm2 = self.make_manager()
+            sm2._note_archive_chunk_max(bad)
+            self.assertGreaterEqual(sm2._archive_body_max(), ha.ARCHIVE_BODY_MAX_DEFAULT)
+        # A preposterous one is clamped before any arithmetic touches it.
+        sm3 = self.make_manager()
+        sm3._note_archive_chunk_max({"archiveChunkMax": 10 ** 400})
+        self.assertEqual(sm3._hub_archive_chunk_max, ha.ARCHIVE_BODY_STATED_MAX)
+
+    def test_a_delta_is_cut_to_the_body_the_hub_takes_losing_nothing(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [
+            _text_entry("u%d" % i, "user", "line %d %s" % (i, "z" * 300))
+            for i in range(6)
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        size = sm._archive_pending["t1"]["size"]
+        # A ceiling that fits one entry but not two, so the cut is exercised
+        # rather than asserted about. (An entry carries its text twice — flat and
+        # in blocks[] — so it weighs about 1 KiB here.)
+        with mock.patch.object(sm, "_archive_body_max", lambda: 1400):
+            pushed = self._push(sm)
+        self.assertGreater(len(pushed), 2)
+        for body in pushed:
+            self.assertLessEqual(len(json.dumps(body)), 1400)
+        # The ranges are contiguous and reach the end of the file: a chunk's byte
+        # range must never contain an entry we did not send, nor omit one we did,
+        # or the archive loses a turn at every boundary.
+        self.assertEqual(pushed[0]["startOffset"], 0)
+        for prev, nxt in zip(pushed, pushed[1:]):
+            self.assertEqual(nxt["startOffset"], prev["endOffset"])
+        self.assertEqual(pushed[-1]["endOffset"], size)
+        # And every entry arrived, once, in order.
+        texts = [e["text"] for body in pushed for e in body["entries"]]
+        self.assertEqual(texts, ["line %d %s" % (i, "z" * 300) for i in range(6)])
+
+    def test_an_entry_too_big_for_its_own_delta_sheds_before_it_is_dropped(self):
+        # The bulk of an over-large entry is the inline SendUserFile preview the
+        # agent reads off DISK — a short transcript line that renders to
+        # megabytes — so it is shed to a name-only chip first. The turn survives.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        png = self._png("shot.png", 6000)
+        self._write_transcript(wt, "t1.jsonl", [self._delivery("a1", png)])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        with mock.patch.object(sm, "_archive_body_max", lambda: 1200):
+            pushed = self._push(sm)
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(len(pushed[0]["entries"]), 1)
+        self.assertEqual(self._files_of(pushed[0])[0],
+                         {"name": "shot.png", "kind": "file", "shed": True})
+        self.assertEqual(pushed[0]["endOffset"], sm._archive_pending["t1"]["size"])
+
+    def test_an_entry_that_still_will_not_fit_leaves_the_cursor_moving(self):
+        # Nothing sheddable and bigger than a whole delta. The range is archived
+        # WITHOUT it and the cursor moves on: the alternative is a body the hub
+        # refuses forever, which is a transcript that never archives at all.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [
+            _text_entry("u1", "user", "q" * 4000),
+            _text_entry("u2", "user", "after the hole"),
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        size = sm._archive_pending["t1"]["size"]
+        lines = []
+        with mock.patch.object(ha, "log", lines.append), \
+                mock.patch.object(sm, "_archive_body_max", lambda: 900):
+            pushed = self._push(sm)
+        texts = [e["text"] for body in pushed for e in body["entries"]]
+        self.assertEqual(texts, ["after the hole"])
+        self.assertEqual(pushed[-1]["endOffset"], size)
+        # ...and the hole is never silent: a conversation with a turn missing is
+        # worse than one an operator knows has a hole.
+        self.assertTrue(any("left 1 entry out of t1" in ln for ln in lines), lines)
+
+    def test_a_line_longer_than_the_window_no_longer_wedges_the_transcript(self):
+        # A bare `break` here left the transcript stuck at this offset on every
+        # pass forever, with nothing logged. Skipping the window instead would
+        # corrupt the byte cursor, which is the durable record's integrity.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [
+            _text_entry("u1", "user", "w" * 4000),
+            _text_entry("u2", "user", "past the long line"),
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        size = sm._archive_pending["t1"]["size"]
+        lines = []
+        with mock.patch.object(ha, "log", lines.append), \
+                mock.patch.object(ha, "ARCHIVE_CHUNK_BYTES", 512):
+            pushed = self._push(sm)
+        self.assertEqual(pushed[0]["startOffset"], 0)
+        self.assertEqual(pushed[0]["entries"], [])   # the line we cannot render
+        self.assertEqual([e["text"] for b in pushed for e in b["entries"]],
+                         ["past the long line"])
+        self.assertEqual(pushed[-1]["endOffset"], size)
+        self.assertTrue(any("left 1 entry out of t1" in ln for ln in lines), lines)
+
+    def test_a_413_forgets_the_learned_ceiling_instead_of_looping(self):
+        # The body was measured against what the hub SAID it takes, so a 413
+        # means that number is stale — a hub restarted with less memory. Falling
+        # back is what stops the same too-big delta going up every pass forever.
+        sm = self.make_manager()
+        sm._note_archive_chunk_max({"archiveChunkMax": 8 << 20})
+        self.assertGreater(sm._archive_body_max(), ha.ARCHIVE_BODY_MAX_DEFAULT)
+        err = urllib.error.HTTPError("u", 413, "Payload Too Large", {}, io.BytesIO(b"{}"))
+        with mock.patch.object(ha.urllib.request, "urlopen", side_effect=err), \
+                mock.patch.object(ha, "log", lambda _m: None):
+            self.assertIsNone(sm._post_archive_chunk("t1", {"entries": []}))
+        self.assertEqual(sm._archive_body_max(), ha.ARCHIVE_BODY_MAX_DEFAULT)
+
 
 class TestPrStatus(unittest.TestCase):
     """The `gh pr view` status helpers: check-rollup classification, the compact

@@ -8,7 +8,7 @@ paths:
 
 Split out of `.claude/rules/turma.md` to keep that file under its size ceiling. The rest of the
 dashboard is there; `CLAUDE.md` has the `/data` volume and what else shares it. The agent half —
-what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archive sync".
+what it ships, what bounds one delta, and when it sheds — is in `.claude/rules/agent-archive.md`.
 
 - The hub hosts a **durable, searchable archive of ended sessions** (`turma/archive.js`): agents
   push each inactive transcript in, landing as **organized files on `/data`** — one folder per repo,
@@ -106,6 +106,16 @@ what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archiv
     archived, so both ship with the ingest.
   - Sizing: measured on the reference host at 336 transcripts + their nested files = 53 MB, largest
     single session directory 7.6 MB — roughly 5–10x the rendered layer.
+- **A delta arrives at the size the ROUTE takes, which is not `readBody`'s default**
+  (`ARCHIVE_CHUNK_BODY_MAX` in `turma/server.js`, XERK-356 — mechanics in
+  `.claude/rules/turma-limits.md`). Archival excludes RUNNING sessions, so an ended session's FIRST
+  delta is its whole transcript; at the old 1 MiB default every real one was refused and this store
+  held nothing but trivially small conversations. Anything reasoning about chunk sizes here has to
+  read that ceiling, not `ingestChunk`'s per-entry budget.
+- **A transcript missing because a push was REFUSED says so** (`archiveRefusals`): `getTranscript`
+  answering null is served as a 404 carrying `refused`, and the clients word that differently from
+  "not here yet". Without it the operator is told the conversation "syncs within a few minutes of
+  ending", which a refusal makes untrue forever.
 - The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
   `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
   browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest

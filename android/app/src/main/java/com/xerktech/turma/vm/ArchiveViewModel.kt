@@ -7,6 +7,7 @@ import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.HISTORY_MIN_QUERY
 import com.xerktech.turma.model.ArchiveTranscript
 import com.xerktech.turma.model.SearchGroup
+import com.xerktech.turma.net.archiveRefusalMessage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,6 +40,14 @@ class ArchiveViewModel(app: Application) : AndroidViewModel(app) {
         val open: ArchiveTranscript? = null,
         val openLoading: Boolean = false,
         val error: String? = null,
+        /**
+         * Why the open transcript is not in the archive, in the hub's own words
+         * (XERK-356) — null when it is simply not there yet, which is the
+         * ordinary case for a session that ended a moment ago. Kept apart from
+         * [error] because the two mean opposite things to the operator: one is
+         * "wait", the other is "waiting will not help".
+         */
+        val refusal: String? = null,
     )
 
     private val _state = MutableStateFlow(Ui())
@@ -67,12 +76,23 @@ class ArchiveViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openTranscript(transcriptId: String) {
-        _state.update { it.copy(openLoading = true) }
+        _state.update { it.copy(openLoading = true, refusal = null) }
         viewModelScope.launch {
-            val t = runCatching { container.client.api.archiveTranscript(transcriptId) }.getOrNull()
-            _state.update { it.copy(open = t, openLoading = false, error = if (t == null) "not found" else null) }
+            val res = runCatching { container.client.api.archiveTranscript(transcriptId) }
+            val t = res.getOrNull()
+            // A 404 that says WHY is the difference between "it syncs within a
+            // few minutes" and a push the hub refused, which never syncs at all.
+            val refusal = if (t == null) res.exceptionOrNull()?.let(::archiveRefusalMessage) else null
+            _state.update {
+                it.copy(
+                    open = t,
+                    openLoading = false,
+                    error = if (t == null) "not found" else null,
+                    refusal = refusal,
+                )
+            }
         }
     }
 
-    fun closeTranscript() = _state.update { it.copy(open = null) }
+    fun closeTranscript() = _state.update { it.copy(open = null, refusal = null) }
 }

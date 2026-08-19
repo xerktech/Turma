@@ -111,6 +111,23 @@ ways that neither bound covers alone.
   finishes, to keep the connection alive — it resumes the paused stream and reads the whole thing.
   Discarded bytes are still read into memory.
 
+## Per-route ceilings
+
+- **A route whose caller sends more than `BODY_MAX` must SAY SO, and pass its own cap.** The
+  archive ingest read at the default 1 MiB while agents built each delta out of an 8 MiB window,
+  and — because archival excludes RUNNING sessions, so an ended session's first delta is its whole
+  transcript — every real session was refused and the durable archive stayed empty (XERK-356).
+  `ARCHIVE_CHUNK_BODY_MAX` is `min(8 MiB, BODY_INFLIGHT_MAX)`: a fixed sanity number tightened by
+  the container, like every other ceiling here, logged at boot beside them.
+  - **The ceiling rides the heartbeat reply** (`archiveChunkMax`), exactly as `bodyMax` does and for
+    the same reason: it is a fraction of THIS container's limit, so an agent guessing it guesses
+    wrong, and past it there may be no status to learn from. An agent predating the field keeps a
+    default under the OLD 1 MiB cap, so it archives against either hub.
+  - **Read at the route, not through the generic handler**, so 413 and 503 stay distinct (shrink vs
+    retry) and so the refusal can be RECORDED: `archiveRefusals` (bounded, oldest evicted, cleared
+    by a chunk that lands) is served as `refused` on `GET /api/archive/<id>`'s 404, which is the
+    only reason an operator ever learns a conversation was refused rather than merely late.
+
 ## Verifying a change here
 
 - The unit suite has never caught any defect in this code. Every one was found by flooding a real
