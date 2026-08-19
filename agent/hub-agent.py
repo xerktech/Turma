@@ -513,6 +513,18 @@ HEARTBEAT_BODY_MAX = int(os.environ.get("TURMA_HEARTBEAT_BODY_MAX", str(24 << 20
 # refused; the margin keeps the last beat before the cliff a 413 we can read
 # rather than a socket that dies unread.
 HEARTBEAT_BODY_MARGIN = 0.75
+# ...and a FLOOR under whatever it claims. `bodyMax` is untrusted wire input: a
+# tiny one would shed every on-demand delivery on every beat while every beat
+# still returned 200, so the operator's chat would simply never load its history
+# and nothing anywhere would look wrong. Below this the hub cannot serve a
+# session at all, so treating the value as nonsense is the honest reading.
+HEARTBEAT_BODY_MIN = int(os.environ.get("TURMA_HEARTBEAT_BODY_MIN", str(1 << 20)))
+# How many CONSECUTIVE beats may fail while on-demand deliveries are staged
+# before they are shed. A beat that gets no status at all cannot be told from a
+# network outage on its own, so one failure proves nothing — but a body the hub
+# will not take is re-sent verbatim every beat, and that is XERK-235's loop. Two
+# is enough to tell them apart at INTERVAL cadence.
+HEARTBEAT_FAILURES_BEFORE_SHED = 2
 
 # File attachments (XERK-234). The operator attaches an image or a document in
 # the chat composer; the hub stages the bytes and names them on the `input`
@@ -9895,6 +9907,8 @@ class SessionManager:
         # What the hub last said it will take as a body (`bodyMax` on the beat
         # reply). 0 until a beat succeeds — see _body_max.
         self._hub_body_max = 0
+        # Consecutive failed beats — see _note_beat_failure.
+        self._beat_failures = 0
         self.history_results = []
         # Staged `subagentHistory` results (one background agent's transcript,
         # fetched when an operator clicks a live agent-list row) — same
@@ -13264,7 +13278,8 @@ class SessionManager:
         stated = getattr(self, "_hub_body_max", 0)
         if not stated:
             return HEARTBEAT_BODY_MAX
-        return max(1, min(HEARTBEAT_BODY_MAX, int(stated * HEARTBEAT_BODY_MARGIN)))
+        return max(HEARTBEAT_BODY_MIN,
+                   min(HEARTBEAT_BODY_MAX, int(stated * HEARTBEAT_BODY_MARGIN)))
 
     def _note_body_max(self, reply):
         """Remember the hub's stated body ceiling off a beat reply. Absent (an
@@ -13275,8 +13290,14 @@ class SessionManager:
         stated = reply.get("bodyMax")
         if isinstance(stated, bool) or not isinstance(stated, (int, float)):
             return
-        if stated > 0:
-            self._hub_body_max = int(stated)
+        # `1e999` is legal JSON and parses to inf, on which int() RAISES — inside
+        # post()'s try, so every beat would be logged as failed while every beat
+        # actually succeeded: commands dropped, staged results never cleared, the
+        # host dead to its operator. NaN compares false everywhere and would slip
+        # a 0 through. isfinite covers both.
+        if not math.isfinite(stated) or stated <= 0:
+            return
+        self._hub_body_max = int(stated)
 
     def _drop_on_demand_results(self, payload=None):
         """Drop the staged on-demand deliveries — and them alone — from the
@@ -16745,6 +16766,7 @@ class SessionManager:
                 # "no reply" — a skipped beat rather than a wedged agent.
                 reply = json.loads(resp.read(HEARTBEAT_REPLY_MAX).decode() or "{}")
             self._note_body_max(reply)
+            self._beat_failures = 0
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
             self.subagent_history_results.clear()  # delivered — same lifecycle
@@ -16761,6 +16783,7 @@ class SessionManager:
             # strict). A rollover that goes wrong otherwise reads as a bare
             # "HTTP Error 403: Forbidden" and a host that silently vanishes.
             log(f"heartbeat failed: {_http_error_detail(e)}")
+            self._note_beat_failure()
             if getattr(e, "code", None) == 413:
                 # A body our own ceiling let through — the first beat runs
                 # before any `bodyMax` has arrived, and a hub can shrink. This
@@ -16773,7 +16796,34 @@ class SessionManager:
             return None
         except Exception as e:
             log(f"heartbeat failed: {e}")
+            self._note_beat_failure()
             return None
+
+    def _note_beat_failure(self):
+        """Count a failed beat and, past HEARTBEAT_FAILURES_BEFORE_SHED in a
+        row, shed the on-demand deliveries it is carrying.
+
+        The 413 branch and _body_max between them cover a body the hub REFUSES
+        and a body we can measure — this covers the one that gets NO answer at
+        all. A hub restarted with less memory, or an agent repointed at a
+        smaller one, has a ceiling below the one we learned (which is only
+        refreshed on a SUCCESSFUL beat, and there are none), so the same body
+        goes up every beat and the host never comes back: XERK-235 again, from
+        the one direction the other two guards cannot see.
+
+        The learned ceiling is forgotten with them, so the next beats run on the
+        conservative default until the hub states its own again. A failure with
+        nothing staged is just an outage — nothing to shed, and nothing done."""
+        self._beat_failures = getattr(self, "_beat_failures", 0) + 1
+        if self._beat_failures < HEARTBEAT_FAILURES_BEFORE_SHED:
+            return
+        if not (self.history_results or self.subagent_history_results
+                or self.jira_issue_results):
+            return
+        log(f"{self._beat_failures} beats in a row failed while carrying on-demand "
+            "deliveries; shedding them rather than re-sending the same body forever")
+        self._drop_on_demand_results()
+        self._hub_body_max = 0
 
     def _read_updating_flag(self):
         """Consume the native updater's hint file (reason + target version) if it

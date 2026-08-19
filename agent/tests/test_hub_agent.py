@@ -10580,8 +10580,8 @@ class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
 
     def test_a_smaller_hub_sheds_a_body_a_bigger_one_would_have_taken(self):
         sm = self.make_manager()
-        sm.history_results.append(self._result("s1", 200000))
-        sm._note_body_max({"bodyMax": 40000})   # a small hub
+        sm.history_results.append(self._result("s1", 3 << 20))
+        sm._note_body_max({"bodyMax": 2 << 20})   # a hub with a 2 MiB ceiling
         payload = sm.build_payload(0)
         sent = {}
 
@@ -10598,7 +10598,72 @@ class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
             self.assertEqual(sm.post(payload), {})
         self.assertNotIn("historyResults", payload)
         self.assertEqual(sm.history_results, [])
-        self.assertLess(sent["bytes"], 200000)
+        self.assertLess(sent["bytes"], sm._body_max())
+
+    def test_a_beat_that_gets_NO_status_still_stops_repeating_itself(self):
+        # The hub answers no status past its ceiling, and the learned ceiling is
+        # only refreshed on a SUCCESSFUL beat — so a hub restarted with less
+        # memory (or an agent repointed at a smaller one) would re-post the same
+        # body every beat forever with nothing able to notice.
+        sm = self.make_manager()
+        sm._note_body_max({"bodyMax": 32 << 20})     # learned from a big hub
+        sm.history_results.append(self._result("s1", 2000))
+        payload = sm.build_payload(0)
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=BrokenPipeError("broken pipe")):
+            self.assertIsNone(sm.post(payload))
+            self.assertEqual(len(sm.history_results), 1)   # one failure proves nothing
+            self.assertIsNone(sm.post(payload))
+        self.assertEqual(sm.history_results, [])           # ...two does
+        # The stale ceiling goes with them: the next beats run on the
+        # conservative default until this hub states its own.
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)
+
+    def test_an_ordinary_outage_sheds_nothing(self):
+        sm = self.make_manager()
+        sm.spawn_failures.append({"cmdId": "c1", "error": "no"})
+        payload = sm.build_payload(0)
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("network down")):
+            for _ in range(5):
+                self.assertIsNone(sm.post(payload))
+        self.assertEqual(len(sm.spawn_failures), 1)
+
+    def test_a_successful_beat_clears_the_failure_streak(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 10))
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b"{}"
+
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("blip")):
+            self.assertIsNone(sm.post(sm.build_payload(0)))
+        with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
+            self.assertEqual(sm.post(sm.build_payload(1)), {})
+        sm.history_results.append(self._result("s2", 10))
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("blip")):
+            self.assertIsNone(sm.post(sm.build_payload(2)))
+        # One failure since the success — a streak that reset, not two in a row.
+        self.assertEqual(len(sm.history_results), 1)
+
+    def test_an_infinite_or_absurd_bodyMax_cannot_break_every_beat(self):
+        # `1e999` is legal JSON and parses to inf; int(inf) RAISES, inside the
+        # try — so every beat would log as failed while every beat succeeded.
+        sm = self.make_manager()
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            sm._note_body_max({"bodyMax": bad})
+            self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)
+
+    def test_a_tiny_bodyMax_cannot_silently_disable_history_forever(self):
+        # Every beat 200, every delivery shed, nothing anywhere looking wrong —
+        # the operator's chat just never loads. Below the floor it is nonsense.
+        sm = self.make_manager()
+        sm._note_body_max({"bodyMax": 1})
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MIN)
 
     def test_a_beat_within_the_aggregate_is_untouched(self):
         sm = self.make_manager()
