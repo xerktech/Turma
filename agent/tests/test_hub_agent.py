@@ -2142,7 +2142,7 @@ class TestEntryBlocks(unittest.TestCase):
 
     def test_string_content_one_text_block(self):
         self.assertEqual(
-            ha._entry_blocks({"type": "user", "message": {"content": "hi"}}, ha.BLOCK_CAPS_LIVE),
+            ha._entry_blocks({"type": "user", "message": {"content": "hi"}}, ha.BLOCK_CAPS),
             [{"t": "text", "text": "hi"}],
         )
 
@@ -2152,7 +2152,7 @@ class TestEntryBlocks(unittest.TestCase):
             {"type": "text", "text": "answer"},
             {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls -la", "timeout": 5}},
         ]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "thinking", "text": "ponder"},
             {"t": "text", "text": "answer"},
             {"t": "tool_use", "name": "Bash", "input": "ls -la", "id": "toolu_1"},
@@ -2166,7 +2166,7 @@ class TestEntryBlocks(unittest.TestCase):
             {"type": "tool_result", "tool_use_id": "toolu_1",
              "content": [{"type": "text", "text": "boom"}], "is_error": True},
         ]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "tool_result", "text": "boom", "forId": "toolu_1", "isError": True},
         ])
         self.assertIsNone(ha._entry_text(entry))  # unchanged: tool_result-only -> None
@@ -2175,28 +2175,28 @@ class TestEntryBlocks(unittest.TestCase):
         blocks = ha._entry_blocks(
             {"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "name": "X", "input": {"a": 1, "b": "z"}}]}},
-            ha.BLOCK_CAPS_LIVE,
+            ha.BLOCK_CAPS,
         )
         self.assertEqual(blocks, [{"t": "tool_use", "name": "X", "input": '{"a":1,"b":"z"}'}])
 
     def test_over_cap_text_and_result_truncated(self):
-        big = "x" * (ha.BLOCK_CAPS_LIVE["text"] + 500)
-        tb = ha._entry_blocks({"type": "assistant", "message": {"content": big}}, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(tb["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        big = "x" * (ha.BLOCK_CAPS["text"] + 500)
+        tb = ha._entry_blocks({"type": "assistant", "message": {"content": big}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(tb["text"]), ha.BLOCK_CAPS["text"])
         self.assertTrue(tb["truncated"])
 
-        big_out = "y" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big_out = "y" * (ha.BLOCK_CAPS["result"] + 500)
         rb = ha._entry_blocks(
             {"type": "user", "message": {"content": [{"type": "tool_result", "content": big_out}]}},
-            ha.BLOCK_CAPS_LIVE,
+            ha.BLOCK_CAPS,
         )[0]
-        self.assertEqual(len(rb["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertEqual(len(rb["text"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(rb["truncated"])
 
     def test_wrong_type_and_no_message_return_none_empty_content_empty_list(self):
-        self.assertIsNone(ha._entry_blocks({"type": "summary", "message": {"content": "x"}}, ha.BLOCK_CAPS_LIVE))
-        self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS_LIVE))
-        self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS_LIVE), [])
+        self.assertIsNone(ha._entry_blocks({"type": "summary", "message": {"content": "x"}}, ha.BLOCK_CAPS))
+        self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS))
+        self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS), [])
 
     def test_edit_tool_use_carries_the_actual_change_as_a_diff(self):
         entry = {"type": "assistant", "message": {"content": [
@@ -2204,25 +2204,25 @@ class TestEntryBlocks(unittest.TestCase):
                 "file_path": "/repo/a.py", "old_string": "x = 1", "new_string": "x = 2",
                 "replace_all": True}},
         ]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "tool_use", "name": "Edit", "input": "/repo/a.py", "id": "toolu_e",
              "edit": {"old": "x = 1", "new": "x = 2", "replaceAll": True}},
         ])
 
     def test_edit_diff_over_cap_flags_the_block_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 100)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 100)
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Edit", "input": {
                 "file_path": "/repo/a.py", "old_string": "x", "new_string": big}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["edit"]["new"]), ha.BLOCK_CAPS_LIVE["result"])
+        ]}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["edit"]["new"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_write_tool_use_carries_the_file_body(self):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Write", "input": {
                 "file_path": "/repo/new.txt", "content": "hello\nworld"}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["input"], "/repo/new.txt")
         self.assertEqual(block["content"], "hello\nworld")
 
@@ -2230,7 +2230,7 @@ class TestEntryBlocks(unittest.TestCase):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "ExitPlanMode", "input": {
                 "plan": "## Plan\n1. do it", "allowedPrompts": []}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["plan"], "## Plan\n1. do it")
 
     def test_send_user_file_embeds_images_svg_html_and_degrades_the_rest(self):
@@ -2249,7 +2249,7 @@ class TestEntryBlocks(unittest.TestCase):
                    "display": "render", "caption": "the set"}
             block = ha._entry_blocks({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": "SendUserFile", "input": inp},
-            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            ]}}, ha.BLOCK_CAPS)[0]
             self.assertEqual(block["caption"], "the set")
             b64 = base64.b64encode(b"<svg><rect/></svg>").decode()
             self.assertEqual(block["files"], [
@@ -2262,7 +2262,7 @@ class TestEntryBlocks(unittest.TestCase):
             b2 = ha._entry_blocks({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t2", "name": "SendUserFile",
                  "input": {"files": [html], "display": "attach"}},
-            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            ]}}, ha.BLOCK_CAPS)[0]
             self.assertEqual(b2["files"], [{"name": "p.html", "kind": "file"}])
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -2277,7 +2277,7 @@ class TestEntryBlocks(unittest.TestCase):
             block = ha._entry_blocks({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": "SendUserFile",
                  "input": {"files": [big], "display": "render"}},
-            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            ]}}, ha.BLOCK_CAPS)[0]
             self.assertEqual(block["files"], [{"name": "big.png", "kind": "file"}])
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -2286,7 +2286,7 @@ class TestEntryBlocks(unittest.TestCase):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Bash", "input": {
                 "command": "ls", "description": "List files"}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["input"], "ls")
         self.assertEqual(block["desc"], "List files")
 
@@ -2295,25 +2295,25 @@ class TestEntryBlocks(unittest.TestCase):
             {"type": "tool_use", "name": "AskUserQuestion", "input": {
                 "questions": [{"question": "Ship it?", "options": [{"label": "yes"}]},
                               {"question": "Which env?"}]}},
-        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["input"], "Ship it? · Which env?")
 
     def test_compact_boundary_becomes_a_status_marker_block(self):
         entry = {"type": "system", "subtype": "compact_boundary",
                  "content": "Conversation compacted", "uuid": "u1",
                  "compactMetadata": {"trigger": "auto", "preTokens": 123380, "postTokens": 5920}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "compact_boundary", "trigger": "auto", "preTokens": 123380, "postTokens": 5920},
         ])
         # Other system subtypes still drop, and the text feed still skips it.
         self.assertIsNone(ha._entry_text(entry))
         self.assertIsNone(ha._entry_blocks(
-            {"type": "system", "subtype": "turn_duration", "durationMs": 5}, ha.BLOCK_CAPS_LIVE))
+            {"type": "system", "subtype": "turn_duration", "durationMs": 5}, ha.BLOCK_CAPS))
 
     def test_pr_link_becomes_a_marker_block_with_a_synthesized_id(self):
         entry = {"type": "pr-link", "prNumber": 230, "prUrl": "https://github.com/o/r/pull/230",
                  "prRepository": "o/r", "timestamp": "2026-07-17T04:25:18.299Z"}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [
             {"t": "pr_link", "url": "https://github.com/o/r/pull/230", "number": 230, "repo": "o/r"},
         ])
         # No uuid on the wire entry: the feeds synthesize a stable id so the
@@ -2325,7 +2325,7 @@ class TestEntryBlocks(unittest.TestCase):
         self.assertEqual(ha._entry_id(restamp), ha._entry_id(entry))
         other = dict(entry, prUrl="https://github.com/o/r/pull/231")
         self.assertNotEqual(ha._entry_id(other), ha._entry_id(entry))
-        self.assertIsNone(ha._entry_blocks({"type": "pr-link"}, ha.BLOCK_CAPS_LIVE))
+        self.assertIsNone(ha._entry_blocks({"type": "pr-link"}, ha.BLOCK_CAPS))
         self.assertEqual(ha._entry_id({"type": "user", "uuid": "u9"}), "u9")
 
 
@@ -2584,7 +2584,7 @@ class TestTaskNotification(unittest.TestCase):
 
     def test_blocks_emit_task_notification_from_string_content(self):
         entry = {"type": "user", "message": {"content": TASK_NOTIFICATION}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [{
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [{
             "t": "task_notification",
             "summary": 'Agent "Confirm merge semantics" finished',
             "status": "completed",
@@ -2594,7 +2594,7 @@ class TestTaskNotification(unittest.TestCase):
     def test_blocks_emit_task_notification_from_list_text_block(self):
         entry = {"type": "user", "message": {"content": [
             {"type": "text", "text": TASK_NOTIFICATION}]}}
-        blocks = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)
+        blocks = ha._entry_blocks(entry, ha.BLOCK_CAPS)
         self.assertEqual(blocks[0]["t"], "task_notification")
         self.assertEqual(blocks[0]["summary"], 'Agent "Confirm merge semantics" finished')
 
@@ -2604,7 +2604,7 @@ class TestTaskNotification(unittest.TestCase):
             "<summary>Background command finished (exit code 0)</summary>\n"
             "</task-notification>"
         )
-        blocks = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS_LIVE)
+        blocks = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS)
         self.assertEqual(blocks, [{
             "t": "task_notification",
             "summary": "Background command finished (exit code 0)",
@@ -2612,10 +2612,10 @@ class TestTaskNotification(unittest.TestCase):
         }])
 
     def test_long_result_is_capped_and_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 500)
         text = f"<task-notification>\n<summary>done</summary>\n<result>{big}</result>\n</task-notification>"
-        block = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["result"]), ha.BLOCK_CAPS_LIVE["result"])
+        block = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["result"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_flattens_to_summary_and_result(self):
@@ -2696,50 +2696,50 @@ class TestLocalCommand(unittest.TestCase):
 
     def test_blocks_drop_the_caveat_entirely(self):
         entry = {"type": "user", "isMeta": True, "message": {"content": COMMAND_CAVEAT}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [])
         self.assertIsNone(ha._entry_text(entry))
 
     def test_blocks_emit_command_from_string_and_list_content(self):
         expected = [{"t": "command", "name": "/compact", "args": "summaries appear as user text"}]
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {"content": COMMAND_INVOCATION}},
-                             ha.BLOCK_CAPS_LIVE),
+                             ha.BLOCK_CAPS),
             expected)
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {"content": [
-                {"type": "text", "text": COMMAND_INVOCATION}]}}, ha.BLOCK_CAPS_LIVE),
+                {"type": "text", "text": COMMAND_INVOCATION}]}}, ha.BLOCK_CAPS),
             expected)
 
     def test_blocks_omit_empty_args(self):
         text = "<command-name>/clear</command-name>\n<command-args></command-args>"
         self.assertEqual(ha._entry_blocks({"type": "user", "message": {"content": text}},
-                                          ha.BLOCK_CAPS_LIVE),
+                                          ha.BLOCK_CAPS),
                          [{"t": "command", "name": "/clear"}])
 
     def test_blocks_emit_command_output(self):
         entry = {"type": "user", "message": {"content": COMMAND_STDOUT}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "command_output", "text": "Compacted (ctrl+o to see full summary)"}])
 
     def test_blocks_flag_stderr_output_as_an_error(self):
         entry = {"type": "user", "message": {"content":
                  "<local-command-stderr>Error: No messages to compact</local-command-stderr>"}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "command_output", "text": "Error: No messages to compact",
                            "isError": True}])
 
     def test_empty_output_yields_no_block(self):
         entry = {"type": "user", "message": {"content":
                  "<local-command-stdout></local-command-stdout>"}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS), [])
         self.assertIsNone(ha._entry_text(entry))
 
     def test_long_output_is_capped_and_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 500)
         entry = {"type": "user", "message": {"content":
                  f"<local-command-stdout>{big}</local-command-stdout>"}}
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_flattens_command_and_output(self):
@@ -2773,20 +2773,20 @@ class TestCompactSummary(unittest.TestCase):
                          "assistant")
 
     def test_blocks_emit_a_compact_summary_block(self):
-        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS),
                          [{"t": "compact_summary", "text": self.SUMMARY}])
 
     def test_an_ordinary_user_turn_stays_a_text_block(self):
         entry = {"type": "user", "message": {"content": self.SUMMARY}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "text", "text": self.SUMMARY}])
 
     def test_long_summary_is_capped_and_truncated(self):
-        big = "z" * (ha.BLOCK_CAPS_LIVE["text"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["text"] + 500)
         entry = {"type": "user", "isCompactSummary": True, "message": {"content": big}}
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["t"], "compact_summary")
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["text"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_keeps_the_summary_prose(self):
@@ -2820,23 +2820,23 @@ class TestSkillBody(unittest.TestCase):
             {"type": "assistant", "sourceToolUseID": "toolu_01ABC", "message": {"content": "hi"}}))
 
     def test_blocks_emit_the_body_as_its_skill_calls_tool_result(self):
-        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS),
                          [{"t": "tool_result", "text": self.BODY, "forId": "toolu_01ABC"}])
 
     def test_the_same_body_typed_by_a_human_stays_a_text_block(self):
         # Only the tool tag makes it tool output — pasting a skill body by hand
         # is the operator talking, and must still read as a user bubble.
         entry = {"type": "user", "message": {"content": [{"type": "text", "text": self.BODY}]}}
-        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS),
                          [{"t": "text", "text": self.BODY}])
 
     def test_a_long_body_is_capped_and_truncated(self):
         entry = self._entry()
-        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        big = "z" * (ha.BLOCK_CAPS["result"] + 500)
         entry["message"]["content"] = [{"type": "text", "text": big}]
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["t"], "tool_result")
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["result"])
         self.assertTrue(block["truncated"])
 
     def test_entry_text_drops_it_like_any_tool_result(self):
@@ -2882,11 +2882,11 @@ class TestBashPassthrough(unittest.TestCase):
     def test_blocks_emit_command_and_output(self):
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {
-                "content": "<bash-input> ls -la</bash-input>"}}, ha.BLOCK_CAPS_LIVE),
+                "content": "<bash-input> ls -la</bash-input>"}}, ha.BLOCK_CAPS),
             [{"t": "command", "name": "!", "args": "ls -la"}])
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {
-                "content": "<bash-stderr>boom</bash-stderr>"}}, ha.BLOCK_CAPS_LIVE),
+                "content": "<bash-stderr>boom</bash-stderr>"}}, ha.BLOCK_CAPS),
             [{"t": "command_output", "text": "boom", "isError": True}])
 
     def test_text_feed_flattens_like_a_slash_command(self):
@@ -2912,7 +2912,7 @@ class TestInterruptMarker(unittest.TestCase):
             for content in (text, [{"type": "text", "text": text}]):
                 self.assertEqual(
                     ha._entry_blocks({"type": "user", "message": {"content": content}},
-                                     ha.BLOCK_CAPS_LIVE),
+                                     ha.BLOCK_CAPS),
                     [{"t": "interrupt", "text": text}])
 
     def test_text_feed_keeps_the_raw_line(self):
@@ -2927,7 +2927,7 @@ class TestInterruptMarker(unittest.TestCase):
         text = "the log said [Request interrupted by user] at 3pm"
         self.assertEqual(
             ha._entry_blocks({"type": "user", "message": {"content": text}},
-                             ha.BLOCK_CAPS_LIVE),
+                             ha.BLOCK_CAPS),
             [{"t": "text", "text": text}])
 
 
@@ -2942,7 +2942,7 @@ class TestAwaySummary(unittest.TestCase):
              "content": "Fixed the bug and opened a PR. (disable recaps in /config)"}
 
     def test_becomes_an_away_summary_block(self):
-        self.assertEqual(ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS_LIVE),
+        self.assertEqual(ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS),
                          [{"t": "away_summary", "text": "Fixed the bug and opened a PR."}])
 
     def test_text_feed_and_role(self):
@@ -2952,20 +2952,20 @@ class TestAwaySummary(unittest.TestCase):
     def test_other_system_subtypes_stay_dropped(self):
         for sub in ("turn_duration", "bridge_status", "stop_hook_summary", None):
             entry = {"type": "system", "subtype": sub, "content": "x"}
-            self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+            self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS))
             self.assertIsNone(ha._entry_text(entry))
 
     def test_empty_recap_drops(self):
         entry = {"type": "system", "subtype": "away_summary",
                  "content": " (disable recaps in /config)"}
-        self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+        self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS))
         self.assertIsNone(ha._entry_text(entry))
 
     def test_long_recap_is_capped_and_truncated(self):
         entry = {"type": "system", "subtype": "away_summary",
-                 "content": "z" * (ha.BLOCK_CAPS_LIVE["text"] + 100)}
-        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
-        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+                 "content": "z" * (ha.BLOCK_CAPS["text"] + 100)}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS["text"])
         self.assertTrue(block["truncated"])
 
 
@@ -3059,6 +3059,60 @@ class TestQueuedPrompts(ProjectDirMixin, unittest.TestCase):
         _, _, queued = ha._history_entries(path)
         self.assertEqual(len(queued), ha.QUEUED_PROMPTS_MAX)
         self.assertEqual(queued[-1], f"p{ha.QUEUED_PROMPTS_MAX + 4}")
+
+
+class TestHistoryBudget(ProjectDirMixin, unittest.TestCase):
+    """XERK-347: the per-block caps bound a BLOCK, so one reply is bounded as a
+    whole — the window is 200 entries and the operator fold reads the entire
+    transcript, and an oversized staged result is XERK-235's offline loop."""
+
+    def _rows(self, n, chars):
+        return [{"id": f"e{i}", "role": "assistant", "text": "",
+                 "blocks": [{"t": "text", "text": "x" * chars}]} for i in range(n)]
+
+    def test_row_chars_counts_every_string_a_row_carries(self):
+        row = {"id": "e1", "role": "assistant", "text": "abc", "blocks": [
+            {"t": "tool_use", "name": "SendUserFile", "input": "x" * 10,
+             "files": [{"kind": "image", "name": "s.png", "src": "y" * 100}]}]}
+        # text + name + input + kind + name + src, i.e. every string, nested ones
+        # included — the base64 preview is the heaviest thing one row can hold.
+        self.assertEqual(ha._row_chars(row), 3 + len("tool_use") + len("SendUserFile") + 10
+                         + len("image") + len("s.png") + 100)
+
+    def test_oldest_rows_go_first_and_the_reply_is_flagged(self):
+        with mock.patch.object(ha, "HISTORY_MAX_CHARS", 3000):
+            kept, dropped = ha._fit_history_budget(self._rows(10, 1000))
+        self.assertTrue(dropped)
+        self.assertEqual([r["id"] for r in kept], ["e8", "e9"])
+
+    def test_a_reply_within_budget_is_untouched(self):
+        rows = self._rows(3, 10)
+        kept, dropped = ha._fit_history_budget(rows)
+        self.assertFalse(dropped)
+        self.assertIs(kept, rows)
+
+    def test_the_newest_row_survives_however_big_it_is(self):
+        with mock.patch.object(ha, "HISTORY_MAX_CHARS", 100):
+            kept, dropped = ha._fit_history_budget(self._rows(2, 5000))
+        self.assertTrue(dropped)
+        self.assertEqual([r["id"] for r in kept], ["e1"])
+
+    def test_history_entries_applies_the_budget_and_reports_truncated(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "x" * 2000}},
+            {"uuid": "a1", "type": "assistant", "message": {"content": "y" * 2000}},
+            {"uuid": "a2", "type": "assistant", "message": {"content": "tail"}},
+        ])
+        # 6000: a row weighs its flat text AND its blocks (a deliberate
+        # over-count — both ride the wire), so two 2000-char turns fit and three
+        # do not.
+        with mock.patch.object(ha, "HISTORY_MAX_CHARS", 6000):
+            entries, capped, _ = ha._history_entries(path)
+        # Nothing else cut this read — the whole-reply budget is what did, and it
+        # says so, because the client renders `truncated` as "older history above".
+        self.assertTrue(capped)
+        self.assertEqual([e["id"] for e in entries], ["a1", "a2"])
 
 
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):

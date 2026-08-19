@@ -38,14 +38,24 @@ data class VerbosityPrefs(
 sealed interface ChatItem {
     val entryKey: String
 
-    /** A user/assistant text bubble. */
+    /**
+     * A user/assistant text bubble. [clipped] marks a block the agent had to cut
+     * to its cap — a static mark, never a control, exactly as the web renders it
+     * (XERK-347): the live tail and /history read at the same fidelity, so there
+     * is no fuller copy for a tap to fetch.
+     */
     data class Bubble(
         override val entryKey: String,
         val role: String,
         val text: String,
+        val clipped: Boolean = false,
     ) : ChatItem
 
-    data class Thinking(override val entryKey: String, val text: String) : ChatItem
+    data class Thinking(
+        override val entryKey: String,
+        val text: String,
+        val clipped: Boolean = false,
+    ) : ChatItem
 
     data class Tool(
         override val entryKey: String,
@@ -53,6 +63,7 @@ sealed interface ChatItem {
         val input: String,
         val result: String,
         val isError: Boolean,
+        val clipped: Boolean = false,
         // SendUserFile inline previews + caption (XERK-221). Shown whenever the
         // card shows (like the web's open-by-default files), not gated on outputs.
         val files: List<SendFile> = emptyList(),
@@ -64,6 +75,7 @@ sealed interface ChatItem {
         val summary: String,
         val status: String,
         val result: String,
+        val clipped: Boolean = false,
     ) : ChatItem
 }
 
@@ -104,17 +116,23 @@ fun buildItems(
         // the web accumulates `msg.text += b.text` and flushes the same way, so
         // a turn split across blocks must not render as several bubbles.
         var pending: StringBuilder? = null
+        var pendingClipped = false
         fun flushText() {
             val text = pending?.toString()
+            val clipped = pendingClipped
             pending = null
-            if (!text.isNullOrBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text))
+            pendingClipped = false
+            if (!text.isNullOrBlank()) out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped))
         }
         for (block in entry.blocks) {
             when (block) {
-                is TextBlock -> (pending ?: StringBuilder().also { pending = it }).append(block.text)
+                is TextBlock -> {
+                    (pending ?: StringBuilder().also { pending = it }).append(block.text)
+                    if (block.truncated) pendingClipped = true
+                }
                 is ThinkingBlock -> if (prefs.thinking && block.text.isNotBlank()) {
                     flushText()
-                    out.add(ChatItem.Thinking(entry.key, block.text))
+                    out.add(ChatItem.Thinking(entry.key, block.text, block.truncated))
                 }
                 // A SendUserFile delivery (a block carrying rendered files) is
                 // user-facing content, not a tool mechanic, so it shows in EVERY
@@ -131,12 +149,13 @@ fun buildItems(
                             isError = res?.isError ?: false,
                             files = block.files,
                             caption = block.caption,
+                            clipped = block.truncated || (prefs.toolOutputs && res?.truncated == true),
                         )
                     )
                 }
                 is TaskNotificationBlock -> {
                     flushText()
-                    out.add(ChatItem.TaskNote(entry.key, block.summary, block.status, block.result))
+                    out.add(ChatItem.TaskNote(entry.key, block.summary, block.status, block.result, block.truncated))
                 }
                 // A result whose call is anywhere in the conversation folded into
                 // that card above. Anything left is an orphan — keep it, so a
@@ -153,6 +172,7 @@ fun buildItems(
                             ChatItem.Tool(
                                 entry.key, name = "result", input = "",
                                 result = block.text, isError = block.isError,
+                                clipped = block.truncated,
                             )
                         )
                     }

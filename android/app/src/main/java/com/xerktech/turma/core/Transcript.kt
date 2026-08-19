@@ -47,17 +47,6 @@ private fun blockText(b: Block): String = when (b) {
     else -> ""
 }
 
-/** Whether any of the entry's blocks was clipped to a cap by the agent. */
-fun entryTruncated(entry: TailEntry): Boolean = entry.blocks.any {
-    when (it) {
-        is TextBlock -> it.truncated
-        is ThinkingBlock -> it.truncated
-        is ToolUseBlock -> it.truncated
-        is ToolResultBlock -> it.truncated
-        is TaskNotificationBlock -> it.truncated
-        else -> false
-    }
-}
 
 /**
  * Merge a delta of [incoming] entries into [existing], keyed on [TailEntry.key].

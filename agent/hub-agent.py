@@ -405,29 +405,34 @@ TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
 TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000"))
 # Rich-block caps (native chat UI). _entry_blocks() preserves the thinking,
 # tool_use inputs and tool_result outputs that _entry_text() flattens away, so
-# the web chat can show/hide each component by verbosity. The live tail
-# (tunnel-agent.js) pushes these ~1s, so it uses the tight LIVE caps; on-demand
-# `history` uses the looser FULL caps so an "Expand" reveals genuinely more. A
-# block cut to its cap is flagged truncated:true. Keep these mirrored in
-# tunnel-agent.js.
-BLOCK_TEXT_CHARS = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS", "4000"))
-BLOCK_TOOL_INPUT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS", "1000"))
-BLOCK_TOOL_RESULT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS", "2000"))
-BLOCK_TEXT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS_FULL", "16000"))
-BLOCK_TOOL_INPUT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS_FULL", "4000"))
-BLOCK_TOOL_RESULT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS_FULL", "8000"))
+# the web chat can show/hide each component by verbosity. A block cut to its cap
+# is flagged truncated:true. Keep these mirrored in tunnel-agent.js.
+#
+# ONE set of caps, shared by the live tail and the on-demand `history` read
+# (XERK-347). They used to differ — the live path clipped to a quarter of what
+# history returned, and every block cut that way carried a "Show more…" button
+# to re-fetch the fuller copy. A message that arrives cut off mid-sentence, with
+# a button to press before it can be read, is not what the chat is for; and the
+# split bought nothing, because a live frame is bounded by the ~128 KB
+# transcript window it is parsed from (TAIL_READ_BYTES), not by these numbers.
+# Never re-introduce a tighter live cap: it puts the button back.
+#
+# The text cap is INPUT_MAX_CHARS, so nothing an operator can type and nothing a
+# model realistically emits is ever clipped (over this host's corpus the longest
+# assistant/thinking block is ~18k chars). Tool inputs and outputs keep tighter
+# caps: a build log or a whole-file Read is not a message, and it is what these
+# ceilings exist to bound. The `history` read's own aggregate is bounded
+# separately by HISTORY_MAX_CHARS.
+BLOCK_TEXT_CHARS = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS", "100000"))
+BLOCK_TOOL_INPUT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS", "4000"))
+BLOCK_TOOL_RESULT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS", "8000"))
 # Defensive per-entry block cap so one pathological turn can't blow the tail
 # frame (each block is already char-capped above).
 BLOCK_MAX_PER_ENTRY = int(os.environ.get("SESSION_BLOCK_MAX_PER_ENTRY", "48"))
-BLOCK_CAPS_LIVE = {
+BLOCK_CAPS = {
     "text": BLOCK_TEXT_CHARS,
     "input": BLOCK_TOOL_INPUT_CHARS,
     "result": BLOCK_TOOL_RESULT_CHARS,
-}
-BLOCK_CAPS_FULL = {
-    "text": BLOCK_TEXT_CHARS_FULL,
-    "input": BLOCK_TOOL_INPUT_CHARS_FULL,
-    "result": BLOCK_TOOL_RESULT_CHARS_FULL,
 }
 # SendUserFile inline preview (XERK-221): the agent reads the image/SVG/HTML files
 # a session delivers via SendUserFile and embeds them ON the tool_use block (a
@@ -461,6 +466,15 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # over-long message with an error the composer shows rather than truncating it.
 INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "100000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
+# Aggregate ceiling on ONE `history` delivery, in characters across every row's
+# text and blocks (a SendUserFile preview's base64 included). The per-block caps
+# bound a BLOCK, never the reply: the window is HISTORY_MAX_MSGS entries and the
+# operator-message fold below scans the WHOLE transcript, so at the block
+# ceilings one reply could reach tens of MiB — and a staged history result rides
+# the heartbeat, which the hub refuses past HEARTBEAT_MAX, taking the host
+# offline in a re-send loop (XERK-235). Oldest rows go first and the reply is
+# flagged truncated, exactly as the entry-count window does.
+HISTORY_MAX_CHARS = int(os.environ.get("SESSION_HISTORY_MAX_CHARS", str(8 << 20)))
 
 # File attachments (XERK-234). The operator attaches an image or a document in
 # the chat composer; the hub stages the bytes and names them on the `input`
@@ -4155,7 +4169,8 @@ def _tool_use_detail(block, name, inp, caps):
     """Attach the reviewable payload of a known tool call to its tool_use block,
     beyond the one-line `input` summary — the part an operator otherwise opens
     the raw terminal to see. Returns True when a payload was clipped by its cap
-    (the caller flags the block truncated so "Show more" refetches the FULL copy).
+    (the caller flags the block truncated, which the chat renders as a static
+    "clipped" mark — there is no fuller copy to fetch).
 
       Edit          -> edit: {old, new, replaceAll?}   (the actual change, as a diff)
       Write         -> content: the file body written
@@ -4556,8 +4571,8 @@ def _entry_blocks(entry, caps):
     it PRESERVES the thinking text, tool_use inputs and tool_result outputs that
     _entry_text() flattens away, so the native chat UI can show/hide each
     component by verbosity. `caps` is a {text, input, result} char-limit dict
-    (BLOCK_CAPS_LIVE for the ~1s tail, BLOCK_CAPS_FULL for on-demand history); a
-    block cut to its cap gets truncated:true. Blocks:
+    (BLOCK_CAPS on every path — the live tail and on-demand history read at the
+    same fidelity); a block cut to its cap gets truncated:true. Blocks:
       {t:"text",           text}
       {t:"thinking",       text, truncated?}
       {t:"tool_use",       id, name, input, truncated?}
@@ -5052,7 +5067,7 @@ def _history_row(entry):
     and is kept, so the chat UI can show tool output. transcript_tail keeps the
     old drop-when-None rule (heartbeat/archive stay lean)."""
     text = _entry_text(entry)
-    blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
+    blocks = _entry_blocks(entry, BLOCK_CAPS)
     if text is None and not blocks:
         return None
     return {
@@ -5113,15 +5128,52 @@ def _operator_entries(path):
     return rows
 
 
+def _row_chars(row):
+    """Rough character weight of one history row: its flat text plus every
+    string its blocks carry — a SendUserFile preview's base64 `src` included,
+    which is the single heaviest thing one row can hold."""
+    total = [len(row.get("text") or "")]
+
+    def walk(value):
+        if isinstance(value, str):
+            total[0] += len(value)
+        elif isinstance(value, dict):
+            for v in value.values():
+                walk(v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v)
+
+    walk(row.get("blocks") or [])
+    return total[0]
+
+
+def _fit_history_budget(rows):
+    """Trim a history window to HISTORY_MAX_CHARS, oldest rows first. Returns
+    (rows, dropped_any). The NEWEST row always survives however big it is —
+    it is what the operator is reading, and the per-block caps already bound
+    one row."""
+    total = 0
+    keep = 0
+    for row in reversed(rows):
+        total += _row_chars(row)
+        if keep and total > HISTORY_MAX_CHARS:
+            break
+        keep += 1
+    if keep >= len(rows):
+        return rows, False
+    return rows[len(rows) - keep:], True
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
     ~128 KB, tolerant JSONL parse, entries mapped through _history_row (no
     duplicated entry->text logic). Returns (entries, truncated, queued) —
-    entries oldest first, already capped to the last HISTORY_MAX_MSGS;
-    truncated is True when older content was cut (the file outgrew the byte
-    window, or the entry cap dropped entries); queued is the still-queued
-    prompt texts (see _fold_queue_op).
+    entries oldest first, capped to the last HISTORY_MAX_MSGS and then to
+    HISTORY_MAX_CHARS of content; truncated is True when older content was cut
+    (the file outgrew the byte window, or either cap dropped entries); queued is
+    the still-queued prompt texts (see _fold_queue_op).
 
     One exemption from the window (XERK-186): OPERATOR MESSAGES. Whenever the
     window cut anything, every operator text turn older than the window is
@@ -5157,7 +5209,8 @@ def _history_entries(path):
         older = [row for row in _operator_entries(path)
                  if row.get("id") and row["id"] not in shown]
         window = older[-HISTORY_USER_MSGS:] + window
-    return window, truncated, _queued_display(queued)
+    window, over_budget = _fit_history_budget(window)
+    return window, truncated or over_budget, _queued_display(queued)
 
 
 # The Task tool's result text carries the spawned agent's id ("agentId: <id>"),
@@ -14031,7 +14084,7 @@ class SessionManager:
                     # copy; the archive has no /history to expand into). Inclusion
                     # widens like _history_entries: a tool_result-only turn (text
                     # is None) still has blocks and is kept.
-                    blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
+                    blocks = _entry_blocks(entry, BLOCK_CAPS)
                     if text is None and not blocks:
                         continue
                     # ...except the SendUserFile payloads, once this transcript

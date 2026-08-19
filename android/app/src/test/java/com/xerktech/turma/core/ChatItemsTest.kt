@@ -9,6 +9,7 @@ import com.xerktech.turma.model.ToolUseBlock
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -92,6 +93,36 @@ class ChatItemsTest {
         val bubbles = items.filterIsInstance<ChatItem.Bubble>()
         assertEquals(1, bubbles.size)
         assertEquals("Hello world", bubbles[0].text)
+    }
+
+    // XERK-347: a clipped block carries a static mark, the web's `.clipped` span
+    // — no "Show more", on either client, because nothing holds a fuller copy.
+    @Test fun `a clipped text block marks its bubble, an intact one does not`() {
+        val prefs = VerbosityPrefs.forPreset(Verbosity.NORMAL)
+        val clipped = buildItems(
+            listOf(TailEntry(id = "a1", role = "assistant",
+                blocks = listOf(TextBlock("Hello "), TextBlock("world", truncated = true)))),
+            prefs,
+        ).filterIsInstance<ChatItem.Bubble>().single()
+        assertTrue(clipped.clipped)
+        val whole = buildItems(
+            listOf(TailEntry(id = "a2", role = "assistant", blocks = listOf(TextBlock("all of it")))),
+            prefs,
+        ).filterIsInstance<ChatItem.Bubble>().single()
+        assertFalse(whole.clipped)
+    }
+
+    @Test fun `a clipped tool RESULT marks its card`() {
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "a1", role = "assistant",
+                    blocks = listOf(ToolUseBlock(id = "t1", name = "Bash", input = null))),
+                TailEntry(id = "r1", role = "user",
+                    blocks = listOf(ToolResultBlock(forId = "t1", text = "cut", truncated = true))),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.NORMAL),
+        )
+        assertTrue(items.filterIsInstance<ChatItem.Tool>().single().clipped)
     }
 
     @Test fun `concise hides tools and thinking, keeps text`() {

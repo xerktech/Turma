@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -462,23 +462,21 @@ test("render: HTML in a command / compact turn is escaped (no injection)", () =>
   assert.match(html, /&lt;script&gt;/);
 });
 
-test("render: a truncated command output / compact summary offers Show more", () => {
+test("render: a clipped command output / compact summary is MARKED, never a button (XERK-347)", () => {
   const html = withVerbosity("normal", () => itemsToHtml(buildItems([
     { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
     { id: "o1", role: "user", blocks: [{ t: "command_output", text: "cut", truncated: true }] },
     { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "cut", truncated: true }] },
   ])));
-  // The output folds into c1's card but is o1's entry — Show more must re-fetch
-  // the entry the text actually came from, not the card it's drawn in.
-  assert.match(html, /<button class="trunc" data-eid="o1">/);
-  assert.match(html, /<button class="trunc" data-eid="s1">/);
+  assert.equal(html.match(/class="clipped"/g).length, 2);
+  assert.doesNotMatch(html, /<button/);
 });
 
-test("render: a folded card's truncated ARGS still expand the invocation entry", () => {
+test("render: a folded card's clipped ARGS are marked too", () => {
   const html = withVerbosity("normal", () => itemsToHtml(buildItems([
     { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "cut", truncated: true }] },
   ])));
-  assert.match(html, /<button class="trunc" data-eid="c1">/);
+  assert.match(html, /class="clipped"/);
 });
 
 // ---- verbosity-driven HTML rendering -------------------------------------
@@ -529,23 +527,26 @@ test("render: an error result gets the .err class on its card", () => {
   assert.match(html, /class="action-card err"/);
 });
 
-test("render: a truncated block emits a Show more button carrying its entry id", () => {
+// XERK-347: a message is shown WHOLE, every time. The agent's block caps are
+// the same on the live tail as on /history, so a clipped block has no fuller
+// copy anywhere — it gets a static mark, and nothing the operator must press
+// before they can read a message.
+test("render: a clipped block gets a static mark, not a Show more button", () => {
   const items = buildItems([
     { id: "a9", role: "assistant", blocks: [{ t: "text", text: "loooong", truncated: true }] },
   ]);
   const html = withVerbosity("verbose", () => itemsToHtml(items));
-  assert.match(html, /class="trunc" data-eid="a9"/);
+  assert.match(html, /class="clipped"/);
+  assert.doesNotMatch(html, /<button/);
+  assert.doesNotMatch(html, /Show more/);
 });
 
-test("render: noExpand (archived view) suppresses the Show more button", () => {
+test("render: an un-clipped block carries no mark at all", () => {
   const items = buildItems([
-    { id: "a9", role: "assistant", blocks: [{ t: "text", text: "loooong", truncated: true }] },
+    { id: "a9", role: "assistant", blocks: [{ t: "text", text: "short" }] },
   ]);
-  __setNoExpand(true);
-  try {
-    const html = withVerbosity("verbose", () => itemsToHtml(items));
-    assert.doesNotMatch(html, /class="trunc"/); // no /history to expand into in the archive
-  } finally { __setNoExpand(false); }
+  const html = withVerbosity("verbose", () => itemsToHtml(items));
+  assert.doesNotMatch(html, /class="clipped"/);
 });
 
 test("render: bubbles, thinking, and tool cards carry data-uuid for scroll-to-hit", () => {

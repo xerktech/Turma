@@ -69,15 +69,18 @@ const MAX_WATCHERS = 16; // safety cap on concurrent live tails
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 
-// Rich-block caps for the live tail — mirror hub-agent.py BLOCK_CAPS_LIVE. The
-// live path ships these ~1s so it uses the tight LIVE caps; a block cut to its
-// cap is flagged truncated (the web UI fetches the fuller copy via /history,
-// which uses the looser FULL caps on the Python side).
-const BLOCK_TEXT_CHARS = Number(process.env.SESSION_BLOCK_TEXT_CHARS) || 4000;
-const BLOCK_TOOL_INPUT_CHARS = Number(process.env.SESSION_BLOCK_TOOL_INPUT_CHARS) || 1000;
-const BLOCK_TOOL_RESULT_CHARS = Number(process.env.SESSION_BLOCK_TOOL_RESULT_CHARS) || 2000;
+// Rich-block caps for the live tail — mirror hub-agent.py BLOCK_CAPS, which is
+// the SAME set the on-demand `history` read uses (XERK-347): the live path used
+// to clip to a quarter of what history returned, and the chat put a "Show more…"
+// button on every block cut that way. A frame is bounded by the ~128 KB
+// transcript window it is parsed from (TAIL_READ_BYTES), not by these numbers,
+// so the tighter live caps bought nothing but that button. A block cut to its
+// cap is still flagged truncated.
+const BLOCK_TEXT_CHARS = Number(process.env.SESSION_BLOCK_TEXT_CHARS) || 100000;
+const BLOCK_TOOL_INPUT_CHARS = Number(process.env.SESSION_BLOCK_TOOL_INPUT_CHARS) || 4000;
+const BLOCK_TOOL_RESULT_CHARS = Number(process.env.SESSION_BLOCK_TOOL_RESULT_CHARS) || 8000;
 const BLOCK_MAX_PER_ENTRY = Number(process.env.SESSION_BLOCK_MAX_PER_ENTRY) || 48;
-const BLOCK_CAPS_LIVE = {
+const BLOCK_CAPS = {
   text: BLOCK_TEXT_CHARS,
   input: BLOCK_TOOL_INPUT_CHARS,
   result: BLOCK_TOOL_RESULT_CHARS,
@@ -719,7 +722,7 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
     if (agentState) scanAgentEntry(entry, agentState);
     if (entry.type === "queue-operation") { foldQueueOp(entry, queued); continue; }
     const text = entryText(entry);
-    const blocks = entryBlocks(entry, BLOCK_CAPS_LIVE);
+    const blocks = entryBlocks(entry, BLOCK_CAPS);
     // Rich path widens inclusion: a tool_result-only turn (text === null) still
     // has renderable blocks, so keep it for the chat UI. text stays the
     // backward-compat flat string the glasses read.
@@ -1589,6 +1592,6 @@ if (require.main === module) {
   connectControl();
 } else {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport,
-    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE,
+    startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
     usableHostname, deviceName };
 }

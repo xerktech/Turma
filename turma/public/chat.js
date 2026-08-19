@@ -767,8 +767,9 @@
           items.push(openCmd);
         } else if (b.t === "command_output") {
           flush();
-          // resultId, not the card's id: the output is its OWN transcript entry,
-          // so that's the entry "Show more" has to re-fetch a fuller copy of.
+          // resultId, not the card's id: the output is its OWN transcript
+          // entry, so that is the entry a hit scrolls to, not the card it is
+          // drawn in.
           const result = {
             text: b.text || "", isError: !!b.isError, truncated: !!b.truncated, entryId: eid,
           };
@@ -842,18 +843,20 @@
   }
 
   // ---- rendering ------------------------------------------------------------
-  // Static (archived) renders have no /history to expand into — the stored
-  // transcript is already the fullest copy — so the "Show more…" affordance is
-  // suppressed there; the live view keeps it.
-  let noExpand = false;
-  function truncBtn(entryId, truncated) {
-    return (truncated && !noExpand) ? '<button class="trunc" data-eid="' + esc(entryId) + '">Show more…</button>' : "";
+  // A block the agent had to clip to its cap: a build log, a whole-file Read —
+  // never an ordinary message, whose cap is the operator's own input ceiling
+  // (agent BLOCK_CAPS). A static mark, never a control: the live tail and
+  // /history read at the SAME fidelity now (XERK-347), so there is no fuller
+  // copy to fetch and a "Show more…" button could only be a dead end. Don't put
+  // one back — that is the ticket.
+  function clipMark(truncated) {
+    return truncated ? '<span class="clipped">… clipped to fit</span>' : "";
   }
 
   function renderMsg(it) {
     const cls = it.role === "user" ? "user" : "assistant";
     return '<div class="tr-msg ' + cls + '" data-uuid="' + esc(it.id) + '"><span class="role">' + cls + "</span>" +
-      renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div>";
+      renderProse(it.text) + clipMark(it.truncated) + "</div>";
   }
 
   function renderThought(it) {
@@ -861,7 +864,7 @@
     const key = "th:" + it.id;
     return '<details class="thought" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' + openAttr(key, true) +
       "><summary>💭 Thought</summary>" +
-      '<div class="thought-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="thought-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
   }
 
   // ` open` when this card should be expanded: the user's explicit toggle wins,
@@ -920,7 +923,7 @@
     if (it.files) body += renderToolFiles(it.files, it.caption);
     if (it.input && !it.plan && !it.files) {
       body += '<div class="tool-block"><div class="tool-label">input</div><pre>' +
-        esc(it.input) + "</pre>" + truncBtn(it.entryId, it.inputTrunc) + "</div>";
+        esc(it.input) + "</pre>" + clipMark(it.inputTrunc) + "</div>";
     }
     // The reviewable payloads (agent _tool_use_detail): an Edit's actual old →
     // new change as a −/+ diff, a Write's file body, an ExitPlanMode plan as
@@ -939,12 +942,12 @@
     if (it.plan) {
       body += '<div class="tool-block"><div class="tool-label">plan</div>' +
         '<div class="tool-plan">' + renderProse(it.plan) + "</div>" +
-        truncBtn(it.entryId, it.inputTrunc) + "</div>";
+        clipMark(it.inputTrunc) + "</div>";
     }
     if (it.result) {
       body += '<div class="tool-block"><div class="tool-label">' + (it.result.isError ? "error" : "output") +
         '</div><pre class="tool-result">' + esc(it.result.text || "(no output)") + "</pre>" +
-        truncBtn(it.entryId, it.result.truncated) + "</div>";
+        clipMark(it.result.truncated) + "</div>";
     }
     if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
     const taskCls = it.task ? " task" : "";
@@ -969,12 +972,12 @@
       (it.args ? '<span class="cmd-args">' + esc(it.args.split("\n")[0]) + "</span>" : "");
     if (!it.result) {
       return '<div class="cmd-card" data-uuid="' + esc(it.id) + '">' + head +
-        truncBtn(it.id, it.argsTrunc) + "</div>";
+        clipMark(it.argsTrunc) + "</div>";
     }
     return '<details class="cmd-card' + (it.result.isError ? " err" : "") + '" data-dkey="' + esc(key) +
       '" data-uuid="' + esc(it.id) + '"' + openAttr(key, false) + "><summary>" + head + "</summary>" +
       '<div class="cmd-body"><pre>' + esc(it.result.text || "(no output)") + "</pre>" +
-      truncBtn(it.result.entryId || it.id, it.result.truncated) + "</div></details>";
+      clipMark(it.result.truncated) + "</div></details>";
   }
 
   // The summary Claude writes when the context is compacted. The transcript
@@ -985,7 +988,7 @@
     const key = "cmp:" + it.id;
     return '<details class="compact-card" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' +
       openAttr(key, false) + "><summary>↺ Context compacted — summary of the conversation so far</summary>" +
-      '<div class="compact-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="compact-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
   }
 
   // "[Request interrupted by user…]" as a centred, muted status marker — the
@@ -1023,7 +1026,7 @@
     const key = "away:" + it.id;
     return '<details class="away-card" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' +
       openAttr(key, false) + "><summary>☾ While you were away — recap</summary>" +
-      '<div class="away-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="away-body">' + renderProse(it.text) + clipMark(it.truncated) + "</div></details>";
   }
 
   function itemsToHtml(items) {
@@ -1904,22 +1907,6 @@
     }
   }
 
-  // ---- expand a truncated block via /history --------------------------------
-  let expandInFlight = false;
-  async function expandEntry(entryId) {
-    if (expandInFlight) return;
-    expandInFlight = true;
-    const myGen = gen;
-    try {
-      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/history");
-      if (myGen !== gen || !r.ok) return;
-      const j = await r.json();
-      if (myGen !== gen || !j || !Array.isArray(j.entries)) return;
-      buffer = mergeTail(buffer, j.entries); // looser caps -> the block grows
-      repaint();
-    } catch {} finally { expandInFlight = false; }
-  }
-
   // ---- file attachments (XERK-234) ------------------------------------------
   // Files the operator staged for the NEXT message. Each is uploaded to the hub
   // the moment it is picked — so Send is instant, and a file too big or a host
@@ -2217,16 +2204,12 @@
     }
   }
 
-  // Delegated clicks for expand-more buttons inside the scroll.
+  // Delegated clicks inside the scroll (code-block copy buttons).
   function wireScrollDelegation() {
     const scroll = $("chatScroll");
     if (!scroll || scroll.dataset.wired) return;
     scroll.dataset.wired = "1";
-    scroll.addEventListener("click", (e) => {
-      if (copyCodeClick(e)) return;
-      const b = e.target.closest && e.target.closest(".trunc[data-eid]");
-      if (b) { e.preventDefault(); expandEntry(b.getAttribute("data-eid")); }
-    });
+    scroll.addEventListener("click", copyCodeClick);
     // Follow the reader: parked at the bottom → keep auto-scrolling (and hide the
     // jump pill); scrolled up → stop pinning and reveal it. Scroll events are
     // coalesced to the settled position, so a programmatic scroll-to-bottom in
@@ -2303,7 +2286,6 @@
     stVerbHost = opts.verbHost || null;
     stTranscriptId = opts.transcriptId || null;
     stEntries = Array.isArray(opts.entries) ? opts.entries : [];
-    noExpand = true;  // no /history to expand into
     detailsOpen.clear();
     loadStaticVerbosity(stTranscriptId);
     renderStaticVerbosity();
@@ -2349,7 +2331,6 @@
     modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
-    noExpand = false;
     detailsOpen.clear();
     loadVerbosity(id);
     setHeader(s, a);
@@ -2468,7 +2449,6 @@
       __setQuestionActive: (v) => { questionActive = v; },
       __setPanePromptActive: (v) => { panePromptActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
-      __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },
       __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; },

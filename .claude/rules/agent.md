@@ -403,10 +403,16 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   survivors as `queued[]`. A window opening mid-sequence errs toward hiding; older agents send no
   `queued`. Tooling payloads ride the same queue, so **display filtering happens at REPORT time**
   (`_queued_display` / `queuedDisplay`), never at fold time, which desyncs the dequeues.
-- Blocks ride the live tail (tight caps), on-demand `history` and the archive push (both
-  `BLOCK_CAPS_FULL`) — the one place inclusion widens: a tool_result-only turn, dropped by
-  `_entry_text`, is kept when it has blocks. Only `transcript_tail` stays text-only.
-  Already-archived bytes are never re-parsed.
+- Blocks ride the live tail, on-demand `history` and the archive push at ONE fidelity —
+  `BLOCK_CAPS`, mirrored in `tunnel-agent.js` — the one place inclusion widens: a tool_result-only
+  turn, dropped by `_entry_text`, is kept when it has blocks. Only `transcript_tail` stays
+  text-only. Already-archived bytes are never re-parsed.
+  - **Never give the live path tighter caps again** (XERK-347): that split is what put a "Show
+    more…" button under every long message, and it bought nothing — a frame is bounded by the
+    ~128 KB window it is parsed from. Text caps at `INPUT_MAX_CHARS`: a message is shown WHOLE.
+  - `HISTORY_MAX_CHARS` bounds a `history` reply as a WHOLE (`_fit_history_budget`, oldest rows
+    first). The per-block caps bound a block, and the operator fold scans the entire transcript —
+    an oversized staged result is XERK-235's offline loop.
 - Tests: `TestEntryBlocks`, the tool-detail/marker cases in `tunnel-agent.test.js`.
 
 ## Archive sync

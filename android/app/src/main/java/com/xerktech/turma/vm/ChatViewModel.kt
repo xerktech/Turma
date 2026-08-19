@@ -14,7 +14,6 @@ import com.xerktech.turma.core.ModelSource
 import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
-import com.xerktech.turma.core.entryTruncated
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
 import com.xerktech.turma.core.tunnelOnlineOf
@@ -218,10 +217,6 @@ class ChatViewModel(
     private var fleetJob: Job? = null
     private var pollJob: Job? = null
     private var refreshJob: Job? = null
-    // Entry keys whose cap-truncated live-tail blocks already triggered a
-    // /history upgrade fetch — one fetch per entry, so a block still truncated
-    // at the FULL caps can't refetch forever.
-    private val upgradedKeys = HashSet<String>()
     private var dictation: Dictation? = null
     // Chip ids for staged attachments — a counter, not the Uri, so the same file
     // picked twice is two removable chips.
@@ -284,7 +279,6 @@ class ChatViewModel(
                         _state.update {
                             it.copy(entries = mergeTail(it.entries, ev.entries), liveTurn = "")
                         }
-                        maybeUpgradeTruncated(ev.entries)
                     }
                     is LiveEvent.Turn -> _state.update {
                         // Empty text = turn committed; the tail owns it now.
@@ -351,24 +345,6 @@ class ChatViewModel(
                 if (!_state.value.connected) refreshHistory()
             }
         }
-    }
-
-    /**
-     * The live tail clips blocks to the tight LIVE caps (4000-char text), so a
-     * long assistant message arrives flagged truncated. The web offers a manual
-     * "Show more…" that refetches /history (FULL caps); here the upgrade is
-     * automatic — once per entry key, so an entry still truncated at the FULL
-     * caps can't loop.
-     */
-    private fun maybeUpgradeTruncated(incoming: List<TailEntry>) {
-        val need = incoming.asSequence()
-            .filter { entryTruncated(it) }
-            .map { it.key }
-            .filter { it.isNotEmpty() && it !in upgradedKeys }
-            .toList()
-        if (need.isEmpty()) return
-        upgradedKeys.addAll(need)
-        refreshHistory()
     }
 
     /** Silent /history re-fetch + merge (no spinner, no 202 retry loop). */
