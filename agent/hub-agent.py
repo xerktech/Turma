@@ -1971,9 +1971,16 @@ def repo_forkable(repo_path, base_ref=None):
     and a blank one falls back exactly as default_base_ref does. A resolving
     HEAD alone is enough (that is what `--detach` with no ref takes), but it is
     NOT required — a repo whose local HEAD is unborn while origin/<default> sits
-    right there forks fine, and gating on HEAD alone refused it. Skipping the
-    fetch only ever under-counts refs a fetch would ADD, and naming a default
-    branch at all already needs origin/HEAD or a local main/master."""
+    right there forks fine, and gating on HEAD alone refused it.
+
+    Skipping the fetch only ever UNDER-counts (a fetch adds refs, never removes
+    them), so it never releases a session that then fails — the direction that
+    matters. It costs one shape: a DANGLING origin/HEAD names a default branch
+    whose ref is only on the remote, which reads unforkable here and which
+    resolve_base_ref's fetch would land. That is the whole gap (any other name
+    comes from a ref that is already local), and a session waiting on it pays
+    the deadline before its error card. Adding a fetch here is not the trade:
+    this runs per queued session per beat, on the loop the heartbeat is on."""
     base_ref = (base_ref or "").strip()
     if base_ref and base_ref != "HEAD":
         # A badly-NAMED base is a bad option, not an unready repo — hand it
@@ -2004,7 +2011,7 @@ def git_error_text(err, limit=300):
              if ln.strip() and not ln.lstrip().startswith("hint:")]
     text = _CONTROL_CHARS_RE.sub(" ", " ".join(lines)).strip()
     if limit is not None and limit >= 0 and len(text) > limit:
-        text = ("…" + text[-(limit - 1):]) if limit else ""
+        text = ("…" + text[-(limit - 1):]) if limit > 1 else text[:limit]
     return text or "no error output"
 
 
@@ -11688,8 +11695,7 @@ class SessionManager:
                 # .git entry: git clone creates that before it fetches an object,
                 # so a `.git`-only check released the session mid-clone and
                 # provisioned it into `fatal: invalid reference: HEAD` (XERK-343).
-                if not repo_forkable(sess["repoPath"],
-                                     sess.get("_pendingBaseRef")):
+                if not repo_forkable(sess["repoPath"]):
                     job = self.clones.get(sess["awaitClone"])
                     cloning = (job or {}).get("status") == "cloning"
                     if job and job.get("status") == "error":
@@ -11712,21 +11718,31 @@ class SessionManager:
                             sess, f"{sess['awaitClone']} still has no commit to "
                                   f"fork from — an unfinished clone, or a repo "
                                   f"with no commits yet")
-                    elif (not job and sess.get("awaitCloneOwner")
-                          and not sess.get("awaitCloneRetried")
-                          and not os.path.exists(sess["repoPath"])):
-                        # No job and nothing on disk: the clone was lost to a
-                        # manager restart before it wrote anything. Re-trigger it
-                        # from the owner we stored, ONCE.
-                        #
-                        # With the dir already there we WAIT instead. A clone
-                        # outlives the manager that launched it (it is its own
-                        # process), so the common restart-mid-clone case finishes
-                        # by itself — while `clone()` refuses a dest that exists,
-                        # which turned that survivable case into a failed session
-                        # and a bogus clone-error card every single beat.
-                        sess["awaitCloneRetried"] = True
-                        self.clone(sess["awaitCloneOwner"])
+                    elif not job and sess.get("awaitCloneOwner"):
+                        # No job: the clone was lost to a manager restart, which
+                        # took the `git clone` child with it — `entrypoint.sh`
+                        # execs hub-agent.py as the container's foreground
+                        # process, so nothing of ours survives that. Never write
+                        # this up as a clone that finishes by itself.
+                        if os.path.exists(sess["repoPath"]):
+                            # It got far enough to create the directory, and
+                            # `clone()` refuses a dest that exists — so nothing
+                            # here can retry. Say that in one beat rather than
+                            # spin the card out to the deadline, and name the
+                            # partial checkout, since removing it is the
+                            # operator's call and not one to take for them.
+                            self._set_error(
+                                sess, f"the clone of {sess['awaitClone']} was "
+                                      f"interrupted; {sess['repoPath']} is a "
+                                      f"partial checkout — remove it and start "
+                                      f"the session again")
+                        elif not sess.get("awaitCloneRetried"):
+                            # Nothing on disk, so a re-clone can land. ONCE: a
+                            # refusal `clone()` files under slugify(spec) is
+                            # invisible to the job lookup above, and retrying it
+                            # every beat papers the UI with clone-error cards.
+                            sess["awaitCloneRetried"] = True
+                            self.clone(sess["awaitCloneOwner"])
                     continue
             self._provision_session(sess)
             return  # one per beat

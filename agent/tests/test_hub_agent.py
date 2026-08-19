@@ -11112,6 +11112,11 @@ class TestGitErrorText(unittest.TestCase):
         self.assertNotIn("\x07", out)
         self.assertIn("fatal:", out)
 
+    def test_a_tiny_limit_never_returns_more_than_it_was_given(self):
+        for limit in (0, 1, 2, 3):
+            out = ha.git_error_text("fatal: a much longer message", limit=limit)
+            self.assertLessEqual(len(out), max(limit, len("no error output")))
+
     def test_it_is_never_empty(self):
         self.assertEqual(ha.git_error_text(""), "no error output")
         self.assertEqual(ha.git_error_text(None), "no error output")
@@ -11173,10 +11178,57 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
         sm._drain_queue()
         self.assertEqual(sess["status"], "running")
         self.assertEqual(len(self._worktree_adds()), 1)
-        # Every queue marker is shed, the internal stamps included.
+        # Every queue marker is shed, the internal stamps included. Set the
+        # ones a plain composer spawn doesn't, so the assertion isn't vacuous.
         for k in ("awaitClone", "awaitCloneOwner", "awaitCloneSince",
                   "awaitCloneRetried", "queuedReason", "queuedAt"):
             self.assertNotIn(k, sess)
+
+    def test_every_queue_marker_is_shed_when_a_session_starts(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess.update(awaitCloneOwner="x/gdt-files", awaitCloneRetried=True)
+        self.head_ready = True
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        for k in ("awaitClone", "awaitCloneOwner", "awaitCloneSince",
+                  "awaitCloneRetried", "queuedReason", "queuedAt"):
+            self.assertNotIn(k, sess)
+
+    def test_the_drain_asks_forkable_not_just_head_ready(self):
+        # The drain half of the same fix as the spawn gate: a repo whose local
+        # HEAD is unborn over a live origin/<default> is forkable, and holding
+        # it there would spin the card out to the deadline for nothing.
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        with mock.patch.object(ha, "repo_forkable", lambda *a, **kw: True), \
+             mock.patch.object(ha, "resolve_base_ref",
+                               lambda path, base: "origin/main"):
+            sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+
+    def test_an_interrupted_clone_says_so_at_once(self):
+        # A clone does NOT outlive its manager — entrypoint.sh execs
+        # hub-agent.py as the container's foreground process — and `clone()`
+        # refuses a dest that exists, so nothing here can retry. One beat, not
+        # the deadline, and the message names the partial checkout.
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files",
+                    awaitCloneOwner="xerktech/gdt-files",
+                    awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("partial checkout", sess["errorMsg"])
+        self.assertIn(self.repo["path"], sess["errorMsg"])
+        sm.clone.assert_not_called()
 
     def test_an_unforkable_repo_with_no_clone_of_ours_is_not_called_cloning(self):
         # An empty repo, or a clone run by hand outside Turma: nothing here will
@@ -11232,26 +11284,6 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
         for _ in range(3):
             sm._drain_queue()
         self.assertEqual(sess["status"], "error")
-
-    def test_a_clone_that_outlived_a_restart_is_waited_on_not_re_triggered(self):
-        # A clone is its own process, so it survives the manager that launched
-        # it and finishes by itself. `clone()` refuses a dest that exists, so
-        # re-triggering turned that survivable case into a failed session.
-        sm = self._manager(cloning=False)
-        sm.clone = mock.Mock()
-        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
-        sess = sm.registry[0]
-        sess.update(status="queued", queuedReason="awaiting-clone",
-                    awaitClone="gdt-files",
-                    awaitCloneOwner="xerktech/gdt-files",
-                    awaitCloneSince=time.time())
-        sm._drain_queue()
-        sm.clone.assert_not_called()          # the dir is on disk — just wait
-        self.assertEqual(sess["status"], "queued")
-        # And it starts the moment the surviving clone lands the refs.
-        self.head_ready = True
-        sm._drain_queue()
-        self.assertEqual(sess["status"], "running")
 
     def test_a_lost_clone_with_nothing_on_disk_is_re_triggered_once(self):
         sm = self._manager(cloning=False)
@@ -18235,6 +18267,28 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
 
     def _launches(self):
         return [c for c in self.run_ok_calls if c and c[0] == "tmux" and "new-session" in c]
+
+    def test_a_mid_clone_repo_defers_the_branch_reservation(self):
+        # Reserving needs a `git fetch` and a ref scan, and a repo whose clone
+        # is still writing it has neither to give — _provision_session reserves
+        # against the repo that then exists (XERK-343).
+        sm = self.make_ticket_manager()
+        sm.clones["Turma"] = {"name": "Turma", "status": "cloning"}
+        sm._reserve_ticket_branch = mock.Mock(return_value="PROJ-7")
+        self.head_ready = False
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")
+        sm._reserve_ticket_branch.assert_not_called()
+        self.assertIsNone(sess["ticket"]["branch"])
+        # And it reserves once the repo can answer.
+        self.head_ready = True
+        sm.clones["Turma"]["status"] = "done"
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        sm._reserve_ticket_branch.assert_called_once()
+        self.assertEqual(sess["ticket"]["branch"], "PROJ-7")
 
     def test_spawns_with_the_ticket_and_a_reserved_branch(self):
         sm = self.make_ticket_manager()

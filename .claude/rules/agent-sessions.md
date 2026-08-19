@@ -83,9 +83,16 @@ process model and the command table.
     job is live (`_poll_clones` bounds that one). `clone()` files a refusal under `slugify(spec)`,
     so a 3-segment GitLab/ADO spec lands under a key the job lookup can't see — behind an `elif`
     that retried every beat and `awaitCloneSince` never bounded anything.
-  - **A clone dir already on disk is waited on, never re-triggered.** A clone outlives the manager
-    that launched it, so the restart-mid-clone case finishes by itself; `clone()` refuses an
-    existing dest, which turned it into a failed session plus a bogus clone-error card per beat.
+  - **A clone does NOT outlive its manager**: `entrypoint.sh` execs `hub-agent.py` as the
+    container's foreground process, so a manager restart takes the `git clone` child with it. A
+    restart mid-clone leaves a PARTIAL checkout that `clone()` refuses as an existing dest — nothing
+    can retry it — so that session errors in ONE beat naming the dir, rather than spinning out the
+    deadline. Removing that dir is the operator's call; don't have the agent take it. The re-clone
+    is for the case with nothing on disk, and runs once (`awaitCloneRetried`).
+  - `repo_forkable` skips the fetch, so it only ever UNDER-counts — it never releases a session that
+    then fails. The one shape it misses is a DANGLING `origin/HEAD` (the default branch's ref is
+    only on the remote), which costs that session the deadline. Adding a fetch is not the trade: it
+    would run per queued session per beat, on the loop the heartbeat is on.
 - **`scan_repos()` deliberately still lists a repo mid-clone**: the check costs a `git` per repo per
   beat and the gates above already cover it. Don't move it there.
 - Tests: `TestSessionLifecycle`, `TestSpawnTicket`, `TestSpawnDuringAnUnfinishedClone`,
