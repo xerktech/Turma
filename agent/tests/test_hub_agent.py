@@ -7695,6 +7695,18 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
         self.assertIsNone(ha._session_inbox(None))
         self.assertIsNone(ha._session_inbox(""))
 
+    def test_an_unpinned_session_does_not_match_a_null_id_record(self):
+        # The early return is what enforces "pinned id or nothing": without it
+        # the comparison is `None == None`, so a planted record carrying a null
+        # sessionId becomes the inbox of every session that has no pinned one.
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "4242.json"), "w") as f:
+            json.dump({"pid": 4242, "sessionId": None, "startedAt": 1,
+                       "messagingSocketPath":
+                       os.path.join(self._sock_dir(), "4242.sock")}, f)
+        self.assertIsNone(ha._session_inbox(None))
+        self.assertIsNone(ha._session_inbox(""))
+
     def test_newest_start_wins_when_two_records_share_the_id(self):
         # A RESUMED session keeps its session id, so a record a killed claude
         # left behind carries the same one as the live process that replaced it.
@@ -7847,12 +7859,15 @@ class TestReadUntrustedJson(unittest.TestCase):
         self.assertEqual(ha._read_untrusted_json(self._path(), 1000), {"a": 1})
 
     def test_a_file_past_the_cap_is_not_parsed_at_all(self):
-        # Never a truncated PREFIX: a key past the ceiling would read as absent,
-        # which for a settings file is a silent "no opinion" the caller acts on.
+        # The fixture is a COMPLETE object followed by padding, so the truncated
+        # prefix is valid JSON that parses to something different. A fixture
+        # whose prefix is merely malformed proves nothing: both a capped read and
+        # an uncapped one would fail it, and the guard could be deleted unseen.
         with open(self._path(), "w") as f:
-            json.dump({"a": "x" * 500}, f)
+            f.write(json.dumps({"crossSessionInbound": "accept"}) + " " * 5000)
         self.assertIsNone(ha._read_untrusted_json(self._path(), 100))
-        self.assertIsNotNone(ha._read_untrusted_json(self._path(), 1 << 20))
+        self.assertEqual(ha._read_untrusted_json(self._path(), 1 << 20),
+                         {"crossSessionInbound": "accept"})
 
     def test_a_json_scalar_or_list_is_not_an_object(self):
         for blob in ("[1,2]", '"str"', "7", "null"):
@@ -7927,6 +7942,17 @@ class TestInboxOptedOut(unittest.TestCase):
         # It is there and it won't say what it wants; the pane always works.
         self._write("settings.local.json", "{not json")
         self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_settings_file_larger_than_a_registry_record_is_still_read(self):
+        # Settings have a ceiling of their own; reusing the registry's 64 KiB
+        # would make an ordinary padded settings file unreadable, and unreadable
+        # opts out — a repo silently losing the inbox for its file's size.
+        self.assertGreater(ha.SETTINGS_READ_MAX_BYTES,
+                           ha.SESSIONS_REGISTRY_MAX_BYTES)
+        self._write("settings.json",
+                    json.dumps({"pad": "x" * (ha.SESSIONS_REGISTRY_MAX_BYTES * 2),
+                                "crossSessionInbound": "accept"}))
+        self.assertFalse(ha._inbox_opted_out(self.tmp))
 
     def test_an_oversize_settings_file_opts_out(self):
         # Not silently skipped: a key sitting past the read cap would otherwise

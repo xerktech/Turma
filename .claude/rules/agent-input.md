@@ -102,10 +102,11 @@ session's inbox carries what this MANAGER composed.**
   - **ANY of the files asking for something other than `accept` opts out — this is NOT a precedence
     calculation.** Measured against Claude Code, a project `refuse` is *not* undone by a local
     `accept`, so "highest-precedence definition wins" posts into a session that drops the message.
-    A file that exists but will not parse opts out too — including one past
-    `SETTINGS_READ_MAX_BYTES` (never parsed as a truncated prefix, or a key past the ceiling would
-    read as "said nothing") and one that is a SYMLINK, which real Claude Code follows and
-    `O_NOFOLLOW` does not. Erring this way costs only the pane, which has always worked.
+    A file that exists but cannot be read opts out too: one past `SETTINGS_READ_MAX_BYTES` (never
+    parsed as a truncated PREFIX — a complete object followed by padding would otherwise parse to
+    something else entirely), and one that is a SYMLINK, which real Claude Code follows and
+    `O_NOFOLLOW` refuses to open, so the two disagree in the safe direction. Erring this way costs
+    only the pane, which has always worked.
   - Claude Code reads these at LAUNCH and this reads them at post time, so a repo that changes the
     value mid-session disagrees with its own running claude until it restarts.
 - Anything else — no inbox bound, an older claude, a dead socket, a listener that isn't the
