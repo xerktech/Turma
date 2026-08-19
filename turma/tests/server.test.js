@@ -8652,6 +8652,35 @@ test("migrate: an ORG-LESS fleet can still move sessions", async () => {
   if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
 });
 
+test("migrate: matches on the CLAIMED org, so the clients can mirror it", async () => {
+  // No client can mirror a rule keyed on `orgBound` — it is stripped from the
+  // served payload, so `eligibleMoveTargets` and its Android/glasses twins can
+  // only reason about `jira.siteKey`. A host BOUND to an org but declaring none
+  // this beat is where the two predicates diverge, and comparing bindings made
+  // the hub allow a move no Move menu would ever offer (and refuse ones they did).
+  await migHost("mQuietA", "q1.atlassian.net");
+  await migHost("mQuietB", "q1.atlassian.net");
+  await migHost("mQuietB", null);          // still bound to q1, declaring nothing
+  const toQuiet = await migrate("mQuietA", "s1", { host: "mQuietB" });
+  assert.equal(toQuiet.status, 409, JSON.stringify(toQuiet.body));
+  // The client predicate, applied to what the client is actually served, agrees.
+  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents;
+  const keyOf = (d) => {
+    const a = served.find((x) => x.device === d) || {};
+    const v = a.jira && a.jira.siteKey;
+    return typeof v === "string" ? v : "";
+  };
+  assert.notEqual(keyOf("mQuietA"), keyOf("mQuietB"));   // the UI hides it too
+  // And the org-less pair the clients DO offer is allowed, so agreement holds
+  // in both directions.
+  await migHost("mQuietC", null);
+  const bothQuiet = await migrate("mQuietC", "s1", { host: "mQuietB" });
+  assert.notEqual(bothQuiet.status, 409, JSON.stringify(bothQuiet.body));
+  assert.equal(keyOf("mQuietC"), keyOf("mQuietB"));
+  if (bothQuiet.body && bothQuiet.body.migrationId)
+    migrations.delete(bothQuiet.body.migrationId);
+});
+
 test("migrate: refuses a host whose declared org isn't the one it is bound to", async () => {
   // Asserted against the ROUTE, not a predicate copied into this file: the
   // previous version of this test passed with the route reverted to comparing
@@ -11835,16 +11864,28 @@ test("a host is served on the org it is BOUND to, never the one it claims", () =
   // summaries — which no agent credential can reach otherwise (/api/agents
   // refuses one). Same objection XERK-268 makes to a self-asserted <host>.
   peerHost("alpha", "acme.atlassian.net", [peerSession("secret")]);
-  peerHost("rogue", "acme.atlassian.net", [peerSession("mine")],
-           0, "rival.atlassian.net");           // bound elsewhere, claiming acme
+  peerHost("alpha2", "acme.atlassian.net", [peerSession("secret2")]);
+  // The rogue must be bound to an org that HAS another member. With a
+  // lone-member binding, BOTH guards in orgPeers are dead code in the fixture:
+  // deleting either left the whole suite green while a drifting host kept its
+  // real org's roster and was served back to its org-mates.
+  peerHost("rmate", "rival.atlassian.net", [peerSession("rivalmate")]);
+  peerHost("rogue", "rival.atlassian.net", [peerSession("mine")]);
+  agents.rogue.jira.siteKey = "acme.atlassian.net";   // bound rival, claiming acme
   try {
     const ids = orgPeers("rogue").map((p) => p.id);
-    assert.deepEqual(ids, ["mine"]);            // its own sessions and nothing else
+    // Not acme's roster (the org it claims)...
     assert.equal(ids.includes("secret"), false);
-    // ...and it is excluded from the roster of the org it is impersonating.
-    assert.deepEqual(orgPeers("alpha").map((p) => p.id), ["secret"]);
+    assert.equal(ids.includes("secret2"), false);
+    // ...and not rival's either (the org it is bound to): a host lying about its
+    // org is quarantined from BOTH while it says so.
+    assert.equal(ids.includes("rivalmate"), false);
+    assert.deepEqual(ids, ["mine"]);
+    // And it is absent from the impersonated org's roster AND its own mate's.
+    assert.deepEqual(orgPeers("alpha").map((p) => p.id).sort(), ["secret", "secret2"]);
+    assert.deepEqual(orgPeers("rmate").map((p) => p.id), ["rivalmate"]);
   } finally {
-    dropPeerHosts("alpha", "rogue");
+    dropPeerHosts("alpha", "alpha2", "rmate", "rogue");
   }
 });
 
@@ -11960,38 +12001,45 @@ test("a non-string siteKey is no org at all, not a permanent drift", () => {
   assert.equal(orgDrifted(a), false);
 });
 
-test("the drift warning is one line per episode, and bounded in size", () => {
-  // Value-keyed de-duping let a host alternating two keys warn every beat, and
-  // the declared key was interpolated uncapped — a 100 KB siteKey wrote a 100 KB
-  // log line, from any single agent token.
+test("the drift warning is rate-limited per host, and capped on both sides", () => {
+  // Keying the de-dupe on the declared VALUE let a host alternating two site
+  // keys warn every beat; keying it on a drifted/not-drifted FLAG was no better,
+  // because the flag flips just as easily — whether the host alternates two orgs
+  // or alternates one org with silence. Both measured ~10 warns per 20 beats.
+  // Only a time bound holds, and the interpolated keys need capping on both
+  // sides: they are agent-supplied and uncapped upstream, and a 100 KB siteKey
+  // wrote a 100 KB log line from a single agent token.
   const lines = [];
   const realWarn = console.warn;
   console.warn = (m) => lines.push(String(m));
   peerHost("flip", "a".repeat(100000), [peerSession("s1")], 0, "bound.example");
   try {
-    warnOrgDrift("flip", agents.flip);
-    agents.flip.jira.siteKey = "b".repeat(100000);
-    warnOrgDrift("flip", agents.flip);        // a different claim, same episode
-    agents.flip.jira.siteKey = "a".repeat(100000);
-    warnOrgDrift("flip", agents.flip);
-    assert.equal(lines.length, 1, "one warning per drift episode");
+    for (let i = 0; i < 20; i++) {
+      if (i % 3 === 0) agents.flip.jira.siteKey = "a".repeat(100000);
+      else if (i % 3 === 1) delete agents.flip.jira.siteKey;   // silence
+      else agents.flip.jira.siteKey = "bound.example";          // its real org
+      warnOrgDrift("flip", agents.flip);
+    }
+    assert.equal(lines.length, 1, `warned ${lines.length} times in 20 beats`);
     assert.ok(lines[0].length < 500, `log line was ${lines[0].length} chars`);
-    // BOTH sides are interpolated, so both need the cap. Only the claimed side
-    // was covered, and deleting the bound-side slice escaped the suite.
+
+    // BOTH interpolated sides need the cap. Only the claimed side was covered,
+    // and deleting the bound-side slice escaped the suite.
     lines.length = 0;
-    orgDriftWarned.delete("flip");
+    orgDriftWarned.delete("flip");            // clear the rate limit, not the drift
     agents.flip.orgBound = "b".repeat(100000);
     agents.flip.jira.siteKey = "short";
     warnOrgDrift("flip", agents.flip);
     assert.equal(lines.length, 1);
     assert.ok(lines[0].length < 500, `bound-side line was ${lines[0].length} chars`);
+
+    // A host that is NOT drifting never warns, however often it beats.
+    lines.length = 0;
+    orgDriftWarned.delete("flip");
     agents.flip.orgBound = "bound.example";
-    // Recovering and drifting again is a NEW episode and warns once more.
     agents.flip.jira.siteKey = "bound.example";
-    warnOrgDrift("flip", agents.flip);
-    agents.flip.jira.siteKey = "c".repeat(10);
-    warnOrgDrift("flip", agents.flip);
-    assert.equal(lines.length, 2);
+    for (let i = 0; i < 5; i++) warnOrgDrift("flip", agents.flip);
+    assert.equal(lines.length, 0);
   } finally {
     console.warn = realWarn;
     dropPeerHosts("flip");
@@ -11999,26 +12047,3 @@ test("the drift warning is one line per episode, and bounded in size", () => {
   }
 });
 
-test("a migration checks the BOUND org, like the roster does", () => {
-  // This route relays raw transcript bytes, so trusting a self-asserted siteKey
-  // here hands them to a host the hub already decided is lying about its org —
-  // a strictly larger disclosure than the roster's.
-  peerHost("srcA", "acme.atlassian.net", [peerSession("s1")]);
-  peerHost("rogue", "acme.atlassian.net", [peerSession("r1")],
-           0, "rival.atlassian.net");
-  peerHost("unbound", "acme.atlassian.net", [peerSession("u1")], 0, null);
-  try {
-    assert.equal(orgDrifted(agents.rogue), true);
-    // The predicate the route now uses, asserted directly: a drifted or unbound
-    // host matches nobody, in either direction.
-    const ok = (a, b) =>
-      !!boundOrgOf(a) && !orgDrifted(a) && !orgDrifted(b) &&
-      boundOrgOf(a) === boundOrgOf(b);
-    assert.equal(ok(agents.srcA, agents.rogue), false);
-    assert.equal(ok(agents.srcA, agents.unbound), false);
-    assert.equal(ok(agents.unbound, agents.srcA), false);
-    assert.equal(ok(agents.srcA, agents.srcA), true);
-  } finally {
-    dropPeerHosts("srcA", "rogue", "unbound");
-  }
-});

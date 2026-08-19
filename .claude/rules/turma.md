@@ -110,11 +110,24 @@ hub half.
   drift locked it out of its roster AND out of migration on that beat — an outage caused by the
   boundary rather than prevented by it, and the real migrate tests beat exactly that shape. The
   attack still trips it: joining another org means naming that org.
-- **The migrate route uses the same predicate**, since it relays a session's raw transcript bytes.
-  Two ORG-LESS hosts still match there, as they did when it compared `siteKeyOf`: clients cannot
-  mirror a rule keyed on `orgBound` (it is stripped from what they are served), so refusing them
-  only makes the Move menu offer hosts the hub then refuses. Pin it with a request against the
-  ROUTE — a test asserting a predicate copied into the test file passes with the route reverted.
+- **The migrate route refuses a DRIFTED host on either side but MATCHES on the claimed org.** It
+  relays raw transcript bytes, so the drift refusal belongs there; the match must stay on
+  `siteKeyOf` because **no client can mirror a rule keyed on `orgBound`** — it is stripped from the
+  served payload, so `eligibleMoveTargets` (`sessions.html`), its Android twin (`core/Sessions.kt`)
+  and the glasses fork see only `jira.siteKey`. Matching on the binding is not a tightening either:
+  a host that is not drifting claims its bound org or claims nothing, so every pair the drift check
+  lets through gets the same answer from both. It measurably broke the UI in BOTH directions —
+  menus offering hosts the hub then 409s, and a legal target no menu would show.
+  - **Known gap: a DRIFTED host still diverges** — the menus offer it, the hub refuses with its own
+    message. Closing it means serving the decided org (a derived field the clients read), which is a
+    three-mirror parity change and its own ticket.
+  - Pin it with a request against the ROUTE. A test asserting a predicate copied into the test file
+    passes with the route reverted — that happened here twice, and the copy then went stale against
+    the rule it claimed to document.
+- **There are THREE client mirrors of "an agent's org", not one**: `turma/public/org.js`'s
+  `siteKeyOf`, `sessions.html`'s own `siteKeyOfAgent` (the one the Move menu actually uses), and
+  Android's. Only the first mirrors the hub's coercion today; the server-side `normalizeJira` is
+  what makes that safe rather than the client guards.
 - **`boundOrgOf` and `siteKeyOf` both coerce to string.** `orgBound` is PERSISTED, so an uncoerced
   one returns on restore and threw the heartbeat handler — 400 on every beat from that host,
   forever, recovery path included. `normalizeJira` drops a non-string `siteKey` for the client-side
@@ -124,8 +137,14 @@ hub half.
   slicing to `PEERS_MAX_ROWS` OOM-killed a 256 MiB hub while the pre-roster hub served the same load.
   Every cell is capped at `PEER_CELL_MAX` too — `rcName` is bounded by nothing else, and the spawn
   route accepts a 100k `label` that the agent slugs into it.
-- `warnOrgDrift` de-dupes on WHETHER a host is drifting, not on the value: keying on the value let a
-  host alternating two site keys warn every beat. Both interpolated keys are capped.
+- `warnOrgDrift` is rate-limited per host **by time** (`ORG_DRIFT_WARN_EVERY_MS`). Keying the
+  de-dupe on the declared value let a host alternating two site keys warn every beat, and keying it
+  on a drifted/not-drifted flag was no better — the flag flips just as easily, whether the host
+  alternates two orgs or alternates one org with silence (~10 warns per 20 beats, measured both
+  ways). Both interpolated keys are capped at `ORG_KEY_LOG_MAX`.
+- **Drift quarantine is self-healing and the warning says so**: the binding never moves, so a beat
+  that declares the bound org again is served normally. Don't reword it back into "remove the host"
+  as the only recovery.
 - Tests: the `orgPeers`/`orgDrifted`/`migrate:` cases in `server.test.js`, `org.test.js`.
 
 ## Dashboard (`index.html`)

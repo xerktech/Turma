@@ -238,8 +238,12 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     hub-owned, assigned AFTER the payload spread like `tokenBound`, persisted with the record, and
     reset only by `DELETE /api/agents/<host>`.
   - **Drift is declaring a DIFFERENT org, never failing to declare one**, and the MIGRATION route
-    shares the predicate — it relays raw transcript bytes, the larger disclosure of the two.
-    Mechanics, and the coercions the binding needs, are in `.claude/rules/turma.md`.
+    refuses a drifted host on either side — it relays raw transcript bytes, the larger disclosure of
+    the two. But it MATCHES on the claimed org, because **no client can mirror a rule keyed on
+    `orgBound`**: it is stripped from the served payload, so `eligibleMoveTargets` and its Android
+    and glasses twins see only `jira.siteKey`. Keying the match on the binding made the hub and every
+    Move menu disagree in both directions. Mechanics and the coercions are in
+    `.claude/rules/turma.md`.
   - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one.
     Nothing bounds `rcName` in the normalizers and the spawn route takes a 100k `label`, so
     capping one field of six built a 23.8 MB reply that OOM-killed a hub in a real 256 MiB cgroup.

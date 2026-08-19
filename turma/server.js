@@ -1751,26 +1751,31 @@ function boundOrgOf(a) {
 // Warned once per host per drift, so a permanently misconfigured host does not
 // bury the log — but the operator has to be able to SEE this: from the host's
 // own side a drift is indistinguishable from "my org has no other hosts up".
-// De-duped on WHETHER the host is drifting, not on the value it declared: a host
-// alternating two site keys defeats a value-keyed check and warns every beat
-// (~10,800 lines a day at an 8s interval). The declared key is also interpolated
-// under a cap — it is agent-supplied and uncapped upstream, and a 100 KB siteKey
-// wrote a 100 KB log line. One warn per drift episode, bounded in size.
+// Rate-limited per host by TIME, which is the only bound that holds. Keying on
+// the declared value let a host alternating two site keys warn every beat, and
+// keying on a drifted/not-drifted flag was no better: the flag flips just as
+// easily as the value, whether the host alternates two orgs or alternates one
+// org with silence. Both were measured at ~10 warns per 20 beats. Interpolated
+// keys are capped on BOTH sides — they are agent-supplied and uncapped upstream,
+// and a 100 KB siteKey wrote a 100 KB log line.
 const orgDriftWarned = new Map();
 const ORG_KEY_LOG_MAX = 80;
+const ORG_DRIFT_WARN_EVERY_MS = 10 * 60 * 1000;
 function warnOrgDrift(key, a) {
-  const drifted = orgDrifted(a);
-  if (drifted && !orgDriftWarned.get(key)) {
-    const claimed = siteKeyOf(a).slice(0, ORG_KEY_LOG_MAX);
-    console.warn(
-      `heartbeat from ${logName(key)}: declares org ${JSON.stringify(claimed)} ` +
-        `but is bound to ${JSON.stringify(boundOrgOf(a).slice(0, ORG_KEY_LOG_MAX))} ` +
-        `— serving it no peers beyond its own sessions, and no migrations. If ` +
-        `this host really moved org, remove it (DELETE /api/agents/<host>) and ` +
-        `let it re-register.`
-    );
-  }
-  orgDriftWarned.set(key, drifted);
+  if (!orgDrifted(a)) return;
+  const now = Date.now();
+  const last = orgDriftWarned.get(key) || 0;
+  if (now - last < ORG_DRIFT_WARN_EVERY_MS) return;
+  orgDriftWarned.set(key, now);
+  const claimed = siteKeyOf(a).slice(0, ORG_KEY_LOG_MAX);
+  console.warn(
+    `heartbeat from ${logName(key)}: declares org ${JSON.stringify(claimed)} ` +
+      `but is bound to ${JSON.stringify(boundOrgOf(a).slice(0, ORG_KEY_LOG_MAX))} ` +
+      `— serving it no peers beyond its own sessions while it says so. The ` +
+      `binding does not move; a beat that declares the bound org again is served ` +
+      `normally. If this host really moved org, remove it ` +
+      `(DELETE /api/agents/<host>) and let it re-register.`
+  );
 }
 
 // A host declaring a different org than the one it is bound to. Either it was
@@ -7877,17 +7882,24 @@ const server = http.createServer(async (req, res) => {
         // has already decided is lying about its org — a strictly larger
         // disclosure than the roster's.
         //
-        // Two ORG-LESS hosts still match, exactly as they did when this compared
-        // `siteKeyOf`: a fleet with no tracker configured has always been able to
-        // move sessions, and refusing it is a regression rather than a tightening
-        // — the clients cannot even mirror such a rule, since `orgBound` is
-        // stripped from the served payload, so their Move menus would keep
-        // offering a host the hub then refuses.
+        // The MATCH compares the CLAIMED org, as it always has, and the binding
+        // is used only to refuse a host that is lying about it. That is not a
+        // weakening: a host that is not drifting either claims its bound org or
+        // claims nothing, so for any pair this pass allows, comparing claims and
+        // comparing bindings give the same answer.
+        //
+        // It has to be the claimed org because **no client can mirror a rule
+        // keyed on `orgBound`** — it is stripped from the served payload, so
+        // `eligibleMoveTargets` (and its Android and glasses twins) can only
+        // reason about `jira.siteKey`. Comparing bindings here made the hub and
+        // every Move menu disagree in BOTH directions: menus offering a host the
+        // hub then 409s, and a legal target no menu would ever show. Only a
+        // DRIFTED host still diverges, which is the narrow residual below.
         if (orgDrifted(src) || orgDrifted(tgt))
           return json(res, 409, {
             error: "that agent's declared org doesn't match the one it is bound to",
           });
-        if (boundOrgOf(src) !== boundOrgOf(tgt))
+        if (siteKeyOf(src) !== siteKeyOf(tgt))
           return json(res, 409, { error: "the target agent is in a different org" });
         if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
           return json(res, 503, { error: "the target agent is offline" });
