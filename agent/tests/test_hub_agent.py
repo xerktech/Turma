@@ -7755,7 +7755,11 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
                     # Canonical in shape, past AF_UNIX's 108-byte path limit.
                     "/" + "a" * 100 + "/cc-socks/7.sock",
                     # Only canonical after traversing out of the real dir.
-                    "/run/user/1000/cc-socks/../../../../tmp/evil/cc-socks/7.sock"):
+                    "/run/user/1000/cc-socks/../../../../tmp/evil/cc-socks/7.sock",
+                    # `cc-socks` as a SUBSTRING of a name the sender chose: the
+                    # parent must be that directory, not merely mention it.
+                    "/tmp/xcc-socksy/7.sock",
+                    "/tmp/notcc-socks/7.sock"):
             with self.subTest(bad=bad):
                 shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
                 self._register(7, self.SID, sock=bad)
@@ -7805,10 +7809,14 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
 
     def test_an_oversize_record_is_not_read_whole(self):
         os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
-        # Valid JSON, but past the cap — the truncated read cannot parse, so the
-        # record is skipped rather than pulled into memory in full.
+        # Padded past the REGISTRY's cap but well under the settings one, so
+        # this fails only while the registry keeps a ceiling of its own: a
+        # record is a few hundred bytes, and reading a megabyte of whatever a
+        # planted one holds is the thing the cap is for.
+        self.assertLess(ha.SESSIONS_REGISTRY_MAX_BYTES, ha.SETTINGS_READ_MAX_BYTES)
         with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "7.json"), "w") as f:
-            json.dump({"pid": 7, "sessionId": self.SID, "pad": "x" * (2 << 20),
+            json.dump({"pid": 7, "sessionId": self.SID,
+                       "pad": "x" * (ha.SESSIONS_REGISTRY_MAX_BYTES * 2),
                        "messagingSocketPath":
                        os.path.join(self._sock_dir(), "7.sock")}, f)
         self.assertIsNone(ha._session_inbox(self.SID))
@@ -7973,6 +7981,14 @@ class TestInboxOptedOut(unittest.TestCase):
         t.join(10)
         self.assertFalse(t.is_alive(), "_inbox_opted_out blocked on a FIFO")
         self.assertTrue(done[0])            # unreadable -> pane
+
+    def test_a_dangling_settings_symlink_still_opts_out(self):
+        # `os.path.exists` is False for a broken link, which would read as "no
+        # settings here" — but something IS there and we cannot tell what it
+        # wants, so it takes the pane like any other unreadable file.
+        os.symlink(os.path.join(self.tmp, "gone.json"),
+                   os.path.join(self.tmp, ".claude", "settings.json"))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
 
     def test_a_symlinked_settings_file_is_not_followed(self):
         real = os.path.join(self.tmp, "elsewhere.json")
