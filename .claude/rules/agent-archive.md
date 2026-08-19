@@ -52,9 +52,15 @@ layer's read-back routes — is in `.claude/rules/turma-archive.md`.
     Floored at the default instead, the fallback after a 413 landed on a number the hub still
     refused, so the same delta went up every pass forever. `ARCHIVE_BODY_MIN` exists only to reject a
     value no hub could mean — under it a delta cannot carry one ordinary turn.
-  - **A 4xx skips that TRANSCRIPT; only a transport failure ends the pass.** Conflated, one
-    unpushable transcript starved every other transcript on the host, every beat — the same line the
+  - **A failed push costs that TRANSCRIPT, not the pass.** A 4xx is permanent for that chunk and is
+    skipped outright; anything else (a 5xx, a dead socket) also leaves that transcript but spends
+    one of `ARCHIVE_FAILURES_MAX`, so a hub that is genuinely down still ends the pass. Conflated,
+    one unpushable transcript starved every other transcript on the host, every beat — a 500 from a
+    chunk the store cannot accept answers the same way however often it goes back up. Same line the
     raw layer already draws.
+  - `TURMA_ARCHIVE_BODY_MAX` may only LOWER the default. Past the hub's cap plus its drain slack the
+    socket is destroyed with no status, so neither the 413 fallback nor the skip can fire and the
+    agent sees only a broken pipe.
   - An entry too big for a delta OF ITS OWN is degraded before it is dropped: file previews first
     (the chip the chat already renders), then the rich `blocks[]` (the flat `text` carries the same
     turn), and only then left out — with its byte range archived without it and **one log line per

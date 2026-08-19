@@ -120,11 +120,19 @@ ways that neither bound covers alone.
 - **A route that costs more than `BODY_PARSE_COST` must SAY THAT TOO** — `readBody`'s third
   argument. The budget bounds memory only while its units mean memory, and the archive ingest holds
   the accumulated body, the parsed entries, `ingestChunk`'s re-serialized lines and the append
-  buffer at once: charged 3x at an 8 MiB ceiling, three hosts backfilling beside one large-but-legal
+  buffer at once: charged 3x at an 8 MiB ceiling, a few hosts backfilling beside one large-but-legal
   heartbeat OOM-killed a real 256 MiB cgroup. `ARCHIVE_PARSE_COST` is 20, and the ceiling
-  (`min(2 MiB, MEMORY_LIMIT / 60)`) is sized so several concurrent deltas fit the in-flight total —
-  at which the same cgroup takes 48 hosts pushing max-size deltas beside a 30 MiB beat, peaking at
-  239 MiB. Deltas are append-only, so a smaller ceiling costs round trips and never content.
+  (`min(2 MiB, MEMORY_LIMIT / 60)`) is sized so several concurrent deltas fit the in-flight total:
+  archive-only floods then measure 114 MiB at 192 concurrent max-size deltas, against 197 MiB at 24
+  before. Deltas are append-only, so a smaller ceiling costs round trips and never content.
+  - **Beside a 30 MiB heartbeat that load peaks around 239 MiB of the 256 — no margin**, and some
+    runs still OOM. That is the HEARTBEAT's own under-charge (below), not the archive's: don't read
+    the archive number as headroom, and re-run any load here 3-5 times.
+- **KNOWN, pre-existing: `/api/heartbeat` is under-charged the way the archive was** (XERK-376). One
+  legal 30 MiB beat measures ~5.5x its wire size against `BODY_PARSE_COST`'s 3x, and two or three
+  concurrent OOM-kill a 256 MiB hub with no archive traffic at all — reproduced on `origin/main`.
+  Charging it honestly trades control-plane 503s against the OOM on the route that carries every
+  host's liveness, so it is a sizing decision rather than a code fix.
   - **The ceiling rides the heartbeat reply** (`archiveChunkMax`), exactly as `bodyMax` does and for
     the same reason: it is a fraction of THIS container's limit, so an agent guessing it guesses
     wrong, and past it there may be no status to learn from. An agent predating the field keeps a

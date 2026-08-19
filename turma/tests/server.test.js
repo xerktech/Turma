@@ -162,7 +162,8 @@ const {
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
   usageLedger, normalizeRetired,
-  ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveRefusals, archiveRefusalFor,
+  ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveChunkLabel,
+  archiveRefusals, archiveRefusalFor,
   noteArchiveRefusal, ARCHIVE_REFUSALS_MAX, ARCHIVE_REFUSALS_PER_HOST,
   chargeBody, releaseBody, BODY_PARSE_COST, BODY_INFLIGHT_TOTAL_MAX,
 } = hub;
@@ -1985,6 +1986,57 @@ test("the archive ceiling leaves concurrent pushes room inside the budget", () =
     delete env.BODY_INFLIGHT_TOTAL_MAX;
   });
   assert.ok(small.ARCHIVE_CHUNK_BODY_MAX < deployed.ARCHIVE_CHUNK_BODY_MAX);
+});
+
+test("the boot line states a sub-MiB archive ceiling as KiB, not as 0 MiB", () => {
+  // The boot line is the stated reason this derived ceiling is discoverable at
+  // all, and a MiB formatter floors — on a small container it printed "0 MiB".
+  assert.equal(archiveChunkLabel(2 << 20), "2 MiB");
+  assert.equal(archiveChunkLabel(400000), "391 KiB");
+  assert.match(archiveChunkLabel(64 << 10), /KiB$/);
+});
+
+test("a refusal record is the NEWEST, is cleared by a chunk that lands, and is the hub's own words", async () => {
+  // Newest, because a transcript legitimately carries one per host after a
+  // migration and the last failure is the one that explains why it is missing.
+  noteArchiveRefusal("shared-tid", "hostOld", "the older reason");
+  await new Promise((r) => setTimeout(r, 2));
+  noteArchiveRefusal("shared-tid", "hostNew", "the newer reason");
+  assert.equal(archiveRefusalFor("shared-tid").error, "the newer reason");
+
+  // A chunk that LANDS clears that host's record — the record answers "why is
+  // this missing", so it must not outlive the missing.
+  const ok = await request("POST", "/api/agents/nas/archive/trclear", {
+    body: { startOffset: 0, endOffset: 4, size: 4, meta: { repo: "turma", slug: "s" },
+      entries: [{ uuid: "c1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(ok.status, 200);
+  noteArchiveRefusal("trclear", "nas", "stale reason");
+  assert.ok(archiveRefusalFor("trclear"));
+  const again = await request("POST", "/api/agents/nas/archive/trclear", {
+    body: { startOffset: 4, endOffset: 8, size: 8, meta: { repo: "turma", slug: "s" },
+      entries: [{ uuid: "c2", role: "user", ts: null, text: "ho" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(again.status, 200);
+  assert.equal(archiveRefusalFor("trclear"), null, "a landed chunk clears it");
+
+  // And a store failure is recorded — and ANSWERED — in the hub's own words.
+  // `e.message` here is node:sqlite's, built out of agent-supplied fields, and
+  // this text reaches both a browser and the agent's log on the host.
+  const bad = await request("POST", "/api/agents/nas/archive/trbadmeta", {
+    body: { startOffset: 0, endOffset: 4, size: 4, meta: { summary: { not: "text" } },
+      entries: [{ uuid: "b1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  // A non-scalar `meta` field is coerced away rather than thrown on: bound
+  // straight into sqlite it 500s, and one poisoned transcript then answers 500
+  // on every beat forever (XERK-356 QA pass 2).
+  assert.equal(bad.status, 200, "a non-scalar meta field is not a 500");
+  const view = await request("GET", "/api/archive/trbadmeta", { headers: userHeaders });
+  assert.equal(view.status, 200);
+  for (const [k, r] of [...archiveRefusals]) if (r.host.startsWith("host")) archiveRefusals.delete(k);
 });
 
 test("one host's archive refusals cannot evict another host's", () => {

@@ -119,9 +119,18 @@ what it ships, what bounds one delta, and when it sheds — is in `.claude/rules
   - Keyed on HOST + transcript and evicted **within a host first**: keyed on the agent-chosen
     transcript alone, one host could file the cap's worth of its own refusals and drop every other
     host's real diagnostic — the one thing the record exists to provide.
-  - The reason is one of a **fixed set of hub-authored strings, never an exception's text**. The
-    record is served to a browser, and `ingestChunk`'s throws carry `node:sqlite`'s own words built
-    from agent-supplied fields; those stay in the hub log.
+  - The reason is one of a **fixed set of hub-authored strings, never an exception's text** — in the
+    stored record AND in the reply. The record is served to a browser and the reply is logged on the
+    host, while `ingestChunk`'s throws carry `node:sqlite`'s own words built from agent-supplied
+    fields; those stay in the hub log.
+  - Residual, accepted: the reader knows only the transcript id, so any host can file a refusal for
+    another host's transcript and be the one NAMED. The text is hub-authored, so this is attribution
+    noise rather than anything a host can put words into.
+- **`meta` is COERCED before it is bound** (`normalizeMeta`): every field is agent-supplied and goes
+  straight into sqlite, which takes only scalars — an object or array threw, the route answered 500,
+  and one poisoned transcript then answered 500 on every beat forever. A non-scalar stores as
+  nothing rather than as `[object Object]`, and the length cap is the receiving half of the agent's
+  own (a bound the receiving path does not enforce is not a bound).
 - The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
   `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
   browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest

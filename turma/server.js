@@ -1360,6 +1360,15 @@ const ARCHIVE_CHUNK_ABSOLUTE_MAX = 2 << 20;   // 2 MiB of rendered entries per d
 const ARCHIVE_CHUNK_BODY_MAX =
   Number(process.env.ARCHIVE_CHUNK_BODY_MAX) ||
   Math.min(ARCHIVE_CHUNK_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / (ARCHIVE_PARSE_COST * 3)));
+// How the boot line states it. A MiB formatter FLOORS, and this is the one
+// derived ceiling that can land under a MiB on a small container — printed as
+// "0 MiB" the boot line stops being the way the number is discoverable, which is
+// the whole reason it is printed.
+function archiveChunkLabel(bytes = ARCHIVE_CHUNK_BODY_MAX) {
+  return bytes >= (1 << 20)
+    ? `${Math.round(bytes / (1 << 20))} MiB`
+    : `${Math.round(bytes / 1024)} KiB`;
+}
 
 // Why a transcript is NOT in the archive, in the hub's own words (XERK-356).
 //
@@ -7450,9 +7459,15 @@ const server = http.createServer(async (req, res) => {
         // stay in the hub log. `e.message` here is whatever `node:sqlite` or the
         // filesystem produced from agent-supplied fields, and this record is
         // served back to a browser (XERK-356 QA D9).
+        // The driver's own words stay in the hub log, out of BOTH the record
+        // and the reply: `e.message` here is whatever `node:sqlite` or the
+        // filesystem made of agent-supplied fields, the record is served to a
+        // browser, and the reply is what the agent logs on the host
+        // (XERK-356 QA D9).
         console.error(`archive: could not store a chunk from ${key} for ${transcriptId}: ${e.message}`);
-        noteArchiveRefusal(transcriptId, key, "the hub could not store this chunk — see the hub log");
-        return json(res, 500, { error: e.message });
+        const stored = "the hub could not store this chunk — see the hub log";
+        noteArchiveRefusal(transcriptId, key, stored);
+        return json(res, 500, { error: stored });
       }
     }
 
@@ -9427,7 +9442,8 @@ if (process.env.TURMA_TEST) {
     // (XERK-356): a test has to be able to hold BOTH — that the hub takes a
     // multi-MB delta at all, and that a refused one is still answerable when the
     // operator asks where that session went.
-    ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveRefusals, archiveRefusalFor,
+    ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveChunkLabel,
+    archiveRefusals, archiveRefusalFor,
     noteArchiveRefusal, ARCHIVE_REFUSALS_MAX, ARCHIVE_REFUSALS_PER_HOST,
     bodyLaneFor, chargeBody, releaseBody, bodyInflightHeld, BODY_PARSE_COST,
     DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
@@ -9619,12 +9635,8 @@ if (process.env.TURMA_TEST) {
     console.log(
       `memory limit ${mib(MEMORY_LIMIT)} -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
         `${mib(BODY_INFLIGHT_TOTAL_MAX)} across both lanes; uploads held ` +
-        `${mib(UPLOAD_TOTAL_MAX_BYTES)}; archive chunk ` +
-        // Not mib(): it FLOORS, and this is the one derived ceiling that can
-        // land under a MiB on a small container — printed as "0 MiB" the boot
-        // line stops being the way the number is discoverable.
-        `${ARCHIVE_CHUNK_BODY_MAX >= (1 << 20) ? mib(ARCHIVE_CHUNK_BODY_MAX)
-          : `${Math.round(ARCHIVE_CHUNK_BODY_MAX / 1024)} KiB`} at ${ARCHIVE_PARSE_COST}x`
+        `${mib(UPLOAD_TOTAL_MAX_BYTES)}; archive chunk ${archiveChunkLabel()} ` +
+        `at ${ARCHIVE_PARSE_COST}x`
     );
     // The effective registry budget, printed for the same reason: it is DERIVED
     // from this container's own cgroup limit rather than configured, so without

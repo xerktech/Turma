@@ -264,7 +264,13 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # so every real session's first delta was refused and the durable archive held
 # nothing but trivially small transcripts. Staying under that default is what
 # makes the archive work against a hub that has not been upgraded yet.
-ARCHIVE_BODY_MAX_DEFAULT = int(os.environ.get("TURMA_ARCHIVE_BODY_MAX", str(768 << 10)))
+# The override may only LOWER it. Past roughly the hub's cap plus its drain
+# slack the socket is destroyed with no status at all, so neither the 413
+# fallback nor the skip below can fire — the agent sees a broken pipe and the
+# pass stops. A knob that can raise this is a knob that can walk an operator
+# straight into that band against a hub that states nothing (XERK-356 QA pass 2).
+ARCHIVE_BODY_MAX_DEFAULT = min(
+    int(os.environ.get("TURMA_ARCHIVE_BODY_MAX", str(768 << 10))), 768 << 10)
 # How much of the hub's stated ceiling to actually use, and the largest stated
 # one worth remembering — see HEARTBEAT_BODY_MARGIN / HEARTBEAT_BODY_STATED_MAX,
 # which this mirrors deliberately. `archiveChunkMax` is untrusted wire input too.
@@ -296,6 +302,13 @@ ARCHIVE_LINE_SCAN_MAX = 1 << 26   # 64 MiB, scanned a block at a time
 # It is display text: a session card and an archive filename, neither of which
 # shows anything like this much.
 ARCHIVE_META_SUMMARY_MAX = 500
+# Failed rendered pushes tolerated in one pass before it gives up until the next
+# beat — the raw layer's ARCHIVE_RAW_FAILURES_MAX, for the same two reasons. One
+# transcript the hub will not take must not cost the OTHERS their sync (a
+# permanent 500 does exactly that: the store cannot accept it however often it
+# goes back up), and a hub that is genuinely down must not have every transcript
+# on the host thrown at it either.
+ARCHIVE_FAILURES_MAX = 3
 
 # The archive's RAW layer (XERK-338): beside the rendered entries above, ship a
 # byte-for-byte copy of the session's OWN files, so what Claude Code wrote
@@ -14357,6 +14370,7 @@ class SessionManager:
             return
         shed_set = set(shed_ids or ())
         budget = ARCHIVE_BEAT_BUDGET
+        failures = 0
         for tid, m in list(self._archive_pending.items()):
             have = int((archive_have or {}).get(tid, 0) or 0)
             size = int(m.get("size", 0))
@@ -14425,7 +14439,17 @@ class SessionManager:
                         "entries": entries, "meta": meta}
                 reply = self._post_archive_chunk(tid, body)
                 if reply is None:
-                    return  # transport failed; the whole pass retries on a beat
+                    # A transport failure or a 5xx. Either can be this transcript
+                    # alone (a chunk the store cannot accept answers 500 every
+                    # time) or the hub as a whole, and one POST cannot tell them
+                    # apart — so leave this transcript and let the failure budget
+                    # decide when to stop trying at all.
+                    failures += 1
+                    if failures >= ARCHIVE_FAILURES_MAX:
+                        log(f"archive: {failures} failed pushes this pass; "
+                            f"stopping until the next beat")
+                        return
+                    break
                 if reply.get("skip"):
                     break   # this transcript is unpushable as built; the others aren't
                 if reply.get("full"):

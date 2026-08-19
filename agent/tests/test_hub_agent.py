@@ -14186,6 +14186,68 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         # ...and the refused one is not re-sent inside the same pass either.
         self.assertEqual(len(set(seen)), 2, seen)
 
+    def test_a_transcript_the_hub_500s_does_not_starve_the_others(self):
+        # A permanent 5xx — a chunk the store cannot accept, which answers the
+        # same way however often it goes back up — used to end the pass, so one
+        # poisoned transcript stopped every other one on the host, every beat.
+        # Bounded the other way too: a hub that is genuinely down must not have
+        # every transcript thrown at it (QA pass 2).
+        sm = self.make_manager()
+        for name, tid in (("aaa", "t0"), ("bbb", "t1"), ("ccc", "t2")):
+            wt = "/w/.turma/worktrees/Turma/" + name
+            self._write_transcript(wt, tid + ".jsonl", [_text_entry("u1", "user", "hi")])
+            sm.usage_ledger = dict(sm.usage_ledger or {}, **{wt: {
+                "repo": "Turma", "remote": "git@github.com:xerk/Turma.git",
+                "slug": ha._project_slug(wt)}})
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        seen = []
+
+        def fail_first(tid, body):
+            seen.append(tid)
+            return None if len(seen) == 1 else {"bytesStored": body["endOffset"]}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fail_first):
+            sm._archive_deltas({})
+        self.assertEqual(len(seen), 3, seen)          # the other two still ran
+        # ...and a hub that fails EVERYTHING stops the pass on the budget rather
+        # than posting once per transcript on the host.
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        allfail = []
+        with mock.patch.object(ha, "log", lambda _m: None), \
+                mock.patch.object(sm, "_post_archive_chunk",
+                                  lambda tid, body: allfail.append(tid)):
+            sm._archive_deltas({})
+        self.assertEqual(len(allfail), ha.ARCHIVE_FAILURES_MAX, allfail)
+
+    def test_the_body_ceiling_knob_can_only_lower_it(self):
+        # Past the hub's cap plus its drain slack the socket dies with no status,
+        # so neither the 413 fallback nor the skip can fire and the pass halts on
+        # a broken pipe. A knob that can RAISE the default walks an operator into
+        # that band against a hub that states nothing (QA pass 2).
+        self.assertLessEqual(ha.ARCHIVE_BODY_MAX_DEFAULT, 768 << 10)
+        # A fresh import with the knob turned UP must land on the same number —
+        # the module-level constant is frozen at import, so this is the only way
+        # to hold the clamp rather than the value.
+        env = dict(os.environ, TURMA_ARCHIVE_BODY_MAX=str(64 << 20))
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util,sys;"
+             f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+             "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+             "print(m.ARCHIVE_BODY_MAX_DEFAULT)"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(out.stdout.strip(), str(ha.ARCHIVE_BODY_MAX_DEFAULT), out.stderr[-400:])
+        # ...and DOWN still works: the knob exists to lower it.
+        env["TURMA_ARCHIVE_BODY_MAX"] = str(200000)
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util,sys;"
+             f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+             "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+             "print(m.ARCHIVE_BODY_MAX_DEFAULT)"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(out.stdout.strip(), "200000", out.stderr[-400:])
+
     def test_the_beat_reply_is_where_the_ceiling_comes_from(self):
         # The wiring, not just the parser: without the call in post() the agent
         # silently keeps its default forever and half the fix is inert (QA D6).
