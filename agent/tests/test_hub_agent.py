@@ -3283,11 +3283,18 @@ class ManagerMixin:
         def fake_port_open(port, host="127.0.0.1", timeout=0.3):
             return port in self.bound_ports
 
+        # Whether a scanned repo has a HEAD to fork a worktree from (XERK-343).
+        # The mixin's repos are bare temp dirs, so the real probe would read
+        # every one of them as an unfinished clone and queue every spawn; the
+        # tests that exercise that wait flip this themselves.
+        self.head_ready = True
+
         for name, value in [
             ("run", fake_run),
             ("run_ok", fake_run_ok),
             ("run_stdin", fake_run_stdin),
             ("_port_open", fake_port_open),
+            ("repo_head_ready", lambda path: self.head_ready),
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
@@ -11323,6 +11330,383 @@ class TestClone(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.clones["Turma"]["status"], "error")
 
 
+class TestRepoHeadReady(unittest.TestCase):
+    """XERK-343: `.git` exists from the first instant of a clone, so it is not
+    the question. `repo_head_ready` asks whether HEAD resolves; `repo_forkable`
+    asks the one a spawn actually needs — is there ANY commit to detach at."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-head-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.tmp,
+                              capture_output=True, text=True)
+
+    def _source_repo(self):
+        src = os.path.join(self.tmp, "src")
+        self._git("init", "-q", "-b", "main", src)
+        self._git("-C", src, "-c", "user.email=a@b", "-c", "user.name=a",
+                  "commit", "-q", "--allow-empty", "-m", "one")
+        return src
+
+    def test_an_unborn_head_is_not_ready_and_is_what_git_refuses(self):
+        repo = os.path.join(self.tmp, "fresh")
+        self._git("init", "-q", repo)
+        # The state a clone is in for its whole run: .git is there, HEAD isn't.
+        self.assertTrue(os.path.isdir(os.path.join(repo, ".git")))
+        self.assertFalse(ha.repo_head_ready(repo))
+        # Nothing to fork from at all — no refs either.
+        self.assertFalse(ha.repo_forkable(repo))
+        # And that is exactly the spawn this used to fail on — the pre-flight
+        # predicts git's own answer rather than guessing at it.
+        out = self._git("-C", repo, "worktree", "add", "--detach",
+                        os.path.join(self.tmp, "wt"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("invalid reference", out.stderr)
+
+    def test_a_repo_with_a_commit_is_ready(self):
+        repo = self._source_repo()
+        self.assertTrue(ha.repo_head_ready(repo))
+        self.assertTrue(ha.repo_forkable(repo))
+
+    def test_an_unborn_head_over_a_real_origin_is_still_forkable(self):
+        # The regression the HEAD-only gate caused: this repo has an unborn
+        # local HEAD and a perfectly good origin/main, which is what
+        # default_base_ref picks — it forked fine before and must still.
+        src = self._source_repo()
+        repo = os.path.join(self.tmp, "orphaned")
+        self._git("clone", "-q", src, repo)
+        self._git("-C", repo, "checkout", "-q", "--orphan", "fresh-start")
+        self.assertFalse(ha.repo_head_ready(repo))
+        self.assertTrue(ha.repo_forkable(repo))
+        self.assertEqual(ha.default_base_ref(repo), "origin/main")
+        # Not a paper fork point: git really detaches a worktree there.
+        out = self._git("-C", repo, "worktree", "add", "--detach",
+                        os.path.join(self.tmp, "wt"), "origin/main")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_repo_git_cannot_answer_for_is_not_ready(self):
+        self.assertFalse(ha.repo_head_ready(os.path.join(self.tmp, "nope")))
+
+    def test_an_unrunnable_probe_reads_as_ready(self):
+        # Fails OPEN: this gates a spawn, so "can't tell" must degrade to the
+        # old behaviour (git's own error), never to a session queued forever.
+        with mock.patch.object(ha, "run_out", lambda *a, **kw: (None, "")):
+            self.assertTrue(ha.repo_head_ready("/anywhere"))
+
+
+class TestGitErrorText(unittest.TestCase):
+    """XERK-343: the operator-facing half of a failed git command."""
+
+    REPRO = ("hint: If you meant to create a worktree containing a new unborn "
+             "branch\nhint: (branch with no commits) for this repository, you "
+             "can do so\nhint: using the --orphan flag:\nhint: \n"
+             "fatal: invalid reference: HEAD")
+
+    def test_advice_lines_are_dropped_and_the_cause_kept(self):
+        self.assertEqual(ha.git_error_text(self.REPRO),
+                         "fatal: invalid reference: HEAD")
+
+    def test_over_length_keeps_the_tail_because_git_states_the_cause_last(self):
+        err = "noise " * 200 + "fatal: THE CAUSE"
+        out = ha.git_error_text(err)
+        self.assertEqual(len(out), 300)
+        self.assertTrue(out.endswith("fatal: THE CAUSE"), out)
+        self.assertTrue(out.startswith("…"), out)
+
+    def test_control_bytes_never_reach_the_record(self):
+        out = ha.git_error_text("\x1b[31mfatal:\x1b[0m bad\x00nul\x07bell")
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x00", out)
+        self.assertNotIn("\x07", out)
+        self.assertIn("fatal:", out)
+
+    def test_a_tiny_limit_never_returns_more_than_it_was_given(self):
+        for limit in (0, 1, 2, 3):
+            out = ha.git_error_text("fatal: a much longer message", limit=limit)
+            self.assertLessEqual(len(out), max(limit, len("no error output")))
+
+    def test_it_is_never_empty(self):
+        self.assertEqual(ha.git_error_text(""), "no error output")
+        self.assertEqual(ha.git_error_text(None), "no error output")
+        self.assertEqual(ha.git_error_text("hint: only advice"), "no error output")
+        self.assertEqual(ha.git_error_text("boom", limit=0), "no error output")
+
+
+class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
+    """XERK-343: a repo Turma is still cloning is in the scan (git creates
+    <dest>/.git before it fetches anything), so a session started on it detached
+    at an unborn HEAD and died with `fatal: invalid reference: HEAD`. It waits
+    for the clone now — and only for a clone: nothing else here is going to make
+    an empty repo forkable, and "cloning the repo first" would be a lie."""
+
+    def setUp(self):
+        super().setUp()
+        self.repos_root = os.path.join(self.tmp, "root")
+        self.repo = {"name": "gdt-files",
+                     "path": os.path.join(self.repos_root, "gdt-files")}
+        # The half-clone: the dir and its .git are there, nothing else is.
+        os.makedirs(os.path.join(self.repo["path"], ".git"))
+        for name, value in [("REPOS_ROOT", self.repos_root),
+                            ("scan_repos", lambda: [self.repo])]:
+            q = mock.patch.object(ha, name, value)
+            q.start()
+            self.addCleanup(q.stop)
+
+    def _manager(self, cloning=True):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        # head_ready False + run() faked to "" makes repo_forkable False, which
+        # is the mid-clone repo. The clone job is what makes it a WAIT.
+        self.head_ready = False
+        if cloning:
+            sm.clones["gdt-files"] = {"name": "gdt-files", "status": "cloning"}
+        return sm
+
+    def _worktree_adds(self):
+        return [c for c in self.run_ok_calls if "worktree" in c and "add" in c]
+
+    def test_a_spawn_mid_clone_queues_instead_of_failing(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")
+        self.assertEqual(sess["queuedReason"], "awaiting-clone")
+        self.assertEqual(sess["awaitClone"], "gdt-files")
+        self.assertEqual(self._worktree_adds(), [])
+
+    def test_the_drain_holds_on_an_unforkable_repo_then_starts_it(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        # A .git dir is NOT the release condition — that is the whole bug.
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "queued")
+        self.head_ready = True
+        sm.clones["gdt-files"]["status"] = "done"
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        self.assertEqual(len(self._worktree_adds()), 1)
+        # Every queue marker is shed, the internal stamps included. Set the
+        # ones a plain composer spawn doesn't, so the assertion isn't vacuous.
+        for k in ("awaitClone", "awaitCloneOwner", "awaitCloneSince",
+                  "awaitCloneRetried", "queuedReason", "queuedAt"):
+            self.assertNotIn(k, sess)
+
+    def test_every_queue_marker_is_shed_when_a_session_starts(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess.update(awaitCloneOwner="x/gdt-files", awaitCloneRetried=True)
+        self.head_ready = True
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        for k in ("awaitClone", "awaitCloneOwner", "awaitCloneSince",
+                  "awaitCloneRetried", "queuedReason", "queuedAt"):
+            self.assertNotIn(k, sess)
+
+    def test_the_drain_asks_forkable_not_just_head_ready(self):
+        # The drain half of the same fix as the spawn gate: a repo whose local
+        # HEAD is unborn over a live origin/<default> is forkable, and holding
+        # it there would spin the card out to the deadline for nothing.
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        with mock.patch.object(ha, "repo_forkable", lambda *a, **kw: True), \
+             mock.patch.object(ha, "resolve_base_ref",
+                               lambda path, base: "origin/main"):
+            sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+
+    def test_an_interrupted_clone_says_so_at_once(self):
+        # A clone does NOT outlive its manager — entrypoint.sh execs
+        # hub-agent.py as the container's foreground process — and `clone()`
+        # refuses a dest that exists, so nothing here can retry. One beat, not
+        # the deadline, and the message names the partial checkout.
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files",
+                    awaitCloneOwner="xerktech/gdt-files",
+                    awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("already exists", sess["errorMsg"])
+        self.assertIn("re-clone is refused", sess["errorMsg"])
+        self.assertIn(self.repo["path"], sess["errorMsg"])
+        sm.clone.assert_not_called()
+
+    def test_an_unforkable_repo_with_no_clone_of_ours_is_not_called_cloning(self):
+        # An empty repo, or a clone run by hand outside Turma: nothing here will
+        # fix it, so it must not borrow a wait that tells the operator a clone is
+        # in progress. It lands as an error card saying what is actually wrong.
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("no commit to fork", sess["errorMsg"])
+        self.assertEqual(self._worktree_adds(), [])
+
+    def test_a_forkable_repo_with_an_unborn_head_still_spawns_at_once(self):
+        # The regression guard: origin/<default> is there, so the session forks
+        # off it exactly as it always did — no queue, no wait.
+        sm = self._manager()
+        with mock.patch.object(ha, "repo_forkable", lambda *a, **kw: True), \
+             mock.patch.object(ha, "resolve_base_ref",
+                               lambda path, base: "origin/main"):
+            sm.spawn("gdt-files")
+        self.assertEqual(sm.registry[0]["status"], "running")
+        # And it forks off that ref — the two gates agree, which is the whole
+        # point: _worktree_add's pre-flight only cares about HEAD when it is
+        # about to detach at HEAD.
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+
+    def test_a_repo_that_never_becomes_forkable_ends_as_an_error(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess["awaitCloneSince"] -= ha.CLONE_TIMEOUT_SEC + 1
+        # A LIVE clone is bounded by _poll_clones, so the drain must not race it.
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "queued")
+        # Once nothing of ours is driving it, the wait is bounded.
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("no commit to fork from", sess["errorMsg"])
+
+    def test_the_deadline_is_reachable_with_an_owner_to_re_clone_from(self):
+        # `clone()` files a refusal under slugify(spec), so a 3-segment GitLab
+        # or ADO spec lands under a key the job lookup can't see. Behind an
+        # elif, that retried every beat and the deadline never ran.
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files", await_clone_owner="grp/sub/gdt-files")
+        sess = sm.registry[0]
+        sess["queuedReason"] = "awaiting-clone"
+        sess["awaitClone"] = "gdt-files"
+        sess["awaitCloneOwner"] = "grp/sub/gdt-files"
+        sess["awaitCloneSince"] = time.time() - (ha.CLONE_TIMEOUT_SEC + 1)
+        sess["status"] = "queued"
+        for _ in range(3):
+            sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+
+    def test_a_lost_clone_with_nothing_on_disk_is_re_triggered_once(self):
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gone")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gone", awaitCloneOwner="xerktech/gone",
+                    awaitCloneSince=time.time(),
+                    repoPath=os.path.join(self.repos_root, "gone"))
+        for _ in range(4):
+            sm._drain_queue()
+        self.assertEqual(sm.clone.call_count, 1)
+
+    def test_the_base_ref_is_resolve_base_refs_business_not_the_waits(self):
+        # Holding a session because its chosen base hasn't landed only delays
+        # the accurate "base ref not found" — and an invalid-NAMED base once
+        # read as forkable, releasing a session mid-clone into a failed add.
+        # Both gates therefore ask the repo, never the base.
+        sm = self._manager()
+        sm.spawn("gdt-files", base_ref="origin/nope")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")   # mid-clone: still waits
+        self.head_ready = True
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()                            # forkable: released at once
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("not found", sess["errorMsg"])
+
+    def test_a_finished_clone_with_no_commits_says_the_repo_is_empty(self):
+        # A clone of an empty upstream exits 0, so the job goes `done` while the
+        # repo stays unforkable. Read it while the job lingers: once pruned it
+        # is indistinguishable from an interrupted clone, and calling it one
+        # asserts a false cause AND recommends deleting a good clone.
+        sm = self._manager()
+        sm.clones["gdt-files"]["status"] = "done"
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("cloned with no commits", sess["errorMsg"])
+        self.assertNotIn("remove it", sess["errorMsg"])
+
+    def test_a_failed_clone_reports_its_own_error(self):
+        # The operator's only accurate cause for a failed clone. Unpinned, the
+        # branch could go and the session would silently degrade to a re-clone
+        # and a 600s deadline instead.
+        sm = self._manager()
+        sm.clones["gdt-files"].update(status="error",
+                                      error="repository not found")
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("clone of gdt-files failed", sess["errorMsg"])
+        self.assertIn("repository not found", sess["errorMsg"])
+
+    def test_a_wait_with_no_owner_never_takes_the_re_clone_branches(self):
+        # Without an owner there is nothing to re-clone from, so neither the
+        # refused-re-clone message nor a clone(None) may fire — it waits out
+        # the deadline like any other wait nothing can name.
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        sm.clone.assert_not_called()
+        self.assertEqual(sess["status"], "queued")
+        sess["awaitCloneSince"] -= ha.CLONE_TIMEOUT_SEC + 1
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("still has no commit to fork from", sess["errorMsg"])
+
+    def test_the_worktree_add_refuses_an_unborn_head_in_plain_words(self):
+        # The last line of defence, for the resume/import paths that add a
+        # worktree without going through spawn's wait.
+        sm = self._manager()
+        sess = {"repo": "gdt-files", "repoPath": self.repo["path"],
+                "worktreePath": os.path.join(self.tmp, "wt", "abcde")}
+        with self.assertRaises(RuntimeError) as caught:
+            sm._worktree_add(sess)
+        self.assertIn("no commit to fork", str(caught.exception))
+        self.assertEqual(self._worktree_adds(), [])
+
+    def test_a_resolved_base_ref_skips_the_head_check(self):
+        # An explicit base already resolved against this repo's refs, so the
+        # repo's own HEAD is beside the point and must not block the spawn.
+        sm = self._manager()
+        sess = {"repo": "gdt-files", "repoPath": self.repo["path"],
+                "worktreePath": os.path.join(self.tmp, "wt", "abcde")}
+        sm._worktree_add(sess, base_ref="origin/main")
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+
+    def test_a_failed_worktree_add_reports_the_cause_not_the_advice(self):
+        sm = self._manager()
+        sess = {"repo": "gdt-files", "repoPath": self.repo["path"],
+                "worktreePath": os.path.join(self.tmp, "wt", "abcde")}
+        with mock.patch.object(
+                ha, "run_ok",
+                lambda *a, **kw: (128, "hint: use --orphan\nfatal: nope")):
+            with self.assertRaises(RuntimeError) as caught:
+                sm._worktree_add(sess, base_ref="origin/main")
+        self.assertIn("fatal: nope", str(caught.exception))
+        self.assertNotIn("hint:", str(caught.exception))
+
+
 class TestValidSourceRepo(unittest.TestCase):
     """XERK-155: the loose path check for non-GitHub listings — spaces are legal
     in an Azure DevOps project segment, but the LAST segment becomes a directory
@@ -18259,6 +18643,28 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
 
     def _launches(self):
         return [c for c in self.run_ok_calls if c and c[0] == "tmux" and "new-session" in c]
+
+    def test_a_mid_clone_repo_defers_the_branch_reservation(self):
+        # Reserving needs a `git fetch` and a ref scan, and a repo whose clone
+        # is still writing it has neither to give — _provision_session reserves
+        # against the repo that then exists (XERK-343).
+        sm = self.make_ticket_manager()
+        sm.clones["Turma"] = {"name": "Turma", "status": "cloning"}
+        sm._reserve_ticket_branch = mock.Mock(return_value="PROJ-7")
+        self.head_ready = False
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")
+        sm._reserve_ticket_branch.assert_not_called()
+        self.assertIsNone(sess["ticket"]["branch"])
+        # And it reserves once the repo can answer.
+        self.head_ready = True
+        sm.clones["Turma"]["status"] = "done"
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        sm._reserve_ticket_branch.assert_called_once()
+        self.assertEqual(sess["ticket"]["branch"], "PROJ-7")
 
     def test_spawns_with_the_ticket_and_a_reserved_branch(self):
         sm = self.make_ticket_manager()
