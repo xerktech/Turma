@@ -19,7 +19,14 @@
   const LIVE_TURN_ID = "__live";
   const POLL_MS = 6000;             // /history fallback cadence when the WS is down
   const HISTORY_RETRY_MS = 1200;    // poll cadence while /history returns 202
-  const HISTORY_MAX_RETRIES = 12;
+  // The retry window must outlast a HEARTBEAT, not just a fetch (XERK-347). A
+  // 202 means "the agent hasn't delivered it yet", and a delivery can be shed —
+  // by the agent's own body ceiling, or after two failed beats — in which case
+  // the NEXT beat is the earliest it can arrive, and the beat interval is 20s.
+  // At 12 retries this gave up after 14.4s and the scrollback then never came:
+  // the poll fallback only re-asks while the socket is DOWN, so a session with a
+  // healthy live tail sat on an empty history until it was reopened.
+  const HISTORY_MAX_RETRIES = 40;   // ~48s
   const STOP_SUPPRESS_MS = 4000;    // how long a clicked Stop overrides the busy read
   const ACTION_FAIL_MS = 2000;      // how long the compose button shows a failure
   // Files one message may carry (XERK-234). Mirrors the hub's

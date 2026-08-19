@@ -10622,12 +10622,18 @@ class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
     def test_an_ordinary_outage_sheds_nothing(self):
         sm = self.make_manager()
         sm.spawn_failures.append({"cmdId": "c1", "error": "no"})
+        sm._note_body_max({"bodyMax": 8 << 20})
+        learned = sm._body_max()
         payload = sm.build_payload(0)
         with mock.patch.object(ha.urllib.request, "urlopen",
                                side_effect=OSError("network down")):
             for _ in range(5):
                 self.assertIsNone(sm.post(payload))
         self.assertEqual(len(sm.spawn_failures), 1)
+        # An outage is not a size problem: it must not throw away what the hub
+        # told us either, or a flapping tunnel silently reverts this agent to
+        # the permissive default against a hub that cannot take it.
+        self.assertEqual(sm._body_max(), learned)
 
     def test_a_successful_beat_clears_the_failure_streak(self):
         sm = self.make_manager()
@@ -10657,6 +10663,26 @@ class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
         for bad in (float("inf"), float("-inf"), float("nan")):
             sm._note_body_max({"bodyMax": bad})
             self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)
+
+    def test_a_huge_INT_bodyMax_is_as_dangerous_as_inf(self):
+        # A 400-digit integer is legal JSON too, and `math.isfinite` RAISES on it
+        # rather than answering — the same beat-always-failed symptom by the
+        # other type. Clamped, not just rejected, because the multiply in
+        # _body_max would overflow next.
+        sm = self.make_manager()
+        sm._note_body_max({"bodyMax": 10 ** 400})
+        self.assertEqual(sm._hub_body_max, ha.HEARTBEAT_BODY_STATED_MAX)
+        # Clamping loses nothing: a hub stating more than this already gets our
+        # own maximum, which is what a generous hub got before the clamp.
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)
+        # ...and a beat carrying it still succeeds, which is the whole point.
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b'{"commands":[],"bodyMax":' + b"1" * 400 + b"}"
+
+        with mock.patch.object(ha.urllib.request, "urlopen", return_value=FakeResp()):
+            self.assertEqual(sm.post(sm.build_payload(0)), {"commands": [], "bodyMax": int("1" * 400)})
 
     def test_a_tiny_bodyMax_cannot_silently_disable_history_forever(self):
         # Every beat 200, every delivery shed, nothing anywhere looking wrong —

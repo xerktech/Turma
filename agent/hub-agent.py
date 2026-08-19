@@ -519,6 +519,10 @@ HEARTBEAT_BODY_MARGIN = 0.75
 # and nothing anywhere would look wrong. Below this the hub cannot serve a
 # session at all, so treating the value as nonsense is the honest reading.
 HEARTBEAT_BODY_MIN = int(os.environ.get("TURMA_HEARTBEAT_BODY_MIN", str(1 << 20)))
+# The largest stated ceiling worth REMEMBERING. Past this the margin already
+# lands on HEARTBEAT_BODY_MAX, so a bigger number changes nothing — and it keeps
+# an unbounded int off the arithmetic below (see _note_body_max).
+HEARTBEAT_BODY_STATED_MAX = int(HEARTBEAT_BODY_MAX / HEARTBEAT_BODY_MARGIN) + 1
 # How many CONSECUTIVE beats may fail while on-demand deliveries are staged
 # before they are shed. A beat that gets no status at all cannot be told from a
 # network outage on its own, so one failure proves nothing — but a body the hub
@@ -13290,14 +13294,24 @@ class SessionManager:
         stated = reply.get("bodyMax")
         if isinstance(stated, bool) or not isinstance(stated, (int, float)):
             return
-        # `1e999` is legal JSON and parses to inf, on which int() RAISES — inside
-        # post()'s try, so every beat would be logged as failed while every beat
-        # actually succeeded: commands dropped, staged results never cleared, the
-        # host dead to its operator. NaN compares false everywhere and would slip
-        # a 0 through. isfinite covers both.
-        if not math.isfinite(stated) or stated <= 0:
+        # The float check comes FIRST and is guarded by isinstance, exactly as
+        # `_token_count` does (and for the reason its comment gives): `1e999` is
+        # legal JSON and parses to inf, on which int() raises — but so does
+        # `math.isfinite` of a huge INT, which is just as legal on the wire. Both
+        # raise INSIDE post()'s try, so every beat is logged as failed while the
+        # hub answers 200: commands dropped, peers never ingested, the host dead
+        # to its operator. NaN compares False against every bound and would slip
+        # a zero through.
+        if isinstance(stated, float) and not math.isfinite(stated):
             return
-        self._hub_body_max = int(stated)
+        if stated <= 0:
+            return
+        # Clamped BEFORE it is stored, so no arithmetic ever touches an unbounded
+        # int: `int(10**400 * HEARTBEAT_BODY_MARGIN)` overflows exactly as
+        # isfinite does. The bound is EXACT rather than arbitrary — at
+        # HEARTBEAT_BODY_MAX / HEARTBEAT_BODY_MARGIN the derived ceiling is
+        # already our own maximum, so anything above it decides nothing.
+        self._hub_body_max = int(min(stated, HEARTBEAT_BODY_STATED_MAX))
 
     def _drop_on_demand_results(self, payload=None):
         """Drop the staged on-demand deliveries — and them alone — from the
