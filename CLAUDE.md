@@ -222,6 +222,41 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - The archive does NOT already hold this. It stores displayable entries and no token counts, never
     sees a live session, and excludes background-agent transcripts. Mechanics in
     `.claude/rules/turma-usage.md`.
+- **The peer roster IS the org boundary for cross-session messaging** (XERK-348). Claude Code's own
+  control is per-MACHINE (`isolatePeerMachines`) and a Turma org spans hosts, so no setting
+  expresses the rule: instead the agent denies `ListAgents` — which removes the tool, leaving a
+  session unable to ENUMERATE anyone — and the hub's **`orgPeers`** puts the same-org sessions on
+  every heartbeat reply, which the agent renders to `~/.turma/peers.tsv`. It spans
+  `turma/server.js` and `agent/hub-agent.py`, so no `paths:`-scoped file sees both halves.
+  - **The roster removes DISCOVERY, not delivery.** `SendMessage` resolves any string, and an
+    `rcName` is `<host>-<repo>-<TICKET-KEY>`, so a session can still guess one. Never write this up
+    as "a session can only name what the hub sent" — it is not true and it hides the residual risk.
+  - **The org is the one the hub BOUND the host to, never the one the host claims** (`orgBound`,
+    trust-on-first-use). `jira.siteKey` is agent-asserted, so gating on it let any host's token
+    join any org and read its whole roster — exposure no agent credential had, since `/api/agents`
+    refuses one. Same objection XERK-268 makes to a self-asserted `<host>`. The binding is
+    hub-owned, assigned AFTER the payload spread like `tokenBound`, persisted with the record, and
+    reset only by `DELETE /api/agents/<host>`.
+  - **Drift is declaring a DIFFERENT org, never failing to declare one** — a host whose tracker goes
+    quiet keeps its binding and its peers.
+  - **The binding gates the peer roster and NOTHING else.** The MIGRATION route still compares the
+    claimed org, unchanged. Two attempts to bind-gate it were reverted: **no client can mirror a
+    rule keyed on `orgBound`** (it is stripped from the served payload, so `eligibleMoveTargets` and
+    its Android and glasses twins see only `jira.siteKey`), so the hub and every Move menu
+    disagreed. Don't retry it without serving the decided org to the clients — that is **XERK-349**,
+    which also carries the pre-existing hole it would close: two hosts that both declare NO org
+    match each other whatever they are bound to. Mechanics in `.claude/rules/turma.md`.
+  - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one.
+    Nothing bounds `rcName` in the normalizers and the spawn route takes a 100k `label`, so
+    capping one field of six built a 23.8 MB reply that OOM-killed a hub in a real 256 MiB cgroup.
+  - **Both sides fail NARROW.** No `peers` on a reply forgets the roster; a silent hub expires it;
+    either way the agent falls back to its OWN host's sessions, which are same-org by construction
+    because a host polls one org. Never add a path that keeps a wide roster nothing vouches for.
+  - **It is a strong soft boundary, not an airtight one.** `crossSessionInbound` has no per-sender
+    filter (accept/hold/refuse only), so an off-org session sharing the Claude login can still
+    DELIVER into a session — it just can't discover one. **One Claude login per org is the only
+    hard boundary**, and it is a DockerOps decision. Don't describe this contract as sealing it.
+  - Mechanics in `.claude/rules/agent-sessions.md` and `.claude/rules/agent-hooks.md`.
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.

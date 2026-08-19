@@ -134,7 +134,8 @@ const hub = require("../server.js");
 // see the fan-out. Real fan-out/pruning is exercised separately below.
 hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
-  server, agents, queueCommand, findSession,
+  server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
+  orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
@@ -2461,7 +2462,10 @@ test("http: command queue rides the reply until acked", async () => {
   // Register the host; queue is empty at first.
   let res = await beat({ device: "h1" });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { commands: [] });
+  // `peers` rides every reply (XERK-348) — it is how a host learns which
+  // sessions its own may address, so an absent key means "no roster", which the
+  // agent reads as a boundary it cannot widen past its own host.
+  assert.deepEqual(res.body, { commands: [], peers: [] });
 
   // The UI queues two session commands (as the /api/agents/... routes do).
   const spawnRes = await request("POST", "/api/agents/h1/sessions", {
@@ -8536,7 +8540,11 @@ const migHost = (device, site, {
     body: {
       device,
       repos: repos.map((name) => ({ name, path: `/git/${name}` })),
-      jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] },
+      // `site` null models a host with no tracker configured — the shape a
+      // Jira-less agent really sends, which has a `jira` block but no siteKey.
+      jira: site
+        ? { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] }
+        : { available: false, configured: false, tickets: [] },
       sessions: [
         {
           id: session, status, root, repo, transcriptId,
@@ -8602,6 +8610,182 @@ test("migrate: rejects a bad source, target, or org mismatch", async () => {
   assert.equal((await migrate("mSrc", "s1", { host: "ghost" })).status, 404);
   // different org
   assert.equal((await migrate("mSrc", "s1", { host: "mOther" })).status, 409);
+});
+
+test("a host that stops declaring an org keeps its binding, and is not drifted", () => {
+  // Drift is declaring a DIFFERENT org, not failing to declare one. Treating an
+  // absent `jira` block as drift locked a host out of its roster AND out of
+  // migration on the beat its tracker went quiet — an outage caused by the
+  // boundary rather than prevented by it. Real migrate tests beat exactly this
+  // shape, which is how it was caught.
+  assert.equal(orgDrifted({ orgBound: "acme", jira: { siteKey: "acme" } }), false);
+  assert.equal(orgDrifted({ orgBound: "acme" }), false);              // no jira at all
+  assert.equal(orgDrifted({ orgBound: "acme", jira: {} }), false);    // block, no key
+  assert.equal(orgDrifted({ orgBound: "acme", jira: { available: false } }), false);
+  // The attack still trips it: joining another org means naming that org.
+  assert.equal(orgDrifted({ orgBound: "acme", jira: { siteKey: "rival" } }), true);
+});
+
+test("orgPeers still serves a host that stopped declaring its org", () => {
+  peerHost("quietA", "acme.atlassian.net", [peerSession("q1")]);
+  peerHost("quietB", "acme.atlassian.net", [peerSession("q2")]);
+  delete agents.quietA.jira;              // its tracker went quiet this beat
+  try {
+    assert.deepEqual(orgPeers("quietA").map((p) => p.id).sort(), ["q1", "q2"]);
+  } finally {
+    dropPeerHosts("quietA", "quietB");
+  }
+});
+
+test("migrate: an ORG-LESS fleet can still move sessions", async () => {
+  // Parity with what this route did before it compared bound orgs: two hosts
+  // with no tracker configured are not "in a different org", they are in no
+  // org, and refusing them is a regression. The clients cannot mirror such a
+  // rule either — `orgBound` is stripped from the served payload — so their
+  // Move menus would keep offering a host the hub then refuses.
+  await migHost("mFreeA", null);
+  await migHost("mFreeB", null);
+  const r = await migrate("mFreeA", "s1", { host: "mFreeB" });
+  // `notEqual(409)` passes on ANY other status — including the 503 the fleet-wide
+  // in-flight cap really returns, since every migrate test holds a slot. Assert
+  // the success, or this pins nothing.
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  // A started move stays in flight until it settles, and the in-flight cap is
+  // shared with every other migrate test — drop it rather than leaking a slot.
+  if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+});
+
+test("migrate: a DRIFTED host is still a legal target — the binding is not here", async () => {
+  // Pins the REVERT, in the one direction it can regress. Two attempts to
+  // bind-gate this route were made and reverted (see .claude/rules/turma.md);
+  // re-inserting `if (orgDrifted(src) || orgDrifted(tgt)) return 409` above the
+  // claim compare escaped the whole suite, so a future session could ship the
+  // thing the docs warn against, green.
+  //
+  // A drifted host that still CLAIMS the source's org is the only case the two
+  // candidate predicates disagree on, so it is the only case that pins this.
+  // Refusing it is not wrong on its own — it is wrong without XERK-349, because
+  // no client can mirror it and every Move menu would keep offering this host.
+  await migHost("mDriftT", "dt1.atlassian.net");     // binds dt1
+  await migHost("mDriftT", "dt2.atlassian.net");     // now claims dt2: drifted
+  await migHost("mDriftS", "dt2.atlassian.net");     // claims dt2 too
+  const r = await migrate("mDriftS", "s1", { host: "mDriftT" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+});
+
+test("migrate: matches on the CLAIMED org, and the client predicate agrees", async () => {
+  // The org binding gates the peer roster and NOT this route. No client can
+  // mirror a rule keyed on `orgBound` — it is stripped from the served payload,
+  // so `eligibleMoveTargets` and its Android/glasses twins see only
+  // `jira.siteKey`. A host BOUND to an org but declaring none this beat is where
+  // a binding-keyed rule would diverge from every Move menu.
+  //
+  // The hole this leaves is real and deliberate (XERK-349): two hosts that both
+  // declare NO org match each other whatever they are bound to. The second half
+  // of this test asserts that, so the day it is closed this test fails loudly
+  // rather than the behaviour changing unnoticed.
+  await migHost("mQuietA", "q1.atlassian.net");
+  await migHost("mQuietB", "q1.atlassian.net");
+  await migHost("mQuietB", null);          // still bound to q1, declaring nothing
+  const toQuiet = await migrate("mQuietA", "s1", { host: "mQuietB" });
+  assert.equal(toQuiet.status, 409, JSON.stringify(toQuiet.body));
+  // `sessions.html`'s own predicate, verbatim, over what the client is really
+  // served — this test was once titled "the clients agree" while running no
+  // client code at all. `eligibleMoveTargets` keys on this, so if it disagrees
+  // with the hub the Move menu offers a host that 409s (or hides a legal one).
+  const siteKeyOfAgent = (a) => (a && a.jira && a.jira.siteKey) || "";
+  // Fetched FRESH per assertion, and every host asserted to be PRESENT in it.
+  // A snapshot taken before a host's first beat makes `find` undefined, which
+  // the client-style `|| ""` turns into "" — so `"" === ""` passed while proving
+  // nothing about the host it named.
+  const keysOf = async (...devices) => {
+    const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents;
+    return devices.map((d) => {
+      const a = served.find((x) => x.device === d);
+      assert.ok(a, `${d} is not in the served payload — this assertion is vacuous`);
+      return siteKeyOfAgent(a);
+    });
+  };
+  const [kA, kB] = await keysOf("mQuietA", "mQuietB");
+  assert.notEqual(kA, kB);                               // the UI hides it too
+  // And the org-less pair the clients DO offer is allowed, so agreement holds
+  // in both directions.
+  await migHost("mQuietC", null);
+  const bothQuiet = await migrate("mQuietC", "s1", { host: "mQuietB" });
+  assert.equal(bothQuiet.status, 200, JSON.stringify(bothQuiet.body));
+  const [kC, kB2] = await keysOf("mQuietC", "mQuietB");
+  assert.equal(kC, kB2);
+  if (bothQuiet.body && bothQuiet.body.migrationId)
+    migrations.delete(bothQuiet.body.migrationId);
+});
+
+
+test("migrate: a genuine same-org move is not refused on the org check", async () => {
+  await migHost("mOkA", "ok1.atlassian.net");
+  await migHost("mOkB", "ok1.atlassian.net");
+  const r = await migrate("mOkA", "s1", { host: "mOkB" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  if (r.body && r.body.migrationId) migrations.delete(r.body.migrationId);
+});
+
+test("http: a persisted non-string orgBound cannot wedge a host's heartbeat", async () => {
+  // An earlier build of this branch bound a non-string org (siteKeyOf did not
+  // coerce yet) and PERSISTED it, so a hub upgrading over its own /data reads
+  // one back. Unguarded, `.slice()` on it threw out of the heartbeat handler:
+  // 400 with the raw exception text on every beat from that host, forever, with
+  // the recovery path throwing too. Nothing coerces orgBound on restore.
+  const host = "wedge-host";
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { siteKey: "acme.atlassian.net" } },
+      headers: agentHeaders,
+    });
+    agents[host].orgBound = { o: 1 };            // what the restore hands back
+    const r = await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { siteKey: "acme.atlassian.net" } },
+      headers: agentHeaders,
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    delete agents[host];
+    orgDriftWarned.delete(host);
+  }
+});
+
+test("http: a non-string siteKey is dropped before it is served", async () => {
+  // Android TYPES jira.siteKey and a full /api/agents decode is atomic there, so
+  // one host beating an object key throws the whole fleet array on every phone.
+  // The coercion belongs in normalizeRecord so the state.json restore is covered
+  // too — see the heartbeat contract in CLAUDE.md.
+  const host = "objkey-host";
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { available: true, siteKey: { o: 1 } } },
+      headers: agentHeaders,
+    });
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const served = res.body.agents.find((a) => a.device === host);
+    assert.ok(served);
+    assert.equal("siteKey" in (served.jira || {}), false);
+  } finally {
+    delete agents[host];
+  }
+});
+
+test("normalizeJira drops a non-string key and leaves a good one alone", () => {
+  const bad = { jira: { available: true, siteKey: ["a"] } };
+  normalizeJira(bad);
+  assert.deepEqual(bad.jira, { available: true });
+  const good = { jira: { siteKey: "acme" } };
+  normalizeJira(good);
+  assert.equal(good.jira.siteKey, "acme");
+  // Shapes that are not an object are left alone rather than thrown on — a
+  // throw here lands in the restore's silent catch and abandons every host
+  // after this one.
+  assert.doesNotThrow(() => normalizeJira({ jira: "nope" }));
+  assert.doesNotThrow(() => normalizeJira({ jira: null }));
+  assert.doesNotThrow(() => normalizeJira(null));
 });
 
 test("migrate: rejects a root session and one with no conversation yet", async () => {
@@ -11567,3 +11751,329 @@ test("usage: a refused beat is not history", async () => {
   assert.equal(fat.status, 413);
   assert.equal(usageLedger.has(host), false);
 });
+
+// --- the org-scoped peer roster (XERK-348) ---------------------------------
+// `ListAgents` is denied agent-side, so this roster is the ONLY address book a
+// session has. What the hub puts in it IS the org boundary, which is why these
+// assert what is EXCLUDED as hard as what is included.
+
+// `bound` defaults to the declared org — the ordinary case, a host the hub bound
+// on its first beat. Pass it explicitly to model a host DECLARING one org while
+// bound to another, which is what an agent token trying to change orgs looks
+// like from here.
+function peerHost(key, siteKey, sessions, ageMs = 0, bound = siteKey) {
+  agents[key] = {
+    key, device: key, lastSeen: Date.now() - ageMs,
+    jira: siteKey ? { siteKey } : undefined,
+    orgBound: bound || undefined,
+    sessions,
+  };
+}
+function peerSession(id, extra = {}) {
+  return { id, rcName: `rc-${id}`, repo: "Turma", status: "running", ...extra };
+}
+function dropPeerHosts(...keys) {
+  for (const k of keys) delete agents[k];
+}
+
+test("orgPeers spans the org's hosts and excludes every other org", () => {
+  peerHost("nasA", "acme.atlassian.net", [peerSession("s1")]);
+  peerHost("nasB", "acme.atlassian.net", [peerSession("s2")]);
+  peerHost("other", "rival.atlassian.net", [peerSession("s3")]);
+  try {
+    const names = orgPeers("nasA").map((p) => p.id);
+    // The whole point: a multi-host org still reaches itself...
+    assert.deepEqual(names.sort(), ["s1", "s2"]);
+    // ...and never anyone else. A regression here is a cross-org leak, not a
+    // cosmetic bug.
+    assert.equal(names.includes("s3"), false);
+  } finally {
+    dropPeerHosts("nasA", "nasB", "other");
+  }
+});
+
+test("an org-less host is alone, never pooled with other org-less hosts", () => {
+  // "No tracker block" is not an org they share — it is the absence of one, and
+  // pooling them would build a roster spanning unrelated deployments.
+  peerHost("loneA", null, [peerSession("s1")]);
+  peerHost("loneB", null, [peerSession("s2")]);
+  try {
+    assert.deepEqual(orgPeers("loneA").map((p) => p.id), ["s1"]);
+  } finally {
+    dropPeerHosts("loneA", "loneB");
+  }
+});
+
+test("an offline host's sessions are left out; the caller's own are not", () => {
+  // A name that can only absorb a message is worse than no name. The caller is
+  // exempt: it is beating right now, by definition.
+  peerHost("nasA", "acme.atlassian.net", [peerSession("mine")]);
+  peerHost("gone", "acme.atlassian.net", [peerSession("dead")], 10 * 60 * 1000);
+  try {
+    assert.deepEqual(orgPeers("nasA").map((p) => p.id), ["mine"]);
+  } finally {
+    dropPeerHosts("nasA", "gone");
+  }
+});
+
+test("only running sessions are listed", () => {
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("run"),
+    peerSession("q", { status: "queued" }),
+    peerSession("stop", { status: "stopped" }),
+  ]);
+  try {
+    assert.deepEqual(orgPeers("nasA").map((p) => p.id), ["run"]);
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("a row carries the ticket, the live branch and the host", () => {
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("s1", {
+      ticket: { key: "XERK-348", summary: "Scope messaging" },
+      summary: "ignored when a ticket names it",
+      git: { liveBranch: "XERK-348" },
+    }),
+  ]);
+  try {
+    const [row] = orgPeers("nasA");
+    assert.equal(row.host, "nasA");
+    assert.equal(row.branch, "XERK-348");
+    assert.equal(row.task, "XERK-348 Scope messaging");
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("a long task is cut on the wire, before the agent ever sees it", () => {
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("s1", { summary: "x".repeat(5000) }),
+  ]);
+  try {
+    assert.ok(orgPeers("nasA")[0].task.length <= 200);
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("the roster is capped, and same-host rows survive the cap first", () => {
+  // Every session reads this file, so an unbounded roster is charged to all of
+  // them — and the peer in the next worktree is likelier to be worth a message
+  // than one two hosts away.
+  peerHost("nasA", "acme.atlassian.net",
+    Array.from({ length: 40 }, (_, i) => peerSession(`mine${i}`)));
+  peerHost("nasB", "acme.atlassian.net",
+    Array.from({ length: 400 }, (_, i) => peerSession(`theirs${i}`)));
+  try {
+    const rows = orgPeers("nasA");
+    assert.equal(rows.length, 120);
+    assert.equal(rows.filter((r) => r.host === "nasA").length, 40);
+  } finally {
+    dropPeerHosts("nasA", "nasB");
+  }
+});
+
+test("an unknown host gets no roster at all", () => {
+  assert.deepEqual(orgPeers("never-heard-of-it"), []);
+});
+
+test("a host is served on the org it is BOUND to, never the one it claims", () => {
+  // The defect this binding exists for: `jira.siteKey` is asserted by the agent
+  // about itself, so without a binding any host token could join any org and
+  // read that org's whole roster — session ids, names, repos, branches, ticket
+  // summaries — which no agent credential can reach otherwise (/api/agents
+  // refuses one). Same objection XERK-268 makes to a self-asserted <host>.
+  peerHost("alpha", "acme.atlassian.net", [peerSession("secret")]);
+  peerHost("alpha2", "acme.atlassian.net", [peerSession("secret2")]);
+  // The rogue must be bound to an org that HAS another member. With a
+  // lone-member binding, BOTH guards in orgPeers are dead code in the fixture:
+  // deleting either left the whole suite green while a drifting host kept its
+  // real org's roster and was served back to its org-mates.
+  peerHost("rmate", "rival.atlassian.net", [peerSession("rivalmate")]);
+  peerHost("rogue", "rival.atlassian.net", [peerSession("mine")]);
+  agents.rogue.jira.siteKey = "acme.atlassian.net";   // bound rival, claiming acme
+  try {
+    const ids = orgPeers("rogue").map((p) => p.id);
+    // Not acme's roster (the org it claims)...
+    assert.equal(ids.includes("secret"), false);
+    assert.equal(ids.includes("secret2"), false);
+    // ...and not rival's either (the org it is bound to): a host lying about its
+    // org is quarantined from BOTH while it says so.
+    assert.equal(ids.includes("rivalmate"), false);
+    assert.deepEqual(ids, ["mine"]);
+    // And it is absent from the impersonated org's roster AND its own mate's.
+    assert.deepEqual(orgPeers("alpha").map((p) => p.id).sort(), ["secret", "secret2"]);
+    assert.deepEqual(orgPeers("rmate").map((p) => p.id), ["rivalmate"]);
+  } finally {
+    dropPeerHosts("alpha", "alpha2", "rmate", "rogue");
+  }
+});
+
+test("orgDrifted/boundOrgOf read the binding, not the claim", () => {
+  assert.equal(boundOrgOf({ orgBound: "a" }), "a");
+  assert.equal(boundOrgOf({ jira: { siteKey: "a" } }), "");   // claim alone binds nothing
+  assert.equal(boundOrgOf(null), "");
+  assert.equal(orgDrifted({ orgBound: "a", jira: { siteKey: "a" } }), false);
+  assert.equal(orgDrifted({ orgBound: "a", jira: { siteKey: "b" } }), true);
+  // Never bound: nothing to drift from, and it gets no peers by the org check.
+  assert.equal(orgDrifted({ jira: { siteKey: "b" } }), false);
+});
+
+test("http: the org binds on first sight and does not move afterwards", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  const host = "tofu-host";
+  try {
+    await beat({ device: host, jira: { siteKey: "first.atlassian.net" } });
+    assert.equal(agents[host].orgBound, "first.atlassian.net");
+    // A later beat claiming a different org must not move the binding — this is
+    // the whole mechanism, and it has to hold on the real route, not just in
+    // the helper.
+    await beat({ device: host, jira: { siteKey: "second.atlassian.net" } });
+    assert.equal(agents[host].orgBound, "first.atlassian.net");
+    // And a heartbeat cannot simply assert its own binding: the field is
+    // assigned AFTER the payload spread, like tokenBound.
+    await beat({ device: host, orgBound: "third.atlassian.net",
+                 jira: { siteKey: "first.atlassian.net" } });
+    assert.equal(agents[host].orgBound, "first.atlassian.net");
+  } finally {
+    delete agents[host];
+    orgDriftWarned.delete(host);
+  }
+});
+
+test("http: orgBound is hub-internal and never served to clients", async () => {
+  const host = "tofu-hidden";
+  try {
+    await request("POST", "/api/heartbeat", {
+      body: { device: host, jira: { siteKey: "acme.atlassian.net" } },
+      headers: agentHeaders,
+    });
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const served = res.body.agents.find((a) => a.device === host);
+    assert.ok(served);
+    assert.equal("orgBound" in served, false);
+  } finally {
+    delete agents[host];
+  }
+});
+
+test("every roster cell is capped on the wire, not just the free-text one", () => {
+  // rcName has no length bound anywhere in the hub's normalizers, and the hub's
+  // own spawn route accepts a 100k label the agent slugs into it. Uncapped, a
+  // few such names build a reply large enough to OOM a 256 MiB hub.
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("i".repeat(9000), {
+      rcName: "n".repeat(200000),
+      repo: "r".repeat(9000),
+      summary: "t".repeat(9000),
+      git: { liveBranch: "b".repeat(9000) },
+    }),
+  ]);
+  try {
+    const [row] = orgPeers("nasA");
+    for (const [field, value] of Object.entries(row)) {
+      assert.ok(value.length <= 120, `${field} was ${value.length} chars`);
+    }
+    // And the whole roster with it: six capped cells x the row cap.
+    assert.ok(JSON.stringify(orgPeers("nasA")).length < 100 * 1024);
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("the roster BUILDS at most the cap, however many sessions are declared", () => {
+  // Capping cell width left the row COUNT unbounded. Nothing limits how many
+  // running sessions a heartbeat may declare, so materialising every row before
+  // slicing to 120 OOM-killed a 256 MiB hub on four hosts x 60k sessions while a
+  // pre-roster hub served the same load. Assert on what is BUILT.
+  const many = (n, p) => Array.from({ length: n }, (_, i) => peerSession(`${p}${i}`));
+  peerHost("nasA", "acme.atlassian.net", many(5000, "mine"));
+  peerHost("nasB", "acme.atlassian.net", many(5000, "theirs"));
+  try {
+    const built = [];
+    const rows = orgPeers("nasA");
+    assert.equal(rows.length, 120);
+    // Own host first and the cap reached there, so no other host is even walked.
+    assert.equal(rows.every((r) => r.host === "nasA"), true);
+    built.push(rows);
+    // And the second host is reached when the first leaves room.
+    peerHost("nasA", "acme.atlassian.net", many(10, "mine"));
+    const mixed = orgPeers("nasA");
+    assert.equal(mixed.length, 120);
+    assert.equal(mixed.filter((r) => r.host === "nasA").length, 10);
+  } finally {
+    dropPeerHosts("nasA", "nasB");
+  }
+});
+
+test("a non-string siteKey is no org at all, not a permanent drift", () => {
+  // `jira` is agent-supplied and `siteKey` is never coerced. An object would be
+  // compared by reference, so a host declaring the same shape every beat reads
+  // as drifted forever: it silently loses every peer and warns on every beat.
+  assert.equal(siteKeyOf({ jira: { siteKey: { o: 1 } } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: ["a"] } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: 5 } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: true } }), "");
+  assert.equal(siteKeyOf({ jira: { siteKey: "acme" } }), "acme");
+  // So a host declaring one is org-less and stable, never drifting.
+  const a = { orgBound: undefined, jira: { siteKey: { o: 1 } } };
+  assert.equal(orgDrifted(a), false);
+});
+
+test("the drift warning is rate-limited per host, and capped on both sides", () => {
+  // Keying the de-dupe on the declared VALUE let a host alternating two site
+  // keys warn every beat; keying it on a drifted/not-drifted FLAG was no better,
+  // because the flag flips just as easily — whether the host alternates two orgs
+  // or alternates one org with silence. Both measured ~10 warns per 20 beats.
+  // Only a time bound holds, and the interpolated keys need capping on both
+  // sides: they are agent-supplied and uncapped upstream, and a 100 KB siteKey
+  // wrote a 100 KB log line from a single agent token.
+  const lines = [];
+  const realWarn = console.warn;
+  console.warn = (m) => lines.push(String(m));
+  peerHost("flip", "a".repeat(100000), [peerSession("s1")], 0, "bound.example");
+  try {
+    for (let i = 0; i < 20; i++) {
+      if (i % 3 === 0) agents.flip.jira.siteKey = "a".repeat(100000);
+      else if (i % 3 === 1) delete agents.flip.jira.siteKey;   // silence
+      else agents.flip.jira.siteKey = "bound.example";          // its real org
+      warnOrgDrift("flip", agents.flip);
+    }
+    assert.equal(lines.length, 1, `warned ${lines.length} times in 20 beats`);
+    assert.ok(lines[0].length < 500, `log line was ${lines[0].length} chars`);
+    // The SUBSTANCE of the line, not just its length. It is the only thing that
+    // tells an operator what happened, and it once claimed the only recovery was
+    // deleting the host — which is false, since the binding never moves. Without
+    // this the whole sentence can be replaced and the suite stays green.
+    assert.match(lines[0], /declares org/);
+    assert.match(lines[0], /but is bound to/);
+    assert.match(lines[0], /no peers beyond its own sessions/);
+    assert.match(lines[0], /declares the bound org again is served normally/);
+
+    // BOTH interpolated sides need the cap. Only the claimed side was covered,
+    // and deleting the bound-side slice escaped the suite.
+    lines.length = 0;
+    orgDriftWarned.delete("flip");            // clear the rate limit, not the drift
+    agents.flip.orgBound = "b".repeat(100000);
+    agents.flip.jira.siteKey = "short";
+    warnOrgDrift("flip", agents.flip);
+    assert.equal(lines.length, 1);
+    assert.ok(lines[0].length < 500, `bound-side line was ${lines[0].length} chars`);
+
+    // A host that is NOT drifting never warns, however often it beats.
+    lines.length = 0;
+    orgDriftWarned.delete("flip");
+    agents.flip.orgBound = "bound.example";
+    agents.flip.jira.siteKey = "bound.example";
+    for (let i = 0; i < 5; i++) warnOrgDrift("flip", agents.flip);
+    assert.equal(lines.length, 0);
+  } finally {
+    console.warn = realWarn;
+    dropPeerHosts("flip");
+    orgDriftWarned.delete("flip");
+  }
+});
+

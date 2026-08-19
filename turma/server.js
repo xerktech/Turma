@@ -1507,7 +1507,8 @@ function serializeAgent(key, agent, now) {
   // `unsupported` is NOT: it's a tiny, rarely-changing map of what this host's
   // agent can't do, worth reading.
   const { history, subagentHistory, jiraIssues, statusResults,
-          createMeta, createTypes, createResults, resultWaits, tokenBound, ...a } = agent;
+          createMeta, createTypes, createResults, resultWaits, tokenBound,
+          orgBound, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   // Earlier epochs of this host's spend added back (XERK-338). Null — and so
   // free — for every host that has never lost transcripts, which is all of them
@@ -1683,7 +1684,168 @@ function dropQueuedCommand(key, cmdId, kind) {
 // this, so two hosts of one Jira org can trade sessions but no session ever
 // leaves its org (or leaks between an org host and an org-less one).
 function siteKeyOf(a) {
-  return (a && a.jira && a.jira.siteKey) || "";
+  const v = a && a.jira && a.jira.siteKey;
+  // STRINGS only. `jira` is agent-supplied and nothing coerces `siteKey`, so an
+  // object or array would be compared by reference: a host declaring the same
+  // `{...}` every beat compares unequal to the one stored in `orgBound`, reads
+  // as permanently drifted, silently loses every peer and warns on every beat.
+  // Anything that is not a string is "no org", which is the narrow answer.
+  return typeof v === "string" ? v : "";
+}
+
+// --- the org-scoped peer roster (XERK-348) --------------------------------
+//
+// Cross-session messaging has exactly ONE boundary control of its own — this
+// machine vs. beyond it — and OUR boundary is the org, which spans hosts. The
+// axes don't line up, so the boundary is drawn where the hub can draw it: an
+// agent denies `ListAgents` (which removes the tool outright, so a session
+// cannot ENUMERATE anyone), and the only address book left is the roster this
+// builds. Note the limit precisely: `SendMessage` resolves any string it is
+// given, so a session can still GUESS a name — rcName is `<host>-<repo>-<KEY>`
+// and structurally guessable. What the roster removes is discovery, not
+// delivery. Never write it up as "can only name what the hub sent".
+//
+// The rule is siteKeyOf's, exactly as a migration's is: same org only, and an
+// ORG-LESS host is alone rather than pooled with every other org-less host.
+// Never widen this to "every host the hub knows" — the roster IS the boundary.
+const PEERS_MAX_ROWS = 120;
+// The wire cap on EVERY cell, not just the free-text one. The agent caps and
+// flattens each cell again on arrival (_peer_cell) — it owns the file's format,
+// and this crosses a trust boundary — but the reply is built and held HERE, so
+// an uncapped field is the hub's problem before it is ever the agent's.
+//
+// Capping only `task` was not a smaller version of this, it was a hole: nothing
+// in sanitizeHeartbeat or normalizeRecord bounds `rcName`, whose only limit is
+// AGENT_RECORD_MAX across the WHOLE record, and the hub's own spawn route takes
+// a SPAWN_FIELD_MAX (100k) `label` that the agent slugs straight into it. Four
+// org hosts x 30 sessions x a 200 KB name each — every record inside the 8 MiB
+// gate — built a 23.8 MB reply and OOM-killed a hub in a real 256 MiB cgroup,
+// while the same load left a pre-roster hub serving at 122 MB. `mem_limit: 256m`
+// plus `restart: unless-stopped` is the outage loop the memory-ceiling contract
+// in CLAUDE.md exists to prevent. Six capped cells x PEERS_MAX_ROWS bounds the
+// whole roster at ~86 KB.
+const PEER_CELL_MAX = 120;
+const peerCell = (v) => String(v == null ? "" : v).slice(0, PEER_CELL_MAX);
+
+// The org the hub BOUND this host to when it first declared one, which is NOT
+// the one it claims on this beat. `jira.siteKey` is asserted by the agent about
+// itself, so gating a disclosure on it lets any holder of any host's token join
+// any org and read that org's whole session roster — session ids, peer names,
+// repos, live branches and ticket summaries — none of which an agent credential
+// could reach before (`/api/agents` refuses one). That is the same objection
+// XERK-268 makes to trusting a self-asserted `<host>`, and the binding is the
+// answer to it: trust-on-first-use, hub-owned, persisted with the record, and
+// reset by the operator action that already exists — DELETE /api/agents/<host>.
+function boundOrgOf(a) {
+  const v = a && a.orgBound;
+  // STRINGS only, for the same reason siteKeyOf coerces — and one more: this
+  // value is PERSISTED. An earlier build of this branch bound a non-string org
+  // (siteKeyOf did not coerce yet), so a hub upgrading over its own `/data`
+  // reads one back, and `.slice()` on it threw out of the heartbeat handler:
+  // 400 with the raw exception text on EVERY beat from that host, forever, with
+  // the recovery path throwing too. Nothing coerces `orgBound` on restore, so
+  // the guard has to live here.
+  return typeof v === "string" ? v : "";
+}
+
+// Warned once per host per drift, so a permanently misconfigured host does not
+// bury the log — but the operator has to be able to SEE this: from the host's
+// own side a drift is indistinguishable from "my org has no other hosts up".
+// Rate-limited per host by TIME, which is the only bound that holds. Keying on
+// the declared value let a host alternating two site keys warn every beat, and
+// keying on a drifted/not-drifted flag was no better: the flag flips just as
+// easily as the value, whether the host alternates two orgs or alternates one
+// org with silence. Both were measured at ~10 warns per 20 beats. Interpolated
+// keys are capped on BOTH sides — they are agent-supplied and uncapped upstream,
+// and a 100 KB siteKey wrote a 100 KB log line.
+const orgDriftWarned = new Map();
+const ORG_KEY_LOG_MAX = 80;
+const ORG_DRIFT_WARN_EVERY_MS = 10 * 60 * 1000;
+function warnOrgDrift(key, a) {
+  if (!orgDrifted(a)) return;
+  const now = Date.now();
+  const last = orgDriftWarned.get(key) || 0;
+  if (now - last < ORG_DRIFT_WARN_EVERY_MS) return;
+  orgDriftWarned.set(key, now);
+  const claimed = siteKeyOf(a).slice(0, ORG_KEY_LOG_MAX);
+  console.warn(
+    `heartbeat from ${logName(key)}: declares org ${JSON.stringify(claimed)} ` +
+      `but is bound to ${JSON.stringify(boundOrgOf(a).slice(0, ORG_KEY_LOG_MAX))} ` +
+      `— serving it no peers beyond its own sessions while it says so. The ` +
+      `binding does not move; a beat that declares the bound org again is served ` +
+      `normally. If this host really moved org, remove it ` +
+      `(DELETE /api/agents/<host>) and let it re-register.`
+  );
+}
+
+// A host declaring a different org than the one it is bound to. Either it was
+// reconfigured (remove the host; the binding goes with the record) or a token
+// holder is trying to change orgs. Both get the same answer: no peers but its
+// own, and it is excluded from everyone else's roster.
+function orgDrifted(a) {
+  const bound = boundOrgOf(a);
+  const claimed = siteKeyOf(a);
+  // Drift is DECLARING A DIFFERENT ORG, not failing to declare one. A host that
+  // sends no `jira` block — tracker never configured, configuration removed, or
+  // simply a beat that omits it — asserts nothing, so there is nothing to
+  // disagree with: it keeps its binding and its peers. Treating "" as drift
+  // locked such a host out of its own roster AND out of migration on the beat
+  // its tracker went quiet, which is a self-inflicted outage, not a boundary.
+  // The attack this exists for still trips it: joining another org means
+  // declaring that org, which is non-empty and different.
+  return !!bound && !!claimed && claimed !== bound;
+}
+
+// One host's running sessions, appended until the roster is FULL. The cap has to
+// bound what is BUILT, not what is returned: capping cell width alone left the
+// row COUNT unbounded, and nothing limits how many running sessions a heartbeat
+// may declare — a ~3.8 MB record buys ~60,000 of them, and materialising four
+// such hosts' rows before slicing to 120 OOM-killed a 256 MiB hub 3/3 while a
+// pre-roster hub served the identical load at 156 MB. Build 120 rows, never
+// 240,000 and then 120.
+function pushPeerRows(rows, host, a) {
+  for (const s of a.sessions || []) {
+    if (rows.length >= PEERS_MAX_ROWS) return;
+    if (!s || s.status !== "running") continue;
+    const t = s.ticket || {};
+    const task = t.key ? `${t.key} ${t.summary || ""}` : (s.summary || s.label || "");
+    rows.push({
+      id: peerCell(s.id),
+      name: peerCell(s.rcName),
+      host: peerCell(host),
+      repo: peerCell(s.repo),
+      // The branch the agent named for itself; "" reads as detached agent-side.
+      branch: peerCell((s.git && s.git.liveBranch) || ""),
+      task: peerCell(task),
+    });
+  }
+}
+
+function orgPeers(key) {
+  const me = agents[key];
+  if (!me) return [];
+  // A drifted host is treated exactly as an org-less one: it still sees its own
+  // sessions, which it already knows, and nothing else.
+  const org = orgDrifted(me) ? "" : boundOrgOf(me);
+  const now = Date.now();
+  const rows = [];
+  // This host FIRST, so its own rows are the ones that survive a full roster:
+  // the peer in the next worktree is likelier to be worth a message than one
+  // two hosts away.
+  pushPeerRows(rows, key, me);
+  if (!org) return rows;
+  for (const [host, a] of Object.entries(agents)) {
+    if (rows.length >= PEERS_MAX_ROWS) break;
+    if (!a || host === key) continue;
+    // No org of its own means no peers of its own; a drifted host is excluded
+    // from everyone else's roster as well as getting none of its own.
+    if (boundOrgOf(a) !== org || orgDrifted(a)) continue;
+    // An offline host's sessions cannot take delivery, and a name that only
+    // absorbs a message is worse than no name at all.
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    pushPeerRows(rows, host, a);
+  }
+  return rows;
 }
 
 // Begin a migration: queue exportSession on the source and record the pending
@@ -3303,6 +3465,27 @@ function normalizeRecord(a) {
   normalizeLocalModel(a);
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
+  normalizeJira(a);
+}
+
+/**
+ * `jira.siteKey` coerced to a string, or dropped (XERK-348).
+ *
+ * It is agent-supplied and was served RAW, while Android types it
+ * (`AgentInfo.jira.siteKey: String`) and a full `/api/agents` decode is atomic
+ * there — so one host beating an object key throws the whole fleet array on
+ * every phone. Per the heartbeat contract in CLAUDE.md, typing a field and
+ * adding its hub-side coercion are the same change, and `normalizeRecord` is
+ * where it goes so the `state.json` restore is covered as well as the ingest.
+ *
+ * Dropped rather than stringified: `siteKeyOf` already reads a non-string as
+ * "no org", and inventing `"[object Object]"` would make one up instead.
+ */
+function normalizeJira(a) {
+  if (!a || typeof a !== "object") return;
+  const j = a.jira;
+  if (!j || typeof j !== "object" || Array.isArray(j)) return;
+  if ("siteKey" in j && typeof j.siteKey !== "string") delete j.siteKey;
 }
 
 /**
@@ -6861,6 +7044,11 @@ const server = http.createServer(async (req, res) => {
         // heartbeat claiming it is bound cannot make itself so; read only by
         // ttydAuth, and stripped from the fleet payload like the caches.
         tokenBound,
+        // The org this host is BOUND to (XERK-348), assigned after the spread
+        // for the same reason `tokenBound` is: a heartbeat claiming a binding
+        // must not be able to make itself one. Set on the first beat that
+        // declares an org and never moved after — see boundOrgOf.
+        orgBound: prev.orgBound || siteKeyOf(payload) || undefined,
         lastSeen: Date.now(),
         // Per-agent alert bookkeeping survives across beats and hub restarts.
         alerts: prev.alerts || {},
@@ -7047,10 +7235,15 @@ const server = http.createServer(async (req, res) => {
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
+      // The roster rides every reply (XERK-348). Built AFTER this beat's ingest,
+      // so a session that first appeared on it is addressable by its peers on
+      // their next beat rather than the one after.
+      warnOrgDrift(key, next);
+      const peers = orgPeers(key);
       return json(res, 200, archiveHave
-        ? { commands: reply, archiveHave, archiveShed, archiveFull,
+        ? { commands: reply, peers, archiveHave, archiveShed, archiveFull,
             archiveRawHave, archiveRawSkip }
-        : { commands: reply });
+        : { commands: reply, peers });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
@@ -7682,6 +7875,24 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "a different target host is required" });
         const tgt = agents[target];
         if (!tgt) return json(res, 404, { error: "unknown target host" });
+        // The CLAIMED org on both sides, deliberately UNCHANGED by XERK-348's
+        // org binding, which gates the peer roster and nothing else.
+        //
+        // Two attempts to bind-gate this route were reverted, and neither should
+        // be retried without the missing piece. Comparing `orgBound` made the hub
+        // and every Move menu disagree in both directions, because `orgBound` is
+        // stripped from the served payload and no client can mirror a rule keyed
+        // on it. Refusing a DRIFTED host on top of a claim match is what is left
+        // of that, and it buys almost nothing: the refusal is one beat deep — a
+        // drifted host that simply omits its `jira` block on the next beat is a
+        // legal target again — while being the only surviving hub/client
+        // divergence. It also does not close the real hole, which predates this
+        // and is measured in XERK-349: two hosts that BOTH declare no org match
+        // each other whatever they are bound to, so a session can be relayed
+        // across a binding boundary with no drift anywhere.
+        //
+        // Closing that means serving the DECIDED org so the three client mirrors
+        // can agree with the hub. That is a parity change, and it is XERK-349.
         if (siteKeyOf(src) !== siteKeyOf(tgt))
           return json(res, 409, { error: "the target agent is in a different org" });
         if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
@@ -9074,6 +9285,7 @@ if (process.env.TURMA_TEST) {
     normalizeRecord,
     normalizeLocalModel,
     normalizeRetired,
+    normalizeJira,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
@@ -9192,6 +9404,11 @@ if (process.env.TURMA_TEST) {
     dropMigrationBlob,
     migrationSpoolPath,
     siteKeyOf,
+    orgPeers,
+    boundOrgOf,
+    orgDrifted,
+    orgDriftWarned,
+    warnOrgDrift,
   };
 } else if (process.argv[2] === "--agent-token") {
   // `node turma/server.js --agent-token <host>` prints the token that host's

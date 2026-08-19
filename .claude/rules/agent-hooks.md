@@ -18,6 +18,20 @@ implementation contract behind it.
   and the file-editing tools, plus `permissions.deny` rules on host credential stores (`~/.ssh`,
   `~/.aws`, `~/.azure`, `~/.terraform.d`, `~/.claude`, `~/.config/gcloud`) — shared by every
   session, so deny wins even under bypass.
+- **`_GUARD_DENY_TOOL_RULES` denies `ListAgents`** (XERK-348) — tool rules, bare names, no
+  specifier, beside the path rules. Denying it REMOVES the tool (verified: the session reports no
+  schema exists to call), which is what makes `PEERS_FILE` the only address book a session has and
+  therefore the org boundary. **`SendMessage` must stay**: it resolves a bare roster name with no
+  prior listing (verified), and denying it would also remove messaging to subagents and agent-team
+  teammates, which ride the same tool. The equality pin in `test_guard_settings.py` covers the PATH
+  rules only, so a tool rule added here needs its own assertion.
+  - `Edit(~/.turma/peers.tsv)` is denied beside the other `~/.turma` files: the roster is the org
+    boundary, so a session must not append rows to its own address book. Bash walks past every
+    pattern (XERK-309), so this covers the file-edit tools only, like its neighbours.
+  - **`Read(~/.turma/peers.tsv)` is ALLOWED, and that pairing is the point.** The roster lives
+    outside every repo, so without the allow rule reading it costs a permission prompt on exactly
+    the file the session's own directive points at — and with `ListAgents` denied outright, a
+    session that never gets that approval has no address book at all. Read granted, Edit denied.
 - **That same file carries `crossSessionInbound: accept`** (XERK-339), and it is a fix rather than
   a convenience. Claude Code's default HOLDS a peer message whenever the sending and receiving
   sessions' permission-mode classes differ — and `bypassPermissions` is a class of its own — by

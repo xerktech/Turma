@@ -5794,7 +5794,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
         sess = sm.registry[0]
-        peers = ha.PEERS_SYSTEM_PROMPT.format(path=ha.PEERS_FILE, sid=sess["id"])
+        peers = ha.PEERS_SYSTEM_PROMPT.format(
+            path=ha.PEERS_FILE, sid=sess["id"], host=sm.device)
         self.assertEqual(sess["status"], "running")
         wt = self._worktree_add_cmd()
         self.assertIn("--detach", wt)
@@ -5937,7 +5938,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm.spawn("Turma")
         cmd = self._claude_cmd()
         peers = ha.PEERS_SYSTEM_PROMPT.format(
-            path=ha.PEERS_FILE, sid=sm.registry[0]["id"])
+            path=ha.PEERS_FILE, sid=sm.registry[0]["id"], host=sm.device)
         self.assertIn(
             "--append-system-prompt "
             + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + peers),
@@ -6004,6 +6005,41 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
                         sess["rcName"])
         self.assertNotIn(sess["id"], sess["rcName"])
 
+    def test_two_sessions_never_share_a_peer_name(self):
+        """A duplicate name makes BOTH sessions unaddressable, not just
+        confusable: SendMessage refuses the ambiguous name and demands a `[ref]`
+        the roster has no column for and no way to learn with ListAgents denied,
+        so the message reaches neither. Measured on Claude Code 2.1.235 — it does
+        not rename the later session for us."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", ticket={"key": "XERK-339", "summary": "first go"})
+        sm.spawn("Turma", ticket={"key": "XERK-339", "summary": "second go"})
+        names = [s["rcName"] for s in sm.registry]
+        self.assertEqual(len(set(names)), 2, names)
+        self.assertTrue(names[0].endswith("-Turma-XERK-339"))
+        self.assertTrue(names[1].endswith("-Turma-XERK-339-2"))
+
+    def test_a_stopped_session_releases_its_peer_name(self):
+        """Only a LIVE session reserves a name — a stopped one holds no inbox
+        socket, so recycling its name is the point rather than a hazard."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", label="hotfix")
+        first = sm.registry[0]["rcName"]
+        sm.registry[0]["status"] = "stopped"
+        sm.spawn("Turma", label="hotfix")
+        self.assertEqual(sm.registry[1]["rcName"], first)
+
+    def test_a_duplicate_operator_label_also_gets_a_variant(self):
+        """The collision is not ticket-specific: an operator reusing a label in
+        one repo hits it too."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", label="hotfix")
+        sm.spawn("Turma", label="hotfix")
+        self.assertNotEqual(sm.registry[0]["rcName"], sm.registry[1]["rcName"])
+
     def test_operator_label_still_beats_the_ticket_key(self):
         """An explicitly typed label is the operator's own name for the session
         and outranks the key we would otherwise derive."""
@@ -6031,8 +6067,13 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sess = sm.registry[0]
         cmd = self._claude_cmd()
         self.assertIn(ha.PEERS_FILE, cmd)
-        self.assertIn(f"the row whose `id` is {sess['id']} is you", cmd)
-        self.assertIn("rather than calling\nListAgents", cmd)
+        # Keyed on host AND id: ids are unique per host and the roster now spans
+        # hosts, so a bare id can name a peer as yourself.
+        self.assertIn(f"`host` is {sm.device} AND `id` is {sess['id']}", cmd)
+        self.assertIn("use no other roster: ListAgents is\nunavailable", cmd)
+        # The org boundary is the point of the file, so the directive has to say
+        # so — a session that treats it as a convenience will reach past it.
+        self.assertIn("scoped to your organisation", cmd)
 
     def test_peers_file_lists_running_sessions_only(self):
         """A queued session has no claude to receive anything and a stopped one's
@@ -6050,8 +6091,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         ])
         body = open(ha.PEERS_FILE).read()
         rows = [r for r in body.splitlines() if not r.startswith("#")]
-        self.assertEqual(rows,
-                         ["aaaaa\tnas-Turma-XERK-1\tTurma\tXERK-1\tlive one"])
+        self.assertEqual(
+            rows, [f"aaaaa\tnas-Turma-XERK-1\t{sm.device}\tTurma\tXERK-1\tlive one"])
 
     def test_peers_file_prefers_the_ticket_and_says_detached(self):
         """The task column names the ticket where there is one, and a session
@@ -6065,8 +6106,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         ])
         row = [r for r in open(ha.PEERS_FILE).read().splitlines()
                if not r.startswith("#")][0]
-        self.assertEqual(row.split("\t")[3], "detached")
-        self.assertEqual(row.split("\t")[4], "XERK-9 Do the thing")
+        self.assertEqual(row.split("\t")[4], "detached")
+        self.assertEqual(row.split("\t")[5], "XERK-9 Do the thing")
 
     def test_a_beat_publishes_the_roster(self):
         """The wiring, not just the writer: a heartbeat leaves the roster on disk
@@ -6080,7 +6121,84 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         rows = [r for r in open(ha.PEERS_FILE).read().splitlines()
                 if not r.startswith("#")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].split("\t")[:2], [sess["id"], sess["rcName"]])
+        self.assertEqual(rows[0].split("\t")[:3],
+                         [sess["id"], sess["rcName"], sm.device])
+
+    def test_hub_roster_replaces_the_local_one(self):
+        """XERK-348: the hub's rows are ORG-scoped and span hosts, so when it
+        sends them they are the roster — the local list is only the fallback."""
+        sm = self.make_manager()
+        sm._ingest_peers([
+            {"id": "p1", "name": "MaxAI-Turma-XERK-9", "host": "MaxAI",
+             "repo": "Turma", "branch": "XERK-9", "task": "XERK-9 elsewhere"},
+        ])
+        sm._write_peers_file([
+            {"id": "local", "rcName": "nas-Turma-local", "repo": "Turma",
+             "status": "running", "summary": "not this one"},
+        ])
+        rows = [r for r in open(ha.PEERS_FILE).read().splitlines()
+                if not r.startswith("#")]
+        self.assertEqual(
+            rows, ["p1\tMaxAI-Turma-XERK-9\tMaxAI\tTurma\tXERK-9\tXERK-9 elsewhere"])
+
+    def test_a_reply_without_peers_forgets_the_last_roster(self):
+        """The boundary may only fail NARROW. A hub that stops vouching for a
+        roster — downgraded, or unable to resolve this host's org — must not
+        leave sessions addressing names it no longer stands behind."""
+        sm = self.make_manager()
+        sm._ingest_peers([{"id": "p1", "name": "other-host-session",
+                           "host": "MaxAI", "repo": "Turma"}])
+        self.assertIsNotNone(sm.peer_fleet)
+        sm._ingest_peers(None)                  # a reply carrying no `peers`
+        self.assertIsNone(sm.peer_fleet)
+        sm._write_peers_file([
+            {"id": "local", "rcName": "nas-Turma-local", "repo": "Turma",
+             "status": "running", "summary": "mine"},
+        ])
+        body = open(ha.PEERS_FILE).read()
+        self.assertNotIn("other-host-session", body)
+        self.assertIn("nas-Turma-local", body)
+
+    def test_a_stale_hub_roster_falls_back_to_this_host(self):
+        """Same rule against the clock: the hub going silent expires its roster
+        rather than freezing it, since its rows name sessions on OTHER hosts
+        that nothing has confirmed since."""
+        sm = self.make_manager()
+        sm._ingest_peers([{"id": "p1", "name": "other-host-session",
+                           "host": "MaxAI", "repo": "Turma"}])
+        sm.peer_fleet_at = time.time() - (ha.PEERS_FLEET_TTL_SEC + 1)
+        sm._write_peers_file([
+            {"id": "local", "rcName": "nas-Turma-local", "repo": "Turma",
+             "status": "running", "summary": "mine"},
+        ])
+        body = open(ha.PEERS_FILE).read()
+        self.assertNotIn("other-host-session", body)
+        self.assertIn("nas-Turma-local", body)
+
+    def test_wire_rows_are_validated_and_capped(self):
+        """The roster crossed a trust boundary, so the agent re-checks it: a row
+        with no `name` is unaddressable and only misleads, a non-dict is noise,
+        and the row count is bounded here as well as hub-side."""
+        sm = self.make_manager()
+        sm._ingest_peers(
+            ["not a dict", {"id": "x", "host": "h"}]                 # both dropped
+            + [{"id": f"p{i}", "name": f"n{i}", "host": "h"}
+               for i in range(ha.PEERS_MAX_ROWS + 25)])
+        self.assertEqual(len(sm.peer_fleet), ha.PEERS_MAX_ROWS)
+        self.assertTrue(all(r[1] for r in sm.peer_fleet))
+
+    def test_wire_rows_are_sanitized_like_local_ones(self):
+        """_peer_cell runs whatever the source: a hub row carrying a tab would
+        otherwise shift every later column under the wrong heading."""
+        sm = self.make_manager()
+        sm._ingest_peers([{"id": "p1", "name": "peer", "host": "h",
+                           "repo": "Turma", "branch": "b",
+                           "task": "two\tcols\nand a row"}])
+        sm._write_peers_file([])
+        row = [r for r in open(ha.PEERS_FILE).read().splitlines()
+               if not r.startswith("#")][0]
+        self.assertEqual(row.split("\t"),
+                         ["p1", "peer", "h", "Turma", "b", "two cols and a row"])
 
     def test_peers_file_write_failure_never_reaches_the_beat(self):
         """Best-effort by contract: the roster is a convenience, and a heartbeat
@@ -10162,13 +10280,24 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            # Real HTTPResponse.read takes an optional size, and post() now
+            # passes one (HEARTBEAT_REPLY_MAX) — a no-arg double stops standing
+            # in for the thing it fakes. RECORDED, not just tolerated: a widened
+            # double that ignores its argument let the bound be deleted with
+            # both suites still green.
+            def read(self, *a):
+                FakeResp.read_args = a
                 return b"{}"
 
         with mock.patch.object(ha.urllib.request, "urlopen",
                                 return_value=FakeResp()):
             reply = sm.post(payload2)
         self.assertEqual(reply, {})
+        # The heartbeat reply is BOUNDED (XERK-348): it now carries a peer
+        # roster, so an unbounded read makes the hub's reply size this process's
+        # memory ceiling. Asserted here because deleting the bound is otherwise
+        # invisible to every test.
+        self.assertEqual(FakeResp.read_args, (ha.HEARTBEAT_REPLY_MAX,))
         self.assertEqual(sm.history_results, [])
         self.assertNotIn("historyResults", sm.build_payload(2))
 
@@ -10479,7 +10608,7 @@ class _FakeHttpResp:
     def __exit__(self, *a):
         return False
 
-    def read(self):
+    def read(self, *a):          # real HTTPResponse.read takes an optional size
         return json.dumps(self._body).encode()
 
 

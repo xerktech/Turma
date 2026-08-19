@@ -97,6 +97,60 @@ which makes an `android/` change part of the same PR) live there.
   org).
 - Tests: `turma/tests/org.test.js`.
 
+## Org binding and the peer roster (XERK-348)
+
+The cross-component contract is in `CLAUDE.md` ("The peer roster IS the org boundary"); this is the
+hub half.
+
+- **`orgBound` is the org the hub bound a host to on its first declaring beat**, assigned AFTER the
+  payload spread (like `tokenBound`) so a heartbeat cannot assert its own, persisted with the
+  record, stripped from the served payload, and reset only by `DELETE /api/agents/<host>`.
+- **Drift is declaring a DIFFERENT org, never failing to declare one.** A host whose tracker goes
+  quiet asserts nothing, so it keeps its binding and its peers. Treating an absent `jira` block as
+  drift locked it out of its roster AND out of migration on that beat — an outage caused by the
+  boundary rather than prevented by it, and the real migrate tests beat exactly that shape. The
+  attack still trips it: joining another org means naming that org.
+- **The migrate route is UNCHANGED by the binding: it compares the claimed org.** Two attempts to
+  bind-gate it were reverted, and neither should be retried without the missing piece.
+  - Comparing `orgBound` broke the UI in BOTH directions — menus offering a host the hub then 409s,
+    and a legal target no menu would show — because **no client can mirror a rule keyed on
+    `orgBound`**: it is stripped from the served payload, so `eligibleMoveTargets`
+    (`sessions.html`), its Android twin (`core/Sessions.kt`) and the glasses fork see only
+    `jira.siteKey`.
+  - Refusing a DRIFTED host on top of a claim match was the fallback, and it buys almost nothing:
+    the refusal is **one beat deep** (a drifted host that omits its `jira` block next beat is a
+    legal target again) while being the only surviving hub/client divergence.
+  - **Neither closes the real hole**, which predates all of this: two hosts that both declare NO
+    org match each other whatever they are bound to, so a session's raw transcript bytes can be
+    relayed across a binding boundary with no drift anywhere — driven end to end to `phase: done`.
+    That, and the derived org that would close it, are **XERK-349**.
+  - Pin this route with a REQUEST against it, and assert the status you mean: a test asserting a
+    predicate copied into the test file passes with the route reverted (it happened twice, and the
+    copy then went stale), and `notEqual(409)` passes on the 503 the shared in-flight cap really
+    returns.
+- **There are THREE client mirrors of "an agent's org", not one**: `turma/public/org.js`'s
+  `siteKeyOf`, `sessions.html`'s own `siteKeyOfAgent` (the one the Move menu actually uses), and
+  Android's. Only the first mirrors the hub's coercion today; the server-side `normalizeJira` is
+  what makes that safe rather than the client guards.
+- **`boundOrgOf` and `siteKeyOf` both coerce to string.** `orgBound` is PERSISTED, so an uncoerced
+  one returns on restore and threw the heartbeat handler — 400 on every beat from that host,
+  forever, recovery path included. `normalizeJira` drops a non-string `siteKey` for the client-side
+  half of the same hazard, and `turma/public/org.js`'s `siteKeyOf` mirrors the coercion.
+- **`orgPeers` bounds what it BUILDS, not what it returns.** Nothing limits how many running
+  sessions a heartbeat declares (a ~3.8 MB record buys ~60,000), so building every row before
+  slicing to `PEERS_MAX_ROWS` OOM-killed a 256 MiB hub while the pre-roster hub served the same load.
+  Every cell is capped at `PEER_CELL_MAX` too — `rcName` is bounded by nothing else, and the spawn
+  route accepts a 100k `label` that the agent slugs into it.
+- `warnOrgDrift` is rate-limited per host **by time** (`ORG_DRIFT_WARN_EVERY_MS`). Keying the
+  de-dupe on the declared value let a host alternating two site keys warn every beat, and keying it
+  on a drifted/not-drifted flag was no better — the flag flips just as easily, whether the host
+  alternates two orgs or alternates one org with silence (~10 warns per 20 beats, measured both
+  ways). Both interpolated keys are capped at `ORG_KEY_LOG_MAX`.
+- **Drift quarantine is self-healing and the warning says so**: the binding never moves, so a beat
+  that declares the bound org again is served normally. Don't reword it back into "remove the host"
+  as the only recovery.
+- Tests: the `orgPeers`/`orgDrifted`/`migrate:` cases in `server.test.js`, `org.test.js`.
+
 ## Dashboard (`index.html`)
 
 ### Fleet tree (host → repo → session)
