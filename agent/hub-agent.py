@@ -5064,7 +5064,10 @@ def _queued_display(queue):
 # history, and a message the operator sent that was still QUEUED — or was typed
 # straight into the pane as compaction began — can be dropped by it instead of
 # consumed: it never becomes a real user turn and never reaches the model, so
-# the operator's message silently vanishes (XERK-47). send_input records every
+# the operator's message silently vanishes (XERK-47). This covers what the PANE
+# carries, which since XERK-340 is operator traffic plus the inbox-less
+# fallback; a message the session's own inbox accepted is queued by Claude Code
+# and never at risk. send_input records every
 # sent message on the session record and _poll_pending_inputs gives it an
 # at-least-once guarantee across a compaction: it reaps the record on delivery,
 # and on a FRESH compaction that ate the message re-types it once the pane has
@@ -6302,8 +6305,8 @@ def _capture_pane(tmux_name):
 # Control bytes that must never reach a pane. The text is delivered as a
 # bracketed paste, so an ESC — or a literal end-of-paste marker — inside it
 # would close the paste early and have everything after it read as KEYSTROKES;
-# and the text is not always the operator's own (a PR review comment is typed
-# into the session by _poll_pr_comments). Tab and newline are real content and
+# and the text is not always the operator's own (a PR review comment reaches the
+# pane this way whenever the session has no inbox — see notify_session). Tab and newline are real content and
 # survive; \r is normalized to \n first.
 INPUT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # The fallback keystroke send carries the text as a tmux COMMAND argument, which
@@ -6466,6 +6469,151 @@ def _type_into_pane(tmux_name, text):
             run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", chunk])
     run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
     return pasted
+
+
+# --- the session inbox (XERK-340) --------------------------------------------
+#
+# Claude Code gives every session a real INBOX: a per-session unix socket that
+# takes newline-delimited JSON and hands what it accepts to Claude Code's own
+# queue, read between tool calls without interrupting one. For the messages this
+# MANAGER composes — PR review activity (XERK-49), merge-conflict nudges
+# (XERK-223) — that beats _type_into_pane on three counts:
+#
+#   - a compaction cannot eat it, so those messages need neither the XERK-47
+#     outbox nor the per-beat transcript read that confirms it;
+#   - it does not depend on the pane, so a turn in flight, a half-typed input
+#     line or a dialog owning it no longer decides whether the message lands;
+#   - a mis-addressed message is DROPPED rather than delivered: every post names
+#     the claude session id it is for and Claude Code refuses a mismatch, which
+#     is what makes connecting to a socket named after a RECYCLED pid safe.
+#
+# What must NOT come this way is anything a PERSON typed — the chat composer's
+# Send, and answer_question's dialog keystrokes. An inbox message arrives as a
+# PEER message: Claude Code frames it to the receiver as another Claude session
+# writing rather than their operator, it can never answer a permission prompt,
+# and slash commands in it arrive as plain text (`skipSlashCommands`). Operator
+# input needs all three the other way round, so it stays on the pane.
+#
+# Delivery is what XERK-339's `crossSessionInbound: accept` buys: without it
+# Claude Code HOLDS a peer message behind a pane dialog nothing here can answer
+# whenever the two sessions' permission-mode classes differ. A repo's own
+# settings outrank ours and may still say `refuse`, and the inbox acknowledges
+# nothing, so that one case drops silently — the residual risk of this path.
+
+# Claude Code registers each live session as `<pid>.json` here, carrying its
+# session id, its tmux target, and — once the inbox is bound — the socket path.
+# Derived from PROJECTS_ROOT's parent like the other claude-home paths, so a
+# native install's CLAUDE_PROJECTS_ROOT override and the test suite move it too.
+SESSIONS_REGISTRY_DIR = os.environ.get(
+    "CLAUDE_SESSIONS_ROOT", os.path.join(_CLAUDE_HOME, "sessions"))
+# One registry record is a few hundred bytes. Read a bounded prefix anyway: this
+# runs over every file in a directory the agent does not own.
+SESSIONS_REGISTRY_MAX_BYTES = 64 * 1024
+# A post is one write to a local socket, so a timeout here means the receiving
+# claude is wedged — in which case the pane would not have worked either.
+INBOX_TIMEOUT_SEC = 5.0
+# The `from` on every post. A LABEL, not an address: it is what the receiving
+# session is told to reply to, and nothing here listens, which the prefix says.
+INBOX_SENDER = "turma"
+# Prepended to every inbox post. Claude Code frames the message to the receiver
+# as one Claude peer writing to another, and a session that believes a SIBLING
+# asked it to fix the conflicts on its PR reads the request wrong. This says who
+# is really speaking; it claims no permission the sender did not already have.
+INBOX_PREFIX = (
+    "[Relayed by Turma, this host's session manager, on your operator's behalf "
+    "— not another Claude session and not a person typing. Nothing is waiting "
+    "on a reply. Act on it as you would the same message typed into this "
+    "session.]")
+
+
+def _session_inbox(claude_sid, tmux_name):
+    """A running session's inbox as `(socket path, claude session id)`, or None.
+
+    Read out of Claude Code's own session registry rather than derived from a
+    pid: the socket lives under `$XDG_RUNTIME_DIR`, which this manager and a
+    session it launched need not agree on, and the registry is where the session
+    records the path it actually bound — including a bind that happened after it
+    started.
+
+    Matched on the CLAUDE SESSION ID whenever the session has a pinned one (the
+    same handle _session_transcript_path uses), and on the tmux target otherwise
+    — all a session launched by an agent predating the pin ever had. Newest
+    `startedAt` wins, so a record left behind by an earlier claude in the same
+    tmux can't shadow the live one.
+
+    Returns None for anything unmatched, unbound or unreadable, and every caller
+    falls back to the pane: a claude too old for the inbox, or one whose inbox
+    is gated off, has to keep receiving these messages.
+    """
+    try:
+        entries = os.listdir(SESSIONS_REGISTRY_DIR)
+    except OSError:
+        return None
+    best = None
+    for name in entries:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SESSIONS_REGISTRY_DIR, name), "rb") as fh:
+                rec = json.loads(fh.read(SESSIONS_REGISTRY_MAX_BYTES))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        sock_path = rec.get("messagingSocketPath")
+        sid = rec.get("sessionId")
+        if not (sock_path and isinstance(sock_path, str)
+                and sid and isinstance(sid, str)):
+            continue
+        if claude_sid:
+            if sid != claude_sid:
+                continue
+        # The registry's tmux target is `<session>:<window>.<pane>`; ours is the
+        # session name, which is unique per Turma session (`agent-<id>`).
+        elif not tmux_name or str(rec.get("tmux") or "").split(":")[0] != tmux_name:
+            continue
+        started = rec.get("startedAt")
+        started = started if isinstance(started, (int, float)) else 0
+        if best is None or started > best[0]:
+            best = (started, sock_path, sid)
+    return (best[1], best[2]) if best else None
+
+
+def _post_to_inbox(sock_path, claude_sid, text):
+    """Post one message to a session's inbox. True when the bytes were written.
+
+    `session_id` is the whole safety story: Claude Code drops a message whose
+    session id is not its own, so a socket a dead session left behind — or one
+    whose pid a DIFFERENT session has since been given — costs a refused connect
+    or an ignored line, never a message delivered into the wrong conversation.
+
+    Fire-and-forget: the inbox answers nothing, so True means "written to the
+    socket", not "queued by claude". The refusal it cannot see is documented
+    above; callers log what they sent so the operator can tell.
+    """
+    payload = json.dumps({
+        "type": "user",
+        "session_id": claude_sid,
+        "from": INBOX_SENDER,
+        "message": {"role": "user", "content": text},
+    }, ensure_ascii=False) + "\n"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(INBOX_TIMEOUT_SEC)
+        sock.connect(sock_path)
+        sock.sendall(payload.encode("utf-8"))
+        # Half-close so claude's reader sees the line end even if the trailing
+        # newline were lost; it never writes back, so nothing is read.
+        sock.shutdown(socket.SHUT_WR)
+        return True
+    except OSError as e:
+        log(f"inbox post to {sock_path} failed: {e}")
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def session_report(workdir, state, tmux_name=None, session_id=None,
@@ -12696,10 +12844,14 @@ class SessionManager:
 
     def send_input(self, sid, text, uploads=None):
         """Type free-text into a running session's Claude TUI and submit it.
-        This is the plain "type a message into the session" path (the chat
-        composer's Send, the glasses actions menu, the PR-comment delivery);
-        AskUserQuestion answers no longer ride it — they go through
+        This is the OPERATOR's path (the chat composer's Send, the glasses
+        actions menu) plus notify_session's fallback for a session with no
+        inbox; AskUserQuestion answers no longer ride it — they go through
         answer_question below. See _type_into_pane for how the text lands.
+
+        Machine-generated messages go to notify_session instead (XERK-340): the
+        pane is what a person types into, and what this manager composes has a
+        queue of its own that a compaction cannot reach.
 
         A message past INPUT_MAX_CHARS is REFUSED, never clipped to it
         (XERK-227): the operator has no way to tell a delivered stub from the
@@ -12755,9 +12907,53 @@ class SessionManager:
         del pend[:-PENDING_INPUT_MAX]
         self.save()
 
+    def notify_session(self, sid, text):
+        """Deliver a MACHINE-generated message to a running session (XERK-340):
+        new PR review activity, a merge-conflict nudge — anything this manager
+        COMPOSES, as opposed to the composer's Send, which relays a person.
+
+        Prefers the session's inbox (see _session_inbox): it cannot be lost to a
+        compaction and does not care what the pane is doing. Falls back to
+        send_input's pane path when the session has no inbox — an older claude,
+        or one with the feature gated off — so a host that upgrades late keeps
+        receiving these messages rather than losing them silently.
+
+        Returns True when it went to the inbox. A pane fallback keeps the whole
+        send_input contract, outbox included: that path is still lossy, so it
+        still needs the XERK-47 guarantee. Which is also why nothing the inbox
+        accepted is recorded there — an inbox message never becomes the user
+        turn `_pending_scan` reaps on, so it would sit in the outbox until a
+        compaction re-typed it into the pane as a duplicate.
+        """
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return False
+        text = _clean_input_text(text)
+        if not text.strip():
+            return False
+        found = (_session_inbox(sess.get("claudeSessionId"), sess.get("tmuxName"))
+                 if len(text) <= INPUT_MAX_CHARS else None)
+        if found:
+            sock_path, claude_sid = found
+            if _post_to_inbox(sock_path, claude_sid, f"{INBOX_PREFIX}\n\n{text}"):
+                log(f"notified session {sid} over its inbox "
+                    f"({len(text)} chars): {text[:80]}")
+                return True
+            log(f"inbox delivery to session {sid} failed; typing it into the "
+                f"pane instead")
+        # Past INPUT_MAX_CHARS too: send_input owns that refusal, and one place
+        # deciding it is what keeps the message and the log line consistent.
+        self.send_input(sid, text)
+        return False
+
     def _poll_pending_inputs(self):
         """Confirm each session's recently-sent messages landed and re-send any a
         compaction dropped (XERK-47). See _pending_scan and the send_input outbox.
+
+        Scoped to what the PANE carries — operator sends, plus notify_session's
+        fallback for a session with no inbox. Nothing delivered over an inbox is
+        on the outbox (XERK-340), which is what took the per-beat transcript read
+        off every session a PR poller had written to.
 
         Runs every beat but short-circuits on a session with an empty outbox, so a
         settled fleet pays one dict lookup per session. For a session that has an
@@ -14523,14 +14719,14 @@ class SessionManager:
 
     def _poll_pr_comments(self):
         """Deliver new PR review activity into the RUNNING session that opened
-        the PR (XERK-49): a reply asking for corrections is typed into that
+        the PR (XERK-49): a reply asking for corrections is delivered to that
         session so the agent continues the work, with no operator relaying it.
 
         Only running sessions, only their OWN PRs (`session_pr_urls`, the same
-        map the status pill reads). Delivery goes through send_input, so it
-        inherits the whole compose path — the compaction-survival outbox
-        (XERK-47) if the message lands mid-turn, and the queue if a turn is in
-        flight — exactly like an operator typing the correction by hand.
+        map the status pill reads). Delivery goes through notify_session, so it
+        lands in the session's own inbox (XERK-340) — queued by Claude Code and
+        read between tool calls, whatever the pane is doing — and falls back to
+        the pane, outbox and all, only for a session that has none.
 
         Each PR carries a per-session `prCommentBase` seen-key set. The FIRST
         time a PR is seen its whole current comment set is baselined silently:
@@ -14587,7 +14783,7 @@ class SessionManager:
                     continue
                 msg = _pr_comment_message(url, fresh)
                 if msg:
-                    self.send_input(sess["id"], msg)
+                    self.notify_session(sess["id"], msg)
             if changed:
                 sess["prCommentBase"] = base
                 self.save()
@@ -14646,9 +14842,9 @@ class SessionManager:
         Runs straight off the status the PR sweep just refreshed
         (`pr_status_cache`), so it costs no network call of its own: the
         conflict is already known the moment a card can render it. Delivery is
-        send_input, so it inherits the compose path exactly like an operator
-        typing the fix request by hand — the compaction-survival outbox
-        (XERK-47) and the queue when a turn is in flight.
+        notify_session, so the nudge rides the session's own inbox (XERK-340)
+        rather than its input line, and falls back to the pane only for a
+        session that has none.
 
         Per (session, PR) episode bookkeeping lives on the record as
         `prConflicts` = {url: {at, attempts}}:
@@ -14665,8 +14861,8 @@ class SessionManager:
             looks like while GitHub recomputes; treating it as resolved would
             hand a still-conflicted PR an unbounded supply of retries.
 
-        Only RUNNING sessions: a nudge is a message typed into a live TUI, and
-        there is nobody to receive it otherwise (an ended session's conflicting
+        Only RUNNING sessions: a nudge goes to a live conversation, and there is
+        nobody to receive it otherwise (an ended session's conflicting
         PR stays for a human, same scope as PR-comment delivery)."""
         if not PR_CONFLICT_RESOLVE:
             return
@@ -14702,7 +14898,7 @@ class SessionManager:
                 changed = True
                 log(f"pr conflict: nudging {sess['id']} to resolve {url} "
                     f"(attempt {attempts + 1})")
-                self.send_input(sess["id"], msg)
+                self.notify_session(sess["id"], msg)
             # Drop episodes for PRs this session no longer owns, so the record
             # can't accumulate them for the life of a long session.
             for stale in [u for u in eps if u not in urls]:

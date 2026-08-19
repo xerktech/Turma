@@ -61,37 +61,11 @@ session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `
   calls.
 - `input` / `history` / `answerQuestion` — the chat composer + glasses client (below).
 
-### `input` / `send_input`
+### `input` / `send_input`, `notify_session` — putting a message INTO a session
 
-- **Guarantees the message survives a compaction** (XERK-47), which can drop one queued mid-turn:
-  every sent message goes on the record's `pendingInputs` outbox, made at-least-once by
-  `_poll_pending_inputs`.
-  - Compactions are counted by `_pending_scan` from the transcript's own `compact_boundary` **system
-    entry**, never by scraping the pane.
-  - A message is **re-sent** only when a NEW compaction happened since it was sent (`compactBase`
-    rose) AND it is neither delivered nor still in the folded live queue AND the pane has settled to
-    idle (`_pane_busy` False, not None). That three-way gate is what makes the resend
-    **duplicate-safe**; `delivered` matches by text alone, biased AGAINST a resend. Bounded by
-    `PENDING_INPUT_MAX_ATTEMPTS`/`PENDING_INPUT_TTL_SEC`, one per beat.
-  - The outbox is internal (not heartbeated), cleared on restart-clear-context; text typed into the
-    raw ttyd terminal bypasses `send_input` and isn't covered.
-  - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
-- **PASTED, not typed** (`_type_into_pane`, XERK-227): `send-keys` is a tmux command argument,
-  refused past ~16 KiB, which a pasted log exceeds. `-p` brackets only for an app that asked (Claude
-  Code does) so **newlines survive as ONE message**; control bytes are stripped, else one ends the
-  paste and the rest reads as KEYSTROKES.
-- **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past
-  `INPUT_MAX_CHARS` (100k) and heartbeats it as **`inputMaxChars`**; the hub caps at the receiving
-  host's figure (`inputCapFor`, **4k when unreported** — that agent predates the paste and clips the
-  tail untold), 413ing with `limit`.
-- **File attachments ride this command** (XERK-234): `send_input` fetches each hub-staged upload
-  into `~/.turma/uploads/<sessionId>/` — **never a worktree**, where it would read as the
-  uncommitted work `prune`/`delete` key on (`build_guard_settings` pre-approves `Read` there) — then
-  prefixes the message with their PATHS, so the COMPOSED text is what lands on the outbox. The name
-  is sanitized on BOTH sides (it is joined onto a path); one that fails to transfer is NAMED, never
-  dropped. **`uploadMaxBytes` is the cap AND the capability flag** (like `inputMaxChars`): an agent
-  reporting none drops uploads untold, so the hub refuses and the composers hide the 📎. Tests:
-  `TestStoreUploads`, `TestSendInputUploads`, `UploadsTest`.
+- Two paths, and which one a message takes is a rule, not a preference: the pane for what a person
+  typed, the session's own inbox for what this manager composed. Both, and why, are in
+  `.claude/rules/agent-input.md`.
 
 ### `history`
 
