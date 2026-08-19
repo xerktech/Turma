@@ -6483,11 +6483,12 @@ def _type_into_pane(tmux_name, text):
 #     outbox nor the per-beat transcript read that confirms it;
 #   - it does not depend on the pane, so a turn in flight, a half-typed input
 #     line or a dialog owning it no longer decides whether the message lands;
-#   - a message named for the wrong conversation is DROPPED rather than
-#     delivered, which is what makes connecting to a socket named after a
-#     RECYCLED pid safe. That guard is narrow on purpose: it proves WHICH
-#     conversation a listener is, never that the listener is the right one, so
-#     _post_to_inbox checks the listening pid itself.
+#   - it is addressed by the session id this manager already pins, and a message
+#     named for the wrong conversation is DROPPED rather than delivered, which is
+#     what makes connecting to a socket named after a RECYCLED pid safe. That
+#     guard is narrow on purpose: it proves WHICH conversation a listener claims
+#     to be, never that the listener is the right one, so _post_to_inbox checks
+#     the listening pid itself.
 #
 # What must NOT come this way is anything a PERSON typed — the chat composer's
 # Send, and answer_question's dialog keystrokes. An inbox message arrives as a
@@ -6627,7 +6628,7 @@ def _canonical_inbox_path(sock_path, pid):
             and (parent == "cc-socks" or parent.startswith("cc-socks-")))
 
 
-def _session_inbox(claude_sid, tmux_name, workdir=None):
+def _session_inbox(claude_sid):
     """A running session's inbox as `(socket path, pid, claude session id)`, or
     None.
 
@@ -6637,25 +6638,32 @@ def _session_inbox(claude_sid, tmux_name, workdir=None):
     records the path it actually bound — including a bind that happened after it
     started.
 
-    Matched on the CLAUDE SESSION ID whenever the session has a pinned one (the
-    same handle _session_transcript_path uses). The tmux fallback is for a
-    session launched by an agent predating the pin, and is deliberately the
-    narrower rule: a claude a session SPAWNS inherits `TMUX`/`TMUX_PANE` and
-    registers the SAME tmux target, the same cwd and `kind: interactive`, with a
-    newer `startedAt` — so it wins on every field but **`entrypoint`**, which is
-    `cli` for the session's own TUI and `sdk-cli` for a `claude -p` child. All
-    four are required. Without the entrypoint check the manager hands a session's
-    PR nudge to a subagent's claude, whose own session id makes the wire-level
-    check agree, and reports it delivered.
+    **The pinned CLAUDE SESSION ID is the only key**, the same handle
+    `_session_transcript_path` uses. A session without one — launched by an agent
+    predating the pin — gets no inbox and keeps the pane, which is what it has
+    always used.
 
-    Newest `startedAt` wins, so a record an earlier claude in the same tmux left
-    behind can't shadow the live one. Non-finite is not newest: `1e999` is legal
+    There is deliberately NO looser fallback, and adding one back needs a better
+    idea than another discriminating field. Matching on the tmux target instead
+    was tried twice: a claude the session SPAWNS inherits `TMUX`/`TMUX_PANE` and
+    registers the same tmux session, the same cwd, `kind: interactive` and a
+    newer `startedAt`, and a second interactive claude in another window of that
+    tmux matches `entrypoint: cli` too. Each such claude has its OWN session id,
+    so the wire-level check agrees with the mistake and `notify_session` reports
+    a nudge delivered that the real session never saw. An exact session id can't
+    collide that way.
+
+    Newest `startedAt` still wins, because a session that is RESUMED keeps its
+    session id: a record a killed claude left behind carries the same one as the
+    live process that replaced it. Non-finite is not newest — `1e999` is legal
     JSON, becomes `inf`, and would win every tiebreak forever.
 
     Returns None for anything unmatched, unbound or unreadable, and every caller
     falls back to the pane: a claude too old for the inbox, or one whose inbox
     is gated off, has to keep receiving these messages.
     """
+    if not claude_sid:
+        return None
     try:
         entries = os.listdir(SESSIONS_REGISTRY_DIR)
     except OSError:
@@ -6671,23 +6679,12 @@ def _session_inbox(claude_sid, tmux_name, workdir=None):
         sid = rec.get("sessionId")
         pid = rec.get("pid")
         if not (sock_path and isinstance(sock_path, str)
-                and sid and isinstance(sid, str)
+                and sid == claude_sid
                 and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0):
             continue
         # Claude Code names the record after the pid it describes. A record that
         # disagrees with its own filename was not written by one.
         if name != f"{pid}.json" or not _canonical_inbox_path(sock_path, pid):
-            continue
-        if claude_sid:
-            if sid != claude_sid:
-                continue
-        # The registry's tmux target is `<session>:<window>.<pane>`; ours is the
-        # session name, which is unique per Turma session (`agent-<id>`).
-        elif (not tmux_name
-                or str(rec.get("tmux") or "").split(":")[0] != tmux_name
-                or rec.get("entrypoint") != "cli"
-                or rec.get("kind") != "interactive"
-                or (workdir and rec.get("cwd") != workdir)):
             continue
         started = rec.get("startedAt")
         started = (started if isinstance(started, (int, float))
@@ -13087,11 +13084,9 @@ class SessionManager:
         text = _clean_input_text(text)
         if not text.strip():
             return False
-        workdir = sess.get("worktreePath")
-        found = (_session_inbox(sess.get("claudeSessionId"), sess.get("tmuxName"),
-                                workdir)
-                 if len(text) <= INPUT_MAX_CHARS and not _inbox_opted_out(workdir)
-                 else None)
+        found = (_session_inbox(sess.get("claudeSessionId"))
+                 if len(text) <= INPUT_MAX_CHARS
+                 and not _inbox_opted_out(sess.get("worktreePath")) else None)
         if found:
             sock_path, pid, claude_sid = found
             if _post_to_inbox(sock_path, pid, claude_sid,

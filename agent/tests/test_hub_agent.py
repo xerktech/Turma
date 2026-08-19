@@ -7684,42 +7684,54 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
         want = self._register(7, self.SID, tmux="agent-other:@0.%0")
         self._register(8, "other", tmux="agent-s1:@0.%0", started=2)
         # The id wins over the tmux name: the id IS this session's conversation.
-        self.assertEqual(ha._session_inbox(self.SID, "agent-s1"),
+        self.assertEqual(ha._session_inbox(self.SID),
                          (want, 7, self.SID))
 
-    def test_falls_back_to_the_tmux_target_without_a_pinned_id(self):
-        # A session launched by an agent predating the session-id pin.
-        want = self._register(9, "cc-9")
-        self.assertEqual(ha._session_inbox(None, "agent-s1", self.tmp),
-                         (want, 9, "cc-9"))
+    def test_a_session_with_no_pinned_id_has_no_inbox(self):
+        # Launched by an agent predating the session-id pin. There is no looser
+        # match to fall back on — every candidate key collides with a claude the
+        # session itself spawned — so it keeps the pane it has always used.
+        self._register(9, "cc-9")
+        self.assertIsNone(ha._session_inbox(None))
+        self.assertIsNone(ha._session_inbox(""))
 
-    def test_newest_start_wins_a_tmux_match(self):
-        # A record an earlier claude in the same tmux left behind must not
-        # shadow the live one.
-        self._register(1, "old", started=100)
-        want = self._register(2, "new", started=200)
-        self.assertEqual(ha._session_inbox(None, "agent-s1", self.tmp),
-                         (want, 2, "new"))
+    def test_newest_start_wins_when_two_records_share_the_id(self):
+        # A RESUMED session keeps its session id, so a record a killed claude
+        # left behind carries the same one as the live process that replaced it.
+        self._register(1, self.SID, started=100)
+        want = self._register(2, self.SID, started=200)
+        self.assertEqual(ha._session_inbox(self.SID), (want, 2, self.SID))
 
     def test_an_infinite_start_does_not_win(self):
         # `1e999` is legal JSON, parses to inf, and would outrank every real
         # record forever — the cheapest way to plant a permanent winner.
-        want = self._register(1, "real", started=100)
+        want = self._register(1, self.SID, started=100)
         os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
         with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "2.json"), "w") as f:
             f.write(json.dumps({
-                "pid": 2, "sessionId": "planted", "tmux": "agent-s1:@0.%0",
-                "kind": "interactive", "cwd": self.tmp,
+                "pid": 2, "sessionId": self.SID, "kind": "interactive",
                 "messagingSocketPath": os.path.join(self._sock_dir(), "2.sock"),
-            }).replace('"cwd"', '"startedAt": 1e999, "cwd"'))
-        self.assertEqual(ha._session_inbox(None, "agent-s1", self.tmp),
-                         (want, 1, "real"))
+            }).replace('"kind"', '"startedAt": 1e999, "kind"'))
+        self.assertEqual(ha._session_inbox(self.SID), (want, 1, self.SID))
+
+    def test_a_claude_the_session_spawned_is_not_its_inbox(self):
+        # Measured against the real thing: a `claude -p` child and a second
+        # interactive claude in the session's tmux both register the same tmux
+        # target, cwd and kind with a newer startedAt — and the second matches
+        # `entrypoint: cli` too. Each has its OWN session id, which is why that
+        # is the only key: the wire-level check agrees with a tmux-shaped
+        # mistake, so notify_session would report a nudge delivered that the
+        # real session never saw.
+        want = self._register(1, self.SID, started=100)
+        self._register(2, "child-p", started=200, entrypoint="sdk-cli")
+        self._register(3, "child-tui", started=300)     # same tmux, cwd, kind
+        self.assertEqual(ha._session_inbox(self.SID), (want, 1, self.SID))
 
     def test_a_record_that_disagrees_with_its_filename_is_ignored(self):
         # Claude Code names the record after the pid it describes; anything else
         # was written by something that is not Claude Code.
         self._register(7, self.SID, name="9.json")
-        self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
+        self.assertIsNone(ha._session_inbox(self.SID))
 
     def test_a_non_canonical_socket_path_is_ignored(self):
         # The path is about to be connect()ed to, so it has to be where Claude
@@ -7735,26 +7747,13 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
             with self.subTest(bad=bad):
                 shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
                 self._register(7, self.SID, sock=bad)
-                self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
-
-    def test_the_tmux_fallback_ignores_a_child_claude(self):
-        # A claude a session SPAWNS inherits TMUX/TMUX_PANE and registers the
-        # SAME tmux target, cwd and kind with a newer startedAt — measured
-        # against the real thing. `entrypoint` is the only field that differs
-        # (`sdk-cli` for `claude -p`), and its own session id makes the
-        # wire-level check agree, so only this branch can catch it.
-        want = self._register(1, "the-session", started=100)
-        self._register(2, "a-p-child", started=200, entrypoint="sdk-cli")
-        self._register(3, "a-bg-claude", started=300, kind="bg")
-        self._register(4, "elsewhere", started=400, cwd="/tmp/somewhere-else")
-        self.assertEqual(ha._session_inbox(None, "agent-s1", self.tmp),
-                         (want, 1, "the-session"))
+                self.assertIsNone(ha._session_inbox(self.SID))
 
     def test_no_bound_socket_is_no_inbox(self):
         # A claude too old for the inbox, or one with it gated off, records no
         # path — the caller has to fall back to the pane.
         self._register(7, self.SID, sock=None)
-        self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
+        self.assertIsNone(ha._session_inbox(self.SID))
 
     def test_unmatched_and_unreadable_records_are_skipped(self):
         os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
@@ -7763,7 +7762,7 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
         with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "notes.txt"), "w") as f:
             f.write("ignored")
         self._register(3, "someone-else", tmux="agent-other:@0.%0")
-        self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
+        self.assertIsNone(ha._session_inbox(self.SID))
 
     def test_wrong_typed_fields_are_skipped(self):
         os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
@@ -7790,7 +7789,7 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
                 os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
                 with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, name), "w") as f:
                     json.dump(rec, f)
-                self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
+                self.assertIsNone(ha._session_inbox(self.SID))
 
     def test_an_oversize_record_is_not_read_whole(self):
         os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
@@ -7800,7 +7799,7 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
             json.dump({"pid": 7, "sessionId": self.SID, "pad": "x" * (2 << 20),
                        "messagingSocketPath":
                        os.path.join(self._sock_dir(), "7.sock")}, f)
-        self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
+        self.assertIsNone(ha._session_inbox(self.SID))
 
     def test_a_fifo_in_the_registry_does_not_block(self):
         # A plain open() of a FIFO blocks until someone writes to it, and this
@@ -7811,7 +7810,7 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
         want = self._register(7, self.SID)
         done = []
         t = threading.Thread(
-            target=lambda: done.append(ha._session_inbox(self.SID, "agent-s1")),
+            target=lambda: done.append(ha._session_inbox(self.SID)),
             daemon=True)
         t.start()
         t.join(10)
@@ -7825,10 +7824,57 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
             json.dump({"pid": 7, "sessionId": self.SID, "messagingSocketPath":
                        os.path.join(self._sock_dir(), "7.sock")}, f)
         os.symlink(real, os.path.join(ha.SESSIONS_REGISTRY_DIR, "7.json"))
-        self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
+        self.assertIsNone(ha._session_inbox(self.SID))
 
     def test_missing_registry_is_no_inbox(self):
-        self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+
+class TestReadUntrustedJson(unittest.TestCase):
+    """_read_untrusted_json is the one reader for files this agent does not own —
+    the session registry and a repo's settings (XERK-340)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-json-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _path(self, name="f.json"):
+        return os.path.join(self.tmp, name)
+
+    def test_reads_an_object(self):
+        with open(self._path(), "w") as f:
+            json.dump({"a": 1}, f)
+        self.assertEqual(ha._read_untrusted_json(self._path(), 1000), {"a": 1})
+
+    def test_a_file_past_the_cap_is_not_parsed_at_all(self):
+        # Never a truncated PREFIX: a key past the ceiling would read as absent,
+        # which for a settings file is a silent "no opinion" the caller acts on.
+        with open(self._path(), "w") as f:
+            json.dump({"a": "x" * 500}, f)
+        self.assertIsNone(ha._read_untrusted_json(self._path(), 100))
+        self.assertIsNotNone(ha._read_untrusted_json(self._path(), 1 << 20))
+
+    def test_a_json_scalar_or_list_is_not_an_object(self):
+        for blob in ("[1,2]", '"str"', "7", "null"):
+            with self.subTest(blob=blob):
+                with open(self._path(), "w") as f:
+                    f.write(blob)
+                self.assertIsNone(ha._read_untrusted_json(self._path(), 1000))
+
+    def test_a_fifo_returns_rather_than_blocking(self):
+        os.mkfifo(self._path("fifo.json"))
+        done = []
+        t = threading.Thread(target=lambda: done.append(
+            ha._read_untrusted_json(self._path("fifo.json"), 1000)), daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "blocked on a FIFO")
+        self.assertIsNone(done[0])
+
+    def test_a_directory_and_a_missing_file_are_none(self):
+        os.makedirs(self._path("d.json"))
+        self.assertIsNone(ha._read_untrusted_json(self._path("d.json"), 1000))
+        self.assertIsNone(ha._read_untrusted_json(self._path("nope.json"), 1000))
 
 
 class TestInboxOptedOut(unittest.TestCase):

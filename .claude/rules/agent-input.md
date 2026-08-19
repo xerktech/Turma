@@ -68,7 +68,8 @@ session's inbox carries what this MANAGER composed.**
     `isfile()` pre-check is not a substitute**: it follows a symlink and loses the race against a
     file being swapped for a FIFO between the check and the open. The size cap bounds the read,
     never the open.
-  - the record must be named `<pid>.json` for the `pid` it declares, and `messagingSocketPath` must
+  - the record must be named `<pid>.json` for the `pid` it declares (a bool is an `int` in python
+    and clears every other gate, so the type check is load-bearing), and `messagingSocketPath` must
     be an absolute, already-normalized, ≤108-byte `…/cc-socks*/<pid>.sock`. That is a SHAPE check,
     not a location one — `cc-socks*` matches a directory the sender owns, so it bounds what gets
     connected to rather than proving whose it is.
@@ -83,12 +84,16 @@ session's inbox carries what this MANAGER composed.**
     session's messages AND denies them (the post succeeds, so there is no pane fallback). It could
     equally read that session's transcript or `tmux send-keys` into its pane, so this adds no
     privilege — don't write it up as sealed, and don't describe it as interception alone.
-- **The tmux fallback additionally requires `entrypoint: cli`**, plus `kind: interactive`, the
-  session's own cwd, and the tmux target. A claude a session SPAWNS inherits `TMUX`/`TMUX_PANE` and
-  — measured, not assumed — matches on target, cwd, `kind` AND a newer `startedAt`; `entrypoint` is
-  the only field that differs (`sdk-cli` for `claude -p`). Its own session id makes the wire check
-  agree, so this branch is the only thing that can catch it, and dropping the entrypoint check
-  hands a session's PR nudge to a subagent's claude and reports it delivered.
+- **The pinned `claudeSessionId` is the ONLY key, and there is deliberately no looser fallback.**
+  A session without a pinned id keeps the pane. Matching on the tmux target instead was tried twice
+  and is a dead end: a claude the session spawns inherits `TMUX`/`TMUX_PANE` and registers the same
+  tmux session, cwd, `kind: interactive` and a newer `startedAt` — and a second interactive claude
+  in another window of that tmux matches `entrypoint: cli` too (both measured, not reasoned).
+  Each such claude has its OWN session id, so the wire-level check agrees with the mistake and
+  `notify_session` reports a nudge delivered that the real session never saw. Re-opening that
+  branch needs a better idea than a third discriminating field.
+- **Newest `startedAt` still wins**, because a RESUMED session keeps its session id: a record a
+  killed claude left behind carries the same one as the live process that replaced it.
 - **`crossSessionInbound` is read BEFORE posting** (`_inbox_opted_out`). A repo can override
   XERK-339's `accept` to `refuse`/`hold`; the inbox acknowledges nothing and the PR pollers burn a
   retry either way, so a message posted into such a session is lost in silence AND never nudged
@@ -97,8 +102,10 @@ session's inbox carries what this MANAGER composed.**
   - **ANY of the files asking for something other than `accept` opts out — this is NOT a precedence
     calculation.** Measured against Claude Code, a project `refuse` is *not* undone by a local
     `accept`, so "highest-precedence definition wins" posts into a session that drops the message.
-    A file that exists but will not parse (or is past `SETTINGS_READ_MAX_BYTES`) opts out too.
-    Erring this way costs only the pane, which has always worked.
+    A file that exists but will not parse opts out too — including one past
+    `SETTINGS_READ_MAX_BYTES` (never parsed as a truncated prefix, or a key past the ceiling would
+    read as "said nothing") and one that is a SYMLINK, which real Claude Code follows and
+    `O_NOFOLLOW` does not. Erring this way costs only the pane, which has always worked.
   - Claude Code reads these at LAUNCH and this reads them at post time, so a repo that changes the
     value mid-session disagrees with its own running claude until it restarts.
 - Anything else — no inbox bound, an older claude, a dead socket, a listener that isn't the
@@ -109,6 +116,7 @@ session's inbox carries what this MANAGER composed.**
   and that the message is about the session's OWN work (without which the peer framing makes a
   conflict nudge read as advisory), and it explicitly holds quoted PR-comment bodies — third-party
   text — back to "review to weigh", never operator instruction.
-- Tests: `TestSessionInbox`, `TestInboxOptedOut`, `TestPostToInbox`, `TestNotifySession`. The
+- Tests: `TestSessionInbox`, `TestReadUntrustedJson`, `TestInboxOptedOut`, `TestPostToInbox`,
+  `TestNotifySession`. The
   hostile-input cases are load-bearing: every guard above was added because a probe got past its
   absence, and three of them because the first attempt at the guard did not work.
