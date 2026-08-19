@@ -85,10 +85,34 @@ const BLOCK_CAPS = {
   input: BLOCK_TOOL_INPUT_CHARS,
   result: BLOCK_TOOL_RESULT_CHARS,
 };
+// A byte ceiling read from the environment, mirroring hub-agent.py's
+// _byte_ceiling (and turma/archive.js's byteCeiling) on both of its rules: an
+// explicit 0 turns the ceiling OFF, where `Number(x) || fallback` would restore
+// the default; and a value must be ENTIRELY digits, so "4MiB" is a typo to
+// reject rather than a 4-BYTE ceiling that sheds every preview on the host.
+// The whitespace set is explicit because String.trim() and Python's str.strip()
+// disagree at the edges, and this pair must read a pasted value identically.
+function byteCeiling(raw, fallback) {
+  const s = String(raw == null ? "" : raw).replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
+  if (!/^[0-9]+$/.test(s)) return fallback;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : fallback;
+}
+
 // SendUserFile inline-preview embedding (XERK-221) — mirror hub-agent.py's
 // SEND_FILE_* constants exactly (the block shape must match byte-for-byte).
 const SEND_FILE_MAX_FILES = Number(process.env.SESSION_SEND_FILE_MAX_FILES) || 16;
 const SEND_FILE_MAX_BYTES = Number(process.env.SESSION_SEND_FILE_MAX_BYTES) || 512 * 1024;
+// ...and the two that bound a TURN and a whole READ, which the pair above do
+// not (XERK-355). A preview comes off DISK, so TAIL_READ_BYTES bounds nothing
+// here: at BLOCK_MAX_PER_ENTRY deliveries x SEND_FILE_MAX_FILES x
+// SEND_FILE_MAX_BYTES one entry built a ~537 MB frame out of a 2 KB transcript,
+// which JSON.stringify cannot even produce. Mirror hub-agent.py's
+// SEND_FILE_ENTRY_MAX_BYTES / SEND_FILE_PASS_MAX_BYTES; 0 disables either half.
+const SEND_FILE_ENTRY_MAX_BYTES = byteCeiling(
+  process.env.SESSION_SEND_FILE_ENTRY_MAX_BYTES, 2 << 20);
+const SEND_FILE_PASS_MAX_BYTES = byteCeiling(
+  process.env.SESSION_SEND_FILE_PASS_MAX_BYTES, 4 << 20);
 const SEND_FILE_IMG_MIME = {
   ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
@@ -411,13 +435,174 @@ function toolInputSummary(inp) {
   return String(inp);
 }
 
-// Read the image/SVG/HTML files a SendUserFile call delivered and return preview
-// entries for its tool_use block (XERK-221), or null. Mirror of hub-agent.py
-// _send_user_file_detail(): image -> {name, kind:"image", src:data URI};
-// html (render only) -> {name, kind:"html", html}; else -> {name, kind:"file"}.
-function sendUserFileDetail(inp) {
+// Where a deferred preview's handle rides between the parse and the fill —
+// mirror hub-agent.py PREVIEW_HANDLE_KEY. An int index into the budget's own
+// table, never the path: a chip whose entry is sliced out of the frame is never
+// filled, so this key can reach a client, and a path there would be disclosure.
+const PREVIEW_HANDLE_KEY = "_p";
+
+// How many bytes of SendUserFile preview one transcript read may embed
+// (XERK-355), measured in the UTF-8 bytes of the src/html payload. Mirror of
+// hub-agent.py _PreviewBudget: `perEntry` bounds ONE entry, `total` bounds the
+// whole pass — which the per-entry half cannot, a tail window holding many
+// delivery turns being the case that built the frame JSON.stringify refuses.
+// 0 on either disables that half.
+//
+// NOTHING IS READ DURING THE PARSE. transcriptTail parses the whole
+// TAIL_READ_BYTES window and then returns its NEWEST TAIL_MSGS entries, so a
+// budget spent in parse order is spent on the entries about to be discarded:
+// measured, an ordinary 40-turn session with one 200 KB screenshot a turn
+// showed the operator ZERO previews — 15 shed chips — where the pre-budget code
+// showed 15 previews. defer() records the candidate; fillPreviews() embeds
+// afterwards, NEWEST FIRST, so what is on screen wins the budget.
+//
+// Reservations, not plain charges: the projection is deducted BEFORE the read
+// and reconciled after. A non-UTF-8 HTML file re-encodes up to 3x its size, so
+// charging only on success let fits() keep admitting reads it then rejected —
+// measured, 960 files and 503 MB read for an 89 KB frame. A payload that
+// outgrows its reservation is shed with the reservation still SPENT, which is
+// what bounds the READS rather than only the bytes.
+class PreviewBudget {
+  constructor(total, perEntry) {
+    this.total = total == null ? SEND_FILE_PASS_MAX_BYTES : total;
+    this.perEntry = perEntry == null ? SEND_FILE_ENTRY_MAX_BYTES : perEntry;
+    this.left = this.total;
+    this.entryLeft = this.perEntry;
+    this.pending = [];   // handle -> [path, mime]
+  }
+  // Start a new entry's allowance. Called by the FILL, once per entry.
+  beginEntry() { this.entryLeft = this.perEntry; }
+  defer(chip, p, mime) {
+    chip[PREVIEW_HANDLE_KEY] = this.pending.length;
+    this.pending.push([p, mime]);
+  }
+  // [path, mime] for a deferred chip, clearing its handle; null for an ordinary
+  // name chip (the fill visits every chip, most of which are not deferred).
+  resolve(chip) {
+    const h = chip[PREVIEW_HANDLE_KEY];
+    delete chip[PREVIEW_HANDLE_KEY];
+    if (!Number.isInteger(h) || h < 0 || h >= this.pending.length) return null;
+    return this.pending[h];
+  }
+  fits(cost) {
+    if (this.perEntry && cost > this.entryLeft) return false;
+    if (this.total && cost > this.left) return false;
+    return true;
+  }
+  // Deduct `cost` up front; false (and nothing spent) when it won't fit.
+  reserve(cost) {
+    if (!this.fits(cost)) return false;
+    this.entryLeft -= cost;
+    this.left -= cost;
+    return true;
+  }
+  // Swap a reservation for what the payload really cost. False when the real
+  // cost doesn't fit — and then the RESERVATION STAYS SPENT, so a payload that
+  // keeps outgrowing its projection cannot buy unbounded reads.
+  settle(reserved, actual) {
+    const extra = actual - reserved;
+    if (extra > 0 && !this.fits(extra)) return false;
+    this.entryLeft -= extra;
+    this.left -= extra;
+    return true;
+  }
+}
+
+// Read one deferred SendUserFile file and embed it on its chip, or leave the
+// chip alone. Mutates in place; a no-op for a chip that was never deferred.
+// Mirror of hub-agent.py _embed_preview().
+function embedPreview(chip, budget) {
+  const resolved = budget.resolve(chip);
+  if (!resolved) return;
+  const [p, mime] = resolved;
+  let st;
+  try { st = fs.statSync(p); } catch { return; }   // gone → the plain name chip
+  // REGULAR FILES ONLY, before the open and not after: a FIFO stats at 0 bytes,
+  // passes every ceiling, and then blocks the read until somebody writes — here
+  // that is pollWatcher's interval, i.e. this host's whole live tail.
+  if (!st.isFile()) return;
+  if (st.size > SEND_FILE_MAX_BYTES) return;       // too big at any budget
+  const prefix = mime ? "data:" + mime + ";base64," : "";
+  // base64 is 4 bytes per 3 rounded up; raw markup rides as-is (an under-
+  // estimate for a non-UTF-8 file, which settle() is what handles).
+  const projected = mime ? prefix.length + 4 * Math.ceil(st.size / 3) : st.size;
+  if (!budget.reserve(projected)) { chip.shed = true; return; }
+  let data;
+  try {
+    data = readCapped(p, SEND_FILE_MAX_BYTES + 1);
+  } catch { budget.settle(projected, 0); return; }
+  if (data.length > SEND_FILE_MAX_BYTES) {          // grew between stat and read
+    budget.settle(projected, 0);
+    return;
+  }
+  const kind = mime ? "image" : "html";
+  const key = mime ? "src" : "html";
+  const value = mime ? prefix + data.toString("base64") : data.toString("utf8");
+  if (!budget.settle(projected, Buffer.byteLength(value, "utf8"))) {
+    chip.shed = true;
+    return;
+  }
+  chip.kind = kind;
+  chip[key] = value;
+}
+
+// At most `cap` bytes of a file. readFileSync would load the whole thing before
+// anything could reject it, where hub-agent.py reads read(cap+1) — the file can
+// grow between the stat and the read, and the two must not diverge on what that
+// costs the process.
+function readCapped(p, cap) {
+  const fd = fs.openSync(p, "r");
+  try {
+    const buf = Buffer.allocUnsafe(cap);
+    let got = 0;
+    for (;;) {
+      const n = fs.readSync(fd, buf, got, cap - got, got);
+      if (n <= 0 || got >= cap) break;
+      got += n;
+    }
+    return buf.subarray(0, got);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Embed the previews deferred while `entries` were parsed, and clear every
+// handle. NEWEST ENTRY FIRST: these are the entries actually being delivered,
+// and the newest is what the operator is looking at, so it wins the budget over
+// one that has scrolled out of the chat. Call it on the FINAL entry list —
+// after the window is sliced — and before anything measures the frame.
+// Mirror of hub-agent.py _fill_previews().
+function fillPreviews(entries, budget) {
+  for (let i = (entries || []).length - 1; i >= 0; i--) {
+    const row = entries[i];
+    if (!row || typeof row !== "object") continue;
+    const chips = [];
+    for (const block of row.blocks || []) {
+      if (block && typeof block === "object" && Array.isArray(block.files)) {
+        for (const c of block.files) if (c && typeof c === "object") chips.push(c);
+      }
+    }
+    if (!chips.length) continue;
+    budget.beginEntry();
+    for (const chip of chips) embedPreview(chip, budget);
+  }
+}
+
+// The preview entries for a SendUserFile call's tool_use block (XERK-221), or
+// null. Mirror of hub-agent.py _send_user_file_detail(): image -> {name,
+// kind:"image", src:data URI}; html (render only) -> {name, kind:"html", html};
+// else -> {name, kind:"file"}; over budget -> that same chip flagged {shed:true}.
+//
+// This decides only WHICH files are renderable; the bytes are read by
+// fillPreviews once the caller's entry list is final (XERK-355). Passing no
+// `budget` fills immediately, bounded at one entry's worth — so a caller that
+// does not care about the pass ceiling still gets a bounded block, and no
+// unfilled handle escapes.
+function sendUserFileDetail(inp, budget) {
   const files = inp.files;
   if (!Array.isArray(files) || !files.length) return null;
+  const own = !budget;
+  if (own) budget = new PreviewBudget(SEND_FILE_ENTRY_MAX_BYTES);
   const display = inp.display;
   const out = [];
   for (const p of files.slice(0, SEND_FILE_MAX_FILES)) {
@@ -426,22 +611,16 @@ function sendUserFileDetail(inp) {
     const ext = path.extname(p).toLowerCase();
     const mime = SEND_FILE_IMG_MIME[ext];
     const renderHtml = SEND_FILE_HTML_EXT.has(ext) && display !== "attach";
-    let entry = { name, kind: "file" };
-    if (mime || renderHtml) {
-      try {
-        if (fs.statSync(p).size <= SEND_FILE_MAX_BYTES) { // bound the read (mirrors Python's read(cap+1))
-          const data = fs.readFileSync(p);
-          if (data.length <= SEND_FILE_MAX_BYTES) {
-            entry = mime
-              ? { name, kind: "image", src: "data:" + mime + ";base64," + data.toString("base64") }
-              : { name, kind: "html", html: data.toString("utf8") };
-          }
-        }
-      } catch { /* unreadable / gone → name chip */ }
-    }
-    out.push(entry);
+    const chip = { name, kind: "file" };
+    if (mime || renderHtml) budget.defer(chip, p, mime);
+    out.push(chip);
   }
-  return out.length ? out : null;
+  if (!out.length) return null;
+  if (own) {
+    budget.beginEntry();
+    for (const chip of out) embedPreview(chip, budget);
+  }
+  return out;
 }
 
 // Attach the reviewable payload of a known tool call to its tool_use block —
@@ -449,8 +628,11 @@ function sendUserFileDetail(inp) {
 // when a payload was clipped by its cap. Mirror of hub-agent.py
 // _tool_use_detail(): Edit -> edit {old, new, replaceAll?}; Write -> content;
 // ExitPlanMode -> plan; SendUserFile -> files + caption (inline preview);
-// any tool's human `description` arg -> desc.
-function toolUseDetail(block, name, inp, caps) {
+// any tool's human `description` arg -> desc. `budget` is the read's
+// PreviewBudget, threaded through to the SendUserFile previews — the one
+// payload here read from DISK rather than clipped out of the transcript, hence
+// the only one no cap above bounds (XERK-355).
+function toolUseDetail(block, name, inp, caps, budget) {
   if (!inp || typeof inp !== "object" || Array.isArray(inp)) return false;
   let truncated = false;
   if (name === "Edit") {
@@ -476,7 +658,7 @@ function toolUseDetail(block, name, inp, caps) {
       truncated = trunc;
     }
   } else if (name === "SendUserFile") {
-    const files = sendUserFileDetail(inp);
+    const files = sendUserFileDetail(inp, budget);
     if (files) {
       block.files = files;
       if (typeof inp.caption === "string" && inp.caption.trim()) {
@@ -517,8 +699,13 @@ function toolResultText(content) {
 // preserves thinking / tool_use inputs / tool_result outputs that entryText
 // flattens away. `caps` is {text, input, result}. A block cut to its cap gets
 // truncated:true. Returns [] for a user/assistant message with no renderable
-// blocks. Line-for-line mirror of hub-agent.py _entry_blocks — keep in lockstep.
-function entryBlocks(entry, caps) {
+// blocks. `budget` is the whole read's PreviewBudget (XERK-355). Passing one
+// DEFERS this entry's SendUserFile previews into it, and the caller must run
+// fillPreviews over its final entry list to embed them — that is what lets the
+// newest entries win the budget rather than the oldest. Omitting it embeds
+// inline, bounded at one entry's worth. Line-for-line mirror of hub-agent.py
+// _entry_blocks — keep in lockstep.
+function entryBlocks(entry, caps, budget) {
   // The "while you were away" recap becomes its own block (assistant-side
   // card); all other system entries still drop. Mirror of _entry_blocks.
   const away = awaySummaryText(entry);
@@ -631,7 +818,7 @@ function entryBlocks(entry, caps) {
         const block = { t: "tool_use", name: String(raw.name), input: clipped };
         if (raw.id) block.id = raw.id;
         if (trunc) block.truncated = true;
-        if (toolUseDetail(block, String(raw.name), raw.input, caps)) block.truncated = true;
+        if (toolUseDetail(block, String(raw.name), raw.input, caps, budget)) block.truncated = true;
         blocks.push(block);
       } else if (raw.type === "tool_result") {
         const text = toolResultText(raw.content).replace(ANSI_RE, "").trim();
@@ -711,6 +898,12 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
   }
   const tail = [];
   const queued = [];
+  // One preview budget for the whole frame (XERK-355). TAIL_READ_BYTES bounds
+  // the transcript this parses, not the previews read off disk, so without this
+  // a 2 KB window still produces a frame no socket should carry. Nothing is
+  // read in this loop — the slice below is what decides whose previews are
+  // worth the budget.
+  const budget = new PreviewBudget();
   for (const raw of readTailLines(p, TAIL_READ_BYTES)) {
     let entry;
     try { entry = JSON.parse(raw); } catch { continue; }
@@ -722,7 +915,7 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
     if (agentState) scanAgentEntry(entry, agentState);
     if (entry.type === "queue-operation") { foldQueueOp(entry, queued); continue; }
     const text = entryText(entry);
-    const blocks = entryBlocks(entry, BLOCK_CAPS);
+    const blocks = entryBlocks(entry, BLOCK_CAPS, budget);
     // Rich path widens inclusion: a tool_result-only turn (text === null) still
     // has renderable blocks, so keep it for the chat UI. text stays the
     // backward-compat flat string the glasses read.
@@ -735,6 +928,10 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
     });
   }
   const result = { entries: tail.slice(-TAIL_MSGS), queued: queuedDisplay(queued) };
+  // Now that the frame's entries are final, read the previews they kept —
+  // newest first, so the turn on screen gets the budget and an older one
+  // degrades to the shed chip. Anything the slice dropped is never read at all.
+  fillPreviews(result.entries, budget);
   if (cache) {
     cache.path = p;
     cache.mtimeMs = st ? st.mtimeMs : 0;
@@ -1239,14 +1436,15 @@ function pollWatcher(sessionId) {
   try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId, w.agentState); }
   catch { tail = null; }
   if (tail && (tail.entries.length || tail.queued.length)) {
-    // The serialize is INSIDE the try, not beside it (XERK-347). A turn holding
-    // BLOCK_MAX_PER_ENTRY SendUserFile deliveries builds a frame past V8's
-    // ~512 MB string ceiling — previews are read from disk, so no transcript
-    // window bounds them (XERK-355) — and this runs in a setInterval with no
-    // uncaughtException handler in this file: the RangeError killed the whole
-    // tunnel process, which entrypoint.sh then restarted in a loop for as long
-    // as that session was watched. Skipping one frame is a stale tail; dying is
-    // every session's terminal, live tail and heartbeat poke on this host.
+    // The serialize is INSIDE the try, not beside it (XERK-347), and it stays
+    // there now that PreviewBudget bounds the frame (XERK-355): this runs in a
+    // setInterval with no uncaughtException handler in this file, so anything
+    // JSON.stringify refuses kills the whole tunnel process, which entrypoint.sh
+    // then restarts in a loop for as long as that session is watched. Skipping
+    // one frame is a stale tail; dying is every session's terminal, live tail
+    // and heartbeat poke on this host. Never move it back out of the try on the
+    // grounds that the frame is bounded — the bound is what must not be the
+    // only thing standing between a parse bug and the host.
     try {
       const json = JSON.stringify(tail);
       if (json !== w.lastJson) {
@@ -1605,5 +1803,7 @@ if (require.main === module) {
 } else {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
-    usableHostname, deviceName };
+    usableHostname, deviceName, byteCeiling, PreviewBudget, sendUserFileDetail,
+    fillPreviews, embedPreview, readCapped, PREVIEW_HANDLE_KEY,
+    SEND_FILE_ENTRY_MAX_BYTES, SEND_FILE_PASS_MAX_BYTES };
 }

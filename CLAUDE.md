@@ -14,6 +14,7 @@ that component's files.
 | `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
 | `.claude/rules/agent-sessions.md` | `agent/hub-agent.py` | how a session is launched, repos-root sessions, the agent-side session queue, kill/resume/delete, the new-work directive, local-model failover |
 | `.claude/rules/agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
+| `.claude/rules/agent-previews.md` | `agent/hub-agent.py`, `agent/tunnel-agent.js` | SendUserFile inline previews: block shapes, the per-entry/per-pass embed budget, shedding |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
@@ -45,7 +46,8 @@ that component's files.
     A ceiling stated as a truncation cliff was wrong; do not restore that framing.
   - **When a file approaches the ceiling, split it by path into another rules file** — that is the
     remedy, not raising the number and not deleting rationale. `agent-board.md`, `agent-prs.md`,
-    `agent-sessions.md`, `turma-board.md` and `turma-sessions.md` exist for exactly that reason.
+    `agent-sessions.md`, `agent-previews.md`, `turma-board.md` and `turma-sessions.md` exist for
+    exactly that reason.
 - **Put a fact in the narrowest file that always sees it.** Component detail → that component's
   rules file. A rule spanning two components → "Cross-cutting contracts" below, since a
   `paths:`-scoped file does not load when Claude works on the other side of the contract.

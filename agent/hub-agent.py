@@ -444,6 +444,24 @@ BLOCK_CAPS = {
 # tunnel-agent.js (sendUserFileDetail).
 SEND_FILE_MAX_FILES = int(os.environ.get("SESSION_SEND_FILE_MAX_FILES", "16"))
 SEND_FILE_MAX_BYTES = int(os.environ.get("SESSION_SEND_FILE_MAX_BYTES", str(512 * 1024)))
+# ...and the two ceilings that bound a TURN and a whole READ, which the pair
+# above do not (XERK-355). A preview is read from DISK, so no transcript window
+# bounds it: at BLOCK_MAX_PER_ENTRY deliveries x SEND_FILE_MAX_FILES x
+# SEND_FILE_MAX_BYTES one entry embedded ~537 MB of base64 out of a transcript
+# of a few KB — past V8's string ceiling on the live tail, past HEARTBEAT_MAX on
+# a beat, and larger than the whole hub container. _PreviewBudget spends these
+# in parse order and a file that no longer fits degrades to the same `shed:True`
+# name chip the archive path produces, so the conversation still says what was
+# delivered. 0 disables either half (the ARCHIVE_PAYLOAD_MAX convention).
+SEND_FILE_ENTRY_MAX_BYTES = _byte_ceiling(
+    os.environ.get("SESSION_SEND_FILE_ENTRY_MAX_BYTES"), 2 << 20)
+SEND_FILE_PASS_MAX_BYTES = _byte_ceiling(
+    os.environ.get("SESSION_SEND_FILE_PASS_MAX_BYTES"), 4 << 20)
+# Where a deferred preview's handle rides between the parse and the fill. It is
+# an int index into the budget's own table, never the path — a chip whose row is
+# dropped from the window is never filled, so this key can reach a client, and
+# a path there would be filesystem disclosure. Every client ignores it.
+PREVIEW_HANDLE_KEY = "_p"
 SEND_FILE_IMG_MIME = {
     ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
@@ -4131,21 +4149,219 @@ def _tool_input_summary(inp):
     return str(inp)
 
 
-def _send_user_file_detail(inp):
-    """Read the image/SVG/HTML files a SendUserFile call delivered and return a
-    list of preview entries for its tool_use block (XERK-221), or None:
+class _PreviewBudget:
+    """How many bytes of SendUserFile preview one transcript read may embed
+    (XERK-355), in the UTF-8 bytes of the `src`/`html` payload — the same
+    measure _block_payload_bytes and the archive budget spend.
+
+    Two ceilings, because they answer different questions. `per_entry` bounds
+    ONE entry, which is what a history reply's newest row and one archive chunk
+    need: the newest row is exempt from HISTORY_MAX_BYTES by design, so nothing
+    else bounds it. `total` bounds the whole PASS — a tail frame, a history
+    delivery — which the per-entry ceiling cannot, a window holding many
+    delivery turns being the case that produced the 33 MB beat. 0 on either
+    disables that half, the convention ARCHIVE_PAYLOAD_MAX already uses.
+
+    **Nothing is read while the transcript is being parsed.** Both readers parse
+    a whole window and then return its NEWEST slice, so a budget spent in parse
+    order is spent on the rows the caller is about to throw away: measured, an
+    ordinary 40-turn session with one 200 KB screenshot a turn showed the
+    operator ZERO previews, all 15 of them shed, while the pre-budget code
+    showed 15. So `defer()` only records the candidate and `_fill_previews()`
+    embeds afterwards, walking the finished rows NEWEST FIRST — what is on
+    screen wins the budget, and what scrolls off is what degrades.
+
+    Reservations, not plain charges: the projected cost (from the file's size)
+    is deducted BEFORE the read and reconciled to the real one after. An HTML
+    file that is not valid UTF-8 re-encodes up to 3x its size, so a projection
+    charged only on success let `fits` keep admitting reads it then rejected —
+    measured 3.36 GB read for a 1 MB reply. A payload that outgrows its
+    reservation and no longer fits is shed with the reservation still SPENT,
+    which is what bounds the reads rather than just the bytes."""
+
+    def __init__(self, total=None, per_entry=None):
+        self.total = SEND_FILE_PASS_MAX_BYTES if total is None else total
+        self.per_entry = SEND_FILE_ENTRY_MAX_BYTES if per_entry is None else per_entry
+        self.left = self.total
+        self.entry_left = self.per_entry
+        # handle -> (path, mime): what defer() recorded, resolved by the fill.
+        self._pending = []
+
+    def begin_entry(self):
+        """Start a new entry's allowance. Called by the FILL, once per row."""
+        self.entry_left = self.per_entry
+
+    def defer(self, chip, path, mime):
+        """Record a renderable file for the fill pass, stamping its handle on
+        the chip. The handle is a small INT and never the path: a chip whose
+        row is dropped, or whose caller forgets to fill, must be harmless on the
+        wire, and a path there would be disclosure."""
+        chip[PREVIEW_HANDLE_KEY] = len(self._pending)
+        self._pending.append((path, mime))
+
+    def resolve(self, chip):
+        """(path, mime) for a deferred chip, clearing its handle. None when the
+        chip carries none — the fill visits every chip, most of which are
+        ordinary name chips."""
+        handle = chip.pop(PREVIEW_HANDLE_KEY, None)
+        if not isinstance(handle, int) or not 0 <= handle < len(self._pending):
+            return None
+        return self._pending[handle]
+
+    def fits(self, cost):
+        if self.per_entry and cost > self.entry_left:
+            return False
+        if self.total and cost > self.left:
+            return False
+        return True
+
+    def reserve(self, cost):
+        """Deduct `cost` up front; False (and nothing spent) when it won't fit."""
+        if not self.fits(cost):
+            return False
+        self.entry_left -= cost
+        self.left -= cost
+        return True
+
+    def settle(self, reserved, actual):
+        """Swap a reservation for what the payload really cost. Returns False
+        when the real cost doesn't fit — and then the RESERVATION STAYS SPENT,
+        so a payload that keeps outgrowing its projection cannot buy unbounded
+        reads. Refunds when it came in under."""
+        extra = actual - reserved
+        if extra > 0 and not self.fits(extra):
+            return False
+        self.entry_left -= extra
+        self.left -= extra
+        return True
+
+
+def _embed_preview(chip, budget):
+    """Read one deferred SendUserFile file and embed it on its chip, or leave
+    the chip as it is. Mutates in place; no-op for a chip that was never
+    deferred. Mirror of tunnel-agent.js embedPreview()."""
+    resolved = budget.resolve(chip)
+    if resolved is None:
+        return
+    path, mime = resolved
+    try:
+        st = os.stat(path)
+    except OSError:
+        return          # gone / unreadable → the plain name chip
+    # REGULAR FILES ONLY, and this is the check that must precede the open, not
+    # follow it: a FIFO stats at 0 bytes, passes every ceiling, and then blocks
+    # in open() until somebody writes — on the tunnel's poll interval and on the
+    # beat thread that stages `history`. Same rule as _project_transcripts.
+    if not stat.S_ISREG(st.st_mode):
+        return
+    if st.st_size > SEND_FILE_MAX_BYTES:
+        return          # too big at any budget → the plain chip, and never read
+    prefix = "data:%s;base64," % mime if mime else ""
+    # base64 is 4 bytes per 3 rounded up; raw markup rides as-is (an under-
+    # estimate for a non-UTF-8 file, which settle() is what handles).
+    projected = (len(prefix) + 4 * ((st.st_size + 2) // 3)) if mime else st.st_size
+    if not budget.reserve(projected):
+        chip["shed"] = True
+        return
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(SEND_FILE_MAX_BYTES + 1)
+    except OSError:
+        budget.settle(projected, 0)
+        return
+    if len(data) > SEND_FILE_MAX_BYTES:   # grew between the stat and the read
+        budget.settle(projected, 0)
+        return
+    if mime:
+        key, kind = "src", "image"
+        value = prefix + base64.b64encode(data).decode("ascii")
+    else:
+        key, kind = "html", "html"
+        value = data.decode("utf-8", "replace")
+    if not budget.settle(projected, len(value.encode("utf-8", "replace"))):
+        chip["shed"] = True
+        return
+    chip["kind"] = kind
+    chip[key] = value
+
+
+def _fill_previews(rows, budget):
+    """Embed the SendUserFile previews deferred while `rows` were parsed, and
+    clear every handle. NEWEST ROW FIRST: these rows are the slice the caller
+    is actually delivering, and the newest is what the operator is looking at,
+    so it must win the budget over one that has scrolled out of the chat.
+
+    Call this on the FINAL row list — after the window is cut, after the
+    operator fold — and before anything measures the rows' wire bytes."""
+    for row in reversed(rows or []):
+        if not isinstance(row, dict):
+            continue
+        chips = []
+        for block in row.get("blocks") or []:
+            if isinstance(block, dict) and isinstance(block.get("files"), list):
+                chips.extend(c for c in block["files"] if isinstance(c, dict))
+        if not chips:
+            continue
+        budget.begin_entry()
+        for chip in chips:
+            _embed_preview(chip, budget)
+
+
+def _drop_deferred_previews(blocks, budget):
+    """Mark every preview deferred on `blocks` as shed WITHOUT reading it, and
+    return the bytes that would have been embedded (projected from each file's
+    size, so the log still says how much was dropped).
+
+    The archive path's counterpart to _fill_previews, for a transcript already
+    over ARCHIVE_PAYLOAD_MAX: filling and then calling _shed_block_payloads
+    reads hundreds of MB off disk purely to throw them away — measured, one
+    sync pass read 3.36 GB to drop 611 MB of it."""
+    dropped = 0
+    for block in blocks or []:
+        if not isinstance(block, dict) or not isinstance(block.get("files"), list):
+            continue
+        for chip in block["files"]:
+            if not isinstance(chip, dict):
+                continue
+            resolved = budget.resolve(chip)
+            if resolved is None:
+                continue
+            path, mime = resolved
+            chip["shed"] = True
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size > SEND_FILE_MAX_BYTES:
+                continue
+            dropped += (4 * ((st.st_size + 2) // 3)) if mime else st.st_size
+    return dropped
+
+
+def _send_user_file_detail(inp, budget=None):
+    """The preview entries for a SendUserFile call's tool_use block (XERK-221),
+    or None:
       image -> {"name", "kind":"image", "src": "data:<mime>;base64,<b64>"}
       html  -> {"name", "kind":"html",  "html": "<markup>"}   (display:"render" only)
       else  -> {"name", "kind":"file"}   (attach-mode HTML, oversize, unreadable, or
                                           a non-renderable type — a bare name chip)
+      over budget -> that same chip flagged {"shed": True}
     Images render regardless of `display` (they ARE the delivery); HTML renders
     only when the call asked to (`display:"attach"` is a download, not a preview).
     Only image/html paths are ever opened, and each is read at most
-    SEND_FILE_MAX_BYTES, so a delivery can neither bloat the frame nor leak an
-    arbitrary file's bytes. Mirror of tunnel-agent.js sendUserFileDetail()."""
+    SEND_FILE_MAX_BYTES, so no single file can leak an arbitrary file's bytes.
+
+    This decides only WHICH files are renderable; the bytes are read by
+    `_fill_previews` once the caller's row list is final (XERK-355). Passing no
+    `budget` fills immediately, bounded at one entry's worth — so a caller that
+    does not care about the pass ceiling still gets a bounded block, and no
+    unfilled handle escapes. Mirror of tunnel-agent.js sendUserFileDetail()."""
     files = inp.get("files")
     if not isinstance(files, list) or not files:
         return None
+    own = budget is None
+    if own:
+        budget = _PreviewBudget(total=SEND_FILE_ENTRY_MAX_BYTES)
     display = inp.get("display")
     out = []
     for path in files[:SEND_FILE_MAX_FILES]:
@@ -4155,21 +4371,17 @@ def _send_user_file_detail(inp):
         ext = os.path.splitext(path)[1].lower()
         mime = SEND_FILE_IMG_MIME.get(ext)
         render_html = ext in SEND_FILE_HTML_EXT and display != "attach"
-        entry = {"name": name, "kind": "file"}
+        chip = {"name": name, "kind": "file"}
         if mime or render_html:
-            try:
-                with open(path, "rb") as fh:
-                    data = fh.read(SEND_FILE_MAX_BYTES + 1)
-                if len(data) <= SEND_FILE_MAX_BYTES:
-                    if mime:
-                        entry = {"name": name, "kind": "image",
-                                 "src": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii"))}
-                    else:
-                        entry = {"name": name, "kind": "html", "html": data.decode("utf-8", "replace")}
-            except OSError:
-                pass  # unreadable / gone → name chip
-        out.append(entry)
-    return out or None
+            budget.defer(chip, path, mime)
+        out.append(chip)
+    if not out:
+        return None
+    if own:
+        budget.begin_entry()
+        for chip in out:
+            _embed_preview(chip, budget)
+    return out
 
 
 def _shed_block_payloads(blocks):
@@ -4223,7 +4435,7 @@ def _block_payload_bytes(blocks):
     return total
 
 
-def _tool_use_detail(block, name, inp, caps):
+def _tool_use_detail(block, name, inp, caps, budget=None):
     """Attach the reviewable payload of a known tool call to its tool_use block,
     beyond the one-line `input` summary — the part an operator otherwise opens
     the raw terminal to see. Returns True when a payload was clipped by its cap
@@ -4236,6 +4448,9 @@ def _tool_use_detail(block, name, inp, caps):
       SendUserFile  -> files: [{name, kind, src|html}] + caption  (inline preview)
       any tool      -> desc: its human `description` arg (Bash, Agent, Monitor, …)
 
+    `budget` is the read's _PreviewBudget, threaded through to the SendUserFile
+    previews — the one payload here read from DISK rather than clipped out of
+    the transcript, hence the only one no cap above bounds (XERK-355).
     Mirror of tunnel-agent.js toolUseDetail()."""
     if not isinstance(inp, dict):
         return False
@@ -4263,7 +4478,7 @@ def _tool_use_detail(block, name, inp, caps):
             block["plan"] = clipped
             truncated = trunc
     elif name == "SendUserFile":
-        files = _send_user_file_detail(inp)
+        files = _send_user_file_detail(inp, budget)
         if files:
             block["files"] = files
             cap = inp.get("caption")
@@ -4623,7 +4838,7 @@ def live_agents_report(state):
             for a in (state.get("liveAgents") or {}).values()]
 
 
-def _entry_blocks(entry, caps):
+def _entry_blocks(entry, caps, budget=None):
     """Rich, order-preserving block list for one transcript entry, or None to
     drop it (wrong type / no message dict). Additive companion to _entry_text:
     it PRESERVES the thinking text, tool_use inputs and tool_result outputs that
@@ -4667,8 +4882,13 @@ def _entry_blocks(entry, caps):
     becomes a `pr_link` marker so the reader sees where in the conversation
     the PR landed; such entries carry no uuid, so the feeds synthesize an id
     (_entry_id / entryId).
-    Returns [] for a user/assistant message with no renderable blocks. Keep this
-    mirrored with tunnel-agent.js entryBlocks()."""
+    Returns [] for a user/assistant message with no renderable blocks.
+    `budget` is the whole read's _PreviewBudget (XERK-355). Passing one DEFERS
+    this entry's SendUserFile previews into it, and the caller must run
+    `_fill_previews` over its final row list to embed them — that is what lets
+    the newest rows win the budget rather than the oldest. Omitting it embeds
+    inline, bounded at one entry's worth. Keep this mirrored with
+    tunnel-agent.js entryBlocks()."""
     away = _away_summary_text(entry)
     if away is not None:
         clipped, trunc = _clip(away, caps["text"])
@@ -4801,7 +5021,7 @@ def _entry_blocks(entry, caps):
                     block["id"] = raw["id"]
                 if trunc:
                     block["truncated"] = True
-                if _tool_use_detail(block, str(raw["name"]), raw.get("input"), caps):
+                if _tool_use_detail(block, str(raw["name"]), raw.get("input"), caps, budget):
                     block["truncated"] = True
                 blocks.append(block)
             elif btype == "tool_result":
@@ -5118,14 +5338,16 @@ def _pending_scan(path):
     return delivered, _queued_display(queued), compactions
 
 
-def _history_row(entry):
+def _history_row(entry, budget=None):
     """One parsed transcript entry -> the history feed's row shape, or None to
     drop it. Rich path: widens inclusion beyond _entry_text — a turn that
     carries only tool_result blocks (text is None) still has renderable blocks
     and is kept, so the chat UI can show tool output. transcript_tail keeps the
-    old drop-when-None rule (heartbeat/archive stay lean)."""
+    old drop-when-None rule (heartbeat/archive stay lean).
+
+    `budget` is the delivery's _PreviewBudget, shared across every row in it."""
     text = _entry_text(entry)
-    blocks = _entry_blocks(entry, BLOCK_CAPS)
+    blocks = _entry_blocks(entry, BLOCK_CAPS, budget)
     if text is None and not blocks:
         return None
     return {
@@ -5155,9 +5377,11 @@ def _is_operator_row(row):
 _USER_LINE_MARKERS = (b'"type":"user"', b'"type": "user"')
 
 
-def _operator_entries(path):
+def _operator_entries(path, budget=None):
     """Every operator-authored text message in the WHOLE transcript, oldest
-    first, as _history_row rows (XERK-186).
+    first, as _history_row rows (XERK-186). `budget` is the delivery's
+    _PreviewBudget — these rows ride the SAME reply as the window's, so they
+    spend the same one.
 
     The windowed history read below cuts old entries wholesale, and in a
     tool-heavy session the few messages the operator typed are exactly what a
@@ -5178,7 +5402,7 @@ def _operator_entries(path):
                     continue
                 if not isinstance(entry, dict) or entry.get("type") != "user":
                     continue
-                row = _history_row(entry)
+                row = _history_row(entry, budget)
                 if row is not None and _is_operator_row(row):
                     rows.append(row)
     except OSError:
@@ -5203,14 +5427,16 @@ def _shed_row_previews(row, budget):
     the row fits `budget` wire bytes. Returns True if anything was dropped.
 
     The block caps do NOT bound a row: a preview is read from DISK, not from the
-    transcript, so one turn carries SEND_FILE_MAX_FILES x SEND_FILE_MAX_BYTES of
-    base64 — ~11 MB per turn, and a delivery no size ceiling can honour
-    (XERK-355). Shedding reuses the ARCHIVE path's `_shed_block_payloads`, so a
-    row degrades to exactly the `shed:True` name chip the archive already
-    produces: the conversation still says what was delivered, and the reply
-    becomes something the hub will actually accept. Better than exempting the
-    row, which produced a body nothing could deliver at all, and better than
-    dropping it, which is a hole in the conversation.
+    transcript. _PreviewBudget now bounds what a turn may embed at the read
+    (XERK-355), so this is the DELIVERY-side backstop rather than the only
+    bound — it still fires for a row over the budget for other reasons, and for
+    an entry-ceiling's worth of previews on a row already near HISTORY_MAX_BYTES.
+    Shedding reuses the ARCHIVE path's `_shed_block_payloads`, so a row degrades
+    to exactly the `shed:True` name chip the archive already produces: the
+    conversation still says what was delivered, and the reply becomes something
+    the hub will actually accept. Better than exempting the row, which produced
+    a body nothing could deliver at all, and better than dropping it, which is a
+    hole in the conversation.
 
     Sizes are measured ONCE per block and subtracted, never by re-measuring the
     row per block: a turn may carry BLOCK_MAX_PER_ENTRY deliveries, and
@@ -5287,6 +5513,12 @@ def _history_entries(path):
         byte_capped = False
     entries = []
     queued = []
+    # One preview budget for the whole delivery (XERK-355), so the reply is
+    # bounded before _fit_history_budget has to shed anything — including the
+    # newest row, which that function may not drop. Nothing is READ here: the
+    # window and the operator fold below both cut rows, and spending the budget
+    # on a row about to be dropped is spending it on nobody.
+    budget = _PreviewBudget()
     for raw in _read_tail_lines(path, read_cap):
         try:
             entry = json.loads(raw)
@@ -5297,16 +5529,22 @@ def _history_entries(path):
         if entry.get("type") == "queue-operation":
             _fold_queue_op(entry, queued)
             continue
-        row = _history_row(entry)
+        row = _history_row(entry, budget)
         if row is not None:
             entries.append(row)
     truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
     window = entries[-HISTORY_MAX_MSGS:]
     if truncated:
         shown = {row["id"] for row in window if row.get("id")}
-        older = [row for row in _operator_entries(path)
+        older = [row for row in _operator_entries(path, budget)
                  if row.get("id") and row["id"] not in shown]
+        # (these are the rows the window CUT, so they fill last — see below)
         window = older[-HISTORY_USER_MSGS:] + window
+    # Now that the window is final, read the previews it kept — newest row
+    # first, so the turn the operator is looking at gets the budget and an
+    # older one degrades to the shed chip. Before _fit_history_budget, which
+    # measures wire bytes and must see the payloads that are really there.
+    _fill_previews(window, budget)
     window, over_budget = _fit_history_budget(window)
     return window, truncated or over_budget, _queued_display(queued)
 
@@ -14264,6 +14502,15 @@ class SessionManager:
                 complete = raw[:nl + 1]
                 end = have + len(complete)
                 entries = []
+                # Entry ceiling only (XERK-355): this pass already has a budget
+                # of its own in ARCHIVE_PAYLOAD_MAX, spent over the whole
+                # transcript rather than one chunk, and stacking the tail's pass
+                # ceiling on top would cut the durable copy's fidelity for
+                # nothing. It bounds ONE ENTRY, which is not a bound on this
+                # POST's body — a chunk holds thousands of them, and what
+                # actually bounds the body is ARCHIVE_CHUNK_BYTES plus the shed
+                # (the hub reads this route with a 1 MiB cap: XERK-373).
+                preview_budget = _PreviewBudget(total=0)
                 for line in complete.split(b"\n"):
                     line = line.strip()
                     if not line:
@@ -14280,17 +14527,21 @@ class SessionManager:
                     # copy; the archive has no /history to expand into). Inclusion
                     # widens like _history_entries: a tool_result-only turn (text
                     # is None) still has blocks and is kept.
-                    blocks = _entry_blocks(entry, BLOCK_CAPS)
+                    blocks = _entry_blocks(entry, BLOCK_CAPS, preview_budget)
                     if text is None and not blocks:
                         continue
                     # ...except the SendUserFile payloads, once this transcript
-                    # has spent its archive budget on them (XERK-267).
+                    # has spent its archive budget on them (XERK-267). Deciding
+                    # that BEFORE the read is the point of the deferral: an
+                    # already-shedding transcript costs no preview I/O at all.
                     if shed:
-                        shed_bytes += _shed_block_payloads(blocks)
-                    elif ARCHIVE_PAYLOAD_MAX > 0:   # 0 = ceiling disabled
-                        payload_sent += _block_payload_bytes(blocks)
-                        if payload_sent >= ARCHIVE_PAYLOAD_MAX:
-                            shed = True
+                        shed_bytes += _drop_deferred_previews(blocks, preview_budget)
+                    else:
+                        _fill_previews([{"blocks": blocks}], preview_budget)
+                        if ARCHIVE_PAYLOAD_MAX > 0:   # 0 = ceiling disabled
+                            payload_sent += _block_payload_bytes(blocks)
+                            if payload_sent >= ARCHIVE_PAYLOAD_MAX:
+                                shed = True
                     entries.append({
                         # _entry_id, not the raw uuid: a pr-link entry has none,
                         # and the archived row's synthesized id must match the

@@ -386,10 +386,9 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   `toolUseDetail`): Edit → `edit`, Write → `content`, ExitPlanMode → `plan`, any tool's
   `description` → `desc`. An AskUserQuestion card is titled with its question text(s), not the input
   JSON.
-  - **SendUserFile → `files[]`+`caption`** (XERK-221): image/SVG as a base64 data URI
-    (`kind:"image"`), a `render` HTML page as raw markup (`kind:"html"`), else a name chip
-    (`kind:"file"` — attach/oversize past `SEND_FILE_MAX_BYTES`/missing/other, **never opened**).
-    Only image/html paths are read, bounded, so a delivery can't bloat the frame or leak bytes.
+  - **SendUserFile → `files[]`+`caption`** (XERK-221) — the shapes, and the budget that bounds what
+    one turn may embed (XERK-355), are in `.claude/rules/agent-previews.md`. They are read from
+    DISK, so nothing else on this page bounds them.
 - Two more markers: `system`/`compact_boundary` → `{t:"compact_boundary", trigger, preTokens,
   postTokens}`, and a `pr-link` entry → `{t:"pr_link", url, number, repo}`. pr-link entries carry no
   uuid, so the feeds synthesize a stable id (`_entry_id`/`entryId`) — the client merge drops id-less
@@ -430,12 +429,9 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,
   `TestResumableReport`.
-- **The archive is the ONE place a SendUserFile preview is shed** (`_shed_block_payloads`,
-  XERK-267): the payloads are bounded per delivery but unbounded relative to the transcript, so a
-  screenshot-heavy session archives orders of magnitude larger than what it records (measured:
-  28 KB of transcript → 447 MB archived). Past `ARCHIVE_PAYLOAD_MAX` the rest of that transcript
-  ships as name-only chips flagged `shed`. The live tail and `history` keep their previews — those
-  are re-read from the transcript on demand and cost nothing durable.
+- **`ARCHIVE_PAYLOAD_MAX` sheds a transcript's SendUserFile previews for durability**
+  (`_shed_block_payloads`, XERK-267) — see `.claude/rules/agent-previews.md`, which owns the whole
+  preview contract including the budget bounding what a turn may embed at all.
 - **The hub owns the ceiling, this is only an early stop.** `archiveShed`/`archiveFull` on the
   heartbeat reply are the hub's verdict (`turma/archive.js`), which the agent applies to keep the
   bytes off the wire and to skip a pass at a full store; the hub re-applies both itself, since an

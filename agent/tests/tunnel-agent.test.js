@@ -1709,6 +1709,319 @@ test("BLOCK_CAPS matches hub-agent.py's, value for value", () => {
   assert.equal(BLOCK_CAPS.text, pyCap("INPUT_MAX_CHARS"));
 });
 
+// Build a transcript of `turns` SendUserFile deliveries, oldest first, and
+// return what the REAL transcriptTail makes of it. Driving the reader rather
+// than entryBlocks is the point: every line that installs the budget on a
+// reader was individually deletable with a green suite, and losing this one
+// took a frame from 88,313 to 42,032,632 bytes.
+function tailOf(turns, filePath, perTurn = 1) {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-tail-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "11111111-2222-3333-4444-" + String(turns).padStart(12, "0");
+  const lines = [];
+  for (let i = 0; i < turns; i++) {
+    lines.push(JSON.stringify({
+      type: "assistant", uuid: `a${String(i).padStart(3, "0")}`,
+      message: { role: "assistant", content: [
+        { type: "tool_use", id: `t${i}`, name: "SendUserFile",
+          input: { files: Array(perTurn).fill(filePath), display: "render" } },
+      ] },
+    }));
+  }
+  fs.writeFileSync(path.join(proj, `${tid}.jsonl`), lines.join("\n") + "\n");
+  return mod.transcriptTail(work, null, tid);
+}
+
+// Which entries came back with a real preview, and which with a shed chip.
+function previewSplit(entries) {
+  const shown = [], shed = [];
+  for (const e of entries) {
+    for (const b of e.blocks || []) {
+      for (const f of b.files || []) {
+        if (f.src || f.html) shown.push(e.id);
+        else if (f.shed) shed.push(e.id);
+      }
+    }
+  }
+  return { shown, shed };
+}
+
+const payloadBytes = (entries) => entries.reduce((n, e) =>
+  n + (e.blocks || []).reduce((m, b) => m + (b.files || []).reduce(
+    (k, f) => k + Buffer.byteLength(f.src || f.html || "", "utf8"), 0), 0), 0);
+
+// --- SendUserFile preview budget (XERK-355) --------------------------------
+// The per-file caps bound a FILE. Nothing bounded the turn or the read, because
+// a preview comes off DISK rather than out of the ~128 KB tail window: measured,
+// 48 deliveries x 16 files x 512 KB built a ~537 MB frame from a 2,306-byte
+// transcript, which JSON.stringify refuses outright.
+
+test("preview budget: the NEWEST turns keep their previews, not the oldest", () => {
+  // The regression a parse-order budget caused, and why the reads are deferred:
+  // transcriptTail parses the whole TAIL_READ_BYTES window and then returns its
+  // newest TAIL_MSGS entries, so a budget spent while parsing is spent on the
+  // entries the frame drops. Measured, an ordinary 40-turn session showed the
+  // operator ZERO previews where the pre-budget code showed 15.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-order-"));
+  const png = path.join(dir, "shot.png");
+  fs.writeFileSync(png, Buffer.alloc(200 * 1024));
+  const { entries } = tailOf(40, png);
+  const { shown, shed } = previewSplit(entries);
+  assert.ok(shown.length, "the frame still carries previews");
+  // The newest entry is what the operator is looking at, so it is the one that
+  // must have survived.
+  assert.equal(shown[shown.length - 1], entries[entries.length - 1].id);
+  assert.ok(shed.length, "the rest degraded rather than blowing the frame");
+  assert.ok(shed.every((id) => id < shown[0]), "what degraded is the older half");
+});
+
+test("preview budget: a frame is bounded, and so is what it reads", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-frame-"));
+  const png = path.join(dir, "shot.png");
+  fs.writeFileSync(png, Buffer.alloc(200 * 1024));
+  const { SEND_FILE_PASS_MAX_BYTES } = require("../tunnel-agent.js");
+  const realOpen = fs.openSync;
+  const opens = [];
+  fs.openSync = function (p, ...rest) { opens.push(p); return realOpen.call(this, p, ...rest); };
+  let entries;
+  try { entries = tailOf(120, png).entries; } finally { fs.openSync = realOpen; }
+  assert.ok(payloadBytes(entries) <= SEND_FILE_PASS_MAX_BYTES);
+  // The reads are bounded too, not just the output — an entry sliced out of the
+  // frame is never opened at all.
+  assert.ok(opens.filter((p) => p === png).length < 30,
+    `opened the preview ${opens.filter((p) => p === png).length} times`);
+});
+
+test("preview budget: non-UTF-8 HTML cannot buy unbounded reads", () => {
+  // An HTML file that is not valid UTF-8 re-encodes to ~3x its size through the
+  // replacement character, so charging only on success let fits() keep admitting
+  // reads it then rejected — measured, 960 files and 503,316,480 bytes read to
+  // produce an 89 KB frame. The reservation stays spent, which is what stops it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-bad-"));
+  const bad = path.join(dir, "bad.html");
+  fs.writeFileSync(bad, Buffer.alloc(512 * 1024, 0xff));
+  const { SEND_FILE_PASS_MAX_BYTES } = require("../tunnel-agent.js");
+  const realOpen = fs.openSync;
+  const opens = [];
+  fs.openSync = function (p, ...rest) { opens.push(p); return realOpen.call(this, p, ...rest); };
+  let entries;
+  try { entries = tailOf(60, bad, 8).entries; } finally { fs.openSync = realOpen; }
+  assert.ok(opens.filter((p) => p === bad).length < 20,
+    `read ${opens.filter((p) => p === bad).length} times`);
+  assert.ok(payloadBytes(entries) <= SEND_FILE_PASS_MAX_BYTES);
+});
+
+test("preview budget: one entry cannot embed more than its ceiling", () => {
+  const { entryBlocks, SEND_FILE_ENTRY_MAX_BYTES } = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-entry-"));
+  // The ticket's own repro. The same path 16 times: the budget is spent per
+  // EMBED, not per unique path, so the fixture costs one file on disk.
+  const big = path.join(dir, "big.png");
+  fs.writeFileSync(big, Buffer.alloc(512 * 1024));
+  const blocks = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", id: "t1", name: "SendUserFile",
+      input: { files: Array(16).fill(big), display: "render" } },
+  ] } }, BLOCK_CAPS);
+  const files = blocks[0].files;
+  assert.equal(files.length, 16, "every delivery is still shown");
+  const embedded = files.reduce((n, f) => n + Buffer.byteLength(f.src || f.html || "", "utf8"), 0);
+  assert.ok(embedded <= SEND_FILE_ENTRY_MAX_BYTES, `embedded ${embedded} bytes`);
+  assert.ok(files.some((f) => f.src), "previews still embed");
+  // The ones past the budget degrade to the shed chip the archive already
+  // produces, which both chat clients render as "… preview dropped to fit".
+  const shed = files.filter((f) => f.shed);
+  assert.ok(shed.length, "the rest are shed chips");
+  for (const f of shed) {
+    assert.equal(f.kind, "file");
+    assert.equal(f.src, undefined);
+  }
+});
+
+test("preview budget: an over-budget delivery is never READ", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-read-"));
+  const big = path.join(dir, "big.png");
+  fs.writeFileSync(big, Buffer.alloc(512 * 1024));
+  const realOpen = fs.openSync;
+  const opens = [];
+  fs.openSync = function (p, ...rest) { opens.push(p); return realOpen.call(this, p, ...rest); };
+  try {
+    mod.entryBlocks({ type: "assistant", message: { content: [
+      { type: "tool_use", id: "t1", name: "SendUserFile",
+        input: { files: Array(16).fill(big), display: "render" } },
+    ] } }, BLOCK_CAPS);
+  } finally {
+    fs.openSync = realOpen;
+  }
+  assert.ok(opens.length < 16, `opened ${opens.length} of 16 files`);
+});
+
+test("preview budget: an oversize file is decided on the stat, never read", () => {
+  // A file past SEND_FILE_MAX_BYTES stays the PLAIN chip (the file is too big,
+  // not the turn), and the length check after the read produces that same chip
+  // — so without asserting the open, the size guard is deletable and every
+  // oversize delivery costs half a MiB of reading per poll.
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-over-"));
+  const big = path.join(dir, "big.png");
+  fs.writeFileSync(big, Buffer.alloc(512 * 1024 + 1));
+  const realOpen = fs.openSync;
+  const opens = [];
+  fs.openSync = function (p, ...rest) { opens.push(p); return realOpen.call(this, p, ...rest); };
+  let blocks;
+  try {
+    blocks = mod.entryBlocks({ type: "assistant", message: { content: [
+      { type: "tool_use", id: "t1", name: "SendUserFile",
+        input: { files: [big], display: "render" } },
+    ] } }, BLOCK_CAPS);
+  } finally {
+    fs.openSync = realOpen;
+  }
+  assert.deepEqual(blocks[0].files, [{ name: "big.png", kind: "file" }]);
+  assert.equal(opens.filter((p) => p === big).length, 0);
+});
+
+test("preview budget: the halves refill independently and a reservation stays spent", () => {
+  const { PreviewBudget } = require("../tunnel-agent.js");
+  const b = new PreviewBudget(300, 100);
+  assert.equal(b.reserve(100), true);
+  assert.equal(b.reserve(1), false);   // entry spent
+  b.beginEntry();
+  assert.equal(b.reserve(100), true);  // entry refilled
+  b.beginEntry();
+  assert.equal(b.reserve(100), true);
+  b.beginEntry();
+  assert.equal(b.reserve(1), false);   // ...but the pass is spent
+  // A payload that outgrows its reservation is refused with the reservation
+  // still gone — that is what bounds the READS, not just the bytes.
+  const c = new PreviewBudget(1000, 1000);
+  assert.equal(c.reserve(100), true);
+  assert.equal(c.settle(100, 5000), false);
+  assert.equal(c.left, 900);
+  assert.equal(c.reserve(100), true);
+  assert.equal(c.settle(100, 40), true);   // an under-run refunds
+  assert.equal(c.left, 860);
+  // 0 disables a half, the convention hub-agent.py's _byte_ceiling and the
+  // archive budget already use — the archive path passes total=0.
+  const off = new PreviewBudget(0, 10);
+  for (let i = 0; i < 1000; i++) { off.beginEntry(); assert.equal(off.reserve(10), true); }
+});
+
+test("preview budget: an unfilled chip carries a handle and never a PATH", () => {
+  // A chip whose entry the slice drops is never filled, so its handle can reach
+  // a client. An int is inert there; the path would be filesystem disclosure.
+  const { entryBlocks, fillPreviews, PreviewBudget, PREVIEW_HANDLE_KEY } =
+    require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-handle-"));
+  const png = path.join(dir, "shot.png");
+  fs.writeFileSync(png, Buffer.alloc(32));
+  const budget = new PreviewBudget();
+  const blocks = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", id: "t1", name: "SendUserFile",
+      input: { files: [png], display: "render" } },
+  ] } }, BLOCK_CAPS, budget);
+  const chip = blocks[0].files[0];
+  assert.ok(Number.isInteger(chip[PREVIEW_HANDLE_KEY]));
+  // The chip, not the block: the tool_use `input` summary has carried the
+  // delivered paths since XERK-221 and is meant to be readable.
+  assert.ok(!JSON.stringify(blocks[0].files).includes(dir));
+  fillPreviews([{ blocks }], budget);
+  assert.equal(chip[PREVIEW_HANDLE_KEY], undefined);
+  assert.ok(chip.src.startsWith("data:image/png;base64,"));
+});
+
+test("preview budget: a FIFO is never opened", () => {
+  // A FIFO stats at 0 bytes and passes every ceiling, then blocks the read
+  // until somebody writes — here that is pollWatcher's interval, i.e. this
+  // host's whole live tail. The regular-file check must precede the open,
+  // which is why this asserts on the open and not on a timeout.
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-fifo-"));
+  const fifo = path.join(dir, "trap.png");
+  const r = require("child_process").spawnSync("mkfifo", [fifo]);
+  if (r.status !== 0) return;   // no mkfifo on this box; the py twin still pins it
+  const realOpen = fs.openSync;
+  const opens = [];
+  // Throwing here stands in for the block a real FIFO would cause. Assert on
+  // the CALL, not on the resulting chip: a guard that lets the open happen and
+  // then handles the failure produces the same chip, and in production it does
+  // not fail — it hangs.
+  fs.openSync = function (p) { opens.push(p); throw new Error(`opened ${p}`); };
+  let blocks;
+  try {
+    blocks = mod.entryBlocks({ type: "assistant", message: { content: [
+      { type: "tool_use", id: "t1", name: "SendUserFile",
+        input: { files: [fifo], display: "render" } },
+    ] } }, BLOCK_CAPS);
+  } finally {
+    fs.openSync = realOpen;
+  }
+  assert.deepEqual(opens, [], "the FIFO must never be opened at all");
+  assert.deepEqual(blocks[0].files, [{ name: "trap.png", kind: "file" }]);
+});
+
+test("preview budget: the read is capped, as hub-agent.py's is", () => {
+  // readFileSync would load a whole file before anything could reject it, where
+  // the Python side reads read(cap+1). A file that grows between the stat and
+  // the read must not cost the two processes different memory.
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-cap-"));
+  const p = path.join(dir, "grew.bin");
+  fs.writeFileSync(p, Buffer.alloc(4096, 0x41));
+  assert.equal(mod.readCapped(p, 100).length, 100);
+  assert.equal(mod.readCapped(p, 8192).length, 4096);   // short file, no padding
+  assert.equal(mod.readCapped(p, 4096).toString(), "A".repeat(4096));
+  // And the preview path must actually USE it. An uncapped read at the call
+  // site produces an identical chip — the only observable difference is the
+  // memory, so the invariant has to be asserted structurally.
+  const png = path.join(dir, "shot.png");
+  fs.writeFileSync(png, Buffer.alloc(1024));
+  const realReadFile = fs.readFileSync;
+  const whole = [];
+  fs.readFileSync = function (f, ...rest) { whole.push(f); return realReadFile.call(this, f, ...rest); };
+  try {
+    mod.entryBlocks({ type: "assistant", message: { content: [
+      { type: "tool_use", id: "t1", name: "SendUserFile",
+        input: { files: [png], display: "render" } },
+    ] } }, BLOCK_CAPS);
+  } finally {
+    fs.readFileSync = realReadFile;
+  }
+  assert.deepEqual(whole, [], "the preview path must not use an uncapped read");
+});
+
+test("preview budget: the ceilings match hub-agent.py's, value for value", () => {
+  const { SEND_FILE_ENTRY_MAX_BYTES, SEND_FILE_PASS_MAX_BYTES, byteCeiling } =
+    require("../tunnel-agent.js");
+  const py = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
+  const pyShift = (name) => {
+    const m = py.match(new RegExp(`^${name} = _byte_ceiling\\(\\n\\s+os\\.environ\\.get\\("[A-Z_]+"\\), (\\d+) << (\\d+)\\)`, "m"));
+    assert.ok(m, `hub-agent.py no longer declares ${name} the way this parity check reads it`);
+    return Number(m[1]) << Number(m[2]);
+  };
+  assert.equal(SEND_FILE_ENTRY_MAX_BYTES, pyShift("SEND_FILE_ENTRY_MAX_BYTES"));
+  assert.equal(SEND_FILE_PASS_MAX_BYTES, pyShift("SEND_FILE_PASS_MAX_BYTES"));
+  // Pinned, not just mirrored: two files drifting together is still the bug,
+  // and these are a product decision about what one turn may show.
+  assert.equal(SEND_FILE_ENTRY_MAX_BYTES, 2 << 20);
+  assert.equal(SEND_FILE_PASS_MAX_BYTES, 4 << 20);
+  // The handle key is on the wire whenever a chip goes unfilled, so it is part
+  // of the contract both sides must spell the same way.
+  assert.equal(require("../tunnel-agent.js").PREVIEW_HANDLE_KEY,
+    (py.match(/^PREVIEW_HANDLE_KEY = "([^"]+)"/m) || [])[1]);
+  // The env read must agree with _byte_ceiling on BOTH of its rules, or the two
+  // processes read different ceilings off one operator value.
+  assert.equal(byteCeiling("0", 99), 0, "an explicit 0 turns the ceiling off");
+  assert.equal(byteCeiling("4MiB", 99), 99, "a typo falls back, it is not 4 bytes");
+  assert.equal(byteCeiling(undefined, 99), 99);
+  assert.equal(byteCeiling(" 12 ", 99), 12);
+});
+
+
 // --- an unserializable tail skips its frame, it does not kill the process ---
 // A turn holding BLOCK_MAX_PER_ENTRY SendUserFile deliveries builds a frame past
 // V8's ~512 MB string ceiling (previews come off DISK, so no transcript window

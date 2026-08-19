@@ -13663,6 +13663,268 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(calls), 1)  # one attempt, then it bails (no loop)
 
 
+class TestSendFilePreviewBudget(unittest.TestCase):
+    """What a SendUserFile turn may EMBED, and when it is read (XERK-355).
+
+    The per-file caps bound a FILE. Nothing bounded the turn or the read,
+    because a preview comes off DISK rather than out of the transcript window —
+    measured, one entry produced an 11,185,184-byte row and 48 of them a
+    ~537 MB frame, both from a transcript of a couple of KB.
+
+    These drive the REAL readers (`_history_entries`, and the archive loop in
+    TestArchivePayloadBudget) as well as the units: with only unit tests, every
+    line that installs the budget on a reader could be deleted with the whole
+    suite green — measured, `_history_entries` losing its budget took the reply
+    from 585,042 to 5,604,318 bytes and 5 opens to 800, and nothing failed."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _file(self, name, size, fill=b"\x00"):
+        p = os.path.join(self.dir, name)
+        with open(p, "wb") as fh:
+            fh.write(fill * size)
+        return p
+
+    def _entry(self, files, display="render"):
+        return {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "SendUserFile",
+             "input": {"files": files, "display": display}},
+        ]}}
+
+    def _transcript(self, turns, path, per_turn=1):
+        """A transcript of `turns` delivery turns, oldest first, as the readers
+        take it: one JSONL entry each, all naming the same real file."""
+        out = os.path.join(self.dir, "conv.jsonl")
+        with open(out, "w") as fh:
+            for i in range(turns):
+                fh.write(json.dumps({
+                    "type": "assistant", "uuid": "a%03d" % i,
+                    "timestamp": "2026-07-01T10:00:00Z",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "t%03d" % i, "name": "SendUserFile",
+                         "input": {"files": [path] * per_turn, "display": "render"}}]},
+                }) + "\n")
+        return out
+
+    @staticmethod
+    def _previewed(rows):
+        """(rows carrying a real preview, rows carrying a shed chip)."""
+        shown, shed = [], []
+        for row in rows:
+            for block in row.get("blocks") or []:
+                for f in block.get("files") or []:
+                    if f.get("src") or f.get("html"):
+                        shown.append(row["id"])
+                    elif f.get("shed"):
+                        shed.append(row["id"])
+        return shown, shed
+
+    # --- the reader that actually delivers ---------------------------------
+
+    def test_the_NEWEST_turns_keep_their_previews_not_the_oldest(self):
+        # The regression that a parse-order budget caused, and the reason the
+        # reads are deferred at all: `_history_entries` parses a 4 MiB window
+        # and then cuts it to HISTORY_MAX_MSGS, so a budget spent while parsing
+        # is spent on rows the reply then drops. Measured on an ordinary
+        # screenshot session, that showed the operator ZERO previews.
+        png = self._file("shot.png", 200 * 1024)
+        rows, _, _ = ha._history_entries(self._transcript(120, png))
+        shown, shed = self._previewed(rows)
+        self.assertTrue(shown, "the delivery still carries previews")
+        # The newest row is the one the operator is looking at, so it is the one
+        # that must have survived — not row 20 of 120.
+        self.assertEqual(shown[-1], rows[-1]["id"])
+        # ...and what degraded is older than everything that survived.
+        self.assertTrue(shed, "the rest degraded rather than blowing the reply")
+        self.assertLess(max(shed), min(shown))
+
+    def test_a_history_delivery_is_bounded_and_so_is_its_reading(self):
+        png = self._file("shot.png", 200 * 1024)
+        path = self._transcript(120, png)
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with mock.patch("builtins.open", counting_open):
+            rows, _, _ = ha._history_entries(path)
+        payload = sum(ha._block_payload_bytes(r.get("blocks")) for r in rows)
+        self.assertLessEqual(payload, ha.SEND_FILE_PASS_MAX_BYTES)
+        # A reply must also fit the ceiling it is delivered under, or
+        # _fit_history_budget is straight back to shedding the newest row.
+        self.assertLess(ha._json_bytes(rows), ha.HISTORY_MAX_BYTES)
+        # The reads are bounded too, not just the output: the previews are the
+        # only thing here that opens a file besides the transcript itself.
+        self.assertLess(len([p for p in opened if p == png]), 30)
+
+    def test_non_utf8_html_cannot_buy_unbounded_reads(self):
+        # An HTML file that is not valid UTF-8 (a latin-1 page, say) re-encodes
+        # to ~3x its size through errors="replace". Charging only on success let
+        # `fits` keep admitting reads it then rejected — measured 3.36 GB read
+        # for a 1 MB reply, 20s of it on the beat thread. The reservation is
+        # what stops that: it stays spent when the payload doesn't fit.
+        bad = self._file("bad.html", 512 * 1024, b"\xff")
+        path = self._transcript(60, bad, per_turn=8)
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with mock.patch("builtins.open", counting_open):
+            rows, _, _ = ha._history_entries(path)
+        reads = len([p for p in opened if p == bad])
+        self.assertLess(reads, 20, "reads stop once the budget is really gone")
+        self.assertLessEqual(
+            sum(ha._block_payload_bytes(r.get("blocks")) for r in rows),
+            ha.SEND_FILE_PASS_MAX_BYTES)
+
+    # --- the entry ceiling -------------------------------------------------
+
+    def test_the_ticket_repro_no_longer_produces_an_11_mb_row(self):
+        # XERK-355's own repro: SEND_FILE_MAX_FILES files of SEND_FILE_MAX_BYTES
+        # on ONE tool_use. The same path is listed 16 times so the fixture costs
+        # one file on disk — the budget is spent per EMBED, not per unique path.
+        big = self._file("big.png", ha.SEND_FILE_MAX_BYTES)
+        blocks = ha._entry_blocks(self._entry([big] * ha.SEND_FILE_MAX_FILES),
+                                  ha.BLOCK_CAPS)
+        payload = ha._block_payload_bytes(blocks)
+        self.assertLessEqual(payload, ha.SEND_FILE_ENTRY_MAX_BYTES)
+        files = blocks[0]["files"]
+        self.assertEqual(len(files), ha.SEND_FILE_MAX_FILES)  # every delivery SHOWN
+        self.assertTrue(any(f.get("src") for f in files), "previews still embed")
+        # The ones past the budget are the shed chip the archive already
+        # produces, which both chat clients render as "… preview dropped to fit"
+        # — the delivery is still named, it just carries no bytes.
+        shed = [f for f in files if f.get("shed")]
+        self.assertTrue(shed)
+        for f in shed:
+            self.assertEqual(f["kind"], "file")
+            self.assertNotIn("src", f)
+
+    def test_an_over_budget_delivery_is_never_READ(self):
+        big = self._file("big.png", ha.SEND_FILE_MAX_BYTES)
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with mock.patch("builtins.open", counting_open):
+            ha._entry_blocks(self._entry([big] * ha.SEND_FILE_MAX_FILES), ha.BLOCK_CAPS)
+        embedded = ha.SEND_FILE_ENTRY_MAX_BYTES // (4 * ((ha.SEND_FILE_MAX_BYTES + 2) // 3))
+        self.assertLessEqual(len(opened), embedded + 1)
+        self.assertLess(len(opened), ha.SEND_FILE_MAX_FILES)
+
+    def test_an_oversize_file_is_still_a_PLAIN_chip_not_a_shed_one(self):
+        # `shed` means "dropped to fit"; the operator can act on that (send
+        # fewer files in one turn). A file past SEND_FILE_MAX_BYTES was never
+        # going to be previewed at any budget, and flagging it shed would blame
+        # the turn for what is the FILE's size.
+        big = self._file("big.png", ha.SEND_FILE_MAX_BYTES + 1)
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with mock.patch("builtins.open", counting_open):
+            blocks = ha._entry_blocks(self._entry([big]), ha.BLOCK_CAPS)
+        self.assertEqual(blocks[0]["files"], [{"name": "big.png", "kind": "file"}])
+        # ...and it is decided on the STAT. The length check after the read
+        # produces the same chip, so without this the size guard is deletable:
+        # the cost of losing it is half a MiB read per oversize file per poll.
+        self.assertEqual(opened.count(big), 0)
+
+    # --- the budget's own arithmetic ---------------------------------------
+
+    def test_the_per_entry_half_refills_and_the_pass_half_does_not(self):
+        b = ha._PreviewBudget(total=300, per_entry=100)
+        self.assertTrue(b.reserve(100))
+        self.assertFalse(b.reserve(1))       # entry spent
+        b.begin_entry()
+        self.assertTrue(b.reserve(100))      # entry refilled
+        b.begin_entry()
+        self.assertTrue(b.reserve(100))
+        b.begin_entry()
+        self.assertFalse(b.reserve(1))       # ...but the pass is spent
+
+    def test_a_reservation_that_outgrows_itself_stays_spent(self):
+        # This is what bounds the READS. Refunding a payload that turned out too
+        # big would let the same file be projected, read and rejected forever.
+        b = ha._PreviewBudget(total=1000, per_entry=1000)
+        self.assertTrue(b.reserve(100))
+        self.assertFalse(b.settle(100, 5000))   # doesn't fit
+        self.assertEqual(b.left, 900)           # ...and the 100 is gone
+        # An under-run refunds, so a file smaller than projected costs only what
+        # it really weighs: 900 - 100 reserved, then 60 given back.
+        self.assertTrue(b.reserve(100))
+        self.assertTrue(b.settle(100, 40))
+        self.assertEqual(b.left, 860)
+
+    def test_zero_disables_a_half_the_way_ARCHIVE_PAYLOAD_MAX_does(self):
+        # The archive path relies on this: it passes total=0 because
+        # ARCHIVE_PAYLOAD_MAX already bounds that pass over the whole
+        # transcript, and stacking a second pass ceiling on top would cut the
+        # durable copy's fidelity for nothing.
+        b = ha._PreviewBudget(total=0, per_entry=10)
+        for _ in range(1000):
+            b.begin_entry()
+            self.assertTrue(b.reserve(10))
+        self.assertFalse(ha._PreviewBudget(total=10, per_entry=0).reserve(11))
+
+    # --- what a deferred chip may carry ------------------------------------
+
+    def test_an_unfilled_chip_carries_a_handle_and_never_a_PATH(self):
+        # A chip whose row the window drops is never filled, so its handle can
+        # reach a client. An int is inert there; the path would be filesystem
+        # disclosure to every viewer of the chat.
+        png = self._file("shot.png", 32)
+        budget = ha._PreviewBudget()
+        blocks = ha._entry_blocks(self._entry([png]), ha.BLOCK_CAPS, budget)
+        chip = blocks[0]["files"][0]
+        self.assertIsInstance(chip[ha.PREVIEW_HANDLE_KEY], int)
+        # The chip itself, not the block: the tool_use `input` summary has
+        # carried the delivered paths since XERK-221, which is the call the
+        # operator made and is meant to be readable.
+        self.assertNotIn(self.dir, json.dumps(blocks[0]["files"]))
+        # ...and filling clears it, so nothing ships with bookkeeping on it.
+        ha._fill_previews([{"blocks": blocks}], budget)
+        self.assertNotIn(ha.PREVIEW_HANDLE_KEY, chip)
+        self.assertTrue(chip["src"].startswith("data:image/png;base64,"))
+
+    def test_a_FIFO_is_never_opened(self):
+        # A FIFO stats at 0 bytes and passes every ceiling, then blocks the read
+        # until somebody writes — on the beat thread that stages `history`. The
+        # regular-file check has to come BEFORE the open, which is why this
+        # asserts on the open rather than on a timeout.
+        fifo = os.path.join(self.dir, "trap.png")
+        os.mkfifo(fifo)
+
+        def refusing_open(p, *a, **kw):
+            raise AssertionError("opened %s" % p)   # would otherwise hang here
+
+        with mock.patch("builtins.open", refusing_open):
+            blocks = ha._entry_blocks(self._entry([fifo]), ha.BLOCK_CAPS)
+        self.assertEqual(blocks[0]["files"], [{"name": "trap.png", "kind": "file"}])
+
+    def test_the_defaults_are_pinned_not_merely_mirrored(self):
+        # Both halves are a product decision about what one turn may show, and
+        # tunnel-agent.js pins the same two numbers. A test that only asserts
+        # "py == js" passes with both moved to 1 KiB, which sheds every preview
+        # on the fleet.
+        self.assertEqual(ha.SEND_FILE_ENTRY_MAX_BYTES, 2 << 20)
+        self.assertEqual(ha.SEND_FILE_PASS_MAX_BYTES, 4 << 20)
+        self.assertLess(ha.SEND_FILE_PASS_MAX_BYTES, ha.HISTORY_MAX_BYTES)
+
+
 class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
     """The archive's SendUserFile payload budget (XERK-267): the previews are
     bounded per delivery but unbounded relative to the transcript, so a
@@ -13815,6 +14077,32 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._files_of(body)[0], {"name": "a.png", "kind": "file", "shed": True})
         # The delivery's own card survives — only the payload went.
         self.assertEqual(body["entries"][0]["blocks"][0]["name"], "SendUserFile")
+
+    def test_a_shedding_transcript_never_READS_the_previews_it_drops(self):
+        # Shedding used to mean embed-then-discard: the pass read every preview
+        # off disk and _shed_block_payloads threw them away — measured, 3.36 GB
+        # read to drop 611 MB of it, on the beat. Deferring the read (XERK-355)
+        # is what lets the verdict be applied first.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        png = self._png("a.png", 4096)
+        self._write_transcript(wt, "t1.jsonl", [
+            self._delivery("a%d" % i, png, "2026-07-01T10:0%d:00Z" % i) for i in range(6)])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with mock.patch("builtins.open", counting_open):
+            body = self._push(sm, shed_ids=["t1"])[0]
+        self.assertEqual(opened.count(png), 0, "a shed preview is never opened")
+        # ...and it is still reported as dropped, so the log keeps meaning
+        # something: the size comes off the stat rather than the read.
+        self.assertTrue(all(f.get("shed") for f in self._files_of(body)))
 
     def test_the_agent_sheds_a_runaway_transcript_without_being_told(self):
         # A first-time offender: the hub has never seen it, so nothing on the
