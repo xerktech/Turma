@@ -7,6 +7,7 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.xerktech.turma.core.ChatItem
+import com.xerktech.turma.model.SendFile
 import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
@@ -75,6 +76,35 @@ class TranscriptClippedMarkTest {
         compose.onAllNodesWithText(mark).assertCountEquals(0)  // collapsed
         compose.onNodeWithText("💭 thinking").performClick()
         compose.onNodeWithText(mark).assertIsDisplayed()
+    }
+
+    /**
+     * A preview the agent DROPPED to fit the reply says so; one that was never
+     * renderable does not. Web parity: `renderToolFiles`' `shed` branch — a bare
+     * chip with no reason is indistinguishable from a file that never rendered.
+     */
+    @Test fun `a shed file chip says the preview was dropped`() {
+        compose.setContent {
+            ChatItemView(
+                ChatItem.Tool("a1", name = "SendUserFile", input = "", result = "",
+                    isError = false,
+                    files = listOf(SendFile(name = "shot.png", kind = "file", shed = true)))
+            )
+        }
+        compose.onNodeWithText("📎 shot.png").assertIsDisplayed()
+        compose.onNodeWithText("… preview dropped to fit").assertIsDisplayed()
+    }
+
+    @Test fun `a chip for a file that never rendered says nothing extra`() {
+        compose.setContent {
+            ChatItemView(
+                ChatItem.Tool("a1", name = "SendUserFile", input = "", result = "",
+                    isError = false,
+                    files = listOf(SendFile(name = "notes.bin", kind = "file")))
+            )
+        }
+        compose.onNodeWithText("📎 notes.bin").assertIsDisplayed()
+        compose.onAllNodesWithText("… preview dropped to fit").assertCountEquals(0)
     }
 
     /**

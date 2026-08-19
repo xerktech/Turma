@@ -2465,7 +2465,14 @@ test("http: command queue rides the reply until acked", async () => {
   // `peers` rides every reply (XERK-348) — it is how a host learns which
   // sessions its own may address, so an absent key means "no roster", which the
   // agent reads as a boundary it cannot widen past its own host.
-  assert.deepEqual(res.body, { commands: [], peers: [] });
+  // `bodyMax` rides it too (XERK-347): the hub's body ceiling is a fraction of
+  // its container limit, so only the hub knows it — and an agent that guesses a
+  // fixed number posts into the band where an oversize body gets no status at
+  // all, which is XERK-235's permanent offline loop.
+  assert.deepEqual(Object.keys(res.body).sort(), ["bodyMax", "commands", "peers"]);
+  assert.deepEqual(res.body.commands, []);
+  assert.deepEqual(res.body.peers, []);
+  assert.ok(res.body.bodyMax > 0, "the hub states a positive body ceiling");
 
   // The UI queues two session commands (as the /api/agents/... routes do).
   const spawnRes = await request("POST", "/api/agents/h1/sessions", {

@@ -95,9 +95,9 @@ private fun scaledSp(base: Float): TextUnit = (base * LocalTextSize.current.curr
  * fidelity, so nothing holds a fuller copy for a tap to fetch.
  */
 @Composable
-private fun ClippedMark(modifier: Modifier = Modifier) {
+private fun ClippedMark(modifier: Modifier = Modifier, label: String = "… clipped to fit") {
     Text(
-        "… clipped to fit",
+        label,
         modifier,
         fontSize = scaledSp(11f),
         fontStyle = FontStyle.Italic,
@@ -391,7 +391,7 @@ private fun SendFileView(f: SendFile) {
                     else -> null
                 }
             }
-            if (model == null) { FileChip(f.name); return }
+            if (model == null) { FileChip(f.name, f.shed); return }
             Column {
                 // A DEFINITE height, not heightIn(max): AsyncImage's painter starts
                 // with an unknown intrinsic size, so a max-only height constraint
@@ -421,13 +421,16 @@ private fun SendFileView(f: SendFile) {
                 .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(6.dp)))
             Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
         }
-        else -> FileChip(f.name)
+        else -> FileChip(f.name, f.shed)
     }
 }
 
 @Composable
-private fun FileChip(name: String) {
-    Text("📎 $name", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun FileChip(name: String, shed: Boolean = false) {
+    Column {
+        Text("📎 $name", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (shed) ClippedMark(label = "… preview dropped to fit")
+    }
 }
 
 // A SendUserFile HTML page in a FULLY sandboxed WebView (web parity: the

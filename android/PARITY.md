@@ -68,8 +68,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   "Show more…" button and Android's automatic re-fetch behind it (`maybeUpgradeTruncated`) both had
   nothing left to fetch, and both are gone. A block still over its cap carries the same static
   "… clipped to fit" mark on both — though Android's shows only once a thinking trace or tool card
-  is expanded, since it collapses cards the web opens by default. Both clients still poll `/history`
-  while the live socket is down, and still page older entries through it.
+  is expanded, since it collapses cards the web opens by default. A SendUserFile preview the agent
+  dropped to fit the reply carries "… preview dropped to fit" on its name chip on both, so it reads
+  differently from a file that never rendered. Both clients still poll `/history` while the live
+  socket is down, and still page older entries through it.
 
 ## Done (this pass — first installment)
 

@@ -728,6 +728,25 @@ test("render: a SendUserFile HTML file renders in a fully sandboxed iframe (srcd
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
 });
 
+test("render: a preview DROPPED to fit says so; one that never rendered does not (XERK-347)", () => {
+  // The agent sheds SendUserFile payloads to keep a reply under the hub's body
+  // ceiling. Without this the operator sees a bare 📎 chip and no reason why
+  // the screenshot they were sent isn't there.
+  const shedHtml = withVerbosity("verbose", () => itemsToHtml(buildItems([
+    { id: "a1", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "SendUserFile",
+      files: [{ name: "shot.png", kind: "file", shed: true }] }] },
+  ])));
+  assert.match(shedHtml, /📎 shot\.png/);
+  assert.match(shedHtml, /preview dropped to fit/);
+
+  const plainHtml = withVerbosity("verbose", () => itemsToHtml(buildItems([
+    { id: "a1", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "SendUserFile",
+      files: [{ name: "notes.bin", kind: "file" }] }] },
+  ])));
+  assert.match(plainHtml, /📎 notes\.bin/);
+  assert.doesNotMatch(plainHtml, /preview dropped/);
+});
+
 test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {
   const html = withVerbosity("normal", () => itemsToHtml(suItems([
     { name: "archive.zip", kind: "file" },

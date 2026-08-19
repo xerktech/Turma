@@ -3146,6 +3146,39 @@ class TestHistoryBudget(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(row["blocks"][1]["files"][0]["kind"], "image")  # light: kept
         self.assertLessEqual(ha._json_bytes(row), 3000)
 
+    def test_shedding_is_LINEAR_in_the_blocks_it_sheds(self):
+        # A turn may carry BLOCK_MAX_PER_ENTRY deliveries. Re-measuring the whole
+        # row per block cost 18s on the beat loop for one 48-block turn — beat
+        # latency against OFFLINE_AFTER_MS, on the thread the heartbeat runs on.
+        # Counted, not timed: a timing assertion in CI is a flake.
+        row = self._preview_row("e1", 1, 500)
+        for _ in range(11):
+            row["blocks"].append(self._preview_row("x", 1, 500)["blocks"][0])
+        calls = []
+        real = ha._json_bytes
+        with mock.patch.object(ha, "_json_bytes",
+                               lambda v: (calls.append(1), real(v))[1]):
+            ha._shed_row_previews(row, 100)
+        # One row + at most two per block (sized before, re-sized after shedding).
+        self.assertLessEqual(len(calls), 1 + 2 * len(row["blocks"]))
+
+    def test_shedding_marks_the_chip_as_DROPPED_not_never_captured(self):
+        # Same `shed:True` the archive path sets, so the client can say which.
+        row = self._preview_row("e1", 2, 2000)
+        self.assertTrue(ha._shed_row_previews(row, 100))
+        for f in row["blocks"][0]["files"]:
+            self.assertTrue(f["shed"])
+            self.assertEqual(f["kind"], "file")
+            self.assertNotIn("src", f)
+
+    def test_a_hostile_files_shape_cannot_break_the_beat(self):
+        # `files` is only ever built as a list by _send_user_file_detail, but this
+        # runs inside the heartbeat: a shape that raises here takes the host down.
+        for files in (5, True, "x", {"a": 1}, [None, 7, "s"], []):
+            row = {"id": "e1", "role": "assistant", "text": "t",
+                   "blocks": [{"t": "tool_use", "files": files}]}
+            ha._shed_row_previews(row, 1)   # must not raise
+
     def test_a_row_with_no_previews_sheds_nothing(self):
         row = {"id": "e1", "role": "assistant", "text": "x" * 100, "blocks": []}
         self.assertFalse(ha._shed_row_previews(row, 10))
@@ -10525,6 +10558,47 @@ class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
         # An EVENT that exists nowhere else is not a fetch — it stays held.
         self.assertEqual(payload["spawnFailures"], [{"cmdId": "c1", "error": "no"}])
         self.assertEqual(len(sm.spawn_failures), 1)
+
+    def test_the_body_ceiling_comes_from_the_HUB_not_a_fixed_number(self):
+        # The hub's ceiling is a fraction of its container limit, so a hub given
+        # less memory has a smaller one — and a fixed agent-side number posts
+        # straight into the band where no status ever comes back.
+        sm = self.make_manager()
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)   # before any reply
+        sm._note_body_max({"commands": [], "bodyMax": 8 << 20})
+        self.assertEqual(sm._body_max(), int((8 << 20) * ha.HEARTBEAT_BODY_MARGIN))
+
+    def test_a_preposterous_or_broken_bodyMax_cannot_talk_us_up(self):
+        sm = self.make_manager()
+        sm._note_body_max({"bodyMax": 1 << 40})
+        self.assertEqual(sm._body_max(), ha.HEARTBEAT_BODY_MAX)   # our own cap holds
+        for bad in ({"bodyMax": 0}, {"bodyMax": -1}, {"bodyMax": True},
+                    {"bodyMax": "8"}, {}, None):
+            sm2 = self.make_manager()
+            sm2._note_body_max(bad)
+            self.assertEqual(sm2._body_max(), ha.HEARTBEAT_BODY_MAX)
+
+    def test_a_smaller_hub_sheds_a_body_a_bigger_one_would_have_taken(self):
+        sm = self.make_manager()
+        sm.history_results.append(self._result("s1", 200000))
+        sm._note_body_max({"bodyMax": 40000})   # a small hub
+        payload = sm.build_payload(0)
+        sent = {}
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            sent["bytes"] = len(req.data)
+            return FakeResp()
+
+        with mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(sm.post(payload), {})
+        self.assertNotIn("historyResults", payload)
+        self.assertEqual(sm.history_results, [])
+        self.assertLess(sent["bytes"], 200000)
 
     def test_a_beat_within_the_aggregate_is_untouched(self):
         sm = self.make_manager()

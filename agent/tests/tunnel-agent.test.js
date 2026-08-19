@@ -1708,3 +1708,47 @@ test("BLOCK_CAPS matches hub-agent.py's, value for value", () => {
   // A message caps at what the composer accepts, so it is never clipped.
   assert.equal(BLOCK_CAPS.text, pyCap("INPUT_MAX_CHARS"));
 });
+
+// --- an unserializable tail skips its frame, it does not kill the process ---
+// A turn holding BLOCK_MAX_PER_ENTRY SendUserFile deliveries builds a frame past
+// V8's ~512 MB string ceiling (previews come off DISK, so no transcript window
+// bounds them — XERK-355). This runs in a setInterval with no uncaughtException
+// handler in this file, so the throw took the whole tunnel process down and
+// entrypoint.sh restarted it in a loop for as long as the session was watched —
+// every terminal, live tail and heartbeat poke on the host with it.
+test("pollWatcher survives a tail JSON.stringify cannot produce", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wire-throw-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "99999999-8888-7777-6666-555555555555";
+  fs.appendFileSync(path.join(proj, `${tid}.jsonl`),
+    JSON.stringify({ type: "user", message: { content: "go" } }) + "\n");
+
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  const realStringify = JSON.stringify;
+  let boom = true;
+  JSON.stringify = function (value, ...rest) {
+    // Only the tail frame — the module serializes other things too.
+    if (boom && value && Array.isArray(value.entries)) throw new RangeError("Invalid string length");
+    return realStringify.call(this, value, ...rest);
+  };
+  try {
+    mod.startWatch("sess-throw", work, tid);
+    mod.pollWatcher("sess-throw");   // must not throw
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(frames.filter((f) => f.tail === "sess-throw").length, 0, "the bad frame was skipped");
+    // ...and the watcher is still alive: the next poll delivers normally.
+    boom = false;
+    mod.pollWatcher("sess-throw");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(frames.some((f) => f.tail === "sess-throw"), "a later frame still sends");
+  } finally {
+    JSON.stringify = realStringify;
+    mod.stopWatch("sess-throw");
+    mod.__setControlSink(null);
+  }
+});

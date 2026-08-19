@@ -1239,10 +1239,22 @@ function pollWatcher(sessionId) {
   try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId, w.agentState); }
   catch { tail = null; }
   if (tail && (tail.entries.length || tail.queued.length)) {
-    const json = JSON.stringify(tail);
-    if (json !== w.lastJson) {
-      w.lastJson = json;
-      sendControl({ tail: sessionId, entries: tail.entries, queued: tail.queued });
+    // The serialize is INSIDE the try, not beside it (XERK-347). A turn holding
+    // BLOCK_MAX_PER_ENTRY SendUserFile deliveries builds a frame past V8's
+    // ~512 MB string ceiling — previews are read from disk, so no transcript
+    // window bounds them (XERK-355) — and this runs in a setInterval with no
+    // uncaughtException handler in this file: the RangeError killed the whole
+    // tunnel process, which entrypoint.sh then restarted in a loop for as long
+    // as that session was watched. Skipping one frame is a stale tail; dying is
+    // every session's terminal, live tail and heartbeat poke on this host.
+    try {
+      const json = JSON.stringify(tail);
+      if (json !== w.lastJson) {
+        w.lastJson = json;
+        sendControl({ tail: sessionId, entries: tail.entries, queued: tail.queued });
+      }
+    } catch (e) {
+      log(`live tail: could not serialize ${sessionId}'s tail (${e && e.message}); skipping this frame`);
     }
   }
   // 2. Live in-progress assistant turn scraped from the TUI (real-time). Sent

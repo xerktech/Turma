@@ -7240,10 +7240,19 @@ const server = http.createServer(async (req, res) => {
       // their next beat rather than the one after.
       warnOrgDrift(key, next);
       const peers = orgPeers(key);
+      // Tell the agent how big a body this hub will actually take (XERK-347).
+      // It is a FRACTION OF THE CONTAINER LIMIT, so only the hub knows it — and
+      // an agent guessing a fixed number guesses wrong on any hub sized smaller
+      // than the deployed 256 MiB. It matters because past roughly this ceiling
+      // Node destroys the socket under a request still being written, so the
+      // agent gets no status at all: it must refuse its own oversize body
+      // BEFORE sending, and it can only do that against a number it was told.
+      // An agent that predates this keeps its own conservative default.
+      const bodyMax = HEARTBEAT_MAX;
       return json(res, 200, archiveHave
-        ? { commands: reply, peers, archiveHave, archiveShed, archiveFull,
+        ? { commands: reply, peers, bodyMax, archiveHave, archiveShed, archiveFull,
             archiveRawHave, archiveRawSkip }
-        : { commands: reply, peers });
+        : { commands: reply, peers, bodyMax });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart

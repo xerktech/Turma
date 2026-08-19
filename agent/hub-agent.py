@@ -489,19 +489,30 @@ HISTORY_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_MAX_BYTES", str(6 << 20)
 # an oversize body is refused whole, forever.
 HISTORY_STAGED_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_STAGED_MAX_BYTES", str(12 << 20)))
 # The biggest body this agent will POST at all. The hub answers an oversize body
-# with 413 only up to a point: past ~36 MiB (measured) Node destroys the socket
-# under a request still being written, so urllib — which is what this posts with
-# — sees a broken pipe and NOT a status. That is XERK-235's failure exactly:
-# post() holds staged results until a beat succeeds, so a body no status ever
-# came back for is re-sent verbatim every beat and the host never returns. A
-# handler for 413 alone cannot close it, because the bodies big enough to matter
-# are the ones that never get a 413.
+# with 413 only NEAR its ceiling: measured, roughly to 1.1x, a coin flip at 1.5x
+# and never at 2x — past that Node destroys the socket under a request still
+# being written, so urllib (which is what this posts with) sees a broken pipe
+# and NOT a status. That is XERK-235's failure exactly: post() holds staged
+# results until a beat succeeds, so a body no status ever came back for is
+# re-sent verbatim every beat and the host never returns. A handler for 413
+# alone cannot close it, because the bodies big enough to matter never get one.
 #
 # So the agent refuses its own body BEFORE sending it: the on-demand deliveries
 # are shed (each is a fetch the client repeats) and the beat itself still goes
-# out. Deliberately under the hub's BODY_INFLIGHT_MAX (32 MiB at the deployed
-# 256 MiB), which moves with the hub's memory and can be smaller than this.
+# out.
+#
+# **The number comes from the HUB, not from here** (`bodyMax` on the beat reply,
+# HEARTBEAT_BODY_MARGIN under it). Its ceiling is a fraction of its container
+# limit, so a hub given less memory has a smaller one — and a fixed agent-side
+# number re-opens the loop on exactly those deployments, besides contradicting
+# the rule that these ceilings are never fixed numbers. This constant is only
+# the floor used before the first reply lands, and the cap on what a hub can
+# talk us into.
 HEARTBEAT_BODY_MAX = int(os.environ.get("TURMA_HEARTBEAT_BODY_MAX", str(24 << 20)))
+# How much of the hub's stated ceiling to actually use. A body AT the ceiling is
+# refused; the margin keeps the last beat before the cliff a 413 we can read
+# rather than a socket that dies unread.
+HEARTBEAT_BODY_MARGIN = 0.75
 
 # File attachments (XERK-234). The operator attaches an image or a document in
 # the chat composer; the hub stages the bytes and names them on the `input`
@@ -5168,28 +5179,41 @@ def _json_bytes(value):
 
 
 def _shed_row_previews(row, budget):
-    """Drop one row's inline SendUserFile previews, heaviest first, until it
-    fits `budget`. Returns True if anything was dropped.
+    """Drop one row's inline SendUserFile payloads, heaviest block first, until
+    the row fits `budget` wire bytes. Returns True if anything was dropped.
 
     The block caps do NOT bound a row: a preview is read from DISK, not from the
     transcript, so one turn carries SEND_FILE_MAX_FILES x SEND_FILE_MAX_BYTES of
     base64 — ~11 MB per turn, and a delivery no size ceiling can honour
-    (XERK-355). Shedding degrades that turn to the NAME CHIP the agent already
-    shows for a file too big to embed: the conversation still says what was
-    delivered, and the reply becomes something the hub will actually accept.
-    Better than exempting the row, which produced a body nothing could deliver
-    at all, and better than dropping it, which is a hole in the conversation."""
-    heavy = [b for b in (row.get("blocks") or [])
-             if isinstance(b, dict) and b.get("files")]
+    (XERK-355). Shedding reuses the ARCHIVE path's `_shed_block_payloads`, so a
+    row degrades to exactly the `shed:True` name chip the archive already
+    produces: the conversation still says what was delivered, and the reply
+    becomes something the hub will actually accept. Better than exempting the
+    row, which produced a body nothing could deliver at all, and better than
+    dropping it, which is a hole in the conversation.
+
+    Sizes are measured ONCE per block and subtracted, never by re-measuring the
+    row per block: a turn may carry BLOCK_MAX_PER_ENTRY deliveries, and
+    re-serializing a multi-hundred-MB row 48 times cost 18s on the beat loop —
+    latency against OFFLINE_AFTER_MS, on the thread the heartbeat runs on."""
+    heavy = []
+    for block in row.get("blocks") or []:
+        if not isinstance(block, dict) or not isinstance(block.get("files"), list):
+            continue
+        size = _json_bytes(block["files"])
+        if size:
+            heavy.append((size, block))
     if not heavy:
         return False
-    heavy.sort(key=lambda b: _json_bytes(b.get("files")), reverse=True)
+    heavy.sort(key=lambda pair: pair[0], reverse=True)
+    remaining = _json_bytes(row)
     shed = False
-    for block in heavy:
-        if _json_bytes(row) <= budget:
+    for size, block in heavy:
+        if remaining <= budget:
             break
-        block["files"] = [{"name": f.get("name") or "file", "kind": "file"}
-                          for f in block["files"] if isinstance(f, dict)]
+        if not _shed_block_payloads([block]):
+            continue          # nothing embedded on it after all
+        remaining -= size - _json_bytes(block["files"])
         block["truncated"] = True
         shed = True
     return shed
@@ -9868,6 +9892,9 @@ class SessionManager:
         # Staged `history` command results awaiting the next heartbeat payload
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
+        # What the hub last said it will take as a body (`bodyMax` on the beat
+        # reply). 0 until a beat succeeds — see _body_max.
+        self._hub_body_max = 0
         self.history_results = []
         # Staged `subagentHistory` results (one background agent's transcript,
         # fetched when an operator clicks a live agent-list row) — same
@@ -13223,6 +13250,33 @@ class SessionManager:
             os.replace(tmp, ans_path)
         except OSError as e:
             log(f"answer_question write failed for {sid}: {e}")
+
+    def _body_max(self):
+        """The biggest body to POST: what the hub last said it takes, less
+        HEARTBEAT_BODY_MARGIN, and never above our own HEARTBEAT_BODY_MAX.
+
+        Bounded on BOTH sides deliberately. Below, because a hub sized smaller
+        than the deployed 256 MiB has a smaller ceiling and a fixed agent-side
+        number would post straight into the band where no status comes back.
+        Above, because `bodyMax` arrives over the wire: a hub that reports a
+        preposterous one must not be able to talk this agent into building a
+        body its own process cannot hold."""
+        stated = getattr(self, "_hub_body_max", 0)
+        if not stated:
+            return HEARTBEAT_BODY_MAX
+        return max(1, min(HEARTBEAT_BODY_MAX, int(stated * HEARTBEAT_BODY_MARGIN)))
+
+    def _note_body_max(self, reply):
+        """Remember the hub's stated body ceiling off a beat reply. Absent (an
+        older hub) leaves the conservative default in place — never zero, which
+        would refuse every beat this agent ever sends."""
+        if not isinstance(reply, dict):
+            return
+        stated = reply.get("bodyMax")
+        if isinstance(stated, bool) or not isinstance(stated, (int, float)):
+            return
+        if stated > 0:
+            self._hub_body_max = int(stated)
 
     def _drop_on_demand_results(self, payload=None):
         """Drop the staged on-demand deliveries — and them alone — from the
@@ -16667,12 +16721,12 @@ class SessionManager:
             if TURMA_TOKEN:
                 headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
             body = json.dumps(payload).encode()
-            if len(body) > HEARTBEAT_BODY_MAX:
+            if len(body) > self._body_max():
                 # Measured, not guessed — this is the exact body about to go up.
                 # Past the hub's ceiling it answers no status at all, so this is
                 # the only place the loop can be stopped (see HEARTBEAT_BODY_MAX).
-                log(f"heartbeat body is {len(body)} bytes, past HEARTBEAT_BODY_MAX "
-                    f"({HEARTBEAT_BODY_MAX}); shedding its on-demand deliveries")
+                log(f"heartbeat body is {len(body)} bytes, past what this hub takes "
+                    f"({self._body_max()}); shedding its on-demand deliveries")
                 self._drop_on_demand_results(payload)
                 body = json.dumps(payload).encode()
             req = urllib.request.Request(
@@ -16690,6 +16744,7 @@ class SessionManager:
                 # read fails the JSON parse, which this method already treats as
                 # "no reply" — a skipped beat rather than a wedged agent.
                 reply = json.loads(resp.read(HEARTBEAT_REPLY_MAX).decode() or "{}")
+            self._note_body_max(reply)
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
             self.subagent_history_results.clear()  # delivered — same lifecycle
@@ -16707,9 +16762,11 @@ class SessionManager:
             # "HTTP Error 403: Forbidden" and a host that silently vanishes.
             log(f"heartbeat failed: {_http_error_detail(e)}")
             if getattr(e, "code", None) == 413:
-                # The hub refused a body HEARTBEAT_BODY_MAX let through — its
-                # ceiling moves with its memory and can be below ours. Same
-                # remedy: re-sending is what cannot fix it.
+                # A body our own ceiling let through — the first beat runs
+                # before any `bodyMax` has arrived, and a hub can shrink. This
+                # branch is the near-ceiling case only: further past it the hub
+                # sends no status at all, which is why _body_max exists rather
+                # than this handler carrying the whole burden.
                 self._drop_on_demand_results()
                 log("heartbeat refused as too large; dropped the staged on-demand "
                     "result(s) rather than re-sending them forever")

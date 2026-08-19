@@ -899,7 +899,12 @@
           ' loading="lazy" title="' + name + '" srcdoc="' + esc(f.html) + '"></iframe>' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else {
-        out += '<div class="tool-file file"><span class="tool-file-name">📎 ' + name + "</span></div>";
+        // `shed` distinguishes "dropped to fit the reply" (agent
+        // _shed_row_previews / _shed_block_payloads) from a file that was never
+        // renderable in the first place — without it the operator sees a bare
+        // chip and no reason why their screenshot isn't there.
+        out += '<div class="tool-file file"><span class="tool-file-name">📎 ' + name + "</span>" +
+          (f.shed ? '<span class="clipped">… preview dropped to fit</span>' : "") + "</div>";
       }
     }
     out += "</div>";
