@@ -12,6 +12,7 @@ that component's files.
 |------|---------------------------|--------|
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
 | `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
+| `.claude/rules/agent-input.md` | `agent/hub-agent.py` | putting a message INTO a session: `send_input`'s pane path and its compaction outbox, `notify_session`'s session inbox |
 | `.claude/rules/agent-sessions.md` | `agent/hub-agent.py` | how a session is launched, repos-root sessions, the agent-side session queue, kill/resume/delete, the new-work directive, local-model failover |
 | `.claude/rules/agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |

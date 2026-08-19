@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import shutil
 import signal
@@ -3316,6 +3317,10 @@ class ManagerMixin:
             # Derived at import too. Every beat rewrites it (XERK-339), so
             # without this the suite would clobber the real host's peer roster.
             ("PEERS_FILE", os.path.join(self.tmp, "peers.tsv")),
+            # Derived at import from the claude home. Without this, notify_session
+            # would resolve inboxes out of the REAL host's session registry and
+            # post to whatever live claude happened to match (XERK-340).
+            ("SESSIONS_REGISTRY_DIR", os.path.join(self.tmp, "cc-sessions")),
             ("LIMITS_SETTINGS_PATH", os.path.join(self.tmp, "limits-settings.json")),
             # The limits probe is OFF for the suite at large. A beat with no
             # snapshot considers one due and starts a real background thread
@@ -7955,6 +7960,559 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
 
+class InboxRegistryMixin:
+    """A fake Claude Code session registry (`<pid>.json` per live session).
+
+    Records are written in the shape the real thing writes, because
+    `_session_inbox` now refuses anything else: the file is named after the pid
+    it describes, and the socket sits at `<...>/cc-socks/<pid>.sock`.
+    """
+
+    def _sock_dir(self):
+        return os.path.join(self.tmp, "cc-socks")
+
+    def _register(self, pid, sid, tmux="agent-s1:@0.%0", started=1,
+                  kind="interactive", entrypoint="cli", cwd=None, sock="",
+                  name=None):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        rec = {"pid": pid, "sessionId": sid, "tmux": tmux, "startedAt": started,
+               "kind": kind, "entrypoint": entrypoint,
+               "cwd": cwd if cwd is not None else self.tmp}
+        # sock="" means the canonical path for this pid; None means unbound.
+        if sock == "":
+            sock = os.path.join(self._sock_dir(), f"{pid}.sock")
+        if sock is not None:
+            rec["messagingSocketPath"] = sock
+        path = os.path.join(ha.SESSIONS_REGISTRY_DIR, name or f"{pid}.json")
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        return rec.get("messagingSocketPath")
+
+
+class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
+    """_session_inbox resolves a session's inbox socket out of Claude Code's own
+    registry — the only place the bound path is recorded (XERK-340).
+
+    The registry is same-uid writable by every session on the host, so every
+    record it reads is an untrusted claim; these are the checks that keep a
+    planted one from steering the manager.
+    """
+
+    SID = "11111111-1111-4111-8111-111111111111"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-inbox-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "SESSIONS_REGISTRY_DIR",
+                              os.path.join(self.tmp, "cc-sessions"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_matches_the_pinned_claude_session_id(self):
+        want = self._register(7, self.SID, tmux="agent-other:@0.%0")
+        self._register(8, "other", tmux="agent-s1:@0.%0", started=2)
+        # The id wins over the tmux name: the id IS this session's conversation.
+        self.assertEqual(ha._session_inbox(self.SID),
+                         (want, 7, self.SID))
+
+    def test_a_session_with_no_pinned_id_has_no_inbox(self):
+        # Launched by an agent predating the session-id pin. There is no looser
+        # match to fall back on — every candidate key collides with a claude the
+        # session itself spawned — so it keeps the pane it has always used.
+        self._register(9, "cc-9")
+        self.assertIsNone(ha._session_inbox(None))
+        self.assertIsNone(ha._session_inbox(""))
+
+    def test_an_unpinned_session_does_not_match_a_null_id_record(self):
+        # The early return is what enforces "pinned id or nothing": without it
+        # the comparison is `None == None`, so a planted record carrying a null
+        # sessionId becomes the inbox of every session that has no pinned one.
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "4242.json"), "w") as f:
+            json.dump({"pid": 4242, "sessionId": None, "startedAt": 1,
+                       "messagingSocketPath":
+                       os.path.join(self._sock_dir(), "4242.sock")}, f)
+        self.assertIsNone(ha._session_inbox(None))
+        self.assertIsNone(ha._session_inbox(""))
+
+    def test_newest_start_wins_when_two_records_share_the_id(self):
+        # A RESUMED session keeps its session id, so a record a killed claude
+        # left behind carries the same one as the live process that replaced it.
+        self._register(1, self.SID, started=100)
+        want = self._register(2, self.SID, started=200)
+        self.assertEqual(ha._session_inbox(self.SID), (want, 2, self.SID))
+
+    def test_an_infinite_start_does_not_win(self):
+        # `1e999` is legal JSON, parses to inf, and would outrank every real
+        # record forever — the cheapest way to plant a permanent winner.
+        want = self._register(1, self.SID, started=100)
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "2.json"), "w") as f:
+            f.write(json.dumps({
+                "pid": 2, "sessionId": self.SID, "kind": "interactive",
+                "messagingSocketPath": os.path.join(self._sock_dir(), "2.sock"),
+            }).replace('"kind"', '"startedAt": 1e999, "kind"'))
+        self.assertEqual(ha._session_inbox(self.SID), (want, 1, self.SID))
+
+    def test_a_claude_the_session_spawned_is_not_its_inbox(self):
+        # Measured against the real thing: a `claude -p` child and a second
+        # interactive claude in the session's tmux both register the same tmux
+        # target, cwd and kind with a newer startedAt — and the second matches
+        # `entrypoint: cli` too. Each has its OWN session id, which is why that
+        # is the only key: the wire-level check agrees with a tmux-shaped
+        # mistake, so notify_session would report a nudge delivered that the
+        # real session never saw.
+        want = self._register(1, self.SID, started=100)
+        self._register(2, "child-p", started=200, entrypoint="sdk-cli")
+        self._register(3, "child-tui", started=300)     # same tmux, cwd, kind
+        self.assertEqual(ha._session_inbox(self.SID), (want, 1, self.SID))
+
+    def test_a_record_that_disagrees_with_its_filename_is_ignored(self):
+        # Claude Code names the record after the pid it describes; anything else
+        # was written by something that is not Claude Code.
+        self._register(7, self.SID, name="9.json")
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_a_non_canonical_socket_path_is_ignored(self):
+        # The path is about to be connect()ed to, so it has to be where Claude
+        # Code would have bound this pid's inbox — not wherever a record says.
+        for bad in ("/tmp/attacker/evil.sock",
+                    os.path.join(self._sock_dir(), "9.sock"),   # wrong pid
+                    "relative/cc-socks/7.sock",
+                    "/x/cc-socks/" + "p" * 120 + "/7.sock",
+                    # Canonical in shape, past AF_UNIX's 108-byte path limit.
+                    "/" + "a" * 100 + "/cc-socks/7.sock",
+                    # Only canonical after traversing out of the real dir.
+                    "/run/user/1000/cc-socks/../../../../tmp/evil/cc-socks/7.sock",
+                    # `cc-socks` as a SUBSTRING of a name the sender chose: the
+                    # parent must be that directory, not merely mention it.
+                    "/tmp/xcc-socksy/7.sock",
+                    "/tmp/notcc-socks/7.sock"):
+            with self.subTest(bad=bad):
+                shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
+                self._register(7, self.SID, sock=bad)
+                self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_no_bound_socket_is_no_inbox(self):
+        # A claude too old for the inbox, or one with it gated off, records no
+        # path — the caller has to fall back to the pane.
+        self._register(7, self.SID, sock=None)
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_unmatched_and_unreadable_records_are_skipped(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "5.json"), "w") as f:
+            f.write("{not json")
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "notes.txt"), "w") as f:
+            f.write("ignored")
+        self._register(3, "someone-else", tmux="agent-other:@0.%0")
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_wrong_typed_fields_are_skipped(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        sock = lambda pid: os.path.join(self._sock_dir(), f"{pid}.sock")
+        # Each record is filed under the name its own `pid` implies, so it is
+        # the TYPE check that has to reject it and not the filename check.
+        for name, rec in (
+                ("7.json", {"pid": 7, "sessionId": self.SID,
+                            "messagingSocketPath": 42}),
+                # `True` is an int in python, and passes every other gate.
+                ("True.json", {"pid": True, "sessionId": self.SID,
+                               "messagingSocketPath": sock(True)}),
+                ("0.json", {"pid": 0, "sessionId": self.SID,
+                            "messagingSocketPath": sock(0)}),
+                ("-1.json", {"pid": -1, "sessionId": self.SID,
+                             "messagingSocketPath": sock(-1)}),
+                ("7.json", {"pid": 7, "sessionId": ["a"],
+                            "messagingSocketPath": sock(7)}),
+                ("7.json", {"pid": "7", "sessionId": self.SID,
+                            "messagingSocketPath": sock(7)}),
+                ("7.json", ["not", "a", "dict"])):
+            with self.subTest(rec=rec):
+                shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
+                os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+                with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, name), "w") as f:
+                    json.dump(rec, f)
+                self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_an_oversize_record_is_not_read_whole(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        # Padded past the REGISTRY's cap but well under the settings one, so
+        # this fails only while the registry keeps a ceiling of its own: a
+        # record is a few hundred bytes, and reading a megabyte of whatever a
+        # planted one holds is the thing the cap is for.
+        self.assertLess(ha.SESSIONS_REGISTRY_MAX_BYTES, ha.SETTINGS_READ_MAX_BYTES)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "7.json"), "w") as f:
+            json.dump({"pid": 7, "sessionId": self.SID,
+                       "pad": "x" * (ha.SESSIONS_REGISTRY_MAX_BYTES * 2),
+                       "messagingSocketPath":
+                       os.path.join(self._sock_dir(), "7.sock")}, f)
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_a_fifo_in_the_registry_does_not_block(self):
+        # A plain open() of a FIFO blocks until someone writes to it, and this
+        # runs on the heartbeat thread — the whole agent would wedge with no
+        # exception to catch. Any session on this host can mkfifo here.
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        os.mkfifo(os.path.join(ha.SESSIONS_REGISTRY_DIR, "000-evil.json"))
+        want = self._register(7, self.SID)
+        done = []
+        t = threading.Thread(
+            target=lambda: done.append(ha._session_inbox(self.SID)),
+            daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "_session_inbox blocked on a FIFO")
+        self.assertEqual(done[0], (want, 7, self.SID))
+
+    def test_a_symlinked_record_is_not_followed(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        real = os.path.join(self.tmp, "elsewhere.json")
+        with open(real, "w") as f:
+            json.dump({"pid": 7, "sessionId": self.SID, "messagingSocketPath":
+                       os.path.join(self._sock_dir(), "7.sock")}, f)
+        os.symlink(real, os.path.join(ha.SESSIONS_REGISTRY_DIR, "7.json"))
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_missing_registry_is_no_inbox(self):
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+
+class TestReadUntrustedJson(unittest.TestCase):
+    """_read_untrusted_json is the one reader for files this agent does not own —
+    the session registry and a repo's settings (XERK-340)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-json-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _path(self, name="f.json"):
+        return os.path.join(self.tmp, name)
+
+    def test_reads_an_object(self):
+        with open(self._path(), "w") as f:
+            json.dump({"a": 1}, f)
+        self.assertEqual(ha._read_untrusted_json(self._path(), 1000), {"a": 1})
+
+    def test_a_file_past_the_cap_is_not_parsed_at_all(self):
+        # The fixture is a COMPLETE object followed by padding, so the truncated
+        # prefix is valid JSON that parses to something different. A fixture
+        # whose prefix is merely malformed proves nothing: both a capped read and
+        # an uncapped one would fail it, and the guard could be deleted unseen.
+        with open(self._path(), "w") as f:
+            f.write(json.dumps({"crossSessionInbound": "accept"}) + " " * 5000)
+        self.assertIsNone(ha._read_untrusted_json(self._path(), 100))
+        self.assertEqual(ha._read_untrusted_json(self._path(), 1 << 20),
+                         {"crossSessionInbound": "accept"})
+
+    def test_a_json_scalar_or_list_is_not_an_object(self):
+        for blob in ("[1,2]", '"str"', "7", "null"):
+            with self.subTest(blob=blob):
+                with open(self._path(), "w") as f:
+                    f.write(blob)
+                self.assertIsNone(ha._read_untrusted_json(self._path(), 1000))
+
+    def test_a_fifo_returns_rather_than_blocking(self):
+        os.mkfifo(self._path("fifo.json"))
+        done = []
+        t = threading.Thread(target=lambda: done.append(
+            ha._read_untrusted_json(self._path("fifo.json"), 1000)), daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "blocked on a FIFO")
+        self.assertIsNone(done[0])
+
+    def test_a_directory_and_a_missing_file_are_none(self):
+        os.makedirs(self._path("d.json"))
+        self.assertIsNone(ha._read_untrusted_json(self._path("d.json"), 1000))
+        self.assertIsNone(ha._read_untrusted_json(self._path("nope.json"), 1000))
+
+
+class TestInboxOptedOut(unittest.TestCase):
+    """_inbox_opted_out: a repo whose own settings refuse peer messages outrank
+    the `accept` on every session's --settings file (XERK-339), and the inbox
+    acknowledges nothing — so those sessions have to stay on the pane."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-optout-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        os.makedirs(os.path.join(self.tmp, ".claude"))
+
+    def _write(self, name, data):
+        with open(os.path.join(self.tmp, ".claude", name), "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_no_settings_is_not_an_opt_out(self):
+        self.assertFalse(ha._inbox_opted_out(self.tmp))
+        self.assertFalse(ha._inbox_opted_out(None))
+
+    def test_project_refuse_opts_out(self):
+        self._write("settings.json", {"crossSessionInbound": "refuse"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_hold_opts_out_too(self):
+        # `hold` parks the message behind a dialog nothing here can answer, and
+        # it expires — the same silent loss as `refuse`.
+        self._write("settings.json", {"crossSessionInbound": "hold"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_local_accept_does_not_undo_a_project_refuse(self):
+        # Measured against Claude Code: it drops the message for this pair, so
+        # the obvious highest-precedence-wins rule posts into a session that
+        # then loses it in silence.
+        self._write("settings.json", {"crossSessionInbound": "refuse"})
+        self._write("settings.local.json", {"crossSessionInbound": "accept"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_file_that_does_not_mention_it_says_nothing(self):
+        self._write("settings.local.json", {"permissions": {}})
+        self._write("settings.json", {"crossSessionInbound": "refuse"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_all_accept_stays_on_the_inbox(self):
+        self._write("settings.json", {"crossSessionInbound": "accept"})
+        self._write("settings.local.json", {"crossSessionInbound": "accept"})
+        self.assertFalse(ha._inbox_opted_out(self.tmp))
+
+    def test_settings_that_exist_but_will_not_parse_opt_out(self):
+        # It is there and it won't say what it wants; the pane always works.
+        self._write("settings.local.json", "{not json")
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_settings_file_larger_than_a_registry_record_is_still_read(self):
+        # Settings have a ceiling of their own; reusing the registry's 64 KiB
+        # would make an ordinary padded settings file unreadable, and unreadable
+        # opts out — a repo silently losing the inbox for its file's size.
+        self.assertGreater(ha.SETTINGS_READ_MAX_BYTES,
+                           ha.SESSIONS_REGISTRY_MAX_BYTES)
+        self._write("settings.json",
+                    json.dumps({"pad": "x" * (ha.SESSIONS_REGISTRY_MAX_BYTES * 2),
+                                "crossSessionInbound": "accept"}))
+        self.assertFalse(ha._inbox_opted_out(self.tmp))
+
+    def test_an_oversize_settings_file_opts_out(self):
+        # Not silently skipped: a key sitting past the read cap would otherwise
+        # be a refusal this never sees.
+        self._write("settings.json",
+                    json.dumps({"pad": "x" * (ha.SETTINGS_READ_MAX_BYTES + 16),
+                                "crossSessionInbound": "refuse"}))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_fifo_settings_file_does_not_block(self):
+        # Same wedge as the registry: os.path.isfile() follows a symlink and can
+        # be raced, and the block is in the open(), on the heartbeat thread.
+        os.mkfifo(os.path.join(self.tmp, ".claude", "settings.json"))
+        done = []
+        t = threading.Thread(target=lambda: done.append(
+            ha._inbox_opted_out(self.tmp)), daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "_inbox_opted_out blocked on a FIFO")
+        self.assertTrue(done[0])            # unreadable -> pane
+
+    def test_a_dangling_settings_symlink_still_opts_out(self):
+        # `os.path.exists` is False for a broken link, which would read as "no
+        # settings here" — but something IS there and we cannot tell what it
+        # wants, so it takes the pane like any other unreadable file.
+        os.symlink(os.path.join(self.tmp, "gone.json"),
+                   os.path.join(self.tmp, ".claude", "settings.json"))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_symlinked_settings_file_is_not_followed(self):
+        real = os.path.join(self.tmp, "elsewhere.json")
+        with open(real, "w") as f:
+            json.dump({"crossSessionInbound": "accept"}, f)
+        os.symlink(real, os.path.join(self.tmp, ".claude", "settings.json"))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+
+class TestPostToInbox(unittest.TestCase):
+    """_post_to_inbox writes one JSON line naming the session it is for, and
+    only to a listener that is the process the registry named (XERK-340)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-sock-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "s.sock")
+
+    def _listen(self, read=True, accepts=1):
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.listen(64)
+        self.addCleanup(srv.close)
+        received = []
+
+        def serve():
+            for _ in range(accepts):
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                with conn:
+                    if not read:
+                        continue
+                    buf = b""
+                    while True:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    received.append(buf)
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        return received, t
+
+    def test_writes_one_addressed_user_line(self):
+        received, t = self._listen()
+        self.assertTrue(ha._post_to_inbox(self.path, os.getpid(), "sid-1",
+                                          "fix the conflicts"))
+        t.join(5)
+        raw = received[0].decode()
+        self.assertTrue(raw.endswith("\n"))
+        msg = json.loads(raw)
+        self.assertEqual(msg["type"], "user")
+        self.assertEqual(msg["session_id"], "sid-1")
+        self.assertEqual(msg["from"], ha.INBOX_SENDER)
+        self.assertEqual(msg["message"], {"role": "user",
+                                          "content": "fix the conflicts"})
+
+    def test_a_listener_that_is_not_the_registered_pid_is_refused(self):
+        # SO_PEERCRED is filled in by the kernel, so this is the one thing about
+        # a socket a same-uid impostor cannot forge. The registry itself is
+        # writable by every session on the host.
+        if not hasattr(socket, "SO_PEERCRED"):
+            self.skipTest("no SO_PEERCRED on this platform")
+        received, t = self._listen()
+        self.assertFalse(ha._post_to_inbox(self.path, os.getpid() + 100000,
+                                           "sid-1", "secret"))
+        t.join(5)
+        # The connection is made and then dropped: not a byte of the message.
+        self.assertEqual(b"".join(received), b"")
+
+    def test_the_socket_is_closed_even_on_success(self):
+        received, t = self._listen(accepts=20)
+        before = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+        for _ in range(20):
+            self.assertTrue(ha._post_to_inbox(self.path, os.getpid(), "sid-1", "x"))
+        after = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+        self.assertLess(after - before, 5, "fds leaked across posts")
+
+    def test_a_timeout_bounds_a_listener_that_never_reads(self):
+        # The heartbeat thread runs this; a wedged claude must not hold it.
+        received, t = self._listen(read=False)
+        with mock.patch.object(ha, "INBOX_TIMEOUT_SEC", 0.2):
+            with mock.patch.object(socket.socket, "sendall",
+                                   side_effect=socket.timeout("timed out")):
+                started = time.time()
+                self.assertFalse(ha._post_to_inbox(self.path, os.getpid(),
+                                                   "sid-1", "x" * 1000))
+        self.assertLess(time.time() - started, 5)
+
+    def test_a_dead_socket_is_a_failure_not_a_crash(self):
+        self.assertFalse(ha._post_to_inbox(
+            os.path.join(self.tmp, "nothing.sock"), 1, "sid-1", "hi"))
+
+
+class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
+    """notify_session: machine-generated messages ride the session's inbox, and
+    fall back to the pane whenever that would not actually deliver (XERK-340)."""
+
+    SID = "11111111-1111-4111-8111-111111111111"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()
+        self.run_stdin_calls.clear()
+        return sm
+
+    def _session(self, sm, status="running"):
+        wt = os.path.join(self.tmp, "wt")
+        os.makedirs(wt, exist_ok=True)
+        sess = {"id": "s1", "status": status, "tmuxName": "agent-s1",
+                "claudeSessionId": self.SID, "worktreePath": wt,
+                "summary": "x", "summaryStarted": True}
+        sm.registry = [sess]
+        return sess
+
+    def _posts(self):
+        posts = []
+        return posts, mock.patch.object(
+            ha, "_post_to_inbox", side_effect=lambda *a: posts.append(a) or True)
+
+    def test_inbox_delivery_skips_the_pane_and_the_outbox(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        want = self._register(7, self.SID)
+        posts, patched = self._posts()
+        with patched:
+            self.assertTrue(sm.notify_session("s1", "resolve the conflicts"))
+        self.assertEqual(posts[0][:3], (want, 7, self.SID))
+        self.assertIn("resolve the conflicts", posts[0][3])
+        # The prefix says who is really speaking — claude frames an inbox
+        # message to the receiver as another Claude session writing.
+        self.assertTrue(posts[0][3].startswith(ha.INBOX_PREFIX))
+        self.assertEqual(self.run_stdin_calls, [])   # nothing pasted
+        self.assertEqual(self.run_calls, [])         # no Enter
+        # Never on the outbox: an inbox message never becomes the user turn
+        # _pending_scan reaps on, so it would be re-typed as a duplicate.
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_no_inbox_falls_back_to_the_pane_with_the_outbox(self):
+        sm = self.make_manager()
+        sess = self._session(sm)                     # nothing registered
+        self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(sess["pendingInputs"][0]["text"], "resolve the conflicts")
+
+    def test_a_failed_post_falls_back_to_the_pane(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._register(7, self.SID)
+        with mock.patch.object(ha, "_post_to_inbox", return_value=False):
+            self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
+    def test_a_session_that_refuses_peer_messages_stays_on_the_pane(self):
+        # Posting into it would be dropped in silence, and the poller would
+        # still burn a retry — the pane is the only path that delivers.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._register(7, self.SID)
+        os.makedirs(os.path.join(sess["worktreePath"], ".claude"), exist_ok=True)
+        with open(os.path.join(sess["worktreePath"], ".claude",
+                               "settings.json"), "w") as f:
+            json.dump({"crossSessionInbound": "refuse"}, f)
+        with mock.patch.object(ha, "_post_to_inbox") as post:
+            self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        post.assert_not_called()
+        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
+    def test_oversize_is_refused_once_by_send_input(self):
+        # send_input owns the INPUT_MAX_CHARS refusal; notify_session must not
+        # route around it by posting the whole thing to the inbox.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._register(7, self.SID)
+        with mock.patch.object(ha, "_post_to_inbox") as post:
+            self.assertFalse(
+                sm.notify_session("s1", "x" * (ha.INPUT_MAX_CHARS + 1)))
+        post.assert_not_called()
+        self.assertEqual(self.run_stdin_calls, [])
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_an_ended_session_is_not_notified(self):
+        sm = self.make_manager()
+        self._session(sm, status="closed")
+        self._register(7, self.SID)
+        with mock.patch.object(ha, "_post_to_inbox") as post:
+            self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        post.assert_not_called()
+        self.assertEqual(self.run_stdin_calls, [])
+
+
 class TestPrCommentEvents(unittest.TestCase):
     """_pr_comment_events normalizes conversation comments, review bodies and
     inline review-thread comments into one self-flagged event list (XERK-49)."""
@@ -8498,9 +9056,12 @@ class TestAzdoCreatedPrUrl(unittest.TestCase):
         self.assertIsNone(ha._azdo_created_pr_url("gh: not json at all"))
 
 
-class TestPollPrComments(ManagerMixin, unittest.TestCase):
-    """_poll_pr_comments types new PR review activity into the running session
-    that opened the PR, baselining history on first sight (XERK-49)."""
+class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
+    """_poll_pr_comments delivers new PR review activity to the running session
+    that opened the PR, baselining history on first sight (XERK-49).
+
+    The registry is empty in these tests, so delivery falls back to the pane and
+    `_typed()` reads it — the inbox route is asserted on its own below."""
 
     URL = "https://github.com/o/r/pull/7"
 
@@ -8548,6 +9109,22 @@ class TestPollPrComments(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(typed), 1)
         self.assertIn("rename it", typed[0])
         self.assertEqual(set(sess["prCommentBase"][self.URL]), {"c1", "c2"})
+
+    def test_delivery_rides_the_session_inbox_when_it_has_one(self):
+        # A PR comment is machine-generated, so it goes to the inbox rather than
+        # the input line, and never lands on the compaction outbox (XERK-340).
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        sess["claudeSessionId"] = "cc-1"
+        self._register(7, "cc-1")
+        posts = []
+        with self._events(self._ev("c1"), self._ev("c2", body="rename it")), \
+                mock.patch.object(ha, "_post_to_inbox",
+                                  side_effect=lambda *a: posts.append(a) or True):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+        self.assertIn("rename it", posts[0][3])
+        self.assertNotIn("pendingInputs", sess)
 
     def test_self_comment_is_not_delivered_but_is_seen(self):
         sm = self.make_manager()
@@ -8635,10 +9212,13 @@ class TestPrConflictMessage(unittest.TestCase):
         self.assertNotIn("MR", msg)
 
 
-class TestPollPrConflicts(ManagerMixin, unittest.TestCase):
-    """_poll_pr_conflicts types a resolve-the-conflicts message into the running
+class TestPollPrConflicts(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
+    """_poll_pr_conflicts sends a resolve-the-conflicts message to the running
     session that opened a now-unmergeable PR, once per conflict episode
-    (XERK-223)."""
+    (XERK-223).
+
+    The registry is empty in these tests, so delivery falls back to the pane and
+    `_typed()` reads it — the inbox route is asserted on its own below."""
 
     URL = "https://github.com/o/r/pull/7"
 
@@ -8671,6 +9251,21 @@ class TestPollPrConflicts(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["prConflicts"][self.URL]["attempts"], 1)
         sm._poll_pr_conflicts()                    # next beat, still conflicting
         self.assertEqual(len(self._typed()), 1)    # not re-typed
+
+    def test_nudge_rides_the_session_inbox_when_it_has_one(self):
+        # The nudge does not depend on the pane being free (XERK-340).
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["claudeSessionId"] = "cc-1"
+        self._register(7, "cc-1")
+        posts = []
+        with mock.patch.object(ha, "_post_to_inbox",
+                               side_effect=lambda *a: posts.append(a) or True):
+            sm._poll_pr_conflicts()
+        self.assertEqual(self._typed(), [])
+        self.assertIn("origin/main", posts[0][3])
+        self.assertEqual(sess["prConflicts"][self.URL]["attempts"], 1)
+        self.assertNotIn("pendingInputs", sess)
 
     def test_mergeable_clears_the_episode_and_rearms(self):
         sm = self.make_manager()
