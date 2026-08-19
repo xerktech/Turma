@@ -14087,6 +14087,71 @@ class TestSendFilePreviewBudget(unittest.TestCase):
         self.assertLess(opened.count(png), 40,
                         "the fold must defer into the delivery's budget")
 
+    def test_an_overdrawn_budget_REFUSES_THE_EMBED_not_just_the_charge(self):
+        # settle() charges always and returns False to say "do not embed this".
+        # Both halves are load-bearing and they fail differently: without the
+        # charge a discarded read is free (unbounded reads), and without the
+        # REFUSAL an over-run payload ships anyway — which put 3,178,331 wire
+        # bytes on a reply whose whole preview budget was 4 MiB and collapsed a
+        # 302-row conversation to one row. Charging is tested above; this is the
+        # refusal.
+        b = ha._PreviewBudget(total=100000, per_entry=4000)
+        self.assertTrue(b.reserve(3000))
+        self.assertFalse(b.settle(3000, 6002), "an over-run must not be embedded")
+        b2 = ha._PreviewBudget(total=4000, per_entry=100000)
+        self.assertTrue(b2.reserve(3000))
+        self.assertFalse(b2.settle(3000, 6002), "the pass half refuses too")
+
+    def test_a_payload_that_outgrows_its_projection_is_SHED_not_embedded(self):
+        # The same rule through the real embed. An HTML file's projection is its
+        # raw size; a not-valid-UTF-8 one costs ~2x that on the wire, so this is
+        # the ordinary way a payload overruns.
+        bad = self._file("bad.html", 3000, b"\xff")
+        budget = ha._PreviewBudget(total=1 << 20, per_entry=4000)
+        blocks = ha._entry_blocks(self._entry([bad]), ha.BLOCK_CAPS, budget)
+        ha._fill_previews([{"blocks": blocks}], budget)
+        chip = blocks[0]["files"][0]
+        self.assertNotIn("html", chip, "it must not ship over the ceiling")
+        self.assertTrue(chip["shed"])
+        # ...and the reply really is bounded by the ceiling, which is the whole
+        # point: an embedded 6 KB payload on a 4 KB budget is the row eviction.
+        self.assertLessEqual(ha._block_payload_bytes(blocks), 4000)
+
+    def test_the_operator_scan_forgets_the_rows_it_discards(self):
+        # It scans the WHOLE transcript and keeps ~1% of it, so retaining a
+        # (path, mime) pair per chip of every filtered-out row is most of the
+        # file — measured +570 MB of RSS on a 359 MB transcript.
+        png = self._file("shot.png", 64)
+        out = os.path.join(self.dir, "scan.jsonl")
+        with open(out, "w") as fh:
+            for i in range(200):
+                # A `user` entry that is NOT operator prose: a tool_result turn
+                # carrying a delivery, which _is_operator_row drops.
+                fh.write(json.dumps({
+                    "type": "user", "uuid": "x%03d" % i,
+                    "message": {"role": "user", "content": [
+                        {"type": "tool_use", "id": "t%d" % i, "name": "SendUserFile",
+                         "input": {"files": [png] * 8, "display": "render"}}]}}) + "\n")
+        budget = ha._PreviewBudget()
+        rows = ha._operator_entries(out, budget)
+        self.assertEqual(rows, [], "the fixture must be entirely non-operator rows")
+        self.assertEqual(len(budget._pending), 0,
+                         "a discarded row's deferrals are rolled back")
+
+    def test_rollback_leaves_the_surviving_handles_resolvable(self):
+        # Handles are indexes, so a rollback that truncated too far would
+        # silently repoint a kept chip at another file's bytes.
+        png = self._file("shot.png", 64)
+        budget = ha._PreviewBudget()
+        keep = {"name": "shot.png", "kind": "file"}
+        budget.defer(keep, png, "image/png")
+        mark = budget.mark()
+        drop = {"name": "gone.png", "kind": "file"}
+        budget.defer(drop, "/nowhere/gone.png", "image/png")
+        budget.rollback(mark)
+        self.assertEqual(budget.resolve(keep), (png, "image/png"))
+        self.assertIsNone(budget.resolve(drop))
+
     def test_the_defaults_are_pinned_not_merely_mirrored(self):
         # Both halves are a product decision about what one turn may show, and
         # tunnel-agent.js pins the same two numbers. A test that only asserts
@@ -14275,6 +14340,70 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         # ...and it is still reported as dropped, so the log keeps meaning
         # something: the size comes off the stat rather than the read.
         self.assertTrue(all(f.get("shed") for f in self._files_of(body)))
+
+    def test_shedding_never_flags_a_file_that_had_no_preview(self):
+        # `shed` means "dropped to fit", and the LIVE path leaves a missing,
+        # FIFO or oversize file a plain name chip. Flagging it here made the
+        # archived copy of a turn say "… preview dropped to fit" where the live
+        # copy of the same turn shows a bare name — so the stat comes first.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        gone = os.path.join(self.files_dir, "nope.png")     # never created
+        over = self._png("over.png", ha.SEND_FILE_MAX_BYTES + 1)
+        self._write_transcript(wt, "t1.jsonl", [
+            self._delivery("a1", gone),
+            self._delivery("a2", over, "2026-07-01T10:01:00Z"),
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        files = self._files_of(self._push(sm, shed_ids=["t1"])[0])
+        self.assertEqual(files, [{"name": "nope.png", "kind": "file"},
+                                 {"name": "over.png", "kind": "file"}])
+        # ...and the live reader agrees, chip for chip.
+        for path in (gone, over):
+            blocks = ha._entry_blocks({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t", "name": "SendUserFile",
+                 "input": {"files": [path], "display": "render"}}]}}, ha.BLOCK_CAPS)
+            self.assertEqual(blocks[0]["files"],
+                             [{"name": os.path.basename(path), "kind": "file"}])
+
+    def test_the_pass_bounds_its_READS_not_only_what_it_embeds(self):
+        # payload_sent brakes on EMBEDDED bytes, so a chip that is read and then
+        # refused advances it by nothing: with a per-entry ceiling alone the
+        # reads grew linearly with the transcript — measured 40 entries -> 83.9
+        # MB read / 31 s for a 124 KB body, on the beat. The pass half is what
+        # bounds the work.
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        # A file that is READ and then REFUSED: not-valid-UTF-8 HTML projects
+        # its raw size and costs ~2x that on the wire, so it overruns the entry
+        # ceiling and embeds nothing. That is the shape payload_sent cannot see
+        # — with an ordinary PNG it advances and brakes the pass by itself, so a
+        # PNG fixture cannot tell the two budgets apart.
+        bad = os.path.join(self.files_dir, "bad.html")
+        with open(bad, "wb") as fh:
+            fh.write(b"\xff" * 3000)
+        self._write_transcript(wt, "t1.jsonl", [
+            self._delivery("a%02d" % i, bad, "2026-07-01T10:%02d:00Z" % i)
+            for i in range(40)])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with mock.patch.object(ha, "ARCHIVE_PAYLOAD_MAX", 40000), \
+                mock.patch.object(ha, "SEND_FILE_ENTRY_MAX_BYTES", 4000), \
+                mock.patch("builtins.open", counting_open):
+            body = self._push(sm)[0]
+        self.assertTrue(all(not f.get("src") and not f.get("html")
+                            for f in self._files_of(body)),
+                        "the fixture must embed nothing, so payload_sent stays put")
+        self.assertLess(opened.count(bad), 15,
+                        "reads must be bounded by the pass, not by the entry count")
 
     def test_the_agent_sheds_a_runaway_transcript_without_being_told(self):
         # A first-time offender: the hub has never seen it, so nothing on the

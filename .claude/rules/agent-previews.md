@@ -80,10 +80,18 @@ contract (`CLAUDE.md`): `_send_user_file_detail` / `_PreviewBudget` in `hub-agen
   different memory.
 - **Who owns a pass:** `transcriptTail` (the frame), `_history_entries` (the delivery, shared with
   `_operator_entries` — those rows ride the same reply and fill last, being the ones the window
-  already cut), and the archive chunk loop, which passes `total=0` because `ARCHIVE_PAYLOAD_MAX`
-  already bounds that pass over the whole transcript and stacking a second ceiling would cut the
-  durable copy's fidelity for nothing. A caller that passes no budget fills inline at one entry's
-  worth, so a new read path is bounded, and leaks no handle, before anyone remembers it.
+  already cut), and the archive sync, one budget per transcript scoped exactly like the
+  `payload_sent` beside it. A caller that passes no budget fills inline at one entry's worth, so a
+  new read path is bounded, and leaks no handle, before anyone remembers it.
+- **The archive's pass half is `ARCHIVE_PAYLOAD_MAX`, and it must not be 0/off.** `payload_sent`
+  brakes on what is EMBEDDED, so a chip that is read and then refused advances it by nothing: with
+  a per-entry ceiling alone the reads grew linearly with the transcript — 40 entries read 83.9 MB
+  in 31 s to post a 124 KB body, on the beat. Reusing the archive's own ceiling costs no fidelity
+  (that ceiling already bounds what may be stored) and bounds the work as well as the bytes.
+- **A caller that BUILDS a row and then discards it must `rollback` its deferrals.**
+  `_operator_entries` scans the whole transcript and keeps roughly 1% of it, so retaining a
+  `(path, mime)` pair per chip of the rest cost +570 MB of RSS on a 359 MB transcript. Handles are
+  indexes into that table, so rolling back to a `mark()` is safe only for rows nothing else holds.
 - **The per-entry ceiling is not a bound on an archive POST's body** — a chunk holds thousands of
   entries, and what bounds that body is `ARCHIVE_CHUNK_BYTES` and the shed. (The hub reads that
   route with a 1 MiB `BODY_MAX` against the agent's 8 MiB chunk: XERK-373.)

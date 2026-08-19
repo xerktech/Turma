@@ -4199,6 +4199,19 @@ class _PreviewBudget:
         chip[PREVIEW_HANDLE_KEY] = len(self._pending)
         self._pending.append((path, mime))
 
+    def mark(self):
+        """A point to roll back to — see rollback()."""
+        return len(self._pending)
+
+    def rollback(self, mark):
+        """Forget everything deferred since `mark`. For a caller that builds a
+        row and then DISCARDS it: the table is indexed by handle and only that
+        row's chips hold the handles above `mark`, so truncating is safe, and
+        without it a whole-file scan retains a (path, mime) pair per chip of
+        every row it filtered out — measured +570 MB of RSS on a 359 MB
+        transcript, for rows nothing would ever fill."""
+        del self._pending[mark:]
+
     def resolve(self, chip):
         """(path, mime) for a deferred chip, clearing its handle. None when the
         chip carries none — the fill visits every chip, most of which are
@@ -5437,9 +5450,16 @@ def _operator_entries(path, budget=None):
                     continue
                 if not isinstance(entry, dict) or entry.get("type") != "user":
                     continue
+                # Most `user` entries are not operator prose, and this scans the
+                # WHOLE file — so a row that does not survive the filter must
+                # give its deferrals back rather than retaining a path per chip
+                # for the rest of the read.
+                mark = budget.mark() if budget is not None else None
                 row = _history_row(entry, budget)
                 if row is not None and _is_operator_row(row):
                     rows.append(row)
+                elif mark is not None:
+                    budget.rollback(mark)
     except OSError:
         return []
     return rows
@@ -14522,6 +14542,18 @@ class SessionManager:
             shed = tid in shed_set
             payload_sent = 0
             shed_bytes = 0
+            # One preview budget for this transcript's whole sync pass, scoped
+            # exactly like payload_sent beside it (XERK-355). Its pass half is
+            # ARCHIVE_PAYLOAD_MAX rather than the tail's, so the durable copy
+            # keeps the fidelity the archive ceiling already allows it — but it
+            # is NOT 0/off, because payload_sent brakes only on what is
+            # EMBEDDED: a chip read and then refused advances it by nothing, so
+            # a per-entry ceiling alone let the reads grow linearly with the
+            # transcript (measured 40 entries -> 83.9 MB read / 31 s for a
+            # 124 KB body). It bounds ONE ENTRY and this PASS, neither of which
+            # bounds the POST body — that is ARCHIVE_CHUNK_BYTES plus the shed
+            # (the hub reads this route with a 1 MiB cap: XERK-373).
+            preview_budget = _PreviewBudget(total=ARCHIVE_PAYLOAD_MAX)
             while have < size and budget > 0:
                 try:
                     with open(path, "rb") as f:
@@ -14537,15 +14569,6 @@ class SessionManager:
                 complete = raw[:nl + 1]
                 end = have + len(complete)
                 entries = []
-                # Entry ceiling only (XERK-355): this pass already has a budget
-                # of its own in ARCHIVE_PAYLOAD_MAX, spent over the whole
-                # transcript rather than one chunk, and stacking the tail's pass
-                # ceiling on top would cut the durable copy's fidelity for
-                # nothing. It bounds ONE ENTRY, which is not a bound on this
-                # POST's body — a chunk holds thousands of them, and what
-                # actually bounds the body is ARCHIVE_CHUNK_BYTES plus the shed
-                # (the hub reads this route with a 1 MiB cap: XERK-373).
-                preview_budget = _PreviewBudget(total=0)
                 for line in complete.split(b"\n"):
                     line = line.strip()
                     if not line:

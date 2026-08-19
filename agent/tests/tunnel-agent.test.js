@@ -1908,6 +1908,16 @@ test("preview budget: the halves refill independently and a reservation stays sp
   assert.equal(d.reserve(100), true);
   assert.equal(d.settle(100, 40), true);   // an under-run refunds
   assert.equal(d.left, 960);
+  // settle() charges always AND refuses the embed once a counter is overdrawn.
+  // Both halves are load-bearing and fail differently: without the charge a
+  // discarded read is free, and without the REFUSAL an over-run payload ships
+  // anyway, over the very ceiling the budget exists to hold.
+  const e = new PreviewBudget(100000, 4000);
+  assert.equal(e.reserve(3000), true);
+  assert.equal(e.settle(3000, 6002), false, "an over-run must not be embedded");
+  const f = new PreviewBudget(4000, 100000);
+  assert.equal(f.reserve(3000), true);
+  assert.equal(f.settle(3000, 6002), false, "the pass half refuses too");
   // 0 disables a half, the convention hub-agent.py's _byte_ceiling and the
   // archive budget already use — the archive path passes total=0.
   const off = new PreviewBudget(0, 10);
@@ -2010,7 +2020,11 @@ test("preview budget: payloadCost matches Python's json.dumps, value for value",
   const r = require("child_process").spawnSync("python3",
     ["-c", "import json,sys;print(json.dumps([len(json.dumps(c)) for c in json.load(sys.stdin)]))"],
     { input: JSON.stringify(cases), encoding: "utf8" });
-  if (r.status !== 0) return;    // no python3 on this box; the py twin still pins it
+  // No soft skip: this is the only assertion that the two runtimes agree on
+  // what a payload COSTS, and a test that goes green when it did not run is
+  // worth less than no test. python3 is not optional in this repo — the agent
+  // it is checking against is written in it.
+  assert.equal(r.status, 0, `python3 is required to check this parity: ${r.stderr}`);
   assert.deepEqual(cases.map(payloadCost), JSON.parse(r.stdout));
   // And it is not the UTF-8 length, which is the measure that was wrong.
   assert.notEqual(payloadCost("�".repeat(10)),
