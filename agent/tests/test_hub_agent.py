@@ -11065,17 +11065,6 @@ class TestRepoHeadReady(unittest.TestCase):
                         os.path.join(self.tmp, "wt"), "origin/main")
         self.assertEqual(out.returncode, 0, out.stderr)
 
-    def test_an_explicit_base_is_the_question_when_one_is_given(self):
-        src = self._source_repo()
-        repo = os.path.join(self.tmp, "clone")
-        self._git("clone", "-q", src, repo)
-        self.assertTrue(ha.repo_forkable(repo, "origin/main"))
-        # Absent, but a clone would land it — that waits.
-        self.assertFalse(ha.repo_forkable(repo, "origin/nope"))
-        # Badly NAMED is a bad option, not an unready repo: resolve_base_ref
-        # fails it as an error card, so this must not send it to the queue.
-        self.assertTrue(ha.repo_forkable(repo, "--upload-pack=evil"))
-
     def test_a_repo_git_cannot_answer_for_is_not_ready(self):
         self.assertFalse(ha.repo_head_ready(os.path.join(self.tmp, "nope")))
 
@@ -11226,7 +11215,8 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
                     awaitCloneSince=time.time())
         sm._drain_queue()
         self.assertEqual(sess["status"], "error")
-        self.assertIn("partial checkout", sess["errorMsg"])
+        self.assertIn("already exists", sess["errorMsg"])
+        self.assertIn("re-clone is refused", sess["errorMsg"])
         self.assertIn(self.repo["path"], sess["errorMsg"])
         sm.clone.assert_not_called()
 
@@ -11297,6 +11287,55 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
         for _ in range(4):
             sm._drain_queue()
         self.assertEqual(sm.clone.call_count, 1)
+
+    def test_the_base_ref_is_resolve_base_refs_business_not_the_waits(self):
+        # Holding a session because its chosen base hasn't landed only delays
+        # the accurate "base ref not found" — and an invalid-NAMED base once
+        # read as forkable, releasing a session mid-clone into a failed add.
+        # Both gates therefore ask the repo, never the base.
+        sm = self._manager()
+        sm.spawn("gdt-files", base_ref="origin/nope")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")   # mid-clone: still waits
+        self.head_ready = True
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()                            # forkable: released at once
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("not found", sess["errorMsg"])
+
+    def test_a_finished_clone_with_no_commits_says_the_repo_is_empty(self):
+        # A clone of an empty upstream exits 0, so the job goes `done` while the
+        # repo stays unforkable. Read it while the job lingers: once pruned it
+        # is indistinguishable from an interrupted clone, and calling it one
+        # asserts a false cause AND recommends deleting a good clone.
+        sm = self._manager()
+        sm.clones["gdt-files"]["status"] = "done"
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("cloned with no commits", sess["errorMsg"])
+        self.assertNotIn("remove it", sess["errorMsg"])
+
+    def test_a_wait_with_no_owner_never_takes_the_re_clone_branches(self):
+        # Without an owner there is nothing to re-clone from, so neither the
+        # refused-re-clone message nor a clone(None) may fire — it waits out
+        # the deadline like any other wait nothing can name.
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        sm.clone.assert_not_called()
+        self.assertEqual(sess["status"], "queued")
+        sess["awaitCloneSince"] -= ha.CLONE_TIMEOUT_SEC + 1
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("still has no commit to fork from", sess["errorMsg"])
 
     def test_the_worktree_add_refuses_an_unborn_head_in_plain_words(self):
         # The last line of defence, for the resume/import paths that add a

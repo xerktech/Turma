@@ -67,7 +67,9 @@ process model and the command table.
   `git clone` creates `<dest>/.git` with an unborn HEAD before it fetches an object, so a repo is in
   `scan_repos()` — and offerable in the composer — for the whole length of its own clone, and
   detaching a worktree in that window dies with `fatal: invalid reference: HEAD`. `repo_forkable`
-  gates the spawn and the drain release.
+  gates the spawn and the drain release. It takes NO base ref: an operator's base is
+  `resolve_base_ref`'s to judge, and holding a session for one that has not landed only delays the
+  accurate "base ref not found".
   - **It is not `repo_head_ready`, and the difference is a regression that already happened**: a
     repo whose local HEAD is unborn over a live `origin/<default>` — an orphan checkout, a
     hand-bootstrapped `init`+`fetch` — forks fine, and gating on HEAD refused it. `repo_forkable`
@@ -85,10 +87,16 @@ process model and the command table.
     that retried every beat and `awaitCloneSince` never bounded anything.
   - **A clone does NOT outlive its manager**: `entrypoint.sh` execs `hub-agent.py` as the
     container's foreground process, so a manager restart takes the `git clone` child with it. A
-    restart mid-clone leaves a PARTIAL checkout that `clone()` refuses as an existing dest — nothing
-    can retry it — so that session errors in ONE beat naming the dir, rather than spinning out the
-    deadline. Removing that dir is the operator's call; don't have the agent take it. The re-clone
-    is for the case with nothing on disk, and runs once (`awaitCloneRetried`).
+    restart mid-clone leaves a directory that `clone()` refuses as an existing dest — nothing can
+    retry it — so that session errors in ONE beat naming the dir, rather than spinning out the
+    deadline. Removing it is the operator's call; don't have the agent take it. The re-clone is for
+    the case with nothing on disk, and runs once (`awaitCloneRetried`).
+  - **The drain branches on the clone job's STATUS, and a `done` job is its own answer**: a clone of
+    an empty upstream exits 0, so the job finishes while the repo stays unforkable. Read that while
+    the job lingers and say the repo is empty — once `_poll_clones` prunes it (30 s, far short of
+    the 600 s deadline) it is indistinguishable from an interrupted clone, and the branch below
+    would assert the wrong cause and recommend deleting a perfectly good clone. For the same reason
+    the no-job message claims no cause: after a restart the two are not distinguishable.
   - `repo_forkable` skips the fetch, so it only ever UNDER-counts — it never releases a session that
     then fails. The one shape it misses is a DANGLING `origin/HEAD` (the default branch's ref is
     only on the remote), which costs that session the deadline. Adding a fetch is not the trade: it

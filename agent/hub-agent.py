@@ -1962,13 +1962,14 @@ def repo_head_ready(repo_path):
     return rc == 0 and bool(out)
 
 
-def repo_forkable(repo_path, base_ref=None):
+def repo_forkable(repo_path):
     """Whether a session on this repo would have a commit to detach at, asked
     WITHOUT the network — the same question `_worktree_add` is about to ask, so
     the spawn gate and the worktree add can't disagree (XERK-343).
 
-    Mirrors resolve_base_ref minus its fetch: an explicit base has to resolve,
-    and a blank one falls back exactly as default_base_ref does. A resolving
+    Mirrors default_base_ref minus its fetch. It takes NO base ref: an operator's
+    base is resolve_base_ref's to judge, and a session held here for one that has
+    not landed yet only delays the accurate "base ref not found". A resolving
     HEAD alone is enough (that is what `--detach` with no ref takes), but it is
     NOT required — a repo whose local HEAD is unborn while origin/<default> sits
     right there forks fine, and gating on HEAD alone refused it.
@@ -1981,14 +1982,6 @@ def repo_forkable(repo_path, base_ref=None):
     comes from a ref that is already local), and a session waiting on it pays
     the deadline before its error card. Adding a fetch here is not the trade:
     this runs per queued session per beat, on the loop the heartbeat is on."""
-    base_ref = (base_ref or "").strip()
-    if base_ref and base_ref != "HEAD":
-        # A badly-NAMED base is a bad option, not an unready repo — hand it
-        # straight to resolve_base_ref, which fails it as an error card. One
-        # that is merely absent still waits: a clone lands it.
-        if not valid_ref_name(base_ref):
-            return True
-        return branch_exists(repo_path, base_ref)
     if repo_head_ready(repo_path):
         return True
     name = default_branch_name(repo_path)
@@ -11476,8 +11469,7 @@ class SessionManager:
                 else:
                     log(f"spawn refused: unknown repo {repo_name!r}")
                     return
-            elif self._cloning(repo_name) and not repo_forkable(repo["path"],
-                                                                base_ref):
+            elif self._cloning(repo_name) and not repo_forkable(repo["path"]):
                 # The dir IS a git repo but has nothing to fork from yet, and a
                 # clone of ours is why: git creates <dest>/.git before it fetches
                 # an object, so the repo is in the scan (and in the composer) for
@@ -11697,52 +11689,62 @@ class SessionManager:
                 # provisioned it into `fatal: invalid reference: HEAD` (XERK-343).
                 if not repo_forkable(sess["repoPath"]):
                     job = self.clones.get(sess["awaitClone"])
-                    cloning = (job or {}).get("status") == "cloning"
-                    if job and job.get("status") == "error":
+                    status = (job or {}).get("status")
+                    name = sess["awaitClone"]
+                    if status == "cloning":
+                        continue  # nothing to decide; _poll_clones bounds this
+                    if status == "error":
                         # The repo will never arrive — fail the session rather
                         # than wait forever. (A terminal clone job lingers briefly
                         # in self.clones; this catches it before it's pruned.)
                         self._set_error(
-                            sess, f"clone of {sess['awaitClone']} failed: "
+                            sess, f"clone of {name} failed: "
                                   f"{job.get('error') or 'unknown error'}")
-                    elif not cloning and self._await_clone_expired(sess):
-                        # Nothing of ours is actively bringing this repo up and it
-                        # still isn't forkable. Checked BEFORE the re-trigger
-                        # below, not after: `clone()` files a refusal under
-                        # slugify(spec), so a 3-segment GitLab/ADO spec lands
-                        # under a key this lookup can't see — and behind an elif,
-                        # that retried forever and this bound never ran.
-                        # A LIVE clone job needs no deadline of its own:
-                        # _poll_clones reaps it and the error branch ends the wait.
+                    elif status == "done":
+                        # It cloned, and there is STILL nothing to fork from, so
+                        # the upstream is empty and no amount of waiting changes
+                        # that. Read while the finished job lingers: once it is
+                        # pruned this is indistinguishable from an interrupted
+                        # one, and the branch below would assert the wrong cause
+                        # AND recommend deleting a perfectly good clone.
                         self._set_error(
-                            sess, f"{sess['awaitClone']} still has no commit to "
-                                  f"fork from — an unfinished clone, or a repo "
-                                  f"with no commits yet")
-                    elif not job and sess.get("awaitCloneOwner"):
-                        # No job: the clone was lost to a manager restart, which
-                        # took the `git clone` child with it — `entrypoint.sh`
-                        # execs hub-agent.py as the container's foreground
-                        # process, so nothing of ours survives that. Never write
-                        # this up as a clone that finishes by itself.
-                        if os.path.exists(sess["repoPath"]):
-                            # It got far enough to create the directory, and
-                            # `clone()` refuses a dest that exists — so nothing
-                            # here can retry. Say that in one beat rather than
-                            # spin the card out to the deadline, and name the
-                            # partial checkout, since removing it is the
-                            # operator's call and not one to take for them.
-                            self._set_error(
-                                sess, f"the clone of {sess['awaitClone']} was "
-                                      f"interrupted; {sess['repoPath']} is a "
-                                      f"partial checkout — remove it and start "
-                                      f"the session again")
-                        elif not sess.get("awaitCloneRetried"):
-                            # Nothing on disk, so a re-clone can land. ONCE: a
-                            # refusal `clone()` files under slugify(spec) is
-                            # invisible to the job lookup above, and retrying it
-                            # every beat papers the UI with clone-error cards.
-                            sess["awaitCloneRetried"] = True
-                            self.clone(sess["awaitCloneOwner"])
+                            sess, f"{name} cloned with no commits — there is "
+                                  f"nothing to fork a session from")
+                    elif sess.get("awaitCloneOwner") and os.path.exists(
+                            sess["repoPath"]):
+                        # No job of ours, but a directory: the clone was lost with
+                        # the manager that launched it (`entrypoint.sh` execs
+                        # hub-agent.py as the container's foreground process, so
+                        # nothing of ours survives a restart). `clone()` refuses a
+                        # dest that exists, so nothing here can retry — say so in
+                        # one beat rather than spin the card out to the deadline.
+                        # Removing that directory is the operator's call, and the
+                        # cause is stated as the condition it actually is: after a
+                        # restart we cannot tell an aborted clone from an empty
+                        # repo, so this claims neither.
+                        self._set_error(
+                            sess, f"{name} has no commit to fork from and "
+                                  f"{sess['repoPath']} already exists, so a "
+                                  f"re-clone is refused — remove it and start the "
+                                  f"session again if its clone was interrupted")
+                    elif (sess.get("awaitCloneOwner")
+                          and not sess.get("awaitCloneRetried")):
+                        # Nothing on disk, so a re-clone can land. ONCE: a refusal
+                        # `clone()` files under slugify(spec) is invisible to the
+                        # job lookup above, and retrying every beat papers the UI
+                        # with clone-error cards.
+                        sess["awaitCloneRetried"] = True
+                        self.clone(sess["awaitCloneOwner"])
+                    elif self._await_clone_expired(sess):
+                        # Last resort, for a wait nothing above can name: a clone
+                        # of ours we never saw finish, or one run outside Turma.
+                        # Deliberately below the retry — with a LIVE job we never
+                        # get here at all, and every other branch is a better
+                        # answer than a deadline.
+                        self._set_error(
+                            sess, f"{name} still has no commit to fork from — "
+                                  f"an unfinished clone, or a repo with no "
+                                  f"commits yet")
                     continue
             self._provision_session(sess)
             return  # one per beat
