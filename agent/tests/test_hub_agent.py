@@ -13856,18 +13856,21 @@ class TestSendFilePreviewBudget(unittest.TestCase):
         b.begin_entry()
         self.assertFalse(b.reserve(1))       # ...but the pass is spent
 
-    def test_a_reservation_that_outgrows_itself_stays_spent(self):
-        # This is what bounds the READS. Refunding a payload that turned out too
-        # big would let the same file be projected, read and rejected forever.
+    def test_a_read_is_charged_even_when_its_payload_is_refused(self):
+        # This is what bounds the READS. A payload that turns out too big is
+        # still charged, so the same file cannot be projected small, read whole
+        # and rejected forever — the budget goes NEGATIVE and stops admitting.
         b = ha._PreviewBudget(total=1000, per_entry=1000)
         self.assertTrue(b.reserve(100))
-        self.assertFalse(b.settle(100, 5000))   # doesn't fit
-        self.assertEqual(b.left, 900)           # ...and the 100 is gone
+        self.assertFalse(b.settle(100, 5000))    # doesn't fit: don't embed it
+        self.assertLess(b.left, 0)               # ...but it was paid for
+        self.assertFalse(b.reserve(1))           # so nothing further is read
         # An under-run refunds, so a file smaller than projected costs only what
-        # it really weighs: 900 - 100 reserved, then 60 given back.
-        self.assertTrue(b.reserve(100))
-        self.assertTrue(b.settle(100, 40))
-        self.assertEqual(b.left, 860)
+        # it really weighs.
+        c = ha._PreviewBudget(total=1000, per_entry=1000)
+        self.assertTrue(c.reserve(100))
+        self.assertTrue(c.settle(100, 40))
+        self.assertEqual(c.left, 960)
 
     def test_zero_disables_a_half_the_way_ARCHIVE_PAYLOAD_MAX_does(self):
         # The archive path relies on this: it passes total=0 because
@@ -13914,6 +13917,175 @@ class TestSendFilePreviewBudget(unittest.TestCase):
         with mock.patch("builtins.open", refusing_open):
             blocks = ha._entry_blocks(self._entry([fifo]), ha.BLOCK_CAPS)
         self.assertEqual(blocks[0]["files"], [{"name": "trap.png", "kind": "file"}])
+
+    # --- the budget's unit is WIRE bytes, not UTF-8 bytes -------------------
+
+    def test_the_budget_is_denominated_in_WIRE_bytes(self):
+        # json.dumps is ensure_ascii, so U+FFFD costs 6 on the wire against 3
+        # UTF-8 bytes. Counting UTF-8 let a 4 MiB budget admit 2-3x that in wire
+        # bytes, and _fit_history_budget paid for it by dropping rows.
+        self.assertEqual(ha._payload_cost("�" * 10), 62)
+        self.assertEqual(len(("�" * 10).encode("utf-8")), 30)
+        self.assertEqual(ha._payload_cost(u"\U0001F600" * 10), 122)
+
+    def test_what_is_CHARGED_is_the_wire_cost_of_the_real_payload(self):
+        # Not the projection. An HTML file's projection is its raw size, which
+        # under-states a non-UTF-8 one by 2x on the wire, so charging the
+        # projection lets a pass embed multiples of its ceiling.
+        bad = self._file("bad.html", 3000, b"\xff")
+        budget = ha._PreviewBudget()
+        before = budget.left
+        blocks = ha._entry_blocks(self._entry([bad]), ha.BLOCK_CAPS, budget)
+        ha._fill_previews([{"blocks": blocks}], budget)
+        html = blocks[0]["files"][0]["html"]
+        self.assertEqual(before - budget.left, ha._payload_cost(html))
+        # ...and that really is more than the file, and more than its UTF-8
+        # length — the two measures a reader might reach for instead.
+        self.assertGreater(before - budget.left, 2 * 3000)
+        self.assertGreater(before - budget.left, len(html.encode("utf-8")))
+
+    def test_a_delivery_never_evicts_the_operators_own_messages(self):
+        # XERK-186: however much tool traffic a session generates, the chat can
+        # always show every message the operator sent. A preview budget counted
+        # in UTF-8 bytes broke that — measured, a 302-row reply collapsed to
+        # ONE row, taking every typed message with it, because two rows of
+        # not-valid-UTF-8 HTML previews weighed 6.3 MB on a 6 MiB ceiling.
+        bad = self._file("bad.html", 512 * 1024, b"\xff")
+        out = os.path.join(self.dir, "mixed.jsonl")
+        with open(out, "w") as fh:
+            for i in range(300):
+                fh.write(json.dumps({
+                    "type": "user", "uuid": "u%03d" % i,
+                    "message": {"role": "user", "content": "hello %d" % i}}) + "\n")
+            for i in range(2):
+                fh.write(json.dumps({
+                    "type": "assistant", "uuid": "d%d" % i,
+                    "message": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "t%d" % i, "name": "SendUserFile",
+                         "input": {"files": [bad] * 4, "display": "render"}}]}}) + "\n")
+        rows, _, _ = ha._history_entries(out)
+        self.assertGreater(len(rows), 100, "the conversation survived the deliveries")
+        self.assertLess(ha._json_bytes(rows), ha.HISTORY_MAX_BYTES)
+
+    # --- a read always costs, even when it is thrown away ------------------
+
+    def _understated(self, path, size):
+        """os.stat lying about `path`'s size, as /proc does and as a file being
+        appended to does between the stat and the read."""
+        real = os.stat
+
+        class _St:
+            def __init__(self, st):
+                self.st_mode, self.st_size = st.st_mode, size
+
+        def fake(p, *a, **kw):
+            st = real(p, *a, **kw)
+            return _St(st) if p == path else st
+
+        return mock.patch.object(ha.os, "stat", fake)
+
+    def test_a_read_thrown_away_is_still_CHARGED(self):
+        # A file whose stat under-states its content reads SEND_FILE_MAX_BYTES
+        # for a projection of nearly nothing. Refunding that reservation left
+        # the budget undrained and every chip in the window read — measured 160
+        # opens / 83.9 MB / 45.1 s for a 28,910-byte reply, on the beat thread.
+        big = self._file("liar.png", ha.SEND_FILE_MAX_BYTES + 1)
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with self._understated(big, 10), mock.patch("builtins.open", counting_open):
+            blocks = ha._entry_blocks(self._entry([big] * ha.SEND_FILE_MAX_FILES),
+                                      ha.BLOCK_CAPS)
+        self.assertLess(opened.count(big), ha.SEND_FILE_MAX_FILES,
+                        "the budget must drain on reads it discards")
+        # Nothing was embedded — the file really is too big — so the row is
+        # chips either way; the point is what it COST to find that out.
+        self.assertEqual(ha._block_payload_bytes(blocks), 0)
+
+    def test_the_read_is_capped_at_the_per_file_ceiling(self):
+        # The cap is what stops an understated file being loaded whole. Assert
+        # the READ's size argument: the length check afterwards produces the
+        # same chip, so a bare fh.read() is otherwise invisible.
+        big = self._file("liar.png", 4 << 20)
+        reads = []
+        real_open = open
+
+        class _Spy:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def read(self, n=-1):
+                reads.append(n)
+                return self._fh.read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self._fh.close()
+
+        def spying_open(p, *a, **kw):
+            return _Spy(real_open(p, *a, **kw)) if p == big else real_open(p, *a, **kw)
+
+        with self._understated(big, 10), mock.patch("builtins.open", spying_open):
+            ha._entry_blocks(self._entry([big]), ha.BLOCK_CAPS)
+        self.assertEqual(reads, [ha.SEND_FILE_MAX_BYTES + 1])
+
+    # --- the per-entry half is refilled BY THE FILL, once per row ----------
+
+    def test_each_ROW_gets_its_own_entry_allowance(self):
+        # begin_entry() is called by _fill_previews, once per row. Without that
+        # call the first row spends the entry half and every later row sheds,
+        # which no single-row test can see.
+        png = self._file("shot.png", 400 * 1024)
+        rows = []
+        budget = ha._PreviewBudget()
+        for i in range(3):
+            rows.append({"id": "r%d" % i,
+                         "blocks": ha._entry_blocks(self._entry([png] * 4),
+                                                    ha.BLOCK_CAPS, budget)})
+        ha._fill_previews(rows, budget)
+        for row in rows:
+            self.assertTrue(any(f.get("src") for f in row["blocks"][0]["files"]),
+                            "every row gets its own entry allowance")
+
+    def test_the_operator_fold_spends_the_SAME_pass_budget(self):
+        # The folded rows ride the same reply, so they must not each get a fresh
+        # inline budget — that is a second, unbounded pass over rows the window
+        # already cut.
+        png = self._file("shot.png", 300 * 1024)
+        out = os.path.join(self.dir, "fold.jsonl")
+        with open(out, "w") as fh:
+            for i in range(ha.HISTORY_MAX_MSGS + 40):
+                fh.write(json.dumps({
+                    "type": "user", "uuid": "o%03d" % i,
+                    "message": {"role": "user", "content": [
+                        {"type": "text", "text": "note %d" % i},
+                        {"type": "tool_use", "id": "t%d" % i, "name": "SendUserFile",
+                         "input": {"files": [png] * 8, "display": "render"}}]}}) + "\n")
+        opened = []
+        real_open = open
+
+        def counting_open(p, *a, **kw):
+            opened.append(p)
+            return real_open(p, *a, **kw)
+
+        with mock.patch("builtins.open", counting_open):
+            rows, truncated, _ = ha._history_entries(out)
+        self.assertTrue(truncated, "the fixture must actually trigger the fold")
+        payload = sum(ha._block_payload_bytes(r.get("blocks")) for r in rows)
+        self.assertLessEqual(payload, ha.SEND_FILE_PASS_MAX_BYTES)
+        # The READS are the tell. `_operator_entries` re-parses the WHOLE
+        # transcript, so a fold with its own inline budget embeds a preview for
+        # every operator delivery in the file — including the rows the id-dedup
+        # and HISTORY_USER_MSGS then throw away — instead of deferring into the
+        # one budget the reply is bounded by.
+        self.assertLess(opened.count(png), 40,
+                        "the fold must defer into the delivery's budget")
 
     def test_the_defaults_are_pinned_not_merely_mirrored(self):
         # Both halves are a product decision about what one turn may show, and

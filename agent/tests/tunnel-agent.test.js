@@ -1896,15 +1896,18 @@ test("preview budget: the halves refill independently and a reservation stays sp
   assert.equal(b.reserve(100), true);
   b.beginEntry();
   assert.equal(b.reserve(1), false);   // ...but the pass is spent
-  // A payload that outgrows its reservation is refused with the reservation
-  // still gone — that is what bounds the READS, not just the bytes.
+  // A payload that outgrows its reservation is refused for EMBEDDING but still
+  // charged — that is what bounds the READS, not just the bytes. The budget
+  // goes negative and stops admitting.
   const c = new PreviewBudget(1000, 1000);
   assert.equal(c.reserve(100), true);
   assert.equal(c.settle(100, 5000), false);
-  assert.equal(c.left, 900);
-  assert.equal(c.reserve(100), true);
-  assert.equal(c.settle(100, 40), true);   // an under-run refunds
-  assert.equal(c.left, 860);
+  assert.ok(c.left < 0, "the read was paid for");
+  assert.equal(c.reserve(1), false, "so nothing further is read");
+  const d = new PreviewBudget(1000, 1000);
+  assert.equal(d.reserve(100), true);
+  assert.equal(d.settle(100, 40), true);   // an under-run refunds
+  assert.equal(d.left, 960);
   // 0 disables a half, the convention hub-agent.py's _byte_ceiling and the
   // archive budget already use — the archive path passes total=0.
   const off = new PreviewBudget(0, 10);
@@ -1992,6 +1995,80 @@ test("preview budget: the read is capped, as hub-agent.py's is", () => {
     fs.readFileSync = realReadFile;
   }
   assert.deepEqual(whole, [], "the preview path must not use an uncapped read");
+});
+
+test("preview budget: payloadCost matches Python's json.dumps, value for value", () => {
+  // The budget's unit is WIRE bytes. JSON.stringify cannot stand in: it leaves
+  // non-ASCII unescaped where Python's ensure_ascii spends 6 per BMP char and
+  // 12 per astral one, so the two sides would embed different files from one
+  // transcript. Pinned against real python3 rather than a table copied here.
+  const { payloadCost } = require("../tunnel-agent.js");
+  const cases = ["", "abc", '"quoted"', "back\\slash", "\n\t\r\b\f",
+    "\x00\x01\x1f\x7f", "中文", "���", "\u{1F600}\u{1F600}",
+    "data:image/png;base64,AAAA", "a".repeat(100) + "é", "߿ࠀ",
+    Array.from({ length: 128 }, (_, i) => String.fromCharCode(i)).join("")];
+  const r = require("child_process").spawnSync("python3",
+    ["-c", "import json,sys;print(json.dumps([len(json.dumps(c)) for c in json.load(sys.stdin)]))"],
+    { input: JSON.stringify(cases), encoding: "utf8" });
+  if (r.status !== 0) return;    // no python3 on this box; the py twin still pins it
+  assert.deepEqual(cases.map(payloadCost), JSON.parse(r.stdout));
+  // And it is not the UTF-8 length, which is the measure that was wrong.
+  assert.notEqual(payloadCost("�".repeat(10)),
+    Buffer.byteLength("�".repeat(10), "utf8"));
+});
+
+test("preview budget: a read thrown away is still CHARGED", () => {
+  // A file whose stat under-states its content (a /proc entry, one being
+  // appended to) reads SEND_FILE_MAX_BYTES for a projection of nearly nothing.
+  // Refunding that left the budget undrained and every chip in the window read.
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-liar-"));
+  const big = path.join(dir, "liar.png");
+  fs.writeFileSync(big, Buffer.alloc(512 * 1024 + 1));
+  const realStat = fs.statSync;
+  const realOpen = fs.openSync;
+  const opens = [];
+  fs.statSync = function (p, ...rest) {
+    const st = realStat.call(this, p, ...rest);
+    if (p === big) return { size: 10, isFile: () => true };
+    return st;
+  };
+  fs.openSync = function (p, ...rest) { opens.push(p); return realOpen.call(this, p, ...rest); };
+  let blocks;
+  try {
+    blocks = mod.entryBlocks({ type: "assistant", message: { content: [
+      { type: "tool_use", id: "t1", name: "SendUserFile",
+        input: { files: Array(16).fill(big), display: "render" } },
+    ] } }, BLOCK_CAPS);
+  } finally {
+    fs.statSync = realStat;
+    fs.openSync = realOpen;
+  }
+  assert.ok(opens.filter((p) => p === big).length < 16,
+    `read ${opens.filter((p) => p === big).length} of 16 — the budget must drain on discarded reads`);
+  assert.equal(blocks[0].files.filter((f) => f.src).length, 0);
+});
+
+test("preview budget: each ENTRY gets its own allowance", () => {
+  // beginEntry() is called by fillPreviews, once per entry. Without that call
+  // the first entry spends the per-entry half and every later one sheds, which
+  // no single-entry test can see.
+  const { entryBlocks, fillPreviews, PreviewBudget } = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preview-rows-"));
+  const png = path.join(dir, "shot.png");
+  fs.writeFileSync(png, Buffer.alloc(400 * 1024));
+  const budget = new PreviewBudget();
+  const entries = [];
+  for (let i = 0; i < 3; i++) {
+    entries.push({ id: `r${i}`, blocks: entryBlocks({ type: "assistant", message: { content: [
+      { type: "tool_use", id: `t${i}`, name: "SendUserFile",
+        input: { files: Array(4).fill(png), display: "render" } },
+    ] } }, BLOCK_CAPS, budget) });
+  }
+  fillPreviews(entries, budget);
+  for (const e of entries) {
+    assert.ok(e.blocks[0].files.some((f) => f.src), `${e.id} got its own allowance`);
+  }
 });
 
 test("preview budget: the ceilings match hub-agent.py's, value for value", () => {

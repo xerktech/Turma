@@ -4224,16 +4224,38 @@ class _PreviewBudget:
         return True
 
     def settle(self, reserved, actual):
-        """Swap a reservation for what the payload really cost. Returns False
-        when the real cost doesn't fit — and then the RESERVATION STAYS SPENT,
-        so a payload that keeps outgrowing its projection cannot buy unbounded
-        reads. Refunds when it came in under."""
+        """Swap a reservation for what the payload really cost, and return
+        whether it fits — False meaning the caller must not embed it.
+
+        The cost is charged UNCONDITIONALLY, letting the counters go negative:
+        a read is spent whether or not its bytes are used, so refusing the
+        charge along with the payload is what let one file be projected small,
+        read whole and rejected, over and over. Only the EMBED is refused here;
+        the read is never free. Refunds when the payload came in under."""
         extra = actual - reserved
-        if extra > 0 and not self.fits(extra):
-            return False
         self.entry_left -= extra
         self.left -= extra
+        if self.per_entry and self.entry_left < 0:
+            return False
+        if self.total and self.left < 0:
+            return False
         return True
+
+
+def _payload_cost(value):
+    """What embedding `value` will cost ON THE WIRE — its JSON form's length,
+    which is what _json_bytes measures and what every ceiling downstream is
+    denominated in.
+
+    NOT its UTF-8 length. json.dumps is ensure_ascii, so U+FFFD costs 6 there
+    against 3 UTF-8 bytes and an astral char 12 against 4: a budget kept in
+    UTF-8 bytes admitted 2-3x its ceiling in wire bytes, and _fit_history_budget
+    paid the difference by evicting rows — measured, a 302-row reply collapsed
+    to ONE, taking every message the operator had typed with it, which is
+    exactly what XERK-186's operator-message exemption exists to prevent.
+    Mirror of tunnel-agent.js payloadCost(), which must agree VALUE FOR VALUE:
+    JSON.stringify does not escape non-ASCII, so it cannot be used there."""
+    return _json_bytes(value)
 
 
 def _embed_preview(chip, budget):
@@ -4259,7 +4281,10 @@ def _embed_preview(chip, budget):
     prefix = "data:%s;base64," % mime if mime else ""
     # base64 is 4 bytes per 3 rounded up; raw markup rides as-is (an under-
     # estimate for a non-UTF-8 file, which settle() is what handles).
-    projected = (len(prefix) + 4 * ((st.st_size + 2) // 3)) if mime else st.st_size
+    # base64 is 4 bytes per 3 rounded up, plus the data: prefix and the two
+    # quotes _payload_cost counts; raw markup rides as-is, which UNDER-states a
+    # file that is not valid UTF-8 — the settle below is what handles that.
+    projected = (len(prefix) + 4 * ((st.st_size + 2) // 3) + 2) if mime else st.st_size
     if not budget.reserve(projected):
         chip["shed"] = True
         return
@@ -4267,10 +4292,15 @@ def _embed_preview(chip, budget):
         with open(path, "rb") as fh:
             data = fh.read(SEND_FILE_MAX_BYTES + 1)
     except OSError:
-        budget.settle(projected, 0)
-        return
+        return          # the reservation STAYS SPENT: the read still cost us
     if len(data) > SEND_FILE_MAX_BYTES:   # grew between the stat and the read
-        budget.settle(projected, 0)
+        # Charge the bytes actually read, never refund them. A file whose stat
+        # UNDER-states its content (a /proc entry, one being appended to) reads
+        # SEND_FILE_MAX_BYTES for a projection of nearly nothing, so refunding
+        # here left the budget undrained and every chip in the window read —
+        # measured 160 opens / 83.9 MB / 45.1 s for a 28,910-byte reply, on the
+        # beat thread. Every read must cost, or the ceiling bounds only bytes.
+        budget.settle(projected, len(data))
         return
     if mime:
         key, kind = "src", "image"
@@ -4278,7 +4308,7 @@ def _embed_preview(chip, budget):
     else:
         key, kind = "html", "html"
         value = data.decode("utf-8", "replace")
-    if not budget.settle(projected, len(value.encode("utf-8", "replace"))):
+    if not budget.settle(projected, _payload_cost(value)):
         chip["shed"] = True
         return
     chip["kind"] = kind
@@ -4327,13 +4357,18 @@ def _drop_deferred_previews(blocks, budget):
             if resolved is None:
                 continue
             path, mime = resolved
-            chip["shed"] = True
+            # `shed` only where a preview was really possible. It means "dropped
+            # to fit", and the live path leaves a missing/FIFO/oversize file a
+            # PLAIN chip — flagging it here made the archived copy of a turn
+            # render "… preview dropped to fit" where the live copy of the same
+            # turn renders a bare name.
             try:
                 st = os.stat(path)
             except OSError:
                 continue
             if not stat.S_ISREG(st.st_mode) or st.st_size > SEND_FILE_MAX_BYTES:
                 continue
+            chip["shed"] = True
             dropped += (4 * ((st.st_size + 2) // 3)) if mime else st.st_size
     return dropped
 

@@ -496,16 +496,44 @@ class PreviewBudget {
     this.left -= cost;
     return true;
   }
-  // Swap a reservation for what the payload really cost. False when the real
-  // cost doesn't fit — and then the RESERVATION STAYS SPENT, so a payload that
-  // keeps outgrowing its projection cannot buy unbounded reads.
+  // Swap a reservation for what the payload really cost, and return whether it
+  // fits — false meaning the caller must not embed it. The cost is charged
+  // UNCONDITIONALLY, letting the counters go negative: a read is spent whether
+  // or not its bytes are used, so refusing the charge along with the payload is
+  // what let one file be projected small, read whole and rejected, over and
+  // over. Only the EMBED is refused here; the read is never free.
   settle(reserved, actual) {
     const extra = actual - reserved;
-    if (extra > 0 && !this.fits(extra)) return false;
     this.entryLeft -= extra;
     this.left -= extra;
+    if (this.perEntry && this.entryLeft < 0) return false;
+    if (this.total && this.left < 0) return false;
     return true;
   }
+}
+
+// What embedding `value` will cost ON THE WIRE — the length of the JSON form
+// hub-agent.py's _json_bytes measures, which is what every ceiling downstream
+// is denominated in. NOT its UTF-8 length: Python's json.dumps is ensure_ascii,
+// so U+FFFD costs 6 there against 3 UTF-8 bytes and an astral char 12 against
+// 4, and a budget kept in UTF-8 bytes admitted 2-3x its ceiling in wire bytes.
+//
+// JSON.stringify CANNOT stand in for this — it leaves non-ASCII unescaped, so
+// it would disagree with the Python side on exactly the payloads that matter,
+// and the two would then embed different files from one transcript. This walks
+// UTF-16 code units to reproduce json.dumps' escaping table: the six short
+// escapes, \uXXXX for every other non-printable and every non-ASCII, and a
+// surrogate PAIR (so 12) for an astral char. The +2 is the quotes.
+function payloadCost(value) {
+  let n = 2;
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    if (c === 0x22 || c === 0x5c) n += 2;                       // " and \
+    else if (c === 0x08 || c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d) n += 2;
+    else if (c >= 0x20 && c <= 0x7e) n += 1;
+    else n += 6;                                                 // \uXXXX
+  }
+  return n;
 }
 
 // Read one deferred SendUserFile file and embed it on its chip, or leave the
@@ -523,22 +551,27 @@ function embedPreview(chip, budget) {
   if (!st.isFile()) return;
   if (st.size > SEND_FILE_MAX_BYTES) return;       // too big at any budget
   const prefix = mime ? "data:" + mime + ";base64," : "";
-  // base64 is 4 bytes per 3 rounded up; raw markup rides as-is (an under-
-  // estimate for a non-UTF-8 file, which settle() is what handles).
-  const projected = mime ? prefix.length + 4 * Math.ceil(st.size / 3) : st.size;
+  // base64 is 4 bytes per 3 rounded up, plus the prefix and the two quotes
+  // payloadCost counts; raw markup rides as-is, which UNDER-states a file that
+  // is not valid UTF-8 — the settle below is what handles that.
+  const projected = mime ? prefix.length + 4 * Math.ceil(st.size / 3) + 2 : st.size;
   if (!budget.reserve(projected)) { chip.shed = true; return; }
   let data;
   try {
     data = readCapped(p, SEND_FILE_MAX_BYTES + 1);
-  } catch { budget.settle(projected, 0); return; }
+  } catch { return; }   // the reservation STAYS SPENT: the read still cost us
   if (data.length > SEND_FILE_MAX_BYTES) {          // grew between stat and read
-    budget.settle(projected, 0);
+    // Charge the bytes actually read, never refund them. A file whose stat
+    // UNDER-states its content (a /proc entry, one being appended to) reads
+    // SEND_FILE_MAX_BYTES for a projection of nearly nothing, so refunding
+    // here left the budget undrained and every chip in the window read.
+    budget.settle(projected, data.length);
     return;
   }
   const kind = mime ? "image" : "html";
   const key = mime ? "src" : "html";
   const value = mime ? prefix + data.toString("base64") : data.toString("utf8");
-  if (!budget.settle(projected, Buffer.byteLength(value, "utf8"))) {
+  if (!budget.settle(projected, payloadCost(value))) {
     chip.shed = true;
     return;
   }
@@ -1804,6 +1837,6 @@ if (require.main === module) {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
     usableHostname, deviceName, byteCeiling, PreviewBudget, sendUserFileDetail,
-    fillPreviews, embedPreview, readCapped, PREVIEW_HANDLE_KEY,
+    fillPreviews, embedPreview, readCapped, payloadCost, PREVIEW_HANDLE_KEY,
     SEND_FILE_ENTRY_MAX_BYTES, SEND_FILE_PASS_MAX_BYTES };
 }

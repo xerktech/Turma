@@ -54,13 +54,23 @@ contract (`CLAUDE.md`): `_send_user_file_detail` / `_PreviewBudget` in `hub-agen
 - **The handle is an INT index into the budget's table, never the path** (`PREVIEW_HANDLE_KEY`,
   `"_p"`). A chip whose row the window drops is never filled, so the key reaches a client; an int is
   inert there and a path would be filesystem disclosure to every viewer of that chat.
-- **The cost is a RESERVATION taken from the file's stat size, reconciled to the real length after
-  the read.** An HTML file that is not valid UTF-8 re-encodes up to 3x through the replacement
-  character, so charging only on success let `fits()` keep admitting reads it then rejected —
-  measured, 960 files and 503 MB read to build an 89 KB frame, and 3.36 GB / 20 s on the history
-  path, which is latency against `OFFLINE_AFTER_MS` on the beat thread. A payload that outgrows its
-  reservation is **shed with the reservation still spent**: that is what bounds the READS rather
-  than only the bytes. An under-run refunds.
+- **The unit is WIRE bytes — `_payload_cost` / `payloadCost`, the length of the JSON form
+  `_json_bytes` measures — never UTF-8 bytes.** `json.dumps` is ensure_ascii, so U+FFFD costs 6
+  there against 3 UTF-8 bytes and an astral char 12 against 4: a budget kept in UTF-8 admitted 2-3x
+  its ceiling in wire bytes, and `_fit_history_budget` paid the difference by evicting rows —
+  measured, a 302-row reply collapsed to **one**, taking every message the operator had typed, which
+  is precisely what XERK-186's exemption exists to prevent. **`JSON.stringify` cannot stand in for
+  this on the JS side** (it leaves non-ASCII unescaped), so `payloadCost` walks UTF-16 code units to
+  reproduce Python's escaping table; a differential test pins the two against real `python3`.
+- **The cost is a RESERVATION from the file's stat size, reconciled to the real length after the
+  read — and the read is ALWAYS charged, even when its bytes are thrown away.** The counters go
+  negative rather than refusing a charge. Both halves of that were learned the hard way: charging
+  only on success let `fits()` keep admitting reads it then rejected (960 files / 503 MB for an
+  89 KB frame; 3.36 GB / 20 s on the history path, i.e. latency against `OFFLINE_AFTER_MS`), and
+  refunding an over-run read let a file whose stat UNDER-states its content — a `/proc` entry, or
+  one being appended to — be projected at nearly nothing, read whole and rejected, over and over
+  (160 opens / 83.9 MB / 45.1 s for a 28,910-byte reply). **Only the EMBED is ever refused; the read
+  is never free.** An under-run refunds.
 - **The stat decides three things before any open**, and each is load-bearing rather than an
   optimisation, because the checks after the read produce an identical chip and are therefore
   deletable without one: **regular files only** (a FIFO stats at 0 bytes, passes every ceiling, then
@@ -100,7 +110,10 @@ contract (`CLAUDE.md`): `_send_user_file_detail` / `_PreviewBudget` in `hub-agen
   flagged `shed`.
   - **A transcript already shedding never READS what it will drop** (`_drop_deferred_previews`).
     Embedding and then calling `_shed_block_payloads` meant one sync pass read 3.36 GB off disk to
-    throw 611 MB of it away; the deferral is what lets the verdict be applied first. The dropped
+    throw 611 MB of it away; the deferral is what lets the verdict be applied first. It flags `shed`
+    only where a preview was really possible — a missing, FIFO or oversize file stays the PLAIN chip
+    the live path gives it, or the archived copy of a turn says "preview dropped to fit" where the
+    live copy of the same turn shows a bare name. The dropped
     bytes are reported from each file's stat, so the log line still means something.
 - **`_shed_row_previews` is the DELIVERY-side backstop** (XERK-347), not the bound: a history row
   over `HISTORY_MAX_BYTES` has its previews stripped heaviest-block-first, reusing the archive's own
