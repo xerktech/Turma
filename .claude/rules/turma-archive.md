@@ -116,6 +116,12 @@ what it ships, what bounds one delta, and when it sheds — is in `.claude/rules
   answering null is served as a 404 carrying `refused`, and the clients word that differently from
   "not here yet". Without it the operator is told the conversation "syncs within a few minutes of
   ending", which a refusal makes untrue forever.
+  - Keyed on HOST + transcript and evicted **within a host first**: keyed on the agent-chosen
+    transcript alone, one host could file the cap's worth of its own refusals and drop every other
+    host's real diagnostic — the one thing the record exists to provide.
+  - The reason is one of a **fixed set of hub-authored strings, never an exception's text**. The
+    record is served to a browser, and `ingestChunk`'s throws carry `node:sqlite`'s own words built
+    from agent-supplied fields; those stay in the hub log.
 - The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
   `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
   browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest

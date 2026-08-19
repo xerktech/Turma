@@ -270,6 +270,16 @@ ARCHIVE_BODY_MAX_DEFAULT = int(os.environ.get("TURMA_ARCHIVE_BODY_MAX", str(768 
 # which this mirrors deliberately. `archiveChunkMax` is untrusted wire input too.
 ARCHIVE_BODY_MARGIN = 0.75
 ARCHIVE_BODY_STATED_MAX = 1 << 30
+# ...and the floor, which is an ABSOLUTE one and deliberately NOT the default
+# above. A stated ceiling SMALLER than what we would otherwise send has to be
+# obeyed: floored at the default instead, the fallback after a 413 landed on a
+# number the hub still refused, so the same delta went up every pass forever and
+# — because a failed push ended the pass — no OTHER transcript on the host
+# archived either (XERK-356 QA D2). This floor exists only to reject a value no
+# hub could mean: under it a delta cannot carry a single ordinary turn, so a
+# ceiling below it would shed the whole conversation a line at a time while every
+# POST still answered 200.
+ARCHIVE_BODY_MIN = int(os.environ.get("TURMA_ARCHIVE_BODY_MIN", str(64 << 10)))
 # How far past a chunk's start we will hunt for the newline ending a single
 # over-long line. A transcript line longer than the read window used to end the
 # pass with `break` and no log at all, so that transcript never advanced again
@@ -278,6 +288,14 @@ ARCHIVE_BODY_STATED_MAX = 1 << 30
 # nothing rendered from it, which loses one entry and keeps the byte cursor —
 # the cursor is the durable record's whole integrity, so it may never be guessed.
 ARCHIVE_LINE_SCAN_MAX = 1 << 26   # 64 MiB, scanned a block at a time
+# A session's summary rides EVERY delta of its transcript, inside the framing
+# that is measured before any entry is fitted. It comes from the session's own
+# name or label, and the hub's spawn route takes a 100 KB label — so uncapped it
+# can eat a whole delta on its own, at which point every entry is dropped for
+# "not fitting" and the transcript archives as empty ranges with a 200 on each.
+# It is display text: a session card and an archive filename, neither of which
+# shows anything like this much.
+ARCHIVE_META_SUMMARY_MAX = 500
 
 # The archive's RAW layer (XERK-338): beside the rendered entries above, ship a
 # byte-for-byte copy of the session's OWN files, so what Claude Code wrote
@@ -13356,16 +13374,15 @@ class SessionManager:
         route takes, less ARCHIVE_BODY_MARGIN, and never below our own
         conservative default.
 
-        The floor is the half that matters here. `archiveChunkMax` is wire input,
-        and a tiny one would cut every delta down to nothing while each POST
-        still answered 200 — an archive that trickles a line at a time never
-        finishes, and nothing anywhere would look wrong. Below the default the
-        hub cannot take a delta worth sending, so reading the value as nonsense
-        is the honest answer."""
+        A stated ceiling is obeyed even when it is SMALLER than the default —
+        that is the point of asking. Only ARCHIVE_BODY_MIN is a floor, and only
+        because a value under it cannot carry one ordinary turn: there, every
+        delta would shed to nothing while each POST still answered 200, so the
+        archive would never finish and nothing would look wrong."""
         stated = getattr(self, "_hub_archive_chunk_max", 0)
         if not stated:
             return ARCHIVE_BODY_MAX_DEFAULT
-        return max(ARCHIVE_BODY_MAX_DEFAULT, int(stated * ARCHIVE_BODY_MARGIN))
+        return max(ARCHIVE_BODY_MIN, int(stated * ARCHIVE_BODY_MARGIN))
 
     def _note_archive_chunk_max(self, reply):
         """Remember the hub's stated archive-chunk ceiling off a beat reply.
@@ -13390,27 +13407,40 @@ class SessionManager:
         self._hub_archive_chunk_max = int(min(stated, ARCHIVE_BODY_STATED_MAX))
 
     def _archive_line_end(self, path, start):
-        """Byte offset just past the newline ending the line at `start`, for a
-        line longer than the read window. None when there is no newline within
-        ARCHIVE_LINE_SCAN_MAX, or the file simply ends mid-line.
+        """Where to resume after a line longer than the read window, as
+        `(offset, found)`.
+
+        `found` is True at a real line end. It is False when the scan hit
+        ARCHIVE_LINE_SCAN_MAX first, and the offset is then simply how far we
+        scanned: the range is archived with nothing rendered from it and the
+        cursor moves on. Resuming mid-line is safe — the next window's leading
+        fragment fails to parse and is skipped like any other unparseable line,
+        and the byte ranges still tile the file — whereas refusing to move is a
+        transcript that never archives again (XERK-356 QA D3).
+
+        `(start, False)` means the file ends mid-line: nothing to do but wait for
+        the rest, which the caller reads as no progress.
 
         Scanned a block at a time and never held: the point is to move the cursor
-        PAST a line we cannot render, not to render it."""
+        PAST what we cannot render, not to render it."""
         try:
             with open(path, "rb") as f:
                 f.seek(start)
                 scanned = 0
                 while scanned < ARCHIVE_LINE_SCAN_MAX:
-                    block = f.read(1 << 20)
+                    # Never read past the budget: a block bigger than what is
+                    # left makes the cap approximate, and the offset returned on
+                    # the not-found path has to be one we actually scanned.
+                    block = f.read(min(1 << 20, ARCHIVE_LINE_SCAN_MAX - scanned))
                     if not block:
-                        return None      # ends mid-line — wait for the rest
+                        return start, False   # ends mid-line — wait for the rest
                     i = block.find(b"\n")
                     if i >= 0:
-                        return start + scanned + i + 1
+                        return start + scanned + i + 1, True
                     scanned += len(block)
+                return start + scanned, False
         except OSError:
-            return None
-        return None
+            return start, False
 
     def _drop_on_demand_results(self, payload=None):
         """Drop the staged on-demand deliveries — and them alone — from the
@@ -14333,11 +14363,14 @@ class SessionManager:
             if have >= size:
                 continue
             path = os.path.join(PROJECTS_ROOT, m["slug"], tid + ".jsonl")
+            summary = m.get("summary")
+            if isinstance(summary, str):
+                summary = summary[:ARCHIVE_META_SUMMARY_MAX]
             meta = {
                 "remoteKey": m.get("remoteKey"), "repo": m.get("repo"),
                 "worktree": m.get("worktree"), "slug": m.get("slug"),
                 "createdAt": m.get("createdAt"), "endedTs": m.get("endedTs"),
-                "summary": m.get("summary"),
+                "summary": summary,
             }
             # Sticky for the whole transcript once set, so a conversation doesn't
             # flicker between full previews and chips chunk to chunk.
@@ -14369,12 +14402,17 @@ class SessionManager:
                     # nothing rendered from it: one entry lost, cursor intact.
                     if len(raw) < ARCHIVE_CHUNK_BYTES:
                         break   # the file ends mid-line — the rest is still coming
-                    line_end = self._archive_line_end(path, have)
-                    if line_end is None:
+                    line_end, found = self._archive_line_end(path, have)
+                    if line_end <= have:
+                        break   # the file ends mid-line; the rest is still coming
+                    if not found:
+                        # No line end within the scan cap. Archiving the scanned
+                        # range and resuming inside the line loses more of it,
+                        # and is still the only move that does not park this
+                        # transcript at this offset for good.
                         log(f"archive: {tid} has no line end within "
                             f"{ARCHIVE_LINE_SCAN_MAX} bytes of offset {have}; "
-                            f"leaving it for a later pass")
-                        break
+                            f"archiving that range with nothing rendered from it")
                     end, entries = line_end, []
                     dropped += 1
                 else:
@@ -14387,7 +14425,9 @@ class SessionManager:
                         "entries": entries, "meta": meta}
                 reply = self._post_archive_chunk(tid, body)
                 if reply is None:
-                    return  # POST failed; retry on a later beat
+                    return  # transport failed; the whole pass retries on a beat
+                if reply.get("skip"):
+                    break   # this transcript is unpushable as built; the others aren't
                 if reply.get("full"):
                     # The store filled up mid-pass; nothing further can land, and
                     # the hub is telling us rather than erroring so we stop
@@ -14495,6 +14535,13 @@ class SessionManager:
                 # so shed that before giving up on the turn entirely.
                 shed_bytes += _shed_block_payloads(rec["blocks"])
                 cost = len(json.dumps(rec)) + 2
+                if used + cost > body_max and rec["blocks"]:
+                    # Then the rich blocks, which carry the SAME conversation the
+                    # flat `text` already holds (the thinking trace and tool
+                    # detail beside it). A turn rendered plainly is worth far
+                    # more to whoever reads this archive than no turn at all.
+                    rec["blocks"] = []
+                    cost = len(json.dumps(rec)) + 2
                 if used + cost > body_max:
                     # Still too big. Archive the RANGE without it: the caller
                     # logs the hole, and the alternative is a body the hub
@@ -14526,7 +14573,8 @@ class SessionManager:
             # the body away — and the body is where the hub says WHY it refused
             # this chunk, which is the one thing an operator can act on.
             log(f"archive push failed for {transcript_id}: {_http_error_detail(e)}")
-            if getattr(e, "code", None) == 413:
+            code = getattr(e, "code", None)
+            if code == 413:
                 # This body was measured against what the hub SAID it takes, so
                 # a 413 means that number is stale (a hub restarted with less
                 # memory) or was never stated at all. Fall back to the
@@ -14537,6 +14585,14 @@ class SessionManager:
                 log(f"archive: the hub refused a {transcript_id} delta as too "
                     f"large; falling back to {ARCHIVE_BODY_MAX_DEFAULT}-byte "
                     f"deltas until it states its ceiling again")
+            # A 4xx is the hub saying THIS CHUNK is not acceptable, which is
+            # permanent for this chunk however many times it goes back up. Only
+            # a transport failure means "the hub is unwell, stop the pass" — the
+            # raw layer already draws exactly this line. Conflated, one
+            # unpushable transcript ended the pass on every beat and starved
+            # every OTHER transcript on the host (XERK-356 QA D2).
+            if code is not None and 400 <= code < 500:
+                return {"skip": True}
             return None
         except Exception as e:
             log(f"archive push failed for {transcript_id}: {e}")

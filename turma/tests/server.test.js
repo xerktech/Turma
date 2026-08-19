@@ -162,7 +162,9 @@ const {
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
   usageLedger, normalizeRetired,
-  ARCHIVE_CHUNK_BODY_MAX, archiveRefusals,
+  ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveRefusals, archiveRefusalFor,
+  noteArchiveRefusal, ARCHIVE_REFUSALS_MAX, ARCHIVE_REFUSALS_PER_HOST,
+  chargeBody, releaseBody, BODY_PARSE_COST, BODY_INFLIGHT_TOTAL_MAX,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -1906,16 +1908,18 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
 // but trivially small conversations.
 test("http: the archive route takes a multi-MB delta, and states its ceiling", async () => {
   const filler = "x".repeat(200_000);
-  const entries = Array.from({ length: 12 }, (_, i) => ({
+  const entries = Array.from({ length: 8 }, (_, i) => ({
     uuid: `big${i}`, role: "assistant", ts: "2026-07-11T00:00:00Z", text: filler,
   }));
   const meta = { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-big",
     summary: "A Real Sized Session" };
-  const body = { startOffset: 0, endOffset: 2_400_000, size: 2_400_000, meta, entries };
-  assert.ok(JSON.stringify(body).length > (1 << 20), "the delta clears the old 1 MiB default");
+  const body = { startOffset: 0, endOffset: 1_600_000, size: 1_600_000, meta, entries };
+  const wire = JSON.stringify(body).length;
+  assert.ok(wire > (1 << 20), "the delta clears the old 1 MiB default");
+  assert.ok(wire <= ARCHIVE_CHUNK_BODY_MAX, "and is one the ceiling actually admits");
   const r = await request("POST", "/api/agents/nas/archive/trbig", { body, headers: agentHeaders });
   assert.equal(r.status, 200);
-  assert.equal(r.body.bytesStored, 2_400_000);
+  assert.equal(r.body.bytesStored, 1_600_000);
   assert.equal((await request("GET", "/api/archive/trbig", { headers: userHeaders })).status, 200);
 
   // And the agent is TOLD the ceiling on the beat it pushes off, because the
@@ -1926,6 +1930,74 @@ test("http: the archive route takes a multi-MB delta, and states its ceiling", a
   const hb = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
   assert.equal(hb.body.archiveChunkMax, ARCHIVE_CHUNK_BODY_MAX);
   assert.ok(ARCHIVE_CHUNK_BODY_MAX > (1 << 20), "the ceiling clears a real first delta");
+});
+
+// XERK-356 QA D1. The in-flight budget is only a bound on memory while its units
+// MEAN memory. This route holds the accumulated body, the parsed entries,
+// ingestChunk's re-serialized lines and the append buffer at once — measured at
+// ~20x the wire size at peak RSS — so charged at BODY_PARSE_COST's 3x the budget
+// admitted about seven times what a 256 MiB container could hold, and three
+// hosts backfilling (or one backfilling beside a large heartbeat) OOM-killed it.
+test("http: the archive route is charged what it costs, not BODY_PARSE_COST", async () => {
+  const filler = "q".repeat(100_000);
+  const room = 1_000_000;   // budget units left free: affordable at 3x, not at 20x
+  chargeBody(BODY_INFLIGHT_TOTAL_MAX - room, "shared");
+  chargeBody(1, "big");     // and the exclusive lane is occupied, so nothing escapes there
+  try {
+    const beat = await request("POST", "/api/heartbeat",
+      { body: { device: "nas", label: filler }, headers: agentHeaders });
+    assert.equal(beat.status, 200, "an ordinary body of this size still fits the room left");
+    const push = await request("POST", "/api/agents/nas/archive/trcost", {
+      body: { startOffset: 0, endOffset: 1, size: 1, meta: {},
+        entries: [{ uuid: "e", role: "user", ts: null, text: filler }] },
+      headers: agentHeaders,
+    });
+    // 503 "come back", never 413 "shrink": the body is well inside the ceiling,
+    // it is the hub that is momentarily too full to parse it.
+    assert.equal(push.status, 503, "the same size on the archive route is not affordable");
+  } finally {
+    releaseBody(BODY_INFLIGHT_TOTAL_MAX - room, "shared");
+    releaseBody(1, "big");
+  }
+});
+
+test("the archive ceiling leaves concurrent pushes room inside the budget", () => {
+  assert.ok(ARCHIVE_PARSE_COST > BODY_PARSE_COST, "this route costs more than an ordinary body");
+  // Held at the DEPLOYED size, which is the only size the numbers mean anything
+  // at — this box's own memory makes every derived ceiling trivially generous.
+  const deployed = freshServerModule((env) => {
+    env.MEMORY_LIMIT_BYTES = String(256 << 20);
+    delete env.ARCHIVE_CHUNK_BODY_MAX;
+    delete env.BODY_INFLIGHT_MAX;
+    delete env.BODY_INFLIGHT_TOTAL_MAX;
+  });
+  assert.ok(
+    deployed.ARCHIVE_CHUNK_BODY_MAX * deployed.ARCHIVE_PARSE_COST * 3 <= deployed.BODY_INFLIGHT_TOTAL_MAX,
+    `three concurrent max-size deltas (${deployed.ARCHIVE_CHUNK_BODY_MAX} x ${deployed.ARCHIVE_PARSE_COST} x 3) ` +
+      `must fit the in-flight total (${deployed.BODY_INFLIGHT_TOTAL_MAX})`
+  );
+  // ...and it TIGHTENS with the container rather than being a flat number a
+  // smaller hub could not honour (XERK-258).
+  const small = freshServerModule((env) => {
+    env.MEMORY_LIMIT_BYTES = String(32 << 20);
+    delete env.ARCHIVE_CHUNK_BODY_MAX;
+    delete env.BODY_INFLIGHT_MAX;
+    delete env.BODY_INFLIGHT_TOTAL_MAX;
+  });
+  assert.ok(small.ARCHIVE_CHUNK_BODY_MAX < deployed.ARCHIVE_CHUNK_BODY_MAX);
+});
+
+test("one host's archive refusals cannot evict another host's", () => {
+  // The record is keyed on an AGENT-CHOSEN transcriptId, so keyed on that alone
+  // any one host could push the cap's worth of its own refusals and drop every
+  // other host's real diagnostic — the one thing this record exists to provide.
+  noteArchiveRefusal("keep-me", "hostA", "hostA's reason");
+  for (let i = 0; i < ARCHIVE_REFUSALS_MAX + 10; i++) noteArchiveRefusal(`flood${i}`, "hostB", "x");
+  assert.equal(archiveRefusalFor("keep-me")?.error, "hostA's reason");
+  assert.ok(archiveRefusals.size <= ARCHIVE_REFUSALS_MAX);
+  const bs = [...archiveRefusals.values()].filter((r) => r.host === "hostB");
+  assert.equal(bs.length, ARCHIVE_REFUSALS_PER_HOST, "a host keeps only its own share");
+  for (const [k, r] of [...archiveRefusals]) if (r.host === "hostA" || r.host === "hostB") archiveRefusals.delete(k);
 });
 
 test("http: a refused archive chunk is 413 AND recorded for the operator", async () => {

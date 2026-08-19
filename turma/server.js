@@ -1322,21 +1322,44 @@ const ARCHIVE_RAW_BODY_MAX = ARCHIVE_RAW_CHUNK_MAX + (1 << 16);
 // answer on), so the durable archive held only trivially small transcripts: it
 // was empty for exactly the sessions it exists to preserve, and nothing said so.
 //
-// Sized the way every other ceiling here is (XERK-258): a fixed sanity number
-// TIGHTENED by what the container can actually hold, never a flat constant a
-// smaller hub could not honour. It stays well under BODY_INFLIGHT_MAX at the
-// deployed size so an archive backfill rides the shared lane and never contends
-// with a heartbeat for the exclusive one.
+// **This route costs many times its wire size at peak, not `BODY_PARSE_COST`'s
+// 3x**, because it holds the accumulated body string, the parsed entry array,
+// `ingestChunk`'s re-serialized `lines` and the append buffer all at once.
+// Measured at roughly this multiple of the body at peak RSS.
+//
+// The number matters because the in-flight budget is only a bound on memory
+// while its units MEAN memory. Charged at 3x with an 8 MiB ceiling, a real
+// 256 MiB cgroup was OOM-KILLED by three hosts backfilling 6 MB deltas beside
+// one large-but-legal heartbeat — `restart: unless-stopped` then loops the
+// outage (XERK-356 QA D1). At this cost and ceiling the same cgroup survives
+// FORTY-EIGHT hosts pushing max-size deltas beside a 30 MiB heartbeat, three
+// rounds running, peaking at 239 MiB of its 256.
+//
+// Measure with `ARCHIVE_DIR` on a REAL DISK. On tmpfs (the obvious scratch
+// choice) every archived byte is charged to the same cgroup and unreclaimable,
+// so the hub OOMs on what it STORED and any conclusion about what it PARSED is
+// worthless — it also makes the fix look like the regression, since the version
+// that refuses the pushes writes nothing.
+const ARCHIVE_PARSE_COST = 20;
+// With the charge honest, the AGGREGATE is already bounded by
+// BODY_INFLIGHT_TOTAL_MAX; the per-body ceiling only decides how many fit at
+// once. It is derived so one max-size delta costs a sixteenth of the container —
+// two or three concurrent backfills plus ordinary traffic — and, like every
+// other ceiling here (XERK-258), it TIGHTENS with a smaller container instead of
+// being a flat number a small hub cannot honour.
 //
 // The agent is TOLD this number on its beat reply (`archiveChunkMax`) and cuts
 // each delta at a line boundary to fit, because the body is a RE-ENCODING of the
 // window rather than a fixed ratio of it — a SendUserFile turn is a short line
 // that renders to megabytes of inline payload. So a body past this is an agent
-// that predates the field, or a bug; it is not the normal path.
-const ARCHIVE_CHUNK_ABSOLUTE_MAX = 8 << 20;   // 8 MiB of rendered entries per delta
+// that predates the field, or a bug; it is not the normal path. Deltas are
+// append-only, so a smaller ceiling costs round trips and never content: 2 MiB
+// keeps the EXCLUSIVE lane's worst case at 40 MiB of charge rather than 80, and
+// a whole-transcript backfill is a handful more POSTs in one sync pass.
+const ARCHIVE_CHUNK_ABSOLUTE_MAX = 2 << 20;   // 2 MiB of rendered entries per delta
 const ARCHIVE_CHUNK_BODY_MAX =
   Number(process.env.ARCHIVE_CHUNK_BODY_MAX) ||
-  Math.min(ARCHIVE_CHUNK_ABSOLUTE_MAX, BODY_INFLIGHT_MAX);
+  Math.min(ARCHIVE_CHUNK_ABSOLUTE_MAX, Math.floor(MEMORY_LIMIT / (ARCHIVE_PARSE_COST * 3)));
 
 // Why a transcript is NOT in the archive, in the hub's own words (XERK-356).
 //
@@ -1349,17 +1372,43 @@ const ARCHIVE_CHUNK_BODY_MAX =
 // that just failed, and they are what the refusal contract already says an
 // operator must see (XERK-264).
 //
-// Bounded, because `transcriptId` is agent-chosen and therefore unbounded input;
-// oldest entry evicted first. A successful chunk for that transcript clears it —
-// the record answers "why is this missing", so it must not outlive the missing.
-const archiveRefusals = new Map(); // transcriptId -> { host, at, error }
+// Bounded, because `transcriptId` is agent-chosen and therefore unbounded input.
+// A successful chunk for that transcript clears it — the record answers "why is
+// this missing", so it must not outlive the missing.
+//
+// Keyed on HOST + transcript, and evicted **within a host first**: keyed on the
+// transcript alone, any one agent could push 200 refusals of its own and drop
+// every other host's real diagnostic on the floor, which is the one thing this
+// record exists to provide (XERK-356 QA D8). The reason is one of a fixed set of
+// hub-authored strings — never an exception's text — so nothing agent-shaped is
+// stored or served, and the whole map is bounded by construction.
+const archiveRefusals = new Map(); // `${host}\u0000${tid}` -> { host, transcriptId, at, error }
 const ARCHIVE_REFUSALS_MAX = 200;
+const ARCHIVE_REFUSALS_PER_HOST = 25;
+const refusalKey = (host, transcriptId) => `${host}\u0000${transcriptId}`;
 function noteArchiveRefusal(transcriptId, host, error) {
-  archiveRefusals.delete(transcriptId); // re-insert so it is the newest
-  archiveRefusals.set(transcriptId, { host, at: Date.now(), error: String(error || "") });
-  while (archiveRefusals.size > ARCHIVE_REFUSALS_MAX) {
-    archiveRefusals.delete(archiveRefusals.keys().next().value);
+  const key = refusalKey(host, transcriptId);
+  archiveRefusals.delete(key); // re-insert so it is this host's newest
+  archiveRefusals.set(key, { host, transcriptId, at: Date.now(), error: String(error || "") });
+  let mine = 0;
+  for (const k of [...archiveRefusals.keys()].reverse()) {           // newest first
+    if (archiveRefusals.get(k).host !== host) continue;
+    if (++mine > ARCHIVE_REFUSALS_PER_HOST) archiveRefusals.delete(k);
   }
+  while (archiveRefusals.size > ARCHIVE_REFUSALS_MAX) {
+    archiveRefusals.delete(archiveRefusals.keys().next().value);      // oldest overall
+  }
+}
+// The newest refusal recorded for a transcript, whichever host reported it. The
+// reader knows only the id — an archived session that never landed has no row to
+// say whose it was — so a migrated transcript legitimately has one per host, and
+// the last failure is the one that explains why it is missing now.
+function archiveRefusalFor(transcriptId) {
+  let found = null;
+  for (const r of archiveRefusals.values()) {
+    if (r.transcriptId === transcriptId && (!found || r.at >= found.at)) found = r;
+  }
+  return found;
 }
 // **The bundle NEVER rides in the record** (XERK-263). At 65 MiB a pair of
 // concurrent moves — two clicks of the Sessions page's Move control — would
@@ -3853,7 +3902,15 @@ const bodyInflightHeld = () => bodyInflightBytes + bigLaneBytes;
 // rather than destroying the socket: draining is what lets the route write a
 // 413 on the same connection, where a mid-body destroy reaches the client as a
 // socket hang-up with no status to branch on. Same rule readRawBody follows.
-function readBody(req, cap = BODY_MAX) {
+//
+// `costPerByte` is what this body will actually cost the hub, in budget units
+// per wire byte. It defaults to BODY_PARSE_COST, which models an ordinary JSON
+// body — a route that costs materially more must say so, because the in-flight
+// budget is only a bound on memory while its units MEAN memory. The archive
+// ingest is the route that proved it: charged 3x while really costing ~20x, the
+// budget happily admitted enough concurrent pushes to OOM-kill the container
+// (XERK-356).
+function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
   return new Promise((resolve, reject) => {
     let data = "";
     let len = 0;
@@ -3866,7 +3923,7 @@ function readBody(req, cap = BODY_MAX) {
     let lane = null; // decided on the first charge, held for the whole read
     let bigLaneSince = 0; // when this read took the exclusive lane, if it has
     let draining = false; // holds one of the DRAIN_CONCURRENCY_MAX slots
-    const costOf = (bytes) => bytes * BODY_PARSE_COST;
+    const costOf = (bytes) => bytes * costPerByte;
     // How far past the refusal point we keep draining before cutting the socket.
     // Draining is what lets the route answer on the same connection; a mid-body
     // destroy reaches the client as a hang-up with no status to branch on. A
@@ -7364,7 +7421,7 @@ const server = http.createServer(async (req, res) => {
       // distinct: on a 503 the agent must retry, on a 413 it must not.
       let raw;
       try {
-        raw = await readBody(req, ARCHIVE_CHUNK_BODY_MAX);
+        raw = await readBody(req, ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST);
       } catch (e) {
         if (e && e.tooLarge) {
           const error = `archive chunk is larger than this hub takes (${e.cap} bytes)`;
@@ -7385,11 +7442,16 @@ const server = http.createServer(async (req, res) => {
           Number(body.startOffset) || 0, Number(body.endOffset) || 0,
           Array.isArray(body.entries) ? body.entries : []
         );
-        // It landed, so whatever this transcript last failed with is history.
-        archiveRefusals.delete(transcriptId);
+        // It landed, so whatever this host last failed with here is history.
+        archiveRefusals.delete(refusalKey(key, transcriptId));
         return json(res, 200, r);
       } catch (e) {
-        noteArchiveRefusal(transcriptId, key, e.message);
+        // The RECORD says what the operator can act on; the driver's own words
+        // stay in the hub log. `e.message` here is whatever `node:sqlite` or the
+        // filesystem produced from agent-supplied fields, and this record is
+        // served back to a browser (XERK-356 QA D9).
+        console.error(`archive: could not store a chunk from ${key} for ${transcriptId}: ${e.message}`);
+        noteArchiveRefusal(transcriptId, key, "the hub could not store this chunk — see the hub log");
         return json(res, 500, { error: e.message });
       }
     }
@@ -7700,7 +7762,7 @@ const server = http.createServer(async (req, res) => {
         // minutes of ending" — which is a promise the hub cannot keep once a
         // push has been refused (XERK-356). `error` keeps its old value so
         // anything reading only that is unchanged; `refused` is the new half.
-        const r = archiveRefusals.get(transcriptId);
+        const r = archiveRefusalFor(transcriptId);
         return json(res, 404, r
           ? { error: "unknown transcript", refused: { host: r.host, at: r.at, error: r.error } }
           : { error: "unknown transcript" });
@@ -9365,7 +9427,8 @@ if (process.env.TURMA_TEST) {
     // (XERK-356): a test has to be able to hold BOTH — that the hub takes a
     // multi-MB delta at all, and that a refused one is still answerable when the
     // operator asks where that session went.
-    ARCHIVE_CHUNK_BODY_MAX, archiveRefusals,
+    ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveRefusals, archiveRefusalFor,
+    noteArchiveRefusal, ARCHIVE_REFUSALS_MAX, ARCHIVE_REFUSALS_PER_HOST,
     bodyLaneFor, chargeBody, releaseBody, bodyInflightHeld, BODY_PARSE_COST,
     DRAIN_CONCURRENCY_MAX, BODY_IDLE_TIMEOUT_MS, BODY_MIN_PROGRESS_BYTES,
     BIG_LANE_MAX_HOLD_MS, budgetUnderPressure,
@@ -9556,7 +9619,12 @@ if (process.env.TURMA_TEST) {
     console.log(
       `memory limit ${mib(MEMORY_LIMIT)} -> body in-flight ${mib(BODY_INFLIGHT_MAX)}/request, ` +
         `${mib(BODY_INFLIGHT_TOTAL_MAX)} across both lanes; uploads held ` +
-        `${mib(UPLOAD_TOTAL_MAX_BYTES)}; archive chunk ${mib(ARCHIVE_CHUNK_BODY_MAX)}`
+        `${mib(UPLOAD_TOTAL_MAX_BYTES)}; archive chunk ` +
+        // Not mib(): it FLOORS, and this is the one derived ceiling that can
+        // land under a MiB on a small container — printed as "0 MiB" the boot
+        // line stops being the way the number is discoverable.
+        `${ARCHIVE_CHUNK_BODY_MAX >= (1 << 20) ? mib(ARCHIVE_CHUNK_BODY_MAX)
+          : `${Math.round(ARCHIVE_CHUNK_BODY_MAX / 1024)} KiB`} at ${ARCHIVE_PARSE_COST}x`
     );
     // The effective registry budget, printed for the same reason: it is DERIVED
     // from this container's own cgroup limit rather than configured, so without

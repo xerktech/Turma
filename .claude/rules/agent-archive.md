@@ -48,11 +48,26 @@ layer's read-back routes — is in `.claude/rules/turma-archive.md`.
     route cap, which is what makes the archive work against a hub that has not been upgraded — the
     8-MiB-delta-into-a-1-MiB-route mismatch is what left the durable archive empty for every real
     session. A 413 forgets the learned number rather than re-sending the same delta every pass.
-  - An entry too big for a delta OF ITS OWN sheds its payloads first and is only then left out, with
-    its byte range archived without it and **one log line per transcript per pass** — a conversation
-    with a turn silently missing is worse than one an operator knows has a hole. Same for a LINE
-    longer than the read window (`_archive_line_end`): the old bare `break` wedged that transcript at
-    that offset forever with nothing logged, and skipping the window would corrupt the byte cursor.
+  - **A stated ceiling SMALLER than the default is obeyed**, floored only at `ARCHIVE_BODY_MIN`.
+    Floored at the default instead, the fallback after a 413 landed on a number the hub still
+    refused, so the same delta went up every pass forever. `ARCHIVE_BODY_MIN` exists only to reject a
+    value no hub could mean — under it a delta cannot carry one ordinary turn.
+  - **A 4xx skips that TRANSCRIPT; only a transport failure ends the pass.** Conflated, one
+    unpushable transcript starved every other transcript on the host, every beat — the same line the
+    raw layer already draws.
+  - An entry too big for a delta OF ITS OWN is degraded before it is dropped: file previews first
+    (the chip the chat already renders), then the rich `blocks[]` (the flat `text` carries the same
+    turn), and only then left out — with its byte range archived without it and **one log line per
+    transcript per pass**, because a conversation with a turn silently missing is worse than one an
+    operator knows has a hole.
+  - A LINE longer than the read window is found with `_archive_line_end`, and past
+    `ARCHIVE_LINE_SCAN_MAX` the scanned range is archived with nothing rendered from it. Resuming
+    mid-line is safe — the leading fragment fails to parse and is skipped like any other unparseable
+    line — where refusing to move parks that transcript at that offset for good.
+  - **`meta` rides EVERY delta and is measured before any entry is fitted**, so `summary` is capped
+    (`ARCHIVE_META_SUMMARY_MAX`). It comes from a session's name or label and the spawn route takes a
+    100 KB label: uncapped it eats a whole delta, every entry is then dropped for "not fitting", and
+    the transcript archives as empty ranges with a 200 on each.
 - **Beside the rendered entries it ships the session's OWN FILES, byte for byte** (XERK-338):
   `_session_files()` enumerates `<id>.jsonl` plus everything under `<id>/` — `subagents/`,
   `workflows/`, `tool-results/`, and whatever Claude Code adds next — and `_archive_raw_deltas()`
