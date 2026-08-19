@@ -7644,10 +7644,12 @@ class InboxRegistryMixin:
         return os.path.join(self.tmp, "cc-socks")
 
     def _register(self, pid, sid, tmux="agent-s1:@0.%0", started=1,
-                  kind="interactive", cwd=None, sock="", name=None):
+                  kind="interactive", entrypoint="cli", cwd=None, sock="",
+                  name=None):
         os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
         rec = {"pid": pid, "sessionId": sid, "tmux": tmux, "startedAt": started,
-               "kind": kind, "cwd": cwd if cwd is not None else self.tmp}
+               "kind": kind, "entrypoint": entrypoint,
+               "cwd": cwd if cwd is not None else self.tmp}
         # sock="" means the canonical path for this pid; None means unbound.
         if sock == "":
             sock = os.path.join(self._sock_dir(), f"{pid}.sock")
@@ -7725,7 +7727,11 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
         for bad in ("/tmp/attacker/evil.sock",
                     os.path.join(self._sock_dir(), "9.sock"),   # wrong pid
                     "relative/cc-socks/7.sock",
-                    "/x/cc-socks/" + "p" * 120 + "/7.sock"):
+                    "/x/cc-socks/" + "p" * 120 + "/7.sock",
+                    # Canonical in shape, past AF_UNIX's 108-byte path limit.
+                    "/" + "a" * 100 + "/cc-socks/7.sock",
+                    # Only canonical after traversing out of the real dir.
+                    "/run/user/1000/cc-socks/../../../../tmp/evil/cc-socks/7.sock"):
             with self.subTest(bad=bad):
                 shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
                 self._register(7, self.SID, sock=bad)
@@ -7733,11 +7739,14 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
 
     def test_the_tmux_fallback_ignores_a_child_claude(self):
         # A claude a session SPAWNS inherits TMUX/TMUX_PANE and registers the
-        # same tmux target with a newer startedAt. Its own session id makes the
+        # SAME tmux target, cwd and kind with a newer startedAt — measured
+        # against the real thing. `entrypoint` is the only field that differs
+        # (`sdk-cli` for `claude -p`), and its own session id makes the
         # wire-level check agree, so only this branch can catch it.
         want = self._register(1, "the-session", started=100)
-        self._register(2, "a-subagent", started=200, kind="bg")
-        self._register(3, "another", started=300, cwd="/tmp/somewhere-else")
+        self._register(2, "a-p-child", started=200, entrypoint="sdk-cli")
+        self._register(3, "a-bg-claude", started=300, kind="bg")
+        self._register(4, "elsewhere", started=400, cwd="/tmp/somewhere-else")
         self.assertEqual(ha._session_inbox(None, "agent-s1", self.tmp),
                          (want, 1, "the-session"))
 
@@ -7758,14 +7767,28 @@ class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
 
     def test_wrong_typed_fields_are_skipped(self):
         os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
-        for rec in ({"pid": 7, "sessionId": self.SID, "messagingSocketPath": 42},
-                    {"pid": 7, "sessionId": ["a"], "messagingSocketPath":
-                     os.path.join(self._sock_dir(), "7.sock")},
-                    {"pid": "7", "sessionId": self.SID, "messagingSocketPath":
-                     os.path.join(self._sock_dir(), "7.sock")},
-                    ["not", "a", "dict"]):
+        sock = lambda pid: os.path.join(self._sock_dir(), f"{pid}.sock")
+        # Each record is filed under the name its own `pid` implies, so it is
+        # the TYPE check that has to reject it and not the filename check.
+        for name, rec in (
+                ("7.json", {"pid": 7, "sessionId": self.SID,
+                            "messagingSocketPath": 42}),
+                # `True` is an int in python, and passes every other gate.
+                ("True.json", {"pid": True, "sessionId": self.SID,
+                               "messagingSocketPath": sock(True)}),
+                ("0.json", {"pid": 0, "sessionId": self.SID,
+                            "messagingSocketPath": sock(0)}),
+                ("-1.json", {"pid": -1, "sessionId": self.SID,
+                             "messagingSocketPath": sock(-1)}),
+                ("7.json", {"pid": 7, "sessionId": ["a"],
+                            "messagingSocketPath": sock(7)}),
+                ("7.json", {"pid": "7", "sessionId": self.SID,
+                            "messagingSocketPath": sock(7)}),
+                ("7.json", ["not", "a", "dict"])):
             with self.subTest(rec=rec):
-                with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "7.json"), "w") as f:
+                shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
+                os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+                with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, name), "w") as f:
                     json.dump(rec, f)
                 self.assertIsNone(ha._session_inbox(self.SID, "agent-s1"))
 
@@ -7836,19 +7859,55 @@ class TestInboxOptedOut(unittest.TestCase):
         self._write("settings.json", {"crossSessionInbound": "hold"})
         self.assertTrue(ha._inbox_opted_out(self.tmp))
 
-    def test_local_settings_outrank_project(self):
+    def test_a_local_accept_does_not_undo_a_project_refuse(self):
+        # Measured against Claude Code: it drops the message for this pair, so
+        # the obvious highest-precedence-wins rule posts into a session that
+        # then loses it in silence.
         self._write("settings.json", {"crossSessionInbound": "refuse"})
         self._write("settings.local.json", {"crossSessionInbound": "accept"})
-        self.assertFalse(ha._inbox_opted_out(self.tmp))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
 
     def test_a_file_that_does_not_mention_it_says_nothing(self):
         self._write("settings.local.json", {"permissions": {}})
         self._write("settings.json", {"crossSessionInbound": "refuse"})
         self.assertTrue(ha._inbox_opted_out(self.tmp))
 
-    def test_unreadable_settings_are_skipped(self):
-        self._write("settings.local.json", "{not json")
+    def test_all_accept_stays_on_the_inbox(self):
+        self._write("settings.json", {"crossSessionInbound": "accept"})
+        self._write("settings.local.json", {"crossSessionInbound": "accept"})
         self.assertFalse(ha._inbox_opted_out(self.tmp))
+
+    def test_settings_that_exist_but_will_not_parse_opt_out(self):
+        # It is there and it won't say what it wants; the pane always works.
+        self._write("settings.local.json", "{not json")
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_an_oversize_settings_file_opts_out(self):
+        # Not silently skipped: a key sitting past the read cap would otherwise
+        # be a refusal this never sees.
+        self._write("settings.json",
+                    json.dumps({"pad": "x" * (ha.SETTINGS_READ_MAX_BYTES + 16),
+                                "crossSessionInbound": "refuse"}))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_fifo_settings_file_does_not_block(self):
+        # Same wedge as the registry: os.path.isfile() follows a symlink and can
+        # be raced, and the block is in the open(), on the heartbeat thread.
+        os.mkfifo(os.path.join(self.tmp, ".claude", "settings.json"))
+        done = []
+        t = threading.Thread(target=lambda: done.append(
+            ha._inbox_opted_out(self.tmp)), daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "_inbox_opted_out blocked on a FIFO")
+        self.assertTrue(done[0])            # unreadable -> pane
+
+    def test_a_symlinked_settings_file_is_not_followed(self):
+        real = os.path.join(self.tmp, "elsewhere.json")
+        with open(real, "w") as f:
+            json.dump({"crossSessionInbound": "accept"}, f)
+        os.symlink(real, os.path.join(self.tmp, ".claude", "settings.json"))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
 
 
 class TestPostToInbox(unittest.TestCase):

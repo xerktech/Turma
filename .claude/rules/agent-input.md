@@ -62,29 +62,45 @@ session's inbox carries what this MANAGER composed.**
   `claudeSessionId`, else the tmux target; newest `startedAt` wins.
 - **That registry is same-uid writable by every session on the host, so each record is a CLAIM.**
   Four checks keep a planted one from steering the manager, and each has a test:
-  - the file is opened `O_NONBLOCK|O_NOFOLLOW` and must be a REGULAR file. A plain `open()` of a
-    FIFO planted there blocks until someone writes, on the HEARTBEAT thread — no exception, no
-    exit, the whole agent wedged. The size cap bounds the read, never the open.
+  - the file is opened `O_NONBLOCK|O_NOFOLLOW` and must be a REGULAR file (`_read_untrusted_json`,
+    which the settings read above shares). A plain `open()` of a FIFO planted there blocks until
+    someone writes, on the HEARTBEAT thread — no exception, no exit, the whole agent wedged. **An
+    `isfile()` pre-check is not a substitute**: it follows a symlink and loses the race against a
+    file being swapped for a FIFO between the check and the open. The size cap bounds the read,
+    never the open.
   - the record must be named `<pid>.json` for the `pid` it declares, and `messagingSocketPath` must
-    be the absolute `…/cc-socks*/<pid>.sock` Claude Code would have bound. Nothing else is
-    connected to.
+    be an absolute, already-normalized, ≤108-byte `…/cc-socks*/<pid>.sock`. That is a SHAPE check,
+    not a location one — `cc-socks*` matches a directory the sender owns, so it bounds what gets
+    connected to rather than proving whose it is.
   - `startedAt` must be FINITE. `1e999` is legal JSON, parses to `inf`, and would win every
     tiebreak forever.
   - `_post_to_inbox` then checks the LISTENER with `SO_PEERCRED`: the kernel's word on which
     process holds that socket, which a same-uid impostor cannot forge. The registry cannot give us
     this, which is why the wire-level `session_id` check is not the whole story — it proves which
     conversation a listener claims to be, never that it is the right listener.
-  - **Not closed**: a hostile same-uid process can still bind its own inbox and register a record
-    naming another session's id. It could equally read that session's transcript or `tmux
-    send-keys` into its pane, so this adds no privilege — don't write it up as sealed.
-- **The tmux fallback additionally requires an INTERACTIVE record in the session's own worktree.**
-  A claude a session SPAWNS inherits `TMUX`/`TMUX_PANE` and registers the same target with a newer
-  `startedAt`; its own session id makes the wire check agree, so only this branch can catch it.
-- **`crossSessionInbound` is read BEFORE posting** (`_inbox_opted_out`, project settings then
-  local, first definition wins). A repo can override XERK-339's `accept` to `refuse`/`hold`, the
-  inbox acknowledges nothing, and the PR pollers burn a retry either way — so a message posted into
-  one is lost in silence AND never nudged again. Such a session stays on the pane, which is what
-  that repo wants: no PEER messages, not the loss of its own PR nudges.
+  - **Not closed**: a hostile same-uid process can still bind its OWN inbox at a `cc-socks*` path
+    it owns and register a record naming another session's id — it then both receives that
+    session's messages AND denies them (the post succeeds, so there is no pane fallback). It could
+    equally read that session's transcript or `tmux send-keys` into its pane, so this adds no
+    privilege — don't write it up as sealed, and don't describe it as interception alone.
+- **The tmux fallback additionally requires `entrypoint: cli`**, plus `kind: interactive`, the
+  session's own cwd, and the tmux target. A claude a session SPAWNS inherits `TMUX`/`TMUX_PANE` and
+  — measured, not assumed — matches on target, cwd, `kind` AND a newer `startedAt`; `entrypoint` is
+  the only field that differs (`sdk-cli` for `claude -p`). Its own session id makes the wire check
+  agree, so this branch is the only thing that can catch it, and dropping the entrypoint check
+  hands a session's PR nudge to a subagent's claude and reports it delivered.
+- **`crossSessionInbound` is read BEFORE posting** (`_inbox_opted_out`). A repo can override
+  XERK-339's `accept` to `refuse`/`hold`; the inbox acknowledges nothing and the PR pollers burn a
+  retry either way, so a message posted into such a session is lost in silence AND never nudged
+  again. It stays on the pane instead, which is what that repo wants: no PEER messages, not the
+  loss of its own PR nudges.
+  - **ANY of the files asking for something other than `accept` opts out — this is NOT a precedence
+    calculation.** Measured against Claude Code, a project `refuse` is *not* undone by a local
+    `accept`, so "highest-precedence definition wins" posts into a session that drops the message.
+    A file that exists but will not parse (or is past `SETTINGS_READ_MAX_BYTES`) opts out too.
+    Erring this way costs only the pane, which has always worked.
+  - Claude Code reads these at LAUNCH and this reads them at post time, so a repo that changes the
+    value mid-session disagrees with its own running claude until it restarts.
 - Anything else — no inbox bound, an older claude, a dead socket, a listener that isn't the
   registered pid — falls back to `send_input`, outbox and all.
 - **An inbox message is never put on the outbox.** It never becomes the user turn `_pending_scan`
@@ -93,4 +109,6 @@ session's inbox carries what this MANAGER composed.**
   and that the message is about the session's OWN work (without which the peer framing makes a
   conflict nudge read as advisory), and it explicitly holds quoted PR-comment bodies — third-party
   text — back to "review to weigh", never operator instruction.
-- Tests: `TestSessionInbox`, `TestInboxOptedOut`, `TestPostToInbox`, `TestNotifySession`.
+- Tests: `TestSessionInbox`, `TestInboxOptedOut`, `TestPostToInbox`, `TestNotifySession`. The
+  hostile-input cases are load-bearing: every guard above was added because a probe got past its
+  absence, and three of them because the first attempt at the guard did not work.

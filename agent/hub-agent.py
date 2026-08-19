@@ -6536,38 +6536,24 @@ INBOX_PREFIX = (
 # notify_session reads these instead and uses the pane, which is what that repo
 # actually wants: no PEER messages, not the loss of its own PR nudges.
 INBOX_OPT_OUT_FILES = (".claude/settings.local.json", ".claude/settings.json")
+# A settings file is a repo's, not a record we wrote, so it gets a ceiling of its
+# own rather than the registry's. Past it the file is unreadable, which opts out.
+SETTINGS_READ_MAX_BYTES = 1 << 20
 
 
-def _inbox_opted_out(workdir):
-    """True when this session's settings turn the inbox off, so the pane is the
-    only path that will actually deliver. First file that DEFINES the key wins,
-    highest precedence first; a missing or unreadable file says nothing.
+def _read_untrusted_json(path, max_bytes):
+    """Parse a JSON object out of a file this agent does NOT control, or None.
 
-    Deliberately fails towards the pane: an unparseable value is not `accept`,
-    and the pane has always worked."""
-    for rel in INBOX_OPT_OUT_FILES:
-        path = os.path.join(workdir, rel) if workdir else None
-        if not path or not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "rb") as fh:
-                data = json.loads(fh.read(SESSIONS_REGISTRY_MAX_BYTES))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and "crossSessionInbound" in data:
-            return data.get("crossSessionInbound") != "accept"
-    return False
+    `O_NONBLOCK|O_NOFOLLOW` and a REGULAR-file check, because a plain `open()` of
+    a FIFO blocks until someone writes to it — and both callers run on the
+    HEARTBEAT thread, where that wedges the whole agent with no exception to
+    catch and no exit for anything to restart. Neither an `isfile()` pre-check
+    nor a read timeout helps: `isfile()` follows a symlink and can be raced
+    between the check and the open, and the block is in the OPEN.
 
-
-def _read_registry_record(path):
-    """One session-registry record, or None.
-
-    Opened O_NONBLOCK|O_NOFOLLOW and required to be a REGULAR file: this reads a
-    directory the agent does not own but every session on the host can write, and
-    a plain open() of a FIFO planted there BLOCKS until someone writes to it —
-    which, on the heartbeat thread that calls this, wedges the whole agent with no
-    exception to catch and no exit for anything to restart. The size cap bounds
-    the read, never the open.
+    None means "this file said nothing usable" — missing, wrong shape,
+    unparseable, or bigger than `max_bytes`. Each caller decides which way that
+    should fail; they do not agree.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
@@ -6577,10 +6563,45 @@ def _read_registry_record(path):
         with os.fdopen(fd, "rb") as fh:
             if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
                 return None
-            rec = json.loads(fh.read(SESSIONS_REGISTRY_MAX_BYTES))
+            blob = fh.read(max_bytes + 1)
+        if len(blob) > max_bytes:
+            return None                   # never parse an unbounded file
+        data = json.loads(blob)
     except (OSError, ValueError):
         return None
-    return rec if isinstance(rec, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def _inbox_opted_out(workdir):
+    """True when this session's settings turn the inbox off, so the pane is the
+    only path that will actually deliver.
+
+    **ANY of these files asking for something other than `accept` opts out**, and
+    a file that exists but cannot be read opts out too. Not a precedence
+    calculation: measured against Claude Code, a project `refuse` is NOT undone
+    by a local `accept`, so the obvious "highest-precedence definition wins" rule
+    posts into a session that then drops the message in silence. Erring the other
+    way only costs the pane, which has always worked.
+    """
+    if not workdir:
+        return False
+    for rel in INBOX_OPT_OUT_FILES:
+        path = os.path.join(workdir, rel)
+        if not os.path.lexists(path):
+            continue
+        data = _read_untrusted_json(path, SETTINGS_READ_MAX_BYTES)
+        if data is None:
+            return True                   # it is there and it won't say — pane
+        if ("crossSessionInbound" in data
+                and data.get("crossSessionInbound") != "accept"):
+            return True
+    return False
+
+
+def _read_registry_record(path):
+    """One session-registry record, or None. See _read_untrusted_json: the
+    registry is a directory every session on this host can write to."""
+    return _read_untrusted_json(path, SESSIONS_REGISTRY_MAX_BYTES)
 
 
 def _canonical_inbox_path(sock_path, pid):
@@ -6596,7 +6617,9 @@ def _canonical_inbox_path(sock_path, pid):
     A session launched with an explicit --messaging-socket-path would fail this
     and fall back to the pane. Turma never passes one.
     """
-    if not sock_path.startswith("/") or len(sock_path.encode("utf-8")) > 108:
+    if (not sock_path.startswith("/")
+            or sock_path != os.path.normpath(sock_path)   # no `..` out of it
+            or len(sock_path.encode("utf-8")) > 108):     # AF_UNIX's own limit
         return False
     head, tail = os.path.split(sock_path)
     parent = os.path.basename(head)
@@ -6618,10 +6641,12 @@ def _session_inbox(claude_sid, tmux_name, workdir=None):
     same handle _session_transcript_path uses). The tmux fallback is for a
     session launched by an agent predating the pin, and is deliberately the
     narrower rule: a claude a session SPAWNS inherits `TMUX`/`TMUX_PANE` and
-    registers the same tmux target, so that branch also requires the record to
-    be an INTERACTIVE session in this session's own worktree — without which the
-    manager would hand a session's PR nudge to a subagent's claude, whose own
-    session id makes the wire-level check agree.
+    registers the SAME tmux target, the same cwd and `kind: interactive`, with a
+    newer `startedAt` — so it wins on every field but **`entrypoint`**, which is
+    `cli` for the session's own TUI and `sdk-cli` for a `claude -p` child. All
+    four are required. Without the entrypoint check the manager hands a session's
+    PR nudge to a subagent's claude, whose own session id makes the wire-level
+    check agree, and reports it delivered.
 
     Newest `startedAt` wins, so a record an earlier claude in the same tmux left
     behind can't shadow the live one. Non-finite is not newest: `1e999` is legal
@@ -6660,6 +6685,7 @@ def _session_inbox(claude_sid, tmux_name, workdir=None):
         # session name, which is unique per Turma session (`agent-<id>`).
         elif (not tmux_name
                 or str(rec.get("tmux") or "").split(":")[0] != tmux_name
+                or rec.get("entrypoint") != "cli"
                 or rec.get("kind") != "interactive"
                 or (workdir and rec.get("cwd") != workdir)):
             continue
@@ -6702,11 +6728,12 @@ def _post_to_inbox(sock_path, pid, claude_sid, text):
         drops one that is not its own — which is what makes a socket named after
         a RECYCLED pid safe to connect to.
 
-    What neither closes: a hostile process on this host that binds its own inbox
-    path and registers a record naming another session's id still receives that
-    session's messages. It is same-uid, so it could equally read that session's
-    transcript or type into its pane — this path adds no privilege it lacked,
-    and it is not the boundary XERK-348 draws.
+    What neither closes: a hostile process on this host that binds its OWN inbox
+    at a `cc-socks*` path it owns and registers a record naming another session's
+    id both RECEIVES that session's messages and DENIES them — the post succeeds,
+    so there is no pane fallback. It is same-uid, so it could equally read that
+    session's transcript or type into its pane: this path adds no privilege it
+    lacked, and it is not the boundary XERK-348 draws.
 
     Fire-and-forget: the inbox answers nothing, so True means "written to the
     socket", not "queued by claude". See notify_session for the refusal that
