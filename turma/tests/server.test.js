@@ -8691,19 +8691,31 @@ test("migrate: matches on the CLAIMED org, and the client predicate agrees", asy
   const toQuiet = await migrate("mQuietA", "s1", { host: "mQuietB" });
   assert.equal(toQuiet.status, 409, JSON.stringify(toQuiet.body));
   // `sessions.html`'s own predicate, verbatim, over what the client is really
-  // served — the test was titled "the clients agree" while running no client
-  // code at all. `eligibleMoveTargets` keys on this, so if it disagrees with the
-  // hub the Move menu offers a host that 409s (or hides a legal one).
-  const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents;
+  // served — this test was once titled "the clients agree" while running no
+  // client code at all. `eligibleMoveTargets` keys on this, so if it disagrees
+  // with the hub the Move menu offers a host that 409s (or hides a legal one).
   const siteKeyOfAgent = (a) => (a && a.jira && a.jira.siteKey) || "";
-  const keyOf = (d) => siteKeyOfAgent(served.find((x) => x.device === d));
-  assert.notEqual(keyOf("mQuietA"), keyOf("mQuietB"));   // the UI hides it too
+  // Fetched FRESH per assertion, and every host asserted to be PRESENT in it.
+  // A snapshot taken before a host's first beat makes `find` undefined, which
+  // the client-style `|| ""` turns into "" — so `"" === ""` passed while proving
+  // nothing about the host it named.
+  const keysOf = async (...devices) => {
+    const served = (await request("GET", "/api/agents", { headers: userHeaders })).body.agents;
+    return devices.map((d) => {
+      const a = served.find((x) => x.device === d);
+      assert.ok(a, `${d} is not in the served payload — this assertion is vacuous`);
+      return siteKeyOfAgent(a);
+    });
+  };
+  const [kA, kB] = await keysOf("mQuietA", "mQuietB");
+  assert.notEqual(kA, kB);                               // the UI hides it too
   // And the org-less pair the clients DO offer is allowed, so agreement holds
   // in both directions.
   await migHost("mQuietC", null);
   const bothQuiet = await migrate("mQuietC", "s1", { host: "mQuietB" });
   assert.equal(bothQuiet.status, 200, JSON.stringify(bothQuiet.body));
-  assert.equal(keyOf("mQuietC"), keyOf("mQuietB"));
+  const [kC, kB2] = await keysOf("mQuietC", "mQuietB");
+  assert.equal(kC, kB2);
   if (bothQuiet.body && bothQuiet.body.migrationId)
     migrations.delete(bothQuiet.body.migrationId);
 });
