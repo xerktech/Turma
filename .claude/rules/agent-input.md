@@ -60,12 +60,37 @@ session's inbox carries what this MANAGER composed.**
   derived from a pid: it lives under `$XDG_RUNTIME_DIR`, which the manager and a session it
   launched need not agree on, and a late bind is only recorded there. Matched on the pinned
   `claudeSessionId`, else the tmux target; newest `startedAt` wins.
-- **Every post names the session id it is for** and Claude Code drops a mismatch — that is what
-  makes connecting to a socket named after a RECYCLED pid safe.
-- **Delivery is what XERK-339's `crossSessionInbound: accept` buys.** The inbox acknowledges
-  nothing, so a repo whose own settings override that to `refuse` drops these messages silently:
-  the one failure this path cannot see. Anything else — no inbox bound, an older claude, a dead
-  socket — falls back to `send_input`, outbox and all.
+- **That registry is same-uid writable by every session on the host, so each record is a CLAIM.**
+  Four checks keep a planted one from steering the manager, and each has a test:
+  - the file is opened `O_NONBLOCK|O_NOFOLLOW` and must be a REGULAR file. A plain `open()` of a
+    FIFO planted there blocks until someone writes, on the HEARTBEAT thread — no exception, no
+    exit, the whole agent wedged. The size cap bounds the read, never the open.
+  - the record must be named `<pid>.json` for the `pid` it declares, and `messagingSocketPath` must
+    be the absolute `…/cc-socks*/<pid>.sock` Claude Code would have bound. Nothing else is
+    connected to.
+  - `startedAt` must be FINITE. `1e999` is legal JSON, parses to `inf`, and would win every
+    tiebreak forever.
+  - `_post_to_inbox` then checks the LISTENER with `SO_PEERCRED`: the kernel's word on which
+    process holds that socket, which a same-uid impostor cannot forge. The registry cannot give us
+    this, which is why the wire-level `session_id` check is not the whole story — it proves which
+    conversation a listener claims to be, never that it is the right listener.
+  - **Not closed**: a hostile same-uid process can still bind its own inbox and register a record
+    naming another session's id. It could equally read that session's transcript or `tmux
+    send-keys` into its pane, so this adds no privilege — don't write it up as sealed.
+- **The tmux fallback additionally requires an INTERACTIVE record in the session's own worktree.**
+  A claude a session SPAWNS inherits `TMUX`/`TMUX_PANE` and registers the same target with a newer
+  `startedAt`; its own session id makes the wire check agree, so only this branch can catch it.
+- **`crossSessionInbound` is read BEFORE posting** (`_inbox_opted_out`, project settings then
+  local, first definition wins). A repo can override XERK-339's `accept` to `refuse`/`hold`, the
+  inbox acknowledges nothing, and the PR pollers burn a retry either way — so a message posted into
+  one is lost in silence AND never nudged again. Such a session stays on the pane, which is what
+  that repo wants: no PEER messages, not the loss of its own PR nudges.
+- Anything else — no inbox bound, an older claude, a dead socket, a listener that isn't the
+  registered pid — falls back to `send_input`, outbox and all.
 - **An inbox message is never put on the outbox.** It never becomes the user turn `_pending_scan`
   reaps on, so it would sit there until a compaction re-typed it into the pane as a duplicate.
-- Tests: `TestSessionInbox`, `TestPostToInbox`, `TestNotifySession`.
+- **`INBOX_PREFIX` corrects attribution; it must not grant authority.** It says Turma is speaking
+  and that the message is about the session's OWN work (without which the peer framing makes a
+  conflict nudge read as advisory), and it explicitly holds quoted PR-comment bodies — third-party
+  text — back to "review to weigh", never operator instruction.
+- Tests: `TestSessionInbox`, `TestInboxOptedOut`, `TestPostToInbox`, `TestNotifySession`.
