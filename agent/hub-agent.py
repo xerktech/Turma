@@ -12812,8 +12812,14 @@ class SessionManager:
         if not CC_SOCK_SWEEP:
             return
         # Without /proc the first test answers "dead" for every pid on the host.
-        # Refuse the whole sweep rather than act on an answer we cannot get.
+        # Refuse the whole sweep rather than act on an answer we cannot get —
+        # and say so, since a refusal nobody can see is the same invisibility
+        # the announce below exists to end.
         if not os.path.isdir("/proc/self"):
+            if not self._cc_socks_announced:
+                self._cc_socks_announced = True
+                log("cc-socks: no /proc here, so a dead pid cannot be told "
+                    "from a live one; not sweeping")
             return
         deadline = time.monotonic() + CC_SOCK_SWEEP_DEADLINE_SEC
         dirs = cc_socket_dirs()

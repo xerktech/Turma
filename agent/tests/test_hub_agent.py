@@ -7544,12 +7544,9 @@ class TestSweepClaudeSockets(ManagerMixin, unittest.TestCase):
             "%d.sock\n" % dead,
             "\u0664\u0661\u0669\u0664\u0663\u0660\u0663.sock",
         )]
-        sub = os.path.join(self.socks, "nested")
-        os.makedirs(sub)
         sm._sweep_claude_sockets()
         for path in keep:
             self.assertTrue(os.path.exists(path), path)
-        self.assertTrue(os.path.isdir(sub))
 
     def test_a_regular_file_named_like_a_socket_is_left_alone(self):
         sm = self.make_manager()
@@ -7560,15 +7557,63 @@ class TestSweepClaudeSockets(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.exists(path))
 
     def test_a_symlink_is_never_followed_or_unlinked(self):
+        # The target is a REAL abandoned socket, so S_ISSOCK would say yes the
+        # moment the link were followed. Pointed at a regular file instead, the
+        # gate rejects it either way and `follow_symlinks=True` sails through.
         sm = self.make_manager()
-        target = os.path.join(self.tmp, "precious")
-        with open(target, "w") as fh:
-            fh.write("x")
+        target = os.path.join(self.tmp, "precious.sock")
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(target)
+            sock.listen(1)
         link = os.path.join(self.socks, "%d.sock" % self._dead_pid())
         os.symlink(target, link)
         sm._sweep_claude_sockets()
         self.assertTrue(os.path.lexists(link))
         self.assertTrue(os.path.exists(target))
+
+    def test_a_dangling_symlink_is_left_alone(self):
+        sm = self.make_manager()
+        link = os.path.join(self.socks, "%d.sock" % self._dead_pid())
+        os.symlink(os.path.join(self.tmp, "nothing-here"), link)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.lexists(link))
+
+    def test_a_zero_padded_pid_is_read_as_the_pid_it_names(self):
+        # "/proc/0003203929" does not exist however alive pid 3203929 is, so
+        # without the int() normalisation a padded name reads as dead and a
+        # live session loses its inbox.
+        sm = self.make_manager()
+        keep = self._leak("%010d.sock" % os.getpid())
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_it_does_not_recurse_into_subdirectories(self):
+        # Claude Code binds at the top level only, and a sweep that walked down
+        # would be deleting inside a tree it knows nothing about.
+        sm = self.make_manager()
+        sub = os.path.join(self.socks, "nested")
+        os.makedirs(sub)
+        buried = os.path.join(sub, "%d.sock" % self._dead_pid())
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(buried)
+            sock.listen(1)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(buried))
+        self.assertTrue(os.path.isdir(sub))
+
+    def test_a_host_with_no_proc_says_why_it_is_not_sweeping(self):
+        sm = self.make_manager()
+        real = os.path.isdir
+        lines = []
+        with mock.patch.object(ha.os.path, "isdir",
+                               lambda p: False if p == "/proc/self" else real(p)), \
+                mock.patch.object(ha, "log", lines.append):
+            sm._sweep_claude_sockets()
+            sm._sweep_claude_sockets()
+        said = [ln for ln in lines if "no /proc here" in ln]
+        self.assertEqual(len(said), 1, lines)
 
     def test_nothing_outside_the_sockets_dir_is_touched(self):
         sm = self.make_manager()
