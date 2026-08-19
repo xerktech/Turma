@@ -12,6 +12,7 @@ docker/tmux/git needed.
 import base64
 import contextlib
 import datetime
+import errno
 import gzip
 import http.server
 import importlib.util
@@ -23,6 +24,7 @@ import shlex
 import subprocess
 import shutil
 import signal
+import socket
 import struct
 import sys
 import tempfile
@@ -7415,6 +7417,325 @@ class TestSweepUploads(ManagerMixin, unittest.TestCase):
         keep = self._dir("recent")
         sm._sweep_uploads()
         self.assertTrue(os.path.exists(keep))
+
+
+class TestCcSocketDirs(unittest.TestCase):
+    """Where the sweep looks. It has to be the same answer Claude Code's own
+    bind reached, so this mirrors its resolution rather than hardcoding /tmp."""
+
+    def _dirs(self, **env):
+        clear = {k: None for k in ("XDG_RUNTIME_DIR", "CLAUDE_CODE_TMPDIR",
+                                   "TMPDIR", "TMP", "TEMP", "TURMA_CC_SOCKS_DIR")}
+        clear.update(env)
+        with mock.patch.dict(os.environ, {k: v for k, v in clear.items() if v},
+                             clear=False):
+            for k, v in clear.items():
+                if not v:
+                    os.environ.pop(k, None)
+            return ha.cc_socket_dirs()
+
+    def test_the_runtime_dir_wins_over_every_temp_var(self):
+        dirs = self._dirs(XDG_RUNTIME_DIR="/run/user/1000",
+                          CLAUDE_CODE_TMPDIR="/cc", TMPDIR="/tee")
+        self.assertEqual(dirs[0], "/run/user/1000/cc-socks")
+
+    def test_claude_s_own_tmpdir_comes_next(self):
+        self.assertEqual(self._dirs(CLAUDE_CODE_TMPDIR="/cc", TMPDIR="/tee")[0],
+                         "/cc/cc-socks")
+
+    def test_then_the_system_temp_dir_then_slash_tmp(self):
+        self.assertEqual(self._dirs(TMPDIR="/tee")[0], "/tee/cc-socks")
+        self.assertEqual(self._dirs()[0], "/tmp/cc-socks")
+
+    def test_the_long_path_fallback_is_swept_too(self):
+        # Claude Code drops to /tmp/cc-socks-<uid> when the preferred path would
+        # pass sun_path's ~104 bytes; the manager cannot tell which a given
+        # session used, so both are candidates.
+        self.assertIn("/tmp/cc-socks-%d" % os.getuid(),
+                      self._dirs(XDG_RUNTIME_DIR="/run/user/1000"))
+
+    def test_slash_tmp_is_not_listed_twice(self):
+        dirs = self._dirs()
+        self.assertEqual(len(dirs), len(set(dirs)))
+
+    def test_an_override_replaces_the_lot(self):
+        self.assertEqual(self._dirs(TURMA_CC_SOCKS_DIR="/somewhere/else/"),
+                         ["/somewhere/else"])
+
+
+class TestSweepClaudeSockets(ManagerMixin, unittest.TestCase):
+    """Claude Code leaks one <pid>.sock per abnormally-ended session (XERK-341).
+    The manager unlinks the dead ones, and EVERY uncertainty keeps the file:
+    deleting a live session's inbox breaks its messaging silently, while leaving
+    a dead one costs an inode until the next slow beat."""
+
+    def setUp(self):
+        super().setUp()
+        self.socks = os.path.join(self.tmp, "cc-socks")
+        os.makedirs(self.socks, exist_ok=True)
+        env = mock.patch.dict(os.environ, {"TURMA_CC_SOCKS_DIR": self.socks})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _dead_pid(self):
+        """A pid with no /proc entry. Well past any pid_max, so it stays free."""
+        pid = 4194303
+        self.assertFalse(os.path.exists("/proc/%d" % pid))
+        return pid
+
+    def _leak(self, name):
+        """A bound-then-abandoned socket inode: exactly what a killed session
+        leaves behind, and connect() to it is refused."""
+        path = os.path.join(self.socks, name)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        s.listen(1)
+        s.close()
+        return path
+
+    def _listening(self, name):
+        """A socket something is still accepting on."""
+        path = os.path.join(self.socks, name)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        s.listen(1)
+        self.addCleanup(s.close)
+        return path
+
+    def test_a_dead_pid_s_abandoned_socket_goes(self):
+        sm = self.make_manager()
+        gone = self._leak("%d.sock" % self._dead_pid())
+        sm._sweep_claude_sockets()
+        self.assertFalse(os.path.exists(gone))
+
+    def test_a_live_pid_s_socket_stays(self):
+        # Pids are REUSED, so a live pid is hands-off whatever is running under
+        # it — the sweep never asks whether the process is a claude.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % os.getpid())
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_a_socket_with_a_listener_stays_even_with_no_proc_entry(self):
+        # The namespace guard: /proc only answers for pids bound in OUR pid
+        # namespace, so a still-accepting socket is kept whatever /proc says.
+        sm = self.make_manager()
+        keep = self._listening("%d.sock" % self._dead_pid())
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_only_pid_dot_sock_is_a_candidate(self):
+        # Every decoy is a REAL abandoned socket owned by a dead pid, so the
+        # NAME is the only thing keeping it: built as plain files instead, the
+        # S_ISSOCK gate would spare them whatever the pattern did, and an
+        # unanchored pattern would sail through this test.
+        sm = self.make_manager()
+        dead = self._dead_pid()
+        keep = [self._leak(name) for name in (
+            "claude.sock",
+            "%d.sock.bak" % dead,
+            "%d.sock.tmp" % dead,
+            "x%d.sock" % dead,
+            ".%d.sock" % dead,
+            "%d.txt" % dead,
+            "12345678901.sock",             # eleven digits is not a pid
+            # `$` would match before a trailing newline; `\d` would match
+            # Arabic-Indic digits. Neither is a name claude ever wrote.
+            "%d.sock\n" % dead,
+            "\u0664\u0661\u0669\u0664\u0663\u0660\u0663.sock",
+        )]
+        sm._sweep_claude_sockets()
+        for path in keep:
+            self.assertTrue(os.path.exists(path), path)
+
+    def test_a_regular_file_named_like_a_socket_is_left_alone(self):
+        sm = self.make_manager()
+        path = os.path.join(self.socks, "%d.sock" % self._dead_pid())
+        with open(path, "w"):
+            pass
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_symlink_is_never_followed_or_unlinked(self):
+        # The target is a REAL abandoned socket, so S_ISSOCK would say yes the
+        # moment the link were followed. Pointed at a regular file instead, the
+        # gate rejects it either way and `follow_symlinks=True` sails through.
+        sm = self.make_manager()
+        target = os.path.join(self.tmp, "precious.sock")
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(target)
+            sock.listen(1)
+        link = os.path.join(self.socks, "%d.sock" % self._dead_pid())
+        os.symlink(target, link)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.lexists(link))
+        self.assertTrue(os.path.exists(target))
+
+    def test_a_dangling_symlink_is_left_alone(self):
+        sm = self.make_manager()
+        link = os.path.join(self.socks, "%d.sock" % self._dead_pid())
+        os.symlink(os.path.join(self.tmp, "nothing-here"), link)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.lexists(link))
+
+    def test_a_zero_padded_pid_is_read_as_the_pid_it_names(self):
+        # "/proc/0003203929" does not exist however alive pid 3203929 is, so
+        # without the int() normalisation a padded name reads as dead and a
+        # live session loses its inbox.
+        sm = self.make_manager()
+        keep = self._leak("%010d.sock" % os.getpid())
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_it_does_not_recurse_into_subdirectories(self):
+        # Claude Code binds at the top level only, and a sweep that walked down
+        # would be deleting inside a tree it knows nothing about.
+        sm = self.make_manager()
+        sub = os.path.join(self.socks, "nested")
+        os.makedirs(sub)
+        buried = os.path.join(sub, "%d.sock" % self._dead_pid())
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(buried)
+            sock.listen(1)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(buried))
+        self.assertTrue(os.path.isdir(sub))
+
+    def test_a_host_with_no_proc_says_why_it_is_not_sweeping(self):
+        sm = self.make_manager()
+        real = os.path.isdir
+        lines = []
+        with mock.patch.object(ha.os.path, "isdir",
+                               lambda p: False if p == "/proc/self" else real(p)), \
+                mock.patch.object(ha, "log", lines.append):
+            sm._sweep_claude_sockets()
+            sm._sweep_claude_sockets()
+        said = [ln for ln in lines if "no /proc here" in ln]
+        self.assertEqual(len(said), 1, lines)
+
+    def test_nothing_outside_the_sockets_dir_is_touched(self):
+        sm = self.make_manager()
+        outside = os.path.join(self.tmp, "%d.sock" % self._dead_pid())
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(outside)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(outside))
+
+    def test_a_missing_sockets_dir_is_not_an_error(self):
+        sm = self.make_manager()
+        shutil.rmtree(self.socks)
+        sm._sweep_claude_sockets()          # no raise
+
+    def test_the_budget_bounds_the_beat(self):
+        # The manager has one loop; a directory too big to finish leaves the
+        # remainder for the next slow beat rather than holding the heartbeat.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        with mock.patch.object(ha, "CC_SOCK_SWEEP_DEADLINE_SEC", -1):
+            sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_the_sweep_can_be_turned_off(self):
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        with mock.patch.object(ha, "CC_SOCK_SWEEP", False):
+            sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_no_proc_means_no_sweep_at_all(self):
+        # Without /proc the pid test answers "dead" for every pid on the host,
+        # so the sweep refuses rather than acting on an answer it cannot get.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        real = os.path.isdir
+
+        def no_proc(path):
+            return False if path == "/proc/self" else real(path)
+
+        with mock.patch.object(ha.os.path, "isdir", no_proc):
+            sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_it_rides_the_slow_usage_cadence(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.SessionManager, "_sweep_claude_sockets") as sweep:
+            sm._refresh_repo_usage()
+        sweep.assert_called_once_with()
+
+    def test_a_sweep_that_raises_does_not_take_the_beat_down(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.SessionManager, "_sweep_claude_sockets",
+                               side_effect=OSError("boom")):
+            sm._refresh_repo_usage()        # no raise
+
+    def test_a_probe_that_cannot_tell_keeps_the_file(self):
+        # The rule the whole "never delete a live inbox" claim rests on. Only a
+        # REFUSED connect is dead; a busy listen backlog (EAGAIN), a socket we
+        # may not connect to (EACCES), a timeout — every one of those is "cannot
+        # tell", and cannot-tell keeps the file.
+        sm = self.make_manager()
+        for err in (BlockingIOError(errno.EAGAIN, "backlog full"),
+                    PermissionError(errno.EACCES, "denied"),
+                    TimeoutError("no answer"),
+                    OSError(errno.EIO, "io error")):
+            with self.subTest(err=err):
+                keep = self._leak("%d.sock" % self._dead_pid())
+                with mock.patch.object(ha.socket, "socket") as sock:
+                    sock.return_value.__enter__.return_value.connect.side_effect = err
+                    sm._sweep_claude_sockets()
+                self.assertTrue(os.path.exists(keep))
+                os.unlink(keep)
+
+    def test_only_a_refused_or_vanished_connect_reads_as_dead(self):
+        sm = self.make_manager()
+        for err in (ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+                    FileNotFoundError(errno.ENOENT, "gone")):
+            with self.subTest(err=err):
+                gone = self._leak("%d.sock" % self._dead_pid())
+                with mock.patch.object(ha.socket, "socket") as sock:
+                    sock.return_value.__enter__.return_value.connect.side_effect = err
+                    sm._sweep_claude_sockets()
+                self.assertFalse(os.path.exists(gone))
+
+    @unittest.skipIf(os.geteuid() == 0, "root connects to a mode-000 socket")
+    def test_a_socket_we_may_not_connect_to_is_kept_for_real(self):
+        # The same rule against the filesystem rather than a mock, so the errno
+        # mapping in _unix_socket_is_dead is exercised end to end.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        os.chmod(keep, 0)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_the_budget_is_checked_before_the_name_is(self):
+        # The bound has to cover EVERY entry, not just the candidates: a
+        # directory of a million names that match nothing costs the same per
+        # entry as one full of sockets, and checking the budget only after the
+        # pattern made it no bound at all.
+        sm = self.make_manager()
+        for i in range(5):
+            with open(os.path.join(self.socks, "not-a-socket-%d" % i), "w"):
+                pass
+        lines = []
+        with mock.patch.object(ha, "log", lines.append), \
+                mock.patch.object(ha, "CC_SOCK_SWEEP_DEADLINE_SEC", -1):
+            sm._sweep_claude_sockets()
+        self.assertTrue([ln for ln in lines if "budget ran out" in ln], lines)
+
+    def test_the_directories_it_resolved_are_named_once(self):
+        # Silence is what let 9,245 files pile up unnoticed, so a host where
+        # this resolves somewhere claude never binds has to say so.
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lines.append):
+            sm._sweep_claude_sockets()
+            sm._sweep_claude_sockets()
+        named = [ln for ln in lines if ln.startswith("cc-socks: sweeping ")]
+        self.assertEqual(len(named), 1, lines)
+        self.assertIn(self.socks, named[0])
 
 
 class TestPendingScan(ProjectDirMixin, unittest.TestCase):
