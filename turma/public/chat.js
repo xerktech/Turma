@@ -609,21 +609,33 @@
   }
 
   // ---- /history fallback (initial scrollback + WS-down updates) -------------
+  // One 202-retry chain at a time. The poll fallback ticks every POLL_MS while
+  // the socket is down and each tick used to start its own chain, which the
+  // longer window above turns from 12 overlapping requests into 40 (measured:
+  // 156 GETs in 45s against 86). The chain that is already waiting is the one
+  // that will deliver.
+  let historyChain = false;
   async function loadHistory(myGen, retries) {
     retries = retries || 0;
+    if (retries === 0) {
+      if (historyChain) return;
+      historyChain = true;
+    }
     // A closed view has no URL to fetch: close() nulls hostKey/sessionId, and a
     // 202-retry timer already in flight would otherwise build (and 404 on)
     // `/api/agents/null/sessions/null/history`. The gen check downstream only
     // discards the RESULT — this is what stops the request.
-    if (myGen !== gen || !hostKey || !sessionId) return;
+    if (myGen !== gen || !hostKey || !sessionId) { historyChain = false; return; }
     let r;
     try { r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/history"); }
-    catch { return; }
-    if (myGen !== gen) return;
+    catch { historyChain = false; return; }
+    if (myGen !== gen) { historyChain = false; return; }
     if (r.status === 202) {
       if (retries < HISTORY_MAX_RETRIES) setTimeout(() => loadHistory(myGen, retries + 1), HISTORY_RETRY_MS);
+      else historyChain = false;   // gave up — the next tick may start over
       return;
     }
+    historyChain = false;
     if (!r.ok) return;
     let j;
     try { j = await r.json(); } catch { return; }
@@ -2338,6 +2350,7 @@
     hostKey = hk; sessionId = id; sess = s; agent = a;
     // The switch has landed once the host reports the source we asked for.
     if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
+    historyChain = false;   // a chain from the PREVIOUS session must not block this one
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
     backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send

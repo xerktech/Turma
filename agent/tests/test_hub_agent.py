@@ -10606,7 +10606,9 @@ class TestStagedHistoryCeiling(ManagerMixin, unittest.TestCase):
         # memory (or an agent repointed at a smaller one) would re-post the same
         # body every beat forever with nothing able to notice.
         sm = self.make_manager()
-        sm._note_body_max({"bodyMax": 32 << 20})     # learned from a big hub
+        # A ceiling whose DERIVED value differs from the default, or the reset
+        # below is invisible: 32 MiB x the margin lands exactly on it.
+        sm._note_body_max({"bodyMax": 8 << 20})
         sm.history_results.append(self._result("s1", 2000))
         payload = sm.build_payload(0)
         with mock.patch.object(ha.urllib.request, "urlopen",

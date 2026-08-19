@@ -531,6 +531,24 @@ test("render: an error result gets the .err class on its card", () => {
 // the same on the live tail as on /history, so a clipped block has no fuller
 // copy anywhere — it gets a static mark, and nothing the operator must press
 // before they can read a message.
+// XERK-347: the /history 202-retry window must outlast a HEARTBEAT, because a
+// delivery the agent shed (its own body ceiling, or two failed beats) can only
+// arrive on the NEXT beat — and the poll fallback re-asks only while the socket
+// is down, so a session with a healthy live tail that gives up early sits on an
+// empty scrollback until it is reopened. Read off the source: these are module
+// constants with no export, and the window is the thing that must not regress.
+test("chat: the /history retry window outlasts the agent's beat interval", () => {
+  const src = require("fs").readFileSync(require.resolve("../public/chat.js"), "utf8");
+  const num = (name) => {
+    const m = src.match(new RegExp(`const ${name} = (\\d+)`));
+    assert.ok(m, `${name} is no longer a plain constant in chat.js`);
+    return Number(m[1]);
+  };
+  const BEAT_MS = 20000;   // hub-agent.py INTERVAL
+  assert.ok(num("HISTORY_MAX_RETRIES") * num("HISTORY_RETRY_MS") > BEAT_MS * 2,
+    "the window must cover the beat that sheds a delivery AND the one that re-delivers it");
+});
+
 test("render: a clipped block gets a static mark, not a Show more button", () => {
   const items = buildItems([
     { id: "a9", role: "assistant", blocks: [{ t: "text", text: "loooong", truncated: true }] },

@@ -508,7 +508,11 @@ HISTORY_STAGED_MAX_BYTES = int(os.environ.get("SESSION_HISTORY_STAGED_MAX_BYTES"
 # the rule that these ceilings are never fixed numbers. This constant is only
 # the floor used before the first reply lands, and the cap on what a hub can
 # talk us into.
-HEARTBEAT_BODY_MAX = int(os.environ.get("TURMA_HEARTBEAT_BODY_MAX", str(24 << 20)))
+# Bounded on read: the derivation below divides by the margin, and a float
+# division of an absurd override raises at IMPORT — a process that will not
+# start rather than one that heartbeats badly. 1 GiB is far above any hub.
+HEARTBEAT_BODY_MAX = min(int(os.environ.get("TURMA_HEARTBEAT_BODY_MAX", str(24 << 20))),
+                         1 << 30)
 # How much of the hub's stated ceiling to actually use. A body AT the ceiling is
 # refused; the margin keeps the last beat before the cliff a 413 we can read
 # rather than a socket that dies unread.
