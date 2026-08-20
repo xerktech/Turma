@@ -1285,6 +1285,81 @@ out="$(run_case "$WORK/fx34" \
 expect "manager still starts" "0" "$(field "$out" uid)"
 expect "the config was written anyway" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
 
+# --- Case 35: /root/.kube ITSELF as a symlink is refused (XERK-369) ---------
+# One level up from case 32, and reachable by any session: the identity block
+# chowns /root to the run-as identity, so a session can replace the whole
+# directory. `mkdir -p` succeeds on a symlink to a directory, and then the
+# staging clear-out deletes inside the session's chosen target and the config
+# lands there root-owned. QA measured both. Unlike `.turma-tmp`, this path is
+# plausibly an operator's own redirect, so it is REFUSED rather than cleared.
+echo "== case: /root/.kube as a symlink is refused, not written through"
+make_fixture "$WORK/fx35" 0 0
+mkdir -p "$WORK/fx35/sa"
+printf 'not-a-real-token\n' > "$WORK/fx35/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx35/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx35/sa/namespace"
+docker run --rm -v "$WORK/fx35:/f" busybox sh -c \
+  'mkdir -p /f/repos/target/.turma-tmp
+   touch /f/repos/target/a /f/repos/target/b /f/repos/target/.turma-tmp/inner' >/dev/null
+out="$(RUN_CASE_SH='ln -s /f/repos/target /root/.kube; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx35" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx35/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "no config was written into the target" "0" \
+  "$(docker run --rm -v "$WORK/fx35:/f" busybox sh -c 'test -e /f/repos/target/config && echo 1 || echo 0')"
+expect "and the target's own staging dir was not deleted" "1" \
+  "$(docker run --rm -v "$WORK/fx35:/f" busybox sh -c 'test -e /f/repos/target/.turma-tmp/inner && echo 1 || echo 0')"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: /root/.kube is a symlink — refusing"; then
+  echo "  ok: refused, and said why"
+else
+  echo "  FAIL: no refusal line: $(echo "$out" | grep -E 'kubectl:' || echo none)"; FAILED=1
+fi
+
+# --- Case 36: a failed stage leaves nothing behind (XERK-369) --------------
+# The `mkdir` can succeed and only the `mktemp` fail, which is the one exit of
+# the three that did NOT clear up while three comments claimed all of them did.
+# Removing mktemp from PATH is the only way to reach it.
+echo "== case: a failed stage leaves no staging directory"
+make_fixture "$WORK/fx36" 0 0
+mkdir -p "$WORK/fx36/sa" "$WORK/fx36/kube"
+printf 'not-a-real-token\n' > "$WORK/fx36/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx36/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx36/sa/namespace"
+out="$(RUN_CASE_SH='rm -f /usr/bin/mktemp /bin/mktemp; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx36" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx36/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx36/kube:/root/.kube")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "nothing was staged" "gone" "$(field "$out" KUBECFG_TMPDIR)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: cannot write /root/.kube/config"; then
+  echo "  ok: reported and carried on"
+else
+  echo "  FAIL: no 'cannot write' line: $(echo "$out" | grep -E 'kubectl:' || echo none)"; FAILED=1
+fi
+
+# --- Case 37: the ownership fix-up is the FILE, not the tree (XERK-369) ----
+# A dropped session has to read the config we just wrote, and that is all the
+# `chown` is for. `-R` also re-homes the operator's own material — and the
+# identity self-heal has already re-owned everything root-owned under
+# /root/.kube earlier in the same boot, so `-R` adds nothing but that damage.
+# The probe file is owned by a THIRD uid, which the self-heal deliberately skips
+# (it only touches uid 0), so it isolates what this chown does.
+echo "== case: the kubeconfig chown does not re-home the operator's files"
+make_fixture "$WORK/fx37" 1000 1000
+mkdir -p "$WORK/fx37/sa" "$WORK/fx37/kube"
+printf 'not-a-real-token\n' > "$WORK/fx37/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx37/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx37/sa/namespace"
+docker run --rm -v "$WORK/fx37/kube:/k" busybox sh -c \
+  'touch /k/admin.conf && chown 2000:2000 /k/admin.conf' >/dev/null
+out="$(run_case "$WORK/fx37" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx37/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx37/kube:/root/.kube")"
+expect "the config is readable by the session" "1000:1000" "$(field "$out" KUBECFG_OWNER)"
+expect "the operator's own file keeps its owner" "2000:2000" \
+  "$(docker run --rm -v "$WORK/fx37/kube:/k" busybox stat -c '%u:%g' /k/admin.conf)"
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi
 exit "$FAILED"

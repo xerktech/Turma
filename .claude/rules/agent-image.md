@@ -144,8 +144,8 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     bool, a number or null, so an unquoted `namespace:` yields a config kubectl refuses to LOAD —
     every call in the pod dies at config load while the same pod with no kubeconfig authenticates
     fine. Those names are all `[a-z0-9-]`, so no character filter catches it.
-  - The temp file is `mktemp` in a staging directory of its own (`~/.kube/.turma-tmp`, removed on
-    every exit), not a name beside the operator's things. `mktemp` gives 0600 before anything is
+  - The temp file is `mktemp` in a staging directory of its own (`~/.kube/.turma-tmp`, cleared on
+    every exit from the write), not a name beside the operator's things. `mktemp` gives 0600 before anything is
     written, so the mode is never a race and no `umask` is touched — a bare `umask 077 … umask 022`
     pair leaks a hardcoded 022 into the manager and every session.
   - **Clearing that directory is `rm -rf` on the PATH, never a glob inside it, and the `mkdir` after
@@ -154,9 +154,19 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     `.config.backup`), and `mkdir -p` + `rm -f "$dir"/*` followed a SYMLINK planted at `.turma-tmp`
     and emptied its target as root while the boot logged success. `rm -rf` on a symlink unlinks the
     LINK without traversing; a bare `mkdir` then refuses anything that raced back into the path.
-  - **`~/.kube` is NOT ours, even in a pod.** The `chown -R` hands it to the run-as identity, so any
-    session can create anything at any path under it — including at `.turma-tmp`. Never write code
-    here that assumes otherwise. Tests: the symlink, leftover-directory and regular-file cases.
+  - **`~/.kube` is NOT ours, even in a pod, and `~/.kube` ITSELF can be a session's symlink.** What
+    re-owns it is the identity self-heal, which chowns every root-owned path under it on every
+    drop-priv boot whether the kubeconfig block runs or not — and `/root` is chowned there too, so a
+    session can replace the whole directory. Do not attribute that to the block's own `chown`
+    (a narrowing there would look like it closed the hole and would not). The block refuses outright
+    when `/root/.kube` is a symlink, because `mkdir -p` succeeds on one and everything after would
+    then delete and write inside a directory the session chose. Never write code here that assumes
+    otherwise. Tests: the `/root/.kube`-symlink, `.turma-tmp`-symlink, leftover-directory and
+    regular-file cases.
+  - **That block's own `chown` is the FILE, not the tree.** `-R` re-homes the operator's own
+    material in `~/.kube` (measured: `admin.conf`, `ca.crt`, a nested `subdir/deep.conf`), and adds
+    nothing the self-heal has not already done — its only job is letting a dropped session read the
+    config that was written after the self-heal ran.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
     see. Nothing in it touches the process `umask` — see the `mktemp` note above for why it does
