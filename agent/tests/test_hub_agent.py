@@ -15453,6 +15453,74 @@ class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("no push has completed", lines[0])
 
+    def test_a_wedged_pass_is_reported_even_with_nothing_left_to_stage(self):
+        """The stall check runs BEFORE the `archiveHave` gate. A wedged pass is
+        the WORKER's state, not this reply's: gating the one line that reports it
+        on the hub still asking for deltas left a host whose manifest emptied
+        mid-wedge silent forever (XERK-395 QA pass 3)."""
+        sm = self.make_manager()
+        wedged = threading.Event()
+        release = threading.Event()
+        lines = []
+
+        def never_returns(*a, **k):
+            wedged.set()
+            release.wait(10)
+
+        with mock.patch.object(ha, "ARCHIVE_PASS_STALL_SEC", 0), \
+                mock.patch.object(sm, "_archive_deltas", never_returns), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(wedged.wait(5))
+            with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+                # Every later beat carries no manifest, so no cursors come back.
+                sm.queue_archive_sync({})
+            release.set()
+
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("no push has completed", lines[0])
+
+    def test_the_worker_seeds_progress_when_a_pass_starts(self):
+        """Without that seed `_archive_progress_at` is still its initial value,
+        so the first wedged pass reports "running 0s and no push has completed in
+        <the machine's uptime>" — the pass-2 false positive in an absurd form,
+        and invisible to a test that seeds the field itself (QA pass 3 D7)."""
+        sm = self.make_manager()
+        wedged = threading.Event()
+        release = threading.Event()
+        lines = []
+
+        def never_returns(*a, **k):
+            wedged.set()
+            release.wait(10)
+
+        # The REAL threshold: the seed is what keeps a just-started pass under it.
+        with mock.patch.object(sm, "_archive_deltas", never_returns), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(wedged.wait(5))
+            with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+                sm.queue_archive_sync({"archiveHave": {"t1": 2}})
+            release.set()
+
+        self.assertEqual(lines, [])
+
+    def test_the_first_wedge_is_never_throttled_away(self):
+        """The throttle is a monotonic delta, and CLOCK_MONOTONIC is the host's
+        uptime — in a container, a host that may have booted minutes ago. With a
+        0 sentinel the first wedge on such a host is suppressed for up to an
+        hour, which is the one report that matters most (QA pass 3 D8)."""
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha.time, "monotonic", return_value=320.0), \
+                mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            with sm._archive_lock:
+                # A pass started 310s ago on a host up for barely five minutes.
+                sm._archive_pass_at = 10.0
+                sm._archive_progress_at = 10.0
+                sm._warn_if_archive_pass_stalled()
+        self.assertEqual(len(lines), 1, lines)
+
     def test_a_slow_but_progressing_pass_is_not_reported(self):
         """A pass is bounded in BYTES, not in time: ARCHIVE_MANIFEST_MAX is 200
         and every unsynced transcript costs at least one POST, so a first

@@ -46,10 +46,16 @@ paths:
     measures the LAST COMPLETED PUSH, never the pass's age. Timing the pass fired on exactly the
     healthy host this ticket is about, saying "no deltas are shipping" while 69 were.
   - Its reachability is as fragile as its logic: the worker stamping the pass, the push helpers
-    stamping each completion, and the beat calling the warn are three separate things, and dropping
-    any one leaves a wedged host permanently silent. All three are pinned END TO END, through a real
-    wedged pass, not by calling the warn with a hand-set stamp. Tests: `TestArchiveSyncWorker`,
-    `TestBeatLoopBudget`.
+    stamping each completion, the seed at pass start, the throttle sentinel starting a full window
+    in the past, and the beat calling the warn are all separate, and dropping any one leaves a
+    wedged host silent or a healthy one accused. Each is pinned END TO END, through a real wedged
+    pass, not by calling the warn with a hand-set stamp.
+  - **It runs BEFORE the `archiveHave` gate**, because a wedged pass is the WORKER's state and not
+    the reply's: behind that gate, a host whose manifest emptied mid-wedge was silent forever.
+  - **A BLACKHOLED hub deliberately does not trip it**, and that is not a hole to close: every push
+    still returns (at its own timeout) and logs its own failure, which is the operator's signal
+    there. Only a peer that answers slowly enough to keep a socket alive is invisible otherwise.
+    Tests: `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,

@@ -14860,16 +14860,20 @@ class SessionManager:
         moved past.
 
         No `archiveHave` means a hub too old to ask for an archive at all, which
-        is the same nothing-to-do the inline call read it as."""
-        if not reply.get("archiveHave"):
-            return
-        job = {
-            "have": reply["archiveHave"],
-            "shed": reply.get("archiveShed"),
-            "full": bool(reply.get("archiveFull")),
-            "rawHave": reply.get("archiveRawHave"),
-            "rawSkip": reply.get("archiveRawSkip"),
-        }
+        is the same nothing-to-do the inline call read it as — but the stall
+        check runs BEFORE that gate: a pass wedged on a socket is the worker's
+        state, not this reply's, and gating the one line that reports it on the
+        hub still asking for deltas made a host whose manifest emptied mid-wedge
+        silent forever (XERK-395 QA pass 3)."""
+        job = None
+        if reply.get("archiveHave"):
+            job = {
+                "have": reply["archiveHave"],
+                "shed": reply.get("archiveShed"),
+                "full": bool(reply.get("archiveFull")),
+                "rawHave": reply.get("archiveRawHave"),
+                "rawSkip": reply.get("archiveRawSkip"),
+            }
         # NOTHING here may raise onto the beat loop. This runs OUTSIDE a try in
         # run_forever, where the inline passes it replaced ran inside one, and
         # the beat loop is the container's main process (entrypoint.sh `exec`s
@@ -14880,8 +14884,10 @@ class SessionManager:
         # _archive_worker, whose is_alive() is False, so the next beat retries.
         try:
             with self._archive_lock:
-                self._archive_job = job
                 self._warn_if_archive_pass_stalled()
+                if job is None:
+                    return
+                self._archive_job = job
                 worker = self._archive_worker
                 if worker is None or not worker.is_alive():
                     worker = threading.Thread(
