@@ -603,6 +603,27 @@ kube_config_is_ours() {
   [ "$(head -n 1 /root/.kube/config 2>/dev/null)" = "$KUBE_GEN_MARK" ]
 }
 
+# Hand /root/.kube to the run-as identity, but only if THIS boot created it.
+#
+# Called straight after the `mkdir`, not from the success branch, because the
+# two failure exits create the directory just the same — and a created
+# directory left root-owned costs a dropped session every `kubectl config`
+# mutation and its whole discovery cache while the config file itself reads
+# fine. Anything that was already there the identity self-heal has handled.
+#
+# Always returns 0: it sits in the `&&` chain that decides whether the write can
+# proceed, and a chown that could not run is not a reason to skip the config.
+#
+# `-h` so a symlink that appeared at this path since the `-L` guard above gets
+# ITSELF chowned rather than whatever it points at — `chown` follows a symlink
+# argument, so without it a won race re-owns a directory somebody else picked.
+kube_own_dir() {
+  if [ "$KUBE_DIR_MADE" = "yes" ] && [ "$DROP_PRIV" = "yes" ]; then
+    chown -h "$PUID:$PGID" /root/.kube 2>/dev/null || true
+  fi
+  return 0
+}
+
 # Write the config to $1. A function so the heredoc can sit in an `if` and a
 # failed write is a return code rather than a dead container.
 #
@@ -706,7 +727,7 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
   # top of this file skips paths that do not exist yet, so a directory this
   # block creates is the one case it never re-owns — see the `chown` below.
   elif ! { if [ -d /root/.kube ]; then KUBE_DIR_MADE=no; else KUBE_DIR_MADE=yes; fi
-           mkdir -p /root/.kube 2>/dev/null; }; then
+           mkdir -p /root/.kube 2>/dev/null && kube_own_dir; }; then
     echo "[entrypoint] ${KUBE_CLI}: cannot create /root/.kube — leaving the credential to client-go's own in-cluster fallback"
   # `mktemp`, not a fixed `config.new`: it creates the file 0600 before anything
   # is written — so the mode is never a race and no `umask` is touched, which is
@@ -752,23 +773,13 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
       # re-creates it.
       rm -rf "$KUBE_TMPDIR" 2>/dev/null || true
       if [ "$DROP_PRIV" = "yes" ]; then
-        # THE FILE, plus the DIRECTORY only when this block created it. Never
-        # `-R`: that re-homes the operator's own material — QA measured
-        # `admin.conf`, `ca.crt` and a nested `subdir/deep.conf` changing owner
-        # — and for everything that was already there the identity self-heal has
-        # done the job earlier in the same boot.
-        #
-        # But the self-heal skips paths that DO NOT EXIST, and this block runs
-        # long after it, so a `/root/.kube` we just made is the one thing it
-        # never reaches. Left root-owned, a dropped session can read the config
-        # and nothing else: `kubectl config set-context` fails on `config.lock`,
-        # and kubectl silently gets no `~/.kube/cache` at all. Measured — and
-        # only repaired on the NEXT boot, which on an ephemeral root filesystem
-        # never comes.
-        if [ "$KUBE_DIR_MADE" = "yes" ]; then
-          chown "$PUID:$PGID" /root/.kube 2>/dev/null || true
-        fi
-        chown "$PUID:$PGID" /root/.kube/config 2>/dev/null || true
+        # THE FILE we just wrote, and only it. Never `-R`: that re-homes the
+        # operator's own material — QA measured `admin.conf`, `ca.crt` and a
+        # nested `subdir/deep.conf` changing owner — and everything that was
+        # already there the identity self-heal handled earlier in the same boot.
+        # The directory, when this boot created it, is `kube_own_dir`'s job and
+        # has already happened.
+        chown -h "$PUID:$PGID" /root/.kube/config 2>/dev/null || true
       fi
       KUBE_FROM_SA=yes
       echo "[entrypoint] ${KUBE_CLI}: in-cluster ServiceAccount credential (ns ${KUBE_NS})"

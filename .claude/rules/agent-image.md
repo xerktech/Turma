@@ -171,8 +171,12 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     before this block, so a `~/.kube` created here is the one directory it never reaches: left
     root-owned, a dropped session can read the config and nothing else — `kubectl config
     set-context` fails on `config.lock` and kubectl gets no `~/.kube/cache` at all, while every
-    assertion about the FILE still passes. Tests: the created-directory and mounted-directory cases,
-    whose probes are uid 2000 because the self-heal would re-own a root-owned one first.
+    assertion about the FILE still passes.
+  - **The hand-over happens where the directory is CREATED, not where the write succeeds** — both
+    failure exits create it too, and a fix that lived in the success branch left them with the same
+    root-owned directory. Tests: one case per exit. The MOUNTED-directory case's probes are uid
+    2000, not root, because the self-heal re-owns a root-owned probe first and the assertion then
+    cannot tell "chown only what we made" from "chown unconditionally" apart.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
     see. Nothing in it touches the process `umask` — see the `mktemp` note above for why it does

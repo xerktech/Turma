@@ -1421,6 +1421,30 @@ expect "manager uid" "1500" "$(field "$out" uid)"
 expect "the config is the session's" "1500:1500" "$(field "$out" KUBECFG_OWNER)"
 expect "and so is the directory it sits in" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
 
+# --- Case 40: a created ~/.kube is handed over even when the write fails ----
+# Case 39 covers the success exit. The two FAILURE exits create the directory
+# just the same, and the harm is identical: a dropped session can read the
+# config it does not have and write nothing — no `kubectl config` mutation, no
+# discovery cache — repaired only on the next boot, which on an ephemeral root
+# filesystem never comes. So the hand-over belongs where the directory is
+# created, not where the write succeeds.
+#
+# Note the fixture: 1500, and NO /root/.kube mount. Case 38 uses a root fixture,
+# so `DROP_PRIV` is `no` there and the ownership question never arises — which
+# is exactly why it could not catch this.
+echo "== case: a created ~/.kube is handed over even when the write fails"
+make_fixture "$WORK/fx40" 1500 1500
+mkdir -p "$WORK/fx40/sa"
+printf 'not-a-real-token\n' > "$WORK/fx40/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx40/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx40/sa/namespace"
+out="$(RUN_CASE_SH='rm -f /usr/bin/mktemp /bin/mktemp; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx40" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx40/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "manager uid" "1500" "$(field "$out" uid)"
+expect "no config was written" "none" "$(field "$out" KUBECFG_MODE)"
+expect "but the directory is still the session's" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi
 exit "$FAILED"
