@@ -144,13 +144,19 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     bool, a number or null, so an unquoted `namespace:` yields a config kubectl refuses to LOAD —
     every call in the pod dies at config load while the same pod with no kubeconfig authenticates
     fine. Those names are all `[a-z0-9-]`, so no character filter catches it.
-  - The temp file is `mktemp` in a **subdirectory of our own** (`~/.kube/.turma-tmp`, `rmdir`ed on
-    the happy path), not a name beside the operator's things. `mktemp` gives 0600 before anything is
+  - The temp file is `mktemp` in a staging directory of its own (`~/.kube/.turma-tmp`, removed on
+    every exit), not a name beside the operator's things. `mktemp` gives 0600 before anything is
     written, so the mode is never a race and no `umask` is touched — a bare `umask 077 … umask 022`
-    pair leaks a hardcoded 022 into the manager and every session. **Sweeping the leftovers is what
-    forces the subdirectory**: a unique name is not self-limiting, and a glob over `~/.kube` to
-    clean it deletes whatever else fits — QA measured `.config.backup` and `.config.2026-0`
-    destroyed, a wider hazard than the one fixed name this replaced.
+    pair leaks a hardcoded 022 into the manager and every session.
+  - **Clearing that directory is `rm -rf` on the PATH, never a glob inside it, and the `mkdir` after
+    it must not be `-p`.** Two earlier shapes were each worse than the leftovers they cleaned:
+    `rm -f ~/.kube/.config.??????` deleted operator files whose names fit (QA destroyed a planted
+    `.config.backup`), and `mkdir -p` + `rm -f "$dir"/*` followed a SYMLINK planted at `.turma-tmp`
+    and emptied its target as root while the boot logged success. `rm -rf` on a symlink unlinks the
+    LINK without traversing; a bare `mkdir` then refuses anything that raced back into the path.
+  - **`~/.kube` is NOT ours, even in a pod.** The `chown -R` hands it to the run-as identity, so any
+    session can create anything at any path under it — including at `.turma-tmp`. Never write code
+    here that assumes otherwise. Tests: the symlink, leftover-directory and regular-file cases.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
     see. Nothing in it touches the process `umask` — see the `mktemp` note above for why it does

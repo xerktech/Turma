@@ -85,9 +85,15 @@ echo "KUBECFG_QUOTED=$(grep -cE '^ +(server|certificate-authority|tokenFile|name
 # and the `mv` leaves one — and in a pod /root is a persistent volume nothing
 # else sweeps, so they accumulate for the life of the agent.
 echo "KUBECFG_STRAYS=$(find /root/.kube/.turma-tmp -maxdepth 1 -type f 2>/dev/null | wc -l)"
-# Everything in /root/.kube that is NOT ours. The sweep must not have touched
-# any of it, and the temp directory must be gone on a clean boot.
-echo "KUBECFG_NEIGHBOURS=$(find /root/.kube -maxdepth 1 -type f -name '.config.*' 2>/dev/null | wc -l)"
+# Everything in /root/.kube that is NOT the kubeconfig. A real ~/.kube is mostly
+# NON-hidden — admin.conf, kubeconfig-prod.yaml, ca.crt — so counting only
+# `.config.*` missed the widening a sweep is most likely to get: QA proved a
+# sweep of `/root/.kube/*` passed the narrower assertion clean.
+echo "KUBECFG_NEIGHBOURS=$(find /root/.kube -maxdepth 1 -type f ! -name config 2>/dev/null | wc -l)"
+# Whether the staging directory survived. A clean boot must leave NOTHING —
+# both the code and .claude/rules/agent-image.md state that as fact, and until
+# now nothing checked it.
+echo "KUBECFG_TMPDIR=$([ -e /root/.kube/.turma-tmp ] && echo present || echo gone)"
 # Configurable lifetime: the manager is PID 1, so how long IT lives is how long
 # the container lives — the tunnel-supervision case needs a few seconds.
 sleep "${STUB_MANAGER_SLEEP:-1}"
@@ -1166,6 +1172,18 @@ else
   echo "  FAIL: helm-only image said nothing about mounted creds: $(echo "$out" | grep -E 'kubectl:|helm:' || echo none)"; FAILED=1
 fi
 
+# BOTH branches of that line, not just one: hardcoding `kubectl` in the no-creds
+# half passed while the gate and the mounted half were pinned, which puts the
+# name of a CLI the image does not ship back in the log.
+echo "== case: and names itself in the no-creds line too"
+out="$(RUN_CASE_SH='rm -f /usr/local/bin/kubectl; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx30")"
+if echo "$out" | grep -q "\[entrypoint\] helm: installed; no creds on this device"; then
+  echo "  ok: reported under helm"
+else
+  echo "  FAIL: wrong CLI in the no-creds line: $(echo "$out" | grep -E 'kubectl:|helm:' || echo none)"; FAILED=1
+fi
+
 # --- Case 31: the temp sweep is ours, and ONLY ours (XERK-369) --------------
 # The write goes through `mktemp`, which — unlike the fixed `config.new` it
 # replaced — is not self-limiting: a crash between the mktemp and the mv leaves
@@ -1188,17 +1206,84 @@ printf 'turma\n' > "$WORK/fx31/sa/namespace"
 : > "$WORK/fx31/kube/.turma-tmp/config.aB3xYz"
 : > "$WORK/fx31/kube/.turma-tmp/config.qQ9zPl"
 # What an operator plausibly keeps beside their kubeconfig. None of these is
-# ours and none may be touched — the first two are the exact names QA destroyed.
+# ours and none may be touched. The first two are the exact names QA destroyed
+# with the original glob; the last three are NON-hidden, which is what a real
+# ~/.kube mostly contains and what the first version of this assertion missed.
 : > "$WORK/fx31/kube/.config.backup"
 : > "$WORK/fx31/kube/.config.2026-0"
 : > "$WORK/fx31/kube/.config.bak"
+: > "$WORK/fx31/kube/admin.conf"
+: > "$WORK/fx31/kube/kubeconfig-prod.yaml"
+: > "$WORK/fx31/kube/ca.crt"
 out="$(run_case "$WORK/fx31" \
   -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
   -v "$WORK/fx31/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
   -v "$WORK/fx31/kube:/root/.kube")"
 expect "the config was still written" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
 expect "our own strays are gone" "0" "$(field "$out" KUBECFG_STRAYS)"
-expect "and the operator's files are all still there" "3" "$(field "$out" KUBECFG_NEIGHBOURS)"
+expect "and the operator's files are all still there" "6" "$(field "$out" KUBECFG_NEIGHBOURS)"
+expect "and the staging directory with them" "gone" "$(field "$out" KUBECFG_TMPDIR)"
+
+# --- Case 32: a symlink at the staging path is not followed (XERK-369) ------
+# THE ONE THAT MATTERS MOST IN THIS BLOCK. `mkdir -p` succeeds on a symlink to a
+# directory, so a sweep of `$KUBE_TMPDIR/*` globs THROUGH it and root empties
+# whatever it points at, with the boot still reporting success. And the planter
+# needs no privilege: the happy path `chown -R`s /root/.kube to the run-as
+# identity, so any session on the host can create this. QA emptied a mounted
+# repo that way. `rm -rf` on the path unlinks the LINK and never traverses.
+echo "== case: a symlink at .turma-tmp does not get its target emptied"
+make_fixture "$WORK/fx32" 0 0
+mkdir -p "$WORK/fx32/sa" "$WORK/fx32/kube"
+printf 'not-a-real-token\n' > "$WORK/fx32/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx32/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx32/sa/namespace"
+# The target: three files in the mounted git root, which is the most valuable
+# thing reachable from that directory and the one QA actually destroyed.
+docker run --rm -v "$WORK/fx32:/f" busybox sh -c \
+  'mkdir -p /f/repos/precious && touch /f/repos/precious/a /f/repos/precious/b /f/repos/precious/c
+   ln -s /f/repos/precious /f/kube/.turma-tmp' >/dev/null
+out="$(run_case "$WORK/fx32" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx32/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx32/kube:/root/.kube")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "the symlink's target is untouched" "3" \
+  "$(docker run --rm -v "$WORK/fx32:/f" busybox sh -c 'ls /f/repos/precious 2>/dev/null | wc -l' | tr -d ' ')"
+expect "and the config was still written" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+
+# --- Case 33: leftovers do not disable generation forever (XERK-369) --------
+# `rm -f dir/*` returns non-zero on a subdirectory, so ONE stray directory in
+# the staging path failed the whole write condition — and kept failing it on
+# every later boot, permanently, while leaving the staging directory behind.
+# It failed safe, which is exactly why it would never have been noticed.
+echo "== case: a leftover directory in the staging path is cleared, not fatal"
+make_fixture "$WORK/fx33" 0 0
+mkdir -p "$WORK/fx33/sa" "$WORK/fx33/kube/.turma-tmp/leftover"
+printf 'not-a-real-token\n' > "$WORK/fx33/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx33/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx33/sa/namespace"
+: > "$WORK/fx33/kube/.turma-tmp/leftover/deep"
+out="$(run_case "$WORK/fx33" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx33/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx33/kube:/root/.kube")"
+expect "the config was written anyway" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+expect "and the staging directory is gone" "gone" "$(field "$out" KUBECFG_TMPDIR)"
+
+# --- Case 34: a regular file at the staging path is cleared (XERK-369) ------
+echo "== case: a regular file at .turma-tmp is cleared, not fatal"
+make_fixture "$WORK/fx34" 0 0
+mkdir -p "$WORK/fx34/sa" "$WORK/fx34/kube"
+printf 'not-a-real-token\n' > "$WORK/fx34/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx34/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx34/sa/namespace"
+printf 'not a directory\n' > "$WORK/fx34/kube/.turma-tmp"
+out="$(run_case "$WORK/fx34" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx34/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx34/kube:/root/.kube")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "the config was written anyway" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi
