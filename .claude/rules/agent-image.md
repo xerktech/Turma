@@ -111,8 +111,9 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     shaped credentials against infrastructure this fleet owns, and a version tag can be re-pointed
     at a new artifact by whoever controls the release. Refresh from the publishers' checksum files
     (URLs are in the Dockerfile comment) in the same commit as the version bump.
-  - Creds are the host's, optional, and log-only exactly like the cloud stores: `/root/.kube/config`,
-    `/root/.talos/config`, `/root/.config/omni/config`, all `permissions.deny`-protected. **A
+  - Creds are the host's, optional, and log-only exactly like the cloud stores:
+    `/root/.kube/config`, `/root/.talos/config`, `/root/.config/omni/config`, all
+    `permissions.deny`-protected. **A
     `~/.talos/config` that EXISTS may still hold no context** — `talosctl` writes one just by being
     run, and truenas's is `context: ""` — so the preflight's line means a store is there, never that
     it works.
@@ -145,8 +146,9 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     every call in the pod dies at config load while the same pod with no kubeconfig authenticates
     fine. Those names are all `[a-z0-9-]`, so no character filter catches it.
   - The temp file is `mktemp` in a staging directory of its own (`~/.kube/.turma-tmp`, cleared on
-    every exit from the write), not a name beside the operator's things. `mktemp` gives 0600 before anything is
-    written, so the mode is never a race and no `umask` is touched — a bare `umask 077 … umask 022`
+    every exit from the write), not a name beside the operator's things. `mktemp` gives 0600
+    before anything is written, so the mode is never a race and no `umask` is touched — a bare
+    `umask 077 … umask 022`
     pair leaks a hardcoded 022 into the manager and every session.
   - **Clearing that directory is `rm -rf` on the PATH, never a glob inside it, and the `mkdir` after
     it must not be `-p`.** Two earlier shapes were each worse than the leftovers they cleaned:
@@ -163,10 +165,14 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     then delete and write inside a directory the session chose. Never write code here that assumes
     otherwise. Tests: the `/root/.kube`-symlink, `.turma-tmp`-symlink, leftover-directory and
     regular-file cases.
-  - **That block's own `chown` is the FILE, not the tree.** `-R` re-homes the operator's own
-    material in `~/.kube` (measured: `admin.conf`, `ca.crt`, a nested `subdir/deep.conf`), and adds
-    nothing the self-heal has not already done — its only job is letting a dropped session read the
-    config that was written after the self-heal ran.
+  - **That block's own `chown` is the FILE, plus the DIRECTORY only when the block created it —
+    never `-R`.** `-R` re-homes the operator's own material (measured: `admin.conf`, `ca.crt`, a
+    nested `subdir/deep.conf`). But the self-heal skips paths that do not exist yet and runs long
+    before this block, so a `~/.kube` created here is the one directory it never reaches: left
+    root-owned, a dropped session can read the config and nothing else — `kubectl config
+    set-context` fails on `config.lock` and kubectl gets no `~/.kube/cache` at all, while every
+    assertion about the FILE still passes. Tests: the created-directory and mounted-directory cases,
+    whose probes are uid 2000 because the self-heal would re-own a root-owned one first.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
     see. Nothing in it touches the process `umask` — see the `mktemp` note above for why it does

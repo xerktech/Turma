@@ -67,6 +67,10 @@ echo "KUBECFG_TOKENFILE=$(sed -n 's/^ *tokenFile: *"\?\([^"]*\)"\?$/\1/p' /root/
 echo "KUBECFG_NS=$(sed -n 's/^ *namespace: *"\?\([^"]*\)"\?$/\1/p' /root/.kube/config 2>/dev/null | head -1)"
 echo "KUBECFG_MODE=$(stat -c %a /root/.kube/config 2>/dev/null || echo none)"
 echo "KUBECFG_OWNER=$(stat -c '%u:%g' /root/.kube/config 2>/dev/null || echo none)"
+# The DIRECTORY's owner. A session that cannot write it gets no `kubectl config`
+# mutation and no discovery cache, while the config file itself reads fine — so
+# the file's owner alone says nothing about whether kubectl works.
+echo "KUBEDIR_OWNER=$(stat -c '%u:%g' /root/.kube 2>/dev/null || echo none)"
 # The umask the manager INHERITED. The kubeconfig write must not change it: it
 # is the mode of every file every session on this host goes on to create.
 echo "MANAGER_UMASK=$(umask)"
@@ -89,7 +93,7 @@ echo "KUBECFG_STRAYS=$(find /root/.kube/.turma-tmp -maxdepth 1 -type f 2>/dev/nu
 # NON-hidden — admin.conf, kubeconfig-prod.yaml, ca.crt — so counting only
 # `.config.*` missed the widening a sweep is most likely to get: QA proved a
 # sweep of `/root/.kube/*` passed the narrower assertion clean.
-echo "KUBECFG_NEIGHBOURS=$(find /root/.kube -maxdepth 1 -type f ! -name config 2>/dev/null | wc -l)"
+echo "KUBECFG_NEIGHBOURS=$(find /root/.kube -maxdepth 1 -mindepth 1 ! -name config ! -name .turma-tmp 2>/dev/null | wc -l)"
 # Whether the staging directory survived. A clean boot must leave NOTHING —
 # both the code and .claude/rules/agent-image.md state that as fact, and until
 # now nothing checked it.
@@ -1207,30 +1211,38 @@ printf 'turma\n' > "$WORK/fx31/sa/namespace"
 : > "$WORK/fx31/kube/.turma-tmp/config.qQ9zPl"
 # What an operator plausibly keeps beside their kubeconfig. None of these is
 # ours and none may be touched. The first two are the exact names QA destroyed
-# with the original glob; the last three are NON-hidden, which is what a real
-# ~/.kube mostly contains and what the first version of this assertion missed.
+# with the original glob; the next three are NON-hidden, which is what a real
+# ~/.kube mostly contains and what the first version of this assertion missed;
+# and the last two are a DIRECTORY and a SYMLINK, because counting regular files
+# only let a sweep destroying either pass clean — and `cache/` is a directory
+# kubectl creates in there itself.
 : > "$WORK/fx31/kube/.config.backup"
 : > "$WORK/fx31/kube/.config.2026-0"
 : > "$WORK/fx31/kube/.config.bak"
 : > "$WORK/fx31/kube/admin.conf"
 : > "$WORK/fx31/kube/kubeconfig-prod.yaml"
 : > "$WORK/fx31/kube/ca.crt"
+mkdir -p "$WORK/fx31/kube/cache/discovery"
+docker run --rm -v "$WORK/fx31/kube:/k" busybox ln -s /k/admin.conf /k/prod-link >/dev/null
 out="$(run_case "$WORK/fx31" \
   -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
   -v "$WORK/fx31/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
   -v "$WORK/fx31/kube:/root/.kube")"
 expect "the config was still written" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
 expect "our own strays are gone" "0" "$(field "$out" KUBECFG_STRAYS)"
-expect "and the operator's files are all still there" "6" "$(field "$out" KUBECFG_NEIGHBOURS)"
+expect "and the operator's files are all still there" "8" "$(field "$out" KUBECFG_NEIGHBOURS)"
 expect "and the staging directory with them" "gone" "$(field "$out" KUBECFG_TMPDIR)"
 
 # --- Case 32: a symlink at the staging path is not followed (XERK-369) ------
 # THE ONE THAT MATTERS MOST IN THIS BLOCK. `mkdir -p` succeeds on a symlink to a
 # directory, so a sweep of `$KUBE_TMPDIR/*` globs THROUGH it and root empties
 # whatever it points at, with the boot still reporting success. And the planter
-# needs no privilege: the happy path `chown -R`s /root/.kube to the run-as
-# identity, so any session on the host can create this. QA emptied a mounted
-# repo that way. `rm -rf` on the path unlinks the LINK and never traverses.
+# needs no privilege: the identity self-heal re-owns everything under
+# /root/.kube on every drop-priv boot and /root itself is chowned there too, so
+# any session on the host can create this. (It is NOT the kubeconfig block's own
+# `chown` that does it — believing that is what nearly let a narrowing of that
+# chown look like it closed this hole.) QA emptied a mounted repo that way.
+# `rm -rf` on the path unlinks the LINK and never traverses.
 echo "== case: a symlink at .turma-tmp does not get its target emptied"
 make_fixture "$WORK/fx32" 0 0
 mkdir -p "$WORK/fx32/sa" "$WORK/fx32/kube"
@@ -1351,7 +1363,7 @@ printf 'not-a-real-token\n' > "$WORK/fx37/sa/token"
 printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx37/sa/ca.crt"
 printf 'turma\n' > "$WORK/fx37/sa/namespace"
 docker run --rm -v "$WORK/fx37/kube:/k" busybox sh -c \
-  'touch /k/admin.conf && chown 2000:2000 /k/admin.conf' >/dev/null
+  'touch /k/admin.conf && chown 2000:2000 /k/admin.conf /k' >/dev/null
 out="$(run_case "$WORK/fx37" \
   -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
   -v "$WORK/fx37/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
@@ -1359,6 +1371,55 @@ out="$(run_case "$WORK/fx37" \
 expect "the config is readable by the session" "1000:1000" "$(field "$out" KUBECFG_OWNER)"
 expect "the operator's own file keeps its owner" "2000:2000" \
   "$(docker run --rm -v "$WORK/fx37/kube:/k" busybox stat -c '%u:%g' /k/admin.conf)"
+# ...and the directory itself is left alone, because this block did not create
+# it. Case 39 is the other half: one it DID create must be handed over. Both
+# the directory and the probe file are uid 2000 for the same reason — the
+# identity self-heal re-owns anything root-owned under /root/.kube before this
+# block runs, so a root-owned probe could not tell the two rules apart.
+expect "and the mounted directory is not re-owned" "2000:2000" "$(field "$out" KUBEDIR_OWNER)"
+
+# --- Case 38: a failed replace leaves nothing behind (XERK-369) -------------
+# The last of the three exits from the write, and the one that looked
+# unreachable: `mv` is called unqualified and /usr/local/bin precedes /bin, so a
+# stub that fails for this destination alone reaches the branch without
+# disturbing anything else that moves a file.
+echo "== case: a failed replace leaves no staging directory"
+make_fixture "$WORK/fx38" 0 0
+mkdir -p "$WORK/fx38/sa" "$WORK/fx38/kube"
+printf 'not-a-real-token\n' > "$WORK/fx38/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx38/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx38/sa/namespace"
+out="$(RUN_CASE_SH='printf "#!/bin/sh\nfor a in \"\$@\"; do [ \"\$a\" = /root/.kube/config ] && exit 1; done\nexec /bin/mv \"\$@\"\n" > /usr/local/bin/mv; chmod +x /usr/local/bin/mv; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx38" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx38/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx38/kube:/root/.kube")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "nothing was staged" "gone" "$(field "$out" KUBECFG_TMPDIR)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: cannot replace /root/.kube/config"; then
+  echo "  ok: reported and carried on"
+else
+  echo "  FAIL: no 'cannot replace' line: $(echo "$out" | grep -E 'kubectl:' || echo none)"; FAILED=1
+fi
+
+# --- Case 39: a ~/.kube this block CREATED is handed over (XERK-369) --------
+# The identity self-heal skips paths that do not exist, and it runs long before
+# this block — so a /root/.kube created here is the one directory it never
+# re-owns. Left root-owned, the session can read the config and nothing else:
+# `kubectl config set-context` fails on config.lock and kubectl gets no
+# discovery cache at all, while every assertion about the FILE still passes.
+# That is why the directory has an assertion of its own.
+echo "== case: a ~/.kube this block created is owned by the run-as user"
+make_fixture "$WORK/fx39" 1500 1500
+mkdir -p "$WORK/fx39/sa"
+printf 'not-a-real-token\n' > "$WORK/fx39/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx39/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx39/sa/namespace"
+out="$(run_case "$WORK/fx39" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx39/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "manager uid" "1500" "$(field "$out" uid)"
+expect "the config is the session's" "1500:1500" "$(field "$out" KUBECFG_OWNER)"
+expect "and so is the directory it sits in" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi

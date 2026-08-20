@@ -702,7 +702,11 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
     echo "[entrypoint] ${KUBE_CLI}: /root/.kube is a symlink — refusing to write through it, leaving the credential to client-go's own in-cluster fallback"
   elif [ -z "$KUBE_API_HOST" ]; then
     echo "[entrypoint] ${KUBE_CLI}: KUBERNETES_SERVICE_HOST is not a usable address — leaving the credential to client-go's own in-cluster fallback"
-  elif ! mkdir -p /root/.kube 2>/dev/null; then
+  # Whether /root/.kube is OURS to hand over. The identity self-heal near the
+  # top of this file skips paths that do not exist yet, so a directory this
+  # block creates is the one case it never re-owns — see the `chown` below.
+  elif ! { if [ -d /root/.kube ]; then KUBE_DIR_MADE=no; else KUBE_DIR_MADE=yes; fi
+           mkdir -p /root/.kube 2>/dev/null; }; then
     echo "[entrypoint] ${KUBE_CLI}: cannot create /root/.kube — leaving the credential to client-go's own in-cluster fallback"
   # `mktemp`, not a fixed `config.new`: it creates the file 0600 before anything
   # is written — so the mode is never a race and no `umask` is touched, which is
@@ -748,13 +752,22 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
       # re-creates it.
       rm -rf "$KUBE_TMPDIR" 2>/dev/null || true
       if [ "$DROP_PRIV" = "yes" ]; then
-        # THE FILE, not the tree. A dropped session has to be able to read what
-        # we just wrote, and that is all this is for: the identity self-heal
-        # above has already re-owned everything else under /root/.kube earlier
-        # in the same boot, so `-R` here adds nothing except re-homing the
-        # operator's own material — QA measured `admin.conf`, `ca.crt` and a
-        # nested `subdir/deep.conf` all changing owner. Non-root-owned files,
-        # which the self-heal deliberately skips, are the ones it took.
+        # THE FILE, plus the DIRECTORY only when this block created it. Never
+        # `-R`: that re-homes the operator's own material — QA measured
+        # `admin.conf`, `ca.crt` and a nested `subdir/deep.conf` changing owner
+        # — and for everything that was already there the identity self-heal has
+        # done the job earlier in the same boot.
+        #
+        # But the self-heal skips paths that DO NOT EXIST, and this block runs
+        # long after it, so a `/root/.kube` we just made is the one thing it
+        # never reaches. Left root-owned, a dropped session can read the config
+        # and nothing else: `kubectl config set-context` fails on `config.lock`,
+        # and kubectl silently gets no `~/.kube/cache` at all. Measured — and
+        # only repaired on the NEXT boot, which on an ephemeral root filesystem
+        # never comes.
+        if [ "$KUBE_DIR_MADE" = "yes" ]; then
+          chown "$PUID:$PGID" /root/.kube 2>/dev/null || true
+        fi
         chown "$PUID:$PGID" /root/.kube/config 2>/dev/null || true
       fi
       KUBE_FROM_SA=yes
