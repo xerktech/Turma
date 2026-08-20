@@ -15348,6 +15348,116 @@ class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(raw_calls, [{"a": 1}, {"b": 2}])
         self.assertTrue(sm._archive_worker.is_alive())
 
+    def test_a_job_staged_in_the_clear_window_is_not_lost(self):
+        """The wake must be CLEARED BEFORE the job is taken (XERK-395 QA D4).
+
+        Clearing after the take opens a window: the beat stores a job and sets
+        the wake, the worker's clear() then wipes that set, and the job sits with
+        nothing to wake anyone for it. Every other test here passes with the
+        clear moved — this is the one that fails, so it is the pin.
+
+        The window is forced by staging the second job from inside the worker's
+        own `clear()`, immediately AFTER the real clear runs. On the shipped
+        order the take is still ahead, so the job is picked up; with the clear
+        moved past the take, the job is stranded."""
+        sm = self.make_manager()
+        ran_staged = threading.Event()
+
+        def rendered(have, shed=None, full=False):
+            if have == {"t1": 99}:
+                ran_staged.set()
+
+        staged = []
+
+        class ClearHookEvent(threading.Event):
+            def clear(self):
+                # BEFORE the real clear, which is what puts the staged job
+                # exactly in the window: on the shipped order the take is still
+                # ahead of us and picks it up; with the clear moved past the
+                # take, this set is the one wiped and nothing is left to wake.
+                if not staged:
+                    staged.append(True)
+                    # The beat's own two steps, without the lock — this runs on
+                    # the worker thread, which may or may not hold it depending
+                    # on where clear() sits, and a test that can deadlock proves
+                    # nothing.
+                    sm._archive_job = {"have": {"t1": 99}, "shed": None,
+                                       "full": False, "rawHave": None,
+                                       "rawSkip": None}
+                    super().set()
+                super().clear()
+
+        sm._archive_wake = ClearHookEvent()
+        with mock.patch.object(sm, "_archive_deltas", rendered), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(ran_staged.wait(5),
+                            "the job staged during the clear window never ran")
+
+    def test_staging_never_raises_onto_the_beat(self):
+        """`queue_archive_sync` is called OUTSIDE a try in run_forever, where the
+        inline passes it replaced ran inside one, and the beat loop is the
+        container's main process — so an exception here takes the host and every
+        session down. `Thread.start()` raises RuntimeError at the pids limit
+        (XERK-395 QA D1)."""
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading, "Thread") as fake:
+            fake.return_value.start.side_effect = RuntimeError("can't start new thread")
+            fake.return_value.is_alive.return_value = False
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})   # must not raise
+
+        # The job stays staged and the dead thread's is_alive() is False, so the
+        # next beat simply tries again.
+        with sm._archive_lock:
+            self.assertEqual(sm._archive_job["have"], {"t1": 1})
+
+    def test_a_wedged_pass_is_reported(self):
+        """Off the beat a wedged pass is otherwise SILENT — beats stay on
+        cadence, the host stays online, and nothing ships (XERK-395 QA D3).
+        `urlopen`'s timeout is per socket operation, so a hub trickling bytes
+        never trips it."""
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            with sm._archive_lock:
+                sm._archive_pass_at = time.monotonic() - ha.ARCHIVE_PASS_STALL_SEC - 1
+                sm._warn_if_archive_pass_stalled()
+                # Throttled — the beat calls this every time it stages a job.
+                sm._warn_if_archive_pass_stalled()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("archive sync has been in one pass", lines[0])
+
+    def test_a_pass_within_its_design_budget_is_not_reported(self):
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            with sm._archive_lock:
+                sm._archive_pass_at = time.monotonic() - 10
+                sm._warn_if_archive_pass_stalled()
+                sm._archive_pass_at = None      # between passes
+                sm._warn_if_archive_pass_stalled()
+        self.assertEqual(lines, [])
+
+    def test_the_pass_stamp_is_cleared_even_when_the_pass_raises(self):
+        """A stamp left behind would report every later pass as wedged."""
+        sm = self.make_manager()
+        done = threading.Event()
+
+        def boom(*a, **k):
+            done.set()
+            raise RuntimeError("nope")
+
+        with mock.patch.object(sm, "_archive_sync_pass", boom):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(done.wait(5))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with sm._archive_lock:
+                if sm._archive_pass_at is None:
+                    return
+            time.sleep(0.01)
+        self.fail("the pass stamp was never cleared")
+
     def test_worker_is_daemon_and_reused(self):
         """One long-lived worker, not one per beat."""
         sm = self.make_manager()

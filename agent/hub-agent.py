@@ -269,6 +269,11 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # bounds its gunzip: a larger window is refused on every push, not truncated.
 ARCHIVE_RAW_CHUNK_BYTES = 1 << 22   # 4 MiB read per POST (~0.5-1 MiB gzipped)
 ARCHIVE_RAW_TIMEOUT_SEC = 30        # one raw-range POST (gzip + a bigger body)
+# A pass held this long is wedged, not slow: the two timeouts above bound one
+# by design at 15 + 3x30 = 105s, and urlopen's timeout is per SOCKET OPERATION,
+# so a hub trickling a byte at a time never trips it. Reported, not killed —
+# the socket cannot be closed from here, and the host is healthy either way.
+ARCHIVE_PASS_STALL_SEC = 300
 ARCHIVE_RAW_BEAT_BUDGET = 1 << 24   # ~16 MiB of raw bytes per sync pass
 # Files one transcript may offer, and across the whole manifest. A session's
 # directory holds one file per delegated agent and per overflowed tool result, so
@@ -10426,6 +10431,10 @@ class SessionManager:
         self._archive_job = None
         self._archive_wake = threading.Event()
         self._archive_worker = None
+        # Monotonic start of the pass in flight, None between passes, and the
+        # throttle for the line that reports one that is wedged.
+        self._archive_pass_at = None
+        self._archive_stall_logged_at = 0.0
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -14853,16 +14862,54 @@ class SessionManager:
             "rawHave": reply.get("archiveRawHave"),
             "rawSkip": reply.get("archiveRawSkip"),
         }
-        with self._archive_lock:
-            self._archive_job = job
-            worker = self._archive_worker
-            if worker is None or not worker.is_alive():
-                worker = threading.Thread(
-                    target=self._archive_worker_loop, name="archive-sync",
-                    daemon=True)
-                self._archive_worker = worker
-                worker.start()
-        self._archive_wake.set()
+        # NOTHING here may raise onto the beat loop. This runs OUTSIDE a try in
+        # run_forever, where the inline passes it replaced ran inside one, and
+        # the beat loop is the container's main process (entrypoint.sh `exec`s
+        # it with no retry) — so an exception here is not a skipped sync, it is
+        # the host and every session on it going down. `Thread.start()` raising
+        # RuntimeError at the pids_limit is the realistic way that happens. A
+        # failed start leaves the job staged and a never-started thread in
+        # _archive_worker, whose is_alive() is False, so the next beat retries.
+        try:
+            with self._archive_lock:
+                self._archive_job = job
+                self._warn_if_archive_pass_stalled()
+                worker = self._archive_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._archive_worker_loop, name="archive-sync",
+                        daemon=True)
+                    self._archive_worker = worker
+                    worker.start()
+            self._archive_wake.set()
+        except Exception as e:
+            log(f"archive sync could not be staged: {e}")
+
+    def _warn_if_archive_pass_stalled(self):
+        """Say so when the worker has been in ONE pass far longer than a pass can
+        take by design. Caller holds _archive_lock.
+
+        Off the beat, a wedged pass is SILENT: moving the passes here removed the
+        symptom that used to announce them (the beat stalling, the host going
+        offline), and `urlopen`'s timeout is per socket operation — a peer that
+        trickles one byte every few seconds never trips it, so a single push can
+        hold the worker forever while beats stay perfectly on cadence and no
+        delta ships. This line is the only thing that would tell an operator.
+        Throttled like the other periodic warns on this path."""
+        started = self._archive_pass_at
+        if started is None:
+            return
+        held = time.monotonic() - started
+        if held < ARCHIVE_PASS_STALL_SEC:
+            return
+        now = time.time()
+        if now - self._archive_stall_logged_at < 3600:
+            return
+        self._archive_stall_logged_at = now
+        log(f"archive sync has been in one pass for {int(held)}s, past the "
+            f"~{ARCHIVE_CHUNK_TIMEOUT_SEC + ARCHIVE_RAW_FAILURES_MAX * ARCHIVE_RAW_TIMEOUT_SEC}s "
+            f"one can take by design: the hub is answering slowly enough that no "
+            f"per-socket timeout fires. No deltas are shipping.")
 
     def _archive_worker_loop(self):
         """Run the newest staged pass, then wait for the next beat to stage one.
@@ -14889,6 +14936,10 @@ class SessionManager:
                 job, self._archive_job = self._archive_job, None
             if job is None:
                 continue
+            # Stamped under the lock the beat reads it under, so a pass wedged on
+            # a socket that never times out is visible rather than silent.
+            with self._archive_lock:
+                self._archive_pass_at = time.monotonic()
             try:
                 self._archive_sync_pass(job)
             except Exception as e:
@@ -14896,6 +14947,9 @@ class SessionManager:
                 # This is a worker's whole body, and an escape here would leave
                 # the host with no archive sync at all until it restarts.
                 log(f"archive sync worker: {e}")
+            finally:
+                with self._archive_lock:
+                    self._archive_pass_at = None
 
     def _archive_sync_pass(self, job):
         """One rendered pass, then one raw pass, off the same reply's cursors.

@@ -271,6 +271,11 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - Inline may cost `INTERVAL` plus the beat's own POSTs (`HEARTBEAT_TIMEOUT_SEC`, twice on a cycle
     that executed commands) — 40s of the 75s. Anything else with a network or disk worst case
     belongs on a worker. Tests: `TestBeatLoopBudget`, `TestArchiveSyncWorker`.
+  - **It is the rule for new work, and NOT yet true everywhere** — say so rather than reading it as
+    a description. Still inline and still over: `refresh_pr_status` (`PR_STATUS_MAX` x `run()`'s 15s
+    ≈ 300s), `refresh_jira` (measured at a 20s beat gap against a blackholed site), `refresh_github`
+    — all three in `build_payload` — and `_migration_upload` under `handle_commands` (~96s).
+    XERK-397 carries them. A fix there extends `TestBeatLoopBudget` rather than adding its own pin.
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.

@@ -414,8 +414,23 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   - `_archive_wake` is cleared BEFORE the job is taken, never after — the beat stores the job and
     only then sets it, so clearing afterwards drops a job staged mid-pass.
   - `self._archive_pending` is beat-written and worker-read with no lock, which is safe ONLY because
-    the beat REBINDS it and never mutates it in place; each pass snapshots it once. Tests:
-    `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
+    the beat REBINDS it and never mutates it in place; each pass snapshots it once.
+  - **`queue_archive_sync` may not raise.** The beat loop is the container's MAIN PROCESS
+    (`entrypoint.sh` `exec`s it, with no retry loop of its own), so an exception on it is not a
+    skipped cycle — it is the host and every session on it going down, and this is called outside
+    any try. Work moved OFF the beat must not leave a raise where the try/except it replaced stood:
+    `Thread.start()` at the `pids_limit` is the realistic one. `_start_limits_probe` still has that
+    shape (XERK-402).
+  - A pass whose cursors predate the previous pass's stores re-offers one chunk per transcript,
+    which the hub rejects at `startOffset !== have` **before storing anything** and answers with its
+    real cursor, which the pass jumps to. Wasted bytes, never a double-store. Only reachable while a
+    pass is still running a full manifest cadence later, i.e. wedged. **A remembered cursor is NOT
+    the fix**: one held across a hub whose archive was reset or evicted is ahead of the hub forever,
+    and that transcript then never ships again — silence is worse than one discarded chunk.
+  - **A wedged pass is otherwise SILENT** now that the beat no longer stalls behind it, and
+    `urlopen`'s timeout is per SOCKET OPERATION, so a hub trickling bytes never trips it. The beat
+    reports one held past `ARCHIVE_PASS_STALL_SEC` (`_warn_if_archive_pass_stalled`); that line is
+    the only signal there is. Tests: `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,
