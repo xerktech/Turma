@@ -70,7 +70,13 @@ echo "KUBECFG_OWNER=$(stat -c '%u:%g' /root/.kube/config 2>/dev/null || echo non
 # The DIRECTORY's owner. A session that cannot write it gets no `kubectl config`
 # mutation and no discovery cache, while the config file itself reads fine — so
 # the file's owner alone says nothing about whether kubectl works.
+# NOT `stat -L`: on a symlink shape this must report the LINK, because the
+# whole point of the `-h` on the chowns is that the link is what gets re-owned.
 echo "KUBEDIR_OWNER=$(stat -c '%u:%g' /root/.kube 2>/dev/null || echo none)"
+# The target of a symlink planted at /root/.kube by case 42's stub. Container-
+# local, because anything under REPOS_ROOT or ~/.claude is re-owned by the
+# identity self-heal before this block runs and could not stay root-owned.
+echo "VICTIM_OWNER=$(stat -c '%u:%g' /tmp/victim 2>/dev/null || echo none)"
 # The umask the manager INHERITED. The kubeconfig write must not change it: it
 # is the mode of every file every session on this host goes on to create.
 echo "MANAGER_UMASK=$(umask)"
@@ -1444,6 +1450,47 @@ out="$(RUN_CASE_SH='rm -f /usr/bin/mktemp /bin/mktemp; exec /usr/local/bin/entry
 expect "manager uid" "1500" "$(field "$out" uid)"
 expect "no config was written" "none" "$(field "$out" KUBECFG_MODE)"
 expect "but the directory is still the session's" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
+
+# --- Case 41: the replace exit hands the directory over too (XERK-369) ------
+# Case 38 reaches this exit but cannot see the hand-over: its fixture is
+# root-owned, so `DROP_PRIV` is `no` and the ownership question never arises.
+# This is the same exit with a dropped identity and no mounted ~/.kube — the
+# combination the whole hand-over rule is about.
+echo "== case: a created ~/.kube is handed over when the replace fails"
+make_fixture "$WORK/fx41" 1500 1500
+mkdir -p "$WORK/fx41/sa"
+printf 'not-a-real-token\n' > "$WORK/fx41/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx41/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx41/sa/namespace"
+out="$(RUN_CASE_SH='printf "#!/bin/sh\nfor a in \"\$@\"; do [ \"\$a\" = /root/.kube/config ] && exit 1; done\nexec /bin/mv \"\$@\"\n" > /usr/local/bin/mv; chmod +x /usr/local/bin/mv; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx41" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx41/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "manager uid" "1500" "$(field "$out" uid)"
+expect "no config was written" "none" "$(field "$out" KUBECFG_MODE)"
+expect "but the directory is still the session's" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
+
+# --- Case 42: the hand-over chown does not follow a symlink (XERK-369) ------
+# `chown` follows a symlink ARGUMENT, so a symlink appearing at /root/.kube
+# between the `-L` guard and the chown would have its TARGET re-owned — a
+# stronger primitive than anything else in this block, since the target is a
+# directory somebody else chose. `-h` chowns the link instead.
+#
+# The race is not winnable in practice (nothing runs as the session identity
+# during boot), so it is staged with a `mkdir` stub that plants the symlink at
+# exactly that moment. The point is to pin the `-h`: without it, both mutants
+# that drop it pass every other case in this suite.
+echo "== case: the hand-over chown does not follow a planted symlink"
+make_fixture "$WORK/fx42" 1500 1500
+mkdir -p "$WORK/fx42/sa"
+printf 'not-a-real-token\n' > "$WORK/fx42/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx42/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx42/sa/namespace"
+out="$(RUN_CASE_SH='printf "#!/bin/sh\nfor a in \"\$@\"; do if [ \"\$a\" = /root/.kube ]; then /bin/mkdir -p /tmp/victim && /bin/ln -s /tmp/victim /root/.kube && exit 0; fi; done\nexec /bin/mkdir \"\$@\"\n" > /usr/local/bin/mkdir; chmod +x /usr/local/bin/mkdir; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx42" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx42/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "manager still starts" "1500" "$(field "$out" uid)"
+expect "the link itself was re-owned" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
+expect "and its target was not" "0:0" "$(field "$out" VICTIM_OWNER)"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi

@@ -172,11 +172,18 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     root-owned, a dropped session can read the config and nothing else — `kubectl config
     set-context` fails on `config.lock` and kubectl gets no `~/.kube/cache` at all, while every
     assertion about the FILE still passes.
-  - **The hand-over happens where the directory is CREATED, not where the write succeeds** — both
-    failure exits create it too, and a fix that lived in the success branch left them with the same
-    root-owned directory. Tests: one case per exit. The MOUNTED-directory case's probes are uid
-    2000, not root, because the self-heal re-owns a root-owned probe first and the assertion then
-    cannot tell "chown only what we made" from "chown unconditionally" apart.
+  - **The hand-over happens where the directory is CREATED, not where the write succeeds** — all
+    three failure exits create it too, and a fix that lived in the success branch left them with the
+    same root-owned directory. Tests: the success exit and two of the three failure exits assert the
+    directory's owner; the write-fail exit is unreachable from the harness without stubbing `cat`,
+    and logs the same line as the stage-fail exit anyway. The MOUNTED-directory case's probes are
+    uid 2000, not root, because the self-heal re-owns a root-owned probe first and the assertion
+    then cannot tell "chown only what we made" from "chown unconditionally" apart.
+  - **Both chowns are `-h`.** `chown` follows a symlink argument, so without it a symlink appearing
+    at `/root/.kube` after the `-L` guard would have its TARGET re-owned. The race is not winnable
+    in practice — nothing running as the session identity exists during boot — but it is two
+    characters, and the self-heal uses `-h` for the same reason. It does not close the residual
+    guard TOCTOU: a won race still lands the config in the attacker's directory.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
     see. Nothing in it touches the process `umask` — see the `mktemp` note above for why it does

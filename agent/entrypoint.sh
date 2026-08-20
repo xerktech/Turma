@@ -606,7 +606,8 @@ kube_config_is_ours() {
 # Hand /root/.kube to the run-as identity, but only if THIS boot created it.
 #
 # Called straight after the `mkdir`, not from the success branch, because the
-# two failure exits create the directory just the same — and a created
+# THREE failure exits past it — stage-fail, write-fail, replace-fail — create
+# the directory just the same — and a created
 # directory left root-owned costs a dropped session every `kubectl config`
 # mutation and its whole discovery cache while the config file itself reads
 # fine. Anything that was already there the identity self-heal has handled.
@@ -725,7 +726,9 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
     echo "[entrypoint] ${KUBE_CLI}: KUBERNETES_SERVICE_HOST is not a usable address — leaving the credential to client-go's own in-cluster fallback"
   # Whether /root/.kube is OURS to hand over. The identity self-heal near the
   # top of this file skips paths that do not exist yet, so a directory this
-  # block creates is the one case it never re-owns — see the `chown` below.
+  # block creates is the one case it never re-owns — which is what
+  # `kube_own_dir`, on the next line, exists for. (The `chown` further down is
+  # the config FILE and deliberately not the directory.)
   elif ! { if [ -d /root/.kube ]; then KUBE_DIR_MADE=no; else KUBE_DIR_MADE=yes; fi
            mkdir -p /root/.kube 2>/dev/null && kube_own_dir; }; then
     echo "[entrypoint] ${KUBE_CLI}: cannot create /root/.kube — leaving the credential to client-go's own in-cluster fallback"
