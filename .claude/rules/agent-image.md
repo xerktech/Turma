@@ -144,19 +144,28 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     bool, a number or null, so an unquoted `namespace:` yields a config kubectl refuses to LOAD —
     every call in the pod dies at config load while the same pod with no kubeconfig authenticates
     fine. Those names are all `[a-z0-9-]`, so no character filter catches it.
-  - The temp file is `mktemp`, not a fixed name: it is created 0600 before anything is written, so
-    the mode is never a race and no `umask` is touched (a bare `umask 077 … umask 022` pair leaks a
-    hardcoded 022 into the manager and every session), and it cannot destroy an operator's file
-    that happened to sit at a name we picked.
+  - The temp file is `mktemp` in a **subdirectory of our own** (`~/.kube/.turma-tmp`, `rmdir`ed on
+    the happy path), not a name beside the operator's things. `mktemp` gives 0600 before anything is
+    written, so the mode is never a race and no `umask` is touched — a bare `umask 077 … umask 022`
+    pair leaks a hardcoded 022 into the manager and every session. **Sweeping the leftovers is what
+    forces the subdirectory**: a unique name is not self-limiting, and a glob over `~/.kube` to
+    clean it deletes whatever else fits — QA measured `.config.backup` and `.config.2026-0`
+    destroyed, a wider hazard than the one fixed name this replaced.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
-    see. The write's `umask` is scoped to a SUBSHELL: a bare pair leaks into the manager, the
-    tunnel and every session, and restores a hardcoded value rather than the operator's.
-  - **`KUBERNETES_SERVICE_HOST` is taken on trust** and is what the generated config pairs with the
-    pod's real bearer token, so whoever sets it decides where that token is sent. Not a boundary
-    being crossed — setting env on a container means choosing its image and entrypoint too — and
-    there is nothing in the SA directory to check the address against. Recorded so it stays a
-    decision.
+    see. Nothing in it touches the process `umask` — see the `mktemp` note above for why it does
+    not need to.
+  - **`KUBERNETES_SERVICE_HOST` is taken on trust, and the CA PIN is what makes that safe.** It is
+    what the config pairs with the pod's real bearer token, and the only thing stopping a redirected
+    apiserver from receiving that token is `certificate-authority` pointing at the cluster's own CA:
+    QA measured a redirected kubectl failing the handshake with
+    `x509: certificate signed by unknown authority` and the rogue server logging a bad-certificate
+    alert having received **zero** requests. So never drop that field, never add
+    `insecure-skip-tls-verify`, and never reuse the variable somewhere without a pin.
+    - The reasoning this replaced — "anything that can set env on a container can do worse
+      directly" — is FALSE for this variable and must not come back: a Service named `kubernetes`
+      in the pod's own namespace overrides it for every pod there, and namespace-scoped `create
+      services` is far less privilege than editing a workload.
   - Tests: the XERK-369 cases in `test_entrypoint.sh`.
 - **Android toolchain** — JDK 17 + Gradle + Android SDK (`gradle`/`sdkmanager`/`avdmanager`/`adb`/
   `aapt2` on PATH), pinned via

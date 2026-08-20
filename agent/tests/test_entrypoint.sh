@@ -16,7 +16,10 @@
 # the node base image's pre-existing node:node at 1000:1000, and the on-boot
 # self-heal chown.
 #
-# Requires docker (the runner has it; the Node suite already relies on it).
+# Requires docker (the runner has it; the Node suite already relies on it) and
+# **bash 4.4 or newer**: `run_case` expands possibly-empty arrays under `set -u`,
+# which is an "unbound variable" fatal on 4.3 and fine from 4.4. ubuntu-latest is
+# 5.x, so this only bites someone running the suite somewhere else.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -81,7 +84,10 @@ echo "KUBECFG_QUOTED=$(grep -cE '^ +(server|certificate-authority|tokenFile|name
 # Temp files left behind. The write goes through `mktemp`, so a crash between it
 # and the `mv` leaves one — and in a pod /root is a persistent volume nothing
 # else sweeps, so they accumulate for the life of the agent.
-echo "KUBECFG_STRAYS=$(find /root/.kube -maxdepth 1 -name '.config.*' 2>/dev/null | wc -l)"
+echo "KUBECFG_STRAYS=$(find /root/.kube/.turma-tmp -maxdepth 1 -type f 2>/dev/null | wc -l)"
+# Everything in /root/.kube that is NOT ours. The sweep must not have touched
+# any of it, and the temp directory must be gone on a clean boot.
+echo "KUBECFG_NEIGHBOURS=$(find /root/.kube -maxdepth 1 -type f -name '.config.*' 2>/dev/null | wc -l)"
 # Configurable lifetime: the manager is PID 1, so how long IT lives is how long
 # the container lives — the tunnel-supervision case needs a few seconds.
 sleep "${STUB_MANAGER_SLEEP:-1}"
@@ -195,8 +201,10 @@ run_case() {
   local rc=0
   local -a extra=() entry=() cmd=()
   if [ -n "${RUN_CASE_DOCKER_ARGS:-}" ]; then
-    # shellcheck disable=SC2206  # deliberate word splitting: these are flags
-    extra=(${RUN_CASE_DOCKER_ARGS})
+    # `read -ra`, not `extra=($…)`: both split on whitespace, but the bare
+    # expansion also GLOBS, so a flag containing `*` or `?` would be replaced by
+    # whatever happened to be in the caller's directory.
+    read -ra extra <<< "$RUN_CASE_DOCKER_ARGS"
   fi
   if [ -n "${RUN_CASE_SH:-}" ]; then
     entry=(--entrypoint sh)
@@ -695,7 +703,7 @@ else
   echo "  FAIL: an oversized timeout overflowed the floor and orphaned the install (install=$done_line manager=$mgr_line)"; FAILED=1
 fi
 
-echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"
+echo "== case: a session cannot wedge the boot with a FIFO in ~/.turma"
 # /root/.turma is the manager's REGISTRY_DIR, so the dropped identity — every
 # Claude session — can write there. Opening a FIFO BLOCKS until the other end
 # appears, with no error for `|| true` to catch, which is the PID-1 wedge again:
@@ -1117,7 +1125,7 @@ mkdir -p "$WORK/fx30/sa"
 printf 'not-a-real-token\n' > "$WORK/fx30/sa/token"
 printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx30/sa/ca.crt"
 printf 'turma\n' > "$WORK/fx30/sa/namespace"
-# Shadow both stubs with directories, so `command -v` finds nothing on PATH.
+# Remove both stubs, so `command -v` finds neither on PATH.
 out="$(RUN_CASE_SH='rm -f /usr/local/bin/kubectl /usr/local/bin/helm; exec /usr/local/bin/entrypoint.sh' \
   run_case "$WORK/fx30" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
   -v "$WORK/fx30/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
@@ -1143,24 +1151,54 @@ else
   echo "  FAIL: not reported as helm: $(echo "$out" | grep -E 'kubectl:|helm:' || echo none)"; FAILED=1
 fi
 
-# --- Case 31: leftover temp files are swept (XERK-369) ----------------------
+# ...and the same for the PREFLIGHT line, which is the other half of the split.
+# Gated on kubectl alone, a helm-only image with host creds mounted says nothing
+# at all, while a kubectl-only one reports them — an asymmetry with no reason
+# behind it.
+echo "== case: helm alone still reports mounted host creds"
+mkdir -p "$WORK/fx30/kube"
+printf 'apiVersion: v1\nkind: Config\nclusters: []\n' > "$WORK/fx30/kube/config"
+out="$(RUN_CASE_SH='rm -f /usr/local/bin/kubectl; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx30" -v "$WORK/fx30/kube:/root/.kube")"
+if echo "$out" | grep -q "\[entrypoint\] helm: host creds mounted at /root/.kube"; then
+  echo "  ok: reported under helm"
+else
+  echo "  FAIL: helm-only image said nothing about mounted creds: $(echo "$out" | grep -E 'kubectl:|helm:' || echo none)"; FAILED=1
+fi
+
+# --- Case 31: the temp sweep is ours, and ONLY ours (XERK-369) --------------
 # The write goes through `mktemp`, which — unlike the fixed `config.new` it
 # replaced — is not self-limiting: a crash between the mktemp and the mv leaves
-# one behind every time, on a volume that in a pod outlives the container.
-echo "== case: stray temp files from a crashed write are swept"
+# one behind every time, on a volume that in a pod outlives the container. So it
+# has to be swept.
+#
+# BOTH HALVES OR NEITHER. An earlier revision swept with a glob over the whole
+# of /root/.kube, and QA measured it destroying a planted `.config.backup` and
+# `.config.2026-0` — a wider hazard than the single fixed name the change set
+# out to stop clobbering, in the directory the compose deployment documents as
+# the operator's own credential store. The second assertion here is the one
+# that catches that, and widening the glob passes the first on its own.
+echo "== case: stray temp files are swept, and only ours are"
 make_fixture "$WORK/fx31" 0 0
-mkdir -p "$WORK/fx31/sa" "$WORK/fx31/kube"
+mkdir -p "$WORK/fx31/sa" "$WORK/fx31/kube/.turma-tmp"
 printf 'not-a-real-token\n' > "$WORK/fx31/sa/token"
 printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx31/sa/ca.crt"
 printf 'turma\n' > "$WORK/fx31/sa/namespace"
-: > "$WORK/fx31/kube/.config.aB3xYz"
-: > "$WORK/fx31/kube/.config.qQ9zPl"
+# What a crashed write leaves: ours, in our own directory.
+: > "$WORK/fx31/kube/.turma-tmp/config.aB3xYz"
+: > "$WORK/fx31/kube/.turma-tmp/config.qQ9zPl"
+# What an operator plausibly keeps beside their kubeconfig. None of these is
+# ours and none may be touched — the first two are the exact names QA destroyed.
+: > "$WORK/fx31/kube/.config.backup"
+: > "$WORK/fx31/kube/.config.2026-0"
+: > "$WORK/fx31/kube/.config.bak"
 out="$(run_case "$WORK/fx31" \
   -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
   -v "$WORK/fx31/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
   -v "$WORK/fx31/kube:/root/.kube")"
 expect "the config was still written" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
-expect "and nothing was left behind" "0" "$(field "$out" KUBECFG_STRAYS)"
+expect "our own strays are gone" "0" "$(field "$out" KUBECFG_STRAYS)"
+expect "and the operator's files are all still there" "3" "$(field "$out" KUBECFG_NEIGHBOURS)"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi
