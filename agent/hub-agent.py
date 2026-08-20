@@ -84,6 +84,13 @@ TURMA_URL = os.environ.get("TURMA_URL", "http://turma:8300")
 # the hub's TURMA_AGENT_TOKEN.
 TURMA_TOKEN = os.environ.get("TURMA_TOKEN", "")
 INTERVAL = int(os.environ.get("TURMA_INTERVAL", "20"))
+# How long ONE heartbeat POST may block the beat loop. This and INTERVAL are
+# the whole of what a healthy beat cycle costs, and their sum has to stay well
+# under the hub's OFFLINE_AFTER_MS (turma/server.js) or the host reads as dead
+# while it is fine — a cross-component contract, pinned by
+# TestBeatLoopBudget. A beat that executes commands posts a second, `light`
+# follow-up, so budget two of these per cycle.
+HEARTBEAT_TIMEOUT_SEC = 10
 
 # Host-multiplexer configuration (see CONTRACT / entrypoint.sh comments).
 REPOS_ROOT = os.environ.get("REPOS_ROOT", "/mnt/data/Docker/git")
@@ -247,6 +254,7 @@ CLAUDE_CONFIG_PATHS = tuple(p for p in (
 # the tunnel or blocking a beat.
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
+ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
 
 # The archive's RAW layer (XERK-338): beside the rendered entries above, ship a
@@ -260,6 +268,16 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # Read window MUST stay at or under the hub's ARCHIVE_RAW_CHUNK_MAX, which
 # bounds its gunzip: a larger window is refused on every push, not truncated.
 ARCHIVE_RAW_CHUNK_BYTES = 1 << 22   # 4 MiB read per POST (~0.5-1 MiB gzipped)
+ARCHIVE_RAW_TIMEOUT_SEC = 30        # one raw-range POST (gzip + a bigger body)
+# How long a pass may go with NO push completing before it is reported as
+# wedged. Measured against the last completed push, never the pass's age — a
+# pass is bounded in BYTES, not in time, so a first backfill legitimately runs
+# for many minutes while shipping steadily (XERK-395 QA). Ten times the longest
+# per-push timeout, so only a push that never returns can reach it: urlopen's
+# timeout is per SOCKET OPERATION, and a hub trickling a byte at a time never
+# trips it. Reported, not killed — the socket cannot be closed from here, and
+# the host is healthy either way.
+ARCHIVE_PASS_STALL_SEC = 300
 ARCHIVE_RAW_BEAT_BUDGET = 1 << 24   # ~16 MiB of raw bytes per sync pass
 # Files one transcript may offer, and across the whole manifest. A session's
 # directory holds one file per delegated agent and per overflowed tool result, so
@@ -10408,6 +10426,23 @@ class SessionManager:
         # Throttle for the "cannot be named by the archive" line (see
         # _session_files): the manifest is rebuilt every beat.
         self._unnameable_logged_at = 0.0
+        # Archive sync runs on its OWN thread (XERK-395), never the beat. The
+        # beat stages the newest reply's cursors as _archive_job under
+        # _archive_lock and sets _archive_wake; the worker takes it from there.
+        # The job is COALESCED, not queued: only the newest cursors are worth
+        # pushing against (see queue_archive_sync).
+        self._archive_lock = threading.Lock()
+        self._archive_job = None
+        self._archive_wake = threading.Event()
+        self._archive_worker = None
+        # Monotonic start of the pass in flight (None between passes), the
+        # monotonic stamp of the last push that COMPLETED during it, and the
+        # throttle for the line that reports a pass wedged on a socket. All
+        # three are worker-written and beat-read, so every touch holds
+        # _archive_lock.
+        self._archive_pass_at = None
+        self._archive_progress_at = 0.0
+        self._archive_stall_logged_at = -3600.0
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -14795,6 +14830,188 @@ class SessionManager:
                     f"{sorted(skipped)[:5]}")
         return out
 
+    # --- Archive sync worker (XERK-395) -----------------------------------
+
+    def queue_archive_sync(self, reply):
+        """Stage a heartbeat reply's archive cursors for the sync WORKER and
+        return — the pushes themselves are `_archive_sync_pass`, on its own
+        thread.
+
+        **Neither pass may run on the beat loop.** Their worst case is
+        structurally larger than the liveness threshold they would block:
+        ARCHIVE_CHUNK_TIMEOUT_SEC + ARCHIVE_RAW_FAILURES_MAX *
+        ARCHIVE_RAW_TIMEOUT_SEC = 105s of archive between two beats, against the
+        hub's 75s OFFLINE_AFTER_MS. Measured on a host with intermittent egress
+        packet loss: three back-to-back TLS handshake timeouts produced a 111s
+        beat gap, so the hub rendered a healthy host with running sessions and a
+        live tunnel offline for ~36s, eight times in two hours. The try/except
+        that used to wrap these calls caught exceptions, never TIME, which is the
+        thing that actually costs the host its online status. Every pushed byte
+        is best-effort backfill; the beat it delayed is the only thing that says
+        the host is alive — and a host on a lossy link is exactly the one an
+        operator most needs to see the true state of. Same fix and the same
+        reason as `prune_repo` (XERK-256).
+
+        ONE worker, and jobs COALESCE rather than queue: a pass is driven
+        entirely by the cursors on the newest reply, so a job waiting behind a
+        slow pass is SUPERSEDED by the next beat's rather than replayed. Queuing
+        them instead would grow an unbounded backlog on any host pushing slower
+        than INTERVAL, every entry of it aimed at cursors the hub has already
+        moved past.
+
+        No `archiveHave` means a hub too old to ask for an archive at all, which
+        is the same nothing-to-do the inline call read it as — but the stall
+        check runs BEFORE that gate: a pass wedged on a socket is the worker's
+        state, not this reply's, and gating the one line that reports it on the
+        hub still asking for deltas made a host whose manifest emptied mid-wedge
+        silent forever (XERK-395 QA pass 3)."""
+        job = None
+        if reply.get("archiveHave"):
+            job = {
+                "have": reply["archiveHave"],
+                "shed": reply.get("archiveShed"),
+                "full": bool(reply.get("archiveFull")),
+                "rawHave": reply.get("archiveRawHave"),
+                "rawSkip": reply.get("archiveRawSkip"),
+            }
+        # NOTHING here may raise onto the beat loop. This runs OUTSIDE a try in
+        # run_forever, where the inline passes it replaced ran inside one, and
+        # the beat loop is the container's main process (entrypoint.sh `exec`s
+        # it with no retry) — so an exception here is not a skipped sync, it is
+        # the host and every session on it going down. `Thread.start()` raising
+        # RuntimeError at the pids_limit is the realistic way that happens. A
+        # failed start leaves the job staged and a never-started thread in
+        # _archive_worker, whose is_alive() is False, so the next beat retries.
+        try:
+            with self._archive_lock:
+                self._warn_if_archive_pass_stalled()
+                if job is None:
+                    return
+                self._archive_job = job
+                worker = self._archive_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._archive_worker_loop, name="archive-sync",
+                        daemon=True)
+                    self._archive_worker = worker
+                    worker.start()
+            self._archive_wake.set()
+        except Exception as e:
+            log(f"archive sync could not be staged: {e}")
+
+    def _warn_if_archive_pass_stalled(self, now=None):
+        """Say so when a pass is in flight and no push has COMPLETED for a long
+        time. Caller holds _archive_lock — it reads three fields the WORKER
+        writes, including the `finally` that clears the pass stamp, so unlocked
+        it can see a pass in flight and then have that stamp vanish before the
+        arithmetic. `now` is injectable so the boot-fresh-clock case can be
+        tested without patching the process's clock out from under every other
+        thread.
+
+        Off the beat, a wedged pass is SILENT: moving the passes here removed the
+        symptom that used to announce them (the beat stalling, the host going
+        offline), and `urlopen`'s timeout is per SOCKET OPERATION — a peer that
+        trickles one byte every few seconds never trips it, so a single push can
+        hold the worker forever while beats stay on cadence and no delta ships.
+        This line is the only thing that would tell an operator.
+
+        **Measured against the last completed push, NOT against the pass's age**
+        (XERK-395 QA pass 2). A pass has no time bound: ARCHIVE_MANIFEST_MAX is
+        200 and every transcript with unsynced bytes costs at least one POST, so
+        a first backfill over a slow link legitimately runs for many minutes — one
+        was measured at 690s while shipping a delta every 10s. Timing the pass
+        made this fire on exactly the healthy host the ticket is about, and say
+        "no deltas are shipping" while 69 were. The 105s design figure bounds only
+        the FAILURE path, so it cannot bound a pass either.
+
+        A push that returns — stored, refused, or timed out — is progress: it
+        proves the socket resolved and the pass moved on. Only a push that never
+        returns at all trips this. Throttled, on the MONOTONIC clock: an NTP step
+        backwards makes a wall-clock delta negative, which reads as "logged
+        recently" and would suppress the line for up to another hour."""
+        if self._archive_pass_at is None:
+            return
+        now = time.monotonic() if now is None else now
+        held = now - self._archive_progress_at
+        if held < ARCHIVE_PASS_STALL_SEC:
+            return
+        if now - self._archive_stall_logged_at < 3600:
+            return
+        self._archive_stall_logged_at = now
+        log(f"archive sync: a pass has been running {int(now - self._archive_pass_at)}s "
+            f"and no push has completed in {int(held)}s — the hub is answering "
+            f"slowly enough that no per-socket timeout fires. No deltas are shipping.")
+
+    def _note_archive_progress(self):
+        """Stamp a completed push. Called from both push helpers on EVERY exit,
+        which is what makes the difference between a slow pass and a wedged one
+        legible to the beat."""
+        with self._archive_lock:
+            self._archive_progress_at = time.monotonic()
+
+    def _archive_worker_loop(self):
+        """Run the newest staged pass, then wait for the next beat to stage one.
+
+        Long-lived, unlike the prune worker which exits once its queue drains: a
+        job arrives every beat, so exiting between them would build and discard a
+        thread three times a minute for nothing.
+
+        Daemon, and never joined on shutdown — for the same reason prune isn't.
+        The archive is append-only against cursors the HUB holds, so a pass cut
+        short by a restart is simply re-offered on the next beat, whereas waiting
+        out an in-flight 30s push would put the stall back on the one path that
+        must never have one.
+
+        The wake is CLEARED BEFORE the job is taken, never after: the beat stores
+        the job and only then sets the event, so clearing afterwards would
+        discard a job staged while this pass was running. Clearing first can cost
+        one spurious loop (job already taken, event still set), which the None
+        check absorbs."""
+        while True:
+            self._archive_wake.wait()
+            self._archive_wake.clear()
+            with self._archive_lock:
+                job, self._archive_job = self._archive_job, None
+            if job is None:
+                continue
+            # Stamped under the lock the beat reads it under, so a pass wedged on
+            # a socket that never times out is visible rather than silent.
+            with self._archive_lock:
+                self._archive_pass_at = time.monotonic()
+                self._archive_progress_at = self._archive_pass_at
+            try:
+                self._archive_sync_pass(job)
+            except Exception as e:
+                # Backstop only — _archive_sync_pass catches both passes itself.
+                # This is a worker's whole body, and an escape here would leave
+                # the host with no archive sync at all until it restarts.
+                log(f"archive sync worker: {e}")
+            finally:
+                with self._archive_lock:
+                    self._archive_pass_at = None
+
+    def _archive_sync_pass(self, job):
+        """One rendered pass, then one raw pass, off the same reply's cursors.
+
+        Each in its own try/except, which is XERK-338's split: a raw push that
+        fails must never cost the rendered transcript, which is what every other
+        surface reads.
+
+        Both passes read `self._archive_pending`, which the BEAT rebinds when it
+        refreshes the manifest. That is safe precisely because it is REBOUND and
+        never mutated in place — each pass snapshots it once with `list(...)` and
+        works from a coherent manifest. Keep it that way: mutating that dict from
+        the beat would raise here mid-iteration, on the thread whose whole job is
+        to not disturb the beat."""
+        try:
+            self._archive_deltas(job["have"], job["shed"], job["full"])
+        except Exception as e:
+            log(f"archive sync failed: {e}")
+        try:
+            self._archive_raw_deltas(job["rawHave"], job["rawSkip"], job["full"])
+        except Exception as e:
+            log(f"archive raw sync failed: {e}")
+
     def _archive_raw_deltas(self, raw_have, skip_ids=None, store_full=False):
         """Push the append-only byte ranges the hub is missing from each session's
         OWN files (XERK-338), gzipped, using the archiveRawHave cursors from the
@@ -14891,7 +15108,7 @@ class SessionManager:
                    f"/archive/{urllib.parse.quote(transcript_id, safe='')}"
                    f"/raw/{urllib.parse.quote(rel, safe='')}?start={int(start)}")
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=ARCHIVE_RAW_TIMEOUT_SEC) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
             return reply if isinstance(reply, dict) else {}
         except urllib.error.HTTPError as e:
@@ -14909,6 +15126,12 @@ class SessionManager:
         except Exception as e:
             log(f"archive raw push failed for {transcript_id} {rel}: {e}")
             return None
+        finally:
+            # EVERY exit — stored, refused or timed out. A push that RETURNS
+            # proves the socket resolved and the pass moved on; only one that
+            # never returns is a wedge, which is the whole distinction
+            # _warn_if_archive_pass_stalled draws.
+            self._note_archive_progress()
 
     def _archive_deltas(self, archive_have, shed_ids=None, store_full=False):
         """Push the byte-range deltas the hub is missing for each manifest entry,
@@ -15035,12 +15258,18 @@ class SessionManager:
                    f"/archive/{urllib.parse.quote(transcript_id, safe='')}")
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode(), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=ARCHIVE_CHUNK_TIMEOUT_SEC) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
             return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"archive push failed for {transcript_id}: {e}")
             return None
+        finally:
+            # EVERY exit — stored, refused or timed out. A push that RETURNS
+            # proves the socket resolved and the pass moved on; only one that
+            # never returns is a wedge, which is the whole distinction
+            # _warn_if_archive_pass_stalled draws.
+            self._note_archive_progress()
 
     # --- GitHub clone-into-root -------------------------------------------
 
@@ -17480,7 +17709,7 @@ class SessionManager:
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=HEARTBEAT_TIMEOUT_SEC) as resp:
                 # BOUNDED read. The reply now carries a peer roster (XERK-348),
                 # so it is no longer a handful of commands, and an agent that
                 # slurps whatever arrives makes the hub's reply size this
@@ -17695,25 +17924,12 @@ class SessionManager:
                 # lag on a per-beat roster is immaterial, and doing it here keeps
                 # a single writer.
                 self._ingest_peers(reply.get("peers"))
-                # Push archive deltas the hub asked for (byte cursors on the reply).
-                # Best-effort: a sync hiccup must never disrupt the beat loop.
-                if reply.get("archiveHave"):
-                    try:
-                        self._archive_deltas(reply["archiveHave"],
-                                             reply.get("archiveShed"),
-                                             bool(reply.get("archiveFull")))
-                    except Exception as e:
-                        log(f"archive sync failed: {e}")
-                    # The raw layer rides the same reply and the same pending
-                    # map (XERK-338), in its own try: a raw push that fails must
-                    # never cost the rendered transcript, which is what every
-                    # other surface reads.
-                    try:
-                        self._archive_raw_deltas(reply.get("archiveRawHave"),
-                                                 reply.get("archiveRawSkip"),
-                                                 bool(reply.get("archiveFull")))
-                    except Exception as e:
-                        log(f"archive raw sync failed: {e}")
+                # Hand the archive cursors on this reply to the sync worker and
+                # move on (XERK-395). It STAGES, it does not push: both passes
+                # together are allowed up to 105s of network, well past the 75s
+                # after which the hub calls this host offline, and the beat they
+                # would delay is the only thing that says it is alive.
+                self.queue_archive_sync(reply)
                 if self.handle_commands(reply.get("commands")):
                     # Fire an immediate extra heartbeat so the UI reflects the
                     # new session state fast (don't wait a whole interval). Its

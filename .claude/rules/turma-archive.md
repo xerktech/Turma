@@ -8,7 +8,7 @@ paths:
 
 Split out of `.claude/rules/turma.md` to keep that file under its size ceiling. The rest of the
 dashboard is there; `CLAUDE.md` has the `/data` volume and what else shares it. The agent half —
-what it ships and when it sheds — is in `.claude/rules/agent.md` under "Archive sync".
+what it ships and when it sheds — is in `.claude/rules/agent-archive.md`.
 
 - The hub hosts a **durable, searchable archive of ended sessions** (`turma/archive.js`): agents
   push each inactive transcript in, landing as **organized files on `/data`** — one folder per repo,

@@ -11,11 +11,12 @@ that component's files.
 | File | Loads when Claude touches | Covers |
 |------|---------------------------|--------|
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
-| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks, archive |
+| `.claude/rules/agent.md` | `agent/**` | `hub-agent.py` process model, commands, heartbeat, live-session signals, summaries, transcript blocks |
 | `.claude/rules/agent-input.md` | `agent/hub-agent.py` | putting a message INTO a session: `send_input`'s pane path and its compaction outbox, `notify_session`'s session inbox |
 | `.claude/rules/agent-sessions.md` | `agent/hub-agent.py` | how a session is launched, repos-root sessions, the agent-side session queue, kill/resume/delete, the new-work directive, local-model failover |
 | `.claude/rules/agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
+| `.claude/rules/agent-archive.md` | `agent/hub-agent.py` | archive sync: the manifest, the rendered + raw delta pushes, the off-the-beat sync worker |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
@@ -258,6 +259,24 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     DELIVER into a session — it just can't discover one. **One Claude login per org is the only
     hard boundary**, and it is a DockerOps decision. Don't describe this contract as sealing it.
   - Mechanics in `.claude/rules/agent-sessions.md` and `.claude/rules/agent-hooks.md`.
+- **Nothing on the agent's BEAT LOOP may have a worst case at or above the hub's `OFFLINE_AFTER_MS`**
+  (XERK-395). The hub calls a host offline after 75s of silence (`turma/server.js`); what sets the
+  gap between two beats is the AGENT's own timeouts and retry counts, so neither side's
+  `paths:`-scoped file sees both halves. Archive sync broke it — `ARCHIVE_CHUNK_TIMEOUT_SEC` +
+  `ARCHIVE_RAW_FAILURES_MAX` x `ARCHIVE_RAW_TIMEOUT_SEC` = 105s of pushes inline, measured on a
+  lossy link as a 111s beat gap that rendered a healthy host offline for ~36s, 8x in 2h — and moved
+  to a worker thread, as `prune` did for the same reason (XERK-256).
+  - **A try/except around slow work does not satisfy this**: it catches exceptions, never TIME,
+    which is what actually costs the host its online status. Nor does a deadline alone, while one
+    in-flight push can overshoot it by a full timeout.
+  - Inline may cost `INTERVAL` plus the beat's own POSTs (`HEARTBEAT_TIMEOUT_SEC`, twice on a cycle
+    that executed commands) — 40s of the 75s. Anything else with a network or disk worst case
+    belongs on a worker. Tests: `TestBeatLoopBudget`, `TestArchiveSyncWorker`.
+  - **It is the rule for new work, and NOT yet true everywhere** — say so rather than reading it as
+    a description. Still inline and still over: `refresh_pr_status` (`PR_STATUS_MAX` x `run()`'s 15s
+    ≈ 300s), `refresh_jira` (measured at a 20s beat gap against a blackholed site), `refresh_github`
+    — all three in `build_payload` — and `_migration_upload` under `handle_commands` (~96s).
+    XERK-397 carries them. A fix there extends `TestBeatLoopBudget` rather than adding its own pin.
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.
