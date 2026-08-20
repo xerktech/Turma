@@ -269,10 +269,14 @@ ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttl
 # bounds its gunzip: a larger window is refused on every push, not truncated.
 ARCHIVE_RAW_CHUNK_BYTES = 1 << 22   # 4 MiB read per POST (~0.5-1 MiB gzipped)
 ARCHIVE_RAW_TIMEOUT_SEC = 30        # one raw-range POST (gzip + a bigger body)
-# A pass held this long is wedged, not slow: the two timeouts above bound one
-# by design at 15 + 3x30 = 105s, and urlopen's timeout is per SOCKET OPERATION,
-# so a hub trickling a byte at a time never trips it. Reported, not killed —
-# the socket cannot be closed from here, and the host is healthy either way.
+# How long a pass may go with NO push completing before it is reported as
+# wedged. Measured against the last completed push, never the pass's age — a
+# pass is bounded in BYTES, not in time, so a first backfill legitimately runs
+# for many minutes while shipping steadily (XERK-395 QA). Ten times the longest
+# per-push timeout, so only a push that never returns can reach it: urlopen's
+# timeout is per SOCKET OPERATION, and a hub trickling a byte at a time never
+# trips it. Reported, not killed — the socket cannot be closed from here, and
+# the host is healthy either way.
 ARCHIVE_PASS_STALL_SEC = 300
 ARCHIVE_RAW_BEAT_BUDGET = 1 << 24   # ~16 MiB of raw bytes per sync pass
 # Files one transcript may offer, and across the whole manifest. A session's
@@ -10431,10 +10435,14 @@ class SessionManager:
         self._archive_job = None
         self._archive_wake = threading.Event()
         self._archive_worker = None
-        # Monotonic start of the pass in flight, None between passes, and the
-        # throttle for the line that reports one that is wedged.
+        # Monotonic start of the pass in flight (None between passes), the
+        # monotonic stamp of the last push that COMPLETED during it, and the
+        # throttle for the line that reports a pass wedged on a socket. All
+        # three are worker-written and beat-read, so every touch holds
+        # _archive_lock.
         self._archive_pass_at = None
-        self._archive_stall_logged_at = 0.0
+        self._archive_progress_at = 0.0
+        self._archive_stall_logged_at = -3600.0
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -14886,30 +14894,49 @@ class SessionManager:
             log(f"archive sync could not be staged: {e}")
 
     def _warn_if_archive_pass_stalled(self):
-        """Say so when the worker has been in ONE pass far longer than a pass can
-        take by design. Caller holds _archive_lock.
+        """Say so when a pass is in flight and no push has COMPLETED for a long
+        time. Caller holds _archive_lock.
 
         Off the beat, a wedged pass is SILENT: moving the passes here removed the
         symptom that used to announce them (the beat stalling, the host going
-        offline), and `urlopen`'s timeout is per socket operation — a peer that
+        offline), and `urlopen`'s timeout is per SOCKET OPERATION — a peer that
         trickles one byte every few seconds never trips it, so a single push can
-        hold the worker forever while beats stay perfectly on cadence and no
-        delta ships. This line is the only thing that would tell an operator.
-        Throttled like the other periodic warns on this path."""
-        started = self._archive_pass_at
-        if started is None:
+        hold the worker forever while beats stay on cadence and no delta ships.
+        This line is the only thing that would tell an operator.
+
+        **Measured against the last completed push, NOT against the pass's age**
+        (XERK-395 QA pass 2). A pass has no time bound: ARCHIVE_MANIFEST_MAX is
+        200 and every transcript with unsynced bytes costs at least one POST, so
+        a first backfill over a slow link legitimately runs for many minutes — one
+        was measured at 690s while shipping a delta every 10s. Timing the pass
+        made this fire on exactly the healthy host the ticket is about, and say
+        "no deltas are shipping" while 69 were. The 105s design figure bounds only
+        the FAILURE path, so it cannot bound a pass either.
+
+        A push that returns — stored, refused, or timed out — is progress: it
+        proves the socket resolved and the pass moved on. Only a push that never
+        returns at all trips this. Throttled, on the MONOTONIC clock: an NTP step
+        backwards makes a wall-clock delta negative, which reads as "logged
+        recently" and would suppress the line for up to another hour."""
+        if self._archive_pass_at is None:
             return
-        held = time.monotonic() - started
+        now = time.monotonic()
+        held = now - self._archive_progress_at
         if held < ARCHIVE_PASS_STALL_SEC:
             return
-        now = time.time()
         if now - self._archive_stall_logged_at < 3600:
             return
         self._archive_stall_logged_at = now
-        log(f"archive sync has been in one pass for {int(held)}s, past the "
-            f"~{ARCHIVE_CHUNK_TIMEOUT_SEC + ARCHIVE_RAW_FAILURES_MAX * ARCHIVE_RAW_TIMEOUT_SEC}s "
-            f"one can take by design: the hub is answering slowly enough that no "
-            f"per-socket timeout fires. No deltas are shipping.")
+        log(f"archive sync: a pass has been running {int(now - self._archive_pass_at)}s "
+            f"and no push has completed in {int(held)}s — the hub is answering "
+            f"slowly enough that no per-socket timeout fires. No deltas are shipping.")
+
+    def _note_archive_progress(self):
+        """Stamp a completed push. Called from both push helpers on EVERY exit,
+        which is what makes the difference between a slow pass and a wedged one
+        legible to the beat."""
+        with self._archive_lock:
+            self._archive_progress_at = time.monotonic()
 
     def _archive_worker_loop(self):
         """Run the newest staged pass, then wait for the next beat to stage one.
@@ -14940,6 +14967,7 @@ class SessionManager:
             # a socket that never times out is visible rather than silent.
             with self._archive_lock:
                 self._archive_pass_at = time.monotonic()
+                self._archive_progress_at = self._archive_pass_at
             try:
                 self._archive_sync_pass(job)
             except Exception as e:
@@ -15087,6 +15115,12 @@ class SessionManager:
         except Exception as e:
             log(f"archive raw push failed for {transcript_id} {rel}: {e}")
             return None
+        finally:
+            # EVERY exit — stored, refused or timed out. A push that RETURNS
+            # proves the socket resolved and the pass moved on; only one that
+            # never returns is a wedge, which is the whole distinction
+            # _warn_if_archive_pass_stalled draws.
+            self._note_archive_progress()
 
     def _archive_deltas(self, archive_have, shed_ids=None, store_full=False):
         """Push the byte-range deltas the hub is missing for each manifest entry,
@@ -15219,6 +15253,12 @@ class SessionManager:
         except Exception as e:
             log(f"archive push failed for {transcript_id}: {e}")
             return None
+        finally:
+            # EVERY exit — stored, refused or timed out. A push that RETURNS
+            # proves the socket resolved and the pass moved on; only one that
+            # never returns is a wedge, which is the whole distinction
+            # _warn_if_archive_pass_stalled draws.
+            self._note_archive_progress()
 
     # --- GitHub clone-into-root -------------------------------------------
 

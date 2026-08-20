@@ -15401,42 +15401,106 @@ class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
         session down. `Thread.start()` raises RuntimeError at the pids limit
         (XERK-395 QA D1)."""
         sm = self.make_manager()
-        with mock.patch.object(ha.threading, "Thread") as fake:
-            fake.return_value.start.side_effect = RuntimeError("can't start new thread")
-            fake.return_value.is_alive.return_value = False
-            sm.queue_archive_sync({"archiveHave": {"t1": 1}})   # must not raise
+        # ANY failure, not just the expected one: the guard is there because the
+        # beat must survive whatever goes wrong, and narrowing it to the error
+        # this was written for is the mutation that a RuntimeError-only test
+        # cannot see (XERK-395 QA pass 2).
+        for boom in (RuntimeError("can't start new thread"),
+                     MemoryError(), OSError(errno.EAGAIN, "no resources")):
+            with mock.patch.object(ha.threading, "Thread") as fake:
+                fake.return_value.start.side_effect = boom
+                fake.return_value.is_alive.return_value = False
+                sm.queue_archive_sync({"archiveHave": {"t1": 1}})   # must not raise
 
-        # The job stays staged and the dead thread's is_alive() is False, so the
-        # next beat simply tries again.
-        with sm._archive_lock:
-            self.assertEqual(sm._archive_job["have"], {"t1": 1})
+            # The job stays staged and the dead thread's is_alive() is False, so
+            # the next beat simply tries again.
+            with sm._archive_lock:
+                self.assertEqual(sm._archive_job["have"], {"t1": 1})
 
-    def test_a_wedged_pass_is_reported(self):
+    def test_a_wedged_pass_is_reported_end_to_end(self):
         """Off the beat a wedged pass is otherwise SILENT — beats stay on
         cadence, the host stays online, and nothing ships (XERK-395 QA D3).
-        `urlopen`'s timeout is per socket operation, so a hub trickling bytes
-        never trips it."""
-        sm = self.make_manager()
-        lines = []
-        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
-            with sm._archive_lock:
-                sm._archive_pass_at = time.monotonic() - ha.ARCHIVE_PASS_STALL_SEC - 1
-                sm._warn_if_archive_pass_stalled()
-                # Throttled — the beat calls this every time it stages a job.
-                sm._warn_if_archive_pass_stalled()
-        self.assertEqual(len(lines), 1, lines)
-        self.assertIn("archive sync has been in one pass", lines[0])
+        `urlopen`'s timeout is per SOCKET OPERATION, so a hub trickling bytes
+        never trips it, and this line is the only signal there is.
 
-    def test_a_pass_within_its_design_budget_is_not_reported(self):
+        Driven through the REAL path — a pass wedged on the worker, then a beat
+        staging its next job — because the reachability is the fragile part:
+        three separate mutations (the worker never stamping the pass, stamping it
+        only after the pass returns, and the beat never calling the warn) each
+        left a wedged host permanently silent with the whole suite green
+        (XERK-395 QA pass 2)."""
+        sm = self.make_manager()
+        wedged = threading.Event()
+        release = threading.Event()
+        lines = []
+
+        def never_returns(*a, **k):
+            wedged.set()
+            release.wait(10)
+
+        with mock.patch.object(ha, "ARCHIVE_PASS_STALL_SEC", 0), \
+                mock.patch.object(sm, "_archive_deltas", never_returns), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(wedged.wait(5))
+            with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+                # The next beat, staging its job while the pass is still stuck.
+                sm.queue_archive_sync({"archiveHave": {"t1": 2}})
+                # Throttled: the beat stages a job on every manifest cadence.
+                sm.queue_archive_sync({"archiveHave": {"t1": 3}})
+            release.set()
+
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("no push has completed", lines[0])
+
+    def test_a_slow_but_progressing_pass_is_not_reported(self):
+        """A pass is bounded in BYTES, not in time: ARCHIVE_MANIFEST_MAX is 200
+        and every unsynced transcript costs at least one POST, so a first
+        backfill over a slow link legitimately runs for many minutes. Timing the
+        PASS instead of the pushes made this fire on exactly the healthy host the
+        ticket is about — measured at 690s, reporting "no deltas are shipping"
+        while 69 were (XERK-395 QA pass 2)."""
         sm = self.make_manager()
         lines = []
         with mock.patch.object(ha, "log", lambda m: lines.append(m)):
             with sm._archive_lock:
-                sm._archive_pass_at = time.monotonic() - 10
-                sm._warn_if_archive_pass_stalled()
-                sm._archive_pass_at = None      # between passes
+                # A pass running far longer than any threshold...
+                sm._archive_pass_at = time.monotonic() - 10 * ha.ARCHIVE_PASS_STALL_SEC
+                sm._archive_progress_at = sm._archive_pass_at
+            # ...but a push completes, as it does every few seconds on a slow link.
+            sm._note_archive_progress()
+            with sm._archive_lock:
                 sm._warn_if_archive_pass_stalled()
         self.assertEqual(lines, [])
+
+    def test_nothing_is_reported_between_passes(self):
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            with sm._archive_lock:
+                sm._archive_pass_at = None
+                sm._archive_progress_at = time.monotonic() - 10 * ha.ARCHIVE_PASS_STALL_SEC
+                sm._warn_if_archive_pass_stalled()
+        self.assertEqual(lines, [])
+
+    def test_every_push_exit_counts_as_progress(self):
+        """Stored, refused or timed out — a push that RETURNS proves the socket
+        resolved. Only one that never returns is a wedge, and the real push
+        helpers are where that distinction is stamped."""
+        sm = self.make_manager()
+        for helper, args in (
+                ("_post_archive_chunk", ("t1", {"startOffset": 0, "endOffset": 1,
+                                                "size": 1, "entries": [], "meta": {}})),
+                ("_post_archive_raw", ("t1", "t1.jsonl", 0, b"x")),
+        ):
+            with sm._archive_lock:
+                sm._archive_progress_at = 0.0
+            with mock.patch.object(ha.urllib.request, "urlopen",
+                                   side_effect=OSError("connection refused")):
+                self.assertIsNone(getattr(sm, helper)(*args))
+            with sm._archive_lock:
+                self.assertGreater(sm._archive_progress_at, 0.0,
+                                   f"{helper} did not stamp progress")
 
     def test_the_pass_stamp_is_cleared_even_when_the_pass_raises(self):
         """A stamp left behind would report every later pass as wedged."""
