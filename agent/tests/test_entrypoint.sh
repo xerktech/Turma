@@ -78,6 +78,10 @@ echo "KUBECFG_LINES=$(wc -l < /root/.kube/config 2>/dev/null || echo 0)"
 # read with sed looks perfectly correct while it happens. Four values come from
 # outside: server, certificate-authority, tokenFile, namespace.
 echo "KUBECFG_QUOTED=$(grep -cE '^ +(server|certificate-authority|tokenFile|namespace): \"' /root/.kube/config 2>/dev/null || true)"
+# Temp files left behind. The write goes through `mktemp`, so a crash between it
+# and the `mv` leaves one — and in a pod /root is a persistent volume nothing
+# else sweeps, so they accumulate for the life of the agent.
+echo "KUBECFG_STRAYS=$(find /root/.kube -maxdepth 1 -name '.config.*' 2>/dev/null | wc -l)"
 # Configurable lifetime: the manager is PID 1, so how long IT lives is how long
 # the container lives — the tunnel-supervision case needs a few seconds.
 sleep "${STUB_MANAGER_SLEEP:-1}"
@@ -175,17 +179,42 @@ make_fixture() {
 # most expensive possible way to learn about it. `timeout` kills the docker
 # CLIENT, so the container is named and force-removed after, and the marker in
 # the output fails whatever assertions the case makes.
+# RUN_CASE_DOCKER_ARGS  extra docker flags (--read-only, --tmpfs …)
+# RUN_CASE_SH           run this through `sh -c` as PID 1 instead of the
+#                       entrypoint, for the cases that have to set something up
+#                       (a umask, a missing binary) before PID 1 exists.
+# Both exist so those cases go through THIS function rather than calling
+# `docker run` themselves: a nameless `--rm` container that `timeout` kills is
+# leaked, unreachable by name, and — under `set -e` — a non-zero exit aborts the
+# whole suite from inside `out="$(…)"` with no FAIL line and no summary, taking
+# every later case with it. QA measured exactly that: the mutant case 28 exists
+# to catch was reported only as a bare exit 1, and cases 29 and 30 never ran.
 run_case() {
   local dir="$1"; shift
   local name="turma-ep-$$-${RANDOM}"
   local rc=0
+  local -a extra=() entry=() cmd=()
+  if [ -n "${RUN_CASE_DOCKER_ARGS:-}" ]; then
+    # shellcheck disable=SC2206  # deliberate word splitting: these are flags
+    extra=(${RUN_CASE_DOCKER_ARGS})
+  fi
+  if [ -n "${RUN_CASE_SH:-}" ]; then
+    entry=(--entrypoint sh)
+    cmd=(-c "$RUN_CASE_SH")
+  fi
   timeout "${RUN_CASE_TIMEOUT:-180}" \
     docker run --rm --name "$name" \
-      -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x "$@" \
-      -v "$dir/repos:/f/repos" -v "$dir/claude:/root/.claude" "$IMG" 2>&1 || rc=$?
+      -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
+      "${extra[@]}" "$@" \
+      -v "$dir/repos:/f/repos" -v "$dir/claude:/root/.claude" \
+      "${entry[@]}" "$IMG" "${cmd[@]}" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     docker rm -f "$name" >/dev/null 2>&1 || true
-    [ "$rc" -eq 124 ] && echo "RUNCASE_TIMEOUT=yes"
+    if [ "$rc" -eq 124 ]; then
+      echo "RUNCASE_TIMEOUT=yes"
+    else
+      echo "RUNCASE_EXIT=$rc"
+    fi
   fi
   return 0
 }
@@ -696,13 +725,12 @@ echo "== case: nothing in the check can stop the container booting"
 # killed PID 1 with a one-line error, on every restart, forever. /tmp is the
 # image's writable layer, so it survived restarts and never self-healed.
 make_fixture "$WORK/fx12" 1000 1000
-out="$(docker run --rm -e AGENT=claude -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
-  -e STUB_MANAGER_SLEEP=2 -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9 \
-  -v "$WORK/fx12/repos:/f/repos" -v "$WORK/fx12/claude:/root/.claude" \
-  --entrypoint /bin/sh "$IMG" -c \
-  'mkdir -p /tmp/.turma-claude-update /tmp/turma-claude-update.XXXXXX; \
-   chmod 000 /tmp/turma-claude-update.XXXXXX 2>/dev/null; \
-   exec /usr/local/bin/entrypoint.sh' 2>&1)"
+# Through `run_case` like every other case, so a regression here fails with a
+# diagnostic rather than aborting the suite from inside the `$( )` — see the
+# comment on run_case.
+out="$(RUN_CASE_SH='mkdir -p /tmp/.turma-claude-update /tmp/turma-claude-update.XXXXXX; chmod 000 /tmp/turma-claude-update.XXXXXX 2>/dev/null; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx12" -e AGENT=claude \
+  -e STUB_MANAGER_SLEEP=2 -e STUB_CLAUDE_VERSION=2.0.1 -e STUB_NPM_LATEST=2.0.9)"
 if echo "$out" | grep -q "MANAGER uid="; then
   echo "  ok: booted with the scratch paths already taken"
 else
@@ -963,7 +991,17 @@ out="$(run_case "$WORK/fx24" \
   -v "$WORK/fx24/kube:/root/.kube")"
 expect "regenerated over the empty file" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
 # ...and out of a cluster the same empty file must read as no creds at all.
-out="$(run_case "$WORK/fx24" -v "$WORK/fx24/kube:/root/.kube")"
+#
+# ITS OWN FIXTURE, and that is not tidiness: the run above mounts the directory
+# READ-WRITE and regenerates `config` into it, so re-using it here would test a
+# 19-line kubeconfig against an assertion about a 0-byte one — which is a FAIL
+# on an entrypoint that is behaving correctly. That is how this case shipped
+# broken, and re-using a fixture across two runs with different premises is the
+# general form of it.
+make_fixture "$WORK/fx24b" 0 0
+mkdir -p "$WORK/fx24b/kube"
+: > "$WORK/fx24b/kube/config"
+out="$(run_case "$WORK/fx24b" -v "$WORK/fx24b/kube:/root/.kube")"
 if echo "$out" | grep -q "\[entrypoint\] kubectl: installed; no creds on this device"; then
   echo "  ok: an empty config is not reported as a mounted store"
 else
@@ -1003,11 +1041,9 @@ printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$W
 printf 'turma\n' > "$WORK/fx26/sa/namespace"
 # docker has no umask flag, so set it in a shell that then becomes PID 1 —
 # the same trick the scratch-path case below uses.
-out="$(timeout 180 docker run --rm -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
-  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
-  -v "$WORK/fx26/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
-  -v "$WORK/fx26/repos:/f/repos" -v "$WORK/fx26/claude:/root/.claude" \
-  --entrypoint sh "$IMG" -c 'umask 077; exec /usr/local/bin/entrypoint.sh' 2>&1)"
+out="$(RUN_CASE_SH='umask 077; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx26" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx26/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
 expect "the config was still written" "600" "$(field "$out" KUBECFG_MODE)"
 expect "and the manager kept the umask it was given" "0077" "$(field "$out" MANAGER_UMASK)"
 
@@ -1044,11 +1080,9 @@ mkdir -p "$WORK/fx28/sa"
 printf 'not-a-real-token\n' > "$WORK/fx28/sa/token"
 printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx28/sa/ca.crt"
 printf 'turma\n' > "$WORK/fx28/sa/namespace"
-out="$(timeout 180 docker run --rm --read-only --tmpfs /tmp --tmpfs /run \
-  -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
-  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
-  -v "$WORK/fx28/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
-  -v "$WORK/fx28/repos:/f/repos" -v "$WORK/fx28/claude:/root/.claude" "$IMG" 2>&1)"
+out="$(RUN_CASE_DOCKER_ARGS='--read-only --tmpfs /tmp --tmpfs /run' \
+  run_case "$WORK/fx28" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx28/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
 expect "manager still starts" "0" "$(field "$out" uid)"
 if echo "$out" | grep -q "\[entrypoint\] kubectl: cannot create /root/.kube"; then
   echo "  ok: reported and carried on"
@@ -1084,12 +1118,9 @@ printf 'not-a-real-token\n' > "$WORK/fx30/sa/token"
 printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx30/sa/ca.crt"
 printf 'turma\n' > "$WORK/fx30/sa/namespace"
 # Shadow both stubs with directories, so `command -v` finds nothing on PATH.
-out="$(timeout 180 docker run --rm -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
-  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
-  -v "$WORK/fx30/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
-  -v "$WORK/fx30/repos:/f/repos" -v "$WORK/fx30/claude:/root/.claude" \
-  --entrypoint sh "$IMG" -c \
-  'rm -f /usr/local/bin/kubectl /usr/local/bin/helm; exec /usr/local/bin/entrypoint.sh' 2>&1)"
+out="$(RUN_CASE_SH='rm -f /usr/local/bin/kubectl /usr/local/bin/helm; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx30" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx30/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
 expect "manager still starts" "0" "$(field "$out" uid)"
 expect "no kubeconfig was written" "none" "$(field "$out" KUBECFG_MODE)"
 if echo "$out" | grep -q "\[entrypoint\] kubectl:"; then
@@ -1097,6 +1128,39 @@ if echo "$out" | grep -q "\[entrypoint\] kubectl:"; then
 else
   echo "  ok: silent, like cloud_creds is for an absent CLI"
 fi
+
+# ...and helm ALONE still gets a kubeconfig, logged under its own name. helm
+# shares client-go's loader, so the file is for it too — but calling the line
+# `kubectl:` would break the rule the half above enforces.
+echo "== case: helm alone still gets a kubeconfig, named as helm"
+out="$(RUN_CASE_SH='rm -f /usr/local/bin/kubectl; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx30" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx30/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "the config was written for helm" "600" "$(field "$out" KUBECFG_MODE)"
+if echo "$out" | grep -q "\[entrypoint\] helm: in-cluster ServiceAccount credential"; then
+  echo "  ok: logged under the CLI that is actually installed"
+else
+  echo "  FAIL: not reported as helm: $(echo "$out" | grep -E 'kubectl:|helm:' || echo none)"; FAILED=1
+fi
+
+# --- Case 31: leftover temp files are swept (XERK-369) ----------------------
+# The write goes through `mktemp`, which — unlike the fixed `config.new` it
+# replaced — is not self-limiting: a crash between the mktemp and the mv leaves
+# one behind every time, on a volume that in a pod outlives the container.
+echo "== case: stray temp files from a crashed write are swept"
+make_fixture "$WORK/fx31" 0 0
+mkdir -p "$WORK/fx31/sa" "$WORK/fx31/kube"
+printf 'not-a-real-token\n' > "$WORK/fx31/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx31/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx31/sa/namespace"
+: > "$WORK/fx31/kube/.config.aB3xYz"
+: > "$WORK/fx31/kube/.config.qQ9zPl"
+out="$(run_case "$WORK/fx31" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx31/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx31/kube:/root/.kube")"
+expect "the config was still written" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+expect "and nothing was left behind" "0" "$(field "$out" KUBECFG_STRAYS)"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi

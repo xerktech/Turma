@@ -542,6 +542,14 @@ cloud_creds "terraform" terraform /root/.terraform.d \
 # taken at boot returning `Unauthorized` eight minutes later while the generated
 # config authenticated in the same second.
 #
+# `KUBERNETES_SERVICE_HOST` IS TAKEN ON TRUST, and it is what the generated
+# config pairs with the pod's real bearer token — so whoever sets it decides
+# where that token gets sent. That is NOT a privilege boundary being crossed:
+# setting env on a container means also choosing its image, its entrypoint and
+# its mounts, so anything that can do it can do worse directly. Recorded so it
+# is a decision rather than an oversight; there is nothing in the SA directory
+# to check the address against.
+#
 # Precedence, highest first: an explicit KUBECONFIG, then a kubeconfig already
 # at /root/.kube/config that this block did not write, then the ServiceAccount.
 # The marker line is what makes the second of those decidable — /root is a
@@ -613,12 +621,23 @@ EOF
 # Silent when nothing in the image reads a kubeconfig, matching `cloud_creds`.
 # Gated on helm TOO, not just kubectl: helm shares client-go's loader, so an
 # image with one and not the other still wants the file.
-if ! command -v kubectl >/dev/null 2>&1 && ! command -v helm >/dev/null 2>&1; then
+if command -v kubectl >/dev/null 2>&1; then
+  KUBE_CLI=kubectl
+elif command -v helm >/dev/null 2>&1; then
+  # helm shares client-go's loader, so it wants the file too — and naming it in
+  # the log keeps case 30's rule ("never log about a CLI this image lacks")
+  # true for an image that ships one and not the other.
+  KUBE_CLI=helm
+else
+  KUBE_CLI=""
+fi
+
+if [ -z "$KUBE_CLI" ]; then
   KUBE_FROM_SA=skip
 elif [ -n "${KUBECONFIG:-}" ]; then
   # Mirrors the `aws` branch below: a host configured through the environment
   # must not be reported as credential-less just because ~/.kube is empty.
-  echo "[entrypoint] kubectl: credentials from the environment (KUBECONFIG)"
+  echo "[entrypoint] ${KUBE_CLI}: credentials from the environment (KUBECONFIG)"
   KUBE_FROM_SA=skip
 elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
      && [ -r "${KUBE_SA_DIR}/token" ] \
@@ -648,19 +667,23 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
   [ "${#KUBE_NS}" -le 63 ] || KUBE_NS=default
 
   if [ -z "$KUBE_API_HOST" ]; then
-    echo "[entrypoint] kubectl: KUBERNETES_SERVICE_HOST is not a usable address — leaving the credential to client-go's own in-cluster fallback"
+    echo "[entrypoint] ${KUBE_CLI}: KUBERNETES_SERVICE_HOST is not a usable address — leaving the credential to client-go's own in-cluster fallback"
   elif ! mkdir -p /root/.kube 2>/dev/null; then
-    echo "[entrypoint] kubectl: cannot create /root/.kube — leaving the credential to client-go's own in-cluster fallback"
+    echo "[entrypoint] ${KUBE_CLI}: cannot create /root/.kube — leaving the credential to client-go's own in-cluster fallback"
   # `mktemp`, not a fixed `config.new`: it creates the file 0600 before anything
   # is written — so the mode is never a race and no `umask` is touched, which is
   # what a bare `umask 077 … umask 022` pair got wrong (it leaked a hardcoded
   # 022 into the manager, the tunnel and every session) — and it can never
   # destroy an operator's own file that happened to sit at the name we chose.
-  elif ! KUBE_TMP="$(mktemp /root/.kube/.config.XXXXXX 2>/dev/null)"; then
-    echo "[entrypoint] kubectl: cannot write /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
+  # Sweep first: unlike the fixed `config.new` this replaced, a unique name
+  # accumulates — a crash between the `mktemp` and the `mv` leaves one behind,
+  # and in a pod /root is a persistent volume that nothing else cleans.
+  elif ! { rm -f /root/.kube/.config.?????? 2>/dev/null; \
+           KUBE_TMP="$(mktemp /root/.kube/.config.XXXXXX 2>/dev/null)"; }; then
+    echo "[entrypoint] ${KUBE_CLI}: cannot write /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
   elif ! kube_write_config "$KUBE_TMP" 2>/dev/null; then
     rm -f "$KUBE_TMP" 2>/dev/null || true
-    echo "[entrypoint] kubectl: cannot write /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
+    echo "[entrypoint] ${KUBE_CLI}: cannot write /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
   else
     chmod 0600 "$KUBE_TMP" 2>/dev/null || true
     if mv -f "$KUBE_TMP" /root/.kube/config 2>/dev/null; then
@@ -668,10 +691,10 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
         chown -R "$PUID:$PGID" /root/.kube 2>/dev/null || true
       fi
       KUBE_FROM_SA=yes
-      echo "[entrypoint] kubectl: in-cluster ServiceAccount credential (ns ${KUBE_NS})"
+      echo "[entrypoint] ${KUBE_CLI}: in-cluster ServiceAccount credential (ns ${KUBE_NS})"
     else
       rm -f "$KUBE_TMP" 2>/dev/null || true
-      echo "[entrypoint] kubectl: cannot replace /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
+      echo "[entrypoint] ${KUBE_CLI}: cannot replace /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
     fi
   fi
 fi

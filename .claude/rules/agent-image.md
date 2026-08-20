@@ -152,6 +152,11 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
     see. The write's `umask` is scoped to a SUBSHELL: a bare pair leaks into the manager, the
     tunnel and every session, and restores a hardcoded value rather than the operator's.
+  - **`KUBERNETES_SERVICE_HOST` is taken on trust** and is what the generated config pairs with the
+    pod's real bearer token, so whoever sets it decides where that token is sent. Not a boundary
+    being crossed — setting env on a container means choosing its image and entrypoint too — and
+    there is nothing in the SA directory to check the address against. Recorded so it stays a
+    decision.
   - Tests: the XERK-369 cases in `test_entrypoint.sh`.
 - **Android toolchain** — JDK 17 + Gradle + Android SDK (`gradle`/`sdkmanager`/`avdmanager`/`adb`/
   `aapt2` on PATH), pinned via
