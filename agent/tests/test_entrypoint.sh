@@ -1428,7 +1428,8 @@ expect "the config is the session's" "1500:1500" "$(field "$out" KUBECFG_OWNER)"
 expect "and so is the directory it sits in" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
 
 # --- Case 40: a created ~/.kube is handed over even when the write fails ----
-# Case 39 covers the success exit. The two FAILURE exits create the directory
+# Case 39 covers the success exit. The THREE failure exits — stage-fail here,
+# write-fail (case 43) and replace-fail (case 41) — create the directory
 # just the same, and the harm is identical: a dropped session can read the
 # config it does not have and write nothing — no `kubectl config` mutation, no
 # discovery cache — repaired only on the next boot, which on an ephemeral root
@@ -1477,8 +1478,15 @@ expect "but the directory is still the session's" "1500:1500" "$(field "$out" KU
 #
 # The race is not winnable in practice (nothing runs as the session identity
 # during boot), so it is staged with a `mkdir` stub that plants the symlink at
-# exactly that moment. The point is to pin the `-h`: without it, both mutants
-# that drop it pass every other case in this suite.
+# exactly that moment.
+#
+# THIS PINS THE DIRECTORY CHOWN'S `-h`, AND ONLY THAT ONE. Dropping `-h` from
+# the CONFIG chown passes all of this suite, and no case here can catch it:
+# `kube_config_is_ours` refuses a symlinked `config`, and `mv -f` replaces the
+# destination rather than following it, so the only way to observe that one is a
+# race between the `mv` and the `chown`. It stays `-h` as defence in depth
+# against a shape this harness cannot construct — do not read its presence as
+# tested.
 echo "== case: the hand-over chown does not follow a planted symlink"
 make_fixture "$WORK/fx42" 1500 1500
 mkdir -p "$WORK/fx42/sa"
@@ -1491,6 +1499,36 @@ out="$(RUN_CASE_SH='printf "#!/bin/sh\nfor a in \"\$@\"; do if [ \"\$a\" = /root
 expect "manager still starts" "1500" "$(field "$out" uid)"
 expect "the link itself was re-owned" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
 expect "and its target was not" "0:0" "$(field "$out" VICTIM_OWNER)"
+
+# --- Case 43: the write exit clears up and hands over (XERK-369) ------------
+# The last of the three failure exits, and the one previously written off as
+# unreachable. It is not: a `/root` tmpfs filled to 100% lets `mkdir` and
+# `mktemp` succeed — they allocate metadata, not blocks — and fails only the
+# heredoc, which is exactly this branch. No stub of any kind.
+#
+# Two things go untested without it, and QA measured both escaping the whole
+# suite: this branch's own `rm -rf` (delete it and `.turma-tmp` is left behind
+# on a volume that in a pod outlives the container), and the hand-over of a
+# directory the block created on the way to failing.
+echo "== case: the write exit clears up, and still hands the directory over"
+make_fixture "$WORK/fx43" 1500 1500
+mkdir -p "$WORK/fx43/sa"
+printf 'not-a-real-token\n' > "$WORK/fx43/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx43/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx43/sa/namespace"
+out="$(RUN_CASE_DOCKER_ARGS='--tmpfs /root:size=64k,mode=0755,exec' \
+  RUN_CASE_SH='dd if=/dev/zero of=/root/filler bs=1k count=64 2>/dev/null; exec /usr/local/bin/entrypoint.sh' \
+  run_case "$WORK/fx43" -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx43/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "manager uid" "1500" "$(field "$out" uid)"
+expect "no config was written" "none" "$(field "$out" KUBECFG_MODE)"
+expect "nothing was staged" "gone" "$(field "$out" KUBECFG_TMPDIR)"
+expect "and the directory is still the session's" "1500:1500" "$(field "$out" KUBEDIR_OWNER)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: cannot write /root/.kube/config"; then
+  echo "  ok: reported and carried on"
+else
+  echo "  FAIL: no 'cannot write' line: $(echo "$out" | grep -E 'kubectl:' || echo none)"; FAILED=1
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi

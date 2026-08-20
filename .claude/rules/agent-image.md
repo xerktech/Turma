@@ -174,9 +174,9 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     assertion about the FILE still passes.
   - **The hand-over happens where the directory is CREATED, not where the write succeeds** — all
     three failure exits create it too, and a fix that lived in the success branch left them with the
-    same root-owned directory. Tests: the success exit and two of the three failure exits assert the
-    directory's owner; the write-fail exit is unreachable from the harness without stubbing `cat`,
-    and logs the same line as the stage-fail exit anyway. The MOUNTED-directory case's probes are
+    same root-owned directory. Tests: one case per exit, the write-fail one reached by filling a
+    `/root` tmpfs to 100% — `mkdir` and `mktemp` allocate metadata rather than blocks, so only the
+    heredoc fails. The MOUNTED-directory case's probes are
     uid 2000, not root, because the self-heal re-owns a root-owned probe first and the assertion
     then cannot tell "chown only what we made" from "chown unconditionally" apart.
   - **Both chowns are `-h`.** `chown` follows a symlink argument, so without it a symlink appearing
