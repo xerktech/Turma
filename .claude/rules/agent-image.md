@@ -100,6 +100,33 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     error**: the preflight only LOGS which stores it found, keying on a **login-marker file** never
     the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's
     build-time smoke test drops the stores it creates. `permissions.deny` protects them.
+- **Cluster CLIs** (`kubectl`/`helm`/`talosctl`/`omnictl`, pinned via `KUBECTL_VERSION`/
+  `HELM_VERSION`/`TALOSCTL_VERSION`/`OMNICTL_VERSION` in `agent/Dockerfile`) sit in `tooling` beside
+  the cloud CLIs, on the same terms and for the same reason (XERK-369).
+  - **Their versions track the `k8x` CLUSTER, not `latest`.** kubectl tolerates one minor of skew
+    either side of the API server and talosctl's machine API is versioned with Talos, so both follow
+    `xerktech/Talos` `cluster.env` (`KUBERNETES_VERSION`, `TALOS_VERSION`) and omnictl follows the
+    Omni release `xerktech/ArgoCD` deploys. A CVE bump alone is not a reason to move them.
+  - **Their digests are pinned**, unlike ttyd/docker/terraform: these four run with cluster-admin-
+    shaped credentials against infrastructure this fleet owns, and a version tag can be re-pointed
+    at a new artifact by whoever controls the release. Refresh from the publishers' checksum files
+    (URLs are in the Dockerfile comment) in the same commit as the version bump.
+  - Creds are the host's, optional, and log-only exactly like the cloud stores: `/root/.kube/config`,
+    `/root/.talos/config`, `/root/.config/omni/config`, all `permissions.deny`-protected. **A
+    `~/.talos/config` that EXISTS may still hold no context** — `talosctl` writes one just by being
+    run, and truenas's is `context: ""` — so the preflight's line means a store is there, never that
+    it works.
+- **In-cluster, the kubeconfig is the POD'S OWN ServiceAccount and nothing is mounted** (XERK-369).
+  `entrypoint.sh` writes `/root/.kube/config` from the projected token when — and only when —
+  `KUBERNETES_SERVICE_HOST` is set, the token is readable, and neither `KUBECONFIG` nor an existing
+  `/root/.kube/config` says otherwise. A mounted kubeconfig always wins; overwriting one would
+  redirect every session on that host at the local API server.
+  - **It must be `tokenFile:`, never an inline `token:`.** The projected token is rewritten in place
+    roughly hourly, so a value baked at boot authenticates for an hour and then fails in a pod that
+    has been up for days and still looks healthy.
+  - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
+    otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
+    see. Tests: the XERK-369 cases in `test_entrypoint.sh`.
 - **Android toolchain** — JDK 17 + Gradle + Android SDK (`gradle`/`sdkmanager`/`avdmanager`/`adb`/
   `aapt2` on PATH), pinned via
   `GRADLE_VERSION`/`ANDROID_CMDLINE_TOOLS`/`ANDROID_PLATFORM`/`ANDROID_BUILD_TOOLS` in

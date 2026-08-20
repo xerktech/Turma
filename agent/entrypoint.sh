@@ -104,7 +104,8 @@ else
   # retargeted rather than followed out of the tree.
   echo "[entrypoint] identity: ${RUN_USER}(${PUID}:${PGID}) — reclaiming root-owned leftovers..."
   for p in "$REPOS_ROOT" /root/.claude /root/.claude.json /root/.turma \
-           /root/.aws /root/.azure /root/.terraform.d; do
+           /root/.aws /root/.azure /root/.terraform.d \
+           /root/.kube /root/.talos /root/.config/omni; do
     [ -e "$p" ] || continue
     find "$p" -uid 0 -exec chown -h "$PUID:$PGID" {} + 2>/dev/null || true
   done
@@ -517,6 +518,85 @@ cloud_creds "az" az /root/.azure \
   /root/.azure/msal_token_cache.json /root/.azure/service_principal_entries.json
 cloud_creds "terraform" terraform /root/.terraform.d \
   /root/.terraform.d/credentials.tfrc.json
+
+# --- In-cluster kubeconfig (agent-agnostic) --------------------------------
+# When this container IS a pod — XERK-369's cluster-side agent — kubectl and
+# helm authenticate as the pod's own ServiceAccount, and NO kubeconfig is
+# mounted. That is the whole credential story there: the token is projected by
+# the kubelet, it rotates on its own, and it is revoked by deleting one
+# ClusterRoleBinding. Nothing is copied into a vault and nothing expires quietly
+# the way the cluster's static `admin` client certificate does.
+#
+# `tokenFile:` rather than an inline `token:` is what makes the rotation work.
+# A projected token is re-written in place roughly hourly; a kubeconfig that
+# baked the value at boot would authenticate until that copy expired and then
+# start failing, in a pod that had been up for days and looked healthy.
+#
+# Written ONLY when there is nothing else to use — a mounted /root/.kube/config
+# or an explicit KUBECONFIG wins, so a host that mounts a real kubeconfig (or a
+# pod that is later given one) is unaffected. Outside a cluster the whole block
+# is skipped: there is no ServiceAccount token to read.
+KUBE_SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
+KUBE_FROM_SA=no
+if [ -z "${KUBECONFIG:-}" ] && [ ! -e /root/.kube/config ] \
+   && [ -n "${KUBERNETES_SERVICE_HOST:-}" ] && [ -r "${KUBE_SA_DIR}/token" ]; then
+  # An IPv6 apiserver address has to be bracketed in the URL. This cluster is
+  # v4-only, so the branch is untested there and costs two lines to be right.
+  case "${KUBERNETES_SERVICE_HOST}" in
+    *:*) KUBE_API_HOST="[${KUBERNETES_SERVICE_HOST}]" ;;
+    *)   KUBE_API_HOST="${KUBERNETES_SERVICE_HOST}" ;;
+  esac
+  KUBE_NS="$(cat "${KUBE_SA_DIR}/namespace" 2>/dev/null || echo default)"
+  mkdir -p /root/.kube
+  umask 077
+  cat > /root/.kube/config <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+  - name: in-cluster
+    cluster:
+      server: https://${KUBE_API_HOST}:${KUBERNETES_SERVICE_PORT:-443}
+      certificate-authority: ${KUBE_SA_DIR}/ca.crt
+users:
+  - name: in-cluster
+    user:
+      tokenFile: ${KUBE_SA_DIR}/token
+contexts:
+  - name: in-cluster
+    context:
+      cluster: in-cluster
+      user: in-cluster
+      namespace: ${KUBE_NS}
+current-context: in-cluster
+EOF
+  umask 022
+  if [ "$DROP_PRIV" = "yes" ]; then
+    chown -R "$PUID:$PGID" /root/.kube
+  fi
+  KUBE_FROM_SA=yes
+  echo "[entrypoint] kubectl: in-cluster ServiceAccount credential (ns ${KUBE_NS})"
+fi
+
+# --- Cluster CLI creds preflight (agent-agnostic) --------------------------
+# kubectl, helm, talosctl and omnictl, on the same terms as the cloud CLIs
+# above: installed in every image, credentials supplied by the host (or, for
+# kubectl, by the block above), never fatal, log-only.
+#
+#   /root/.kube/config          kubectl, helm
+#   /root/.talos/config         talosctl
+#   /root/.config/omni/config   omnictl
+#
+# Same caveat as ~/.azure, and it bites hardest on talosctl: `talosctl config`
+# writes ~/.talos/config the first time it is run at all, so the file can exist
+# holding `context: ""` and no contexts — which is exactly what the truenas host
+# has. A presence check says a store is there, never that a usable context is.
+# The CLI reports the real answer at the point of use, in the session, where an
+# agent can act on it.
+if [ "$KUBE_FROM_SA" = "no" ]; then
+  cloud_creds "kubectl" kubectl /root/.kube /root/.kube/config
+fi
+cloud_creds "talosctl" talosctl /root/.talos /root/.talos/config
+cloud_creds "omnictl" omnictl /root/.config/omni /root/.config/omni/config
 
 # --- Host identity (agent-agnostic) ----------------------------------------
 # The hub keys each agent by its physical host name (device). A container can't

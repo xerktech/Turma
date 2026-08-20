@@ -174,7 +174,8 @@ spec:
             - { name: IS_SANDBOX,   value: "1" }
             - { name: PUID,         value: "0" }
           envFrom:
-            - secretRef: { name: turma-agent }             # TURMA_TOKEN, JIRA_*, GITLAB_TOKEN
+            - configMapRef: { name: turma-agent }          # the non-secret config, all of it
+            - secretRef:    { name: turma-agent }          # TURMA_TOKEN, JIRA_*, GITLAB_TOKEN
           resources:
             requests: { cpu: "2", memory: 8Gi }
             limits:   { cpu: "8", memory: 32Gi }           # MAX_SESSIONS x session + build headroom
@@ -223,6 +224,19 @@ This is what the ticket owner asked for, and it falls out of having one agent:
 - **One `~/.aws`, `~/.azure`, `~/.terraform.d`.** They live on the PVC exactly as they live on a host
   bind mount today, and the guard's `permissions.deny` rules already protect them from the Edit/Write
   tools (`.claude/rules/agent-hooks.md`) while leaving an explicit `aws sso login` working.
+- **The cluster credential is the pod's own ServiceAccount, and there is no kubeconfig anywhere.**
+  The agent's job here is to manage `k8x`, so the image now carries `kubectl`, `helm`, `talosctl` and
+  `omnictl` (`.claude/rules/agent-image.md`) and the pod runs under a `turma-agent` ServiceAccount
+  bound to `cluster-admin`; `entrypoint.sh` turns the projected token into `/root/.kube/config` at
+  boot. The alternative — putting the cluster's `admin@k8x` client certificate in Bitwarden and
+  mounting it — was rejected: it is the strongest static credential the cluster has, copying it adds
+  a third place to hold it, it cannot be revoked without rotating the cluster PKI, and it expires
+  (2027-08-17) with nothing watching. A projected token rotates itself and is revoked by deleting
+  one binding.
+  - **`talosctl` and `omnictl` get no such treatment** — their credentials are a Talos PKI client
+    cert and an Omni service-account key, which no in-cluster identity can stand in for. Those are
+    mounted from Bitwarden, read-only, and are the only cluster credentials this pod holds as files.
+  - The pod therefore needs `automountServiceAccountToken: true`, unlike the hub beside it.
 - **`DEVICE_NAME` is the agent's whole identity** — it names the hub card, `TURMA_TOKEN` is
   HMAC-bound to it (XERK-268), and it keys the tunnel's control channel. `hub-agent.py` and
   `tunnel-agent.js` must resolve the *same* name or the host gets commands while its terminal and
@@ -409,6 +423,18 @@ Stated so they are choices:
   removes it.
 - **One triage, one login, one credential set** — the upside of the same concentration, and the
   reason this shape was chosen.
+
+## What shipped, and where
+
+Phase 1 is split across two repos, because the image and the workload live in different ones:
+
+- **`xerktech/Turma`** — the cluster CLIs in `agent/Dockerfile`, the in-cluster kubeconfig and the
+  cluster-creds preflight in `agent/entrypoint.sh`, and `Edit(~/.kube/**)` / `Edit(~/.talos/**)` /
+  `Edit(~/.config/omni/**)` on the guard's deny list.
+- **`xerktech/ArgoCD`** — `ai/turma-agent/`: the ConfigMap holding every non-secret setting, the
+  ExternalSecret holding the rest, the ServiceAccount and its binding, and the StatefulSet. It is a
+  second Application in the `turma` namespace beside the hub, at its own path, for the reason
+  `apps/turma.yaml` already records: an Application's `path:` is not recursive.
 
 ## Next steps
 

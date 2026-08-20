@@ -54,6 +54,14 @@ echo "ROOTDIR_OWNER=$(stat -c '%u:%g' /root)"
 touch "$REPOS_ROOT/.probe" 2>/dev/null || true
 echo "NEWFILE_OWNER=$(stat -c '%u:%g' "$REPOS_ROOT/.probe" 2>/dev/null || echo none)"
 echo "LEFTOVER_ROOT_PATHS=$(find "$REPOS_ROOT" /root/.claude -uid 0 2>/dev/null | wc -l)"
+# What the in-cluster kubeconfig block left behind, observed from the process
+# that would actually use it. Reported as fields rather than a dump so the token
+# PATH is asserted and no credential is ever echoed.
+echo "KUBECFG_SERVER=$(sed -n 's/^ *server: *//p' /root/.kube/config 2>/dev/null | head -1)"
+echo "KUBECFG_TOKENFILE=$(sed -n 's/^ *tokenFile: *//p' /root/.kube/config 2>/dev/null | head -1)"
+echo "KUBECFG_NS=$(sed -n 's/^ *namespace: *//p' /root/.kube/config 2>/dev/null | head -1)"
+echo "KUBECFG_MODE=$(stat -c %a /root/.kube/config 2>/dev/null || echo none)"
+echo "KUBECFG_OWNER=$(stat -c '%u:%g' /root/.kube/config 2>/dev/null || echo none)"
 # Configurable lifetime: the manager is PID 1, so how long IT lives is how long
 # the container lives — the tunnel-supervision case needs a few seconds.
 sleep "${STUB_MANAGER_SLEEP:-1}"
@@ -65,7 +73,8 @@ echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid() 
 # Stand-ins for the cloud CLIs the real image bundles. The preflight only ever
 # probes `command -v` and the creds store on disk — it deliberately never runs
 # these — so a stub on PATH exercises it exactly as the 1 GB of real ones would.
-for cli in aws az terraform; do
+# The cluster CLIs (XERK-369) ride the same preflight and the same rule.
+for cli in aws az terraform kubectl helm talosctl omnictl; do
   printf '#!/bin/sh\necho "%s stub should not be invoked" >&2\nexit 1\n' "$cli" \
     > "$WORK/$cli"
 done
@@ -113,11 +122,13 @@ cat > "$WORK/Dockerfile" <<'DOCKERFILE'
 FROM node:24-bookworm-slim
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY python3 /usr/local/bin/python3
-COPY hub-agent.py tunnel-agent.js aws az terraform /usr/local/bin/
+COPY hub-agent.py tunnel-agent.js aws az terraform kubectl helm talosctl omnictl /usr/local/bin/
 # Last, so they shadow the base image's real npm.
 COPY claude npm /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/python3 \
       /usr/local/bin/aws /usr/local/bin/az /usr/local/bin/terraform \
+      /usr/local/bin/kubectl /usr/local/bin/helm /usr/local/bin/talosctl \
+      /usr/local/bin/omnictl \
       /usr/local/bin/claude /usr/local/bin/npm
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 DOCKERFILE
@@ -685,6 +696,91 @@ if echo "$out" | grep -q "claude check skipped"; then
 else
   echo "  FAIL: a restart loop would check on every pass: $(echo "$out" | grep claude)"; FAILED=1
 fi
+
+# --- Case 14: no cluster creds on the device (XERK-369) ----------------------
+# kubectl/helm/talosctl/omnictl ship in every image, and a host that gives them
+# nothing to authenticate with is a supported configuration exactly like a host
+# with no ~/.aws. Same non-fatal contract as the cloud preflight above.
+echo "== case: no cluster creds mounted is ignored, not fatal"
+make_fixture "$WORK/fx14" 0 0
+out="$(run_case "$WORK/fx14")"
+for cli in kubectl talosctl omnictl; do
+  if echo "$out" | grep -q "\[entrypoint\] ${cli}: installed; no creds on this device"; then
+    echo "  ok: ${cli} reported as ignored"
+  else
+    echo "  FAIL: ${cli} — no 'ignoring' line in output"; FAILED=1
+  fi
+done
+expect "manager still starts" "0" "$(field "$out" uid)"
+
+# --- Case 15: in-cluster ServiceAccount becomes the kubeconfig (XERK-369) ----
+# The cluster-side agent mounts NO kubeconfig; its credential is the pod's own
+# projected ServiceAccount token. `tokenFile:` is the assertion that matters —
+# an inline token would be baked at boot and start failing hours later, in a pod
+# that had been up for days and still looked healthy.
+echo "== case: in-cluster ServiceAccount is turned into a kubeconfig"
+make_fixture "$WORK/fx15" 0 0
+mkdir -p "$WORK/fx15/sa"
+printf 'not-a-real-token\n' > "$WORK/fx15/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx15/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx15/sa/namespace"
+out="$(run_case "$WORK/fx15" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 -e KUBERNETES_SERVICE_PORT=443 \
+  -v "$WORK/fx15/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "apiserver from the injected env" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+expect "credential is the rotating token FILE" \
+  "/var/run/secrets/kubernetes.io/serviceaccount/token" "$(field "$out" KUBECFG_TOKENFILE)"
+expect "context namespace is the pod's own" "turma" "$(field "$out" KUBECFG_NS)"
+expect "kubeconfig is not world-readable" "600" "$(field "$out" KUBECFG_MODE)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: in-cluster ServiceAccount credential (ns turma)"; then
+  echo "  ok: reported as the in-cluster credential, not as a mounted store"
+else
+  echo "  FAIL: no in-cluster kubectl line in output"; FAILED=1
+fi
+if echo "$out" | grep -q "\[entrypoint\] kubectl: installed; no creds"; then
+  echo "  FAIL: also reported as credential-less"; FAILED=1
+else
+  echo "  ok: the 'no creds' line is suppressed"
+fi
+
+# --- Case 16: a mounted kubeconfig wins over the ServiceAccount (XERK-369) ---
+# A pod that IS given a kubeconfig — another cluster, or a real admin credential
+# — must keep it. Overwriting it would silently redirect every kubectl call in
+# every session on that host at the local API server.
+echo "== case: a mounted kubeconfig is never overwritten"
+make_fixture "$WORK/fx16" 0 0
+mkdir -p "$WORK/fx16/sa" "$WORK/fx16/kube"
+printf 'not-a-real-token\n' > "$WORK/fx16/sa/token"
+printf 'turma\n' > "$WORK/fx16/sa/namespace"
+printf 'apiVersion: v1\nkind: Config\nclusters:\n  - name: other\n    cluster:\n      server: https://elsewhere.example:6443\n' \
+  > "$WORK/fx16/kube/config"
+out="$(run_case "$WORK/fx16" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx16/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx16/kube:/root/.kube")"
+expect "the mounted kubeconfig survives" "https://elsewhere.example:6443" \
+  "$(field "$out" KUBECFG_SERVER)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: host creds mounted at /root/.kube"; then
+  echo "  ok: reported as a mounted store"
+else
+  echo "  FAIL: a mounted kubeconfig was not reported"; FAILED=1
+fi
+
+# --- Case 17: the generated kubeconfig lands host-owned (XERK-369) -----------
+# It is written as root, before the manager starts, into a /root the identity
+# block has already handed to the run-as user. Left root-owned it is unreadable
+# by every session on a PUID host — kubectl fails with a permission error on a
+# file the operator can neither see nor fix.
+echo "== case: the generated kubeconfig is owned by the run-as user"
+make_fixture "$WORK/fx17" 1000 1000
+mkdir -p "$WORK/fx17/sa"
+printf 'not-a-real-token\n' > "$WORK/fx17/sa/token"
+printf 'turma\n' > "$WORK/fx17/sa/namespace"
+out="$(run_case "$WORK/fx17" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx17/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "manager uid" "1000" "$(field "$out" uid)"
+expect "kubeconfig owner" "1000:1000" "$(field "$out" KUBECFG_OWNER)"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi
