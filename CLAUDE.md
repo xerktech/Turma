@@ -258,6 +258,19 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     DELIVER into a session — it just can't discover one. **One Claude login per org is the only
     hard boundary**, and it is a DockerOps decision. Don't describe this contract as sealing it.
   - Mechanics in `.claude/rules/agent-sessions.md` and `.claude/rules/agent-hooks.md`.
+- **Nothing on the agent's BEAT LOOP may have a worst case at or above the hub's `OFFLINE_AFTER_MS`**
+  (XERK-395). The hub calls a host offline after 75s of silence (`turma/server.js`); what sets the
+  gap between two beats is the AGENT's own timeouts and retry counts, so neither side's
+  `paths:`-scoped file sees both halves. Archive sync broke it — `ARCHIVE_CHUNK_TIMEOUT_SEC` +
+  `ARCHIVE_RAW_FAILURES_MAX` x `ARCHIVE_RAW_TIMEOUT_SEC` = 105s of pushes inline, measured on a
+  lossy link as a 111s beat gap that rendered a healthy host offline for ~36s, 8x in 2h — and moved
+  to a worker thread, as `prune` did for the same reason (XERK-256).
+  - **A try/except around slow work does not satisfy this**: it catches exceptions, never TIME,
+    which is what actually costs the host its online status. Nor does a deadline alone, while one
+    in-flight push can overshoot it by a full timeout.
+  - Inline may cost `INTERVAL` plus the beat's own POSTs (`HEARTBEAT_TIMEOUT_SEC`, twice on a cycle
+    that executed commands) — 40s of the 75s. Anything else with a network or disk worst case
+    belongs on a worker. Tests: `TestBeatLoopBudget`, `TestArchiveSyncWorker`.
 - **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
   it. Changing the rule means changing all five.

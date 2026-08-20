@@ -400,6 +400,22 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   ledger slug's `*.jsonl`, minus any backing a running session); the hub replies with per-transcript
   byte cursors (`archiveHave`), and `_archive_deltas()` POSTs the missing append-only deltas
   (pre-parsed through `_entry_text`), bounded per chunk/beat.
+- **Both passes run on a WORKER THREAD, never the beat** (XERK-395), the same fix `prune` got:
+  their combined worst case is larger than the hub's offline threshold, so inline a lossy link made
+  a healthy host read as dead. `run_forever` only calls `queue_archive_sync`, which STAGES the
+  reply's cursors; `_archive_sync_pass` pushes. See the beat-loop budget contract in `CLAUDE.md`.
+  - **Jobs COALESCE, they do not queue.** A pass is only worth running against the NEWEST cursors,
+    so a job staged behind a slow pass replaces the one waiting — queuing them would grow an
+    unbounded backlog on any host pushing slower than `INTERVAL`, all of it aimed at cursors the hub
+    has already moved past.
+  - One long-lived daemon worker (prune's exits when drained; a job here arrives every beat), never
+    joined on shutdown: the archive is append-only against HUB-held cursors, so a pass cut short is
+    re-offered on the next beat.
+  - `_archive_wake` is cleared BEFORE the job is taken, never after — the beat stores the job and
+    only then sets it, so clearing afterwards drops a job staged mid-pass.
+  - `self._archive_pending` is beat-written and worker-read with no lock, which is safe ONLY because
+    the beat REBINDS it and never mutates it in place; each pass snapshots it once. Tests:
+    `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,

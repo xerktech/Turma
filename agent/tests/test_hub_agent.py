@@ -16,6 +16,7 @@ import errno
 import gzip
 import http.server
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -15206,6 +15207,194 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
                                lambda tid, body: (calls.append(tid), {"bytesStored": 0, "full": True})[1]):
             sm._archive_deltas({})
         self.assertEqual(len(calls), 1)
+
+
+class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
+    """Archive sync runs on its OWN thread, never the beat loop (XERK-395).
+
+    Both passes together are allowed more network time than the hub waits before
+    calling a host offline, so inline they turned a lossy link into a host that
+    reads as dead (measured: a 111s beat gap against a 75s threshold, on a host
+    that was fine)."""
+
+    def _drain(self, sm, timeout=5):
+        """Wait until the worker has no staged job and is not mid-pass."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with sm._archive_lock:
+                idle = sm._archive_job is None
+            if idle and not sm._archive_wake.is_set():
+                # One more beat of grace for a pass that took the job but has
+                # not finished it.
+                time.sleep(0.02)
+                with sm._archive_lock:
+                    if sm._archive_job is None:
+                        return
+            time.sleep(0.01)
+        self.fail("archive worker never drained")
+
+    def test_run_forever_does_not_push_inline(self):
+        """The beat loop STAGES the cursors; it must not call either pass.
+
+        Source-level on purpose: this is the invariant, and it is undone by an
+        ordinary-looking edit that puts a push back where the reply is read."""
+        src = inspect.getsource(ha.SessionManager.run_forever)
+        self.assertIn("queue_archive_sync(", src)
+        self.assertNotIn("_archive_deltas(", src)
+        self.assertNotIn("_archive_raw_deltas(", src)
+
+    def test_queue_returns_while_a_pass_is_blocked(self):
+        """A push wedged for longer than the hub's whole offline threshold must
+        not hold the caller for a measurable moment."""
+        sm = self.make_manager()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking(*a, **k):
+            started.set()
+            release.wait(10)
+
+        with mock.patch.object(sm, "_archive_deltas", blocking), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            t0 = time.time()
+            sm.queue_archive_sync({"archiveHave": {"t1": 0}})
+            elapsed = time.time() - t0
+            self.assertTrue(started.wait(5), "the pass never ran on the worker")
+            self.assertLess(elapsed, 0.5)
+            release.set()
+
+    def test_cursors_and_flags_reach_both_passes(self):
+        sm = self.make_manager()
+        seen = {}
+        done = threading.Event()
+
+        def rendered(have, shed=None, full=False):
+            seen["rendered"] = (have, shed, full)
+
+        def raw(raw_have, skip_ids=None, store_full=False):
+            seen["raw"] = (raw_have, skip_ids, store_full)
+            done.set()
+
+        with mock.patch.object(sm, "_archive_deltas", rendered), \
+                mock.patch.object(sm, "_archive_raw_deltas", raw):
+            sm.queue_archive_sync({
+                "archiveHave": {"t1": 10}, "archiveShed": ["t2"],
+                "archiveFull": True, "archiveRawHave": {"t1": {"t1.jsonl": 4}},
+                "archiveRawSkip": ["t3"],
+            })
+            self.assertTrue(done.wait(5))
+
+        self.assertEqual(seen["rendered"], ({"t1": 10}, ["t2"], True))
+        self.assertEqual(seen["raw"], ({"t1": {"t1.jsonl": 4}}, ["t3"], True))
+
+    def test_no_archive_have_stages_nothing(self):
+        """A hub too old to ask for an archive is the same nothing-to-do the
+        inline call read it as — and must not spin up a worker."""
+        sm = self.make_manager()
+        sm.queue_archive_sync({})
+        self.assertIsNone(sm._archive_worker)
+        self.assertIsNone(sm._archive_job)
+
+    def test_jobs_coalesce_to_the_newest_cursors(self):
+        """Beats landing behind a slow pass SUPERSEDE each other rather than
+        queuing: a pass is only ever worth running against the newest cursors,
+        and queuing them would grow an unbounded backlog on a slow host."""
+        sm = self.make_manager()
+        first = threading.Event()
+        release = threading.Event()
+        passes = []
+
+        def rendered(have, shed=None, full=False):
+            passes.append(have)
+            if len(passes) == 1:
+                first.set()
+                release.wait(10)
+
+        with mock.patch.object(sm, "_archive_deltas", rendered), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(first.wait(5))
+            for n in (2, 3, 4):
+                sm.queue_archive_sync({"archiveHave": {"t1": n}})
+            release.set()
+            self._drain(sm)
+
+        # Exactly two passes: the one that was running, and ONE more carrying the
+        # newest cursors — not one per beat that arrived while it ran.
+        self.assertEqual(passes, [{"t1": 1}, {"t1": 4}])
+
+    def test_a_raising_pass_does_not_kill_the_worker(self):
+        """The rendered pass raising must cost neither the raw pass (XERK-338's
+        split) nor every LATER pass — the worker is the only archive there is."""
+        sm = self.make_manager()
+        raw_calls = []
+        done = threading.Event()
+
+        def boom(*a, **k):
+            raise RuntimeError("push exploded")
+
+        def raw(*a, **k):
+            raw_calls.append(a[0])
+            done.set()
+
+        with mock.patch.object(sm, "_archive_deltas", boom), \
+                mock.patch.object(sm, "_archive_raw_deltas", raw):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}, "archiveRawHave": {"a": 1}})
+            self.assertTrue(done.wait(5))
+            done.clear()
+            sm.queue_archive_sync({"archiveHave": {"t1": 2}, "archiveRawHave": {"b": 2}})
+            self.assertTrue(done.wait(5), "the worker died on the first failure")
+
+        self.assertEqual(raw_calls, [{"a": 1}, {"b": 2}])
+        self.assertTrue(sm._archive_worker.is_alive())
+
+    def test_worker_is_daemon_and_reused(self):
+        """One long-lived worker, not one per beat."""
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_archive_deltas", lambda *a, **k: None), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            worker = sm._archive_worker
+            self._drain(sm)
+            sm.queue_archive_sync({"archiveHave": {"t1": 2}})
+            self._drain(sm)
+        self.assertIs(sm._archive_worker, worker)
+        self.assertTrue(worker.daemon)
+        self.assertTrue(worker.is_alive())
+
+
+class TestBeatLoopBudget(unittest.TestCase):
+    """The beat loop's blocking budget against the hub's offline threshold
+    (XERK-395) — a cross-component contract, so it is read out of
+    `turma/server.js` rather than restated here."""
+
+    def _offline_after_ms(self):
+        server = os.path.join(os.path.dirname(AGENT_DIR), "turma", "server.js")
+        if not os.path.exists(server):
+            self.skipTest("turma/server.js not checked out beside the agent")
+        m = re.search(r"OFFLINE_AFTER_MS\s*=\s*(\d+)\s*\*\s*(\d+)",
+                      open(server).read())
+        self.assertIsNotNone(m, "OFFLINE_AFTER_MS moved or changed shape")
+        return int(m.group(1)) * int(m.group(2))
+
+    def test_archive_worst_case_exceeds_the_offline_threshold(self):
+        """WHY archive sync may not run inline: one rendered push plus the raw
+        pass's whole failure budget is longer than the hub's patience, so an
+        inline pass can silently cost the host its online status. If this ever
+        stops being true it is still not licence to move it back — the worker is
+        also what keeps the beat's cost independent of the archive's."""
+        worst = (ha.ARCHIVE_CHUNK_TIMEOUT_SEC
+                 + ha.ARCHIVE_RAW_FAILURES_MAX * ha.ARCHIVE_RAW_TIMEOUT_SEC)
+        self.assertGreaterEqual(worst * 1000, self._offline_after_ms())
+
+    def test_what_stays_on_the_beat_fits_under_the_threshold(self):
+        """What IS inline — the interval plus the beat's own POSTs, two of them
+        on a cycle that executed commands — has to leave real margin under the
+        threshold. This covers the beat's network cost; it does not bound
+        `handle_commands`, which is the next thing to measure if a host flaps
+        again with the archive already off the loop."""
+        worst_ms = (ha.INTERVAL + 2 * ha.HEARTBEAT_TIMEOUT_SEC) * 1000
+        self.assertLess(worst_ms, self._offline_after_ms())
 
 
 class TestPrStatus(unittest.TestCase):
