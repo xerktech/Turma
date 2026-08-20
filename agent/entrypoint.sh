@@ -569,11 +569,23 @@ kube_config_is_ours() {
   if [ ! -s /root/.kube/config ]; then
     return 0
   fi
-  head -n 1 /root/.kube/config 2>/dev/null | grep -qF "$KUBE_GEN_MARK"
+  # EXACT, not a substring match: `grep -qF` would also claim a file whose
+  # first line is "<marker> (operator copy) do not touch".
+  [ "$(head -n 1 /root/.kube/config 2>/dev/null)" = "$KUBE_GEN_MARK" ]
 }
 
 # Write the config to $1. A function so the heredoc can sit in an `if` and a
 # failed write is a return code rather than a dead container.
+#
+# EVERY INTERPOLATED SCALAR IS QUOTED, and `namespace` is why. Kubernetes
+# accepts `no`, `on`, `off`, `yes`, `true`, `123` and `null` as namespace names;
+# YAML reads every one of them as a bool, a number or null. Unquoted, the
+# generated config then fails to LOAD — `cannot unmarshal bool into Go struct
+# field Context.contexts.context.namespace of type string` — and every kubectl
+# call in the pod dies at config load, `kubectl version` included, while the
+# same pod with no kubeconfig at all reaches the API server normally. QA
+# measured exactly that. Validating the characters does not help: these names
+# are all `[a-z0-9-]`.
 kube_write_config() {
   cat > "$1" <<EOF
 ${KUBE_GEN_MARK}
@@ -582,23 +594,28 @@ kind: Config
 clusters:
   - name: in-cluster
     cluster:
-      server: https://${KUBE_API_HOST}:${KUBE_API_PORT}
-      certificate-authority: ${KUBE_SA_DIR}/ca.crt
+      server: "https://${KUBE_API_HOST}:${KUBE_API_PORT}"
+      certificate-authority: "${KUBE_SA_DIR}/ca.crt"
 users:
   - name: in-cluster
     user:
-      tokenFile: ${KUBE_SA_DIR}/token
+      tokenFile: "${KUBE_SA_DIR}/token"
 contexts:
   - name: in-cluster
     context:
       cluster: in-cluster
       user: in-cluster
-      namespace: ${KUBE_NS}
+      namespace: "${KUBE_NS}"
 current-context: in-cluster
 EOF
 }
 
-if [ -n "${KUBECONFIG:-}" ]; then
+# Silent when nothing in the image reads a kubeconfig, matching `cloud_creds`.
+# Gated on helm TOO, not just kubectl: helm shares client-go's loader, so an
+# image with one and not the other still wants the file.
+if ! command -v kubectl >/dev/null 2>&1 && ! command -v helm >/dev/null 2>&1; then
+  KUBE_FROM_SA=skip
+elif [ -n "${KUBECONFIG:-}" ]; then
   # Mirrors the `aws` branch below: a host configured through the environment
   # must not be reported as credential-less just because ~/.kube is empty.
   echo "[entrypoint] kubectl: credentials from the environment (KUBECONFIG)"
@@ -634,24 +651,26 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
     echo "[entrypoint] kubectl: KUBERNETES_SERVICE_HOST is not a usable address — leaving the credential to client-go's own in-cluster fallback"
   elif ! mkdir -p /root/.kube 2>/dev/null; then
     echo "[entrypoint] kubectl: cannot create /root/.kube — leaving the credential to client-go's own in-cluster fallback"
-  # `umask` in a SUBSHELL, so the restrictive value covers the file's creation
-  # rather than being applied after it — and so it cannot leak into the manager,
-  # the tunnel and every session the way a bare `umask 077 … umask 022` pair
-  # does (that pair also restores a hardcoded 022 rather than what the operator
-  # set, which QA measured changing the manager's umask from 077 to 022).
-  elif ! (umask 077; kube_write_config /root/.kube/config.new) 2>/dev/null; then
-    rm -f /root/.kube/config.new 2>/dev/null || true
+  # `mktemp`, not a fixed `config.new`: it creates the file 0600 before anything
+  # is written — so the mode is never a race and no `umask` is touched, which is
+  # what a bare `umask 077 … umask 022` pair got wrong (it leaked a hardcoded
+  # 022 into the manager, the tunnel and every session) — and it can never
+  # destroy an operator's own file that happened to sit at the name we chose.
+  elif ! KUBE_TMP="$(mktemp /root/.kube/.config.XXXXXX 2>/dev/null)"; then
+    echo "[entrypoint] kubectl: cannot write /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
+  elif ! kube_write_config "$KUBE_TMP" 2>/dev/null; then
+    rm -f "$KUBE_TMP" 2>/dev/null || true
     echo "[entrypoint] kubectl: cannot write /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
   else
-    chmod 0600 /root/.kube/config.new 2>/dev/null || true
-    if mv -f /root/.kube/config.new /root/.kube/config 2>/dev/null; then
+    chmod 0600 "$KUBE_TMP" 2>/dev/null || true
+    if mv -f "$KUBE_TMP" /root/.kube/config 2>/dev/null; then
       if [ "$DROP_PRIV" = "yes" ]; then
         chown -R "$PUID:$PGID" /root/.kube 2>/dev/null || true
       fi
       KUBE_FROM_SA=yes
       echo "[entrypoint] kubectl: in-cluster ServiceAccount credential (ns ${KUBE_NS})"
     else
-      rm -f /root/.kube/config.new 2>/dev/null || true
+      rm -f "$KUBE_TMP" 2>/dev/null || true
       echo "[entrypoint] kubectl: cannot replace /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
     fi
   fi

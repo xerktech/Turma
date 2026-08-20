@@ -139,6 +139,15 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
   - Everything interpolated into it is validated first (`KUBERNETES_SERVICE_HOST`,
     `KUBERNETES_SERVICE_PORT`, the `namespace` file), because it is a YAML heredoc and a namespace
     with a stray newline produces a file that parses as something else entirely.
+  - **And every interpolated scalar is QUOTED, which validation does not cover.** Kubernetes accepts
+    `no`, `on`, `off`, `yes`, `true`, `null` and `123` as namespace names and YAML reads each as a
+    bool, a number or null, so an unquoted `namespace:` yields a config kubectl refuses to LOAD —
+    every call in the pod dies at config load while the same pod with no kubeconfig authenticates
+    fine. Those names are all `[a-z0-9-]`, so no character filter catches it.
+  - The temp file is `mktemp`, not a fixed name: it is created 0600 before anything is written, so
+    the mode is never a race and no `umask` is touched (a bare `umask 077 … umask 022` pair leaks a
+    hardcoded 022 into the manager and every session), and it cannot destroy an operator's file
+    that happened to sit at a name we picked.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
     see. The write's `umask` is scoped to a SUBSHELL: a bare pair leaks into the manager, the

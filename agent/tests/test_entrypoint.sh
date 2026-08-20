@@ -57,11 +57,27 @@ echo "LEFTOVER_ROOT_PATHS=$(find "$REPOS_ROOT" /root/.claude -uid 0 2>/dev/null 
 # What the in-cluster kubeconfig block left behind, observed from the process
 # that would actually use it. Reported as fields rather than a dump so the token
 # PATH is asserted and no credential is ever echoed.
-echo "KUBECFG_SERVER=$(sed -n 's/^ *server: *//p' /root/.kube/config 2>/dev/null | head -1)"
-echo "KUBECFG_TOKENFILE=$(sed -n 's/^ *tokenFile: *//p' /root/.kube/config 2>/dev/null | head -1)"
-echo "KUBECFG_NS=$(sed -n 's/^ *namespace: *//p' /root/.kube/config 2>/dev/null | head -1)"
+# The values are QUOTED in the file (see KUBECFG_QUOTED below for why), so the
+# quotes come off here rather than in every assertion.
+echo "KUBECFG_SERVER=$(sed -n 's/^ *server: *"\?\([^"]*\)"\?$/\1/p' /root/.kube/config 2>/dev/null | head -1)"
+echo "KUBECFG_TOKENFILE=$(sed -n 's/^ *tokenFile: *"\?\([^"]*\)"\?$/\1/p' /root/.kube/config 2>/dev/null | head -1)"
+echo "KUBECFG_NS=$(sed -n 's/^ *namespace: *"\?\([^"]*\)"\?$/\1/p' /root/.kube/config 2>/dev/null | head -1)"
 echo "KUBECFG_MODE=$(stat -c %a /root/.kube/config 2>/dev/null || echo none)"
 echo "KUBECFG_OWNER=$(stat -c '%u:%g' /root/.kube/config 2>/dev/null || echo none)"
+# The umask the manager INHERITED. The kubeconfig write must not change it: it
+# is the mode of every file every session on this host goes on to create.
+echo "MANAGER_UMASK=$(umask)"
+# Any line the generated config was not supposed to contain. `KUBECFG_SERVER` is
+# read with `head -1`, so an injected line landing AFTER it is invisible to
+# every other field here — which is exactly how an injection would survive.
+echo "KUBECFG_INJECTED=$(grep -ci injected /root/.kube/config 2>/dev/null || true)"
+echo "KUBECFG_LINES=$(wc -l < /root/.kube/config 2>/dev/null || echo 0)"
+# Are the interpolated scalars QUOTED? A namespace of `no`/`123`/`null` is legal
+# in Kubernetes and reads as a bool/number/null in YAML, so an unquoted scalar
+# produces a config kubectl refuses to load at all — while a `namespace:` field
+# read with sed looks perfectly correct while it happens. Four values come from
+# outside: server, certificate-authority, tokenFile, namespace.
+echo "KUBECFG_QUOTED=$(grep -cE '^ +(server|certificate-authority|tokenFile|namespace): \"' /root/.kube/config 2>/dev/null || true)"
 # Configurable lifetime: the manager is PID 1, so how long IT lives is how long
 # the container lives — the tunnel-supervision case needs a few seconds.
 sleep "${STUB_MANAGER_SLEEP:-1}"
@@ -152,10 +168,26 @@ make_fixture() {
 }
 
 # run_case <fixture-dir> [extra docker -e args...]
+#
+# BOUNDED, and that is not paranoia: case 19 exists because an unbounded read in
+# the entrypoint hung PID 1 forever. Unbounded here, re-introducing that defect
+# would hang the GitHub job to its 6-hour ceiling rather than failing it — the
+# most expensive possible way to learn about it. `timeout` kills the docker
+# CLIENT, so the container is named and force-removed after, and the marker in
+# the output fails whatever assertions the case makes.
 run_case() {
   local dir="$1"; shift
-  docker run --rm -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x "$@" \
-    -v "$dir/repos:/f/repos" -v "$dir/claude:/root/.claude" "$IMG" 2>&1
+  local name="turma-ep-$$-${RANDOM}"
+  local rc=0
+  timeout "${RUN_CASE_TIMEOUT:-180}" \
+    docker run --rm --name "$name" \
+      -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x "$@" \
+      -v "$dir/repos:/f/repos" -v "$dir/claude:/root/.claude" "$IMG" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    [ "$rc" -eq 124 ] && echo "RUNCASE_TIMEOUT=yes"
+  fi
+  return 0
 }
 
 # expect <label> <expected> <actual>
@@ -786,9 +818,11 @@ expect "kubeconfig owner" "1000:1000" "$(field "$out" KUBECFG_OWNER)"
 
 # --- Case 18: the kubeconfig block can never fail the boot (XERK-369) --------
 # It runs under `set -e` as PID 1, before the manager starts, so every failure
-# in it has to be a log line. QA measured all three of these killing or hanging
-# the container: an unguarded `mkdir` on a read-only /root and on a /root/.kube
-# that is a FILE, and an unbounded read of a `namespace` that is a fifo.
+# in it has to be a log line. QA measured three ways it killed or hung the
+# container, and each has a case: a /root/.kube that is a FILE (here), an
+# unbounded read of a `namespace` that is a fifo (case 19), and an unguarded
+# `mkdir` on a read-only root filesystem (case 28). Case 27 covers the write
+# failing inside a directory that already exists.
 #
 # The reason it is allowed to give up so cheaply is that the credential does not
 # depend on it: client-go falls back to the in-cluster ServiceAccount on its
@@ -845,6 +879,19 @@ users2: injected' \
   -v "$WORK/fx20/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
 expect "a multi-line namespace is rejected, not embedded" "default" "$(field "$out" KUBECFG_NS)"
 expect "a non-numeric port falls back to 443" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+# THE ASSERTION THAT ACTUALLY CATCHES THE PORT CASE. `KUBECFG_SERVER` is read
+# with `head -1`, so a payload injected through the PORT lands on a later line
+# and every field above still reads correct — QA proved a mutant with the port
+# validation deleted passing both assertions above with an injected line in the
+# file. Count the whole file instead.
+expect "nothing was injected anywhere in the file" "0" "$(field "$out" KUBECFG_INJECTED)"
+expect "the file is exactly the 19 lines it should be" "19" "$(field "$out" KUBECFG_LINES)"
+# Kubernetes accepts `no`, `on`, `off`, `yes`, `true`, `null` and `123` as
+# namespace names, and YAML reads every one of them as a bool, a number or
+# null. Unquoted, kubectl then refuses to load the file at all — every call in
+# the pod dies at config load — while the `namespace:` line reads correctly to
+# anything using sed. Four values come from outside; all four must be quoted.
+expect "every interpolated scalar is quoted" "4" "$(field "$out" KUBECFG_QUOTED)"
 
 echo "== case: a symlink at /root/.kube/config is never written through"
 make_fixture "$WORK/fx21" 0 0
@@ -921,6 +968,134 @@ if echo "$out" | grep -q "\[entrypoint\] kubectl: installed; no creds on this de
   echo "  ok: an empty config is not reported as a mounted store"
 else
   echo "  FAIL: an empty config was reported as creds"; FAILED=1
+fi
+
+# --- Case 25: ca.crt is part of the gate (XERK-369) --------------------------
+# Without it the config is written and every call then fails with `unable to
+# read certificate-authority`. Writing a config that cannot work is worse than
+# writing none: with none, client-go's own in-cluster fallback still
+# authenticates.
+echo "== case: no ca.crt means no kubeconfig, not a broken one"
+make_fixture "$WORK/fx25" 0 0
+mkdir -p "$WORK/fx25/sa"
+printf 'not-a-real-token\n' > "$WORK/fx25/sa/token"
+printf 'turma\n' > "$WORK/fx25/sa/namespace"
+out="$(run_case "$WORK/fx25" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx25/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "nothing was written" "none" "$(field "$out" KUBECFG_MODE)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: installed; no creds on this device"; then
+  echo "  ok: reported as credential-less"
+else
+  echo "  FAIL: a config was written without a CA to verify the apiserver"; FAILED=1
+fi
+
+# --- Case 26: the write does not touch the process umask (XERK-369) ----------
+# The manager is PID 1 and every session inherits its umask, so a `umask 077 …
+# umask 022` pair around the write silently changes the mode of every file every
+# session on the host goes on to create — and restores a hardcoded value rather
+# than the operator's. QA measured exactly that: parent 077, manager 022.
+echo "== case: the kubeconfig write leaves the umask alone"
+make_fixture "$WORK/fx26" 0 0
+mkdir -p "$WORK/fx26/sa"
+printf 'not-a-real-token\n' > "$WORK/fx26/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx26/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx26/sa/namespace"
+# docker has no umask flag, so set it in a shell that then becomes PID 1 —
+# the same trick the scratch-path case below uses.
+out="$(timeout 180 docker run --rm -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx26/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx26/repos:/f/repos" -v "$WORK/fx26/claude:/root/.claude" \
+  --entrypoint sh "$IMG" -c 'umask 077; exec /usr/local/bin/entrypoint.sh' 2>&1)"
+expect "the config was still written" "600" "$(field "$out" KUBECFG_MODE)"
+expect "and the manager kept the umask it was given" "0077" "$(field "$out" MANAGER_UMASK)"
+
+# --- Case 27: an unwritable /root/.kube is reported, not fatal (XERK-369) ----
+# Reaches the `cannot write` branch, which case 18's unwritable-PARENT case does
+# not: here `mkdir -p` succeeds because the directory already exists, and the
+# write inside it is what fails. In a pod this is a read-only projected volume
+# or a full filesystem.
+echo "== case: an unwritable /root/.kube is reported, not fatal"
+make_fixture "$WORK/fx27" 0 0
+mkdir -p "$WORK/fx27/sa" "$WORK/fx27/kube"
+printf 'not-a-real-token\n' > "$WORK/fx27/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx27/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx27/sa/namespace"
+out="$(run_case "$WORK/fx27" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx27/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx27/kube:/root/.kube:ro")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: cannot write /root/.kube/config"; then
+  echo "  ok: reported and carried on"
+else
+  echo "  FAIL: no 'cannot write' line: $(echo "$out" | grep -i kubectl || echo none)"; FAILED=1
+fi
+
+# --- Case 28: a whole read-only root filesystem still boots (XERK-369) -------
+# `readOnlyRootFilesystem: true` is the obvious hardening for the pod XERK-369
+# ships, and before this block every preflight in this file survived it. The
+# failure it caused was a CrashLoopBackOff with one `mkdir:` line as the only
+# clue.
+echo "== case: a read-only root filesystem still boots"
+make_fixture "$WORK/fx28" 0 0
+mkdir -p "$WORK/fx28/sa"
+printf 'not-a-real-token\n' > "$WORK/fx28/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx28/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx28/sa/namespace"
+out="$(timeout 180 docker run --rm --read-only --tmpfs /tmp --tmpfs /run \
+  -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx28/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx28/repos:/f/repos" -v "$WORK/fx28/claude:/root/.claude" "$IMG" 2>&1)"
+expect "manager still starts" "0" "$(field "$out" uid)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: cannot create /root/.kube"; then
+  echo "  ok: reported and carried on"
+else
+  echo "  FAIL: no 'cannot create' line — did it die instead? $(echo "$out" | tail -2)"; FAILED=1
+fi
+
+# --- Case 29: the marker must match line 1 EXACTLY (XERK-369) ---------------
+# A substring match would claim a file whose first line is "<marker> (operator
+# copy) do not touch" — someone deliberately recording where their file came
+# from is the likeliest way to write that line.
+echo "== case: a marker with a suffix is the operator's file, not ours"
+make_fixture "$WORK/fx29" 0 0
+mkdir -p "$WORK/fx29/sa" "$WORK/fx29/kube"
+printf 'not-a-real-token\n' > "$WORK/fx29/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx29/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx29/sa/namespace"
+printf '# generated by turma entrypoint.sh from this pod'"'"'s ServiceAccount (operator copy) do not touch\nclusters:\n  - name: mine\n    cluster:\n      server: "https://mine.example:6443"\n' \
+  > "$WORK/fx29/kube/config"
+out="$(run_case "$WORK/fx29" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx29/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx29/kube:/root/.kube")"
+expect "the operator's file survives" "https://mine.example:6443" "$(field "$out" KUBECFG_SERVER)"
+
+# --- Case 30: the block is silent when nothing reads a kubeconfig (XERK-369) -
+# `cloud_creds` stays silent for a CLI the image does not ship, and this has to
+# match: an image with neither kubectl nor helm has nothing to configure.
+echo "== case: no kubectl and no helm means no kubeconfig and no log line"
+make_fixture "$WORK/fx30" 0 0
+mkdir -p "$WORK/fx30/sa"
+printf 'not-a-real-token\n' > "$WORK/fx30/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx30/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx30/sa/namespace"
+# Shadow both stubs with directories, so `command -v` finds nothing on PATH.
+out="$(timeout 180 docker run --rm -e AGENT=none -e REPOS_ROOT=/f/repos -e DEVICE_NAME=x \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx30/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx30/repos:/f/repos" -v "$WORK/fx30/claude:/root/.claude" \
+  --entrypoint sh "$IMG" -c \
+  'rm -f /usr/local/bin/kubectl /usr/local/bin/helm; exec /usr/local/bin/entrypoint.sh' 2>&1)"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "no kubeconfig was written" "none" "$(field "$out" KUBECFG_MODE)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl:"; then
+  echo "  FAIL: logged about a CLI the image does not have"; FAILED=1
+else
+  echo "  ok: silent, like cloud_creds is for an absent CLI"
 fi
 
 echo
