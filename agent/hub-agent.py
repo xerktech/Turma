@@ -14899,9 +14899,14 @@ class SessionManager:
         except Exception as e:
             log(f"archive sync could not be staged: {e}")
 
-    def _warn_if_archive_pass_stalled(self):
+    def _warn_if_archive_pass_stalled(self, now=None):
         """Say so when a pass is in flight and no push has COMPLETED for a long
-        time. Caller holds _archive_lock.
+        time. Caller holds _archive_lock — it reads three fields the WORKER
+        writes, including the `finally` that clears the pass stamp, so unlocked
+        it can see a pass in flight and then have that stamp vanish before the
+        arithmetic. `now` is injectable so the boot-fresh-clock case can be
+        tested without patching the process's clock out from under every other
+        thread.
 
         Off the beat, a wedged pass is SILENT: moving the passes here removed the
         symptom that used to announce them (the beat stalling, the host going
@@ -14926,7 +14931,7 @@ class SessionManager:
         recently" and would suppress the line for up to another hour."""
         if self._archive_pass_at is None:
             return
-        now = time.monotonic()
+        now = time.monotonic() if now is None else now
         held = now - self._archive_progress_at
         if held < ARCHIVE_PASS_STALL_SEC:
             return

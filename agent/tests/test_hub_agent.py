@@ -15512,14 +15512,36 @@ class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
         hour, which is the one report that matters most (QA pass 3 D8)."""
         sm = self.make_manager()
         lines = []
-        with mock.patch.object(ha.time, "monotonic", return_value=320.0), \
-                mock.patch.object(ha, "log", lambda m: lines.append(m)):
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
             with sm._archive_lock:
                 # A pass started 310s ago on a host up for barely five minutes.
+                # `now` is injected rather than patched onto the time module,
+                # which the whole process (and the worker threads the
+                # neighbouring tests leave finishing) reads.
                 sm._archive_pass_at = 10.0
                 sm._archive_progress_at = 10.0
-                sm._warn_if_archive_pass_stalled()
+                sm._warn_if_archive_pass_stalled(now=320.0)
         self.assertEqual(len(lines), 1, lines)
+
+    def test_the_stall_check_runs_under_the_lock(self):
+        """It reads what the worker writes, so unlocked it can see a pass in
+        flight and then have the stamp cleared before the arithmetic — a
+        TypeError the beat's own guard would relabel "archive sync could not be
+        staged" (XERK-395 QA pass 4)."""
+        sm = self.make_manager()
+        held = []
+        real = sm._warn_if_archive_pass_stalled
+
+        def spy(now=None):
+            held.append(sm._archive_lock.locked())
+            return real(now)
+
+        with mock.patch.object(sm, "_warn_if_archive_pass_stalled", spy), \
+                mock.patch.object(sm, "_archive_deltas", lambda *a, **k: None), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({})                          # cursorless beat
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})  # and one with work
+        self.assertEqual(held, [True, True])
 
     def test_a_slow_but_progressing_pass_is_not_reported(self):
         """A pass is bounded in BYTES, not in time: ARCHIVE_MANIFEST_MAX is 200
