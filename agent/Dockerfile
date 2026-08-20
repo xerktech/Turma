@@ -17,13 +17,13 @@
 #   tooling        No Android at all. 2.4 GB. CI scans this.
 #
 # Every tier grew 1.0 GB when the cloud CLIs (terraform/az/aws — see their layer
-# below) landed in `tooling`, and 0.26 GB again when the cluster CLIs
+# below) landed in `tooling`, and 0.27 GB again when the cluster CLIs
 # (kubectl/helm/talosctl/omnictl) landed beside them. Neither is a tier of its
 # own: unlike Android, which is a whole toolchain most sessions never invoke,
 # these are credential-bearing runtime tools, they are what the Trivy gate most
 # wants to see, and a fourth tier would double the tag matrix to spare :latest a
-# third of what the emulator alone costs. The three figures above are the
-# measured totals WITH both of those layers.
+# third of what the emulator alone costs. The three figures above PREDATE the
+# cluster CLIs; add 0.27 GB to each until they are re-measured.
 #
 # Note the shape: the whole Android BUILD toolchain costs 0.6 GB, while the
 # emulator + x86_64 system image cost 4.4 GB — 7x more. That asymmetry is why
@@ -184,7 +184,7 @@ RUN set -eux; \
     terraform version; aws --version; az version; az repos -h >/dev/null; \
     rm -rf /root/.azure /root/.terraform.d
 
-# --- Kubernetes / cluster CLI layer (stable, ~0.26 GB) ----------------------
+# --- Kubernetes / cluster CLI layer (stable, ~0.27 GB) ----------------------
 # kubectl, helm, talosctl and omnictl, so a session can operate the `k8x` Talos
 # cluster the same way it already operates GitHub through `gh` and cloud
 # accounts through aws/az/terraform.
@@ -206,8 +206,9 @@ RUN set -eux; \
 # Its own RUN inside `tooling`, after the cloud layer, for the reasons that
 # layer states: every tier needs them, they authenticate to a control plane so
 # they are exactly the surface the Trivy gate is for, and a separate RUN keeps
-# a bump here from re-downloading the GB above it. Sizes on disk: talosctl
-# 90 MB, kubectl 60 MB, helm 60 MB, omnictl 45 MB.
+# a bump here from re-downloading the GB above it. Sizes on disk, measured by
+# running each binary in the base image: talosctl 97 MB, omnictl 67 MB, kubectl
+# 57 MB, helm 57 MB — 278 MB the tier.
 #
 # VERSIONS TRACK THE CLUSTER, NOT `latest`, and that is the pin that matters
 # here rather than a CVE sweep. kubectl tolerates one minor of skew either side

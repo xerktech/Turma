@@ -751,6 +751,7 @@ echo "== case: a mounted kubeconfig is never overwritten"
 make_fixture "$WORK/fx16" 0 0
 mkdir -p "$WORK/fx16/sa" "$WORK/fx16/kube"
 printf 'not-a-real-token\n' > "$WORK/fx16/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx16/sa/ca.crt"
 printf 'turma\n' > "$WORK/fx16/sa/namespace"
 printf 'apiVersion: v1\nkind: Config\nclusters:\n  - name: other\n    cluster:\n      server: https://elsewhere.example:6443\n' \
   > "$WORK/fx16/kube/config"
@@ -775,12 +776,152 @@ echo "== case: the generated kubeconfig is owned by the run-as user"
 make_fixture "$WORK/fx17" 1000 1000
 mkdir -p "$WORK/fx17/sa"
 printf 'not-a-real-token\n' > "$WORK/fx17/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx17/sa/ca.crt"
 printf 'turma\n' > "$WORK/fx17/sa/namespace"
 out="$(run_case "$WORK/fx17" \
   -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
   -v "$WORK/fx17/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
 expect "manager uid" "1000" "$(field "$out" uid)"
 expect "kubeconfig owner" "1000:1000" "$(field "$out" KUBECFG_OWNER)"
+
+# --- Case 18: the kubeconfig block can never fail the boot (XERK-369) --------
+# It runs under `set -e` as PID 1, before the manager starts, so every failure
+# in it has to be a log line. QA measured all three of these killing or hanging
+# the container: an unguarded `mkdir` on a read-only /root and on a /root/.kube
+# that is a FILE, and an unbounded read of a `namespace` that is a fifo.
+#
+# The reason it is allowed to give up so cheaply is that the credential does not
+# depend on it: client-go falls back to the in-cluster ServiceAccount on its
+# own, so a pod with NO kubeconfig still authenticates. What this block adds is
+# a named context and the pod's namespace, which is not worth a boot.
+echo "== case: a broken /root/.kube does not stop the container"
+make_fixture "$WORK/fx18" 0 0
+mkdir -p "$WORK/fx18/sa"
+printf 'not-a-real-token\n' > "$WORK/fx18/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx18/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx18/sa/namespace"
+# /root/.kube is a FILE. In a pod /root is a persistent volume, so this survives
+# every restart and the pod could never be repaired from inside — it would never
+# get far enough to run anything.
+printf 'not a directory\n' > "$WORK/fx18/kubefile"
+out="$(run_case "$WORK/fx18" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx18/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx18/kubefile:/root/.kube")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: cannot create /root/.kube"; then
+  echo "  ok: reported and carried on"
+else
+  echo "  FAIL: no 'cannot create' line — did it die instead? $(echo "$out" | tail -2)"; FAILED=1
+fi
+
+echo "== case: a namespace file that blocks on read does not hang PID 1"
+make_fixture "$WORK/fx19" 0 0
+mkdir -p "$WORK/fx19/sa"
+printf 'not-a-real-token\n' > "$WORK/fx19/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx19/sa/ca.crt"
+# A fifo: `cat` on it never returns. The container would sit "up" forever with
+# no manager and no heartbeat, which the hub can only show as an offline host.
+docker run --rm -v "$WORK/fx19/sa:/sa" busybox mkfifo /sa/namespace >/dev/null
+out="$(run_case "$WORK/fx19" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx19/sa:/var/run/secrets/kubernetes.io/serviceaccount")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "and falls back to the default namespace" "default" "$(field "$out" KUBECFG_NS)"
+
+echo "== case: junk in the injected env cannot corrupt the kubeconfig"
+make_fixture "$WORK/fx20" 0 0
+mkdir -p "$WORK/fx20/sa"
+printf 'not-a-real-token\n' > "$WORK/fx20/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx20/sa/ca.crt"
+# Everything here is interpolated into a YAML heredoc. These sources are the
+# kubelet's, so this is robustness rather than a threat model — but a namespace
+# with a stray newline produces a file that parses as something else entirely,
+# and that failure would be silent.
+printf 'prod\nbogus: injected\n' > "$WORK/fx20/sa/namespace"
+out="$(run_case "$WORK/fx20" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 -e 'KUBERNETES_SERVICE_PORT=443
+users2: injected' \
+  -v "$WORK/fx20/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "a multi-line namespace is rejected, not embedded" "default" "$(field "$out" KUBECFG_NS)"
+expect "a non-numeric port falls back to 443" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+
+echo "== case: a symlink at /root/.kube/config is never written through"
+make_fixture "$WORK/fx21" 0 0
+mkdir -p "$WORK/fx21/sa" "$WORK/fx21/kube"
+printf 'not-a-real-token\n' > "$WORK/fx21/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx21/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx21/sa/namespace"
+# A DANGLING symlink fails `-e`, so a naive absence check reads it as "no
+# kubeconfig here" and `cat >` then creates whatever it points at — arbitrary
+# root-owned file creation at a path somebody else chose.
+docker run --rm -v "$WORK/fx21/kube:/k" busybox ln -s /f/repos/victim /k/config >/dev/null
+out="$(run_case "$WORK/fx21" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx21/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx21/kube:/root/.kube")"
+expect "manager still starts" "0" "$(field "$out" uid)"
+expect "the symlink target was not created" "0" \
+  "$(docker run --rm -v "$WORK/fx21:/f" busybox sh -c 'test -e /f/repos/victim && echo 1 || echo 0')"
+
+echo "== case: KUBECONFIG in the environment is reported, not ignored"
+# The `aws` branch has had this shape for a while: a host configured through the
+# environment must not be reported as credential-less because a directory it
+# does not use is empty.
+make_fixture "$WORK/fx22" 0 0
+mkdir -p "$WORK/fx22/sa"
+printf 'not-a-real-token\n' > "$WORK/fx22/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx22/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx22/sa/namespace"
+out="$(run_case "$WORK/fx22" -e KUBECONFIG=/f/repos/elsewhere.yaml \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx22/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro")"
+expect "nothing was written" "none" "$(field "$out" KUBECFG_MODE)"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: credentials from the environment"; then
+  echo "  ok: reported as env-configured"
+else
+  echo "  FAIL: KUBECONFIG set but not reported"; FAILED=1
+fi
+
+echo "== case: a stale generated kubeconfig is refreshed, a mounted one is not"
+# /root is a persistent volume in a pod, so the first boot's config would
+# otherwise be frozen there forever — a changed apiserver address or namespace
+# would lose silently. The marker line on line 1 is what makes "did we write
+# this?" decidable, and it is the only thing that makes overwriting safe.
+make_fixture "$WORK/fx23" 0 0
+mkdir -p "$WORK/fx23/sa" "$WORK/fx23/kube"
+printf 'not-a-real-token\n' > "$WORK/fx23/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx23/sa/ca.crt"
+printf 'newns\n' > "$WORK/fx23/sa/namespace"
+printf '# generated by turma entrypoint.sh from this pod'"'"'s ServiceAccount\napiVersion: v1\nkind: Config\nclusters:\n  - name: in-cluster\n    cluster:\n      server: https://10.0.0.1:443\ncontexts:\n  - name: in-cluster\n    context:\n      namespace: oldns\n' \
+  > "$WORK/fx23/kube/config"
+out="$(run_case "$WORK/fx23" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx23/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx23/kube:/root/.kube")"
+expect "the stale apiserver was refreshed" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+expect "and so was the namespace" "newns" "$(field "$out" KUBECFG_NS)"
+# A 0-byte file is the residue of a half-finished write, not a credential: it
+# must be regenerated rather than reported as a mounted store forever.
+echo "== case: a 0-byte kubeconfig is residue, not a credential"
+make_fixture "$WORK/fx24" 0 0
+mkdir -p "$WORK/fx24/sa" "$WORK/fx24/kube"
+printf 'not-a-real-token\n' > "$WORK/fx24/sa/token"
+printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$WORK/fx24/sa/ca.crt"
+printf 'turma\n' > "$WORK/fx24/sa/namespace"
+: > "$WORK/fx24/kube/config"
+out="$(run_case "$WORK/fx24" \
+  -e KUBERNETES_SERVICE_HOST=10.96.0.1 \
+  -v "$WORK/fx24/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -v "$WORK/fx24/kube:/root/.kube")"
+expect "regenerated over the empty file" "https://10.96.0.1:443" "$(field "$out" KUBECFG_SERVER)"
+# ...and out of a cluster the same empty file must read as no creds at all.
+out="$(run_case "$WORK/fx24" -v "$WORK/fx24/kube:/root/.kube")"
+if echo "$out" | grep -q "\[entrypoint\] kubectl: installed; no creds on this device"; then
+  echo "  ok: an empty config is not reported as a mounted store"
+else
+  echo "  FAIL: an empty config was reported as creds"; FAILED=1
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi

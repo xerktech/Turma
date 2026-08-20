@@ -228,7 +228,9 @@ This is what the ticket owner asked for, and it falls out of having one agent:
   The agent's job here is to manage `k8x`, so the image now carries `kubectl`, `helm`, `talosctl` and
   `omnictl` (`.claude/rules/agent-image.md`) and the pod runs under a `turma-agent` ServiceAccount
   bound to `cluster-admin`; `entrypoint.sh` turns the projected token into `/root/.kube/config` at
-  boot. The alternative — putting the cluster's `admin@k8x` client certificate in Bitwarden and
+  boot — a convenience rather than the mechanism, since client-go falls back to the in-cluster
+  token on its own and what the file adds is a named context and the pod's own namespace. The
+  alternative — putting the cluster's `admin@k8x` client certificate in Bitwarden and
   mounting it — was rejected: it is the strongest static credential the cluster has, copying it adds
   a third place to hold it, it cannot be revoked without rotating the cluster PKI, and it expires
   (2027-08-17) with nothing watching. A projected token rotates itself and is revoked by deleting
@@ -237,6 +239,11 @@ This is what the ticket owner asked for, and it falls out of having one agent:
     cert and an Omni service-account key, which no in-cluster identity can stand in for. Those are
     mounted from Bitwarden, read-only, and are the only cluster credentials this pod holds as files.
   - The pod therefore needs `automountServiceAccountToken: true`, unlike the hub beside it.
+  - **The token, not the kubeconfig, is the boundary.** Kubernetes projects it 0644, so on a `PUID`
+    host every session's uid reads it directly whatever the kubeconfig's mode is — and the guard's
+    `permissions.deny` rules cover the file-editing tools only. A session on `k8x` has
+    cluster-admin, full stop; treat the pod as an operator's console rather than as a sandbox that
+    happens to hold a credential.
 - **`DEVICE_NAME` is the agent's whole identity** — it names the hub card, `TURMA_TOKEN` is
   HMAC-bound to it (XERK-268), and it keys the tunnel's control channel. `hub-agent.py` and
   `tunnel-agent.js` must resolve the *same* name or the host gets commands while its terminal and

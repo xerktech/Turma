@@ -1362,10 +1362,15 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
     # The cluster credentials the k8s CLI layer's tools read (XERK-369). Same
-    # terms as ~/.aws above — shared by every session on the box, and a write is
-    # how a session would redirect one of them at a control plane it chose.
-    # ~/.kube/config is on this list even where the entrypoint GENERATED it from
-    # a pod ServiceAccount: what it points at is the credential.
+    # terms as ~/.aws above, and the same LIMIT: these cover the file-editing
+    # tools only — the guard walks past Bash (XERK-309), so a session can still
+    # write any of them with a redirect, or skip them entirely by exporting
+    # KUBECONFIG. In a pod it can also read the projected ServiceAccount token
+    # straight out of /var/run/secrets, which is 0644 by Kubernetes' own
+    # default. Read this as tidiness of the same kind ~/.aws gets, NOT as
+    # containment — the pod's token is the boundary, and it is cluster-admin.
+    # ~/.kube/config is on the list even where the entrypoint GENERATED it: what
+    # it points at is the credential.
     "Edit(~/.kube/**)",
     "Edit(~/.talos/**)",
     "Edit(~/.config/omni/**)",

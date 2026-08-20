@@ -118,15 +118,32 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     it works.
 - **In-cluster, the kubeconfig is the POD'S OWN ServiceAccount and nothing is mounted** (XERK-369).
   `entrypoint.sh` writes `/root/.kube/config` from the projected token when — and only when —
-  `KUBERNETES_SERVICE_HOST` is set, the token is readable, and neither `KUBECONFIG` nor an existing
-  `/root/.kube/config` says otherwise. A mounted kubeconfig always wins; overwriting one would
-  redirect every session on that host at the local API server.
+  `KUBERNETES_SERVICE_HOST` is set, the token and `ca.crt` are readable, and neither `KUBECONFIG`
+  nor a `/root/.kube/config` this block did not write says otherwise.
+  - **It is a CONVENIENCE, not the credential**, and that is what decides how hard it may try:
+    client-go falls back to the in-cluster ServiceAccount on its own, so `kubectl` and `helm` in a
+    pod authenticate with no kubeconfig at all (measured). What the file adds is a named
+    current-context and the pod's own namespace as the default. **So every step of it is guarded
+    and every failure is one log line** — it runs under `set -e` as PID 1 before the manager
+    starts, and QA measured an unguarded `mkdir` killing the container on a read-only `/root` and
+    on a `/root/.kube` that was a file, and an unbounded read of `namespace` hanging PID 1 on a
+    fifo. Never "fix" one of those guards by making it fatal.
   - **It must be `tokenFile:`, never an inline `token:`.** The projected token is rewritten in place
-    roughly hourly, so a value baked at boot authenticates for an hour and then fails in a pod that
-    has been up for days and still looks healthy.
+    at ~80% of its TTL; QA measured a copy taken at boot returning `Unauthorized` eight minutes
+    later while the generated config authenticated in the same second.
+  - **A line-1 marker is what makes it safe to overwrite**, and it is load-bearing: `/root` is a
+    persistent volume in a pod, so without it the first boot's config is frozen there forever and a
+    changed apiserver address or namespace loses silently. A file without the marker — and a
+    SYMLINK, dangling included, which fails `-e` and would otherwise read as absent — is the
+    operator's and is never touched.
+  - Everything interpolated into it is validated first (`KUBERNETES_SERVICE_HOST`,
+    `KUBERNETES_SERVICE_PORT`, the `namespace` file), because it is a YAML heredoc and a namespace
+    with a stray newline produces a file that parses as something else entirely.
   - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
     otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
-    see. Tests: the XERK-369 cases in `test_entrypoint.sh`.
+    see. The write's `umask` is scoped to a SUBSHELL: a bare pair leaks into the manager, the
+    tunnel and every session, and restores a hardcoded value rather than the operator's.
+  - Tests: the XERK-369 cases in `test_entrypoint.sh`.
 - **Android toolchain** — JDK 17 + Gradle + Android SDK (`gradle`/`sdkmanager`/`avdmanager`/`adb`/
   `aapt2` on PATH), pinned via
   `GRADLE_VERSION`/`ANDROID_CMDLINE_TOOLS`/`ANDROID_PLATFORM`/`ANDROID_BUILD_TOOLS` in
