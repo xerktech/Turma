@@ -100,6 +100,14 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     error**: the preflight only LOGS which stores it found, keying on a **login-marker file** never
     the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's
     build-time smoke test drops the stores it creates. `permissions.deny` protects them.
+- **A missing Docker socket must never reach a UI as content.** `log_tail` merges `docker logs`'
+  stderr into stdout, so ignoring its return code published *"failed to connect to the docker API
+  at unix:///var/run/docker.sock"* as the agent's own log on the host card — which reads as a broken
+  agent during whatever the operator was doing (a clone, when it was reported). It returns
+  `LOG_TAIL_UNAVAILABLE` instead, and that sentinel is a **string, not None**: `_log_tail` refreshes
+  whenever its cache is None, so a None would put a 15s-timeout subprocess back on every beat, which
+  is what XERK-395 took off it. The degradation table below is only honest once the error stops
+  being presented as content.
 - **Cluster CLIs** (`kubectl`/`helm`/`talosctl`/`omnictl`, pinned via `KUBECTL_VERSION`/
   `HELM_VERSION`/`TALOSCTL_VERSION`/`OMNICTL_VERSION` in `agent/Dockerfile`) sit in `tooling` beside
   the cloud CLIs, on the same terms and for the same reason (XERK-369).
