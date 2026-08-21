@@ -16,19 +16,19 @@ paths:
 
 ## Unified releases
 
-- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all five components + a changelog**, cut by
+- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all six components + a changelog**, cut by
   `.github/workflows/release.yml`. **Never split back into per-component workflows** — their
   independent `run_number` patches drift out of lockstep.
 - The root **`VERSION`** file holds `MAJOR.MINOR` only. The **patch is derived from existing `v*`
   tags** (`max` on that line + 1), never committed. Bump `VERSION` only for a minor/major.
-- The five components: `turma` image, `agent` image, glasses `.ehpk`, android `.apk`, native agent
-  tarball. All version math (tag-derived patch, android `versionCode` packing, the strictly-greater
-  guard) lives in the tested `.github/scripts`.
+- The six components: `turma` image, `agent` image, glasses `.ehpk`, android `.apk`, native agent
+  tarball, veiller miniapp `.zip`. All version math (tag-derived patch, android `versionCode`
+  packing, the strictly-greater guard) lives in the tested `.github/scripts`.
 
 ### What a release builds vs carries
 
 - Only **changed** components build; **unchanged** ones are **carried** — their prior artifact is
-  published at its own prior version, not rebuilt. Every release publishes all five.
+  published at its own prior version, not rebuilt. Every release publishes all six.
 - **Images**: carried → the manifest references the prior `:version` tag (no retag); a carried
   image's `:latest` is already correct, so Watchtower needs nothing.
 - **Assets** (`.ehpk`/`.apk`/`.tar.gz`): a carried asset is copied forward under its **original
@@ -42,9 +42,28 @@ paths:
 - Trigger: `workflow_dispatch` (`dry_run` defaulting on) plus `push: main` for auto patch releases.
   A manual `minor`/`major` dispatch bumps `VERSION`, rolls intervening patches into `CHANGELOG.md`,
   and force-builds every component.
-- The `push: main` trigger is **path-filtered to the four component source dirs**, restating
+- The `push: main` trigger is **path-filtered to the five component source dirs**, restating
   `changes.js`'s `PREFIX_MAP` (a workflow trigger can't call into JS; a test asserts the two match).
   A docs-only merge cuts no release.
+
+### The release DEPLOYS the hub (XERK-425)
+
+- The last step of `build-turma-image` rewrites the `image:` line of the k8x hub's manifest in the
+  private GitOps repo (`ai/turma/deployment.yaml` in xerktech/ArgoCD) to the tag it just pushed and
+  commits it to main. That Application is `automated` + `selfHeal`, so **the commit is the deploy**.
+- **Every failure is loud**: no `ARGOCD_DEPLOY_KEY`, or no `image:` line to update, fails the
+  step. A silent skip is a cluster that quietly never updates behind a green pipeline.
+- It authenticates with a **write deploy key** on the GitOps repo, never a PAT — `GITHUB_TOKEN`
+  can't reach another repo, a classic PAT carries a whole account into CI, and a fine-grained one
+  **expires**, which surfaces as a deploy that silently stops happening. GitHub's host key is
+  pinned in the step rather than accepted on first use.
+- Skipped on a dry run (no image was pushed) and off **main** — `workflow_dispatch` takes any ref,
+  and this is the one step that reaches production.
+- **"Built" is not "changed"**: `changes.js` maps the whole `turma/` prefix, so a test-only merge
+  rebuilds the image and redeploys a runtime-identical hub, which `Recreate` + `replicas: 1` pays
+  for with every tunnel, SSE stream and terminal channel. XERK-426.
+- The cluster-side **agent** StatefulSet (`ai/turma-agent`) is still bumped by hand: rolling it
+  kills every session that host is running.
 
 ## PR gates (pre-merge to main)
 

@@ -117,6 +117,33 @@ release that *builds* the native agent also publishes an `agent-native-v<version
 alias release so hosts still on the legacy updater self-heal; that alias step is
 removed once the fleet is confirmed migrated.
 
+## Deploying the hub to k8x (automatic)
+
+The `k8x` hub is a Kubernetes Deployment in the private **xerktech/ArgoCD** repo
+(`ai/turma/deployment.yaml`). Its Argo CD Application is `automated` +
+`selfHeal`, so a commit to that file *is* the deploy.
+
+The last step of `build-turma-image` therefore rewrites that file's `image:`
+line to `ghcr.io/<owner>/turma:<version>` — the tag it just pushed — and commits
+it to `main`. It is skipped on a dry run (which pushes no image) and off `main`
+(a dispatch takes any ref, and this is the step that reaches production), and it
+fails loudly if the manifest has no line to update, since a cluster that quietly
+never updates is the failure it exists to prevent.
+
+It authenticates with a **write deploy key** on the GitOps repo, held as the
+secret **`ARGOCD_DEPLOY_KEY`** (the private half; the public half is a deploy
+key titled `turma-release` on that repo). Not a PAT: `GITHUB_TOKEN` is scoped to
+this repo, a classic PAT would carry a whole account into CI, and a fine-grained
+one expires — which fails as a deploy that silently stops happening. Revoke by
+deleting the deploy key.
+
+Two things it deliberately does not do. It does not fire for a **carried**
+(unchanged) hub, because the job it lives in doesn't run then; but "built" is
+not "changed" — `changes.js` maps the whole `turma/` prefix, so a test-only
+merge still rebuilds and redeploys a runtime-identical hub (XERK-426). And the
+cluster-side Turma **agent** (`ai/turma-agent`) is still bumped by hand, since
+restarting it kills every session that host is running.
+
 ## Known wrinkles
 
 - **Rapid merges leave patch-number gaps.** The release workflow serializes

@@ -226,6 +226,63 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+      # Point k8x at the image just pushed. The hub runs there as `ai/turma` in
+      # xerktech/ArgoCD, whose Application is `automated` + `selfHeal`, so this
+      # commit IS the deploy — without it a release publishes the image and
+      # nothing ever runs it.
+      #
+      # Authenticated by a WRITE DEPLOY KEY on that repo, not a PAT: GITHUB_TOKEN
+      # is scoped to this repo, a classic PAT would carry a human's whole account
+      # into CI, and a fine-grained one expires — which fails as a deploy that
+      # silently stops happening. The key is write-only, on one repo, and is
+      # revoked by deleting it there.
+      #
+      # Skipped on a dry run, which pushes no image, and off main, since a
+      # dispatch takes any ref and this is the step that reaches production.
+      - name: Update the hub image tag in ArgoCD
+        if: needs.plan.outputs.dry_run != 'true' && github.ref == 'refs/heads/main'
+        env:
+          GITOPS_DEPLOY_KEY: ${{ secrets.ARGOCD_DEPLOY_KEY }}
+          GITOPS_REPO: ${{ github.repository_owner }}/ArgoCD
+          MANIFEST: ai/turma/deployment.yaml
+          IMAGE: ${{ env.TURMA_IMAGE }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GITOPS_DEPLOY_KEY" ]; then
+            echo "::error::ARGOCD_DEPLOY_KEY is not set — k8x will stay on the previous hub image. See RELEASING.md." >&2
+            exit 1
+          fi
+          KEY="$RUNNER_TEMP/argocd_deploy_key"
+          KNOWN="$RUNNER_TEMP/argocd_known_hosts"
+          printf '%s\n' "$GITOPS_DEPLOY_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          # GitHub's published ed25519 host key, PINNED rather than accepted on
+          # first use: a runner is a fresh VM every time, so TOFU here means
+          # trusting whatever answers on the day.
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$KNOWN"
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN"
+          git clone --quiet "git@github.com:${GITOPS_REPO}.git" "$RUNNER_TEMP/gitops"
+          cd "$RUNNER_TEMP/gitops"
+          # Only the hub's own line: the pattern is anchored on the exact
+          # repository, so `turma-agent` in the same repo cannot match it. The
+          # old pin may carry a tag, a @digest, or neither.
+          sed -i -E "s#^([[:space:]]*image: )${IMAGE}([:@][^[:space:]]*)?[[:space:]]*\$#\1${IMAGE}:${VERSION}#" "$MANIFEST"
+          # A sed that matched nothing is silent, and a cluster that quietly
+          # never updates is the failure this step exists to prevent.
+          grep -q "image: ${IMAGE}:${VERSION}$" "$MANIFEST" || {
+            echo "::error::${MANIFEST} has no \`image: ${IMAGE}\` line to update — k8x is still on the previous image." >&2
+            exit 1
+          }
+          if git diff --quiet -- "$MANIFEST"; then
+            echo "Already at ${VERSION}; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --quiet -m "Turma hub ${VERSION} (${TAG})" -- "$MANIFEST"
+          git push --quiet origin HEAD:main
   # --------------------------------------------------------- build: agent -----
   # Hosted. This is the biggest build in the repo; its layer cache is `type=gha`
   # (GitHub-side, so it follows the job) and its disk is handled by the reclaim

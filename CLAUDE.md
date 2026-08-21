@@ -70,8 +70,9 @@ Turma is the source and CI for the Claude Code agent fleet used with the TrueNAS
 Claude Code Remote Control sessions, plus a central dashboard ("turma") that lists each host's
 repos, spawns/kills those sessions, and monitors them.
 
-It builds two images and pushes them to GHCR; the running stack comes from the sibling **DockerOps**
-repo (`compose/turma-truenas.yaml`, via Portainer GitOps).
+It builds two images and pushes them to GHCR. The per-host agents run from the sibling **DockerOps**
+repo (`compose/turma-truenas.yaml`, via Portainer GitOps); the hub runs on `k8x` from
+**xerktech/ArgoCD** (`ai/turma/`), which a release updates itself — see Deployment below.
 
 ## Session Model
 
@@ -412,6 +413,11 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   contracts above), the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
   basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
   env — usage is counted in tokens per model, so there is no rate table.
+- **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`), and a release DEPLOYS it** (XERK-425):
+  the last step of `build-turma-image` rewrites that manifest's image tag to the build it just
+  pushed, and the Application is `automated`, so merging hub code to main is what puts it in
+  production. It needs the `ARGOCD_DEPLOY_KEY` secret (a write deploy key on that repo, not a
+  PAT) and fails loudly without it; detail in `.claude/rules/release.md`.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit — **except `k8x`, whose
   agent is a StatefulSet in xerktech/ArgoCD (`ai/turma-agent/`, XERK-369)**: one agent for the whole
   cluster, its kubeconfig its own ServiceAccount, and its image pinned there by tag with no
