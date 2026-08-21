@@ -658,4 +658,3 @@ jobs:
             --notes "Native agent ${V}. Alias of release ${{ needs.plan.outputs.tag }} for hosts on the legacy updater; see RELEASING.md." \
             "dist/turma-agent-native-v${V}.tar.gz" \
             "dist/turma-agent-native-v${V}.tar.gz.sha256"
-
