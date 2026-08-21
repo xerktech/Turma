@@ -185,3 +185,18 @@ CVE-2026-56862 exp:2026-10-17
 # client, and this image runs no Go toolchain. The expiry forces the revisit.
 CVE-2026-56864 exp:2026-10-17
 CVE-2026-56865 exp:2026-10-17
+
+# CVE-2026-50163 — oras-go: information disclosure and arbitrary file access via
+# crafted tarball hardlinks when pulling an OCI artifact (fix: oras-go 2.6.2).
+# Reaches us only as a vendored dependency of the bundled `helm` binary, so it is
+# not independently patchable — and there is nowhere to bump to. helm 3.21.4 is
+# the newest 3.x, and helm 4.2.4, the newest release of any line, vendors the
+# SAME oras.land/oras-go/v2@v2.6.1; both read from the published binaries' own
+# build info rather than from a changelog. So a major-version upgrade would not
+# clear it either, which is worth knowing before someone tries.
+#
+# The blast radius is one `helm pull`/`helm install` against an OCI registry a
+# session chose to talk to. Not reachable from chart repos over HTTPS, which is
+# how every chart in xerktech/ArgoCD is fetched. The expiry forces the revisit
+# once upstream ships a helm built against 2.6.2.
+CVE-2026-50163 exp:2026-10-24

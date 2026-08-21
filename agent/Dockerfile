@@ -213,9 +213,15 @@ RUN set -eux; \
 # VERSIONS TRACK THE CLUSTER, NOT `latest`, and that is the pin that matters
 # here rather than a CVE sweep. kubectl tolerates one minor of skew either side
 # of the API server and talosctl's machine API is versioned with Talos itself,
-# so both are pinned to what `xerktech/Talos` `cluster.env` declares
-# (KUBERNETES_VERSION, TALOS_VERSION) and omnictl to the Omni release
+# so both follow what `xerktech/Talos` `cluster.env` declares
+# (KUBERNETES_VERSION, TALOS_VERSION) and omnictl the Omni release
 # `xerktech/ArgoCD` deploys. Bump them when that repo moves.
+#
+# WITHIN a minor, take the newest PATCH: the cluster runs 1.36.2 and this is
+# 1.36.4, because 1.36.2 vendors golang.org/x/net v0.49.0 and the image scan
+# fails on three HIGH CVEs in it (1.36.4 carries v0.56.0, read from the
+# published binary's own build info). Same-minor is what the skew rule cares
+# about; the patch is ours to choose, and choosing the oldest one buys nothing.
 #
 # DIGESTS ARE PINNED, unlike ttyd/docker/terraform above, and the difference is
 # deliberate: these four run with cluster-admin-shaped credentials against
@@ -226,8 +232,8 @@ RUN set -eux; \
 #   curl -sSL https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz.sha256sum
 #   curl -sSL https://github.com/siderolabs/talos/releases/download/v${TALOSCTL_VERSION}/sha256sum.txt
 #   curl -sSL https://github.com/siderolabs/omni/releases/download/v${OMNICTL_VERSION}/sha256sum.txt
-ARG KUBECTL_VERSION=1.36.2
-ARG KUBECTL_SHA256=1e9045ec32bea85da43de85f0065358529ea7c7a152eca78154fba5b58c27d82
+ARG KUBECTL_VERSION=1.36.4
+ARG KUBECTL_SHA256=8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a
 ARG HELM_VERSION=3.21.4
 ARG HELM_SHA256=61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14
 ARG TALOSCTL_VERSION=1.13.8

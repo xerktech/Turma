@@ -111,6 +111,13 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     shaped credentials against infrastructure this fleet owns, and a version tag can be re-pointed
     at a new artifact by whoever controls the release. Refresh from the publishers' checksum files
     (URLs are in the Dockerfile comment) in the same commit as the version bump.
+  - **Within a minor, take the newest PATCH.** The skew rule cares about the minor; the patch is
+    ours, and the oldest one buys nothing — kubectl 1.36.2 (the cluster's exact version) ships
+    `golang.org/x/net` v0.49.0 and fails the image scan on three HIGH CVEs, while 1.36.4 carries
+    v0.56.0. **`helm` has no such escape**: no released helm of any line vendors the fixed
+    `oras-go` 2.6.2 — 4.2.4 has the same v2.6.1 as 3.21.4 — so its CVE is a reviewed `.trivyignore`
+    entry with an expiry, not a bump. Read the binary's own build info rather than a changelog when
+    deciding which of the two a finding is.
   - Creds are the host's, optional, and log-only exactly like the cloud stores:
     `/root/.kube/config`, `/root/.talos/config`, `/root/.config/omni/config`, all
     `permissions.deny`-protected. **A
