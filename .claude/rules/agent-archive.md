@@ -82,15 +82,22 @@ paths:
       oscillates PERIODICALLY between two values — 700 of 1201 never offered in 400 beats on a
       period-2 toggle, both counts above the cap. A session going busy and idle on a regular cadence
       is exactly that, since candidates exclude whole slugs.
-      - **Bounded against the CANDIDATE COUNT, never a flat number** (`_trim_archive_offered`,
-        `2 x candidates`). An evicted stamp is indistinguishable from never-offered, and whichever
-        way that tie breaks it cycles — newest-first the evictions outrank the tail forever,
-        oldest-first the evicted head re-wins forever. A flat 5,000 starved the oldest
-        `N - 5200` at any number of beats. Sized to the live set there is nothing live to evict, so
-        the ambiguity never arises; the keys come from our own filesystem enumeration, not the wire,
-        so sizing to what is on disk is the honest bound. Trimmed on the passthrough too, or a host
-        that drops below the cap for good keeps every stamp it ever took. Sharing
-        `ARCHIVE_KNOWN_MAX` was also wrong — it coupled that map's off-switch to the rotation.
+      - **Bounded against the HIGH-WATER candidate count** (`_trim_archive_offered`). An evicted
+        stamp is indistinguishable from never-offered and whichever way that tie breaks it cycles,
+        so the bound's only job is to never drop an id that is still LIVE — and "live" spans the
+        oscillation, not this beat. Three versions of it were wrong, each looking obviously right:
+        a flat 5,000 cannot cover the live set at all (the oldest `N - 5200` starved at any beat
+        count); `2 x this beat's` count is computed against the TROUGH, so a slug going busy evicts
+        what is live at the peak and the cycle returns (201 of 1201 on a 201/1000 toggle, 2250 of
+        3250 on 250/3000); and no constant multiplier fixes that, because the one needed tracks the
+        peak/trough ratio, which is unbounded. The high-water mark never decays: a host whose
+        transcripts genuinely go away keeps a roomier map than it needs, which costs bytes and
+        cannot cost correctness. `ARCHIVE_OFFERED_HARD_MAX` is where that trade stops — ~25 MB of
+        Python heap, reached around 100k transcripts on one host.
+      - **Both paths through `_archive_window` trim.** The passthrough is what a host that has
+        shrunk below the cap takes every beat, so skipping it there means the map never comes down.
+      - Sharing `ARCHIVE_KNOWN_MAX` was also wrong — it coupled that map's off-switch to the
+        rotation.
       - **Ties break oldest-first**, so what is closest to being lost wins, and eviction is
         least-recently-offered — which is why a re-stamp POPS before it re-inserts rather than
         assigning in place.

@@ -278,6 +278,11 @@ ARCHIVE_KNOWN_MAX = max(0, int(os.environ.get("ARCHIVE_KNOWN_MAX", "5000")))
 # ...and the longest id worth remembering. Bounding ENTRIES bounds no bytes when
 # one key may be a megabyte, and this map outlives the reply that filled it.
 ARCHIVE_KNOWN_KEY_MAX = 256
+# Backstop on the last-offered stamps (see _trim_archive_offered). The bound that
+# matters is derived from the high-water candidate count; this is the point at
+# which we stop paying memory for the guarantee — ~25 MB of Python heap, which
+# needs about 100k transcripts on one host to reach.
+ARCHIVE_OFFERED_HARD_MAX = int(os.environ.get("ARCHIVE_OFFERED_HARD_MAX", "200000"))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read-ahead window per delta
 ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
@@ -10575,6 +10580,9 @@ class SessionManager:
         # for why each of those is the difference between a queue and a cliff.
         self._archive_offered = {}
         self._archive_offer_seq = 0
+        # The largest candidate count seen, which is what _trim_archive_offered
+        # sizes against — never this beat's, which dips whenever a slug goes busy.
+        self._archive_cand_hwm = 0
         # Throttle for the "cannot be named by the archive" line (see
         # _session_files): the manifest is rebuilt every beat.
         self._unnameable_logged_at = 0.0
@@ -15028,15 +15036,12 @@ class SessionManager:
         #     same oscillation: the beats where a slug is absent conclude the
         #     sweep is finished and restart it, throwing away the position inside
         #     that slug's range, so its tail is never reached.
-        #   * **Bounded against the CANDIDATE COUNT, not a flat number.** The
-        #     bound has to clear the live set, because an evicted stamp is
+        #   * **Bounded against the HIGH-WATER candidate count** — see
+        #     `_trim_archive_offered`, which carries the two versions of that
+        #     bound that were wrong and why. The short form: an evicted stamp is
         #     indistinguishable from never-offered and whichever way that tie
-        #     breaks it cycles: newest-first the evictions outrank the tail
-        #     forever, oldest-first the evicted head re-wins forever. A flat
-        #     5,000 starved the oldest `N - 5200` at any number of beats. This is
-        #     keyed on our own filesystem enumeration rather than on the wire, so
-        #     sizing it to what is on disk is the honest bound — it is the same
-        #     order as the candidate list this function is already handed.
+        #     breaks it cycles, so the bound must never drop a live id, and
+        #     "live" spans the oscillation rather than this beat.
         if slots > 0:
             pool = [m for m in rest if m["transcriptId"] not in taken]
             if pool:
@@ -15053,18 +15058,40 @@ class SessionManager:
         return window, backlog_start
 
     def _trim_archive_offered(self, candidate_count):
-        """Bound the last-offered stamps against how many candidates there ARE.
+        """Bound the last-offered stamps against the HIGH-WATER candidate count.
 
-        A flat number cannot cover the live set on a big host, and an evicted
-        stamp is indistinguishable from never-offered — whichever way that tie
-        breaks it cycles, so a flat 5,000 starved the oldest `N - 5200`
-        transcripts at any number of beats (XERK-424 QA pass 3, D1). Keyed on our
-        own filesystem enumeration rather than on the wire, so sizing it to what
-        is on disk is the honest bound: it is the same order as the candidate
-        list `_archive_window` is already handed. Evicts the least-recently-
-        offered, which after `_archive_window`'s re-insert is insertion order.
+        An evicted stamp is indistinguishable from never-offered, and whichever
+        way that tie breaks it cycles — so the bound's whole job is to never drop
+        an id that is still live. Two earlier versions got that wrong:
+
+          * a flat 5,000 cannot cover the live set on a big host at all, and
+            starved the oldest `N - 5200` at any number of beats (QA pass 3);
+          * `2 x THIS BEAT's` count looks like it fixes that and does not.
+            Candidates exclude whole slugs backing a running session, so the
+            count DIPS — which is the same busy/idle swing the rotation is not an
+            index because of. The trough's bound is computed against the trough,
+            evicts stamps that are live at the peak, and the cycle comes back:
+            201 of 1201 never offered on a 201/1000 toggle, 2250 of 3250 on a
+            250/3000 one, permanently (QA pass 4). No constant multiplier fixes
+            it either — the multiplier needed tracks the peak/trough ratio, which
+            is unbounded (measured: k>=6 for 201/1000, k>=13 for 250/3000).
+
+        So the bound is sized against the largest candidate count this process
+        has SEEN, which is what covers the union across an oscillation. It never
+        decays: a host whose transcripts genuinely go away keeps a roomier map
+        than it needs, which costs bytes and cannot cost correctness. Those bytes
+        are proportional to the peak transcripts on disk — measured ~25 MB of
+        Python heap at 100k transcripts, ~1 MB at the reference 2.4k — and
+        ARCHIVE_OFFERED_HARD_MAX is the backstop above which this trades the
+        guarantee back for memory.
+
+        Evicts the least-recently-offered, which after `_archive_window`'s
+        re-insert is insertion order.
         """
-        keep = max(2 * candidate_count, 4 * ARCHIVE_MANIFEST_MAX)
+        if candidate_count > self._archive_cand_hwm:
+            self._archive_cand_hwm = candidate_count
+        keep = min(max(2 * self._archive_cand_hwm, 4 * ARCHIVE_MANIFEST_MAX),
+                   ARCHIVE_OFFERED_HARD_MAX)
         while len(self._archive_offered) > keep:
             self._archive_offered.pop(next(iter(self._archive_offered)))
 

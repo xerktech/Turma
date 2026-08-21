@@ -15037,31 +15037,32 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
                          ["t000", "t001", "t002", "t003", "t004"])
 
     def test_stamp_map_evicts_oldest_offered_and_stays_bounded(self):
-        # The bound is sized against the CANDIDATE COUNT, so it only evicts
-        # entries that have fallen out of the live set — and it must evict the
-        # least-recently-offered, or the map describes the opposite of what it is
-        # for (XERK-424 QA pass 3, D5 / P08, P09).
+        # Eviction is forced through the BACKSTOP here, because the high-water
+        # bound deliberately does not fire when the candidate count merely dips —
+        # that dip is the defect it exists to prevent (XERK-424 QA pass 4, D1).
+        # What is pinned is that eviction, when it happens, takes the
+        # least-recently-offered and leaves the map bounded.
         sm = self.make_manager()
         with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
              mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
             big = self._cands(80)
-            # Long enough for the rotation to WRAP, so ids are re-stamped: a
-            # plain assignment keeps a re-stamped entry at its old insertion
-            # position, and then eviction order stops tracking recency.
+            # Long enough for the rotation to WRAP, so ids are re-stamped.
             for _ in range(30):
                 sm._archive_window(big)
             self.assertGreaterEqual(len(sm._archive_offered), 40,
                                     "stamps accumulate while the candidates are live")
-            stamped_early = min(sm._archive_offered, key=sm._archive_offered.get)
-            # Now most of them stop being candidates: the bound follows the live
-            # set down and the stale entries go.
-            sm._archive_window(self._cands(6))
-            keep = max(2 * 6, 4 * 10)
-            self.assertLessEqual(len(sm._archive_offered), keep, "bounded")
-            self.assertNotIn(stamped_early, sm._archive_offered,
-                             "the least-recently-offered is what goes")
+            # Probe an early-stamped id that this beat will NOT re-offer: the
+            # five lowest stamps are exactly what the rotation takes, and a
+            # re-offered transcript legitimately survives the trim.
+            by_seq = sorted(sm._archive_offered, key=sm._archive_offered.get)
+            stamped_early = by_seq[ha.ARCHIVE_MANIFEST_MAX - ha.ARCHIVE_MANIFEST_RECENT]
             seqs = [sm._archive_offered[k] for k in sm._archive_offered]
             self.assertEqual(seqs, sorted(seqs), "insertion order tracks recency")
+            with mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 20):
+                sm._archive_window(big)
+            self.assertLessEqual(len(sm._archive_offered), 20, "bounded")
+            self.assertNotIn(stamped_early, sm._archive_offered,
+                             "the least-recently-offered is what goes")
 
     def test_a_re_offered_transcript_moves_to_the_end_of_the_map(self):
         # A plain assignment leaves a re-stamped entry at its ORIGINAL insertion
@@ -15088,6 +15089,100 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
                           "the lowest stamp is what the rotation takes")
             self.assertIn(oldest, list(sm._archive_offered)[-picked:],
                           "a re-offered transcript moves to the end of the map")
+
+    def test_rotation_survives_a_candidate_count_that_halves(self):
+        # The bound's job is to never drop an id that is still live, and "live"
+        # spans the oscillation rather than this beat. Sized against THIS beat's
+        # count, a trough evicts stamps that are live at the peak and the cycle
+        # comes back: 201 of 1201 never offered on a 201/1000 toggle, permanently
+        # (XERK-424 QA pass 4, D1). Candidates exclude whole slugs, so a slug
+        # going busy is exactly that trough.
+        sm = self.make_manager()
+        wt_a = "/w/.turma/worktrees/Turma/ha"
+        wt_b = "/w/.turma/worktrees/Turma/hb"
+        for wt, n, base in ((wt_a, 8, 1_800_000_500), (wt_b, 40, 1_800_000_000)):
+            d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+            os.makedirs(d, exist_ok=True)
+            for i in range(n):
+                f = os.path.join(d, "%s%03d.jsonl" % (wt[-2:], i))
+                write_jsonl(f, [_text_entry("u", "user", "hi")])
+                os.utime(f, (base + i, base + i))
+        sm.usage_ledger = {w: {"repo": "Turma", "remote": "git@github.com:x/y.git",
+                               "slug": ha._project_slug(w)} for w in (wt_a, wt_b)}
+        sm.closed = []
+        seen = set()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 6), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 3):
+            for beat in range(120):
+                sm.registry = ([{"id": "s", "worktreePath": wt_b, "status": "running"}]
+                               if beat % 2 else [])
+                seen |= {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(len(seen), 48, "a trough must not evict what is live at the peak")
+
+    def test_the_stamp_bound_tracks_the_high_water_mark(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10):
+            sm._trim_archive_offered(500)
+            self.assertEqual(sm._archive_cand_hwm, 500)
+            sm._trim_archive_offered(20)      # a dip must not lower it
+            self.assertEqual(sm._archive_cand_hwm, 500)
+            sm._archive_offered = {"t%04d" % i: i for i in range(900)}
+            sm._trim_archive_offered(20)
+            self.assertEqual(len(sm._archive_offered), 900,
+                             "1000 of room at the high-water mark, so nothing is dropped")
+            sm._archive_offered = {"t%04d" % i: i for i in range(1200)}
+            sm._trim_archive_offered(20)
+            self.assertEqual(len(sm._archive_offered), 1000, "...but it is still a bound")
+            self.assertNotIn("t0000", sm._archive_offered, "the oldest offered is what goes")
+            self.assertIn("t1199", sm._archive_offered)
+        # The floor keeps a tiny host's map above one window, and the backstop
+        # caps what the guarantee may cost in memory.
+        sm2 = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10):
+            sm2._archive_offered = {"x%d" % i: i for i in range(60)}
+            sm2._trim_archive_offered(1)
+            self.assertEqual(len(sm2._archive_offered), 40, "4 x the window is the floor")
+        with mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 30), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10):
+            sm2._archive_offered = {"y%d" % i: i for i in range(90)}
+            sm2._trim_archive_offered(10_000)
+            self.assertEqual(len(sm2._archive_offered), 30, "the backstop caps it")
+        # BOTH paths through _archive_window trim. The passthrough is the one a
+        # host that has shrunk below the cap takes every beat, so skipping it
+        # there means the map never comes down again.
+        for n, label in ((5, "passthrough"), (40, "above the cap")):
+            sm3 = self.make_manager()
+            sm3._archive_offered = {"z%d" % i: i for i in range(90)}
+            with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+                 mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5), \
+                 mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 20):
+                sm3._archive_window(self._cands(n))
+            self.assertLessEqual(len(sm3._archive_offered), 20,
+                                 "the %s path trims too" % label)
+
+    def test_the_window_path_trims_too(self):
+        # The passthrough's trim call was pinned and the ABOVE-cap one was not,
+        # so the bound the whole defect turns on was exercised only below the cap
+        # (XERK-424 QA pass 4, D3 / Q06). Churn is what makes the above-cap path
+        # exceed its bound: ids come and go, so distinct stamps outrun the live
+        # count.
+        sm = self.make_manager()
+        slug = self._many_transcripts(sm, 30)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 6), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 3):
+            for gen in range(10):
+                # Replace the oldest few each round, so the id space churns while
+                # the candidate count stays flat.
+                for i in range(3):
+                    os.remove(os.path.join(d, "t%03d.jsonl" % (gen * 3 + i)))
+                    f = os.path.join(d, "g%03d_%d.jsonl" % (gen, i))
+                    write_jsonl(f, [_text_entry("u", "user", "hi")])
+                    os.utime(f, (1_800_100_000 + gen * 10 + i,) * 2)
+                sm._archive_manifest()
+            self.assertLessEqual(len(sm._archive_offered),
+                                 max(2 * sm._archive_cand_hwm, 4 * 6),
+                                 "the above-cap path bounds the map too")
 
     def test_only_the_backlog_is_stamped(self):
         # Stamping the recent slice too spends capacity on the transcripts that
