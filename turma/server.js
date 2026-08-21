@@ -2224,11 +2224,22 @@ function normalizeUsageBlock(usage, tally) {
 // A usage block hangs off its owner under a known key; a non-object one is
 // decode-fatal on Android (`UsageInfo`), so it is DROPPED — deleting shrinks the
 // record where rewriting it to `null` would grow it.
+//
+// An explicit `null` is DROPPED THE SAME WAY BUT NOT TALLIED, because it is the
+// agent's deliberate "nothing to report" rather than a value it got wrong: a
+// host reports `usage: null` until it has spent something (`host_usage` in
+// hub-agent.py), and a session's is `null` until its transcript has a usage
+// block. Counting those made a brand-new host warn on EVERY beat that its
+// "token figures understate what it really spent" — false, since it had spent
+// nothing, and it drowned the real signal at ~1 line per beat per new host.
+// Anything else non-object is still a host getting the shape wrong, and still
+// says so.
 function dropUnusableUsage(owner, tally) {
   if (!objectish(owner) || !("usage" in owner)) return;
   if (objectish(owner.usage)) return;
+  const deliberate = owner.usage === null;
   delete owner.usage;
-  noteUsageCoercion(tally, "usage");
+  if (!deliberate) noteUsageCoercion(tally, "usage");
 }
 
 // Every place a usage block rides the heartbeat: the host-wide aggregate, the
@@ -2292,6 +2303,11 @@ function noteUsageCoercion(tally, where) {
 // state is declared with the other log throttles, above `loadState`, because
 // the restore reaches this too. The example path goes through logName: a `days`
 // key is agent-authored text that would otherwise forge a log line.
+function resetUsageCoercionLog() {
+  usageCoercionLogAt = 0;
+  usageCoercionSuppressed = 0;
+}
+
 function logUsageCoercion(payload, tally) {
   if (!tally.count) return;
   usageCoercionSuppressed += 1;
@@ -9465,6 +9481,12 @@ if (process.env.TURMA_TEST) {
     supersededAsset,
     invalidateAgentsCache,
     serializeAgentsForSave,
+    // The usage-coercion warning is rate-limited to one line a minute across the
+    // WHOLE fleet, on module state. Exported so a test can hold BOTH halves of
+    // the rule — that a deliberate `null` stays silent AND that a wrong-typed
+    // value still warns — without the second half passing merely because an
+    // earlier test in the file spent the window.
+    resetUsageCoercionLog,
     // The in-flight body budget (XERK-258). Exported because the admission rule
     // is the whole fix and is otherwise only reachable by actually flooding a
     // memory-limited container: the ceilings so a test can hold the arithmetic

@@ -11653,6 +11653,40 @@ test("normalizeUsage survives a non-iterable repoUsage or sessions", () => {
   }
 });
 
+test("a null usage is dropped in silence; a wrong-typed one still warns", () => {
+  // The agent sends `usage: null` on purpose — a host reports one until it has
+  // spent something, and a session's stays null until its transcript carries a
+  // usage block. Tallying that made a NEW host warn on every beat that its
+  // "token figures understate what it really spent", which was false and, at a
+  // line per beat, buried the hosts genuinely sending the wrong shape.
+  const warnings = [];
+  const realWarn = console.warn;
+  // One line a minute, fleet-wide — an earlier test in this file may have spent
+  // the window, which would let the second assertion below pass for the wrong
+  // reason.
+  hub.resetUsageCoercionLog();
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    // Nulls in all three places one can ride: the host block, a repo row, and a
+    // session. Every one is the deliberate value, so none of them may warn.
+    hub.normalizeRecord({
+      device: "quiet-host", usage: null,
+      repoUsage: [{ repo: "Turma", usage: null }],
+      sessions: [{ id: "s1", usage: null }],
+    });
+    assert.deepEqual(warnings, [], `a deliberate null must not warn: ${warnings[0] || ""}`);
+
+    // The other half, and the reason this is not just "stop warning": a host
+    // that genuinely got the shape wrong must still be named.
+    hub.resetUsageCoercionLog();
+    hub.normalizeRecord({ device: "broken-host", usage: "lots" });
+    assert.equal(warnings.length, 1, "a non-object, non-null usage must still warn");
+    assert.match(warnings[0], /broken-host/, "the warning must name the host");
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
 test("normalizeSessions coerces the per-session fields Android types", () => {
   // Typing a field on `SessionInfo` is what makes it decode-fatal: before that
   // `ignoreUnknownKeys` skipped it and any value was harmless. `modelSource`
