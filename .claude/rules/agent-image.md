@@ -100,6 +100,113 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     error**: the preflight only LOGS which stores it found, keying on a **login-marker file** never
     the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's
     build-time smoke test drops the stores it creates. `permissions.deny` protects them.
+- **Cluster CLIs** (`kubectl`/`helm`/`talosctl`/`omnictl`, pinned via `KUBECTL_VERSION`/
+  `HELM_VERSION`/`TALOSCTL_VERSION`/`OMNICTL_VERSION` in `agent/Dockerfile`) sit in `tooling` beside
+  the cloud CLIs, on the same terms and for the same reason (XERK-369).
+  - **Their versions track the `k8x` CLUSTER, not `latest`.** kubectl tolerates one minor of skew
+    either side of the API server and talosctl's machine API is versioned with Talos, so both follow
+    `xerktech/Talos` `cluster.env` (`KUBERNETES_VERSION`, `TALOS_VERSION`) and omnictl follows the
+    Omni release `xerktech/ArgoCD` deploys. A CVE bump alone is not a reason to move them.
+  - **Their digests are pinned**, unlike ttyd/docker/terraform: these four run with cluster-admin-
+    shaped credentials against infrastructure this fleet owns, and a version tag can be re-pointed
+    at a new artifact by whoever controls the release. Refresh from the publishers' checksum files
+    (URLs are in the Dockerfile comment) in the same commit as the version bump.
+  - **Within a minor, take the newest PATCH.** The skew rule cares about the minor; the patch is
+    ours, and the oldest one buys nothing — kubectl 1.36.2 (the cluster's exact version) ships
+    `golang.org/x/net` v0.49.0 and fails the image scan on three HIGH CVEs, while 1.36.4 carries
+    v0.56.0. **`helm` has no such escape**: no released helm of any line vendors the fixed
+    `oras-go` 2.6.2 — 4.2.4 has the same v2.6.1 as 3.21.4 — so its CVE is a reviewed `.trivyignore`
+    entry with an expiry, not a bump. Read the binary's own build info rather than a changelog when
+    deciding which of the two a finding is.
+  - Creds are the host's, optional, and log-only exactly like the cloud stores:
+    `/root/.kube/config`, `/root/.talos/config`, `/root/.config/omni/config`, all
+    `permissions.deny`-protected. **A
+    `~/.talos/config` that EXISTS may still hold no context** — `talosctl` writes one just by being
+    run, and truenas's is `context: ""` — so the preflight's line means a store is there, never that
+    it works.
+- **In-cluster, the kubeconfig is the POD'S OWN ServiceAccount and nothing is mounted** (XERK-369).
+  `entrypoint.sh` writes `/root/.kube/config` from the projected token when — and only when —
+  `KUBERNETES_SERVICE_HOST` is set, the token and `ca.crt` are readable, and neither `KUBECONFIG`
+  nor a `/root/.kube/config` this block did not write says otherwise.
+  - **It is a CONVENIENCE, not the credential**, and that is what decides how hard it may try:
+    client-go falls back to the in-cluster ServiceAccount on its own, so `kubectl` and `helm` in a
+    pod authenticate with no kubeconfig at all (measured). What the file adds is a named
+    current-context and the pod's own namespace as the default. **So every step of it is guarded
+    and every failure is one log line** — it runs under `set -e` as PID 1 before the manager
+    starts, and QA measured an unguarded `mkdir` killing the container on a read-only `/root` and
+    on a `/root/.kube` that was a file, and an unbounded read of `namespace` hanging PID 1 on a
+    fifo. Never "fix" one of those guards by making it fatal.
+  - **It must be `tokenFile:`, never an inline `token:`.** The projected token is rewritten in place
+    at ~80% of its TTL; QA measured a copy taken at boot returning `Unauthorized` eight minutes
+    later while the generated config authenticated in the same second.
+  - **A line-1 marker is what makes it safe to overwrite**, and it is load-bearing: `/root` is a
+    persistent volume in a pod, so without it the first boot's config is frozen there forever and a
+    changed apiserver address or namespace loses silently. A file without the marker — and a
+    SYMLINK, dangling included, which fails `-e` and would otherwise read as absent — is the
+    operator's and is never touched.
+  - Everything interpolated into it is validated first (`KUBERNETES_SERVICE_HOST`,
+    `KUBERNETES_SERVICE_PORT`, the `namespace` file), because it is a YAML heredoc and a namespace
+    with a stray newline produces a file that parses as something else entirely.
+  - **And every interpolated scalar is QUOTED, which validation does not cover.** Kubernetes accepts
+    `no`, `on`, `off`, `yes`, `true`, `null` and `123` as namespace names and YAML reads each as a
+    bool, a number or null, so an unquoted `namespace:` yields a config kubectl refuses to LOAD —
+    every call in the pod dies at config load while the same pod with no kubeconfig authenticates
+    fine. Those names are all `[a-z0-9-]`, so no character filter catches it.
+  - The temp file is `mktemp` in a staging directory of its own (`~/.kube/.turma-tmp`, cleared on
+    every exit from the write), not a name beside the operator's things. `mktemp` gives 0600
+    before anything is written, so the mode is never a race and no `umask` is touched — a bare
+    `umask 077 … umask 022`
+    pair leaks a hardcoded 022 into the manager and every session.
+  - **Clearing that directory is `rm -rf` on the PATH, never a glob inside it, and the `mkdir` after
+    it must not be `-p`.** Two earlier shapes were each worse than the leftovers they cleaned:
+    `rm -f ~/.kube/.config.??????` deleted operator files whose names fit (QA destroyed a planted
+    `.config.backup`), and `mkdir -p` + `rm -f "$dir"/*` followed a SYMLINK planted at `.turma-tmp`
+    and emptied its target as root while the boot logged success. `rm -rf` on a symlink unlinks the
+    LINK without traversing; a bare `mkdir` then refuses anything that raced back into the path.
+  - **`~/.kube` is NOT ours, even in a pod, and `~/.kube` ITSELF can be a session's symlink.** What
+    re-owns it is the identity self-heal, which chowns every root-owned path under it on every
+    drop-priv boot whether the kubeconfig block runs or not — and `/root` is chowned there too, so a
+    session can replace the whole directory. Do not attribute that to the block's own `chown`
+    (a narrowing there would look like it closed the hole and would not). The block refuses outright
+    when `/root/.kube` is a symlink, because `mkdir -p` succeeds on one and everything after would
+    then delete and write inside a directory the session chose. Never write code here that assumes
+    otherwise. Tests: the `/root/.kube`-symlink, `.turma-tmp`-symlink, leftover-directory and
+    regular-file cases.
+  - **That block's own `chown` is the FILE, plus the DIRECTORY only when the block created it —
+    never `-R`.** `-R` re-homes the operator's own material (measured: `admin.conf`, `ca.crt`, a
+    nested `subdir/deep.conf`). But the self-heal skips paths that do not exist yet and runs long
+    before this block, so a `~/.kube` created here is the one directory it never reaches: left
+    root-owned, a dropped session can read the config and nothing else — `kubectl config
+    set-context` fails on `config.lock` and kubectl gets no `~/.kube/cache` at all, while every
+    assertion about the FILE still passes.
+  - **The hand-over happens where the directory is CREATED, not where the write succeeds** — all
+    three failure exits create it too, and a fix that lived in the success branch left them with the
+    same root-owned directory. Tests: one case per exit, the write-fail one reached by filling a
+    `/root` tmpfs to 100% — `mkdir` and `mktemp` allocate metadata rather than blocks, so only the
+    heredoc fails. The MOUNTED-directory case's probes are
+    uid 2000, not root, because the self-heal re-owns a root-owned probe first and the assertion
+    then cannot tell "chown only what we made" from "chown unconditionally" apart.
+  - **Both chowns are `-h`.** `chown` follows a symlink argument, so without it a symlink appearing
+    at `/root/.kube` after the `-L` guard would have its TARGET re-owned. The race is not winnable
+    in practice — nothing running as the session identity exists during boot — but it is two
+    characters, and the self-heal uses `-h` for the same reason. It does not close the residual
+    guard TOCTOU: a won race still lands the config in the attacker's directory.
+  - It is written as root before the manager starts, so it is `chown`ed to the run-as identity —
+    otherwise every session on a `PUID` host gets a permission error on a file the operator cannot
+    see. Nothing in it touches the process `umask` — see the `mktemp` note above for why it does
+    not need to.
+  - **`KUBERNETES_SERVICE_HOST` is taken on trust, and the CA PIN is what makes that safe.** It is
+    what the config pairs with the pod's real bearer token, and the only thing stopping a redirected
+    apiserver from receiving that token is `certificate-authority` pointing at the cluster's own CA:
+    QA measured a redirected kubectl failing the handshake with
+    `x509: certificate signed by unknown authority` and the rogue server logging a bad-certificate
+    alert having received **zero** requests. So never drop that field, never add
+    `insecure-skip-tls-verify`, and never reuse the variable somewhere without a pin.
+    - The reasoning this replaced — "anything that can set env on a container can do worse
+      directly" — is FALSE for this variable and must not come back: a Service named `kubernetes`
+      in the pod's own namespace overrides it for every pod there, and namespace-scoped `create
+      services` is far less privilege than editing a workload.
+  - Tests: the XERK-369 cases in `test_entrypoint.sh`.
 - **Android toolchain** — JDK 17 + Gradle + Android SDK (`gradle`/`sdkmanager`/`avdmanager`/`adb`/
   `aapt2` on PATH), pinned via
   `GRADLE_VERSION`/`ANDROID_CMDLINE_TOOLS`/`ANDROID_PLATFORM`/`ANDROID_BUILD_TOOLS` in

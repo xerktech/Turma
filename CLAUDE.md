@@ -412,7 +412,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   contracts above), the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
   basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
   env — usage is counted in tokens per model, so there is no rate table.
-- Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land
+- Changing how it's RUN (or adding a host) is a DockerOps compose edit — **except `k8x`, whose
+  agent is a StatefulSet in xerktech/ArgoCD (`ai/turma-agent/`, XERK-369)**: one agent for the whole
+  cluster, its kubeconfig its own ServiceAccount, and its image pinned there by tag with no
+  Watchtower, so a release does not reach it until someone deletes the pod. Image content edits land
   here.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.

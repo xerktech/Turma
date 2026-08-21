@@ -1361,6 +1361,19 @@ _GUARD_DENY_PATH_RULES = [
     "Edit(~/.aws/**)",
     "Edit(~/.azure/**)",
     "Edit(~/.terraform.d/**)",
+    # The cluster credentials the k8s CLI layer's tools read (XERK-369). Same
+    # terms as ~/.aws above, and the same LIMIT: these cover the file-editing
+    # tools only — the guard walks past Bash (XERK-309), so a session can still
+    # write any of them with a redirect, or skip them entirely by exporting
+    # KUBECONFIG. In a pod it can also read the projected ServiceAccount token
+    # straight out of /var/run/secrets, which is 0644 by Kubernetes' own
+    # default. Read this as tidiness of the same kind ~/.aws gets, NOT as
+    # containment — the pod's token is the boundary, and it is cluster-admin.
+    # ~/.kube/config is on the list even where the entrypoint GENERATED it: what
+    # it points at is the credential.
+    "Edit(~/.kube/**)",
+    "Edit(~/.talos/**)",
+    "Edit(~/.config/omni/**)",
     # ~/.claude is covered by `hooks/fileguard.py`, NOT by a pattern, because the
     # rule is "everything under ~/.claude except the two agent-memory trees" and
     # a glob list cannot express it: deny beats allow, so the exception must be a

@@ -42,6 +42,10 @@ class TestGuardSettings(unittest.TestCase):
         for rule in (
             "Edit(~/.azure/**)",
             "Edit(~/.terraform.d/**)",
+            # The cluster CLIs the image bundles (XERK-369), on the same terms.
+            "Edit(~/.kube/**)",
+            "Edit(~/.talos/**)",
+            "Edit(~/.config/omni/**)",
         ):
             self.assertIn(rule, deny)
 
@@ -215,6 +219,9 @@ class TestGuardSettings(unittest.TestCase):
         "Edit(~/.aws/**)",
         "Edit(~/.azure/**)",
         "Edit(~/.terraform.d/**)",
+        "Edit(~/.kube/**)",
+        "Edit(~/.talos/**)",
+        "Edit(~/.config/omni/**)",
         "Edit(~/.claude.json)",
         "Edit(~/.claude/.*)",
         "Edit(~/.claude/*.json)",
