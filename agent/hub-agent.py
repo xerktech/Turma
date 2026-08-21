@@ -14983,6 +14983,8 @@ class SessionManager:
             # high-water bound it does not, and the docstring below says so. It
             # runs so the hard cap is enforceable on this path too, which is
             # every beat for a host below the manifest cap (XERK-424 QA pass 6).
+            # The earlier returns above trim nothing and need not: they never
+            # stamp either, so the map cannot grow through them.
             self._trim_archive_offered(universe)
             return list(cands), len(cands)
         # Clamped so the backlog keeps a QUARTER of the window whatever the two
@@ -15043,8 +15045,8 @@ class SessionManager:
         #     that slug's range, so its tail is never reached.
         #   * **Bounded against the high-water transcript UNIVERSE** — every
         #     eligible slug's `.jsonl` count, RUNNING SLUGS INCLUDED. See
-        #     `_trim_archive_offered`, which carries the four versions of that
-        #     bound that were wrong and why they all shared one root cause. The
+        #     `_trim_archive_offered`, which carries the three versions of that
+        #     bound that were wrong and why they shared one root cause. The
         #     short form: an evicted stamp is indistinguishable from
         #     never-offered and whichever way that tie breaks it cycles, so the
         #     bound must never drop an id that CAN be live — which is not the
@@ -15069,7 +15071,10 @@ class SessionManager:
 
         An evicted stamp is indistinguishable from never-offered, and whichever
         way that tie breaks it cycles — so the bound's whole job is to never drop
-        an id that is still live. Two earlier versions got that wrong:
+        an id that is still live. THREE earlier versions of this bound shipped on
+        the branch and each got that wrong, all for the same reason — the number
+        they were derived from was structurally smaller than the set it had to
+        cover:
 
           * a flat 5,000 cannot cover the live set on a big host at all, and
             starved the oldest `N - 5200` at any number of beats (QA pass 3);

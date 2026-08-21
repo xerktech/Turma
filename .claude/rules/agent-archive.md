@@ -85,9 +85,9 @@ paths:
       - **Bounded against the high-water TRANSCRIPT UNIVERSE** (`_trim_archive_offered`) — every
         eligible slug's `.jsonl` count, **running slugs included**. An evicted stamp is
         indistinguishable from never-offered and whichever way that tie breaks it cycles, so the
-        bound's only job is to never drop an id that can still be live. Four versions were wrong,
-        each looking obviously right, and the pattern in all four is that the bound was derived
-        from a number structurally smaller than the set it had to cover:
+        bound's only job is to never drop an id that can still be live. Three versions shipped
+        and were wrong, each looking obviously right, and the pattern in all three is that the
+        bound was derived from a number structurally smaller than the set it had to cover:
         - a flat 5,000 cannot cover the live set at all — the oldest `N - 5200` starved at any
           beat count;
         - `2 x this beat's CANDIDATE count` is computed against the TROUGH, since a slug going
@@ -106,8 +106,10 @@ paths:
         trade stops (32.5 MB RSS measured at the 200k cap with real UUID keys, ~100k transcripts on
         one host). Past it the loss is a linear slope, roughly `universe - cap - MANIFEST_MAX`
         transcripts, so it is **logged once** rather than left silent.
-      - **Both paths through `_archive_window` trim**, because the passthrough is every beat for a
-        host below the cap and the hard cap has to be enforceable there too. Not because a shrunk
+      - **The two paths that can GROW the map both trim** — the normal window and the under-cap
+        passthrough — because the passthrough is every beat for a host below the cap and the hard
+        cap has to be enforceable there too. The two early returns that trim nothing also never
+        stamp, so the map cannot grow through them. Not because a shrunk
         host's map comes down — under a never-decaying mark it does not.
       - **The state is in MEMORY, so a restart LOOP starves the rotation** (XERK-430): a single
         restart is safe, but at a 2-4 beat restart period 900 of 1300 were never offered. The
