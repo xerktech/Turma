@@ -2297,17 +2297,19 @@ function noteUsageCoercion(tally, where) {
   if (!tally.first) tally.first = where;
 }
 
+// Test-only, and exported only under TURMA_TEST: the throttle below is
+// fleet-wide module state, so one test spending the window silences the next.
+function resetUsageCoercionLog() {
+  usageCoercionLogAt = 0;
+  usageCoercionSuppressed = 0;
+}
+
 // Coercing a figure to 0 UNDERSTATES the host rather than excluding it, so it
 // must not be silent. Throttled process-wide (a beat arrives every few seconds
 // and a host reporting one bad figure reports it forever) — the throttle's own
 // state is declared with the other log throttles, above `loadState`, because
 // the restore reaches this too. The example path goes through logName: a `days`
 // key is agent-authored text that would otherwise forge a log line.
-function resetUsageCoercionLog() {
-  usageCoercionLogAt = 0;
-  usageCoercionSuppressed = 0;
-}
-
 function logUsageCoercion(payload, tally) {
   if (!tally.count) return;
   usageCoercionSuppressed += 1;

@@ -37,6 +37,16 @@ paths:
     A window, `days` or `usage` that is not an object at all IS dropped, and a missing figure is
     never filled in — this walk sits between the raw and coerced `AGENT_RECORD_MAX` measurements, so
     `{}` → four invented zeros on an agent-sized `days` map is an expansion it must not make.
+  - **An explicit `null` `usage` is dropped but NOT logged**, because it is the agent's deliberate
+    "nothing to report": a host reports `usage: null` until it has spent something, and a session's
+    is null until its transcript carries a usage block. Tallying it made every new host warn on
+    every beat that it under-reports — false, and worse, those beats spent the fleet-wide throttle
+    window and silently swallowed the warnings from hosts genuinely sending the wrong shape. Any
+    other non-object still tallies and still names the host. Never restore the tally for `null`.
+  - **The drop itself is load-bearing and must stay a `delete`**: `RepoUsage.usage` is NON-nullable
+    on Android (`Models.kt`), so serving an explicit `null` there is decode-fatal for the whole
+    `/api/agents` array, not just that row. Tests: `a null usage is dropped in silence` asserts the
+    key is absent, not merely unlogged.
   - **`normalizeLimits` coerces the block at ingest**, like the per-model usage lists beside it and
     for the same reason: it fans out to web, Android and glasses, and Android decodes it into TYPED
     fields, so a `usedPct` of `"lots"` from one buggy host would fail the decode of the WHOLE fleet

@@ -11669,12 +11669,21 @@ test("a null usage is dropped in silence; a wrong-typed one still warns", () => 
   try {
     // Nulls in all three places one can ride: the host block, a repo row, and a
     // session. Every one is the deliberate value, so none of them may warn.
-    hub.normalizeRecord({
+    const rec = {
       device: "quiet-host", usage: null,
       repoUsage: [{ repo: "Turma", usage: null }],
       sessions: [{ id: "s1", usage: null }],
-    });
+    };
+    hub.normalizeRecord(rec);
     assert.deepEqual(warnings, [], `a deliberate null must not warn: ${warnings[0] || ""}`);
+    // Silence is only half of it: the key must still be DELETED, not left as an
+    // explicit null. `RepoUsage.usage` is NON-nullable on Android
+    // (Models.kt), so a served null there is decode-fatal for the whole
+    // /api/agents array — and an early return in front of the delete is a
+    // plausible edit now that the null case has a branch of its own.
+    assert.ok(!("usage" in rec), "a null host usage must be dropped, not served");
+    assert.ok(!("usage" in rec.repoUsage[0]), "a null repo usage must be dropped, not served");
+    assert.ok(!("usage" in rec.sessions[0]), "a null session usage must be dropped, not served");
 
     // The other half, and the reason this is not just "stop warning": a host
     // that genuinely got the shape wrong must still be named.
