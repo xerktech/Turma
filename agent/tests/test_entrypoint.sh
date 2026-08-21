@@ -738,7 +738,13 @@ elapsed=$(( $(date +%s) - t0 ))
 if echo "$out" | grep -q "MANAGER uid=" && [ "$elapsed" -lt 25 ]; then
   echo "  ok: booted in ${elapsed}s with both state files replaced by FIFOs"
 else
-  echo "  FAIL: a session-planted FIFO held the boot ${elapsed}s (wedge, or only the watchdog saved it)"; FAILED=1
+  # The container's output, not just the clock. Which half failed decides
+  # everything: a missing `MANAGER uid=` with a SHORT elapsed is a boot that
+  # died, not a wedge — and this case has been seen failing that way (XERK-413).
+  # Without the output a CI failure here is unactionable.
+  echo "  FAIL: a session-planted FIFO held the boot ${elapsed}s (wedge, or only the watchdog saved it)"
+  echo "        container output: $(echo "$out" | tr '\n' '|')"
+  FAILED=1
 fi
 docker run --rm -v "$WORK/fx16/turma:/t" busybox sh -c 'rm -f /t/last-claude-check /t/claude-unparseable' >/dev/null 2>&1
 
@@ -1385,10 +1391,11 @@ expect "the operator's own file keeps its owner" "2000:2000" \
 expect "and the mounted directory is not re-owned" "2000:2000" "$(field "$out" KUBEDIR_OWNER)"
 
 # --- Case 38: a failed replace leaves nothing behind (XERK-369) -------------
-# The last of the three exits from the write, and the one that looked
-# unreachable: `mv` is called unqualified and /usr/local/bin precedes /bin, so a
-# stub that fails for this destination alone reaches the branch without
-# disturbing anything else that moves a file.
+# The replace-fail exit, and the one that looked unreachable: `mv` is called
+# unqualified and /usr/local/bin precedes /bin, so a stub that fails for this
+# destination alone reaches the branch without disturbing anything else that
+# moves a file. (Case 43 covers the write-fail exit, and case 36 the
+# stage-fail one.)
 echo "== case: a failed replace leaves no staging directory"
 make_fixture "$WORK/fx38" 0 0
 mkdir -p "$WORK/fx38/sa" "$WORK/fx38/kube"

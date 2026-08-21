@@ -760,8 +760,7 @@ elif [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
            && mkdir "$KUBE_TMPDIR" 2>/dev/null \
            && KUBE_TMP="$(mktemp "$KUBE_TMPDIR/config.XXXXXX" 2>/dev/null)"; }; then
     # `mkdir` may have succeeded and only the `mktemp` failed, which leaves the
-    # staging directory behind — the one exit that did NOT clear up while three
-    # comments claimed all of them did.
+    # staging directory behind. Every exit past the `mkdir` clears it.
     rm -rf "$KUBE_TMPDIR" 2>/dev/null || true
     echo "[entrypoint] ${KUBE_CLI}: cannot write /root/.kube/config — leaving the credential to client-go's own in-cluster fallback"
   elif ! kube_write_config "$KUBE_TMP" 2>/dev/null; then
