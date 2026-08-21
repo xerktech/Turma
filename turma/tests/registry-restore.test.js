@@ -136,7 +136,22 @@ test("a restore that fails PART WAY through serves nothing, not half a registry"
   assert.ok(r.stderr.includes("state restore skipped"), r.stderr);
 });
 
-test("when it CANNOT move the file, it says that instead of naming one that isn't there", () => {
+// ROOT CANNOT RUN THIS ONE, and the reason is the mechanism it tests. The case
+// makes the rename fail by chmod'ing the DIRECTORY to 0555 — but root bypasses
+// the DAC check, so the rename succeeds, the hub takes the happy path, and the
+// assertion fails on a hub that is behaving correctly. Skipped rather than
+// reworked because there is no portable way to make `rename` fail for root
+// without a real read-only mount, and CI runs as a normal user, where this is
+// the case that actually guards the message.
+//
+// It matters that this is a SKIP and not a deletion: every agent session on the
+// TrueNAS host runs as root, so before this the suite failed there on every run
+// and the failure had to be recognised and dismissed by hand each time.
+const ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+
+test("when it CANNOT move the file, it says that instead of naming one that isn't there", {
+  skip: ROOT && "root bypasses the directory permission this case depends on",
+}, () => {
   // The message is the operator's only lead. On a read-only /data the rename
   // fails, and pointing them at a `.oversized` that was never created sends
   // them looking for a file the hub did not write — reading as "the hub ate my

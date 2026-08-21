@@ -17,11 +17,13 @@
 #   tooling        No Android at all. 2.4 GB. CI scans this.
 #
 # Every tier grew 1.0 GB when the cloud CLIs (terraform/az/aws — see their layer
-# below) landed in `tooling`. They are NOT a tier of their own: unlike Android,
-# which is a whole toolchain most sessions never invoke, these are credential-
-# bearing runtime tools, they are what the Trivy gate most wants to see, and a
-# fourth tier would double the tag matrix to spare :latest a third of what the
-# emulator alone costs.
+# below) landed in `tooling`, and 0.27 GB again when the cluster CLIs
+# (kubectl/helm/talosctl/omnictl) landed beside them. Neither is a tier of its
+# own: unlike Android, which is a whole toolchain most sessions never invoke,
+# these are credential-bearing runtime tools, they are what the Trivy gate most
+# wants to see, and a fourth tier would double the tag matrix to spare :latest a
+# third of what the emulator alone costs. The three figures above PREDATE the
+# cluster CLIs; add 0.27 GB to each until they are re-measured.
 #
 # Note the shape: the whole Android BUILD toolchain costs 0.6 GB, while the
 # emulator + x86_64 system image cost 4.4 GB — 7x more. That asymmetry is why
@@ -181,6 +183,81 @@ RUN set -eux; \
     az extension add --name azure-devops --version "${AZURE_DEVOPS_EXT_VERSION}" --yes; \
     terraform version; aws --version; az version; az repos -h >/dev/null; \
     rm -rf /root/.azure /root/.terraform.d
+
+# --- Kubernetes / cluster CLI layer (stable, ~0.27 GB) ----------------------
+# kubectl, helm, talosctl and omnictl, so a session can operate the `k8x` Talos
+# cluster the same way it already operates GitHub through `gh` and cloud
+# accounts through aws/az/terraform.
+#
+# On PATH in EVERY image, not just the cluster-side one XERK-369 adds. The
+# truenas and MaxAI agents already work in `xerktech/ArgoCD` and
+# `xerktech/Talos`, whose whole content is manifests and machine configs for
+# that cluster, and today they do it with no way to look at what they changed.
+#
+# Nothing here logs in, bakes a credential, or fails when a host has none —
+# the same rule the cloud layer above states. Credentials arrive at runtime:
+#   /root/.kube/config          kubectl, helm
+#   /root/.talos/config         talosctl
+#   /root/.config/omni/config   omnictl
+# ...except IN-CLUSTER, where entrypoint.sh writes /root/.kube/config from the
+# pod's own ServiceAccount and no kubeconfig is mounted at all. See the
+# preflight in entrypoint.sh for both halves.
+#
+# Its own RUN inside `tooling`, after the cloud layer, for the reasons that
+# layer states: every tier needs them, they authenticate to a control plane so
+# they are exactly the surface the Trivy gate is for, and a separate RUN keeps
+# a bump here from re-downloading the GB above it. Sizes on disk, measured by
+# running each binary in the base image: talosctl 97 MB, omnictl 67 MB, kubectl
+# 57 MB, helm 57 MB — 278 MB the tier.
+#
+# VERSIONS TRACK THE CLUSTER, NOT `latest`, and that is the pin that matters
+# here rather than a CVE sweep. kubectl tolerates one minor of skew either side
+# of the API server and talosctl's machine API is versioned with Talos itself,
+# so both follow what `xerktech/Talos` `cluster.env` declares
+# (KUBERNETES_VERSION, TALOS_VERSION) and omnictl the Omni release
+# `xerktech/ArgoCD` deploys. Bump them when that repo moves.
+#
+# WITHIN a minor, take the newest PATCH: the cluster runs 1.36.2 and this is
+# 1.36.4, because 1.36.2 vendors golang.org/x/net v0.49.0 and the image scan
+# fails on three HIGH CVEs in it (1.36.4 carries v0.56.0, read from the
+# published binary's own build info). Same-minor is what the skew rule cares
+# about; the patch is ours to choose, and choosing the oldest one buys nothing.
+#
+# DIGESTS ARE PINNED, unlike ttyd/docker/terraform above, and the difference is
+# deliberate: these four run with cluster-admin-shaped credentials against
+# infrastructure this fleet owns. A version tag can be re-pointed at a new
+# artifact by whoever controls the release; a digest cannot. Refresh them from
+# the publishers' own checksum files when bumping a version:
+#   curl -sSL https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256
+#   curl -sSL https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz.sha256sum
+#   curl -sSL https://github.com/siderolabs/talos/releases/download/v${TALOSCTL_VERSION}/sha256sum.txt
+#   curl -sSL https://github.com/siderolabs/omni/releases/download/v${OMNICTL_VERSION}/sha256sum.txt
+ARG KUBECTL_VERSION=1.36.4
+ARG KUBECTL_SHA256=8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a
+ARG HELM_VERSION=3.21.4
+ARG HELM_SHA256=61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14
+ARG TALOSCTL_VERSION=1.13.8
+ARG TALOSCTL_SHA256=406b56f9e4ff03b1557cc941b1f163aec8a6ebb36e28f0bbbe6d083589529261
+ARG OMNICTL_VERSION=1.10.3
+ARG OMNICTL_SHA256=8b755cf06fb132f111c7fe2f219714594223e4685e2362f37765bac8cca88ceb
+RUN set -eux; \
+    curl -fsSL "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl; \
+    echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum -c -; \
+    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl; \
+    curl -fsSL "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tgz; \
+    echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm; \
+    install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm; \
+    curl -fsSL "https://github.com/siderolabs/talos/releases/download/v${TALOSCTL_VERSION}/talosctl-linux-amd64" -o /tmp/talosctl; \
+    echo "${TALOSCTL_SHA256}  /tmp/talosctl" | sha256sum -c -; \
+    install -m 0755 /tmp/talosctl /usr/local/bin/talosctl; \
+    curl -fsSL "https://github.com/siderolabs/omni/releases/download/v${OMNICTL_VERSION}/omnictl-linux-amd64" -o /tmp/omnictl; \
+    echo "${OMNICTL_SHA256}  /tmp/omnictl" | sha256sum -c -; \
+    install -m 0755 /tmp/omnictl /usr/local/bin/omnictl; \
+    rm -rf /tmp/kubectl /tmp/helm.tgz /tmp/linux-amd64 /tmp/talosctl /tmp/omnictl; \
+    kubectl version --client; helm version --short; \
+    talosctl version --client; omnictl --help >/dev/null; \
+    rm -rf /root/.kube /root/.talos /root/.config/omni /root/.cache/helm /root/.config/helm
 
 # --- Android BUILD tooling layer (stable, ~0.5 GB) --------------------------
 # JDK 17 (installed in the base apt layer above) + Gradle + the Android SDK

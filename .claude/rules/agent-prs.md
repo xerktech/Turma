@@ -71,10 +71,10 @@ state is polled across GitHub/GitLab/Azure DevOps, and what gets typed back in b
 
 ## PR comment delivery (XERK-49) and conflict nudges (XERK-223)
 
-- **A reply asking for corrections on a session's PR is typed back into the session that opened
+- **A reply asking for corrections on a session's PR is delivered back to the session that opened
   it.** `_poll_pr_comments` runs on the PR cadence, **running sessions only**, over their OWN PRs
-  (`session_pr_urls`), through `send_input` — inheriting the compaction-survival outbox and the
-  mid-turn queue.
+  (`session_pr_urls`), through `notify_session` — the session's inbox (XERK-340), falling back to
+  `send_input`'s pane and outbox only for a session that has none. Same for the conflict nudge.
 - `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments, review
   bodies, inline review-thread comments; a bare approve is dropped. One call covers all three on
   GitLab (notes) and ADO (threads), minus that tracker's own system notes. `_pr_ref` numbers it

@@ -1,19 +1,61 @@
 ---
 paths:
   - "agent/hub-agent.py"
+  - "agent/tests/test_hub_agent.py"
 ---
 
-# Archive sync (`agent/hub-agent.py`)
-
-Split out of `.claude/rules/agent.md` to keep that file under its size ceiling; the rest of the
-agent's process model is there. The HUB half — the store's layout, its two size ceilings, the raw
-layer's read-back routes — is in `.claude/rules/turma-archive.md`.
+# Archive sync
 
 - The agent **ships every INACTIVE session's transcript to the hub's durable archive** so history
   survives this host being wiped/offline. `_archive_manifest()` enumerates ended transcripts (every
   ledger slug's `*.jsonl`, minus any backing a running session); the hub replies with per-transcript
   byte cursors (`archiveHave`), and `_archive_deltas()` POSTs the missing append-only deltas
   (pre-parsed through `_entry_text`), bounded per chunk/beat.
+- **Both passes run on a WORKER THREAD, never the beat** (XERK-395), the same fix `prune` got:
+  their combined worst case is larger than the hub's offline threshold, so inline a lossy link made
+  a healthy host read as dead. `run_forever` only calls `queue_archive_sync`, which STAGES the
+  reply's cursors; `_archive_sync_pass` pushes. See the beat-loop budget contract in `CLAUDE.md`.
+  - **Jobs COALESCE, they do not queue.** A pass is only worth running against the NEWEST cursors,
+    so a job staged behind a slow pass replaces the one waiting — queuing them would grow an
+    unbounded backlog on any host pushing slower than `INTERVAL`, all of it aimed at cursors the hub
+    has already moved past.
+  - One long-lived daemon worker (prune's exits when drained; a job here arrives every beat), never
+    joined on shutdown: the archive is append-only against HUB-held cursors, so a pass cut short is
+    re-offered on the next beat.
+  - `_archive_wake` is cleared BEFORE the job is taken, never after — the beat stores the job and
+    only then sets it, so clearing afterwards drops a job staged mid-pass.
+  - `self._archive_pending` is beat-written and worker-read with no lock, which is safe ONLY because
+    the beat REBINDS it and never mutates it in place; each pass snapshots it once.
+  - **`queue_archive_sync` may not raise.** The beat loop is the container's MAIN PROCESS
+    (`entrypoint.sh` `exec`s it, with no retry loop of its own), so an exception on it is not a
+    skipped cycle — it is the host and every session on it going down, and this is called outside
+    any try. Work moved OFF the beat must not leave a raise where the try/except it replaced stood:
+    `Thread.start()` at the `pids_limit` is the realistic one. `_start_limits_probe` still has that
+    shape (XERK-402).
+  - A pass whose cursors predate the previous pass's stores re-offers one chunk per transcript,
+    which the hub rejects at `startOffset !== have` **before storing anything** and answers with its
+    real cursor, which the pass jumps to. Wasted bytes, never a double-store. It needs a pass still
+    running when the next manifest beat comes round, which a wedge does and so does an ordinary slow
+    backfill — **a pass is bounded in BYTES, not in time** (`ARCHIVE_MANIFEST_MAX` transcripts, each
+    at least one POST; one healthy pass measured at 690s). **A remembered cursor is NOT the fix**:
+    one held across a hub whose archive was reset or evicted is ahead of the hub forever, and that
+    transcript then never ships again — silence is worse than one discarded chunk.
+  - **A wedged pass is otherwise SILENT** now that the beat no longer stalls behind it, and
+    `urlopen`'s timeout is per SOCKET OPERATION, so a hub trickling bytes never trips it. The beat
+    reports it (`_warn_if_archive_pass_stalled`) and that line is the only signal there is — so it
+    measures the LAST COMPLETED PUSH, never the pass's age. Timing the pass fired on exactly the
+    healthy host this ticket is about, saying "no deltas are shipping" while 69 were.
+  - Its reachability is as fragile as its logic: the worker stamping the pass, the push helpers
+    stamping each completion, the seed at pass start, the throttle sentinel starting a full window
+    in the past, and the beat calling the warn are all separate, and dropping any one leaves a
+    wedged host silent or a healthy one accused. Each is pinned END TO END, through a real wedged
+    pass, not by calling the warn with a hand-set stamp.
+  - **It runs BEFORE the `archiveHave` gate**, because a wedged pass is the WORKER's state and not
+    the reply's: behind that gate, a host whose manifest emptied mid-wedge was silent forever.
+  - **A BLACKHOLED hub deliberately does not trip it**, and that is not a hole to close: every push
+    still returns (at its own timeout) and logs its own failure, which is the operator's signal
+    there. Only a peer that answers slowly enough to keep a socket alive is invisible otherwise.
+    Tests: `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,

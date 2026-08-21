@@ -8761,6 +8761,24 @@ const migHost = (device, site, {
 // with it, reported as a timeout with no failing assertion to read. The
 // sentinel status makes the assertion that was going to run fail instead.
 const RAW_REQUEST_TIMEOUT_MS = 10_000;
+// The spool unlink is FIRE-AND-FORGET — `dropMigrationBlob` calls
+// `fs.unlink(p, () => {})` and returns — so any assertion that the file is gone
+// is racing it. Deliberately so: the comment there explains that dropping the
+// name while a reader still holds the fd is the point.
+//
+// Poll rather than sleep a fixed amount. A fixed 30ms is what two of these
+// tests used, and it passes on a quiet laptop and loses on a loaded CI runner,
+// which is exactly how this surfaced — one green local run after another and an
+// intermittent red on a merge gate.
+async function awaitUnlinked(p, deadlineMs = 5000) {
+  const until = Date.now() + deadlineMs;
+  while (fs.existsSync(p)) {
+    if (Date.now() > until) return false;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return true;
+}
+
 function requestRaw(method, pathName, { body, headers, timeoutMs = RAW_REQUEST_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -9064,7 +9082,7 @@ test("migrate: full move — export, relay, import, then kill the source", async
   // The bundle is freed on handoff — the record's pointer AND the spool file
   // (XERK-263): a leaked file is 65 MiB of disk nothing comes back for.
   assert.equal(after.blobPath, null);
-  assert.equal(fs.existsSync(spoolFile), false,
+  assert.equal(await awaitUnlinked(spoolFile), true,
     "the spool file should be unlinked once the migration is done");
 });
 
@@ -9094,8 +9112,7 @@ test("migrate: a stalled move times out and frees its blob", async () => {
   assert.equal(m.phase, "failed");
   assert.match(m.error, /timed out/);
   assert.equal(m.blobPath, null);
-  await new Promise((r2) => setTimeout(r2, 30)); // the unlink is async
-  assert.equal(fs.existsSync(spoolFile), false,
+  assert.equal(await awaitUnlinked(spoolFile), true,
     "a timed-out move must not leave its spool file behind");
 });
 
@@ -9113,8 +9130,8 @@ test("migrate: an empty bundle is refused and leaves no spool file", async () =>
   const m = migrations.get(mid);
   assert.equal(m.phase, "exporting"); // still awaiting a real bundle
   assert.equal(m.blobPath, null);
-  await new Promise((r2) => setTimeout(r2, 30));
-  assert.equal(fs.existsSync(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`)), false);
+  assert.equal(await awaitUnlinked(path.join(MIGRATE_SPOOL_DIR, `${mid}.bin`)), true,
+    "a refused bundle must not leave its spool file behind");
 });
 
 test("migrate: a bundle past the cap is refused 413 and spools nothing", async () => {

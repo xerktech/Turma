@@ -12,17 +12,21 @@ docker/tmux/git needed.
 import base64
 import contextlib
 import datetime
+import errno
 import gzip
 import http.server
 import importlib.util
+import inspect
 import io
 import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import shutil
 import signal
+import socket
 import struct
 import sys
 import tempfile
@@ -3281,11 +3285,18 @@ class ManagerMixin:
         def fake_port_open(port, host="127.0.0.1", timeout=0.3):
             return port in self.bound_ports
 
+        # Whether a scanned repo has a HEAD to fork a worktree from (XERK-343).
+        # The mixin's repos are bare temp dirs, so the real probe would read
+        # every one of them as an unfinished clone and queue every spawn; the
+        # tests that exercise that wait flip this themselves.
+        self.head_ready = True
+
         for name, value in [
             ("run", fake_run),
             ("run_ok", fake_run_ok),
             ("run_stdin", fake_run_stdin),
             ("_port_open", fake_port_open),
+            ("repo_head_ready", lambda path: self.head_ready),
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
@@ -3307,6 +3318,10 @@ class ManagerMixin:
             # Derived at import too. Every beat rewrites it (XERK-339), so
             # without this the suite would clobber the real host's peer roster.
             ("PEERS_FILE", os.path.join(self.tmp, "peers.tsv")),
+            # Derived at import from the claude home. Without this, notify_session
+            # would resolve inboxes out of the REAL host's session registry and
+            # post to whatever live claude happened to match (XERK-340).
+            ("SESSIONS_REGISTRY_DIR", os.path.join(self.tmp, "cc-sessions")),
             ("LIMITS_SETTINGS_PATH", os.path.join(self.tmp, "limits-settings.json")),
             # The limits probe is OFF for the suite at large. A beat with no
             # snapshot considers one due and starts a real background thread
@@ -7417,6 +7432,325 @@ class TestSweepUploads(ManagerMixin, unittest.TestCase):
         self.assertTrue(os.path.exists(keep))
 
 
+class TestCcSocketDirs(unittest.TestCase):
+    """Where the sweep looks. It has to be the same answer Claude Code's own
+    bind reached, so this mirrors its resolution rather than hardcoding /tmp."""
+
+    def _dirs(self, **env):
+        clear = {k: None for k in ("XDG_RUNTIME_DIR", "CLAUDE_CODE_TMPDIR",
+                                   "TMPDIR", "TMP", "TEMP", "TURMA_CC_SOCKS_DIR")}
+        clear.update(env)
+        with mock.patch.dict(os.environ, {k: v for k, v in clear.items() if v},
+                             clear=False):
+            for k, v in clear.items():
+                if not v:
+                    os.environ.pop(k, None)
+            return ha.cc_socket_dirs()
+
+    def test_the_runtime_dir_wins_over_every_temp_var(self):
+        dirs = self._dirs(XDG_RUNTIME_DIR="/run/user/1000",
+                          CLAUDE_CODE_TMPDIR="/cc", TMPDIR="/tee")
+        self.assertEqual(dirs[0], "/run/user/1000/cc-socks")
+
+    def test_claude_s_own_tmpdir_comes_next(self):
+        self.assertEqual(self._dirs(CLAUDE_CODE_TMPDIR="/cc", TMPDIR="/tee")[0],
+                         "/cc/cc-socks")
+
+    def test_then_the_system_temp_dir_then_slash_tmp(self):
+        self.assertEqual(self._dirs(TMPDIR="/tee")[0], "/tee/cc-socks")
+        self.assertEqual(self._dirs()[0], "/tmp/cc-socks")
+
+    def test_the_long_path_fallback_is_swept_too(self):
+        # Claude Code drops to /tmp/cc-socks-<uid> when the preferred path would
+        # pass sun_path's ~104 bytes; the manager cannot tell which a given
+        # session used, so both are candidates.
+        self.assertIn("/tmp/cc-socks-%d" % os.getuid(),
+                      self._dirs(XDG_RUNTIME_DIR="/run/user/1000"))
+
+    def test_slash_tmp_is_not_listed_twice(self):
+        dirs = self._dirs()
+        self.assertEqual(len(dirs), len(set(dirs)))
+
+    def test_an_override_replaces_the_lot(self):
+        self.assertEqual(self._dirs(TURMA_CC_SOCKS_DIR="/somewhere/else/"),
+                         ["/somewhere/else"])
+
+
+class TestSweepClaudeSockets(ManagerMixin, unittest.TestCase):
+    """Claude Code leaks one <pid>.sock per abnormally-ended session (XERK-341).
+    The manager unlinks the dead ones, and EVERY uncertainty keeps the file:
+    deleting a live session's inbox breaks its messaging silently, while leaving
+    a dead one costs an inode until the next slow beat."""
+
+    def setUp(self):
+        super().setUp()
+        self.socks = os.path.join(self.tmp, "cc-socks")
+        os.makedirs(self.socks, exist_ok=True)
+        env = mock.patch.dict(os.environ, {"TURMA_CC_SOCKS_DIR": self.socks})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _dead_pid(self):
+        """A pid with no /proc entry. Well past any pid_max, so it stays free."""
+        pid = 4194303
+        self.assertFalse(os.path.exists("/proc/%d" % pid))
+        return pid
+
+    def _leak(self, name):
+        """A bound-then-abandoned socket inode: exactly what a killed session
+        leaves behind, and connect() to it is refused."""
+        path = os.path.join(self.socks, name)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        s.listen(1)
+        s.close()
+        return path
+
+    def _listening(self, name):
+        """A socket something is still accepting on."""
+        path = os.path.join(self.socks, name)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        s.listen(1)
+        self.addCleanup(s.close)
+        return path
+
+    def test_a_dead_pid_s_abandoned_socket_goes(self):
+        sm = self.make_manager()
+        gone = self._leak("%d.sock" % self._dead_pid())
+        sm._sweep_claude_sockets()
+        self.assertFalse(os.path.exists(gone))
+
+    def test_a_live_pid_s_socket_stays(self):
+        # Pids are REUSED, so a live pid is hands-off whatever is running under
+        # it — the sweep never asks whether the process is a claude.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % os.getpid())
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_a_socket_with_a_listener_stays_even_with_no_proc_entry(self):
+        # The namespace guard: /proc only answers for pids bound in OUR pid
+        # namespace, so a still-accepting socket is kept whatever /proc says.
+        sm = self.make_manager()
+        keep = self._listening("%d.sock" % self._dead_pid())
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_only_pid_dot_sock_is_a_candidate(self):
+        # Every decoy is a REAL abandoned socket owned by a dead pid, so the
+        # NAME is the only thing keeping it: built as plain files instead, the
+        # S_ISSOCK gate would spare them whatever the pattern did, and an
+        # unanchored pattern would sail through this test.
+        sm = self.make_manager()
+        dead = self._dead_pid()
+        keep = [self._leak(name) for name in (
+            "claude.sock",
+            "%d.sock.bak" % dead,
+            "%d.sock.tmp" % dead,
+            "x%d.sock" % dead,
+            ".%d.sock" % dead,
+            "%d.txt" % dead,
+            "12345678901.sock",             # eleven digits is not a pid
+            # `$` would match before a trailing newline; `\d` would match
+            # Arabic-Indic digits. Neither is a name claude ever wrote.
+            "%d.sock\n" % dead,
+            "\u0664\u0661\u0669\u0664\u0663\u0660\u0663.sock",
+        )]
+        sm._sweep_claude_sockets()
+        for path in keep:
+            self.assertTrue(os.path.exists(path), path)
+
+    def test_a_regular_file_named_like_a_socket_is_left_alone(self):
+        sm = self.make_manager()
+        path = os.path.join(self.socks, "%d.sock" % self._dead_pid())
+        with open(path, "w"):
+            pass
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_symlink_is_never_followed_or_unlinked(self):
+        # The target is a REAL abandoned socket, so S_ISSOCK would say yes the
+        # moment the link were followed. Pointed at a regular file instead, the
+        # gate rejects it either way and `follow_symlinks=True` sails through.
+        sm = self.make_manager()
+        target = os.path.join(self.tmp, "precious.sock")
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(target)
+            sock.listen(1)
+        link = os.path.join(self.socks, "%d.sock" % self._dead_pid())
+        os.symlink(target, link)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.lexists(link))
+        self.assertTrue(os.path.exists(target))
+
+    def test_a_dangling_symlink_is_left_alone(self):
+        sm = self.make_manager()
+        link = os.path.join(self.socks, "%d.sock" % self._dead_pid())
+        os.symlink(os.path.join(self.tmp, "nothing-here"), link)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.lexists(link))
+
+    def test_a_zero_padded_pid_is_read_as_the_pid_it_names(self):
+        # "/proc/0003203929" does not exist however alive pid 3203929 is, so
+        # without the int() normalisation a padded name reads as dead and a
+        # live session loses its inbox.
+        sm = self.make_manager()
+        keep = self._leak("%010d.sock" % os.getpid())
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_it_does_not_recurse_into_subdirectories(self):
+        # Claude Code binds at the top level only, and a sweep that walked down
+        # would be deleting inside a tree it knows nothing about.
+        sm = self.make_manager()
+        sub = os.path.join(self.socks, "nested")
+        os.makedirs(sub)
+        buried = os.path.join(sub, "%d.sock" % self._dead_pid())
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(buried)
+            sock.listen(1)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(buried))
+        self.assertTrue(os.path.isdir(sub))
+
+    def test_a_host_with_no_proc_says_why_it_is_not_sweeping(self):
+        sm = self.make_manager()
+        real = os.path.isdir
+        lines = []
+        with mock.patch.object(ha.os.path, "isdir",
+                               lambda p: False if p == "/proc/self" else real(p)), \
+                mock.patch.object(ha, "log", lines.append):
+            sm._sweep_claude_sockets()
+            sm._sweep_claude_sockets()
+        said = [ln for ln in lines if "no /proc here" in ln]
+        self.assertEqual(len(said), 1, lines)
+
+    def test_nothing_outside_the_sockets_dir_is_touched(self):
+        sm = self.make_manager()
+        outside = os.path.join(self.tmp, "%d.sock" % self._dead_pid())
+        with contextlib.closing(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as sock:
+            sock.bind(outside)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(outside))
+
+    def test_a_missing_sockets_dir_is_not_an_error(self):
+        sm = self.make_manager()
+        shutil.rmtree(self.socks)
+        sm._sweep_claude_sockets()          # no raise
+
+    def test_the_budget_bounds_the_beat(self):
+        # The manager has one loop; a directory too big to finish leaves the
+        # remainder for the next slow beat rather than holding the heartbeat.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        with mock.patch.object(ha, "CC_SOCK_SWEEP_DEADLINE_SEC", -1):
+            sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_the_sweep_can_be_turned_off(self):
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        with mock.patch.object(ha, "CC_SOCK_SWEEP", False):
+            sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_no_proc_means_no_sweep_at_all(self):
+        # Without /proc the pid test answers "dead" for every pid on the host,
+        # so the sweep refuses rather than acting on an answer it cannot get.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        real = os.path.isdir
+
+        def no_proc(path):
+            return False if path == "/proc/self" else real(path)
+
+        with mock.patch.object(ha.os.path, "isdir", no_proc):
+            sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_it_rides_the_slow_usage_cadence(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.SessionManager, "_sweep_claude_sockets") as sweep:
+            sm._refresh_repo_usage()
+        sweep.assert_called_once_with()
+
+    def test_a_sweep_that_raises_does_not_take_the_beat_down(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.SessionManager, "_sweep_claude_sockets",
+                               side_effect=OSError("boom")):
+            sm._refresh_repo_usage()        # no raise
+
+    def test_a_probe_that_cannot_tell_keeps_the_file(self):
+        # The rule the whole "never delete a live inbox" claim rests on. Only a
+        # REFUSED connect is dead; a busy listen backlog (EAGAIN), a socket we
+        # may not connect to (EACCES), a timeout — every one of those is "cannot
+        # tell", and cannot-tell keeps the file.
+        sm = self.make_manager()
+        for err in (BlockingIOError(errno.EAGAIN, "backlog full"),
+                    PermissionError(errno.EACCES, "denied"),
+                    TimeoutError("no answer"),
+                    OSError(errno.EIO, "io error")):
+            with self.subTest(err=err):
+                keep = self._leak("%d.sock" % self._dead_pid())
+                with mock.patch.object(ha.socket, "socket") as sock:
+                    sock.return_value.__enter__.return_value.connect.side_effect = err
+                    sm._sweep_claude_sockets()
+                self.assertTrue(os.path.exists(keep))
+                os.unlink(keep)
+
+    def test_only_a_refused_or_vanished_connect_reads_as_dead(self):
+        sm = self.make_manager()
+        for err in (ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+                    FileNotFoundError(errno.ENOENT, "gone")):
+            with self.subTest(err=err):
+                gone = self._leak("%d.sock" % self._dead_pid())
+                with mock.patch.object(ha.socket, "socket") as sock:
+                    sock.return_value.__enter__.return_value.connect.side_effect = err
+                    sm._sweep_claude_sockets()
+                self.assertFalse(os.path.exists(gone))
+
+    @unittest.skipIf(os.geteuid() == 0, "root connects to a mode-000 socket")
+    def test_a_socket_we_may_not_connect_to_is_kept_for_real(self):
+        # The same rule against the filesystem rather than a mock, so the errno
+        # mapping in _unix_socket_is_dead is exercised end to end.
+        sm = self.make_manager()
+        keep = self._leak("%d.sock" % self._dead_pid())
+        os.chmod(keep, 0)
+        sm._sweep_claude_sockets()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_the_budget_is_checked_before_the_name_is(self):
+        # The bound has to cover EVERY entry, not just the candidates: a
+        # directory of a million names that match nothing costs the same per
+        # entry as one full of sockets, and checking the budget only after the
+        # pattern made it no bound at all.
+        sm = self.make_manager()
+        for i in range(5):
+            with open(os.path.join(self.socks, "not-a-socket-%d" % i), "w"):
+                pass
+        lines = []
+        with mock.patch.object(ha, "log", lines.append), \
+                mock.patch.object(ha, "CC_SOCK_SWEEP_DEADLINE_SEC", -1):
+            sm._sweep_claude_sockets()
+        self.assertTrue([ln for ln in lines if "budget ran out" in ln], lines)
+
+    def test_the_directories_it_resolved_are_named_once(self):
+        # Silence is what let 9,245 files pile up unnoticed, so a host where
+        # this resolves somewhere claude never binds has to say so.
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lines.append):
+            sm._sweep_claude_sockets()
+            sm._sweep_claude_sockets()
+        named = [ln for ln in lines if ln.startswith("cc-socks: sweeping ")]
+        self.assertEqual(len(named), 1, lines)
+        self.assertIn(self.socks, named[0])
+
+
 class TestPendingScan(ProjectDirMixin, unittest.TestCase):
     """_pending_scan folds a transcript into (delivered user turns, still-queued
     prompts, compaction count) in one pass — the facts the resend guarantee
@@ -7625,6 +7959,559 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
             sm._poll_pending_inputs()
         self.assertEqual(self.run_calls, [])
         self.assertEqual(len(sess["pendingInputs"]), 1)
+
+
+class InboxRegistryMixin:
+    """A fake Claude Code session registry (`<pid>.json` per live session).
+
+    Records are written in the shape the real thing writes, because
+    `_session_inbox` now refuses anything else: the file is named after the pid
+    it describes, and the socket sits at `<...>/cc-socks/<pid>.sock`.
+    """
+
+    def _sock_dir(self):
+        return os.path.join(self.tmp, "cc-socks")
+
+    def _register(self, pid, sid, tmux="agent-s1:@0.%0", started=1,
+                  kind="interactive", entrypoint="cli", cwd=None, sock="",
+                  name=None):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        rec = {"pid": pid, "sessionId": sid, "tmux": tmux, "startedAt": started,
+               "kind": kind, "entrypoint": entrypoint,
+               "cwd": cwd if cwd is not None else self.tmp}
+        # sock="" means the canonical path for this pid; None means unbound.
+        if sock == "":
+            sock = os.path.join(self._sock_dir(), f"{pid}.sock")
+        if sock is not None:
+            rec["messagingSocketPath"] = sock
+        path = os.path.join(ha.SESSIONS_REGISTRY_DIR, name or f"{pid}.json")
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        return rec.get("messagingSocketPath")
+
+
+class TestSessionInbox(InboxRegistryMixin, unittest.TestCase):
+    """_session_inbox resolves a session's inbox socket out of Claude Code's own
+    registry — the only place the bound path is recorded (XERK-340).
+
+    The registry is same-uid writable by every session on the host, so every
+    record it reads is an untrusted claim; these are the checks that keep a
+    planted one from steering the manager.
+    """
+
+    SID = "11111111-1111-4111-8111-111111111111"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-inbox-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "SESSIONS_REGISTRY_DIR",
+                              os.path.join(self.tmp, "cc-sessions"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_matches_the_pinned_claude_session_id(self):
+        want = self._register(7, self.SID, tmux="agent-other:@0.%0")
+        self._register(8, "other", tmux="agent-s1:@0.%0", started=2)
+        # The id wins over the tmux name: the id IS this session's conversation.
+        self.assertEqual(ha._session_inbox(self.SID),
+                         (want, 7, self.SID))
+
+    def test_a_session_with_no_pinned_id_has_no_inbox(self):
+        # Launched by an agent predating the session-id pin. There is no looser
+        # match to fall back on — every candidate key collides with a claude the
+        # session itself spawned — so it keeps the pane it has always used.
+        self._register(9, "cc-9")
+        self.assertIsNone(ha._session_inbox(None))
+        self.assertIsNone(ha._session_inbox(""))
+
+    def test_an_unpinned_session_does_not_match_a_null_id_record(self):
+        # The early return is what enforces "pinned id or nothing": without it
+        # the comparison is `None == None`, so a planted record carrying a null
+        # sessionId becomes the inbox of every session that has no pinned one.
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "4242.json"), "w") as f:
+            json.dump({"pid": 4242, "sessionId": None, "startedAt": 1,
+                       "messagingSocketPath":
+                       os.path.join(self._sock_dir(), "4242.sock")}, f)
+        self.assertIsNone(ha._session_inbox(None))
+        self.assertIsNone(ha._session_inbox(""))
+
+    def test_newest_start_wins_when_two_records_share_the_id(self):
+        # A RESUMED session keeps its session id, so a record a killed claude
+        # left behind carries the same one as the live process that replaced it.
+        self._register(1, self.SID, started=100)
+        want = self._register(2, self.SID, started=200)
+        self.assertEqual(ha._session_inbox(self.SID), (want, 2, self.SID))
+
+    def test_an_infinite_start_does_not_win(self):
+        # `1e999` is legal JSON, parses to inf, and would outrank every real
+        # record forever — the cheapest way to plant a permanent winner.
+        want = self._register(1, self.SID, started=100)
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "2.json"), "w") as f:
+            f.write(json.dumps({
+                "pid": 2, "sessionId": self.SID, "kind": "interactive",
+                "messagingSocketPath": os.path.join(self._sock_dir(), "2.sock"),
+            }).replace('"kind"', '"startedAt": 1e999, "kind"'))
+        self.assertEqual(ha._session_inbox(self.SID), (want, 1, self.SID))
+
+    def test_a_claude_the_session_spawned_is_not_its_inbox(self):
+        # Measured against the real thing: a `claude -p` child and a second
+        # interactive claude in the session's tmux both register the same tmux
+        # target, cwd and kind with a newer startedAt — and the second matches
+        # `entrypoint: cli` too. Each has its OWN session id, which is why that
+        # is the only key: the wire-level check agrees with a tmux-shaped
+        # mistake, so notify_session would report a nudge delivered that the
+        # real session never saw.
+        want = self._register(1, self.SID, started=100)
+        self._register(2, "child-p", started=200, entrypoint="sdk-cli")
+        self._register(3, "child-tui", started=300)     # same tmux, cwd, kind
+        self.assertEqual(ha._session_inbox(self.SID), (want, 1, self.SID))
+
+    def test_a_record_that_disagrees_with_its_filename_is_ignored(self):
+        # Claude Code names the record after the pid it describes; anything else
+        # was written by something that is not Claude Code.
+        self._register(7, self.SID, name="9.json")
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_a_non_canonical_socket_path_is_ignored(self):
+        # The path is about to be connect()ed to, so it has to be where Claude
+        # Code would have bound this pid's inbox — not wherever a record says.
+        for bad in ("/tmp/attacker/evil.sock",
+                    os.path.join(self._sock_dir(), "9.sock"),   # wrong pid
+                    "relative/cc-socks/7.sock",
+                    "/x/cc-socks/" + "p" * 120 + "/7.sock",
+                    # Canonical in shape, past AF_UNIX's 108-byte path limit.
+                    "/" + "a" * 100 + "/cc-socks/7.sock",
+                    # Only canonical after traversing out of the real dir.
+                    "/run/user/1000/cc-socks/../../../../tmp/evil/cc-socks/7.sock",
+                    # `cc-socks` as a SUBSTRING of a name the sender chose: the
+                    # parent must be that directory, not merely mention it.
+                    "/tmp/xcc-socksy/7.sock",
+                    "/tmp/notcc-socks/7.sock"):
+            with self.subTest(bad=bad):
+                shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
+                self._register(7, self.SID, sock=bad)
+                self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_no_bound_socket_is_no_inbox(self):
+        # A claude too old for the inbox, or one with it gated off, records no
+        # path — the caller has to fall back to the pane.
+        self._register(7, self.SID, sock=None)
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_unmatched_and_unreadable_records_are_skipped(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "5.json"), "w") as f:
+            f.write("{not json")
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "notes.txt"), "w") as f:
+            f.write("ignored")
+        self._register(3, "someone-else", tmux="agent-other:@0.%0")
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_wrong_typed_fields_are_skipped(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        sock = lambda pid: os.path.join(self._sock_dir(), f"{pid}.sock")
+        # Each record is filed under the name its own `pid` implies, so it is
+        # the TYPE check that has to reject it and not the filename check.
+        for name, rec in (
+                ("7.json", {"pid": 7, "sessionId": self.SID,
+                            "messagingSocketPath": 42}),
+                # `True` is an int in python, and passes every other gate.
+                ("True.json", {"pid": True, "sessionId": self.SID,
+                               "messagingSocketPath": sock(True)}),
+                ("0.json", {"pid": 0, "sessionId": self.SID,
+                            "messagingSocketPath": sock(0)}),
+                ("-1.json", {"pid": -1, "sessionId": self.SID,
+                             "messagingSocketPath": sock(-1)}),
+                ("7.json", {"pid": 7, "sessionId": ["a"],
+                            "messagingSocketPath": sock(7)}),
+                ("7.json", {"pid": "7", "sessionId": self.SID,
+                            "messagingSocketPath": sock(7)}),
+                ("7.json", ["not", "a", "dict"])):
+            with self.subTest(rec=rec):
+                shutil.rmtree(ha.SESSIONS_REGISTRY_DIR, ignore_errors=True)
+                os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+                with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, name), "w") as f:
+                    json.dump(rec, f)
+                self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_an_oversize_record_is_not_read_whole(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        # Padded past the REGISTRY's cap but well under the settings one, so
+        # this fails only while the registry keeps a ceiling of its own: a
+        # record is a few hundred bytes, and reading a megabyte of whatever a
+        # planted one holds is the thing the cap is for.
+        self.assertLess(ha.SESSIONS_REGISTRY_MAX_BYTES, ha.SETTINGS_READ_MAX_BYTES)
+        with open(os.path.join(ha.SESSIONS_REGISTRY_DIR, "7.json"), "w") as f:
+            json.dump({"pid": 7, "sessionId": self.SID,
+                       "pad": "x" * (ha.SESSIONS_REGISTRY_MAX_BYTES * 2),
+                       "messagingSocketPath":
+                       os.path.join(self._sock_dir(), "7.sock")}, f)
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_a_fifo_in_the_registry_does_not_block(self):
+        # A plain open() of a FIFO blocks until someone writes to it, and this
+        # runs on the heartbeat thread — the whole agent would wedge with no
+        # exception to catch. Any session on this host can mkfifo here.
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        os.mkfifo(os.path.join(ha.SESSIONS_REGISTRY_DIR, "000-evil.json"))
+        want = self._register(7, self.SID)
+        done = []
+        t = threading.Thread(
+            target=lambda: done.append(ha._session_inbox(self.SID)),
+            daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "_session_inbox blocked on a FIFO")
+        self.assertEqual(done[0], (want, 7, self.SID))
+
+    def test_a_symlinked_record_is_not_followed(self):
+        os.makedirs(ha.SESSIONS_REGISTRY_DIR, exist_ok=True)
+        real = os.path.join(self.tmp, "elsewhere.json")
+        with open(real, "w") as f:
+            json.dump({"pid": 7, "sessionId": self.SID, "messagingSocketPath":
+                       os.path.join(self._sock_dir(), "7.sock")}, f)
+        os.symlink(real, os.path.join(ha.SESSIONS_REGISTRY_DIR, "7.json"))
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+    def test_missing_registry_is_no_inbox(self):
+        self.assertIsNone(ha._session_inbox(self.SID))
+
+
+class TestReadUntrustedJson(unittest.TestCase):
+    """_read_untrusted_json is the one reader for files this agent does not own —
+    the session registry and a repo's settings (XERK-340)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-json-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _path(self, name="f.json"):
+        return os.path.join(self.tmp, name)
+
+    def test_reads_an_object(self):
+        with open(self._path(), "w") as f:
+            json.dump({"a": 1}, f)
+        self.assertEqual(ha._read_untrusted_json(self._path(), 1000), {"a": 1})
+
+    def test_a_file_past_the_cap_is_not_parsed_at_all(self):
+        # The fixture is a COMPLETE object followed by padding, so the truncated
+        # prefix is valid JSON that parses to something different. A fixture
+        # whose prefix is merely malformed proves nothing: both a capped read and
+        # an uncapped one would fail it, and the guard could be deleted unseen.
+        with open(self._path(), "w") as f:
+            f.write(json.dumps({"crossSessionInbound": "accept"}) + " " * 5000)
+        self.assertIsNone(ha._read_untrusted_json(self._path(), 100))
+        self.assertEqual(ha._read_untrusted_json(self._path(), 1 << 20),
+                         {"crossSessionInbound": "accept"})
+
+    def test_a_json_scalar_or_list_is_not_an_object(self):
+        for blob in ("[1,2]", '"str"', "7", "null"):
+            with self.subTest(blob=blob):
+                with open(self._path(), "w") as f:
+                    f.write(blob)
+                self.assertIsNone(ha._read_untrusted_json(self._path(), 1000))
+
+    def test_a_fifo_returns_rather_than_blocking(self):
+        os.mkfifo(self._path("fifo.json"))
+        done = []
+        t = threading.Thread(target=lambda: done.append(
+            ha._read_untrusted_json(self._path("fifo.json"), 1000)), daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "blocked on a FIFO")
+        self.assertIsNone(done[0])
+
+    def test_a_directory_and_a_missing_file_are_none(self):
+        os.makedirs(self._path("d.json"))
+        self.assertIsNone(ha._read_untrusted_json(self._path("d.json"), 1000))
+        self.assertIsNone(ha._read_untrusted_json(self._path("nope.json"), 1000))
+
+
+class TestInboxOptedOut(unittest.TestCase):
+    """_inbox_opted_out: a repo whose own settings refuse peer messages outrank
+    the `accept` on every session's --settings file (XERK-339), and the inbox
+    acknowledges nothing — so those sessions have to stay on the pane."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-optout-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        os.makedirs(os.path.join(self.tmp, ".claude"))
+
+    def _write(self, name, data):
+        with open(os.path.join(self.tmp, ".claude", name), "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_no_settings_is_not_an_opt_out(self):
+        self.assertFalse(ha._inbox_opted_out(self.tmp))
+        self.assertFalse(ha._inbox_opted_out(None))
+
+    def test_project_refuse_opts_out(self):
+        self._write("settings.json", {"crossSessionInbound": "refuse"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_hold_opts_out_too(self):
+        # `hold` parks the message behind a dialog nothing here can answer, and
+        # it expires — the same silent loss as `refuse`.
+        self._write("settings.json", {"crossSessionInbound": "hold"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_local_accept_does_not_undo_a_project_refuse(self):
+        # Measured against Claude Code: it drops the message for this pair, so
+        # the obvious highest-precedence-wins rule posts into a session that
+        # then loses it in silence.
+        self._write("settings.json", {"crossSessionInbound": "refuse"})
+        self._write("settings.local.json", {"crossSessionInbound": "accept"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_file_that_does_not_mention_it_says_nothing(self):
+        self._write("settings.local.json", {"permissions": {}})
+        self._write("settings.json", {"crossSessionInbound": "refuse"})
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_all_accept_stays_on_the_inbox(self):
+        self._write("settings.json", {"crossSessionInbound": "accept"})
+        self._write("settings.local.json", {"crossSessionInbound": "accept"})
+        self.assertFalse(ha._inbox_opted_out(self.tmp))
+
+    def test_settings_that_exist_but_will_not_parse_opt_out(self):
+        # It is there and it won't say what it wants; the pane always works.
+        self._write("settings.local.json", "{not json")
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_settings_file_larger_than_a_registry_record_is_still_read(self):
+        # Settings have a ceiling of their own; reusing the registry's 64 KiB
+        # would make an ordinary padded settings file unreadable, and unreadable
+        # opts out — a repo silently losing the inbox for its file's size.
+        self.assertGreater(ha.SETTINGS_READ_MAX_BYTES,
+                           ha.SESSIONS_REGISTRY_MAX_BYTES)
+        self._write("settings.json",
+                    json.dumps({"pad": "x" * (ha.SESSIONS_REGISTRY_MAX_BYTES * 2),
+                                "crossSessionInbound": "accept"}))
+        self.assertFalse(ha._inbox_opted_out(self.tmp))
+
+    def test_an_oversize_settings_file_opts_out(self):
+        # Not silently skipped: a key sitting past the read cap would otherwise
+        # be a refusal this never sees.
+        self._write("settings.json",
+                    json.dumps({"pad": "x" * (ha.SETTINGS_READ_MAX_BYTES + 16),
+                                "crossSessionInbound": "refuse"}))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_fifo_settings_file_does_not_block(self):
+        # Same wedge as the registry: os.path.isfile() follows a symlink and can
+        # be raced, and the block is in the open(), on the heartbeat thread.
+        os.mkfifo(os.path.join(self.tmp, ".claude", "settings.json"))
+        done = []
+        t = threading.Thread(target=lambda: done.append(
+            ha._inbox_opted_out(self.tmp)), daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "_inbox_opted_out blocked on a FIFO")
+        self.assertTrue(done[0])            # unreadable -> pane
+
+    def test_a_dangling_settings_symlink_still_opts_out(self):
+        # `os.path.exists` is False for a broken link, which would read as "no
+        # settings here" — but something IS there and we cannot tell what it
+        # wants, so it takes the pane like any other unreadable file.
+        os.symlink(os.path.join(self.tmp, "gone.json"),
+                   os.path.join(self.tmp, ".claude", "settings.json"))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+    def test_a_symlinked_settings_file_is_not_followed(self):
+        real = os.path.join(self.tmp, "elsewhere.json")
+        with open(real, "w") as f:
+            json.dump({"crossSessionInbound": "accept"}, f)
+        os.symlink(real, os.path.join(self.tmp, ".claude", "settings.json"))
+        self.assertTrue(ha._inbox_opted_out(self.tmp))
+
+
+class TestPostToInbox(unittest.TestCase):
+    """_post_to_inbox writes one JSON line naming the session it is for, and
+    only to a listener that is the process the registry named (XERK-340)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-sock-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "s.sock")
+
+    def _listen(self, read=True, accepts=1):
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.listen(64)
+        self.addCleanup(srv.close)
+        received = []
+
+        def serve():
+            for _ in range(accepts):
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                with conn:
+                    if not read:
+                        continue
+                    buf = b""
+                    while True:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    received.append(buf)
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        return received, t
+
+    def test_writes_one_addressed_user_line(self):
+        received, t = self._listen()
+        self.assertTrue(ha._post_to_inbox(self.path, os.getpid(), "sid-1",
+                                          "fix the conflicts"))
+        t.join(5)
+        raw = received[0].decode()
+        self.assertTrue(raw.endswith("\n"))
+        msg = json.loads(raw)
+        self.assertEqual(msg["type"], "user")
+        self.assertEqual(msg["session_id"], "sid-1")
+        self.assertEqual(msg["from"], ha.INBOX_SENDER)
+        self.assertEqual(msg["message"], {"role": "user",
+                                          "content": "fix the conflicts"})
+
+    def test_a_listener_that_is_not_the_registered_pid_is_refused(self):
+        # SO_PEERCRED is filled in by the kernel, so this is the one thing about
+        # a socket a same-uid impostor cannot forge. The registry itself is
+        # writable by every session on the host.
+        if not hasattr(socket, "SO_PEERCRED"):
+            self.skipTest("no SO_PEERCRED on this platform")
+        received, t = self._listen()
+        self.assertFalse(ha._post_to_inbox(self.path, os.getpid() + 100000,
+                                           "sid-1", "secret"))
+        t.join(5)
+        # The connection is made and then dropped: not a byte of the message.
+        self.assertEqual(b"".join(received), b"")
+
+    def test_the_socket_is_closed_even_on_success(self):
+        received, t = self._listen(accepts=20)
+        before = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+        for _ in range(20):
+            self.assertTrue(ha._post_to_inbox(self.path, os.getpid(), "sid-1", "x"))
+        after = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+        self.assertLess(after - before, 5, "fds leaked across posts")
+
+    def test_a_timeout_bounds_a_listener_that_never_reads(self):
+        # The heartbeat thread runs this; a wedged claude must not hold it.
+        received, t = self._listen(read=False)
+        with mock.patch.object(ha, "INBOX_TIMEOUT_SEC", 0.2):
+            with mock.patch.object(socket.socket, "sendall",
+                                   side_effect=socket.timeout("timed out")):
+                started = time.time()
+                self.assertFalse(ha._post_to_inbox(self.path, os.getpid(),
+                                                   "sid-1", "x" * 1000))
+        self.assertLess(time.time() - started, 5)
+
+    def test_a_dead_socket_is_a_failure_not_a_crash(self):
+        self.assertFalse(ha._post_to_inbox(
+            os.path.join(self.tmp, "nothing.sock"), 1, "sid-1", "hi"))
+
+
+class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
+    """notify_session: machine-generated messages ride the session's inbox, and
+    fall back to the pane whenever that would not actually deliver (XERK-340)."""
+
+    SID = "11111111-1111-4111-8111-111111111111"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()
+        self.run_stdin_calls.clear()
+        return sm
+
+    def _session(self, sm, status="running"):
+        wt = os.path.join(self.tmp, "wt")
+        os.makedirs(wt, exist_ok=True)
+        sess = {"id": "s1", "status": status, "tmuxName": "agent-s1",
+                "claudeSessionId": self.SID, "worktreePath": wt,
+                "summary": "x", "summaryStarted": True}
+        sm.registry = [sess]
+        return sess
+
+    def _posts(self):
+        posts = []
+        return posts, mock.patch.object(
+            ha, "_post_to_inbox", side_effect=lambda *a: posts.append(a) or True)
+
+    def test_inbox_delivery_skips_the_pane_and_the_outbox(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        want = self._register(7, self.SID)
+        posts, patched = self._posts()
+        with patched:
+            self.assertTrue(sm.notify_session("s1", "resolve the conflicts"))
+        self.assertEqual(posts[0][:3], (want, 7, self.SID))
+        self.assertIn("resolve the conflicts", posts[0][3])
+        # The prefix says who is really speaking — claude frames an inbox
+        # message to the receiver as another Claude session writing.
+        self.assertTrue(posts[0][3].startswith(ha.INBOX_PREFIX))
+        self.assertEqual(self.run_stdin_calls, [])   # nothing pasted
+        self.assertEqual(self.run_calls, [])         # no Enter
+        # Never on the outbox: an inbox message never becomes the user turn
+        # _pending_scan reaps on, so it would be re-typed as a duplicate.
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_no_inbox_falls_back_to_the_pane_with_the_outbox(self):
+        sm = self.make_manager()
+        sess = self._session(sm)                     # nothing registered
+        self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(sess["pendingInputs"][0]["text"], "resolve the conflicts")
+
+    def test_a_failed_post_falls_back_to_the_pane(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._register(7, self.SID)
+        with mock.patch.object(ha, "_post_to_inbox", return_value=False):
+            self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
+    def test_a_session_that_refuses_peer_messages_stays_on_the_pane(self):
+        # Posting into it would be dropped in silence, and the poller would
+        # still burn a retry — the pane is the only path that delivers.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._register(7, self.SID)
+        os.makedirs(os.path.join(sess["worktreePath"], ".claude"), exist_ok=True)
+        with open(os.path.join(sess["worktreePath"], ".claude",
+                               "settings.json"), "w") as f:
+            json.dump({"crossSessionInbound": "refuse"}, f)
+        with mock.patch.object(ha, "_post_to_inbox") as post:
+            self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        post.assert_not_called()
+        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
+    def test_oversize_is_refused_once_by_send_input(self):
+        # send_input owns the INPUT_MAX_CHARS refusal; notify_session must not
+        # route around it by posting the whole thing to the inbox.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        self._register(7, self.SID)
+        with mock.patch.object(ha, "_post_to_inbox") as post:
+            self.assertFalse(
+                sm.notify_session("s1", "x" * (ha.INPUT_MAX_CHARS + 1)))
+        post.assert_not_called()
+        self.assertEqual(self.run_stdin_calls, [])
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_an_ended_session_is_not_notified(self):
+        sm = self.make_manager()
+        self._session(sm, status="closed")
+        self._register(7, self.SID)
+        with mock.patch.object(ha, "_post_to_inbox") as post:
+            self.assertFalse(sm.notify_session("s1", "resolve the conflicts"))
+        post.assert_not_called()
+        self.assertEqual(self.run_stdin_calls, [])
 
 
 class TestPrCommentEvents(unittest.TestCase):
@@ -8170,9 +9057,12 @@ class TestAzdoCreatedPrUrl(unittest.TestCase):
         self.assertIsNone(ha._azdo_created_pr_url("gh: not json at all"))
 
 
-class TestPollPrComments(ManagerMixin, unittest.TestCase):
-    """_poll_pr_comments types new PR review activity into the running session
-    that opened the PR, baselining history on first sight (XERK-49)."""
+class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
+    """_poll_pr_comments delivers new PR review activity to the running session
+    that opened the PR, baselining history on first sight (XERK-49).
+
+    The registry is empty in these tests, so delivery falls back to the pane and
+    `_typed()` reads it — the inbox route is asserted on its own below."""
 
     URL = "https://github.com/o/r/pull/7"
 
@@ -8220,6 +9110,22 @@ class TestPollPrComments(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(typed), 1)
         self.assertIn("rename it", typed[0])
         self.assertEqual(set(sess["prCommentBase"][self.URL]), {"c1", "c2"})
+
+    def test_delivery_rides_the_session_inbox_when_it_has_one(self):
+        # A PR comment is machine-generated, so it goes to the inbox rather than
+        # the input line, and never lands on the compaction outbox (XERK-340).
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        sess["claudeSessionId"] = "cc-1"
+        self._register(7, "cc-1")
+        posts = []
+        with self._events(self._ev("c1"), self._ev("c2", body="rename it")), \
+                mock.patch.object(ha, "_post_to_inbox",
+                                  side_effect=lambda *a: posts.append(a) or True):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+        self.assertIn("rename it", posts[0][3])
+        self.assertNotIn("pendingInputs", sess)
 
     def test_self_comment_is_not_delivered_but_is_seen(self):
         sm = self.make_manager()
@@ -8307,10 +9213,13 @@ class TestPrConflictMessage(unittest.TestCase):
         self.assertNotIn("MR", msg)
 
 
-class TestPollPrConflicts(ManagerMixin, unittest.TestCase):
-    """_poll_pr_conflicts types a resolve-the-conflicts message into the running
+class TestPollPrConflicts(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
+    """_poll_pr_conflicts sends a resolve-the-conflicts message to the running
     session that opened a now-unmergeable PR, once per conflict episode
-    (XERK-223)."""
+    (XERK-223).
+
+    The registry is empty in these tests, so delivery falls back to the pane and
+    `_typed()` reads it — the inbox route is asserted on its own below."""
 
     URL = "https://github.com/o/r/pull/7"
 
@@ -8343,6 +9252,21 @@ class TestPollPrConflicts(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["prConflicts"][self.URL]["attempts"], 1)
         sm._poll_pr_conflicts()                    # next beat, still conflicting
         self.assertEqual(len(self._typed()), 1)    # not re-typed
+
+    def test_nudge_rides_the_session_inbox_when_it_has_one(self):
+        # The nudge does not depend on the pane being free (XERK-340).
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["claudeSessionId"] = "cc-1"
+        self._register(7, "cc-1")
+        posts = []
+        with mock.patch.object(ha, "_post_to_inbox",
+                               side_effect=lambda *a: posts.append(a) or True):
+            sm._poll_pr_conflicts()
+        self.assertEqual(self._typed(), [])
+        self.assertIn("origin/main", posts[0][3])
+        self.assertEqual(sess["prConflicts"][self.URL]["attempts"], 1)
+        self.assertNotIn("pendingInputs", sess)
 
     def test_mergeable_clears_the_episode_and_rearms(self):
         sm = self.make_manager()
@@ -10796,6 +11720,55 @@ class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
         self.assertEqual(log_calls, [])            # docker logs not shelled out
         self.assertEqual(payload["logTail"], "cached")
 
+    def test_log_tail_never_publishes_dockers_own_error(self):
+        """A pod has no Docker socket, and `docker logs` then fails with its
+        error on STDERR — which this function merges into stdout. Publishing
+        that made the host card read "failed to connect to the docker API ..."
+        as if it were the agent's log, during whatever the operator happened to
+        be doing (a clone, when this was reported). Nothing was wrong with the
+        agent."""
+        class _Failed:
+            returncode = 1
+            stdout = ("failed to connect to the docker API at "
+                      "unix:///var/run/docker.sock; check if the path is correct "
+                      "and if the daemon is running: dial unix "
+                      "/var/run/docker.sock: connect: no such file or directory")
+        with mock.patch.object(ha.subprocess, "run", lambda *a, **k: _Failed()):
+            out = ha.log_tail("turma-agent-0")
+        self.assertEqual(out, ha.LOG_TAIL_UNAVAILABLE)
+        self.assertNotIn("docker API", out)
+
+    def test_log_tail_missing_binary_is_the_same_sentinel(self):
+        """And it must not be None. `_log_tail` refreshes whenever its cache is
+        None, so a None here puts a `docker logs` with a 15s timeout back on
+        EVERY beat — the beat-loop budget XERK-395 exists to protect."""
+        def _boom(*a, **k):
+            raise FileNotFoundError("docker")
+        with mock.patch.object(ha.subprocess, "run", _boom):
+            self.assertEqual(ha.log_tail("x"), ha.LOG_TAIL_UNAVAILABLE)
+        self.assertIsNotNone(ha.LOG_TAIL_UNAVAILABLE)
+
+    def test_log_tail_returns_the_log_when_docker_works(self):
+        class _Ok:
+            returncode = 0
+            stdout = "hello from the container\n"
+        with mock.patch.object(ha.subprocess, "run", lambda *a, **k: _Ok()):
+            # Byte-for-byte, trailing newline included: the success path is a
+            # tail slice and this change must not have touched it.
+            self.assertEqual(ha.log_tail("x"), "hello from the container\n")
+
+    def test_log_tail_unavailable_does_not_re_shell_every_beat(self):
+        """The sentinel is a STRING so the beat cache holds it. With a None the
+        throttle would never engage and every beat would shell out again."""
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        with mock.patch.object(ha, "log_tail",
+                               lambda cid: calls.append(cid) or ha.LOG_TAIL_UNAVAILABLE):
+            for beat in range(ha.LOG_TAIL_EVERY):
+                sm.build_payload(beat)
+        self.assertEqual(len(calls), 1, "an unavailable tail must still be cached")
+
     def test_log_tail_throttled_across_beats(self):
         sm = self.make_manager()
         sm.registry = []
@@ -11000,6 +11973,383 @@ class TestClone(ManagerMixin, unittest.TestCase):
             sm.clone("xerktech/Turma")
         sm._poll_clones()
         self.assertEqual(sm.clones["Turma"]["status"], "error")
+
+
+class TestRepoHeadReady(unittest.TestCase):
+    """XERK-343: `.git` exists from the first instant of a clone, so it is not
+    the question. `repo_head_ready` asks whether HEAD resolves; `repo_forkable`
+    asks the one a spawn actually needs — is there ANY commit to detach at."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-head-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.tmp,
+                              capture_output=True, text=True)
+
+    def _source_repo(self):
+        src = os.path.join(self.tmp, "src")
+        self._git("init", "-q", "-b", "main", src)
+        self._git("-C", src, "-c", "user.email=a@b", "-c", "user.name=a",
+                  "commit", "-q", "--allow-empty", "-m", "one")
+        return src
+
+    def test_an_unborn_head_is_not_ready_and_is_what_git_refuses(self):
+        repo = os.path.join(self.tmp, "fresh")
+        self._git("init", "-q", repo)
+        # The state a clone is in for its whole run: .git is there, HEAD isn't.
+        self.assertTrue(os.path.isdir(os.path.join(repo, ".git")))
+        self.assertFalse(ha.repo_head_ready(repo))
+        # Nothing to fork from at all — no refs either.
+        self.assertFalse(ha.repo_forkable(repo))
+        # And that is exactly the spawn this used to fail on — the pre-flight
+        # predicts git's own answer rather than guessing at it.
+        out = self._git("-C", repo, "worktree", "add", "--detach",
+                        os.path.join(self.tmp, "wt"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("invalid reference", out.stderr)
+
+    def test_a_repo_with_a_commit_is_ready(self):
+        repo = self._source_repo()
+        self.assertTrue(ha.repo_head_ready(repo))
+        self.assertTrue(ha.repo_forkable(repo))
+
+    def test_an_unborn_head_over_a_real_origin_is_still_forkable(self):
+        # The regression the HEAD-only gate caused: this repo has an unborn
+        # local HEAD and a perfectly good origin/main, which is what
+        # default_base_ref picks — it forked fine before and must still.
+        src = self._source_repo()
+        repo = os.path.join(self.tmp, "orphaned")
+        self._git("clone", "-q", src, repo)
+        self._git("-C", repo, "checkout", "-q", "--orphan", "fresh-start")
+        self.assertFalse(ha.repo_head_ready(repo))
+        self.assertTrue(ha.repo_forkable(repo))
+        self.assertEqual(ha.default_base_ref(repo), "origin/main")
+        # Not a paper fork point: git really detaches a worktree there.
+        out = self._git("-C", repo, "worktree", "add", "--detach",
+                        os.path.join(self.tmp, "wt"), "origin/main")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_repo_git_cannot_answer_for_is_not_ready(self):
+        self.assertFalse(ha.repo_head_ready(os.path.join(self.tmp, "nope")))
+
+    def test_an_unrunnable_probe_reads_as_ready(self):
+        # Fails OPEN: this gates a spawn, so "can't tell" must degrade to the
+        # old behaviour (git's own error), never to a session queued forever.
+        with mock.patch.object(ha, "run_out", lambda *a, **kw: (None, "")):
+            self.assertTrue(ha.repo_head_ready("/anywhere"))
+
+
+class TestGitErrorText(unittest.TestCase):
+    """XERK-343: the operator-facing half of a failed git command."""
+
+    REPRO = ("hint: If you meant to create a worktree containing a new unborn "
+             "branch\nhint: (branch with no commits) for this repository, you "
+             "can do so\nhint: using the --orphan flag:\nhint: \n"
+             "fatal: invalid reference: HEAD")
+
+    def test_advice_lines_are_dropped_and_the_cause_kept(self):
+        self.assertEqual(ha.git_error_text(self.REPRO),
+                         "fatal: invalid reference: HEAD")
+
+    def test_over_length_keeps_the_tail_because_git_states_the_cause_last(self):
+        err = "noise " * 200 + "fatal: THE CAUSE"
+        out = ha.git_error_text(err)
+        self.assertEqual(len(out), 300)
+        self.assertTrue(out.endswith("fatal: THE CAUSE"), out)
+        self.assertTrue(out.startswith("…"), out)
+
+    def test_control_bytes_never_reach_the_record(self):
+        out = ha.git_error_text("\x1b[31mfatal:\x1b[0m bad\x00nul\x07bell")
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x00", out)
+        self.assertNotIn("\x07", out)
+        self.assertIn("fatal:", out)
+
+    def test_a_tiny_limit_never_returns_more_than_it_was_given(self):
+        for limit in (0, 1, 2, 3):
+            out = ha.git_error_text("fatal: a much longer message", limit=limit)
+            self.assertLessEqual(len(out), max(limit, len("no error output")))
+
+    def test_it_is_never_empty(self):
+        self.assertEqual(ha.git_error_text(""), "no error output")
+        self.assertEqual(ha.git_error_text(None), "no error output")
+        self.assertEqual(ha.git_error_text("hint: only advice"), "no error output")
+        self.assertEqual(ha.git_error_text("boom", limit=0), "no error output")
+
+
+class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
+    """XERK-343: a repo Turma is still cloning is in the scan (git creates
+    <dest>/.git before it fetches anything), so a session started on it detached
+    at an unborn HEAD and died with `fatal: invalid reference: HEAD`. It waits
+    for the clone now — and only for a clone: nothing else here is going to make
+    an empty repo forkable, and "cloning the repo first" would be a lie."""
+
+    def setUp(self):
+        super().setUp()
+        self.repos_root = os.path.join(self.tmp, "root")
+        self.repo = {"name": "gdt-files",
+                     "path": os.path.join(self.repos_root, "gdt-files")}
+        # The half-clone: the dir and its .git are there, nothing else is.
+        os.makedirs(os.path.join(self.repo["path"], ".git"))
+        for name, value in [("REPOS_ROOT", self.repos_root),
+                            ("scan_repos", lambda: [self.repo])]:
+            q = mock.patch.object(ha, name, value)
+            q.start()
+            self.addCleanup(q.stop)
+
+    def _manager(self, cloning=True):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        # head_ready False + run() faked to "" makes repo_forkable False, which
+        # is the mid-clone repo. The clone job is what makes it a WAIT.
+        self.head_ready = False
+        if cloning:
+            sm.clones["gdt-files"] = {"name": "gdt-files", "status": "cloning"}
+        return sm
+
+    def _worktree_adds(self):
+        return [c for c in self.run_ok_calls if "worktree" in c and "add" in c]
+
+    def test_a_spawn_mid_clone_queues_instead_of_failing(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")
+        self.assertEqual(sess["queuedReason"], "awaiting-clone")
+        self.assertEqual(sess["awaitClone"], "gdt-files")
+        self.assertEqual(self._worktree_adds(), [])
+
+    def test_the_drain_holds_on_an_unforkable_repo_then_starts_it(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        # A .git dir is NOT the release condition — that is the whole bug.
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "queued")
+        self.head_ready = True
+        sm.clones["gdt-files"]["status"] = "done"
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        self.assertEqual(len(self._worktree_adds()), 1)
+        # Every queue marker is shed, the internal stamps included. Set the
+        # ones a plain composer spawn doesn't, so the assertion isn't vacuous.
+        for k in ("awaitClone", "awaitCloneOwner", "awaitCloneSince",
+                  "awaitCloneRetried", "queuedReason", "queuedAt"):
+            self.assertNotIn(k, sess)
+
+    def test_every_queue_marker_is_shed_when_a_session_starts(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess.update(awaitCloneOwner="x/gdt-files", awaitCloneRetried=True)
+        self.head_ready = True
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        for k in ("awaitClone", "awaitCloneOwner", "awaitCloneSince",
+                  "awaitCloneRetried", "queuedReason", "queuedAt"):
+            self.assertNotIn(k, sess)
+
+    def test_the_drain_asks_forkable_not_just_head_ready(self):
+        # The drain half of the same fix as the spawn gate: a repo whose local
+        # HEAD is unborn over a live origin/<default> is forkable, and holding
+        # it there would spin the card out to the deadline for nothing.
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        with mock.patch.object(ha, "repo_forkable", lambda *a, **kw: True), \
+             mock.patch.object(ha, "resolve_base_ref",
+                               lambda path, base: "origin/main"):
+            sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+
+    def test_an_interrupted_clone_says_so_at_once(self):
+        # A clone does NOT outlive its manager — entrypoint.sh execs
+        # hub-agent.py as the container's foreground process — and `clone()`
+        # refuses a dest that exists, so nothing here can retry. One beat, not
+        # the deadline, and the message names the partial checkout.
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files",
+                    awaitCloneOwner="xerktech/gdt-files",
+                    awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("already exists", sess["errorMsg"])
+        self.assertIn("re-clone is refused", sess["errorMsg"])
+        self.assertIn(self.repo["path"], sess["errorMsg"])
+        sm.clone.assert_not_called()
+
+    def test_an_unforkable_repo_with_no_clone_of_ours_is_not_called_cloning(self):
+        # An empty repo, or a clone run by hand outside Turma: nothing here will
+        # fix it, so it must not borrow a wait that tells the operator a clone is
+        # in progress. It lands as an error card saying what is actually wrong.
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("no commit to fork", sess["errorMsg"])
+        self.assertEqual(self._worktree_adds(), [])
+
+    def test_a_forkable_repo_with_an_unborn_head_still_spawns_at_once(self):
+        # The regression guard: origin/<default> is there, so the session forks
+        # off it exactly as it always did — no queue, no wait.
+        sm = self._manager()
+        with mock.patch.object(ha, "repo_forkable", lambda *a, **kw: True), \
+             mock.patch.object(ha, "resolve_base_ref",
+                               lambda path, base: "origin/main"):
+            sm.spawn("gdt-files")
+        self.assertEqual(sm.registry[0]["status"], "running")
+        # And it forks off that ref — the two gates agree, which is the whole
+        # point: _worktree_add's pre-flight only cares about HEAD when it is
+        # about to detach at HEAD.
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+
+    def test_a_repo_that_never_becomes_forkable_ends_as_an_error(self):
+        sm = self._manager()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess["awaitCloneSince"] -= ha.CLONE_TIMEOUT_SEC + 1
+        # A LIVE clone is bounded by _poll_clones, so the drain must not race it.
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "queued")
+        # Once nothing of ours is driving it, the wait is bounded.
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("no commit to fork from", sess["errorMsg"])
+
+    def test_the_deadline_is_reachable_with_an_owner_to_re_clone_from(self):
+        # `clone()` files a refusal under slugify(spec), so a 3-segment GitLab
+        # or ADO spec lands under a key the job lookup can't see. Behind an
+        # elif, that retried every beat and the deadline never ran.
+        sm = self._manager(cloning=False)
+        sm.spawn("gdt-files", await_clone_owner="grp/sub/gdt-files")
+        sess = sm.registry[0]
+        sess["queuedReason"] = "awaiting-clone"
+        sess["awaitClone"] = "gdt-files"
+        sess["awaitCloneOwner"] = "grp/sub/gdt-files"
+        sess["awaitCloneSince"] = time.time() - (ha.CLONE_TIMEOUT_SEC + 1)
+        sess["status"] = "queued"
+        for _ in range(3):
+            sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+
+    def test_a_lost_clone_with_nothing_on_disk_is_re_triggered_once(self):
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gone")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gone", awaitCloneOwner="xerktech/gone",
+                    awaitCloneSince=time.time(),
+                    repoPath=os.path.join(self.repos_root, "gone"))
+        for _ in range(4):
+            sm._drain_queue()
+        self.assertEqual(sm.clone.call_count, 1)
+
+    def test_the_base_ref_is_resolve_base_refs_business_not_the_waits(self):
+        # Holding a session because its chosen base hasn't landed only delays
+        # the accurate "base ref not found" — and an invalid-NAMED base once
+        # read as forkable, releasing a session mid-clone into a failed add.
+        # Both gates therefore ask the repo, never the base.
+        sm = self._manager()
+        sm.spawn("gdt-files", base_ref="origin/nope")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")   # mid-clone: still waits
+        self.head_ready = True
+        sm.clones.pop("gdt-files")
+        sm._drain_queue()                            # forkable: released at once
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("not found", sess["errorMsg"])
+
+    def test_a_finished_clone_with_no_commits_says_the_repo_is_empty(self):
+        # A clone of an empty upstream exits 0, so the job goes `done` while the
+        # repo stays unforkable. Read it while the job lingers: once pruned it
+        # is indistinguishable from an interrupted clone, and calling it one
+        # asserts a false cause AND recommends deleting a good clone.
+        sm = self._manager()
+        sm.clones["gdt-files"]["status"] = "done"
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("cloned with no commits", sess["errorMsg"])
+        self.assertNotIn("remove it", sess["errorMsg"])
+
+    def test_a_failed_clone_reports_its_own_error(self):
+        # The operator's only accurate cause for a failed clone. Unpinned, the
+        # branch could go and the session would silently degrade to a re-clone
+        # and a 600s deadline instead.
+        sm = self._manager()
+        sm.clones["gdt-files"].update(status="error",
+                                      error="repository not found")
+        sm.spawn("gdt-files", await_clone_owner="xerktech/gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("clone of gdt-files failed", sess["errorMsg"])
+        self.assertIn("repository not found", sess["errorMsg"])
+
+    def test_a_wait_with_no_owner_never_takes_the_re_clone_branches(self):
+        # Without an owner there is nothing to re-clone from, so neither the
+        # refused-re-clone message nor a clone(None) may fire — it waits out
+        # the deadline like any other wait nothing can name.
+        sm = self._manager(cloning=False)
+        sm.clone = mock.Mock()
+        sm.spawn("gdt-files")
+        sess = sm.registry[0]
+        sess.update(status="queued", queuedReason="awaiting-clone",
+                    awaitClone="gdt-files", awaitCloneSince=time.time())
+        sm._drain_queue()
+        sm.clone.assert_not_called()
+        self.assertEqual(sess["status"], "queued")
+        sess["awaitCloneSince"] -= ha.CLONE_TIMEOUT_SEC + 1
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("still has no commit to fork from", sess["errorMsg"])
+
+    def test_the_worktree_add_refuses_an_unborn_head_in_plain_words(self):
+        # The last line of defence, for the resume/import paths that add a
+        # worktree without going through spawn's wait.
+        sm = self._manager()
+        sess = {"repo": "gdt-files", "repoPath": self.repo["path"],
+                "worktreePath": os.path.join(self.tmp, "wt", "abcde")}
+        with self.assertRaises(RuntimeError) as caught:
+            sm._worktree_add(sess)
+        self.assertIn("no commit to fork", str(caught.exception))
+        self.assertEqual(self._worktree_adds(), [])
+
+    def test_a_resolved_base_ref_skips_the_head_check(self):
+        # An explicit base already resolved against this repo's refs, so the
+        # repo's own HEAD is beside the point and must not block the spawn.
+        sm = self._manager()
+        sess = {"repo": "gdt-files", "repoPath": self.repo["path"],
+                "worktreePath": os.path.join(self.tmp, "wt", "abcde")}
+        sm._worktree_add(sess, base_ref="origin/main")
+        self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
+
+    def test_a_failed_worktree_add_reports_the_cause_not_the_advice(self):
+        sm = self._manager()
+        sess = {"repo": "gdt-files", "repoPath": self.repo["path"],
+                "worktreePath": os.path.join(self.tmp, "wt", "abcde")}
+        with mock.patch.object(
+                ha, "run_ok",
+                lambda *a, **kw: (128, "hint: use --orphan\nfatal: nope")):
+            with self.assertRaises(RuntimeError) as caught:
+                sm._worktree_add(sess, base_ref="origin/main")
+        self.assertIn("fatal: nope", str(caught.exception))
+        self.assertNotIn("hint:", str(caught.exception))
 
 
 class TestValidSourceRepo(unittest.TestCase):
@@ -14262,6 +15612,458 @@ class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha.urllib.request, "urlopen", return_value=Resp()):
             sm.post({"device": "nas"})
         self.assertEqual(sm._archive_body_max(), int((8 << 20) * ha.ARCHIVE_BODY_MARGIN))
+
+
+class TestArchiveSyncWorker(ManagerMixin, unittest.TestCase):
+    """Archive sync runs on its OWN thread, never the beat loop (XERK-395).
+
+    Both passes together are allowed more network time than the hub waits before
+    calling a host offline, so inline they turned a lossy link into a host that
+    reads as dead (measured: a 111s beat gap against a 75s threshold, on a host
+    that was fine)."""
+
+    def _drain(self, sm, timeout=5):
+        """Wait until the worker has no staged job and is not mid-pass."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with sm._archive_lock:
+                idle = sm._archive_job is None
+            if idle and not sm._archive_wake.is_set():
+                # One more beat of grace for a pass that took the job but has
+                # not finished it.
+                time.sleep(0.02)
+                with sm._archive_lock:
+                    if sm._archive_job is None:
+                        return
+            time.sleep(0.01)
+        self.fail("archive worker never drained")
+
+    def test_run_forever_does_not_push_inline(self):
+        """The beat loop STAGES the cursors; it must not call either pass.
+
+        Source-level on purpose: this is the invariant, and it is undone by an
+        ordinary-looking edit that puts a push back where the reply is read."""
+        src = inspect.getsource(ha.SessionManager.run_forever)
+        self.assertIn("queue_archive_sync(", src)
+        self.assertNotIn("_archive_deltas(", src)
+        self.assertNotIn("_archive_raw_deltas(", src)
+
+    def test_queue_returns_while_a_pass_is_blocked(self):
+        """A push wedged for longer than the hub's whole offline threshold must
+        not hold the caller for a measurable moment."""
+        sm = self.make_manager()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking(*a, **k):
+            started.set()
+            release.wait(10)
+
+        with mock.patch.object(sm, "_archive_deltas", blocking), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            t0 = time.time()
+            sm.queue_archive_sync({"archiveHave": {"t1": 0}})
+            elapsed = time.time() - t0
+            self.assertTrue(started.wait(5), "the pass never ran on the worker")
+            self.assertLess(elapsed, 0.5)
+            release.set()
+
+    def test_cursors_and_flags_reach_both_passes(self):
+        sm = self.make_manager()
+        seen = {}
+        done = threading.Event()
+
+        def rendered(have, shed=None, full=False):
+            seen["rendered"] = (have, shed, full)
+
+        def raw(raw_have, skip_ids=None, store_full=False):
+            seen["raw"] = (raw_have, skip_ids, store_full)
+            done.set()
+
+        with mock.patch.object(sm, "_archive_deltas", rendered), \
+                mock.patch.object(sm, "_archive_raw_deltas", raw):
+            sm.queue_archive_sync({
+                "archiveHave": {"t1": 10}, "archiveShed": ["t2"],
+                "archiveFull": True, "archiveRawHave": {"t1": {"t1.jsonl": 4}},
+                "archiveRawSkip": ["t3"],
+            })
+            self.assertTrue(done.wait(5))
+
+        self.assertEqual(seen["rendered"], ({"t1": 10}, ["t2"], True))
+        self.assertEqual(seen["raw"], ({"t1": {"t1.jsonl": 4}}, ["t3"], True))
+
+    def test_no_archive_have_stages_nothing(self):
+        """A hub too old to ask for an archive is the same nothing-to-do the
+        inline call read it as — and must not spin up a worker."""
+        sm = self.make_manager()
+        sm.queue_archive_sync({})
+        self.assertIsNone(sm._archive_worker)
+        self.assertIsNone(sm._archive_job)
+
+    def test_jobs_coalesce_to_the_newest_cursors(self):
+        """Beats landing behind a slow pass SUPERSEDE each other rather than
+        queuing: a pass is only ever worth running against the newest cursors,
+        and queuing them would grow an unbounded backlog on a slow host."""
+        sm = self.make_manager()
+        first = threading.Event()
+        release = threading.Event()
+        passes = []
+
+        def rendered(have, shed=None, full=False):
+            passes.append(have)
+            if len(passes) == 1:
+                first.set()
+                release.wait(10)
+
+        with mock.patch.object(sm, "_archive_deltas", rendered), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(first.wait(5))
+            for n in (2, 3, 4):
+                sm.queue_archive_sync({"archiveHave": {"t1": n}})
+            release.set()
+            self._drain(sm)
+
+        # Exactly two passes: the one that was running, and ONE more carrying the
+        # newest cursors — not one per beat that arrived while it ran.
+        self.assertEqual(passes, [{"t1": 1}, {"t1": 4}])
+
+    def test_a_raising_pass_does_not_kill_the_worker(self):
+        """The rendered pass raising must cost neither the raw pass (XERK-338's
+        split) nor every LATER pass — the worker is the only archive there is."""
+        sm = self.make_manager()
+        raw_calls = []
+        done = threading.Event()
+
+        def boom(*a, **k):
+            raise RuntimeError("push exploded")
+
+        def raw(*a, **k):
+            raw_calls.append(a[0])
+            done.set()
+
+        with mock.patch.object(sm, "_archive_deltas", boom), \
+                mock.patch.object(sm, "_archive_raw_deltas", raw):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}, "archiveRawHave": {"a": 1}})
+            self.assertTrue(done.wait(5))
+            done.clear()
+            sm.queue_archive_sync({"archiveHave": {"t1": 2}, "archiveRawHave": {"b": 2}})
+            self.assertTrue(done.wait(5), "the worker died on the first failure")
+
+        self.assertEqual(raw_calls, [{"a": 1}, {"b": 2}])
+        self.assertTrue(sm._archive_worker.is_alive())
+
+    def test_a_job_staged_in_the_clear_window_is_not_lost(self):
+        """The wake must be CLEARED BEFORE the job is taken (XERK-395 QA D4).
+
+        Clearing after the take opens a window: the beat stores a job and sets
+        the wake, the worker's clear() then wipes that set, and the job sits with
+        nothing to wake anyone for it. Every other test here passes with the
+        clear moved — this is the one that fails, so it is the pin.
+
+        The window is forced by staging the second job from inside the worker's
+        own `clear()`, immediately AFTER the real clear runs. On the shipped
+        order the take is still ahead, so the job is picked up; with the clear
+        moved past the take, the job is stranded."""
+        sm = self.make_manager()
+        ran_staged = threading.Event()
+
+        def rendered(have, shed=None, full=False):
+            if have == {"t1": 99}:
+                ran_staged.set()
+
+        staged = []
+
+        class ClearHookEvent(threading.Event):
+            def clear(self):
+                # BEFORE the real clear, which is what puts the staged job
+                # exactly in the window: on the shipped order the take is still
+                # ahead of us and picks it up; with the clear moved past the
+                # take, this set is the one wiped and nothing is left to wake.
+                if not staged:
+                    staged.append(True)
+                    # The beat's own two steps, without the lock — this runs on
+                    # the worker thread, which may or may not hold it depending
+                    # on where clear() sits, and a test that can deadlock proves
+                    # nothing.
+                    sm._archive_job = {"have": {"t1": 99}, "shed": None,
+                                       "full": False, "rawHave": None,
+                                       "rawSkip": None}
+                    super().set()
+                super().clear()
+
+        sm._archive_wake = ClearHookEvent()
+        with mock.patch.object(sm, "_archive_deltas", rendered), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(ran_staged.wait(5),
+                            "the job staged during the clear window never ran")
+
+    def test_staging_never_raises_onto_the_beat(self):
+        """`queue_archive_sync` is called OUTSIDE a try in run_forever, where the
+        inline passes it replaced ran inside one, and the beat loop is the
+        container's main process — so an exception here takes the host and every
+        session down. `Thread.start()` raises RuntimeError at the pids limit
+        (XERK-395 QA D1)."""
+        sm = self.make_manager()
+        # ANY failure, not just the expected one: the guard is there because the
+        # beat must survive whatever goes wrong, and narrowing it to the error
+        # this was written for is the mutation that a RuntimeError-only test
+        # cannot see (XERK-395 QA pass 2).
+        for boom in (RuntimeError("can't start new thread"),
+                     MemoryError(), OSError(errno.EAGAIN, "no resources")):
+            with mock.patch.object(ha.threading, "Thread") as fake:
+                fake.return_value.start.side_effect = boom
+                fake.return_value.is_alive.return_value = False
+                sm.queue_archive_sync({"archiveHave": {"t1": 1}})   # must not raise
+
+            # The job stays staged and the dead thread's is_alive() is False, so
+            # the next beat simply tries again.
+            with sm._archive_lock:
+                self.assertEqual(sm._archive_job["have"], {"t1": 1})
+
+    def test_a_wedged_pass_is_reported_end_to_end(self):
+        """Off the beat a wedged pass is otherwise SILENT — beats stay on
+        cadence, the host stays online, and nothing ships (XERK-395 QA D3).
+        `urlopen`'s timeout is per SOCKET OPERATION, so a hub trickling bytes
+        never trips it, and this line is the only signal there is.
+
+        Driven through the REAL path — a pass wedged on the worker, then a beat
+        staging its next job — because the reachability is the fragile part:
+        three separate mutations (the worker never stamping the pass, stamping it
+        only after the pass returns, and the beat never calling the warn) each
+        left a wedged host permanently silent with the whole suite green
+        (XERK-395 QA pass 2)."""
+        sm = self.make_manager()
+        wedged = threading.Event()
+        release = threading.Event()
+        lines = []
+
+        def never_returns(*a, **k):
+            wedged.set()
+            release.wait(10)
+
+        with mock.patch.object(ha, "ARCHIVE_PASS_STALL_SEC", 0), \
+                mock.patch.object(sm, "_archive_deltas", never_returns), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(wedged.wait(5))
+            with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+                # The next beat, staging its job while the pass is still stuck.
+                sm.queue_archive_sync({"archiveHave": {"t1": 2}})
+                # Throttled: the beat stages a job on every manifest cadence.
+                sm.queue_archive_sync({"archiveHave": {"t1": 3}})
+            release.set()
+
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("no push has completed", lines[0])
+
+    def test_a_wedged_pass_is_reported_even_with_nothing_left_to_stage(self):
+        """The stall check runs BEFORE the `archiveHave` gate. A wedged pass is
+        the WORKER's state, not this reply's: gating the one line that reports it
+        on the hub still asking for deltas left a host whose manifest emptied
+        mid-wedge silent forever (XERK-395 QA pass 3)."""
+        sm = self.make_manager()
+        wedged = threading.Event()
+        release = threading.Event()
+        lines = []
+
+        def never_returns(*a, **k):
+            wedged.set()
+            release.wait(10)
+
+        with mock.patch.object(ha, "ARCHIVE_PASS_STALL_SEC", 0), \
+                mock.patch.object(sm, "_archive_deltas", never_returns), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(wedged.wait(5))
+            with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+                # Every later beat carries no manifest, so no cursors come back.
+                sm.queue_archive_sync({})
+            release.set()
+
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("no push has completed", lines[0])
+
+    def test_the_worker_seeds_progress_when_a_pass_starts(self):
+        """Without that seed `_archive_progress_at` is still its initial value,
+        so the first wedged pass reports "running 0s and no push has completed in
+        <the machine's uptime>" — the pass-2 false positive in an absurd form,
+        and invisible to a test that seeds the field itself (QA pass 3 D7)."""
+        sm = self.make_manager()
+        wedged = threading.Event()
+        release = threading.Event()
+        lines = []
+
+        def never_returns(*a, **k):
+            wedged.set()
+            release.wait(10)
+
+        # The REAL threshold: the seed is what keeps a just-started pass under it.
+        with mock.patch.object(sm, "_archive_deltas", never_returns), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(wedged.wait(5))
+            with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+                sm.queue_archive_sync({"archiveHave": {"t1": 2}})
+            release.set()
+
+        self.assertEqual(lines, [])
+
+    def test_the_first_wedge_is_never_throttled_away(self):
+        """The throttle is a monotonic delta, and CLOCK_MONOTONIC is the host's
+        uptime — in a container, a host that may have booted minutes ago. With a
+        0 sentinel the first wedge on such a host is suppressed for up to an
+        hour, which is the one report that matters most (QA pass 3 D8)."""
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            with sm._archive_lock:
+                # A pass started 310s ago on a host up for barely five minutes.
+                # `now` is injected rather than patched onto the time module,
+                # which the whole process (and the worker threads the
+                # neighbouring tests leave finishing) reads.
+                sm._archive_pass_at = 10.0
+                sm._archive_progress_at = 10.0
+                sm._warn_if_archive_pass_stalled(now=320.0)
+        self.assertEqual(len(lines), 1, lines)
+
+    def test_the_stall_check_runs_under_the_lock(self):
+        """It reads what the worker writes, so unlocked it can see a pass in
+        flight and then have the stamp cleared before the arithmetic — a
+        TypeError the beat's own guard would relabel "archive sync could not be
+        staged" (XERK-395 QA pass 4)."""
+        sm = self.make_manager()
+        held = []
+        real = sm._warn_if_archive_pass_stalled
+
+        def spy(now=None):
+            held.append(sm._archive_lock.locked())
+            return real(now)
+
+        with mock.patch.object(sm, "_warn_if_archive_pass_stalled", spy), \
+                mock.patch.object(sm, "_archive_deltas", lambda *a, **k: None), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({})                          # cursorless beat
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})  # and one with work
+        self.assertEqual(held, [True, True])
+
+    def test_a_slow_but_progressing_pass_is_not_reported(self):
+        """A pass is bounded in BYTES, not in time: ARCHIVE_MANIFEST_MAX is 200
+        and every unsynced transcript costs at least one POST, so a first
+        backfill over a slow link legitimately runs for many minutes. Timing the
+        PASS instead of the pushes made this fire on exactly the healthy host the
+        ticket is about — measured at 690s, reporting "no deltas are shipping"
+        while 69 were (XERK-395 QA pass 2)."""
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            with sm._archive_lock:
+                # A pass running far longer than any threshold...
+                sm._archive_pass_at = time.monotonic() - 10 * ha.ARCHIVE_PASS_STALL_SEC
+                sm._archive_progress_at = sm._archive_pass_at
+            # ...but a push completes, as it does every few seconds on a slow link.
+            sm._note_archive_progress()
+            with sm._archive_lock:
+                sm._warn_if_archive_pass_stalled()
+        self.assertEqual(lines, [])
+
+    def test_nothing_is_reported_between_passes(self):
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)):
+            with sm._archive_lock:
+                sm._archive_pass_at = None
+                sm._archive_progress_at = time.monotonic() - 10 * ha.ARCHIVE_PASS_STALL_SEC
+                sm._warn_if_archive_pass_stalled()
+        self.assertEqual(lines, [])
+
+    def test_every_push_exit_counts_as_progress(self):
+        """Stored, refused or timed out — a push that RETURNS proves the socket
+        resolved. Only one that never returns is a wedge, and the real push
+        helpers are where that distinction is stamped."""
+        sm = self.make_manager()
+        for helper, args in (
+                ("_post_archive_chunk", ("t1", {"startOffset": 0, "endOffset": 1,
+                                                "size": 1, "entries": [], "meta": {}})),
+                ("_post_archive_raw", ("t1", "t1.jsonl", 0, b"x")),
+        ):
+            with sm._archive_lock:
+                sm._archive_progress_at = 0.0
+            with mock.patch.object(ha.urllib.request, "urlopen",
+                                   side_effect=OSError("connection refused")):
+                self.assertIsNone(getattr(sm, helper)(*args))
+            with sm._archive_lock:
+                self.assertGreater(sm._archive_progress_at, 0.0,
+                                   f"{helper} did not stamp progress")
+
+    def test_the_pass_stamp_is_cleared_even_when_the_pass_raises(self):
+        """A stamp left behind would report every later pass as wedged."""
+        sm = self.make_manager()
+        done = threading.Event()
+
+        def boom(*a, **k):
+            done.set()
+            raise RuntimeError("nope")
+
+        with mock.patch.object(sm, "_archive_sync_pass", boom):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            self.assertTrue(done.wait(5))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with sm._archive_lock:
+                if sm._archive_pass_at is None:
+                    return
+            time.sleep(0.01)
+        self.fail("the pass stamp was never cleared")
+
+    def test_worker_is_daemon_and_reused(self):
+        """One long-lived worker, not one per beat."""
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_archive_deltas", lambda *a, **k: None), \
+                mock.patch.object(sm, "_archive_raw_deltas", lambda *a, **k: None):
+            sm.queue_archive_sync({"archiveHave": {"t1": 1}})
+            worker = sm._archive_worker
+            self._drain(sm)
+            sm.queue_archive_sync({"archiveHave": {"t1": 2}})
+            self._drain(sm)
+        self.assertIs(sm._archive_worker, worker)
+        self.assertTrue(worker.daemon)
+        self.assertTrue(worker.is_alive())
+
+
+class TestBeatLoopBudget(unittest.TestCase):
+    """The beat loop's blocking budget against the hub's offline threshold
+    (XERK-395) — a cross-component contract, so it is read out of
+    `turma/server.js` rather than restated here."""
+
+    def _offline_after_ms(self):
+        server = os.path.join(os.path.dirname(AGENT_DIR), "turma", "server.js")
+        if not os.path.exists(server):
+            self.skipTest("turma/server.js not checked out beside the agent")
+        m = re.search(r"OFFLINE_AFTER_MS\s*=\s*(\d+)\s*\*\s*(\d+)",
+                      open(server).read())
+        self.assertIsNotNone(m, "OFFLINE_AFTER_MS moved or changed shape")
+        return int(m.group(1)) * int(m.group(2))
+
+    def test_archive_worst_case_exceeds_the_offline_threshold(self):
+        """WHY archive sync may not run inline: one rendered push plus the raw
+        pass's whole failure budget is longer than the hub's patience, so an
+        inline pass can silently cost the host its online status. If this ever
+        stops being true it is still not licence to move it back — the worker is
+        also what keeps the beat's cost independent of the archive's."""
+        worst = (ha.ARCHIVE_CHUNK_TIMEOUT_SEC
+                 + ha.ARCHIVE_RAW_FAILURES_MAX * ha.ARCHIVE_RAW_TIMEOUT_SEC)
+        self.assertGreaterEqual(worst * 1000, self._offline_after_ms())
+
+    def test_what_stays_on_the_beat_fits_under_the_threshold(self):
+        """What IS inline — the interval plus the beat's own POSTs, two of them
+        on a cycle that executed commands — has to leave real margin under the
+        threshold. This covers the beat's network cost; it does not bound
+        `handle_commands`, which is the next thing to measure if a host flaps
+        again with the archive already off the loop."""
+        worst_ms = (ha.INTERVAL + 2 * ha.HEARTBEAT_TIMEOUT_SEC) * 1000
+        self.assertLess(worst_ms, self._offline_after_ms())
 
 
 class TestPrStatus(unittest.TestCase):
@@ -18294,6 +20096,28 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
 
     def _launches(self):
         return [c for c in self.run_ok_calls if c and c[0] == "tmux" and "new-session" in c]
+
+    def test_a_mid_clone_repo_defers_the_branch_reservation(self):
+        # Reserving needs a `git fetch` and a ref scan, and a repo whose clone
+        # is still writing it has neither to give — _provision_session reserves
+        # against the repo that then exists (XERK-343).
+        sm = self.make_ticket_manager()
+        sm.clones["Turma"] = {"name": "Turma", "status": "cloning"}
+        sm._reserve_ticket_branch = mock.Mock(return_value="PROJ-7")
+        self.head_ready = False
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "queued")
+        sm._reserve_ticket_branch.assert_not_called()
+        self.assertIsNone(sess["ticket"]["branch"])
+        # And it reserves once the repo can answer.
+        self.head_ready = True
+        sm.clones["Turma"]["status"] = "done"
+        sm._drain_queue()
+        self.assertEqual(sess["status"], "running")
+        sm._reserve_ticket_branch.assert_called_once()
+        self.assertEqual(sess["ticket"]["branch"], "PROJ-7")
 
     def test_spawns_with_the_ticket_and_a_reserved_branch(self):
         sm = self.make_ticket_manager()

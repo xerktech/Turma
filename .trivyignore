@@ -168,3 +168,35 @@ CVE-2026-56858 exp:2026-10-17
 CVE-2026-56859 exp:2026-10-17
 CVE-2026-56860 exp:2026-10-17
 CVE-2026-56862 exp:2026-10-17
+
+# CVE-2026-56864 / CVE-2026-56865 — golang.org/x/mod sumdb: a malicious GOSUMDB
+# could serve arbitrary module content, and a malicious GOPROXY could forge
+# sumdb tree heads (fix: x/mod 0.40.0). Reaches us only as a vendored dependency
+# of two bundled third-party Go binaries — gh (x/mod v0.37.0) and terraform
+# (x/mod v0.35.0) — so it is not independently patchable, and neither pin has
+# anywhere to go: gh 2.97.0, the newest release, still vendors v0.37.0 (read from
+# the published binary's own build info), and terraform 1.15.8 IS the latest
+# stable (1.16.0-rc2 is a pre-release). The next upstream
+# release of either built against x/mod 0.40.0+ clears it.
+#
+# Not reachable here either way: both CLIs vendor x/mod to PARSE module paths
+# and semver, and the vulnerable code is the sumdb client that verifies modules
+# fetched from a GOPROXY/GOSUMDB. Neither gh nor terraform is a Go module
+# client, and this image runs no Go toolchain. The expiry forces the revisit.
+CVE-2026-56864 exp:2026-10-17
+CVE-2026-56865 exp:2026-10-17
+
+# CVE-2026-50163 — oras-go: information disclosure and arbitrary file access via
+# crafted tarball hardlinks when pulling an OCI artifact (fix: oras-go 2.6.2).
+# Reaches us only as a vendored dependency of the bundled `helm` binary, so it is
+# not independently patchable — and there is nowhere to bump to. helm 3.21.4 is
+# the newest 3.x, and helm 4.2.4, the newest release of any line, vendors the
+# SAME oras.land/oras-go/v2@v2.6.1; both read from the published binaries' own
+# build info rather than from a changelog. So a major-version upgrade would not
+# clear it either, which is worth knowing before someone tries.
+#
+# The blast radius is one `helm pull`/`helm install` against an OCI registry a
+# session chose to talk to. Not reachable from chart repos over HTTPS, which is
+# how every chart in xerktech/ArgoCD is fetched. The expiry forces the revisit
+# once upstream ships a helm built against 2.6.2.
+CVE-2026-50163 exp:2026-10-24
