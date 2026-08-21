@@ -116,7 +116,7 @@ echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid() 
 # probes `command -v` and the creds store on disk — it deliberately never runs
 # these — so a stub on PATH exercises it exactly as the 1 GB of real ones would.
 # The cluster CLIs (XERK-369) ride the same preflight and the same rule.
-for cli in aws az terraform kubectl helm talosctl omnictl; do
+for cli in aws az terraform kubectl helm talosctl omnictl bws; do
   printf '#!/bin/sh\necho "%s stub should not be invoked" >&2\nexit 1\n' "$cli" \
     > "$WORK/$cli"
 done
@@ -164,13 +164,13 @@ cat > "$WORK/Dockerfile" <<'DOCKERFILE'
 FROM node:24-bookworm-slim
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY python3 /usr/local/bin/python3
-COPY hub-agent.py tunnel-agent.js aws az terraform kubectl helm talosctl omnictl /usr/local/bin/
+COPY hub-agent.py tunnel-agent.js aws az terraform kubectl helm talosctl omnictl bws /usr/local/bin/
 # Last, so they shadow the base image's real npm.
 COPY claude npm /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/python3 \
       /usr/local/bin/aws /usr/local/bin/az /usr/local/bin/terraform \
       /usr/local/bin/kubectl /usr/local/bin/helm /usr/local/bin/talosctl \
-      /usr/local/bin/omnictl \
+      /usr/local/bin/omnictl /usr/local/bin/bws \
       /usr/local/bin/claude /usr/local/bin/npm
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 DOCKERFILE
@@ -815,6 +815,31 @@ for cli in kubectl talosctl omnictl; do
   fi
 done
 expect "manager still starts" "0" "$(field "$out" uid)"
+
+# --- Case 14b: bws is env-configured, not file-configured (XERK-369) --------
+# `bws` reads BWS_ACCESS_TOKEN and has NO credential file, so the marker-file
+# check every other CLI here uses would report a properly configured host as
+# credential-less. It is probed the way `aws` is for its env credentials.
+echo "== case: bws reports its env credential, and its absence"
+make_fixture "$WORK/fxk14b" 0 0
+out="$(run_case "$WORK/fxk14b" -e BWS_ACCESS_TOKEN=machine-account-token)"
+if echo "$out" | grep -q "\[entrypoint\] bws: credentials from the environment"; then
+  echo "  ok: reported as env-configured"
+else
+  echo "  FAIL: a configured bws was not reported: $(echo "$out" | grep -E 'bws:' || echo none)"; FAILED=1
+fi
+# The token itself must never reach the log.
+if echo "$out" | grep -q "machine-account-token"; then
+  echo "  FAIL: the token was echoed into the boot log"; FAILED=1
+else
+  echo "  ok: the token itself is never printed"
+fi
+out="$(run_case "$WORK/fxk14b")"
+if echo "$out" | grep -q "\[entrypoint\] bws: installed; no BWS_ACCESS_TOKEN"; then
+  echo "  ok: reported as unconfigured"
+else
+  echo "  FAIL: an unconfigured bws was not reported: $(echo "$out" | grep -E 'bws:' || echo none)"; FAILED=1
+fi
 
 # --- Case 15: in-cluster ServiceAccount becomes the kubeconfig (XERK-369) ----
 # The cluster-side agent mounts NO kubeconfig; its credential is the pod's own
