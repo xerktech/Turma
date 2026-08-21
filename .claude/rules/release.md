@@ -55,9 +55,17 @@ paths:
 - **The digest is `build-turma-image`'s own build output, never re-resolved from the registry.**
   `:latest` and `:<version>` are mutable, so a release racing this one would hand the cluster a
   different image than the one that was just built.
-- Gated on the turma component being **BUILT** (a carried hub is already the running image) and on
-  `publish` succeeding, so the cluster only ever gets an image from a release that exists. Its
-  failure does not unpublish anything — it reports that k8x is still on the previous image.
+- Gated on the turma component being **BUILT** (a carried hub is already the running image), on
+  `publish` succeeding, and on `github.ref` being **main** — `workflow_dispatch` takes any ref, and
+  this is the one job that would put an unmerged branch into production. Its failure unpublishes
+  nothing; it reports that k8x is still on the previous image.
+- **"Built" is not "changed"**: `changes.js` maps the whole `turma/` prefix, so a test-only merge
+  rebuilds the image and redeploys a runtime-identical hub, which `Recreate` + `replicas: 1` pays
+  for with every tunnel, SSE stream and terminal channel. XERK-426.
+- A rejected push is **re-applied, never rebased** — reset onto the new `origin/main` and re-run the
+  rewrite. The racing commit is usually a hand-edit of that same line, so a rebase conflicts and
+  `set -e` kills the step before its error annotation; re-applying also stops the job when the rival
+  already pinned the same ref, instead of committing over them.
 - **A missing `ARGOCD_REPO_TOKEN` FAILS the job rather than skipping it.** `GITHUB_TOKEN` can't
   reach another repo, and a silent skip is a cluster that quietly never updates behind a green
   pipeline. Repo variables `ARGOCD_REPO` / `ARGOCD_HUB_MANIFEST` override the defaults.

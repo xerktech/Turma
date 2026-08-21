@@ -133,6 +133,15 @@ test("bumpImage does not match an image line carrying a trailing comment", () =>
   assert.throws(() => A.bumpImage(text, { repository: IMAGE, version: "1.0.31", digest: DIGEST }), /changed shape/);
 });
 
+// Every byte outside the rewritten line survives, mixed endings included: the
+// diff a human reviews on the GitOps repo must be the one line, never the file.
+test("bumpImage leaves a mixed-ending file alone apart from its own line", () => {
+  const text = `a\r\nb\n          image: ${IMAGE}@${OTHER}\r\nc\nd`;
+  const res = A.bumpImage(text, { repository: IMAGE, version: "1.0.31", digest: DIGEST });
+  assert.equal(res.text, `a\r\nb\n          image: ${IMAGE}:1.0.31@${DIGEST}\r\nc\nd`);
+  assert.equal(res.line, 3);
+});
+
 test("bumpImage preserves CRLF line endings", () => {
   const text = manifest(`${IMAGE}@${OTHER}`).replace(/\n/g, "\r\n");
   const res = A.bumpImage(text, { repository: IMAGE, version: "1.0.31", digest: DIGEST });

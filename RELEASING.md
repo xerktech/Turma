@@ -132,11 +132,25 @@ because `:latest`/`:<version>` are mutable and a later release could otherwise
 hand the cluster a different image than the one that was just built.
 
 It runs **only when the `turma` component was actually built** (a carried hub is
-already the running image) and never on a dry run. Running it after `publish`
-means the cluster only ever receives an image belonging to a release that
-exists. If it fails, the release itself still stands — the tag, the images and
-the assets are already published; what the red job reports is that k8x is still
-on the previous image.
+already the running image), never on a dry run, and **only from `main`** — a
+`workflow_dispatch` accepts any ref, and without that guard one mis-aimed
+non-dry dispatch would roll the fleet's control plane onto an unmerged branch.
+Running it after `publish` means the cluster only ever receives an image
+belonging to a release that exists. If it fails, the release itself still
+stands — the tag, the images and the assets are already published; what the red
+job reports is that k8x is still on the previous image.
+
+The converse of the build-vs-carry gate does not hold: `changes.js` maps the
+whole `turma/` prefix, so a test-only change still rebuilds the image and
+therefore redeploys a runtime-identical hub, costing the single replica a
+`Recreate`. XERK-426 carries that.
+
+A rejected push is **re-applied, not rebased**: the job resets onto the new
+`origin/main` and re-runs the rewrite. The commit it races with is most often a
+hand-edit of this very line, which a rebase would turn into a conflict that
+kills the step before its error message. Re-applying also makes the rival's edit
+visible — if they pinned the same ref, the re-run stages nothing and the job
+stops rather than committing over them.
 
 The rewrite is `.github/scripts/argocd.js` (pure, unit-tested) driven by
 `argocd-cli.js`. It is a textual one-line edit on purpose: that manifest is

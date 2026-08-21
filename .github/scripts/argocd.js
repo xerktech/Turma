@@ -47,6 +47,11 @@ function imageRef(repository, version, digest) {
   return `${repository}:${version}@${digest}`;
 }
 
+// parts index -> 1-based line number (see the split below).
+function lineNumber(index) {
+  return index / 2 + 1;
+}
+
 // Rewrite the single `image:` line whose repository is `repository`.
 //
 // Throws when there is not exactly one. Both failure modes are the ones worth
@@ -64,29 +69,31 @@ function bumpImage(text, opts) {
   if (!TAG_RE.test(version)) throw new Error(`bumpImage: version ${JSON.stringify(version)} is not a usable image tag`);
   if (!DIGEST_RE.test(digest)) throw new Error(`bumpImage: digest ${JSON.stringify(digest)} is not a sha256 digest`);
 
-  // Keep the file's own line ending: a CRLF manifest rewritten with LF is a
-  // whole-file diff, which hides the one line that actually changed.
-  const eol = text.includes("\r\n") ? "\r\n" : "\n";
-  const lines = text.split(/\r?\n/);
+  // Split KEEPING the separators, so every byte this function does not mean to
+  // touch survives verbatim — including each line's own ending. Rebuilding the
+  // file from bare lines and one guessed EOL would rewrite every line of a
+  // mixed-ending file, and a whole-file diff hides the one line that changed.
+  // Even indices are line content, odd ones are the separators between them.
+  const parts = text.split(/(\r?\n)/);
 
   const hits = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = IMAGE_LINE_RE.exec(lines[i]);
+  for (let i = 0; i < parts.length; i += 2) {
+    const m = IMAGE_LINE_RE.exec(parts[i]);
     if (m && parseRef(m[2]).repository === repository) hits.push({ index: i, indent: m[1], ref: m[2] });
   }
   if (hits.length === 0) throw new Error(`no \`image: ${repository}…\` line found — the manifest changed shape`);
   if (hits.length > 1) {
-    const at = hits.map((h) => h.index + 1).join(", ");
+    const at = hits.map((h) => lineNumber(h.index)).join(", ");
     throw new Error(`${hits.length} \`image: ${repository}…\` lines found (lines ${at}) — refusing to guess which one to bump`);
   }
 
   const hit = hits[0];
   const next = imageRef(repository, version, digest);
-  lines[hit.index] = `${hit.indent}image: ${next}`;
+  parts[hit.index] = `${hit.indent}image: ${next}`;
   return {
-    text: lines.join(eol),
+    text: parts.join(""),
     changed: hit.ref !== next,
-    line: hit.index + 1,
+    line: lineNumber(hit.index),
     previous: hit.ref,
     next,
   };

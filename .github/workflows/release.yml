@@ -635,14 +635,23 @@ jobs:
   # a release publishes ghcr.io/<owner>/turma:<version> and nothing ever runs it
   # — the manifest sat on the cutover digest and was bumped by hand.
   #
-  # Only when turma was actually BUILT: a carried (unchanged) hub component is
-  # already the running image, and rewriting the pin to the same bits under a new
-  # tag would restart the pod for nothing.
+  # Only when turma was actually BUILT: a CARRIED hub is already the running
+  # image, so re-pinning it would restart the pod for nothing. The converse does
+  # NOT hold — `changes.js` maps the whole `turma/` prefix, so a test-only change
+  # rebuilds the image (new labels, so a new digest) and redeploys a hub whose
+  # runtime content is identical. That costs the single replica a Recreate: every
+  # agent tunnel, SSE stream and terminal channel reconnects. XERK-426 carries it.
   #
   # Runs after `publish`, not straight after the build, so the cluster only ever
   # receives an image that belongs to a release that exists — a run that dies in
   # `publish` leaves no tag, and deploying from it would put the fleet on a
   # version with no release page, no manifest.json and no notes.
+  #
+  # main only. `workflow_dispatch` accepts any ref and `plan` happily versions
+  # whatever is checked out, so without this guard one mis-aimed non-dry dispatch
+  # would roll the fleet's control plane onto an unmerged branch. The rest of the
+  # pipeline has always been able to publish from a branch; this job is the one
+  # that would put it in production.
   #
   # Its failure does NOT unpublish the release (the tag, the images and the
   # assets are all already out); it means the cluster is still on the previous
@@ -654,6 +663,7 @@ jobs:
       && needs.build-turma-image.result == 'success'
       && needs.plan.outputs.build_turma == 'true'
       && needs.plan.outputs.dry_run != 'true'
+      && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -675,6 +685,11 @@ jobs:
       # different one) needs a PAT with contents:write on it. A missing secret
       # fails the job loudly rather than skipping: a silent skip is a cluster
       # that quietly never updates, which looks exactly like a working pipeline.
+      #
+      # The credential lands in ${RUNNER_TEMP}/gitops/.git/config as part of the
+      # remote URL, which is fine on an ephemeral runner (and Actions masks
+      # `secrets.*` while git strips userinfo from its own errors) — but nothing
+      # later may print that remote or upload RUNNER_TEMP as an artifact.
       - name: Check out the GitOps repo
         env:
           GITOPS_TOKEN: ${{ secrets.ARGOCD_REPO_TOKEN }}
@@ -700,19 +715,34 @@ jobs:
           set -euo pipefail
           MANIFEST="${RUNNER_TEMP}/gitops/${GITOPS_MANIFEST}" node .github/scripts/argocd-cli.js
       # Push to main directly: that branch is what Argo tracks, and a PR nobody
-      # merges is a release that never deploys. The retry is for the case where
-      # someone lands an unrelated manifest change between the clone and the
-      # push.
+      # merges is a release that never deploys.
+      #
+      # A rejected push is RE-APPLIED, never rebased. The commit this job races
+      # with is most often a hand-edit of this very line — the workflow this job
+      # replaces — so a rebase conflicts, and `set -e` then kills the step
+      # mid-rebase, losing the error message the operator needs. Resetting onto
+      # the new origin/main and re-running the rewrite is also what makes the
+      # rival's edit visible: if they pinned this same ref, the re-run comes back
+      # with nothing staged and the job stops, rather than committing over them.
       - name: Commit + push
         working-directory: ${{ runner.temp }}/gitops
         env:
           TAG: ${{ needs.plan.outputs.tag }}
+          IMAGE: ${{ env.TURMA_IMAGE }}
           VERSION: ${{ needs.plan.outputs.version }}
+          DIGEST: ${{ needs.build-turma-image.outputs.digest }}
           REF: ${{ steps.bump.outputs.ref }}
           CHANGED: ${{ steps.bump.outputs.changed }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # An absent `changed`/`ref` is the previous step's output going missing,
+          # NOT "already up to date". Treating it as the latter is the silent skip
+          # this job exists to refuse, so it is an error rather than an exit 0.
+          if [ -z "${REF}" ] || [ -z "${CHANGED}" ]; then
+            echo "::error::the manifest rewrite reported no result — refusing to call this a deploy. k8x is still on the previous image." >&2
+            exit 1
+          fi
           if [ "$CHANGED" != "true" ]; then
             echo "Manifest already points at ${REF} — nothing to push."
             echo "Hub manifest already at \`${REF}\`; no commit." >> "$GITHUB_STEP_SUMMARY"
@@ -720,15 +750,23 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- "$GITOPS_MANIFEST"
-          git commit --quiet -m "Turma hub ${VERSION} (${TAG})" \
-            -m "Automated by the Turma release pipeline (XERK-425): ${RUN_URL}" \
-            -m "${REF}"
           pushed=""
           for attempt in 1 2 3; do
+            git add -- "$GITOPS_MANIFEST"
+            if git diff --cached --quiet; then
+              echo "Manifest already points at ${REF} — nothing to push."
+              echo "Hub manifest already at \`${REF}\`; no commit." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            git commit --quiet -m "Turma hub ${VERSION} (${TAG})" \
+              -m "Automated by the Turma release pipeline (XERK-425): ${RUN_URL}" \
+              -m "${REF}"
             if git push --quiet origin HEAD:main; then pushed=yes; break; fi
-            echo "push attempt ${attempt} rejected; rebasing onto origin/main"
-            git pull --quiet --rebase origin main
+            echo "push attempt ${attempt} rejected; re-applying on top of origin/main"
+            git fetch --quiet origin main
+            git reset --hard --quiet FETCH_HEAD
+            GITHUB_OUTPUT=/dev/null MANIFEST="${RUNNER_TEMP}/gitops/${GITOPS_MANIFEST}" \
+              node "${GITHUB_WORKSPACE}/.github/scripts/argocd-cli.js"
           done
           if [ -z "$pushed" ]; then
             echo "::error::could not push the hub image bump to ${GITOPS_REPO} — k8x is still on the previous image." >&2
