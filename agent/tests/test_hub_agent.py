@@ -14744,8 +14744,16 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         # And the whole staging path must swallow it rather than kill the beat.
         sm.queue_archive_sync({"archiveHave": {"t": float("inf")}})
         # Keys are length-capped: bounding ENTRIES bounds no bytes on its own.
+        # Asserted on the map itself: filtering the empty key out of the
+        # comprehension first made the empty-key half unable to fail, which is
+        # the same over-claiming name this suite has been caught on before
+        # (XERK-424 QA delta, finding 4).
         sm._note_archive_known({"x" * (ha.ARCHIVE_KNOWN_KEY_MAX + 1): 5, "": 5})
-        self.assertEqual([k for k in sm._archive_known if k], [])
+        self.assertEqual(sm._archive_known, {})
+        # ...and one AT the cap is still accepted, so the bound is a bound and
+        # not an off-by-one that rejects every real id.
+        sm._note_archive_known({"y" * ha.ARCHIVE_KNOWN_KEY_MAX: 5})
+        self.assertEqual(len(sm._archive_known), 1)
         # A negative cursor floors at 0 rather than reading as "less than zero".
         sm._note_archive_known({"neg": -9})
         self.assertEqual(sm._archive_known["neg"], 0)
@@ -14892,6 +14900,104 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(spent, 32, "the backlog's unspent half returns to the newest")
         self.assertLessEqual(spent, 32)
 
+    def test_rotation_survives_a_periodic_candidate_count(self):
+        # An index-based cursor is index-SAFE, not starvation-safe: advanced
+        # against one pool and re-read modulo a differently sized one, a strict
+        # period-2 toggle makes the two advances cancel and the cursor never
+        # leaves a 2-cycle — 700 of 1201 transcripts never offered in 400 beats,
+        # with BOTH counts above the cap so the passthrough never runs
+        # (XERK-424 QA delta, finding 1). Stamps are per transcript, so the pool
+        # changing size under them is not a thing they can be wrong about.
+        sm = self.make_manager()
+        wt_a = "/w/.turma/worktrees/Turma/pa"
+        wt_b = "/w/.turma/worktrees/Turma/pb"
+        for wt, n, base in ((wt_a, 14, 1_800_000_100), (wt_b, 10, 1_800_000_000)):
+            d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+            os.makedirs(d, exist_ok=True)
+            for i in range(n):
+                f = os.path.join(d, "%s%03d.jsonl" % (wt[-2:], i))
+                write_jsonl(f, [_text_entry("u", "user", "hi")])
+                os.utime(f, (base + i, base + i))
+        sm.usage_ledger = {w: {"repo": "Turma", "remote": "git@github.com:x/y.git",
+                               "slug": ha._project_slug(w)} for w in (wt_a, wt_b)}
+        sm.closed = []
+        seen = set()
+        # Both counts (24 and 14) stay above the cap, so this is the limit cycle
+        # and not the passthrough-reset case above.
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 8), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 4):
+            for beat in range(60):
+                sm.registry = ([{"id": "s", "worktreePath": wt_b, "status": "running"}]
+                               if beat % 2 else [])
+                seen |= {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(len(seen), 24, "a periodic candidate count must not cycle")
+
+    def test_backlog_slice_keeps_HALF_the_slots_not_one(self):
+        # "not zero" is not the rule — half is. Pinning only that the cap is
+        # non-zero lets a later edit shrink the slice to one slot a beat and ship
+        # green (XERK-424 QA delta, finding 5 / N02).
+        sm = self.make_manager()
+        self._many_transcripts(sm, 60)
+        # Only the OLDEST 20 are known-short; the rest are unknown, so a backlog
+        # entry the hub has spoken about can only have come from the known-short
+        # slice and the rotation's picks are distinguishable from it.
+        sm._note_archive_known({"t%03d" % i: 0 for i in range(20)})
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 20), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 10):
+            out = sm._archive_manifest()
+        backlog = [m["transcriptId"] for m in out[10:]]
+        self.assertEqual(len(backlog), 10)
+        known = [t for t in backlog if sm._archive_known.get(t) is not None]
+        self.assertEqual(len(known), 5, "half of the 10 backlog slots, not one")
+
+    def test_staging_survives_a_raising_known_map(self):
+        # Half the D1 fix is that the call sits INSIDE the try — defence in
+        # depth, and finding 2 showed the function can still raise for reasons
+        # other than the one that was caught. Moving it back out was unpinned
+        # (XERK-424 QA delta, finding 5 / N10).
+        sm = self.make_manager()
+        with mock.patch.object(type(sm), "_note_archive_known",
+                               side_effect=RuntimeError("boom")):
+            sm.queue_archive_sync({"archiveHave": {"t": 1}})   # must not raise
+
+    def test_known_map_bounds_are_the_documented_ones(self):
+        # Only the EXISTENCE of the caps was pinned, not their size: 64 KiB keys
+        # times 5000 entries is 320 MB of agent memory, and the map outlives the
+        # reply (XERK-424 QA delta, finding 5 / N11, N12).
+        self.assertLessEqual(ha.ARCHIVE_KNOWN_KEY_MAX, 1024)
+        self.assertLessEqual(ha.ARCHIVE_KNOWN_MAX * ha.ARCHIVE_KNOWN_KEY_MAX, 4 << 20)
+        # ...and the entry cap is env-settable AND floored. The constant is
+        # frozen at import, so a fresh interpreter is the only way to hold this:
+        # asserting the clamp EXPRESSION instead passed against a module that had
+        # gone back to a bare constant (XERK-424 QA delta, N12).
+        def fresh(value):
+            env = dict(os.environ, ARCHIVE_KNOWN_MAX=value)
+            out = subprocess.run(
+                [sys.executable, "-c",
+                 "import importlib.util,sys;"
+                 f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+                 "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+                 "print(m.ARCHIVE_KNOWN_MAX)"],
+                capture_output=True, text=True, env=env)
+            return out.stdout.strip(), out.stderr[-400:]
+        got, err = fresh("77")
+        self.assertEqual(got, "77", err)          # settable
+        got, err = fresh("-1")
+        self.assertEqual(got, "0", err)           # floored, never negative
+        sm = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_KNOWN_MAX", 0):
+            sm._note_archive_known({"a": 1})     # must not raise
+            self.assertEqual(sm._archive_known, {})
+
+    def test_a_zero_manifest_cap_offers_nothing(self):
+        # The clamp floors recent_n at 1, so MAX<=0 started emitting one entry a
+        # beat where it used to emit none (XERK-424 QA delta, finding 3).
+        sm = self.make_manager()
+        self._many_transcripts(sm, 20)
+        for cap in (0, -4):
+            with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", cap):
+                self.assertEqual(sm._archive_manifest(), [])
+
     def test_window_is_a_passthrough_below_the_cap(self):
         # The common case — a host with fewer transcripts than slots — must be
         # untouched by any of this, and must not rotate.
@@ -14901,7 +15007,7 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
             got = [m["transcriptId"] for m in sm._archive_manifest()]
             self.assertEqual(got, ["t005", "t004", "t003", "t002", "t001", "t000"])
-            self.assertEqual(sm._archive_rotate, 0)
+            self.assertEqual(sm._archive_offered, {}, "nothing to rotate, nothing stamped")
 
     def test_deltas_push_filtered_entries_and_resume(self):
         sm = self.make_manager()

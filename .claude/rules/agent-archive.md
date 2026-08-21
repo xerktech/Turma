@@ -75,11 +75,18 @@ paths:
       anything broken or hostile answering `TURMA_URL`. Keys are length-capped as well as counted:
       bounding ENTRIES bounds no bytes when one key may be a megabyte.
   - **Three ways this reverts to a cliff, each closed deliberately.** They all look like tidying.
-    - **The rotation cursor is NEVER reset**, including on the under-the-cap passthrough.
-      Candidates exclude whole slugs backing a running session and a root slug holds every root
-      session's transcript, so one session going busy swings the count by hundreds; resetting on
-      each dip re-offered the pool's head forever and never reached its tail (200 of 400 never
-      offered in 200 beats). Taken modulo the pool size on use, so a stale cursor is always safe.
+    - **The rotation is keyed on the TRANSCRIPT, never on a position in the candidate list.**
+      `_archive_offered` stamps what each beat offered and the pool is taken least-recently-offered
+      first. An index cursor is index-SAFE but not starvation-safe: advanced against one pool and
+      re-read modulo a differently sized one, it forms a limit cycle whenever the candidate count
+      oscillates PERIODICALLY between two values — 700 of 1201 never offered in 400 beats on a
+      period-2 toggle, both counts above the cap. A session going busy and idle on a regular cadence
+      is exactly that, since candidates exclude whole slugs. Never-offered sorts first, so an
+      evicted stamp re-offers rather than strands.
+    - **The stamps are NEVER cleared**, including on the under-the-cap passthrough. A root slug
+      holds every root session's transcript, so one session going busy swings the count by hundreds;
+      clearing on each dip re-offered the same transcripts forever and never reached the rest
+      (200 of 400 never offered in 200 beats).
     - **The known-short slice takes at most HALF the backlog slots.** Given all of them it starves
       the rotation to nothing once enough transcripts are known-short and cannot progress — a full
       store, a permanent per-transcript failure — and then nothing new is ever offered. It bites
@@ -94,9 +101,13 @@ paths:
     recent slice: the backlog is served first at its floor, then a second pass hands whatever it
     left back to the newest, so the budget is never under-spent.
   - **`ARCHIVE_BEAT_BUDGET` deliberately has no such floor.** A manifest slot is re-contended every
-    beat where those bytes are not: running sessions are excluded, so a recent transcript's size is
-    fixed, spent down once and then skipped free on `have >= size`. A first sync costs the backlog
-    a few beats of delay, never starvation.
+    beat where those bytes are not: the budget is charged only AFTER a push that stored something,
+    so a transport failure, a 5xx, a `skip` and a `full` all cost zero, and the hub REFUSES at
+    `ARCHIVE_TOTAL_MAX` rather than evicting — so a cursor cannot regress in a loop and a
+    transcript cannot re-consume budget indefinitely. A first sync costs the backlog some beats of
+    delay, never starvation. Not because "running sessions are excluded so sizes are fixed":
+    `_running_slugs` sees only this agent's OWN registry, and a real drive archived three
+    transcripts that grew throughout it.
   - Tests: the `test_window_*`, `test_known_map_*`, `test_rotation_*`, `test_backlog_*`,
     `test_recent_slice_*` and `test_a_complete_transcript_*` cases in `TestArchiveSync`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the

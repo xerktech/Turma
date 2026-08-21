@@ -269,7 +269,12 @@ ARCHIVE_MANIFEST_RECENT = int(os.environ.get("ARCHIVE_MANIFEST_RECENT", "100"))
 # What the hub last said it holds, per transcript, so the backlog slice can
 # prefer what is genuinely missing. Bounded like every other agent-side map: it
 # is keyed on every transcript this host has ever offered, which only grows.
-ARCHIVE_KNOWN_MAX = int(os.environ.get("ARCHIVE_KNOWN_MAX", "5000"))
+# Floored at 0: the eviction loops are `while len(...) > MAX: pop(next(iter(...)))`,
+# so a negative value drains the map and then raises StopIteration out of
+# `_note_archive_known` — which the beat's try/except catches, silently ending
+# archive sync for that host forever, under a log line that says nothing at all
+# because StopIteration stringifies to "" (XERK-424 QA delta, finding 2).
+ARCHIVE_KNOWN_MAX = max(0, int(os.environ.get("ARCHIVE_KNOWN_MAX", "5000")))
 # ...and the longest id worth remembering. Bounding ENTRIES bounds no bytes when
 # one key may be a megabyte, and this map outlives the reply that filled it.
 ARCHIVE_KNOWN_KEY_MAX = 256
@@ -10559,11 +10564,17 @@ class SessionManager:
         # has this" from "the hub has never seen it" — the reply only carries
         # cursors for what was OFFERED, so an id that never fit the window is
         # absent rather than zero, and the two must not be confused.
-        # `_archive_rotate` walks the candidates that knowledge does not cover,
-        # so a transcript the hub has never been told about is offered within a
-        # bounded number of beats instead of never.
+        # `_archive_offered` walks the candidates that knowledge does not cover,
+        # least-recently-offered first, so a transcript the hub has never been
+        # told about is offered within a bounded number of beats instead of
+        # never.
         self._archive_known = {}
-        self._archive_rotate = 0
+        # Least-recently-OFFERED bookkeeping for the backlog rotation:
+        # transcriptId -> the sequence number of the beat that last offered it,
+        # and the counter that issues them. Per transcript rather than a position
+        # in the candidate list, because that list changes size between beats.
+        self._archive_offered = {}
+        self._archive_offer_seq = 0
         # Throttle for the "cannot be named by the archive" line (see
         # _session_files): the manifest is rebuilt every beat.
         self._unnameable_logged_at = 0.0
@@ -14944,17 +14955,19 @@ class SessionManager:
         raw budget can guarantee it a share instead of spending everything on the
         recent slice.
         """
+        if ARCHIVE_MANIFEST_MAX <= 0:
+            return [], 0    # an off-switch has to stay one; the clamp below floors at 1
         if len(cands) <= ARCHIVE_MANIFEST_MAX:
-            # Everything fits, so there is no rotation to do — but the cursor is
-            # deliberately LEFT ALONE. Candidates exclude whole slugs backing a
-            # running session, and a root slug holds every root session's
-            # transcript, so one session going busy can swing the count by
-            # hundreds and dip it under the cap. Resetting here made every dip
-            # discard the rotation's progress, so the pool's head was re-offered
-            # forever and its tail never reached: measured at 200 of 400
-            # transcripts never offered in 200 beats, against 0 with the reset
-            # removed (XERK-424 QA D2). The cursor is taken modulo the pool size
-            # on use, so a stale value is always safe.
+            # Everything fits, so there is nothing to choose — and the
+            # last-offered stamps are deliberately LEFT ALONE. Candidates exclude
+            # whole slugs backing a running session, and a root slug holds every
+            # root session's transcript, so one session going busy can swing the
+            # count by hundreds and dip it under the cap. Clearing that progress
+            # on each dip re-offered the same transcripts forever and never
+            # reached the rest: measured at 200 of 400 never offered in 200 beats
+            # (XERK-424 QA D2). Stamps are per TRANSCRIPT, so a pool that grows,
+            # shrinks or reorders under them stays correct — which is the whole
+            # reason they are not an index (see below).
             return list(cands), len(cands)
         # Clamped so the backlog keeps a QUARTER of the window whatever the two
         # are set to. At RECENT >= MAX there is no backlog and no rotation — the
@@ -14995,17 +15008,30 @@ class SessionManager:
             taken.add(m["transcriptId"])
         slots = ARCHIVE_MANIFEST_MAX - len(window)
 
-        # ...then rotate over whatever knowledge does not cover, so nothing that
-        # has never been offered can wait behind something that has.
+        # ...then the LEAST-RECENTLY-OFFERED of what knowledge does not cover, so
+        # nothing that has never been offered waits behind something that has.
+        #
+        # Keyed on the transcript, NOT on a position in the pool. An index-based
+        # rotation is only index-SAFE: advanced against one pool and then
+        # re-interpreted modulo a differently-sized one, it forms a limit cycle
+        # whenever the candidate count oscillates periodically between two values
+        # — which is what a session going busy and idle on a regular cadence
+        # does, since candidates exclude whole slugs. Measured on a strict
+        # period-2 toggle: 700 of 1201 transcripts never offered in 400 beats,
+        # with the modulo doing exactly what it says and starving them anyway
+        # (XERK-424 QA delta, finding 1). Never-offered sorts first, so an
+        # evicted stamp re-offers rather than strands.
         if slots > 0:
             pool = [m for m in rest if m["transcriptId"] not in taken]
             if pool:
-                start = self._archive_rotate % len(pool)
-                picked = (pool[start:] + pool[:start])[:slots]
-                window.extend(picked)
-                # Advance by what was actually offered, so consecutive beats walk
-                # the pool rather than re-offering the same head of it.
-                self._archive_rotate = (start + len(picked)) % len(pool)
+                pool.sort(key=lambda m: self._archive_offered.get(m["transcriptId"], -1))
+                window.extend(pool[:slots])
+        self._archive_offer_seq += 1
+        for m in window[backlog_start:]:
+            self._archive_offered.pop(m["transcriptId"], None)
+            self._archive_offered[m["transcriptId"]] = self._archive_offer_seq
+        while len(self._archive_offered) > ARCHIVE_KNOWN_MAX:
+            self._archive_offered.pop(next(iter(self._archive_offered)))
         return window, backlog_start
 
     def _archive_manifest(self):
@@ -15290,7 +15316,11 @@ class SessionManager:
                     worker.start()
             self._archive_wake.set()
         except Exception as e:
-            log(f"archive sync could not be staged: {e}")
+            # `{e}` alone is empty for the exceptions that carry no message —
+            # StopIteration is the one this actually hit — and "could not be
+            # staged: " with nothing after it is indistinguishable from a
+            # formatting bug (XERK-424 QA delta, finding 2).
+            log(f"archive sync could not be staged: {type(e).__name__}: {e}")
 
     def _warn_if_archive_pass_stalled(self, now=None):
         """Say so when a pass is in flight and no push has COMPLETED for a long
@@ -15548,13 +15578,19 @@ class SessionManager:
         # One budget, spent in manifest order, so the recent slice is served
         # before the backlog. That deliberately gets NO reservation of its own,
         # unlike the manifest's raw-file budget (XERK-424): a manifest slot is
-        # re-contended every beat, where these bytes are not. Running sessions
-        # are excluded from the manifest, so a recent transcript's size is FIXED
-        # — it is spent down once and then skipped for free on `have >= size`.
-        # A first sync or a reset archive therefore costs the backlog a few
-        # beats of delay, never starvation. If a case is ever found where a
-        # recent transcript consumes budget indefinitely, this needs the same
-        # floor the raw budget has.
+        # re-contended every beat, where these bytes are not. The budget is
+        # charged AFTER a push that stored something, so a transport failure, a
+        # 5xx, a `skip` and a `full` all cost zero — and the hub refuses at
+        # ARCHIVE_TOTAL_MAX rather than evicting, so a cursor cannot regress in a
+        # loop. A transcript therefore cannot re-consume budget indefinitely: a
+        # first sync costs the backlog some beats of delay, never starvation.
+        #
+        # NOT because "running sessions are excluded so the size is fixed" — that
+        # was the reason given here first and it is false. `_running_slugs` knows
+        # only this agent's OWN registry, and a drive over the real projects root
+        # archived three transcripts that were growing throughout it: another
+        # worktree session's, and two under the test suite's own manager slugs
+        # (XERK-424 QA delta, finding 6).
         budget = ARCHIVE_BEAT_BUDGET
         failures = 0
         for tid, m in list(self._archive_pending.items()):
