@@ -340,6 +340,41 @@ fun hubErrorMessage(resp: retrofit2.Response<*>): String {
     return msg?.takeIf { it.isNotBlank() } ?: "the hub answered HTTP ${resp.code()}"
 }
 
+/** What the hub records about a refused archive push (XERK-356). */
+@Serializable
+data class ArchiveRefusal(
+    val host: String = "",
+    val at: Long = 0,
+    val error: String = "",
+)
+
+/** The 404 body `GET /api/archive/<id>` answers with when it knows why. */
+@Serializable
+private data class ArchiveMissing(
+    val error: String = "",
+    val refused: ArchiveRefusal? = null,
+)
+
+/**
+ * Why an archived transcript is missing, in the hub's own words, when its 404
+ * carries them (XERK-356) — else null, meaning the ordinary "not here yet".
+ *
+ * The distinction is the point: a refused push never arrives, so the reassuring
+ * "it syncs within a few minutes" the ended view falls back to is a promise that
+ * will not be kept, and the operator would go on waiting for it. Web twin:
+ * `archiveRefusalNote` in sessions.html.
+ */
+fun archiveRefusalMessage(e: Throwable): String? {
+    val resp = (e as? HttpException)?.response() ?: return null
+    if (resp.code() != 404) return null
+    val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
+    val r = runCatching { TurmaJson.decodeFromString<ArchiveMissing>(body).refused }.getOrNull()
+        ?: return null
+    if (r.error.isBlank()) return null
+    return "${r.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
+        "to the archive was refused: ${r.error}."
+}
+
 @Serializable
 data class JiraSessionResponse(
     val ok: Boolean = false,

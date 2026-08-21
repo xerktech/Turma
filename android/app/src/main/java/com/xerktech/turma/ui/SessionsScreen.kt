@@ -1170,6 +1170,7 @@ internal fun EndedSessionView(
             // Guard on the loaded transcript's OWN id so a stale one from the
             // previously-open ended session never flashes before this one loads.
             val ready = arch.open?.takeIf { it.transcriptId == transcriptId }
+            val refusal = arch.refusal
             when {
                 transcriptId.isBlank() -> EndedMessage("No conversation was recorded for this session.")
                 ready != null -> {
@@ -1183,6 +1184,11 @@ internal fun EndedSessionView(
                     }
                 }
                 arch.openLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                // The hub's words when it has any: a REFUSED push never arrives,
+                // so telling the operator to wait a few minutes for it is a
+                // promise nothing will keep (XERK-356). Web twin: the same two
+                // wordings in sessions.html's ended-session view.
+                refusal != null -> EndedMessage("$refusal Resume still works.")
                 else -> EndedMessage(
                     "This conversation hasn't reached the hub's archive yet — it syncs within a few minutes. Resume still works.",
                 )

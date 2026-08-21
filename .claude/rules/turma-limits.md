@@ -111,6 +111,37 @@ ways that neither bound covers alone.
   finishes, to keep the connection alive — it resumes the paused stream and reads the whole thing.
   Discarded bytes are still read into memory.
 
+## Per-route ceilings
+
+- **A route whose caller sends more than `BODY_MAX` must SAY SO, and pass its own cap.** The
+  archive ingest read at the default 1 MiB while agents built each delta out of an 8 MiB window,
+  and — because archival excludes RUNNING sessions, so an ended session's first delta is its whole
+  transcript — every real session was refused and the durable archive stayed empty (XERK-356).
+- **A route that costs more than `BODY_PARSE_COST` must SAY THAT TOO** — `readBody`'s third
+  argument. The budget bounds memory only while its units mean memory, and the archive ingest holds
+  the accumulated body, the parsed entries, `ingestChunk`'s re-serialized lines and the append
+  buffer at once: charged 3x at an 8 MiB ceiling, a few hosts backfilling beside one large-but-legal
+  heartbeat OOM-killed a real 256 MiB cgroup. `ARCHIVE_PARSE_COST` is 20, and the ceiling
+  (`min(2 MiB, MEMORY_LIMIT / 60)`) is sized so several concurrent deltas fit the in-flight total:
+  archive-only floods then measure 114 MiB at 192 concurrent max-size deltas, against 197 MiB at 24
+  before. Deltas are append-only, so a smaller ceiling costs round trips and never content.
+  - **Beside a 30 MiB heartbeat that load peaks around 239 MiB of the 256 — no margin**, and some
+    runs still OOM. That is the HEARTBEAT's own under-charge (below), not the archive's: don't read
+    the archive number as headroom, and re-run any load here 3-5 times.
+- **KNOWN, pre-existing: `/api/heartbeat` is under-charged the way the archive was** (XERK-376). One
+  legal 30 MiB beat measures ~5.5x its wire size against `BODY_PARSE_COST`'s 3x, and two or three
+  concurrent OOM-kill a 256 MiB hub with no archive traffic at all — reproduced on `origin/main`.
+  Charging it honestly trades control-plane 503s against the OOM on the route that carries every
+  host's liveness, so it is a sizing decision rather than a code fix.
+  - **The ceiling rides the heartbeat reply** (`archiveChunkMax`), exactly as `bodyMax` does and for
+    the same reason: it is a fraction of THIS container's limit, so an agent guessing it guesses
+    wrong, and past it there may be no status to learn from. An agent predating the field keeps a
+    default under the OLD 1 MiB cap, so it archives against either hub.
+  - **Read at the route, not through the generic handler**, so 413 and 503 stay distinct (shrink vs
+    retry) and so the refusal can be RECORDED: `archiveRefusals` (bounded, oldest evicted, cleared
+    by a chunk that lands) is served as `refused` on `GET /api/archive/<id>`'s 404, which is the
+    only reason an operator ever learns a conversation was refused rather than merely late.
+
 ## Verifying a change here
 
 - The unit suite has never caught any defect in this code. Every one was found by flooding a real
@@ -121,6 +152,11 @@ ways that neither bound covers alone.
   re-run it on any change here — 3-5 times, because the OOM is probabilistic.
 - Staged uploads are a separate budget that must be added to whatever the bodies hold; stage them
   (the agent must report `uploadMaxBytes` or uploads 409) before concluding a shape is safe.
+- **Point `ARCHIVE_DIR` at a REAL DISK when the load writes to the archive.** On tmpfs — the obvious
+  scratch choice, and what `/tmp` is on the reference host — every archived byte is charged to the
+  same cgroup and cannot be reclaimed, so the hub OOMs on what it STORED and the measurement says
+  nothing about what it PARSED. It also inverts the verdict: the build that REFUSES the pushes
+  writes nothing and looks like the safe one (XERK-356).
 - **Prove a new test fails without its fix.** Both leak tests here were checked against a build with
   `migrateToBigLane` disabled; a test that passes either way pins nothing.
 - Tests: the `budget:`, `drain:` and `connections:` cases in `server.test.js`.

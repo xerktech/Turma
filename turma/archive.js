@@ -613,9 +613,32 @@ function warnArchiveFull(total) {
 // equal what we've already stored (append-only). Returns {bytesStored} — the
 // caller relays it so the agent can resume. On an offset mismatch we DON'T
 // append; we just report our real cursor and let the agent realign.
+// The text fields a delta's `meta` may carry, and the longest each is stored at.
+// **Every one is agent-supplied and every one is BOUND INTO SQLITE**, which
+// accepts only scalars: a `summary` that arrives as an object or an array throws
+// "Provided value cannot be bound to SQLite parameter N", the route answers 500,
+// and the agent — which cannot tell a poisoned transcript from a hub that is
+// unwell — has that 500 to deal with on every beat (XERK-356 QA pass 2). A
+// non-scalar is not text, so it is stored as nothing rather than as
+// "[object Object]"; the length cap is the receiving half of the agent's own
+// (a bound the receiving path does not enforce is not a bound, XERK-235).
+const META_TEXT_MAX = 500;
+const META_FIELDS = ["remoteKey", "repo", "worktree", "slug", "createdAt", "endedTs", "summary"];
+function metaText(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "object") return null;      // arrays and objects are not text
+  const s = String(v);
+  return s ? s.slice(0, META_TEXT_MAX) : null;
+}
+function normalizeMeta(meta) {
+  const out = {};
+  for (const k of META_FIELDS) out[k] = metaText((meta || {})[k]);
+  return out;
+}
+
 function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) {
   openDb();
-  meta = meta || {};
+  meta = normalizeMeta(meta);
   const row = db.prepare(
     "SELECT bytesStored, archiveBytes, filePath FROM sessions WHERE transcriptId=?"
   ).get(transcriptId);
@@ -1224,7 +1247,7 @@ module.exports = {
   RAW_DIR_SUFFIX,
   slugify, archiveRelPath, ftsQuery, byteCeiling, shedFilePayloads,
   openDb, closeDb, rebuildIndex,
-  ingestChunk, manifestCursors, archiveLimits,
+  ingestChunk, manifestCursors, archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).
   ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
   safeRawRel, rawDirFor, rawFilePath,

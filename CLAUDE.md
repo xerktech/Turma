@@ -15,8 +15,8 @@ that component's files.
 | `.claude/rules/agent-input.md` | `agent/hub-agent.py` | putting a message INTO a session: `send_input`'s pane path and its compaction outbox, `notify_session`'s session inbox |
 | `.claude/rules/agent-sessions.md` | `agent/hub-agent.py` | how a session is launched, repos-root sessions, the agent-side session queue, kill/resume/delete, the new-work directive, local-model failover |
 | `.claude/rules/agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
+| `.claude/rules/agent-archive.md` | `agent/hub-agent.py` | archive sync: the manifest, the rendered + raw delta pushes and what bounds one, the payload shed, the off-the-beat sync worker |
 | `.claude/rules/agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
-| `.claude/rules/agent-archive.md` | `agent/hub-agent.py` | archive sync: the manifest, the rendered + raw delta pushes, the off-the-beat sync worker |
 | `.claude/rules/agent-usage.md` | `agent/hub-agent.py`, `agent/hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |

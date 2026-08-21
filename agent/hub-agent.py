@@ -253,9 +253,70 @@ CLAUDE_CONFIG_PATHS = tuple(p for p in (
 # the heartbeat reply). Bounded so a big backfill trickles in rather than flooding
 # the tunnel or blocking a beat.
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
-ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
+ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read-ahead window per delta
 ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
+
+# What must fit under the hub's ceiling is the JSON BODY, never the window above
+# (XERK-356). The two are not a fixed ratio of each other: the entries are a
+# re-encoding of those bytes, and a SendUserFile turn is a SHORT transcript line
+# that renders to megabytes of inline preview the agent reads off disk. So each
+# delta is cut at a LINE BOUNDARY that keeps the measured body under the ceiling,
+# and the window is only how far ahead we read to find those lines.
+#
+# **The number comes from the hub** (`archiveChunkMax` on the beat reply), for
+# the same reason `bodyMax` does: it is a fraction of the hub's container limit,
+# so only the hub knows it. This constant is the floor used before any reply has
+# stated one — and it is under an OLD hub's DEFAULT 1 MiB body cap on that route,
+# which is the whole of XERK-356: the agent posted 8 MiB deltas at a 1 MiB route,
+# so every real session's first delta was refused and the durable archive held
+# nothing but trivially small transcripts. Staying under that default is what
+# makes the archive work against a hub that has not been upgraded yet.
+# The override may only LOWER it. Past roughly the hub's cap plus its drain
+# slack the socket is destroyed with no status at all, so neither the 413
+# fallback nor the skip below can fire — the agent sees a broken pipe and the
+# pass stops. A knob that can raise this is a knob that can walk an operator
+# straight into that band against a hub that states nothing (XERK-356 QA pass 2).
+ARCHIVE_BODY_MAX_DEFAULT = min(
+    int(os.environ.get("TURMA_ARCHIVE_BODY_MAX", str(768 << 10))), 768 << 10)
+# How much of the hub's stated ceiling to actually use, and the largest stated
+# one worth remembering — see HEARTBEAT_BODY_MARGIN / HEARTBEAT_BODY_STATED_MAX,
+# which this mirrors deliberately. `archiveChunkMax` is untrusted wire input too.
+ARCHIVE_BODY_MARGIN = 0.75
+ARCHIVE_BODY_STATED_MAX = 1 << 30
+# ...and the floor, which is an ABSOLUTE one and deliberately NOT the default
+# above. A stated ceiling SMALLER than what we would otherwise send has to be
+# obeyed: floored at the default instead, the fallback after a 413 landed on a
+# number the hub still refused, so the same delta went up every pass forever and
+# — because a failed push ended the pass — no OTHER transcript on the host
+# archived either (XERK-356 QA D2). This floor exists only to reject a value no
+# hub could mean: under it a delta cannot carry a single ordinary turn, so a
+# ceiling below it would shed the whole conversation a line at a time while every
+# POST still answered 200.
+ARCHIVE_BODY_MIN = int(os.environ.get("TURMA_ARCHIVE_BODY_MIN", str(64 << 10)))
+# How far past a chunk's start we will hunt for the newline ending a single
+# over-long line. A transcript line longer than the read window used to end the
+# pass with `break` and no log at all, so that transcript never advanced again
+# and nothing anywhere said why (found fixing XERK-356). It is reachable: a
+# pasted image or a huge paste lands in ONE line. The range is archived with
+# nothing rendered from it, which loses one entry and keeps the byte cursor —
+# the cursor is the durable record's whole integrity, so it may never be guessed.
+ARCHIVE_LINE_SCAN_MAX = 1 << 26   # 64 MiB, scanned a block at a time
+# A session's summary rides EVERY delta of its transcript, inside the framing
+# that is measured before any entry is fitted. It comes from the session's own
+# name or label, and the hub's spawn route takes a 100 KB label — so uncapped it
+# can eat a whole delta on its own, at which point every entry is dropped for
+# "not fitting" and the transcript archives as empty ranges with a 200 on each.
+# It is display text: a session card and an archive filename, neither of which
+# shows anything like this much.
+ARCHIVE_META_SUMMARY_MAX = 500
+# Failed rendered pushes tolerated in one pass before it gives up until the next
+# beat — the raw layer's ARCHIVE_RAW_FAILURES_MAX, for the same two reasons. One
+# transcript the hub will not take must not cost the OTHERS their sync (a
+# permanent 500 does exactly that: the store cannot accept it however often it
+# goes back up), and a hub that is genuinely down must not have every transcript
+# on the host thrown at it either.
+ARCHIVE_FAILURES_MAX = 3
 
 # The archive's RAW layer (XERK-338): beside the rendered entries above, ship a
 # byte-for-byte copy of the session's OWN files, so what Claude Code wrote
@@ -10433,6 +10494,10 @@ class SessionManager:
         # What the hub last said it will take as a body (`bodyMax` on the beat
         # reply). 0 until a beat succeeds — see _body_max.
         self._hub_body_max = 0
+        # ...and what it last said it takes as one ARCHIVE delta
+        # (`archiveChunkMax`, XERK-356). A different route with its own ceiling,
+        # so its own number — see _archive_body_max.
+        self._hub_archive_chunk_max = 0
         # Consecutive failed beats — see _note_beat_failure.
         self._beat_failures = 0
         self.history_results = []
@@ -14094,6 +14159,79 @@ class SessionManager:
         # already our own maximum, so anything above it decides nothing.
         self._hub_body_max = int(min(stated, HEARTBEAT_BODY_STATED_MAX))
 
+    def _archive_body_max(self):
+        """The biggest archive delta BODY to POST: what the hub last said that
+        route takes, less ARCHIVE_BODY_MARGIN, and never below our own
+        conservative default.
+
+        A stated ceiling is obeyed even when it is SMALLER than the default —
+        that is the point of asking. Only ARCHIVE_BODY_MIN is a floor, and only
+        because a value under it cannot carry one ordinary turn: there, every
+        delta would shed to nothing while each POST still answered 200, so the
+        archive would never finish and nothing would look wrong."""
+        stated = getattr(self, "_hub_archive_chunk_max", 0)
+        if not stated:
+            return ARCHIVE_BODY_MAX_DEFAULT
+        return max(ARCHIVE_BODY_MIN, int(stated * ARCHIVE_BODY_MARGIN))
+
+    def _note_archive_chunk_max(self, reply):
+        """Remember the hub's stated archive-chunk ceiling off a beat reply.
+        Absent (a hub predating XERK-356, which reads that route at its default
+        1 MiB body cap) leaves the conservative default in place — which is what
+        keeps the archive working against one."""
+        if not isinstance(reply, dict):
+            return
+        stated = reply.get("archiveChunkMax")
+        if isinstance(stated, bool) or not isinstance(stated, (int, float)):
+            return
+        # isfinite BEFORE any arithmetic, and guarded by isinstance, exactly as
+        # _note_body_max does and for the reason its comment gives: `1e999` is
+        # legal JSON and parses to inf, and a 400-digit int is just as legal —
+        # int() raises on the first and math.isfinite on the second, inside the
+        # caller's try, so every beat would log as failed while the hub answered
+        # 200. NaN compares False against every bound and would slip through.
+        if isinstance(stated, float) and not math.isfinite(stated):
+            return
+        if stated <= 0:
+            return
+        self._hub_archive_chunk_max = int(min(stated, ARCHIVE_BODY_STATED_MAX))
+
+    def _archive_line_end(self, path, start):
+        """Where to resume after a line longer than the read window, as
+        `(offset, found)`.
+
+        `found` is True at a real line end. It is False when the scan hit
+        ARCHIVE_LINE_SCAN_MAX first, and the offset is then simply how far we
+        scanned: the range is archived with nothing rendered from it and the
+        cursor moves on. Resuming mid-line is safe — the next window's leading
+        fragment fails to parse and is skipped like any other unparseable line,
+        and the byte ranges still tile the file — whereas refusing to move is a
+        transcript that never archives again (XERK-356 QA D3).
+
+        `(start, False)` means the file ends mid-line: nothing to do but wait for
+        the rest, which the caller reads as no progress.
+
+        Scanned a block at a time and never held: the point is to move the cursor
+        PAST what we cannot render, not to render it."""
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                scanned = 0
+                while scanned < ARCHIVE_LINE_SCAN_MAX:
+                    # Never read past the budget: a block bigger than what is
+                    # left makes the cap approximate, and the offset returned on
+                    # the not-found path has to be one we actually scanned.
+                    block = f.read(min(1 << 20, ARCHIVE_LINE_SCAN_MAX - scanned))
+                    if not block:
+                        return start, False   # ends mid-line — wait for the rest
+                    i = block.find(b"\n")
+                    if i >= 0:
+                        return start + scanned + i + 1, True
+                    scanned += len(block)
+                return start + scanned, False
+        except OSError:
+            return start, False
+
     def _drop_on_demand_results(self, payload=None):
         """Drop the staged on-demand deliveries — and them alone — from the
         staged lists and, when given, from the payload already built.
@@ -15183,7 +15321,9 @@ class SessionManager:
         """Push the byte-range deltas the hub is missing for each manifest entry,
         using the archiveHave cursors it returned. Append-only and bounded: at most
         ARCHIVE_BEAT_BUDGET bytes per pass, so a big backfill trickles across beats.
-        A failed POST just stops this pass — the next manifest re-offers it.
+        A failed POST costs that TRANSCRIPT, not the pass: a 4xx is permanent for
+        that chunk and skips it outright, anything else spends one of
+        ARCHIVE_FAILURES_MAX so a hub that is genuinely down still ends the pass.
 
         `shed_ids`/`store_full` are the hub's budget state from the same reply
         (XERK-267): transcripts already over their archive budget ship with their
@@ -15197,23 +15337,32 @@ class SessionManager:
             return
         shed_set = set(shed_ids or ())
         budget = ARCHIVE_BEAT_BUDGET
+        failures = 0
         for tid, m in list(self._archive_pending.items()):
             have = int((archive_have or {}).get(tid, 0) or 0)
             size = int(m.get("size", 0))
             if have >= size:
                 continue
             path = os.path.join(PROJECTS_ROOT, m["slug"], tid + ".jsonl")
+            summary = m.get("summary")
+            if isinstance(summary, str):
+                summary = summary[:ARCHIVE_META_SUMMARY_MAX]
             meta = {
                 "remoteKey": m.get("remoteKey"), "repo": m.get("repo"),
                 "worktree": m.get("worktree"), "slug": m.get("slug"),
                 "createdAt": m.get("createdAt"), "endedTs": m.get("endedTs"),
-                "summary": m.get("summary"),
+                "summary": summary,
             }
             # Sticky for the whole transcript once set, so a conversation doesn't
             # flicker between full previews and chips chunk to chunk.
             shed = tid in shed_set
             payload_sent = 0
             shed_bytes = 0
+            dropped = 0
+            # What the HUB says it takes on that route, not what we can read
+            # (XERK-356). Read once per transcript: a mid-pass change would put
+            # two different ceilings on one conversation for no gain.
+            body_max = self._archive_body_max()
             while have < size and budget > 0:
                 try:
                     with open(path, "rb") as f:
@@ -15225,52 +15374,51 @@ class SessionManager:
                     break
                 nl = raw.rfind(b"\n")
                 if nl < 0:
-                    break  # no complete line in the window (pathological); skip
-                complete = raw[:nl + 1]
-                end = have + len(complete)
-                entries = []
-                for line in complete.split(b"\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    text = _entry_text(entry)
-                    # Rich path (parity with _history_entries): ship the full
-                    # blocks[] — thinking, tool_use inputs, tool_result outputs —
-                    # so the hub's chat UI renders an archived session exactly like
-                    # a live one. FULL caps (the durable record is the fullest
-                    # copy; the archive has no /history to expand into). Inclusion
-                    # widens like _history_entries: a tool_result-only turn (text
-                    # is None) still has blocks and is kept.
-                    blocks = _entry_blocks(entry, BLOCK_CAPS)
-                    if text is None and not blocks:
-                        continue
-                    # ...except the SendUserFile payloads, once this transcript
-                    # has spent its archive budget on them (XERK-267).
-                    if shed:
-                        shed_bytes += _shed_block_payloads(blocks)
-                    elif ARCHIVE_PAYLOAD_MAX > 0:   # 0 = ceiling disabled
-                        payload_sent += _block_payload_bytes(blocks)
-                        if payload_sent >= ARCHIVE_PAYLOAD_MAX:
-                            shed = True
-                    entries.append({
-                        # _entry_id, not the raw uuid: a pr-link entry has none,
-                        # and the archived row's synthesized id must match the
-                        # live feeds' so the viewer keys cards the same way.
-                        "uuid": _entry_id(entry),
-                        "role": _entry_role(entry),
-                        "ts": entry.get("timestamp"),
-                        "text": text or "",
-                        "blocks": blocks or [],
-                    })
+                    # ONE line longer than the whole read window. A bare `break`
+                    # here left that transcript stuck at this offset on every
+                    # pass forever, with nothing logged (found fixing XERK-356);
+                    # skipping the window instead would corrupt the byte cursor,
+                    # which is the durable record's whole integrity. So find
+                    # where the line really ends and archive that range with
+                    # nothing rendered from it: one entry lost, cursor intact.
+                    if len(raw) < ARCHIVE_CHUNK_BYTES:
+                        break   # the file ends mid-line — the rest is still coming
+                    line_end, found = self._archive_line_end(path, have)
+                    if line_end <= have:
+                        break   # the file ends mid-line; the rest is still coming
+                    if not found:
+                        # No line end within the scan cap. Archiving the scanned
+                        # range and resuming inside the line loses more of it,
+                        # and is still the only move that does not park this
+                        # transcript at this offset for good.
+                        log(f"archive: {tid} has no line end within "
+                            f"{ARCHIVE_LINE_SCAN_MAX} bytes of offset {have}; "
+                            f"archiving that range with nothing rendered from it")
+                    end, entries = line_end, []
+                    dropped += 1
+                else:
+                    (end, entries, shed, payload_sent,
+                     more_shed, more_dropped) = self._archive_chunk_entries(
+                         raw[:nl + 1], meta, have, size, shed, payload_sent, body_max)
+                    shed_bytes += more_shed
+                    dropped += more_dropped
                 body = {"startOffset": have, "endOffset": end, "size": size,
                         "entries": entries, "meta": meta}
                 reply = self._post_archive_chunk(tid, body)
                 if reply is None:
-                    return  # POST failed; retry on a later beat
+                    # A transport failure or a 5xx. Either can be this transcript
+                    # alone (a chunk the store cannot accept answers 500 every
+                    # time) or the hub as a whole, and one POST cannot tell them
+                    # apart — so leave this transcript and let the failure budget
+                    # decide when to stop trying at all.
+                    failures += 1
+                    if failures >= ARCHIVE_FAILURES_MAX:
+                        log(f"archive: {failures} failed pushes this pass; "
+                            f"stopping until the next beat")
+                        return
+                    break
+                if reply.get("skip"):
+                    break   # this transcript is unpushable as built; the others aren't
                 if reply.get("full"):
                     # The store filled up mid-pass; nothing further can land, and
                     # the hub is telling us rather than erroring so we stop
@@ -15281,7 +15429,7 @@ class SessionManager:
                 # we count only sheddable payload) — take its word for the rest.
                 if reply.get("shed"):
                     shed = True
-                budget -= len(complete)
+                budget -= max(0, end - have)
                 new_have = int(reply.get("bytesStored", have) or have)
                 if new_have <= have:
                     break  # no forward progress (offset realign / hub cursor) — stop
@@ -15292,6 +15440,110 @@ class SessionManager:
                 # previews were dropped for size rather than never captured.
                 log(f"archive: shed {shed_bytes} bytes of inline file previews "
                     f"from {tid} (over ARCHIVE_TRANSCRIPT_MAX_BYTES)")
+            if dropped:
+                # Also once per transcript per pass, and for the same reason: a
+                # conversation with a turn silently missing from it is worse than
+                # one an operator knows has a hole, and this is the only place
+                # that knows there is one.
+                log(f"archive: left {dropped} entr{'y' if dropped == 1 else 'ies'} "
+                    f"out of {tid} — each is bigger on its own than the delta this "
+                    f"hub takes ({body_max} bytes); their byte ranges are archived "
+                    f"without them")
+
+    def _archive_chunk_entries(self, complete, meta, have, size, shed,
+                               payload_sent, body_max):
+        """Build ONE delta's entries out of `complete` — whole transcript lines
+        starting at byte `have` — cut so the POSTed body stays under `body_max`.
+
+        Returns (end, entries, shed, payload_sent, shed_bytes, dropped). `end` is
+        the byte offset just past the last line the returned entries account for:
+        a chunk's range must never contain an entry we did not send, nor omit one
+        we did, or the archive quietly loses turns at every chunk boundary.
+
+        The cut is on the MEASURED body, because the entries are a re-encoding of
+        those bytes rather than a fixed ratio of them — a SendUserFile turn is a
+        short line that renders to megabytes of inline preview read off disk, so
+        the window the caller read says nothing about what the body will weigh
+        (XERK-356)."""
+        entries = []
+        shed_bytes = 0
+        dropped = 0
+        end = have
+        # Everything a body carries that is not an entry — framing, the offsets,
+        # the meta block — measured rather than guessed, and measured against the
+        # same encoder that will send it. `ensure_ascii` is on by default, so one
+        # character is one byte and this is the wire size, not an estimate of it.
+        used = len(json.dumps({"startOffset": have, "endOffset": have + len(complete),
+                               "size": size, "entries": [], "meta": meta}))
+        pos = have
+        for piece in complete.split(b"\n")[:-1]:
+            after = pos + len(piece) + 1     # the line, and the newline ending it
+            pos = after
+            line = piece.strip()
+            if not line:
+                end = after
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                end = after
+                continue
+            text = _entry_text(entry)
+            # Rich path (parity with _history_entries): ship the full blocks[] —
+            # thinking, tool_use inputs, tool_result outputs — so the hub's chat
+            # UI renders an archived session exactly like a live one. FULL caps
+            # (the durable record is the fullest copy; the archive has no
+            # /history to expand into). Inclusion widens like _history_entries: a
+            # tool_result-only turn (text is None) still has blocks and is kept.
+            blocks = _entry_blocks(entry, BLOCK_CAPS)
+            if text is None and not blocks:
+                end = after
+                continue
+            # ...except the SendUserFile payloads, once this transcript has spent
+            # its archive budget on them (XERK-267).
+            if shed:
+                shed_bytes += _shed_block_payloads(blocks)
+            elif ARCHIVE_PAYLOAD_MAX > 0:   # 0 = ceiling disabled
+                payload_sent += _block_payload_bytes(blocks)
+                if payload_sent >= ARCHIVE_PAYLOAD_MAX:
+                    shed = True
+            rec = {
+                # _entry_id, not the raw uuid: a pr-link entry has none, and the
+                # archived row's synthesized id must match the live feeds' so the
+                # viewer keys cards the same way.
+                "uuid": _entry_id(entry),
+                "role": _entry_role(entry),
+                "ts": entry.get("timestamp"),
+                "text": text or "",
+                "blocks": blocks or [],
+            }
+            cost = len(json.dumps(rec)) + 2   # + the `, ` before it in the array
+            if used + cost > body_max:
+                if entries:
+                    break        # it opens the NEXT delta; `end` stays behind it
+                # It does not fit a delta of its OWN. Its bulk is the inline file
+                # preview, which the chat already degrades to a name-only chip,
+                # so shed that before giving up on the turn entirely.
+                shed_bytes += _shed_block_payloads(rec["blocks"])
+                cost = len(json.dumps(rec)) + 2
+                if used + cost > body_max and rec["blocks"]:
+                    # Then the rich blocks, which carry the SAME conversation the
+                    # flat `text` already holds (the thinking trace and tool
+                    # detail beside it). A turn rendered plainly is worth far
+                    # more to whoever reads this archive than no turn at all.
+                    rec["blocks"] = []
+                    cost = len(json.dumps(rec)) + 2
+                if used + cost > body_max:
+                    # Still too big. Archive the RANGE without it: the caller
+                    # logs the hole, and the alternative is a body the hub
+                    # refuses and a transcript that never advances past it.
+                    dropped += 1
+                    end = after
+                    continue
+            entries.append(rec)
+            used += cost
+            end = after
+        return end, entries, shed, payload_sent, shed_bytes, dropped
 
     def _post_archive_chunk(self, transcript_id, body):
         """POST one archive delta to the hub. Returns the parsed reply
@@ -15307,6 +15559,32 @@ class SessionManager:
             with urllib.request.urlopen(req, timeout=ARCHIVE_CHUNK_TIMEOUT_SEC) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
             return reply if isinstance(reply, dict) else {}
+        except urllib.error.HTTPError as e:
+            # urllib stringifies an HTTPError to its status line alone and throws
+            # the body away — and the body is where the hub says WHY it refused
+            # this chunk, which is the one thing an operator can act on.
+            log(f"archive push failed for {transcript_id}: {_http_error_detail(e)}")
+            code = getattr(e, "code", None)
+            if code == 413:
+                # This body was measured against what the hub SAID it takes, so
+                # a 413 means that number is stale (a hub restarted with less
+                # memory) or was never stated at all. Fall back to the
+                # conservative default until a beat states one again, rather than
+                # re-sending the same too-big delta every pass — XERK-235's loop
+                # in the archive's own shape, and how XERK-356 stayed invisible.
+                self._hub_archive_chunk_max = 0
+                log(f"archive: the hub refused a {transcript_id} delta as too "
+                    f"large; falling back to {ARCHIVE_BODY_MAX_DEFAULT}-byte "
+                    f"deltas until it states its ceiling again")
+            # A 4xx is the hub saying THIS CHUNK is not acceptable, which is
+            # permanent for this chunk however many times it goes back up. Only
+            # a transport failure means "the hub is unwell, stop the pass" — the
+            # raw layer already draws exactly this line. Conflated, one
+            # unpushable transcript ended the pass on every beat and starved
+            # every OTHER transcript on the host (XERK-356 QA D2).
+            if code is not None and 400 <= code < 500:
+                return {"skip": True}
+            return None
         except Exception as e:
             log(f"archive push failed for {transcript_id}: {e}")
             return None
@@ -17803,6 +18081,9 @@ class SessionManager:
                 # "no reply" — a skipped beat rather than a wedged agent.
                 reply = json.loads(resp.read(HEARTBEAT_REPLY_MAX).decode() or "{}")
             self._note_body_max(reply)
+            # The ARCHIVE route's own ceiling, off the same reply and before
+            # _archive_deltas runs on it (XERK-356).
+            self._note_archive_chunk_max(reply)
             self._beat_failures = 0
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
@@ -17861,6 +18142,10 @@ class SessionManager:
             "deliveries; shedding them rather than re-sending the same body forever")
         self._drop_on_demand_results()
         self._hub_body_max = 0
+        # Forgotten with it, and for the same reason: a hub restarted with less
+        # memory has a smaller archive ceiling too, and the one we learned is
+        # only refreshed on a SUCCESSFUL beat.
+        self._hub_archive_chunk_max = 0
 
     def _read_updating_flag(self):
         """Consume the native updater's hint file (reason + target version) if it

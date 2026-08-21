@@ -78,6 +78,44 @@ paths:
 - A refused delta comes back as **the hub's real cursor plus a flag, never an error status** — the
   agent must read it as no forward progress and drop it, not as a chunk to re-send forever
   (XERK-255).
+- **What is cut to the hub's ceiling is the delta's BODY, never the read window** (XERK-356).
+  `ARCHIVE_CHUNK_BYTES` is only how far ahead `_archive_deltas` reads to find whole lines;
+  `_archive_chunk_entries` then cuts at a LINE BOUNDARY so the measured body stays under
+  `_archive_body_max()`. The two are not a ratio of each other — a SendUserFile turn is a short
+  transcript line that renders to megabytes of preview the agent reads off DISK — so sizing the
+  window bounds nothing. A chunk's byte range must contain exactly the entries it carries: an entry
+  that does not fit opens the NEXT delta, and the cursor stops behind it.
+  - **The number comes from the hub** (`archiveChunkMax` on the beat reply), like `bodyMax` and for
+    the same reason. The default used before one arrives is deliberately under an OLD hub's 1 MiB
+    route cap, which is what makes the archive work against a hub that has not been upgraded — the
+    8-MiB-delta-into-a-1-MiB-route mismatch is what left the durable archive empty for every real
+    session. A 413 forgets the learned number rather than re-sending the same delta every pass.
+  - **A stated ceiling SMALLER than the default is obeyed**, floored only at `ARCHIVE_BODY_MIN`.
+    Floored at the default instead, the fallback after a 413 landed on a number the hub still
+    refused, so the same delta went up every pass forever. `ARCHIVE_BODY_MIN` exists only to reject a
+    value no hub could mean — under it a delta cannot carry one ordinary turn.
+  - **A failed push costs that TRANSCRIPT, not the pass.** A 4xx is permanent for that chunk and is
+    skipped outright; anything else (a 5xx, a dead socket) also leaves that transcript but spends
+    one of `ARCHIVE_FAILURES_MAX`, so a hub that is genuinely down still ends the pass. Conflated,
+    one unpushable transcript starved every other transcript on the host, every beat — a 500 from a
+    chunk the store cannot accept answers the same way however often it goes back up. Same line the
+    raw layer already draws.
+  - `TURMA_ARCHIVE_BODY_MAX` may only LOWER the default. Past the hub's cap plus its drain slack the
+    socket is destroyed with no status, so neither the 413 fallback nor the skip can fire and the
+    agent sees only a broken pipe.
+  - An entry too big for a delta OF ITS OWN is degraded before it is dropped: file previews first
+    (the chip the chat already renders), then the rich `blocks[]` (the flat `text` carries the same
+    turn), and only then left out — with its byte range archived without it and **one log line per
+    transcript per pass**, because a conversation with a turn silently missing is worse than one an
+    operator knows has a hole.
+  - A LINE longer than the read window is found with `_archive_line_end`, and past
+    `ARCHIVE_LINE_SCAN_MAX` the scanned range is archived with nothing rendered from it. Resuming
+    mid-line is safe — the leading fragment fails to parse and is skipped like any other unparseable
+    line — where refusing to move parks that transcript at that offset for good.
+  - **`meta` rides EVERY delta and is measured before any entry is fitted**, so `summary` is capped
+    (`ARCHIVE_META_SUMMARY_MAX`). It comes from a session's name or label and the spawn route takes a
+    100 KB label: uncapped it eats a whole delta, every entry is then dropped for "not fitting", and
+    the transcript archives as empty ranges with a 200 on each.
 - **Beside the rendered entries it ships the session's OWN FILES, byte for byte** (XERK-338):
   `_session_files()` enumerates `<id>.jsonl` plus everything under `<id>/` — `subagents/`,
   `workflows/`, `tool-results/`, and whatever Claude Code adds next — and `_archive_raw_deltas()`

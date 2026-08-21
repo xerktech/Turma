@@ -408,7 +408,8 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
 ## Archive sync
 
 See `.claude/rules/agent-archive.md` (scoped to `hub-agent.py` + its tests): the manifest, the
-rendered and raw delta pushes, and the sync WORKER that keeps all of it off the beat loop.
+rendered and raw delta pushes and what bounds one, the SendUserFile shed, and the sync WORKER
+that keeps all of it off the beat loop.
 
 ## Hooks
 

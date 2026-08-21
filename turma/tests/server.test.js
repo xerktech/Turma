@@ -163,6 +163,10 @@ const {
   dropMigrationBlob, migrationSpoolPath,
   safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
   usageLedger, normalizeRetired,
+  ARCHIVE_CHUNK_BODY_MAX, ARCHIVE_PARSE_COST, archiveChunkLabel,
+  archiveRefusals, archiveRefusalFor,
+  noteArchiveRefusal, ARCHIVE_REFUSALS_MAX, ARCHIVE_REFUSALS_PER_HOST,
+  chargeBody, releaseBody, BODY_PARSE_COST, BODY_INFLIGHT_TOTAL_MAX,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -1897,6 +1901,252 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   // a hub too old to send them is the same case (XERK-267).
   assert.equal("archiveShed" in r2.body, false);
   assert.equal("archiveFull" in r2.body, false);
+});
+
+// XERK-356. The rendered archive route read with `readBody`'s DEFAULT 1 MiB
+// while the agent builds each delta out of an 8 MiB window — and archival
+// excludes RUNNING sessions, so an ended session's FIRST delta is its whole
+// transcript. Every real one was refused, and the durable archive held nothing
+// but trivially small conversations.
+test("http: the archive route takes a multi-MB delta, and states its ceiling", async () => {
+  const filler = "x".repeat(200_000);
+  const entries = Array.from({ length: 8 }, (_, i) => ({
+    uuid: `big${i}`, role: "assistant", ts: "2026-07-11T00:00:00Z", text: filler,
+  }));
+  const meta = { remoteKey: "github.com/xerk/turma", repo: "turma", slug: "-w-big",
+    summary: "A Real Sized Session" };
+  const body = { startOffset: 0, endOffset: 1_600_000, size: 1_600_000, meta, entries };
+  const wire = JSON.stringify(body).length;
+  assert.ok(wire > (1 << 20), "the delta clears the old 1 MiB default");
+  assert.ok(wire <= ARCHIVE_CHUNK_BODY_MAX, "and is one the ceiling actually admits");
+  const r = await request("POST", "/api/agents/nas/archive/trbig", { body, headers: agentHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.bytesStored, 1_600_000);
+  assert.equal((await request("GET", "/api/archive/trbig", { headers: userHeaders })).status, 200);
+
+  // And the agent is TOLD the ceiling on the beat it pushes off, because the
+  // number is a fraction of THIS container's limit: an agent guessing it guesses
+  // wrong on any hub sized differently, and past the ceiling it may get no
+  // status at all to learn from (the same reasoning as `bodyMax`, XERK-347).
+  const beat = { device: "nas", archiveManifest: [{ transcriptId: "trbig", slug: "-w-big", repo: "turma" }] };
+  const hb = await request("POST", "/api/heartbeat", { body: beat, headers: agentHeaders });
+  assert.equal(hb.body.archiveChunkMax, ARCHIVE_CHUNK_BODY_MAX);
+  assert.ok(ARCHIVE_CHUNK_BODY_MAX > (1 << 20), "the ceiling clears a real first delta");
+});
+
+// XERK-356 QA D1. The in-flight budget is only a bound on memory while its units
+// MEAN memory. This route holds the accumulated body, the parsed entries,
+// ingestChunk's re-serialized lines and the append buffer at once — measured at
+// ~20x the wire size at peak RSS — so charged at BODY_PARSE_COST's 3x the budget
+// admitted about seven times what a 256 MiB container could hold, and three
+// hosts backfilling (or one backfilling beside a large heartbeat) OOM-killed it.
+test("http: the archive route is charged what it costs, not BODY_PARSE_COST", async () => {
+  const filler = "q".repeat(100_000);
+  const room = 1_000_000;   // budget units left free: affordable at 3x, not at 20x
+  chargeBody(BODY_INFLIGHT_TOTAL_MAX - room, "shared");
+  chargeBody(1, "big");     // and the exclusive lane is occupied, so nothing escapes there
+  try {
+    const beat = await request("POST", "/api/heartbeat",
+      { body: { device: "nas", label: filler }, headers: agentHeaders });
+    assert.equal(beat.status, 200, "an ordinary body of this size still fits the room left");
+    const push = await request("POST", "/api/agents/nas/archive/trcost", {
+      body: { startOffset: 0, endOffset: 1, size: 1, meta: {},
+        entries: [{ uuid: "e", role: "user", ts: null, text: filler }] },
+      headers: agentHeaders,
+    });
+    // 503 "come back", never 413 "shrink": the body is well inside the ceiling,
+    // it is the hub that is momentarily too full to parse it.
+    assert.equal(push.status, 503, "the same size on the archive route is not affordable");
+  } finally {
+    releaseBody(BODY_INFLIGHT_TOTAL_MAX - room, "shared");
+    releaseBody(1, "big");
+  }
+});
+
+test("the archive ceiling leaves concurrent pushes room inside the budget", () => {
+  assert.ok(ARCHIVE_PARSE_COST > BODY_PARSE_COST, "this route costs more than an ordinary body");
+  // Held at the DEPLOYED size, which is the only size the numbers mean anything
+  // at — this box's own memory makes every derived ceiling trivially generous.
+  const deployed = freshServerModule((env) => {
+    env.MEMORY_LIMIT_BYTES = String(256 << 20);
+    delete env.ARCHIVE_CHUNK_BODY_MAX;
+    delete env.BODY_INFLIGHT_MAX;
+    delete env.BODY_INFLIGHT_TOTAL_MAX;
+  });
+  assert.ok(
+    deployed.ARCHIVE_CHUNK_BODY_MAX * deployed.ARCHIVE_PARSE_COST * 3 <= deployed.BODY_INFLIGHT_TOTAL_MAX,
+    `three concurrent max-size deltas (${deployed.ARCHIVE_CHUNK_BODY_MAX} x ${deployed.ARCHIVE_PARSE_COST} x 3) ` +
+      `must fit the in-flight total (${deployed.BODY_INFLIGHT_TOTAL_MAX})`
+  );
+  // ...and it TIGHTENS with the container rather than being a flat number a
+  // smaller hub could not honour (XERK-258).
+  const small = freshServerModule((env) => {
+    env.MEMORY_LIMIT_BYTES = String(32 << 20);
+    delete env.ARCHIVE_CHUNK_BODY_MAX;
+    delete env.BODY_INFLIGHT_MAX;
+    delete env.BODY_INFLIGHT_TOTAL_MAX;
+  });
+  assert.ok(small.ARCHIVE_CHUNK_BODY_MAX < deployed.ARCHIVE_CHUNK_BODY_MAX);
+});
+
+test("the boot line states a sub-MiB archive ceiling as KiB, not as 0 MiB", () => {
+  // The boot line is the stated reason this derived ceiling is discoverable at
+  // all, and a MiB formatter floors — on a small container it printed "0 MiB".
+  assert.equal(archiveChunkLabel(2 << 20), "2 MiB");
+  assert.equal(archiveChunkLabel(400000), "391 KiB");
+  assert.match(archiveChunkLabel(64 << 10), /KiB$/);
+});
+
+test("a refusal record is the NEWEST, and is cleared by a chunk that lands", async () => {
+  // Newest, because a transcript legitimately carries one per host after a
+  // migration and the last failure is the one that explains why it is missing.
+  noteArchiveRefusal("shared-tid", "hostOld", "the older reason");
+  await new Promise((r) => setTimeout(r, 2));
+  noteArchiveRefusal("shared-tid", "hostNew", "the newer reason");
+  assert.equal(archiveRefusalFor("shared-tid").error, "the newer reason");
+
+  // A chunk that LANDS clears that host's record — the record answers "why is
+  // this missing", so it must not outlive the missing.
+  const ok = await request("POST", "/api/agents/nas/archive/trclear", {
+    body: { startOffset: 0, endOffset: 4, size: 4, meta: { repo: "turma", slug: "s" },
+      entries: [{ uuid: "c1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(ok.status, 200);
+  noteArchiveRefusal("trclear", "nas", "stale reason");
+  assert.ok(archiveRefusalFor("trclear"));
+  const again = await request("POST", "/api/agents/nas/archive/trclear", {
+    body: { startOffset: 4, endOffset: 8, size: 8, meta: { repo: "turma", slug: "s" },
+      entries: [{ uuid: "c2", role: "user", ts: null, text: "ho" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(again.status, 200);
+  assert.equal(archiveRefusalFor("trclear"), null, "a landed chunk clears it");
+
+  // A non-scalar `meta` field is coerced away rather than thrown on. This is NOT
+  // a test of the 500 branch's wording — normalizeMeta makes this a 200, which is
+  // the point; the store-failure test above is the one that reaches the 500.
+  const bad = await request("POST", "/api/agents/nas/archive/trbadmeta", {
+    body: { startOffset: 0, endOffset: 4, size: 4, meta: { summary: { not: "text" } },
+      entries: [{ uuid: "b1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  // A non-scalar `meta` field is coerced away rather than thrown on: bound
+  // straight into sqlite it 500s, and one poisoned transcript then answers 500
+  // on every beat forever (XERK-356 QA pass 2).
+  assert.equal(bad.status, 200, "a non-scalar meta field is not a 500");
+  const view = await request("GET", "/api/archive/trbadmeta", { headers: userHeaders });
+  assert.equal(view.status, 200);
+  for (const [k, r] of [...archiveRefusals]) if (r.host.startsWith("host")) archiveRefusals.delete(k);
+});
+
+// Walk ARCHIVE_DIR for the organized file a transcript landed in. The name is
+// `<repo>/<date>__<summary>__<host>__<shortId>.jsonl`, and only the shortId (the
+// first 8 alnum characters of the id) is ours to predict.
+function findArchiveJsonl(transcriptId) {
+  const short = String(transcriptId).replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        const hit = walk(full);
+        if (hit) return hit;
+      } else if (e.name.endsWith(`__${short}.jsonl`)) return full;
+    }
+    return null;
+  };
+  return walk(process.env.ARCHIVE_DIR);
+}
+
+test("a store failure answers and RECORDS the hub's own words, never the driver's", async () => {
+  // This branch had no test at all: the only body the suite pushed at it was a
+  // non-scalar `meta`, which normalizeMeta now turns into a 200, so replacing
+  // the hub-authored string with `e.message` left both suites green while the
+  // hub served node:sqlite's and fs's words — built out of agent-supplied fields
+  // and carrying absolute /data paths — to a browser AND into every agent's log
+  // (XERK-356 QA pass 3, D1).
+  //
+  // So drive the failure the way it actually happens: land one chunk, then put a
+  // DIRECTORY where the archive file was, and let the next append EISDIR.
+  const tid = "trstorefail";
+  const meta = { repo: "turma", slug: "-w-sf", summary: "store fail" };
+  const first = await request("POST", `/api/agents/nas/archive/${tid}`, {
+    body: { startOffset: 0, endOffset: 4, size: 8, meta,
+      entries: [{ uuid: "s1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(first.status, 200);
+
+  const written = findArchiveJsonl(tid);
+  assert.ok(written, "the first chunk has to land somewhere before it can be broken");
+  fs.rmSync(written);
+  fs.mkdirSync(written);
+  try {
+    const boom = await request("POST", `/api/agents/nas/archive/${tid}`, {
+      body: { startOffset: 4, endOffset: 8, size: 8, meta,
+        entries: [{ uuid: "s2", role: "user", ts: null, text: "ho" }] },
+      headers: agentHeaders,
+    });
+    assert.equal(boom.status, 500);
+    // Spelled out, deliberately NOT imported from server.js: bound to the same
+    // constant the route reads, a mutation would move both and this would pass.
+    assert.equal(boom.body.error, "the hub could not store this chunk — see the hub log");
+    // The assertion the old test only claimed to make: nothing of the driver's,
+    // and no filesystem path, reaches either surface.
+    assert.doesNotMatch(boom.body.error, /EISDIR|SQLITE|sqlite|[/\\]/);
+    assert.equal(archiveRefusalFor(tid)?.error,
+      "the hub could not store this chunk — see the hub log",
+      "the record the operator reads says it too, not the driver's words");
+  } finally {
+    fs.rmSync(written, { recursive: true, force: true });
+    for (const [k, r] of [...archiveRefusals]) if (k.includes(tid)) archiveRefusals.delete(k);
+  }
+});
+
+test("one host's archive refusals cannot evict another host's", () => {
+  // The record is keyed on an AGENT-CHOSEN transcriptId, so keyed on that alone
+  // any one host could push the cap's worth of its own refusals and drop every
+  // other host's real diagnostic — the one thing this record exists to provide.
+  noteArchiveRefusal("keep-me", "hostA", "hostA's reason");
+  for (let i = 0; i < ARCHIVE_REFUSALS_MAX + 10; i++) noteArchiveRefusal(`flood${i}`, "hostB", "x");
+  assert.equal(archiveRefusalFor("keep-me")?.error, "hostA's reason");
+  assert.ok(archiveRefusals.size <= ARCHIVE_REFUSALS_MAX);
+  const bs = [...archiveRefusals.values()].filter((r) => r.host === "hostB");
+  assert.equal(bs.length, ARCHIVE_REFUSALS_PER_HOST, "a host keeps only its own share");
+  for (const [k, r] of [...archiveRefusals]) if (r.host === "hostA" || r.host === "hostB") archiveRefusals.delete(k);
+});
+
+test("http: a refused archive chunk is 413 AND recorded for the operator", async () => {
+  const body = {
+    startOffset: 0, endOffset: 10, size: 10, meta: { repo: "turma", slug: "-w-ov" },
+    entries: [{ uuid: "e1", role: "user", ts: null,
+      text: "y".repeat(ARCHIVE_CHUNK_BODY_MAX + (1 << 16)) }],
+  };
+  const r = await request("POST", "/api/agents/nas/archive/trover", { body, headers: agentHeaders });
+  // 413, not the 503 a full hub answers: the agent must SHRINK this, never
+  // re-send it (the two are opposite instructions — see readRawBody's callers).
+  assert.equal(r.status, 413);
+  assert.equal(r.body.limit, ARCHIVE_CHUNK_BODY_MAX);
+
+  // ...and the operator who goes looking for that conversation is told why it is
+  // not there, instead of "it syncs within a few minutes of ending" — which is a
+  // promise nothing will keep once a push has been refused.
+  const view = await request("GET", "/api/archive/trover", { headers: userHeaders });
+  assert.equal(view.status, 404);
+  assert.equal(view.body.error, "unknown transcript");   // unchanged for older readers
+  assert.equal(view.body.refused.host, "nas");
+  assert.match(view.body.refused.error, /larger than this hub takes/);
+
+  // A chunk that lands clears it: the record answers "why is this missing", so
+  // it must not outlive the missing.
+  const ok = await request("POST", "/api/agents/nas/archive/trover", {
+    body: { startOffset: 0, endOffset: 5, size: 5, meta: { repo: "turma", slug: "-w-ov" },
+      entries: [{ uuid: "e1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(archiveRefusals.has("trover"), false);
+  assert.equal((await request("GET", "/api/archive/trover", { headers: userHeaders })).status, 200);
 });
 
 // ---- the archive's raw layer (XERK-338) -------------------------------------
