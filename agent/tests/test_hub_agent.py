@@ -14938,10 +14938,10 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         # green (XERK-424 QA delta, finding 5 / N02).
         sm = self.make_manager()
         self._many_transcripts(sm, 60)
-        # Only the OLDEST 20 are known-short; the rest are unknown, so a backlog
-        # entry the hub has spoken about can only have come from the known-short
-        # slice and the rotation's picks are distinguishable from it.
-        sm._note_archive_known({"t%03d" % i: 0 for i in range(20)})
+        # The known-short ones sit in the MIDDLE of the age range, so they cannot
+        # be confused with the rotation's picks: the rotation takes the oldest it
+        # has never offered, which here is always older than any of these.
+        sm._note_archive_known({"t%03d" % i: 0 for i in range(20, 30)})
         with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 20), \
              mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 10):
             out = sm._archive_manifest()
@@ -14997,6 +14997,150 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         for cap in (0, -4):
             with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", cap):
                 self.assertEqual(sm._archive_manifest(), [])
+
+    def test_rotation_reaches_the_tail_at_any_scale(self):
+        # A bounded per-transcript map cannot tell "evicted" from "never
+        # offered", and whichever way that tie broke it cycled: newest-first the
+        # evictions outranked the tail forever, oldest-first the evicted head
+        # re-won forever. The oldest N - (bound + window) were never offered
+        # again at ANY number of beats (XERK-424 QA pass 3, D1). The sweep has no
+        # bound to exceed, so coverage does not depend on the host's size.
+        sm = self.make_manager()
+        self._many_transcripts(sm, 90)
+        seen = set()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            for _ in range(40):
+                seen |= {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(len(seen), 90)
+        self.assertIn("t000", seen, "the oldest is reachable")
+
+    def _cands(self, n, first=0):
+        """Synthetic candidates in the order _archive_manifest hands them over:
+        newest first. t000 is the OLDEST."""
+        c = [{"transcriptId": "t%03d" % i, "size": 10, "mtime": 1_800_000_000 + i}
+             for i in range(first, first + n)]
+        c.sort(key=lambda m: m["mtime"], reverse=True)
+        return c
+
+    def test_window_prefers_the_OLDEST_of_the_unstamped(self):
+        # Everything unstamped reads the same, so the order within that group is
+        # what decides who is reached. Resolved by pool position it is
+        # newest-first — which is what let each beat's evictions outrank the
+        # never-offered tail forever (XERK-424 QA pass 3, D1). The oldest is both
+        # the safe answer and the one closest to being lost.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            window, start = sm._archive_window(self._cands(30))
+        self.assertEqual([m["transcriptId"] for m in window[start:]],
+                         ["t000", "t001", "t002", "t003", "t004"])
+
+    def test_stamp_map_evicts_oldest_offered_and_stays_bounded(self):
+        # The bound is sized against the CANDIDATE COUNT, so it only evicts
+        # entries that have fallen out of the live set — and it must evict the
+        # least-recently-offered, or the map describes the opposite of what it is
+        # for (XERK-424 QA pass 3, D5 / P08, P09).
+        sm = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            big = self._cands(80)
+            # Long enough for the rotation to WRAP, so ids are re-stamped: a
+            # plain assignment keeps a re-stamped entry at its old insertion
+            # position, and then eviction order stops tracking recency.
+            for _ in range(30):
+                sm._archive_window(big)
+            self.assertGreaterEqual(len(sm._archive_offered), 40,
+                                    "stamps accumulate while the candidates are live")
+            stamped_early = min(sm._archive_offered, key=sm._archive_offered.get)
+            # Now most of them stop being candidates: the bound follows the live
+            # set down and the stale entries go.
+            sm._archive_window(self._cands(6))
+            keep = max(2 * 6, 4 * 10)
+            self.assertLessEqual(len(sm._archive_offered), keep, "bounded")
+            self.assertNotIn(stamped_early, sm._archive_offered,
+                             "the least-recently-offered is what goes")
+            seqs = [sm._archive_offered[k] for k in sm._archive_offered]
+            self.assertEqual(seqs, sorted(seqs), "insertion order tracks recency")
+
+    def test_a_re_offered_transcript_moves_to_the_end_of_the_map(self):
+        # A plain assignment leaves a re-stamped entry at its ORIGINAL insertion
+        # position, so eviction then drops what was offered most recently. The
+        # ordering check above cannot see this on its own: the rotation re-visits
+        # ids in the same order each cycle, which makes it symmetric. Small
+        # enough here that every pool entry is stamped, so nothing ties at the
+        # never-offered sentinel (XERK-424 QA pass 3, D5 / P07).
+        sm = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            cands = self._cands(12)
+            # Hand-set so the invariant is checked rather than a coincidence of
+            # which id happened to have the lowest stamp: t000 is BOTH the lowest
+            # stamp and the first insertion, so a missing re-insert leaves it at
+            # the head of the map after being offered again.
+            sm._archive_offered = {"t%03d" % i: i + 1 for i in range(7)}
+            oldest = "t000"
+            self.assertEqual(min(sm._archive_offered, key=sm._archive_offered.get), oldest)
+            self.assertEqual(list(sm._archive_offered)[0], oldest)
+            window, start = sm._archive_window(cands)
+            picked = len(window) - start
+            self.assertIn(oldest, [m["transcriptId"] for m in window[start:]],
+                          "the lowest stamp is what the rotation takes")
+            self.assertIn(oldest, list(sm._archive_offered)[-picked:],
+                          "a re-offered transcript moves to the end of the map")
+
+    def test_only_the_backlog_is_stamped(self):
+        # Stamping the recent slice too spends capacity on the transcripts that
+        # need it least (XERK-424 QA pass 3, D5 / P05, P15).
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            out = sm._archive_manifest()
+        recent = {m["transcriptId"] for m in out[:5]}
+        backlog = {m["transcriptId"] for m in out[5:]}
+        self.assertFalse(recent & set(sm._archive_offered), "the recent slice is not stamped")
+        self.assertEqual(backlog, set(sm._archive_offered))
+
+    def test_rotation_does_not_depend_on_the_known_map(self):
+        # Sharing a bound with `_archive_known` once coupled that map's
+        # off-switch to the rotation. The stamps are bounded against the
+        # candidate count instead, so turning the known map off can only cost the
+        # backlog slice its priority, never the rotation its coverage
+        # (XERK-424 QA pass 3, D2).
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        seen = set()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5), \
+             mock.patch.object(ha, "ARCHIVE_KNOWN_MAX", 0):
+            for _ in range(30):
+                seen |= {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(len(seen), 40, "turning the known map off must not stop the rotation")
+
+    def test_staging_failure_names_the_exception(self):
+        # `{e}` alone is empty for StopIteration, so the line read "could not be
+        # staged: " with nothing after it — indistinguishable from a formatting
+        # bug, on the one path that silently ends archive sync for the host
+        # (XERK-424 QA pass 3, D5 / P14).
+        sm = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)), \
+             mock.patch.object(type(sm), "_note_archive_known",
+                               side_effect=StopIteration()):
+            sm.queue_archive_sync({"archiveHave": {"t": 1}})
+        self.assertTrue(lines, "the failure is logged at all")
+        self.assertIn("StopIteration", lines[-1])
+
+    def test_pool_never_offers_one_transcript_twice(self):
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        sm._note_archive_known({"t%03d" % i: 0 for i in range(10, 20)})
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 20), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 8):
+            for _ in range(10):
+                got = [m["transcriptId"] for m in sm._archive_manifest()]
+                self.assertEqual(len(got), len(set(got)), "a slot per transcript, never two")
 
     def test_window_is_a_passthrough_below_the_cap(self):
         # The common case — a host with fewer transcripts than slots — must be

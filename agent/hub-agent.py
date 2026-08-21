@@ -10565,14 +10565,14 @@ class SessionManager:
         # cursors for what was OFFERED, so an id that never fit the window is
         # absent rather than zero, and the two must not be confused.
         # `_archive_offered` walks the candidates that knowledge does not cover,
-        # least-recently-offered first, so a transcript the hub has never been
-        # told about is offered within a bounded number of beats instead of
-        # never.
+        # so a transcript the hub has never been told about is offered within a
+        # bounded number of beats instead of never.
         self._archive_known = {}
-        # Least-recently-OFFERED bookkeeping for the backlog rotation:
-        # transcriptId -> the sequence number of the beat that last offered it,
-        # and the counter that issues them. Per transcript rather than a position
-        # in the candidate list, because that list changes size between beats.
+        # Backlog rotation state: transcriptId -> the sequence number of the beat
+        # that last offered it, and the counter that issues them. Per TRANSCRIPT
+        # rather than a place in the candidate list, and bounded against how many
+        # candidates there are rather than by a flat number — see _archive_window
+        # for why each of those is the difference between a queue and a cliff.
         self._archive_offered = {}
         self._archive_offer_seq = 0
         # Throttle for the "cannot be named by the archive" line (see
@@ -14967,7 +14967,10 @@ class SessionManager:
             # reached the rest: measured at 200 of 400 never offered in 200 beats
             # (XERK-424 QA D2). Stamps are per TRANSCRIPT, so a pool that grows,
             # shrinks or reorders under them stays correct — which is the whole
-            # reason they are not an index (see below).
+            # reason they are not an index (see below). Trimmed even here, or a
+            # host that drops below the cap for good keeps every stamp it ever
+            # took.
+            self._trim_archive_offered(len(cands))
             return list(cands), len(cands)
         # Clamped so the backlog keeps a QUARTER of the window whatever the two
         # are set to. At RECENT >= MAX there is no backlog and no rotation — the
@@ -15011,28 +15014,59 @@ class SessionManager:
         # ...then the LEAST-RECENTLY-OFFERED of what knowledge does not cover, so
         # nothing that has never been offered waits behind something that has.
         #
-        # Keyed on the transcript, NOT on a position in the pool. An index-based
-        # rotation is only index-SAFE: advanced against one pool and then
-        # re-interpreted modulo a differently-sized one, it forms a limit cycle
-        # whenever the candidate count oscillates periodically between two values
-        # — which is what a session going busy and idle on a regular cadence
-        # does, since candidates exclude whole slugs. Measured on a strict
-        # period-2 toggle: 700 of 1201 transcripts never offered in 400 beats,
-        # with the modulo doing exactly what it says and starving them anyway
-        # (XERK-424 QA delta, finding 1). Never-offered sorts first, so an
-        # evicted stamp re-offers rather than strands.
+        # `_archive_offered` maps a transcriptId to the beat that last offered
+        # it, and the pool is taken in that order, oldest transcript first on a
+        # tie. Three things about it are load-bearing, and each is a mechanism
+        # that failed here first (XERK-424 QA delta finding 1, pass 3 D1):
+        #
+        #   * **Not an index into the candidate list.** A cursor taken modulo the
+        #     pool size is index-SAFE but forms a limit cycle when the candidate
+        #     count oscillates periodically — 700 of 1201 never offered in 400
+        #     beats on a period-2 toggle, which is what a session going busy and
+        #     idle on a regular cadence is, since candidates exclude whole slugs.
+        #   * **Not a single watermark either.** One scalar cannot survive the
+        #     same oscillation: the beats where a slug is absent conclude the
+        #     sweep is finished and restart it, throwing away the position inside
+        #     that slug's range, so its tail is never reached.
+        #   * **Bounded against the CANDIDATE COUNT, not a flat number.** The
+        #     bound has to clear the live set, because an evicted stamp is
+        #     indistinguishable from never-offered and whichever way that tie
+        #     breaks it cycles: newest-first the evictions outrank the tail
+        #     forever, oldest-first the evicted head re-wins forever. A flat
+        #     5,000 starved the oldest `N - 5200` at any number of beats. This is
+        #     keyed on our own filesystem enumeration rather than on the wire, so
+        #     sizing it to what is on disk is the honest bound — it is the same
+        #     order as the candidate list this function is already handed.
         if slots > 0:
             pool = [m for m in rest if m["transcriptId"] not in taken]
             if pool:
-                pool.sort(key=lambda m: self._archive_offered.get(m["transcriptId"], -1))
+                pool.sort(key=lambda m: (self._archive_offered.get(m["transcriptId"], -1),
+                                         m.get("mtime", 0)))
                 window.extend(pool[:slots])
         self._archive_offer_seq += 1
+        # Only the backlog is stamped: the recent slice is offered every beat
+        # regardless, so stamping it would spend capacity on what needs it least.
         for m in window[backlog_start:]:
             self._archive_offered.pop(m["transcriptId"], None)
             self._archive_offered[m["transcriptId"]] = self._archive_offer_seq
-        while len(self._archive_offered) > ARCHIVE_KNOWN_MAX:
-            self._archive_offered.pop(next(iter(self._archive_offered)))
+        self._trim_archive_offered(len(cands))
         return window, backlog_start
+
+    def _trim_archive_offered(self, candidate_count):
+        """Bound the last-offered stamps against how many candidates there ARE.
+
+        A flat number cannot cover the live set on a big host, and an evicted
+        stamp is indistinguishable from never-offered — whichever way that tie
+        breaks it cycles, so a flat 5,000 starved the oldest `N - 5200`
+        transcripts at any number of beats (XERK-424 QA pass 3, D1). Keyed on our
+        own filesystem enumeration rather than on the wire, so sizing it to what
+        is on disk is the honest bound: it is the same order as the candidate
+        list `_archive_window` is already handed. Evicts the least-recently-
+        offered, which after `_archive_window`'s re-insert is insertion order.
+        """
+        keep = max(2 * candidate_count, 4 * ARCHIVE_MANIFEST_MAX)
+        while len(self._archive_offered) > keep:
+            self._archive_offered.pop(next(iter(self._archive_offered)))
 
     def _archive_manifest(self):
         """Manifest of inactive-session transcripts eligible for archive: enumerate
@@ -15578,19 +15612,23 @@ class SessionManager:
         # One budget, spent in manifest order, so the recent slice is served
         # before the backlog. That deliberately gets NO reservation of its own,
         # unlike the manifest's raw-file budget (XERK-424): a manifest slot is
-        # re-contended every beat, where these bytes are not. The budget is
-        # charged AFTER a push that stored something, so a transport failure, a
-        # 5xx, a `skip` and a `full` all cost zero — and the hub refuses at
-        # ARCHIVE_TOTAL_MAX rather than evicting, so a cursor cannot regress in a
-        # loop. A transcript therefore cannot re-consume budget indefinitely: a
-        # first sync costs the backlog some beats of delay, never starvation.
+        # re-contended every beat, where these bytes are not. A transport
+        # failure, a 5xx, a `skip` and a `full` all cost ZERO budget, and the hub
+        # refuses at ARCHIVE_TOTAL_MAX rather than evicting, so a cursor cannot
+        # regress in a loop. A transcript therefore cannot re-consume budget
+        # indefinitely: a first sync costs the backlog some beats of delay,
+        # never starvation.
         #
-        # NOT because "running sessions are excluded so the size is fixed" — that
-        # was the reason given here first and it is false. `_running_slugs` knows
-        # only this agent's OWN registry, and a drive over the real projects root
-        # archived three transcripts that were growing throughout it: another
-        # worktree session's, and two under the test suite's own manager slugs
-        # (XERK-424 QA delta, finding 6).
+        # Two reasons given here before were WRONG, both stated more confidently
+        # than they were checked. Not "running sessions are excluded so the size
+        # is fixed": `_running_slugs` knows only this agent's OWN registry, and a
+        # drive over the real projects root archived three transcripts that grew
+        # throughout it. And not "charged only after a push that stored
+        # something": the charge runs BEFORE the `new_have <= have` break, so a
+        # 200 whose cursor does not advance — the offset-realign case named at
+        # that break — costs the full chunk. Pre-existing, and only reachable
+        # from a hub that realigns persistently, which is an archive wipe
+        # (XERK-424 QA delta finding 6, pass 3 D4).
         budget = ARCHIVE_BEAT_BUDGET
         failures = 0
         for tid, m in list(self._archive_pending.items()):

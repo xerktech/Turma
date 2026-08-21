@@ -81,8 +81,19 @@ paths:
       re-read modulo a differently sized one, it forms a limit cycle whenever the candidate count
       oscillates PERIODICALLY between two values — 700 of 1201 never offered in 400 beats on a
       period-2 toggle, both counts above the cap. A session going busy and idle on a regular cadence
-      is exactly that, since candidates exclude whole slugs. Never-offered sorts first, so an
-      evicted stamp re-offers rather than strands.
+      is exactly that, since candidates exclude whole slugs.
+      - **Bounded against the CANDIDATE COUNT, never a flat number** (`_trim_archive_offered`,
+        `2 x candidates`). An evicted stamp is indistinguishable from never-offered, and whichever
+        way that tie breaks it cycles — newest-first the evictions outrank the tail forever,
+        oldest-first the evicted head re-wins forever. A flat 5,000 starved the oldest
+        `N - 5200` at any number of beats. Sized to the live set there is nothing live to evict, so
+        the ambiguity never arises; the keys come from our own filesystem enumeration, not the wire,
+        so sizing to what is on disk is the honest bound. Trimmed on the passthrough too, or a host
+        that drops below the cap for good keeps every stamp it ever took. Sharing
+        `ARCHIVE_KNOWN_MAX` was also wrong — it coupled that map's off-switch to the rotation.
+      - **Ties break oldest-first**, so what is closest to being lost wins, and eviction is
+        least-recently-offered — which is why a re-stamp POPS before it re-inserts rather than
+        assigning in place.
     - **The stamps are NEVER cleared**, including on the under-the-cap passthrough. A root slug
       holds every root session's transcript, so one session going busy swings the count by hundreds;
       clearing on each dip re-offered the same transcripts forever and never reached the rest
@@ -101,8 +112,9 @@ paths:
     recent slice: the backlog is served first at its floor, then a second pass hands whatever it
     left back to the newest, so the budget is never under-spent.
   - **`ARCHIVE_BEAT_BUDGET` deliberately has no such floor.** A manifest slot is re-contended every
-    beat where those bytes are not: the budget is charged only AFTER a push that stored something,
-    so a transport failure, a 5xx, a `skip` and a `full` all cost zero, and the hub REFUSES at
+    beat where those bytes are not: a transport failure, a 5xx, a `skip` and a `full` all cost
+    zero budget (though a 200 whose cursor does not advance costs the full chunk — pre-existing,
+    and only reachable from a hub that realigns persistently), and the hub REFUSES at
     `ARCHIVE_TOTAL_MAX` rather than evicting — so a cursor cannot regress in a loop and a
     transcript cannot re-consume budget indefinitely. A first sync costs the backlog some beats of
     delay, never starvation. Not because "running sessions are excluded so sizes are fixed":
