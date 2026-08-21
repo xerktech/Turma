@@ -542,6 +542,12 @@ data class GitSourceInfo(
  * One clone job the agent reported (its `_clones_payload`): `repo` is the
  * owner/repo spec as asked for, `name` the bare repo dir it lands in, and
  * `status` one of cloning/done/error, `error` carrying the reason for the last.
+ *
+ * [progress] is the last line `git clone --progress` wrote, present only while
+ * a clone is running and absent for one that finishes inside a single beat.
+ * Every field here is typed, so all of them are coerced hub-side in
+ * `normalizeClones` — a decode throws for the WHOLE fleet array, not just the
+ * offending host.
  */
 @Serializable
 data class CloneInfo(
@@ -550,6 +556,7 @@ data class CloneInfo(
     val status: String = "",
     val error: String = "",
     val startedAt: String = "",
+    val progress: String = "",
 )
 
 @Serializable

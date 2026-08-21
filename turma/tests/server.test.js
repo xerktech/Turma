@@ -135,7 +135,8 @@ const hub = require("../server.js");
 hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession, orgPeers, boundOrgOf, orgDrifted,
-  orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira,
+  orgDriftWarned, warnOrgDrift, siteKeyOf, normalizeJira, normalizeClones,
+  CLONE_PROGRESS_MAX,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
@@ -8811,6 +8812,52 @@ test("normalizeJira drops a non-string key and leaves a good one alone", () => {
   assert.doesNotThrow(() => normalizeJira({ jira: "nope" }));
   assert.doesNotThrow(() => normalizeJira({ jira: null }));
   assert.doesNotThrow(() => normalizeJira(null));
+});
+
+test("normalizeClones coerces every field a client types, and caps progress", () => {
+  // There was no coercion here at all while Android types EVERY field on
+  // CloneInfo as a String — and a full /api/agents decode is atomic there, so
+  // one host beating a number threw the whole fleet array on every phone.
+  const a = {
+    clones: [
+      { repo: "o/r", name: "r", status: 123, error: null, startedAt: {},
+        progress: "Receiving objects:  47%" },
+    ],
+  };
+  normalizeClones(a);
+  const c = a.clones[0];
+  assert.equal(c.repo, "o/r");
+  assert.equal(c.status, undefined, "a non-string is dropped, not stringified");
+  assert.equal(c.error, undefined);
+  assert.equal(c.startedAt, undefined);
+  assert.equal(c.progress, "Receiving objects:  47%");
+
+  // Capped: agent-supplied, per-clone and otherwise unbounded on the wire —
+  // the shape that OOM-killed a hub in XERK-348.
+  const long = { clones: [{ progress: "x".repeat(5000) }] };
+  normalizeClones(long);
+  assert.equal(long.clones[0].progress.length, CLONE_PROGRESS_MAX);
+
+  // Entries that are not objects are dropped rather than iterated into.
+  const junk = { clones: [null, "nope", ["a"], { repo: "keep" }] };
+  normalizeClones(junk);
+  assert.deepEqual(junk.clones, [{ repo: "keep" }]);
+
+  // And nothing here may throw: a throw lands in the restore's silent catch
+  // and abandons every host after this one.
+  assert.doesNotThrow(() => normalizeClones({ clones: "nope" }));
+  assert.doesNotThrow(() => normalizeClones({ clones: null }));
+  assert.doesNotThrow(() => normalizeClones({}));
+  assert.doesNotThrow(() => normalizeClones(null));
+  const notArray = { clones: "nope" };
+  normalizeClones(notArray);
+  assert.equal("clones" in notArray, false, "a non-array clones is dropped whole");
+});
+
+test("normalizeRecord runs the clone coercion too, on ingest and on restore", () => {
+  const a = { clones: [{ status: 7 }] };
+  hub.normalizeRecord(a);
+  assert.equal(a.clones[0].status, undefined);
 });
 
 test("migrate: rejects a root session and one with no conversation yet", async () => {

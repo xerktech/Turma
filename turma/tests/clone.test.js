@@ -87,6 +87,44 @@ function sampleAgent() {
   };
 }
 
+test("cloneBar: a running clone shows the progress line, and escapes it", () => {
+  const m = loadCloneModule();
+  const a = sampleAgent();
+  a.clones = [{ repo: "me/alpha", name: "alpha", status: "cloning",
+                progress: "Receiving objects:  47% (2345/5000)" }];
+  m.setCache({ agents: [a] });
+  const html = m.cloneBar(a);
+  assert.match(html, /Cloning <b>me\/alpha<\/b>/);
+  assert.match(html, /Receiving objects:\s+47% \(2345\/5000\)/,
+    "the agent's progress line reaches the row");
+  // It is agent-supplied text on a page that renders HTML: escaped like every
+  // other field, never interpolated raw.
+  a.clones[0].progress = "<img src=x onerror=alert(1)>";
+  assert.ok(!m.cloneBar(a).includes("<img src=x"), "progress is escaped");
+});
+
+test("cloneBar: no progress renders exactly as it did before", () => {
+  // A repo that finishes inside one beat never reports progress, and an older
+  // agent never sends the field — neither may leave a stray empty note.
+  const m = loadCloneModule();
+  const a = sampleAgent();
+  a.clones = [{ repo: "me/alpha", name: "alpha", status: "cloning" }];
+  m.setCache({ agents: [a] });
+  const html = m.cloneBar(a);
+  assert.match(html, /Cloning <b>me\/alpha<\/b>…<\/div>/);
+  assert.ok(!html.includes("clone-note\"></span>"), "no empty note span");
+});
+
+test("cloneBar: a finished clone ignores any progress left on the job", () => {
+  const m = loadCloneModule();
+  const a = sampleAgent();
+  a.clones = [{ repo: "me/alpha", name: "alpha", status: "done", progress: "99%" }];
+  m.setCache({ agents: [a] });
+  const html = m.cloneBar(a);
+  assert.match(html, /✓ Cloned <b>alpha<\/b>/);
+  assert.ok(!html.includes("99%"), "done rows have their own wording");
+});
+
 test("cloneBar: collapsed by default — header only, no picker until expanded", () => {
   const m = loadCloneModule();
   const a = sampleAgent();

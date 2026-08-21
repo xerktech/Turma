@@ -7302,6 +7302,10 @@ GH_REPO_LIMIT = 100         # per owner, passed to `gh repo list --limit`
 GH_REPO_MAX = 300           # total repos reported (bounds the heartbeat payload)
 GH_ORG_MAX = 20             # orgs to auto-sweep for repos (bounds the gh calls)
 CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
+# One progress line on the wire, not a log. Capped here AND on the hub: every
+# client types it, and an uncapped per-clone string is the shape that built a
+# 23.8 MB reply and OOM-killed a hub once already (XERK-348).
+CLONE_PROGRESS_MAX = 120
 CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
 CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
 PRUNE_RESULT_LINGER_SEC = 60  # keep a FINISHED repo's prune summary in the heartbeat
@@ -15757,7 +15761,13 @@ class SessionManager:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             logf = open(job["logPath"], "w")
             proc = subprocess.Popen(
-                ["git", "clone", "--", url, dest],
+                # `--progress` because stdout is a FILE, not a terminal, and
+                # git stays silent about progress unless asked. Without it a
+                # small repo's whole log is `Cloning into '/repos/X'...` — 31
+                # bytes for ArgoCD, measured — so the UI has nothing to show
+                # while a clone runs and a big one looks indistinguishable from
+                # a hang.
+                ["git", "clone", "--progress", "--", url, dest],
                 stdout=logf, stderr=subprocess.STDOUT, env=env,
             )
         except Exception as e:
@@ -15769,6 +15779,37 @@ class SessionManager:
         job["proc"] = proc
         job["logf"] = logf
         log(f"cloning {repo_id} ({src}) into {dest}")
+
+    def _clone_progress(self, job):
+        """The most recent line git wrote, for the UI's cloning row.
+
+        `git --progress` updates in place with CARRIAGE RETURNS, so the log is
+        one enormous line and splitting on newlines alone returns the whole
+        thing. Split on both, take the last non-empty token, and cap it: this is
+        a status line, not a log — `_clone_log_tail` is what carries detail, and
+        only on failure.
+
+        Read in BINARY and decoded with `replace`: a tail slice can land
+        mid-codepoint, and a UnicodeDecodeError here would be raised while
+        building a heartbeat.
+        """
+        if job.get("status") != "cloning":
+            return None
+        path = job.get("logPath")
+        if not path:
+            return None
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 4096))
+                raw = f.read()
+        except OSError:
+            return None
+        for tok in reversed(re.split(r"[\r\n]+", raw.decode("utf-8", "replace"))):
+            tok = tok.strip()
+            if tok:
+                return tok[:CLONE_PROGRESS_MAX]
+        return None
 
     def _clone_log_tail(self, job):
         try:
@@ -15834,7 +15875,8 @@ class SessionManager:
         return [
             {"name": j.get("name"), "repo": j.get("repo"),
              "status": j.get("status"), "error": j.get("error"),
-             "source": j.get("source"), "startedAt": j.get("startedAt")}
+             "source": j.get("source"), "startedAt": j.get("startedAt"),
+             "progress": self._clone_progress(j)}
             for j in self.clones.values()
         ]
 

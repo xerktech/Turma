@@ -821,6 +821,17 @@ if [ -n "$KUBE_CLI" ] && [ "$KUBE_FROM_SA" = "no" ]; then
 fi
 cloud_creds "talosctl" talosctl /root/.talos /root/.talos/config
 cloud_creds "omnictl" omnictl /root/.config/omni /root/.config/omni/config
+# `bws` has NO credential file — it authenticates from BWS_ACCESS_TOKEN in the
+# environment and nothing else, so `cloud_creds`' marker-file check would report
+# a configured host as credential-less. Probed the way `aws` is when it is
+# configured from the environment.
+if command -v bws >/dev/null 2>&1; then
+  if env_creds_set BWS_ACCESS_TOKEN; then
+    echo "[entrypoint] bws: credentials from the environment"
+  else
+    echo "[entrypoint] bws: installed; no BWS_ACCESS_TOKEN on this device — ignoring"
+  fi
+fi
 
 # --- Host identity (agent-agnostic) ----------------------------------------
 # The hub keys each agent by its physical host name (device). A container can't
