@@ -56,6 +56,98 @@ paths:
     still returns (at its own timeout) and logs its own failure, which is the operator's signal
     there. Only a peer that answers slowly enough to keep a socket alive is invisible otherwise.
     Tests: `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
+- **The manifest window is a QUEUE, not a cliff** (XERK-424). `_archive_window` splits
+  `ARCHIVE_MANIFEST_MAX` into the newest `ARCHIVE_MANIFEST_RECENT` (so an ending session archives
+  promptly), then what the hub is KNOWN to be short of, oldest first, then a **rotation** over
+  everything else. Newest-by-mtime alone never re-offered what fell out: 10 transcripts and 51
+  sessions' raw sidecars were unarchivable on the reference host while in-window coverage was
+  perfect, and 115 of the 200 slots were sub-1KB records the hub already held, re-offered every
+  beat. An already-complete transcript costs a pass nothing — `_archive_deltas` skips it on
+  `have >= size` without a push — so rotating one back in is cheap and re-offering it is not a bug.
+  - **`_archive_known` is what the hub SAID, and absent is not zero.** A reply only carries cursors
+    for what was OFFERED, so an id that has never fit the window is missing from the map rather
+    than zero, and the rotation exists precisely to reach those. A reported cursor REPLACES what we
+    held, including downwards — a reset or evicted archive answers smaller, and a high-water mark
+    would leave that transcript looking complete here and missing there for good.
+    - **It may not raise**, because `queue_archive_sync` runs on the beat loop, which is the
+      container's main process. `int(float("inf"))` raises OverflowError — neither of the two
+      obvious exceptions — and a bare `1e400` is plain RFC-8259 JSON, so it is reachable from
+      anything broken or hostile answering `TURMA_URL`. Keys are length-capped as well as counted:
+      bounding ENTRIES bounds no bytes when one key may be a megabyte.
+  - **Three ways this reverts to a cliff, each closed deliberately.** They all look like tidying.
+    - **The rotation is keyed on the TRANSCRIPT, never on a position in the candidate list.**
+      `_archive_offered` stamps what each beat offered and the pool is taken least-recently-offered
+      first. An index cursor is index-SAFE but not starvation-safe: advanced against one pool and
+      re-read modulo a differently sized one, it forms a limit cycle whenever the candidate count
+      oscillates PERIODICALLY between two values — 700 of 1201 never offered in 400 beats on a
+      period-2 toggle, both counts above the cap. A session going busy and idle on a regular cadence
+      is exactly that, since candidates exclude whole slugs.
+      - **Bounded against the high-water TRANSCRIPT UNIVERSE** (`_trim_archive_offered`) — every
+        eligible slug's `.jsonl` count, **running slugs included**. An evicted stamp is
+        indistinguishable from never-offered and whichever way that tie breaks it cycles, so the
+        bound's only job is to never drop an id that can still be live. Three versions shipped
+        and were wrong, each looking obviously right, and the pattern in all three is that the
+        bound was derived from a number structurally smaller than the set it had to cover:
+        - a flat 5,000 cannot cover the live set at all — the oldest `N - 5200` starved at any
+          beat count;
+        - `2 x this beat's CANDIDATE count` is computed against the TROUGH, since a slug going
+          busy drops out — 201 of 1201 on a 201/1000 toggle, 2250 of 3250 on 250/3000;
+        - no constant multiplier fixes that: the one needed tracks the peak/trough ratio, which is
+          unbounded (k>=6 for 201/1000, k>=13 for 250/3000);
+        - and the high-water CANDIDATE count is still too small, because `_archive_manifest` drops
+          a running slug **before** it lists that slug's files, so the candidate count can never
+          see it. Three large slugs with one idle per beat hold the per-beat peak at one slug's
+          worth while the union is three: 600 of 3000 starved.
+        The universe is the set that can be live rather than the subset offerable this beat, so
+        there is no oscillation left for it to be smaller than. It costs one extra `os.listdir`
+        per RUNNING slug, of which there are at most `MAX_SESSIONS`.
+      - **The mark never decays**, so the map does not shrink after a delete — a roomier map than
+        needed costs bytes and cannot cost correctness. `ARCHIVE_OFFERED_HARD_MAX` is where that
+        trade stops (32.5 MB RSS measured at the 200k cap with real UUID keys, ~100k transcripts on
+        one host). Past it the loss is a linear slope, roughly `universe - cap - MANIFEST_MAX`
+        transcripts, so it is **logged once** rather than left silent.
+      - **The two paths that can GROW the map both trim** — the normal window and the under-cap
+        passthrough — because the passthrough is every beat for a host below the cap and the hard
+        cap has to be enforceable there too. The two early returns that trim nothing also never
+        stamp, so the map cannot grow through them. Not because a shrunk
+        host's map comes down — under a never-decaying mark it does not.
+      - **The state is in MEMORY, so a restart LOOP starves the rotation** (XERK-430): a single
+        restart is safe, but at a 2-4 beat restart period 900 of 1300 were never offered. The
+        durable copy of "what the hub already has" lives on the hub, which is what XERK-431
+        proposes moving the whole choice to.
+      - Sharing `ARCHIVE_KNOWN_MAX` was also wrong — it coupled that map's off-switch to the
+        rotation.
+      - **Ties break oldest-first**, so what is closest to being lost wins, and eviction is
+        least-recently-offered — which is why a re-stamp POPS before it re-inserts rather than
+        assigning in place.
+    - **The stamps are NEVER cleared**, including on the under-the-cap passthrough. A root slug
+      holds every root session's transcript, so one session going busy swings the count by hundreds;
+      clearing on each dip re-offered the same transcripts forever and never reached the rest
+      (200 of 400 never offered in 200 beats).
+    - **The known-short slice takes at most HALF the backlog slots.** Given all of them it starves
+      the rotation to nothing once enough transcripts are known-short and cannot progress — a full
+      store, a permanent per-transcript failure — and then nothing new is ever offered. It bites
+      the RAW layer hardest: a session whose sidecars are missing but whose transcript is complete
+      reads as known-COMPLETE, so only the rotation can ever reach it.
+    - **`ARCHIVE_MANIFEST_RECENT` is clamped to three quarters of the window.** At `>= MAX` there
+      is no backlog and no rotation at all, and both are env-settable.
+  - **The backlog gets a reserved share of `ARCHIVE_RAW_MANIFEST_FILES_MAX`.** Spent in window
+    order the recent slice exhausts it alone, and then the backlog's SIDECARS never ship however
+    often its transcripts are offered — invisible to any coverage check on transcripts, since those
+    sessions have rows and read back fine. It is a FLOOR under the backlog, not a ceiling on the
+    recent slice: the backlog is served first at its floor, then a second pass hands whatever it
+    left back to the newest, so the budget is never under-spent.
+  - **`ARCHIVE_BEAT_BUDGET` deliberately has no such floor.** A manifest slot is re-contended every
+    beat where those bytes are not: a transport failure, a 5xx, a `skip` and a `full` all cost
+    zero budget (though a 200 whose cursor does not advance costs the full chunk — pre-existing,
+    and only reachable from a hub that realigns persistently), and the hub REFUSES at
+    `ARCHIVE_TOTAL_MAX` rather than evicting — so a cursor cannot regress in a loop and a
+    transcript cannot re-consume budget indefinitely. A first sync costs the backlog some beats of
+    delay, never starvation. Not because "running sessions are excluded so sizes are fixed":
+    `_running_slugs` sees only this agent's OWN registry, and a real drive archived three
+    transcripts that grew throughout it.
+  - Tests: the `test_window_*`, `test_known_map_*`, `test_rotation_*`, `test_backlog_*`,
+    `test_recent_slice_*` and `test_a_complete_transcript_*` cases in `TestArchiveSync`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,

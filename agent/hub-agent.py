@@ -253,6 +253,36 @@ CLAUDE_CONFIG_PATHS = tuple(p for p in (
 # the heartbeat reply). Bounded so a big backfill trickles in rather than flooding
 # the tunnel or blocking a beat.
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
+# Of those slots, how many are reserved for the NEWEST transcripts (XERK-424).
+# The manifest used to be newest-by-mtime and nothing else, so a transcript that
+# fell out of the window was never offered again: on the reference host, 10
+# transcripts (48.9 MB) and the raw sidecars of 51 sessions (57.7 MB) had aged
+# out and were unarchivable while in-window coverage was perfect. Worse, 115 of
+# the 200 slots were held by sub-1KB `(root)` records the hub ALREADY had, re-
+# offered every beat forever — an archived 124-byte row competing one-for-one
+# with an 11 MB conversation the hub had never seen.
+#
+# So the window is split: this many for the newest (which is what keeps today's
+# work archiving promptly), and the rest for the BACKLOG — what the hub has said
+# it does not have, then a rotation over everything else so nothing can starve.
+ARCHIVE_MANIFEST_RECENT = int(os.environ.get("ARCHIVE_MANIFEST_RECENT", "100"))
+# What the hub last said it holds, per transcript, so the backlog slice can
+# prefer what is genuinely missing. Bounded like every other agent-side map: it
+# is keyed on every transcript this host has ever offered, which only grows.
+# Floored at 0: the eviction loops are `while len(...) > MAX: pop(next(iter(...)))`,
+# so a negative value drains the map and then raises StopIteration out of
+# `_note_archive_known` — which the beat's try/except catches, silently ending
+# archive sync for that host forever, under a log line that says nothing at all
+# because StopIteration stringifies to "" (XERK-424 QA delta, finding 2).
+ARCHIVE_KNOWN_MAX = max(0, int(os.environ.get("ARCHIVE_KNOWN_MAX", "5000")))
+# ...and the longest id worth remembering. Bounding ENTRIES bounds no bytes when
+# one key may be a megabyte, and this map outlives the reply that filled it.
+ARCHIVE_KNOWN_KEY_MAX = 256
+# Backstop on the last-offered stamps (see _trim_archive_offered). The bound that
+# matters is derived from the high-water transcript universe; this is the point
+# at which we stop paying memory for the guarantee — 32.5 MB RSS measured at this
+# cap with real UUID keys, which needs about 100k transcripts on one host.
+ARCHIVE_OFFERED_HARD_MAX = max(0, int(os.environ.get("ARCHIVE_OFFERED_HARD_MAX", "200000")))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read-ahead window per delta
 ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
@@ -10534,6 +10564,28 @@ class SessionManager:
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
         self._archive_pending = {}
+        # XERK-424. `_archive_known` is transcriptId -> the byte cursor the hub
+        # last reported for it, which is the only way this side can tell "the hub
+        # has this" from "the hub has never seen it" — the reply only carries
+        # cursors for what was OFFERED, so an id that never fit the window is
+        # absent rather than zero, and the two must not be confused.
+        # `_archive_offered` walks the candidates that knowledge does not cover,
+        # so a transcript the hub has never been told about is offered within a
+        # bounded number of beats instead of never.
+        self._archive_known = {}
+        # Backlog rotation state: transcriptId -> the sequence number of the beat
+        # that last offered it, and the counter that issues them. Per TRANSCRIPT
+        # rather than a place in the candidate list, and bounded against how many
+        # candidates there are rather than by a flat number — see _archive_window
+        # for why each of those is the difference between a queue and a cliff.
+        self._archive_offered = {}
+        self._archive_offer_seq = 0
+        # The largest transcript UNIVERSE seen (every eligible slug's *.jsonl,
+        # running ones included), which is what _trim_archive_offered sizes
+        # against — never this beat's candidate count, which drops a running slug
+        # whole. Plus the once-only flag for the hard-cap warning.
+        self._archive_cand_hwm = 0
+        self._archive_cap_logged = False
         # Throttle for the "cannot be named by the archive" line (see
         # _session_files): the manifest is rebuilt every beat.
         self._unnameable_logged_at = 0.0
@@ -14849,11 +14901,249 @@ class SessionManager:
                 e.pop("mtime", None)
         return by_repo
 
+    def _note_archive_known(self, have):
+        """Record what the hub says it holds, from one reply's archiveHave.
+
+        This is the ONLY signal on this side for "the hub already has that one",
+        and the manifest's backlog slice is chosen from it (XERK-424). A cursor
+        the hub reports is authoritative and REPLACES what we thought, including
+        downwards: an archive that was reset or evicted answers with a smaller
+        number, and treating that as a high-water mark would leave the transcript
+        looking complete here and missing there, permanently.
+
+        Bounded, and evicting the OLDEST-CONFIRMED rather than the smallest or the
+        stalest-looking: the map is keyed on whatever a reply names, which in
+        practice is what this host offered, and on a long-lived host only grows.
+        Losing an entry is not a correctness problem — an unknown id is simply
+        rotated back in and re-learned on the next reply.
+
+        **Nothing in here may raise**: it is called from `queue_archive_sync`,
+        whose whole docstring is about the beat loop being the container's main
+        process. `int()` on a JSON number is exactly where that goes wrong —
+        `int(float("inf"))` raises OverflowError, which is neither of the two
+        obvious exceptions, and a bare `1e400` is plain RFC-8259 JSON that any
+        broken or hostile thing answering TURMA_URL can send (XERK-424 QA D1).
+        """
+        if not isinstance(have, dict):
+            return
+        for tid, cur in have.items():
+            # Length-capped like every other cell taken off the wire: this map
+            # outlives the reply that filled it, and bounding ENTRIES bounds no
+            # bytes at all when one key may be a megabyte (XERK-235's rule).
+            if not isinstance(tid, str) or not tid or len(tid) > ARCHIVE_KNOWN_KEY_MAX:
+                continue
+            try:
+                n = int(cur or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            # Re-insert so the eviction order below is genuinely least-recently
+            # confirmed; a plain assignment keeps a stale entry's old position.
+            self._archive_known.pop(tid, None)
+            self._archive_known[tid] = max(0, n)
+        while len(self._archive_known) > ARCHIVE_KNOWN_MAX:
+            self._archive_known.pop(next(iter(self._archive_known)))
+
+    def _archive_window(self, cands, universe):
+        """Pick the ARCHIVE_MANIFEST_MAX entries to offer, from every candidate
+        sorted newest-first (XERK-424).
+
+        Newest-first alone made the window a CLIFF rather than a queue: a
+        transcript that fell out was never offered again, however little of it
+        the hub held, while transcripts the hub was known to have complete were
+        re-offered every beat forever. So:
+
+          * the newest ARCHIVE_MANIFEST_RECENT keep their slots outright, which
+            is what makes an ending session archive promptly;
+          * then everything the hub is KNOWN to be missing or short of, oldest
+            first — oldest, because that is the one closest to being lost and the
+            newest of them would be picked up by the recent slice anyway;
+          * then a ROTATION over what is left, so a transcript no reply has ever
+            mentioned is offered within a bounded number of beats rather than
+            never. Complete ones cost the pass nothing: `_archive_deltas` skips
+            them on `have >= size` without a push.
+
+        Returns (window, backlog_start) — the index the backlog begins at, so the
+        raw budget can guarantee it a share instead of spending everything on the
+        recent slice.
+        """
+        if ARCHIVE_MANIFEST_MAX <= 0:
+            return [], 0    # an off-switch has to stay one; the clamp below floors at 1
+        if len(cands) <= ARCHIVE_MANIFEST_MAX:
+            # Everything fits, so there is nothing to choose — and the
+            # last-offered stamps are deliberately LEFT ALONE. Candidates exclude
+            # whole slugs backing a running session, and a root slug holds every
+            # root session's transcript, so one session going busy can swing the
+            # count by hundreds and dip it under the cap. Clearing that progress
+            # on each dip re-offered the same transcripts forever and never
+            # reached the rest: measured at 200 of 400 never offered in 200 beats
+            # (XERK-424 QA D2). Stamps are per TRANSCRIPT, so a pool that grows,
+            # shrinks or reorders under them stays correct — which is the whole
+            # reason they are not an index (see below). The trim still runs, but
+            # NOT because a shrunk host's map comes down — under a never-decaying
+            # high-water bound it does not, and the docstring below says so. It
+            # runs so the hard cap is enforceable on this path too, which is
+            # every beat for a host below the manifest cap (XERK-424 QA pass 6).
+            # The earlier returns above trim nothing and need not: they never
+            # stamp either, so the map cannot grow through them.
+            self._trim_archive_offered(universe)
+            return list(cands), len(cands)
+        # Clamped so the backlog keeps a QUARTER of the window whatever the two
+        # are set to. At RECENT >= MAX there is no backlog and no rotation — the
+        # queue silently reverts to the cliff with nothing to say so — and a
+        # clamp to MAX-1 is barely better, since one slot a beat takes as many
+        # beats as the pool is long. Both are env-settable, so this is a
+        # reachable misconfiguration rather than a theoretical one.
+        recent_n = max(0, min(ARCHIVE_MANIFEST_RECENT,
+                              max(1, (ARCHIVE_MANIFEST_MAX * 3) // 4)))
+        window = list(cands[:recent_n])
+        taken = {m["transcriptId"] for m in window}
+        slots = ARCHIVE_MANIFEST_MAX - len(window)
+        rest = [m for m in cands[recent_n:] if m["transcriptId"] not in taken]
+        if slots <= 0 or not rest:
+            return window, len(window)
+        backlog_start = len(window)
+
+        def short(m):
+            known = self._archive_known.get(m["transcriptId"])
+            return known is None or known < int(m.get("size", 0))
+
+        # Known-short, oldest first. `rest` is newest-first, so walk it backwards.
+        #
+        # It may take at most HALF the backlog slots. Given the whole slice it
+        # starves the rotation to nothing the moment enough transcripts are
+        # known-short AND cannot progress — a full store, or per-transcript
+        # permanent ingest failures — and then anything never offered is never
+        # offered, which is the cliff this function exists to remove, one layer
+        # down. Measured: at 100 stuck transcripts (exactly MAX - RECENT), 0 of
+        # 20 late arrivals were ever offered in 400 beats; with this cap they
+        # are (XERK-424 QA D3). It hits the raw layer hardest, because a session
+        # whose sidecars are missing but whose transcript is complete reads as
+        # known-COMPLETE and is only ever reachable by the rotation.
+        missing = [m for m in reversed(rest)
+                   if self._archive_known.get(m["transcriptId"]) is not None and short(m)]
+        for m in missing[:max(1, slots // 2)]:
+            window.append(m)
+            taken.add(m["transcriptId"])
+        slots = ARCHIVE_MANIFEST_MAX - len(window)
+
+        # ...then the LEAST-RECENTLY-OFFERED of what knowledge does not cover, so
+        # nothing that has never been offered waits behind something that has.
+        #
+        # `_archive_offered` maps a transcriptId to the beat that last offered
+        # it, and the pool is taken in that order, oldest transcript first on a
+        # tie. Three things about it are load-bearing, and each is a mechanism
+        # that failed here first (XERK-424 QA delta finding 1, pass 3 D1):
+        #
+        #   * **Not an index into the candidate list.** A cursor taken modulo the
+        #     pool size is index-SAFE but forms a limit cycle when the candidate
+        #     count oscillates periodically — 700 of 1201 never offered in 400
+        #     beats on a period-2 toggle, which is what a session going busy and
+        #     idle on a regular cadence is, since candidates exclude whole slugs.
+        #   * **Not a single watermark either.** One scalar cannot survive the
+        #     same oscillation: the beats where a slug is absent conclude the
+        #     sweep is finished and restart it, throwing away the position inside
+        #     that slug's range, so its tail is never reached.
+        #   * **Bounded against the high-water transcript UNIVERSE** — every
+        #     eligible slug's `.jsonl` count, RUNNING SLUGS INCLUDED. See
+        #     `_trim_archive_offered`, which carries the three versions of that
+        #     bound that were wrong and why they shared one root cause. The
+        #     short form: an evicted stamp is indistinguishable from
+        #     never-offered and whichever way that tie breaks it cycles, so the
+        #     bound must never drop an id that CAN be live — which is not the
+        #     same set as the ids offerable this beat.
+        if slots > 0:
+            pool = [m for m in rest if m["transcriptId"] not in taken]
+            if pool:
+                pool.sort(key=lambda m: (self._archive_offered.get(m["transcriptId"], -1),
+                                         m.get("mtime", 0)))
+                window.extend(pool[:slots])
+        self._archive_offer_seq += 1
+        # Only the backlog is stamped: the recent slice is offered every beat
+        # regardless, so stamping it would spend capacity on what needs it least.
+        for m in window[backlog_start:]:
+            self._archive_offered.pop(m["transcriptId"], None)
+            self._archive_offered[m["transcriptId"]] = self._archive_offer_seq
+        self._trim_archive_offered(universe)
+        return window, backlog_start
+
+    def _trim_archive_offered(self, universe):
+        """Bound the last-offered stamps against the high-water TRANSCRIPT UNIVERSE.
+
+        An evicted stamp is indistinguishable from never-offered, and whichever
+        way that tie breaks it cycles — so the bound's whole job is to never drop
+        an id that is still live. THREE earlier versions of this bound shipped on
+        the branch and each got that wrong, all for the same reason — the number
+        they were derived from was structurally smaller than the set it had to
+        cover:
+
+          * a flat 5,000 cannot cover the live set on a big host at all, and
+            starved the oldest `N - 5200` at any number of beats (QA pass 3);
+          * `2 x THIS BEAT's` count looks like it fixes that and does not.
+            Candidates exclude whole slugs backing a running session, so the
+            count DIPS — which is the same busy/idle swing the rotation is not an
+            index because of. The trough's bound is computed against the trough,
+            evicts stamps that are live at the peak, and the cycle comes back:
+            201 of 1201 never offered on a 201/1000 toggle, 2250 of 3250 on a
+            250/3000 one, permanently (QA pass 4). No constant multiplier fixes
+            it either — the multiplier needed tracks the peak/trough ratio, which
+            is unbounded (measured: k>=6 for 201/1000, k>=13 for 250/3000).
+
+          * and `2 x the high-water CANDIDATE count` is still the wrong
+            quantity, because the candidate count can never see a running slug:
+            `_archive_manifest` drops those whole. Two large slugs busy on
+            alternating beats keep the per-beat peak at one slug's worth while
+            the live union is both, so a three-slug lockstep starved 600 of 3000
+            (QA pass 5).
+
+        So the bound is sized against the TRANSCRIPT UNIVERSE — every eligible
+        slug's `.jsonl` count, running slugs included — at its high-water mark.
+        That is the set of ids that can be live, rather than the subset that
+        happens to be offerable this beat, so there is no oscillation left for it
+        to be smaller than.
+
+        The mark never decays: a host whose transcripts genuinely go away keeps a
+        roomier map than it needs, which costs bytes and cannot cost correctness
+        (so the map does NOT shrink after a delete — the trim only comes down at
+        the hard cap). Those bytes are proportional to the peak transcripts on
+        disk: measured 32.5 MB RSS at the 200k cap with real UUID keys, 0.8 MB at
+        5k. ARCHIVE_OFFERED_HARD_MAX is the backstop above which this trades the
+        guarantee back for memory, and the loss above it is a linear slope —
+        roughly `universe - HARD_MAX - ARCHIVE_MANIFEST_MAX` transcripts drop out
+        of the rotation — so it is warned about once rather than left silent.
+
+        Evicts the least-recently-offered, which after `_archive_window`'s
+        re-insert is insertion order.
+        """
+        if universe > self._archive_cand_hwm:
+            self._archive_cand_hwm = universe
+        want = max(2 * self._archive_cand_hwm, 4 * ARCHIVE_MANIFEST_MAX)
+        keep = min(want, ARCHIVE_OFFERED_HARD_MAX)
+        # Gated on where transcripts actually START dropping out, not on `want`:
+        # `want` is 2x the mark, so warning on it fired at half the real cliff
+        # and said "the oldest will stop being offered" while nothing had
+        # (measured: 0 never-offered at three caps that all warned). A line that
+        # is not true when it appears is worse than none (XERK-424 QA pass 6).
+        if (self._archive_cand_hwm > ARCHIVE_OFFERED_HARD_MAX
+                and not self._archive_cap_logged):
+            # Once. Past here the rotation silently drops roughly
+            # `universe - keep - ARCHIVE_MANIFEST_MAX` transcripts, and an
+            # operator has no other way to learn that from the outside.
+            self._archive_cap_logged = True
+            log(f"archive: {self._archive_cand_hwm} transcripts is past what the "
+                f"rotation can track at ARCHIVE_OFFERED_HARD_MAX={ARCHIVE_OFFERED_HARD_MAX}; "
+                f"the oldest will stop being offered. Raise it or prune the host.")
+        while len(self._archive_offered) > keep:
+            self._archive_offered.pop(next(iter(self._archive_offered)))
+
     def _archive_manifest(self):
         """Manifest of inactive-session transcripts eligible for archive: enumerate
         every ledger slug's *.jsonl, attribute it to a repo via the durable usage
-        ledger, skip transcripts backing a running session, and cap to the newest
-        ARCHIVE_MANIFEST_MAX (scalars only — bounds the heartbeat)."""
+        ledger, skip transcripts backing a running session, and cap to
+        ARCHIVE_MANIFEST_MAX entries (scalars only — bounds the heartbeat).
+
+        Which ones is `_archive_window`: the newest, then the backlog the hub is
+        known to be missing, then a rotation over the rest (XERK-424). It is not
+        newest-by-mtime alone, because that never re-offers what falls out."""
         running = self._running_slugs()
         sess_meta = self._session_meta_by_slug()
         # slug -> {repo, remoteKey, worktree}, from the durable attribution ledger.
@@ -14869,13 +15159,22 @@ class SessionManager:
                 "worktree": wt,
             }
         out = []
+        # Every transcript in every eligible slug, RUNNING ONES INCLUDED — the
+        # universe the rotation's bookkeeping has to cover, which is not the same
+        # number as `len(out)` (XERK-424 QA pass 5). Candidates drop a running
+        # slug whole, so the candidate count is structurally smaller than the set
+        # of ids that will be live again a beat later; bounding on it starved
+        # 600 of 3000 transcripts on a three-slug lockstep rotation. One extra
+        # os.listdir per RUNNING slug, of which there are at most MAX_SESSIONS.
+        universe = 0
         for slug, attr in slug_attr.items():
-            if slug in running:
-                continue
             proj = os.path.join(PROJECTS_ROOT, slug)
             try:
                 names = os.listdir(proj)
             except OSError:
+                continue
+            universe += sum(1 for n in names if n.endswith(".jsonl"))
+            if slug in running:
                 continue
             sm = sess_meta.get(slug, {})
             for fname in names:
@@ -14899,23 +15198,65 @@ class SessionManager:
                     "summary": sm.get("summary"),
                 })
         out.sort(key=lambda m: m["mtime"], reverse=True)
-        out = out[:ARCHIVE_MANIFEST_MAX]
+        out, backlog_start = self._archive_window(out, universe)
         # The raw layer's file list (XERK-338), newest transcript first so the
         # aggregate cap drops the oldest offers rather than a random slice of
         # one session. Paid only for the capped survivors, like `endedTs` below.
+        #
+        # The BACKLOG slice gets a reserved share of that budget (XERK-424).
+        # Spent strictly in window order, the recent slice can exhaust it on its
+        # own — a handful of subagent-heavy sessions is enough — and then the
+        # backlog's sidecars never ship however often its transcripts are
+        # offered. That is the shape the rendered layer just had: the reference
+        # host had 51 sessions short 57.7 MB of sidecars with the rendered layer
+        # complete, which no coverage check on transcripts would ever show.
+        # A reservation, not a partition: whatever one half does not spend is
+        # still there for the other, because the halves run in sequence.
         raw_budget = ARCHIVE_RAW_MANIFEST_FILES_MAX
-        for m in out:
-            if raw_budget <= 0:
-                break
+        recent_cap = ARCHIVE_RAW_MANIFEST_FILES_MAX
+        if backlog_start < len(out):
+            recent_cap = max(1, ARCHIVE_RAW_MANIFEST_FILES_MAX // 2)
+        spent_recent = 0
+
+        def offer_raw(i, m, room):
+            """Attach up to `room` of this transcript's sidecars. Returns spend."""
+            nonlocal raw_budget, spent_recent
+            if room <= 0 or m.get("rawFiles"):
+                return 0
             files = self._session_files(
                 os.path.join(PROJECTS_ROOT, m["slug"]), m["transcriptId"],
-                limit=min(ARCHIVE_RAW_FILES_MAX, raw_budget))
-            if files:
-                # Pairs, not objects: this rides every slow beat, and 200
-                # transcripts of {"path":...,"size":...} is several times the
-                # heartbeat cost of the same information as [rel, size].
-                m["rawFiles"] = [[rel, size] for rel, size in files]
-                raw_budget -= len(files)
+                limit=min(ARCHIVE_RAW_FILES_MAX, room))
+            if not files:
+                return 0
+            # Pairs, not objects: this rides every slow beat, and 200
+            # transcripts of {"path":...,"size":...} is several times the
+            # heartbeat cost of the same information as [rel, size].
+            m["rawFiles"] = [[rel, size] for rel, size in files]
+            raw_budget -= len(files)
+            if i < backlog_start:
+                spent_recent += len(files)
+            return len(files)
+
+        for i, m in enumerate(out):
+            if raw_budget <= 0:
+                break
+            room = raw_budget
+            if i < backlog_start:
+                room = min(room, recent_cap - spent_recent)
+            offer_raw(i, m, room)
+        # The reservation is a FLOOR under the backlog, not a ceiling on the
+        # recent slice: whatever the backlog leaves unspent goes back to the
+        # newest transcripts on a second pass. Without this the recent slice
+        # permanently lost half the budget it used to have — measured at 1100 of
+        # 2000 files offered where the old code offered 2000 — and a session
+        # could drop out of the recent slice before its sidecars were ever
+        # offered (XERK-424 QA D4). Sequence matters: the backlog is served
+        # first at its floor, so it can never be squeezed out by this.
+        if raw_budget > 0:
+            for i, m in enumerate(out[:backlog_start]):
+                if raw_budget <= 0:
+                    break
+                offer_raw(i, m, raw_budget)
         for m in out:
             # The last new message's own timestamp, not the file mtime (XERK-73) —
             # the archive orders and dates its rows by this, so a synced/restored
@@ -15067,6 +15408,10 @@ class SessionManager:
         # failed start leaves the job staged and a never-started thread in
         # _archive_worker, whose is_alive() is False, so the next beat retries.
         try:
+            # Inside the try, with everything else that must not reach the beat
+            # loop — it parses untrusted numbers off the reply (XERK-424 QA D1).
+            if job is not None:
+                self._note_archive_known(job["have"])
             with self._archive_lock:
                 self._warn_if_archive_pass_stalled()
                 if job is None:
@@ -15081,7 +15426,11 @@ class SessionManager:
                     worker.start()
             self._archive_wake.set()
         except Exception as e:
-            log(f"archive sync could not be staged: {e}")
+            # `{e}` alone is empty for the exceptions that carry no message —
+            # StopIteration is the one this actually hit — and "could not be
+            # staged: " with nothing after it is indistinguishable from a
+            # formatting bug (XERK-424 QA delta, finding 2).
+            log(f"archive sync could not be staged: {type(e).__name__}: {e}")
 
     def _warn_if_archive_pass_stalled(self, now=None):
         """Say so when a pass is in flight and no push has COMPLETED for a long
@@ -15336,6 +15685,26 @@ class SessionManager:
             log("archive store is full at the hub; skipping this sync pass")
             return
         shed_set = set(shed_ids or ())
+        # One budget, spent in manifest order, so the recent slice is served
+        # before the backlog. That deliberately gets NO reservation of its own,
+        # unlike the manifest's raw-file budget (XERK-424): a manifest slot is
+        # re-contended every beat, where these bytes are not. A transport
+        # failure, a 5xx, a `skip` and a `full` all cost ZERO budget, and the hub
+        # refuses at ARCHIVE_TOTAL_MAX rather than evicting, so a cursor cannot
+        # regress in a loop. A transcript therefore cannot re-consume budget
+        # indefinitely: a first sync costs the backlog some beats of delay,
+        # never starvation.
+        #
+        # Two reasons given here before were WRONG, both stated more confidently
+        # than they were checked. Not "running sessions are excluded so the size
+        # is fixed": `_running_slugs` knows only this agent's OWN registry, and a
+        # drive over the real projects root archived three transcripts that grew
+        # throughout it. And not "charged only after a push that stored
+        # something": the charge runs BEFORE the `new_have <= have` break, so a
+        # 200 whose cursor does not advance — the offset-realign case named at
+        # that break — costs the full chunk. Pre-existing, and only reachable
+        # from a hub that realigns persistently, which is an archive wipe
+        # (XERK-424 QA delta finding 6, pass 3 D4).
         budget = ARCHIVE_BEAT_BUDGET
         failures = 0
         for tid, m in list(self._archive_pending.items()):
