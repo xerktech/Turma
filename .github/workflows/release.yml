@@ -765,8 +765,14 @@ jobs:
             echo "push attempt ${attempt} rejected; re-applying on top of origin/main"
             git fetch --quiet origin main
             git reset --hard --quiet FETCH_HEAD
-            GITHUB_OUTPUT=/dev/null MANIFEST="${RUNNER_TEMP}/gitops/${GITOPS_MANIFEST}" \
-              node "${GITHUB_WORKSPACE}/.github/scripts/argocd-cli.js"
+            # If the racing commit changed the manifest's SHAPE, the re-apply
+            # refuses and prints why. Say what that costs as well, so the run
+            # ends with the same sentence every other failure here ends with.
+            if ! GITHUB_OUTPUT=/dev/null MANIFEST="${RUNNER_TEMP}/gitops/${GITOPS_MANIFEST}" \
+                 node "${GITHUB_WORKSPACE}/.github/scripts/argocd-cli.js"; then
+              echo "::error::could not re-apply the hub image bump onto the new ${GITOPS_REPO} main — k8x is still on the previous image." >&2
+              exit 1
+            fi
           done
           if [ -z "$pushed" ]; then
             echo "::error::could not push the hub image bump to ${GITOPS_REPO} — k8x is still on the previous image." >&2
