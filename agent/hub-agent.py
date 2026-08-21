@@ -7136,8 +7136,34 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     return _finish()
 
 
+# What the host card shows instead of a log when there is no container log to
+# read. A STRING, not None, and that is load-bearing: `_log_tail` refreshes
+# whenever its cache is None, so returning None here would re-run this
+# subprocess on EVERY beat — a `docker logs` with a 15s timeout back on the beat
+# loop, which is the thing XERK-395 exists to keep off it.
+LOG_TAIL_UNAVAILABLE = (
+    "[turma] no container log to tail here — there is no Docker socket. That is "
+    "normal for the Kubernetes agent, whose log is the pod's own stdout: "
+    "`kubectl logs <pod>`. The agent itself is unaffected."
+)
+
+
 def log_tail(container_id):
-    """Last lines of this container's own log, stdout+stderr interleaved."""
+    """Last lines of this container's own log, stdout+stderr interleaved.
+
+    RETURNS THE SENTINEL RATHER THAN DOCKER'S ERROR TEXT when the socket is
+    missing. `stderr=STDOUT` merges docker's own failure into the output, so
+    ignoring the return code published that failure AS IF IT WERE the
+    container's log: a pod with no socket showed
+
+        failed to connect to the docker API at unix:///var/run/docker.sock ...
+
+    on its host card, which reads as a broken agent during whatever the operator
+    happened to be doing at the time — a clone, in the report that found this.
+    Nothing is broken; there is simply nothing to tail. `.claude/rules/
+    agent-image.md` calls this degradation cosmetic, and it only IS cosmetic
+    once the error stops being presented as content.
+    """
     try:
         out = subprocess.run(
             ["docker", "logs", "--tail", str(LOG_TAIL_LINES), container_id],
@@ -7147,9 +7173,12 @@ def log_tail(container_id):
             errors="replace",
             timeout=15,
         )
-        text = out.stdout or ""
     except Exception:
-        return None
+        # No docker binary at all, or it hung past the timeout.
+        return LOG_TAIL_UNAVAILABLE
+    if out.returncode != 0:
+        return LOG_TAIL_UNAVAILABLE
+    text = out.stdout or ""
     return text[-LOG_TAIL_MAX_BYTES:] or None
 
 
