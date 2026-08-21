@@ -14943,7 +14943,7 @@ class SessionManager:
         while len(self._archive_known) > ARCHIVE_KNOWN_MAX:
             self._archive_known.pop(next(iter(self._archive_known)))
 
-    def _archive_window(self, cands, universe=None):
+    def _archive_window(self, cands, universe):
         """Pick the ARCHIVE_MANIFEST_MAX entries to offer, from every candidate
         sorted newest-first (XERK-424).
 
@@ -14978,10 +14978,12 @@ class SessionManager:
             # reached the rest: measured at 200 of 400 never offered in 200 beats
             # (XERK-424 QA D2). Stamps are per TRANSCRIPT, so a pool that grows,
             # shrinks or reorders under them stays correct — which is the whole
-            # reason they are not an index (see below). Trimmed even here, or a
-            # host that drops below the cap for good keeps every stamp it ever
-            # took.
-            self._trim_archive_offered(len(cands) if universe is None else universe)
+            # reason they are not an index (see below). The trim still runs, but
+            # NOT because a shrunk host's map comes down — under a never-decaying
+            # high-water bound it does not, and the docstring below says so. It
+            # runs so the hard cap is enforceable on this path too, which is
+            # every beat for a host below the manifest cap (XERK-424 QA pass 6).
+            self._trim_archive_offered(universe)
             return list(cands), len(cands)
         # Clamped so the backlog keeps a QUARTER of the window whatever the two
         # are set to. At RECENT >= MAX there is no backlog and no rotation — the
@@ -15039,12 +15041,14 @@ class SessionManager:
         #     same oscillation: the beats where a slug is absent conclude the
         #     sweep is finished and restart it, throwing away the position inside
         #     that slug's range, so its tail is never reached.
-        #   * **Bounded against the HIGH-WATER candidate count** — see
-        #     `_trim_archive_offered`, which carries the two versions of that
-        #     bound that were wrong and why. The short form: an evicted stamp is
-        #     indistinguishable from never-offered and whichever way that tie
-        #     breaks it cycles, so the bound must never drop a live id, and
-        #     "live" spans the oscillation rather than this beat.
+        #   * **Bounded against the high-water transcript UNIVERSE** — every
+        #     eligible slug's `.jsonl` count, RUNNING SLUGS INCLUDED. See
+        #     `_trim_archive_offered`, which carries the four versions of that
+        #     bound that were wrong and why they all shared one root cause. The
+        #     short form: an evicted stamp is indistinguishable from
+        #     never-offered and whichever way that tie breaks it cycles, so the
+        #     bound must never drop an id that CAN be live — which is not the
+        #     same set as the ids offerable this beat.
         if slots > 0:
             pool = [m for m in rest if m["transcriptId"] not in taken]
             if pool:
@@ -15057,7 +15061,7 @@ class SessionManager:
         for m in window[backlog_start:]:
             self._archive_offered.pop(m["transcriptId"], None)
             self._archive_offered[m["transcriptId"]] = self._archive_offer_seq
-        self._trim_archive_offered(len(cands) if universe is None else universe)
+        self._trim_archive_offered(universe)
         return window, backlog_start
 
     def _trim_archive_offered(self, universe):
@@ -15109,7 +15113,13 @@ class SessionManager:
             self._archive_cand_hwm = universe
         want = max(2 * self._archive_cand_hwm, 4 * ARCHIVE_MANIFEST_MAX)
         keep = min(want, ARCHIVE_OFFERED_HARD_MAX)
-        if want > ARCHIVE_OFFERED_HARD_MAX and not self._archive_cap_logged:
+        # Gated on where transcripts actually START dropping out, not on `want`:
+        # `want` is 2x the mark, so warning on it fired at half the real cliff
+        # and said "the oldest will stop being offered" while nothing had
+        # (measured: 0 never-offered at three caps that all warned). A line that
+        # is not true when it appears is worse than none (XERK-424 QA pass 6).
+        if (self._archive_cand_hwm > ARCHIVE_OFFERED_HARD_MAX
+                and not self._archive_cap_logged):
             # Once. Past here the rotation silently drops roughly
             # `universe - keep - ARCHIVE_MANIFEST_MAX` transcripts, and an
             # operator has no other way to learn that from the outside.

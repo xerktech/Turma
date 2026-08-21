@@ -107,7 +107,12 @@ paths:
         one host). Past it the loss is a linear slope, roughly `universe - cap - MANIFEST_MAX`
         transcripts, so it is **logged once** rather than left silent.
       - **Both paths through `_archive_window` trim**, because the passthrough is every beat for a
-        host below the cap and the hard cap has to be enforceable there too.
+        host below the cap and the hard cap has to be enforceable there too. Not because a shrunk
+        host's map comes down — under a never-decaying mark it does not.
+      - **The state is in MEMORY, so a restart LOOP starves the rotation** (XERK-430): a single
+        restart is safe, but at a 2-4 beat restart period 900 of 1300 were never offered. The
+        durable copy of "what the hub already has" lives on the hub, which is what XERK-431
+        proposes moving the whole choice to.
       - Sharing `ARCHIVE_KNOWN_MAX` was also wrong — it coupled that map's off-switch to the
         rotation.
       - **Ties break oldest-first**, so what is closest to being lost wins, and eviction is

@@ -15032,7 +15032,8 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
              mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
-            window, start = sm._archive_window(self._cands(30))
+            cands = self._cands(30)
+            window, start = sm._archive_window(cands, len(cands))
         self.assertEqual([m["transcriptId"] for m in window[start:]],
                          ["t000", "t001", "t002", "t003", "t004"])
 
@@ -15048,7 +15049,7 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             big = self._cands(80)
             # Long enough for the rotation to WRAP, so ids are re-stamped.
             for _ in range(30):
-                sm._archive_window(big)
+                sm._archive_window(big, len(big))
             self.assertGreaterEqual(len(sm._archive_offered), 40,
                                     "stamps accumulate while the candidates are live")
             # Probe an early-stamped id that this beat will NOT re-offer: the
@@ -15059,7 +15060,7 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             seqs = [sm._archive_offered[k] for k in sm._archive_offered]
             self.assertEqual(seqs, sorted(seqs), "insertion order tracks recency")
             with mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 20):
-                sm._archive_window(big)
+                sm._archive_window(big, len(big))
             self.assertLessEqual(len(sm._archive_offered), 20, "bounded")
             self.assertNotIn(stamped_early, sm._archive_offered,
                              "the least-recently-offered is what goes")
@@ -15083,7 +15084,7 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             oldest = "t000"
             self.assertEqual(min(sm._archive_offered, key=sm._archive_offered.get), oldest)
             self.assertEqual(list(sm._archive_offered)[0], oldest)
-            window, start = sm._archive_window(cands)
+            window, start = sm._archive_window(cands, len(cands))
             picked = len(window) - start
             self.assertIn(oldest, [m["transcriptId"] for m in window[start:]],
                           "the lowest stamp is what the rotation takes")
@@ -15156,7 +15157,8 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
                  mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5), \
                  mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 20):
-                sm3._archive_window(self._cands(n))
+                c = self._cands(n)
+                sm3._archive_window(c, len(c))
             self.assertLessEqual(len(sm3._archive_offered), 20,
                                  "the %s path trims too" % label)
 
@@ -15196,7 +15198,12 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             wt = "/w/.turma/worktrees/Turma/lock%d" % k
             d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
             os.makedirs(d, exist_ok=True)
-            for i in range(14):
+            # Big enough that `2 x one slug` cannot cover the union: at 3x120,
+            # a bound taken from the candidate count tops out at 240 against a
+            # live set of 360. Parameterised smaller, this test passed against a
+            # window path that ignored `universe` entirely (XERK-424 QA pass 6,
+            # F1) — which is the defect the whole commit exists to close.
+            for i in range(120):
                 f = os.path.join(d, "l%d_%03d.jsonl" % (k, i))
                 write_jsonl(f, [_text_entry("u", "user", "hi")])
                 os.utime(f, (1_800_000_000 + k * 100 + i,) * 2)
@@ -15207,8 +15214,8 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         seen = set()
         with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 6), \
              mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 3), \
-             mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 30):
-            for beat in range(150):
+             mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 10_000):
+            for beat in range(400):
                 # Exactly ONE slug idle per beat, rotating: the per-beat candidate
                 # count is one slug's worth, the live union is three.
                 idle = beat % 3
@@ -15216,7 +15223,7 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
                                 "status": "running"}
                                for k in range(3) if k != idle]
                 seen |= {m["transcriptId"] for m in sm._archive_manifest()}
-        self.assertEqual(len(seen), 42, "the bound must cover slugs that are busy now")
+        self.assertEqual(len(seen), 360, "the bound must cover slugs that are busy now")
 
     def test_the_universe_counts_running_slugs(self):
         sm = self.make_manager()
@@ -15232,6 +15239,11 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
                                "slug": ha._project_slug(w)} for w in (wt_a, wt_b)}
         sm.closed = []
         sm.registry = [{"id": "s", "worktreePath": wt_b, "status": "running"}]
+        # ...and a non-transcript file in the slug must not inflate it.
+        os.makedirs(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt_b), "subagents"),
+                    exist_ok=True)
+        with open(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt_b), "notes.txt"), "w") as f:
+            f.write("x")
         sm._archive_manifest()
         self.assertEqual(sm._archive_cand_hwm, 10,
                          "the busy slug's 7 count toward the bound, though none are offered")
@@ -15261,16 +15273,24 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             sm._archive_offered = {"a": 1}
             sm._trim_archive_offered(50)      # must not raise
             self.assertEqual(sm._archive_offered, {})
-        # Past the cap the loss is silent and linear, so it is said ONCE.
-        sm2 = self.make_manager()
-        lines = []
-        with mock.patch.object(ha, "log", lambda m: lines.append(m)), \
-             mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 10), \
-             mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 2):
-            for _ in range(5):
-                sm2._trim_archive_offered(500)
-        self.assertEqual(len([l for l in lines if "rotation can track" in l]), 1,
-                         "announced, and only once")
+        # Past the cap the loss is silent and linear, so it is said ONCE — and
+        # said where transcripts actually start dropping out. Gated on `want`
+        # (2x the mark) it fired at HALF the real cliff, claiming "the oldest
+        # will stop being offered" while nothing had (XERK-424 QA pass 6, F4).
+        def warnings_at(universe, cap):
+            sm2 = self.make_manager()
+            lines = []
+            with mock.patch.object(ha, "log", lambda m: lines.append(m)), \
+                 mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", cap), \
+                 mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 2):
+                for _ in range(5):
+                    sm2._trim_archive_offered(universe)
+            return [l for l in lines if "rotation can track" in l]
+        self.assertEqual(len(warnings_at(500, 10)), 1, "announced, and only once")
+        self.assertEqual(warnings_at(500, 1000), [],
+                         "a mark UNDER the cap loses nothing and must stay quiet")
+        self.assertEqual(warnings_at(500, 600), [],
+                         "...including where 2x the mark is over it but the mark is not")
 
     def test_only_the_backlog_is_stamped(self):
         # Stamping the recent slice too spends capacity on the transcripts that
