@@ -15184,6 +15184,94 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
                                  max(2 * sm._archive_cand_hwm, 4 * 6),
                                  "the above-cap path bounds the map too")
 
+    def test_the_bound_covers_slugs_that_are_busy_right_now(self):
+        # The candidate count can never see a running slug — _archive_manifest
+        # drops those whole — so bounding on it is structurally too small. Three
+        # large slugs with exactly one idle per beat keep the per-beat peak at one
+        # slug's worth while the live union is all three: 600 of 3000 starved
+        # (XERK-424 QA pass 5, D1). The bound is the transcript UNIVERSE instead.
+        sm = self.make_manager()
+        slugs = []
+        for k in range(3):
+            wt = "/w/.turma/worktrees/Turma/lock%d" % k
+            d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+            os.makedirs(d, exist_ok=True)
+            for i in range(14):
+                f = os.path.join(d, "l%d_%03d.jsonl" % (k, i))
+                write_jsonl(f, [_text_entry("u", "user", "hi")])
+                os.utime(f, (1_800_000_000 + k * 100 + i,) * 2)
+            slugs.append(wt)
+        sm.usage_ledger = {w: {"repo": "Turma", "remote": "git@github.com:x/y.git",
+                               "slug": ha._project_slug(w)} for w in slugs}
+        sm.closed = []
+        seen = set()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 6), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 3), \
+             mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 30):
+            for beat in range(150):
+                # Exactly ONE slug idle per beat, rotating: the per-beat candidate
+                # count is one slug's worth, the live union is three.
+                idle = beat % 3
+                sm.registry = [{"id": "s%d" % k, "worktreePath": slugs[k],
+                                "status": "running"}
+                               for k in range(3) if k != idle]
+                seen |= {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(len(seen), 42, "the bound must cover slugs that are busy now")
+
+    def test_the_universe_counts_running_slugs(self):
+        sm = self.make_manager()
+        wt_a = "/w/.turma/worktrees/Turma/ua"
+        wt_b = "/w/.turma/worktrees/Turma/ub"
+        for wt, n in ((wt_a, 3), (wt_b, 7)):
+            d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+            os.makedirs(d, exist_ok=True)
+            for i in range(n):
+                write_jsonl(os.path.join(d, "%s%d.jsonl" % (wt[-2:], i)),
+                            [_text_entry("u", "user", "hi")])
+        sm.usage_ledger = {w: {"repo": "Turma", "remote": "git@github.com:x/y.git",
+                               "slug": ha._project_slug(w)} for w in (wt_a, wt_b)}
+        sm.closed = []
+        sm.registry = [{"id": "s", "worktreePath": wt_b, "status": "running"}]
+        sm._archive_manifest()
+        self.assertEqual(sm._archive_cand_hwm, 10,
+                         "the busy slug's 7 count toward the bound, though none are offered")
+
+    def test_the_hard_cap_is_clamped_and_announced(self):
+        # Its neighbour carries an eight-line comment about exactly this: the
+        # eviction loop drains the map and then raises StopIteration, and here
+        # that reaches build_payload with no try above it — the whole agent, not
+        # just archive sync (XERK-424 QA pass 5, N1).
+        self.assertGreaterEqual(ha.ARCHIVE_OFFERED_HARD_MAX, 0)
+        def fresh(value):
+            env = dict(os.environ, ARCHIVE_OFFERED_HARD_MAX=value)
+            out = subprocess.run(
+                [sys.executable, "-c",
+                 "import importlib.util,sys;"
+                 f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+                 "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+                 "print(m.ARCHIVE_OFFERED_HARD_MAX)"],
+                capture_output=True, text=True, env=env)
+            return out.stdout.strip(), out.stderr[-400:]
+        got, err = fresh("500")
+        self.assertEqual(got, "500", err)
+        got, err = fresh("-1")
+        self.assertEqual(got, "0", err)
+        sm = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 0):
+            sm._archive_offered = {"a": 1}
+            sm._trim_archive_offered(50)      # must not raise
+            self.assertEqual(sm._archive_offered, {})
+        # Past the cap the loss is silent and linear, so it is said ONCE.
+        sm2 = self.make_manager()
+        lines = []
+        with mock.patch.object(ha, "log", lambda m: lines.append(m)), \
+             mock.patch.object(ha, "ARCHIVE_OFFERED_HARD_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 2):
+            for _ in range(5):
+                sm2._trim_archive_offered(500)
+        self.assertEqual(len([l for l in lines if "rotation can track" in l]), 1,
+                         "announced, and only once")
+
     def test_only_the_backlog_is_stamped(self):
         # Stamping the recent slice too spends capacity on the transcripts that
         # need it least (XERK-424 QA pass 3, D5 / P05, P15).

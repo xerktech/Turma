@@ -279,10 +279,10 @@ ARCHIVE_KNOWN_MAX = max(0, int(os.environ.get("ARCHIVE_KNOWN_MAX", "5000")))
 # one key may be a megabyte, and this map outlives the reply that filled it.
 ARCHIVE_KNOWN_KEY_MAX = 256
 # Backstop on the last-offered stamps (see _trim_archive_offered). The bound that
-# matters is derived from the high-water candidate count; this is the point at
-# which we stop paying memory for the guarantee — ~25 MB of Python heap, which
-# needs about 100k transcripts on one host to reach.
-ARCHIVE_OFFERED_HARD_MAX = int(os.environ.get("ARCHIVE_OFFERED_HARD_MAX", "200000"))
+# matters is derived from the high-water transcript universe; this is the point
+# at which we stop paying memory for the guarantee — 32.5 MB RSS measured at this
+# cap with real UUID keys, which needs about 100k transcripts on one host.
+ARCHIVE_OFFERED_HARD_MAX = max(0, int(os.environ.get("ARCHIVE_OFFERED_HARD_MAX", "200000")))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read-ahead window per delta
 ARCHIVE_CHUNK_TIMEOUT_SEC = 15  # one rendered-delta POST
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
@@ -10580,9 +10580,12 @@ class SessionManager:
         # for why each of those is the difference between a queue and a cliff.
         self._archive_offered = {}
         self._archive_offer_seq = 0
-        # The largest candidate count seen, which is what _trim_archive_offered
-        # sizes against — never this beat's, which dips whenever a slug goes busy.
+        # The largest transcript UNIVERSE seen (every eligible slug's *.jsonl,
+        # running ones included), which is what _trim_archive_offered sizes
+        # against — never this beat's candidate count, which drops a running slug
+        # whole. Plus the once-only flag for the hard-cap warning.
         self._archive_cand_hwm = 0
+        self._archive_cap_logged = False
         # Throttle for the "cannot be named by the archive" line (see
         # _session_files): the manifest is rebuilt every beat.
         self._unnameable_logged_at = 0.0
@@ -14940,7 +14943,7 @@ class SessionManager:
         while len(self._archive_known) > ARCHIVE_KNOWN_MAX:
             self._archive_known.pop(next(iter(self._archive_known)))
 
-    def _archive_window(self, cands):
+    def _archive_window(self, cands, universe=None):
         """Pick the ARCHIVE_MANIFEST_MAX entries to offer, from every candidate
         sorted newest-first (XERK-424).
 
@@ -14978,7 +14981,7 @@ class SessionManager:
             # reason they are not an index (see below). Trimmed even here, or a
             # host that drops below the cap for good keeps every stamp it ever
             # took.
-            self._trim_archive_offered(len(cands))
+            self._trim_archive_offered(len(cands) if universe is None else universe)
             return list(cands), len(cands)
         # Clamped so the backlog keeps a QUARTER of the window whatever the two
         # are set to. At RECENT >= MAX there is no backlog and no rotation — the
@@ -15054,11 +15057,11 @@ class SessionManager:
         for m in window[backlog_start:]:
             self._archive_offered.pop(m["transcriptId"], None)
             self._archive_offered[m["transcriptId"]] = self._archive_offer_seq
-        self._trim_archive_offered(len(cands))
+        self._trim_archive_offered(len(cands) if universe is None else universe)
         return window, backlog_start
 
-    def _trim_archive_offered(self, candidate_count):
-        """Bound the last-offered stamps against the HIGH-WATER candidate count.
+    def _trim_archive_offered(self, universe):
+        """Bound the last-offered stamps against the high-water TRANSCRIPT UNIVERSE.
 
         An evicted stamp is indistinguishable from never-offered, and whichever
         way that tie breaks it cycles — so the bound's whole job is to never drop
@@ -15076,22 +15079,44 @@ class SessionManager:
             it either — the multiplier needed tracks the peak/trough ratio, which
             is unbounded (measured: k>=6 for 201/1000, k>=13 for 250/3000).
 
-        So the bound is sized against the largest candidate count this process
-        has SEEN, which is what covers the union across an oscillation. It never
-        decays: a host whose transcripts genuinely go away keeps a roomier map
-        than it needs, which costs bytes and cannot cost correctness. Those bytes
-        are proportional to the peak transcripts on disk — measured ~25 MB of
-        Python heap at 100k transcripts, ~1 MB at the reference 2.4k — and
-        ARCHIVE_OFFERED_HARD_MAX is the backstop above which this trades the
-        guarantee back for memory.
+          * and `2 x the high-water CANDIDATE count` is still the wrong
+            quantity, because the candidate count can never see a running slug:
+            `_archive_manifest` drops those whole. Two large slugs busy on
+            alternating beats keep the per-beat peak at one slug's worth while
+            the live union is both, so a three-slug lockstep starved 600 of 3000
+            (QA pass 5).
+
+        So the bound is sized against the TRANSCRIPT UNIVERSE — every eligible
+        slug's `.jsonl` count, running slugs included — at its high-water mark.
+        That is the set of ids that can be live, rather than the subset that
+        happens to be offerable this beat, so there is no oscillation left for it
+        to be smaller than.
+
+        The mark never decays: a host whose transcripts genuinely go away keeps a
+        roomier map than it needs, which costs bytes and cannot cost correctness
+        (so the map does NOT shrink after a delete — the trim only comes down at
+        the hard cap). Those bytes are proportional to the peak transcripts on
+        disk: measured 32.5 MB RSS at the 200k cap with real UUID keys, 0.8 MB at
+        5k. ARCHIVE_OFFERED_HARD_MAX is the backstop above which this trades the
+        guarantee back for memory, and the loss above it is a linear slope —
+        roughly `universe - HARD_MAX - ARCHIVE_MANIFEST_MAX` transcripts drop out
+        of the rotation — so it is warned about once rather than left silent.
 
         Evicts the least-recently-offered, which after `_archive_window`'s
         re-insert is insertion order.
         """
-        if candidate_count > self._archive_cand_hwm:
-            self._archive_cand_hwm = candidate_count
-        keep = min(max(2 * self._archive_cand_hwm, 4 * ARCHIVE_MANIFEST_MAX),
-                   ARCHIVE_OFFERED_HARD_MAX)
+        if universe > self._archive_cand_hwm:
+            self._archive_cand_hwm = universe
+        want = max(2 * self._archive_cand_hwm, 4 * ARCHIVE_MANIFEST_MAX)
+        keep = min(want, ARCHIVE_OFFERED_HARD_MAX)
+        if want > ARCHIVE_OFFERED_HARD_MAX and not self._archive_cap_logged:
+            # Once. Past here the rotation silently drops roughly
+            # `universe - keep - ARCHIVE_MANIFEST_MAX` transcripts, and an
+            # operator has no other way to learn that from the outside.
+            self._archive_cap_logged = True
+            log(f"archive: {self._archive_cand_hwm} transcripts is past what the "
+                f"rotation can track at ARCHIVE_OFFERED_HARD_MAX={ARCHIVE_OFFERED_HARD_MAX}; "
+                f"the oldest will stop being offered. Raise it or prune the host.")
         while len(self._archive_offered) > keep:
             self._archive_offered.pop(next(iter(self._archive_offered)))
 
@@ -15119,13 +15144,22 @@ class SessionManager:
                 "worktree": wt,
             }
         out = []
+        # Every transcript in every eligible slug, RUNNING ONES INCLUDED — the
+        # universe the rotation's bookkeeping has to cover, which is not the same
+        # number as `len(out)` (XERK-424 QA pass 5). Candidates drop a running
+        # slug whole, so the candidate count is structurally smaller than the set
+        # of ids that will be live again a beat later; bounding on it starved
+        # 600 of 3000 transcripts on a three-slug lockstep rotation. One extra
+        # os.listdir per RUNNING slug, of which there are at most MAX_SESSIONS.
+        universe = 0
         for slug, attr in slug_attr.items():
-            if slug in running:
-                continue
             proj = os.path.join(PROJECTS_ROOT, slug)
             try:
                 names = os.listdir(proj)
             except OSError:
+                continue
+            universe += sum(1 for n in names if n.endswith(".jsonl"))
+            if slug in running:
                 continue
             sm = sess_meta.get(slug, {})
             for fname in names:
@@ -15149,7 +15183,7 @@ class SessionManager:
                     "summary": sm.get("summary"),
                 })
         out.sort(key=lambda m: m["mtime"], reverse=True)
-        out, backlog_start = self._archive_window(out)
+        out, backlog_start = self._archive_window(out, universe)
         # The raw layer's file list (XERK-338), newest transcript first so the
         # aggregate cap drops the oldest offers rather than a random slice of
         # one session. Paid only for the capped survivors, like `endedTs` below.

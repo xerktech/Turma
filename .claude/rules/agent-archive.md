@@ -82,20 +82,32 @@ paths:
       oscillates PERIODICALLY between two values — 700 of 1201 never offered in 400 beats on a
       period-2 toggle, both counts above the cap. A session going busy and idle on a regular cadence
       is exactly that, since candidates exclude whole slugs.
-      - **Bounded against the HIGH-WATER candidate count** (`_trim_archive_offered`). An evicted
-        stamp is indistinguishable from never-offered and whichever way that tie breaks it cycles,
-        so the bound's only job is to never drop an id that is still LIVE — and "live" spans the
-        oscillation, not this beat. Three versions of it were wrong, each looking obviously right:
-        a flat 5,000 cannot cover the live set at all (the oldest `N - 5200` starved at any beat
-        count); `2 x this beat's` count is computed against the TROUGH, so a slug going busy evicts
-        what is live at the peak and the cycle returns (201 of 1201 on a 201/1000 toggle, 2250 of
-        3250 on 250/3000); and no constant multiplier fixes that, because the one needed tracks the
-        peak/trough ratio, which is unbounded. The high-water mark never decays: a host whose
-        transcripts genuinely go away keeps a roomier map than it needs, which costs bytes and
-        cannot cost correctness. `ARCHIVE_OFFERED_HARD_MAX` is where that trade stops — ~25 MB of
-        Python heap, reached around 100k transcripts on one host.
-      - **Both paths through `_archive_window` trim.** The passthrough is what a host that has
-        shrunk below the cap takes every beat, so skipping it there means the map never comes down.
+      - **Bounded against the high-water TRANSCRIPT UNIVERSE** (`_trim_archive_offered`) — every
+        eligible slug's `.jsonl` count, **running slugs included**. An evicted stamp is
+        indistinguishable from never-offered and whichever way that tie breaks it cycles, so the
+        bound's only job is to never drop an id that can still be live. Four versions were wrong,
+        each looking obviously right, and the pattern in all four is that the bound was derived
+        from a number structurally smaller than the set it had to cover:
+        - a flat 5,000 cannot cover the live set at all — the oldest `N - 5200` starved at any
+          beat count;
+        - `2 x this beat's CANDIDATE count` is computed against the TROUGH, since a slug going
+          busy drops out — 201 of 1201 on a 201/1000 toggle, 2250 of 3250 on 250/3000;
+        - no constant multiplier fixes that: the one needed tracks the peak/trough ratio, which is
+          unbounded (k>=6 for 201/1000, k>=13 for 250/3000);
+        - and the high-water CANDIDATE count is still too small, because `_archive_manifest` drops
+          a running slug **before** it lists that slug's files, so the candidate count can never
+          see it. Three large slugs with one idle per beat hold the per-beat peak at one slug's
+          worth while the union is three: 600 of 3000 starved.
+        The universe is the set that can be live rather than the subset offerable this beat, so
+        there is no oscillation left for it to be smaller than. It costs one extra `os.listdir`
+        per RUNNING slug, of which there are at most `MAX_SESSIONS`.
+      - **The mark never decays**, so the map does not shrink after a delete — a roomier map than
+        needed costs bytes and cannot cost correctness. `ARCHIVE_OFFERED_HARD_MAX` is where that
+        trade stops (32.5 MB RSS measured at the 200k cap with real UUID keys, ~100k transcripts on
+        one host). Past it the loss is a linear slope, roughly `universe - cap - MANIFEST_MAX`
+        transcripts, so it is **logged once** rather than left silent.
+      - **Both paths through `_archive_window` trim**, because the passthrough is every beat for a
+        host below the cap and the hard cap has to be enforceable there too.
       - Sharing `ARCHIVE_KNOWN_MAX` was also wrong — it coupled that map's off-switch to the
         rotation.
       - **Ties break oldest-first**, so what is closest to being lost wins, and eviction is
