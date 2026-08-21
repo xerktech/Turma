@@ -201,13 +201,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      # The manifest digest of what was just pushed, for deploy-hub-image to pin
-      # the GitOps manifest at. Taken from the build itself rather than
-      # re-resolved from the registry: :latest and :<version> are mutable, so a
-      # later release racing this one could hand the deploy a different image
-      # than the one this job built.
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -220,7 +213,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v4
       - name: Build and push
-        id: build
         uses: docker/build-push-action@v7
         with:
           context: ./turma
@@ -234,6 +226,49 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+      # Point k8x at the image just pushed. The hub runs there as `ai/turma` in
+      # xerktech/ArgoCD, whose Application is `automated` + `selfHeal`, so this
+      # commit IS the deploy — without it a release publishes the image and
+      # nothing ever runs it. Needs ARGOCD_REPO_TOKEN, a PAT with contents:write
+      # on that repo (GITHUB_TOKEN is scoped to this one).
+      #
+      # Skipped on a dry run, which pushes no image, and off main, since a
+      # dispatch takes any ref and this is the step that reaches production.
+      - name: Update the hub image tag in ArgoCD
+        if: needs.plan.outputs.dry_run != 'true' && github.ref == 'refs/heads/main'
+        env:
+          GITOPS_TOKEN: ${{ secrets.ARGOCD_REPO_TOKEN }}
+          GITOPS_REPO: ${{ github.repository_owner }}/ArgoCD
+          MANIFEST: ai/turma/deployment.yaml
+          IMAGE: ${{ env.TURMA_IMAGE }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GITOPS_TOKEN" ]; then
+            echo "::error::ARGOCD_REPO_TOKEN is not set — k8x will stay on the previous hub image. See RELEASING.md." >&2
+            exit 1
+          fi
+          git clone --quiet "https://x-access-token:${GITOPS_TOKEN}@github.com/${GITOPS_REPO}.git" "$RUNNER_TEMP/gitops"
+          cd "$RUNNER_TEMP/gitops"
+          # Only the hub's own line: the pattern is anchored on the exact
+          # repository, so `turma-agent` in the same repo cannot match it. The
+          # old pin may carry a tag, a @digest, or neither.
+          sed -i -E "s#^([[:space:]]*image: )${IMAGE}([:@][^[:space:]]*)?[[:space:]]*\$#\1${IMAGE}:${VERSION}#" "$MANIFEST"
+          # A sed that matched nothing is silent, and a cluster that quietly
+          # never updates is the failure this step exists to prevent.
+          grep -q "image: ${IMAGE}:${VERSION}$" "$MANIFEST" || {
+            echo "::error::${MANIFEST} has no \`image: ${IMAGE}\` line to update — k8x is still on the previous image." >&2
+            exit 1
+          }
+          if git diff --quiet -- "$MANIFEST"; then
+            echo "Already at ${VERSION}; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --quiet -m "Turma hub ${VERSION} (${TAG})" -- "$MANIFEST"
+          git push --quiet origin HEAD:main
   # --------------------------------------------------------- build: agent -----
   # Hosted. This is the biggest build in the repo; its layer cache is `type=gha`
   # (GitHub-side, so it follows the job) and its disk is handled by the reclaim
@@ -624,161 +659,3 @@ jobs:
             "dist/turma-agent-native-v${V}.tar.gz" \
             "dist/turma-agent-native-v${V}.tar.gz.sha256"
 
-  # ----------------------------------------------------- deploy: hub (k8x) ----
-  # Push the image this release just built into the GitOps repo, which is what
-  # actually deploys the hub (XERK-425).
-  #
-  # The hub runs on k8x as `ai/turma` in xerktech/ArgoCD — one Deployment, pinned
-  # by digest, with no Watchtower. That Application is `automated` + `selfHeal`,
-  # so the commit below IS the deploy: Argo reconciles it within its poll
-  # interval and the Recreate strategy rolls the single replica. Without this job
-  # a release publishes ghcr.io/<owner>/turma:<version> and nothing ever runs it
-  # — the manifest sat on the cutover digest and was bumped by hand.
-  #
-  # Only when turma was actually BUILT: a CARRIED hub is already the running
-  # image, so re-pinning it would restart the pod for nothing. The converse does
-  # NOT hold — `changes.js` maps the whole `turma/` prefix, so a test-only change
-  # rebuilds the image (new labels, so a new digest) and redeploys a hub whose
-  # runtime content is identical. That costs the single replica a Recreate: every
-  # agent tunnel, SSE stream and terminal channel reconnects. XERK-426 carries it.
-  #
-  # Runs after `publish`, not straight after the build, so the cluster only ever
-  # receives an image that belongs to a release that exists — a run that dies in
-  # `publish` leaves no tag, and deploying from it would put the fleet on a
-  # version with no release page, no manifest.json and no notes.
-  #
-  # main only. `workflow_dispatch` accepts any ref and `plan` happily versions
-  # whatever is checked out, so without this guard one mis-aimed non-dry dispatch
-  # would roll the fleet's control plane onto an unmerged branch. The rest of the
-  # pipeline has always been able to publish from a branch; this job is the one
-  # that would put it in production.
-  #
-  # Its failure does NOT unpublish the release (the tag, the images and the
-  # assets are all already out); it means the cluster is still on the previous
-  # image, which is the state the red job is reporting.
-  deploy-hub-image:
-    needs: [plan, bump, build-turma-image, publish]
-    if: >-
-      !cancelled() && needs.publish.result == 'success'
-      && needs.build-turma-image.result == 'success'
-      && needs.plan.outputs.build_turma == 'true'
-      && needs.plan.outputs.dry_run != 'true'
-      && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read # this repo, for .github/scripts. The GitOps repo uses a PAT.
-    env:
-      # Overridable so the pipeline doesn't hardcode one cluster's layout, in the
-      # shape EVENHUB_PACKAGE_ID already uses: repo variables win, the defaults
-      # are what xerktech/ArgoCD holds today.
-      GITOPS_REPO: ${{ vars.ARGOCD_REPO || format('{0}/ArgoCD', github.repository_owner) }}
-      GITOPS_MANIFEST: ${{ vars.ARGOCD_HUB_MANIFEST || 'ai/turma/deployment.yaml' }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-      # GITHUB_TOKEN is scoped to THIS repo, so the GitOps repo (private, and a
-      # different one) needs a PAT with contents:write on it. A missing secret
-      # fails the job loudly rather than skipping: a silent skip is a cluster
-      # that quietly never updates, which looks exactly like a working pipeline.
-      #
-      # The credential lands in ${RUNNER_TEMP}/gitops/.git/config as part of the
-      # remote URL, which is fine on an ephemeral runner (and Actions masks
-      # `secrets.*` while git strips userinfo from its own errors) — but nothing
-      # later may print that remote or upload RUNNER_TEMP as an artifact.
-      - name: Check out the GitOps repo
-        env:
-          GITOPS_TOKEN: ${{ secrets.ARGOCD_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "$GITOPS_TOKEN" ]; then
-            echo "::error::ARGOCD_REPO_TOKEN is not set — the hub image cannot be pushed to ${GITOPS_REPO} and k8x will stay on the previous image. See RELEASING.md." >&2
-            exit 1
-          fi
-          git clone --quiet --branch main \
-            "https://x-access-token:${GITOPS_TOKEN}@github.com/${GITOPS_REPO}.git" \
-            "${RUNNER_TEMP}/gitops"
-      # The rewrite itself is .github/scripts/argocd.js — pure and unit-tested,
-      # like the rest of the release logic. It refuses to guess: no matching
-      # image line, or more than one, fails the job.
-      - name: Point the manifest at this release's image
-        id: bump
-        env:
-          IMAGE: ${{ env.TURMA_IMAGE }}
-          VERSION: ${{ needs.plan.outputs.version }}
-          DIGEST: ${{ needs.build-turma-image.outputs.digest }}
-        run: |
-          set -euo pipefail
-          MANIFEST="${RUNNER_TEMP}/gitops/${GITOPS_MANIFEST}" node .github/scripts/argocd-cli.js
-      # Push to main directly: that branch is what Argo tracks, and a PR nobody
-      # merges is a release that never deploys.
-      #
-      # A rejected push is RE-APPLIED, never rebased. The commit this job races
-      # with is most often a hand-edit of this very line — the workflow this job
-      # replaces — so a rebase conflicts, and `set -e` then kills the step
-      # mid-rebase, losing the error message the operator needs. Resetting onto
-      # the new origin/main and re-running the rewrite is also what makes the
-      # rival's edit visible: if they pinned this same ref, the re-run comes back
-      # with nothing staged and the job stops, rather than committing over them.
-      - name: Commit + push
-        working-directory: ${{ runner.temp }}/gitops
-        env:
-          TAG: ${{ needs.plan.outputs.tag }}
-          IMAGE: ${{ env.TURMA_IMAGE }}
-          VERSION: ${{ needs.plan.outputs.version }}
-          DIGEST: ${{ needs.build-turma-image.outputs.digest }}
-          REF: ${{ steps.bump.outputs.ref }}
-          CHANGED: ${{ steps.bump.outputs.changed }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          # An absent `changed`/`ref` is the previous step's output going missing,
-          # NOT "already up to date". Treating it as the latter is the silent skip
-          # this job exists to refuse, so it is an error rather than an exit 0.
-          if [ -z "${REF}" ] || [ -z "${CHANGED}" ]; then
-            echo "::error::the manifest rewrite reported no result — refusing to call this a deploy. k8x is still on the previous image." >&2
-            exit 1
-          fi
-          if [ "$CHANGED" != "true" ]; then
-            echo "Manifest already points at ${REF} — nothing to push."
-            echo "Hub manifest already at \`${REF}\`; no commit." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          pushed=""
-          for attempt in 1 2 3; do
-            git add -- "$GITOPS_MANIFEST"
-            if git diff --cached --quiet; then
-              echo "Manifest already points at ${REF} — nothing to push."
-              echo "Hub manifest already at \`${REF}\`; no commit." >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            git commit --quiet -m "Turma hub ${VERSION} (${TAG})" \
-              -m "Automated by the Turma release pipeline (XERK-425): ${RUN_URL}" \
-              -m "${REF}"
-            if git push --quiet origin HEAD:main; then pushed=yes; break; fi
-            echo "push attempt ${attempt} rejected; re-applying on top of origin/main"
-            git fetch --quiet origin main
-            git reset --hard --quiet FETCH_HEAD
-            # If the racing commit changed the manifest's SHAPE, the re-apply
-            # refuses and prints why. Say what that costs as well, so the run
-            # ends with the same sentence every other failure here ends with.
-            if ! GITHUB_OUTPUT=/dev/null MANIFEST="${RUNNER_TEMP}/gitops/${GITOPS_MANIFEST}" \
-                 node "${GITHUB_WORKSPACE}/.github/scripts/argocd-cli.js"; then
-              echo "::error::could not re-apply the hub image bump onto the new ${GITOPS_REPO} main — k8x is still on the previous image." >&2
-              exit 1
-            fi
-          done
-          if [ -z "$pushed" ]; then
-            echo "::error::could not push the hub image bump to ${GITOPS_REPO} — k8x is still on the previous image." >&2
-            exit 1
-          fi
-          {
-            echo "## Deployed to k8x"
-            echo "\`${GITOPS_REPO}\` \`${GITOPS_MANIFEST}\` -> \`${REF}\`"
-          } >> "$GITHUB_STEP_SUMMARY"

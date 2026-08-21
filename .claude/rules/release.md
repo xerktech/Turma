@@ -48,31 +48,17 @@ paths:
 
 ### The release DEPLOYS the hub (XERK-425)
 
-- `deploy-hub-image` runs after `publish` and rewrites the `image:` line of the k8x hub's manifest
-  in the private GitOps repo (`ai/turma/deployment.yaml` in xerktech/ArgoCD) to
-  `ghcr.io/<owner>/turma:<version>@sha256:<digest>`. That Application is `automated` + `selfHeal`,
-  so **the commit is the deploy** — this job is the release's last mile, not a convenience.
-- **The digest is `build-turma-image`'s own build output, never re-resolved from the registry.**
-  `:latest` and `:<version>` are mutable, so a release racing this one would hand the cluster a
-  different image than the one that was just built.
-- Gated on the turma component being **BUILT** (a carried hub is already the running image), on
-  `publish` succeeding, and on `github.ref` being **main** — `workflow_dispatch` takes any ref, and
-  this is the one job that would put an unmerged branch into production. Its failure unpublishes
-  nothing; it reports that k8x is still on the previous image.
+- The last step of `build-turma-image` rewrites the `image:` line of the k8x hub's manifest in the
+  private GitOps repo (`ai/turma/deployment.yaml` in xerktech/ArgoCD) to the tag it just pushed and
+  commits it to main. That Application is `automated` + `selfHeal`, so **the commit is the deploy**.
+- **Every failure is loud**: no `ARGOCD_REPO_TOKEN` (a PAT — `GITHUB_TOKEN` can't reach another
+  repo), or no `image:` line to update, fails the step. A silent skip is a cluster that quietly
+  never updates behind a green pipeline.
+- Skipped on a dry run (no image was pushed) and off **main** — `workflow_dispatch` takes any ref,
+  and this is the one step that reaches production.
 - **"Built" is not "changed"**: `changes.js` maps the whole `turma/` prefix, so a test-only merge
   rebuilds the image and redeploys a runtime-identical hub, which `Recreate` + `replicas: 1` pays
   for with every tunnel, SSE stream and terminal channel. XERK-426.
-- A rejected push is **re-applied, never rebased** — reset onto the new `origin/main` and re-run the
-  rewrite. The racing commit is usually a hand-edit of that same line, so a rebase conflicts and
-  `set -e` kills the step before its error annotation; re-applying also stops the job when the rival
-  already pinned the same ref, instead of committing over them.
-- **A missing `ARGOCD_REPO_TOKEN` FAILS the job rather than skipping it.** `GITHUB_TOKEN` can't
-  reach another repo, and a silent skip is a cluster that quietly never updates behind a green
-  pipeline. Repo variables `ARGOCD_REPO` / `ARGOCD_HUB_MANIFEST` override the defaults.
-- The rewrite is **textual and refuses to guess** (`.github/scripts/argocd.js`): that manifest is
-  mostly comments carrying the reasoning for each field, which a YAML round-trip would delete every
-  release, so no matching `image:` line — or more than one — fails the job. Tests:
-  `.github/scripts/tests/argocd.test.js`.
 - The cluster-side **agent** StatefulSet (`ai/turma-agent`) is still bumped by hand: rolling it
   kills every session that host is running.
 

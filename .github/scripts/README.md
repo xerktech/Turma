@@ -23,8 +23,6 @@ offline in milliseconds (`.github/scripts/tests/*.test.js`, run by
 | `plan.js` | CLI | the `plan` job: compute version/tag/build-matrix → `$GITHUB_OUTPUT` |
 | `publish.js` | CLI | the `publish` job: write `manifest.json`, `release-notes.md`, carry plan |
 | `changelog-cli.js` | CLI | the `bump` job (minor/major): roll patches up into `CHANGELOG.md` |
-| `argocd.js` | pure | the GitOps manifest's `image:` line: parse a ref, rewrite exactly one |
-| `argocd-cli.js` | CLI | the `deploy-hub-image` job: point the k8x hub manifest at this release's image |
 
 ## Version scheme
 
@@ -45,7 +43,3 @@ tag namespace, `v<M>.<m>.<p>`, one release, all six components.
   `has_carry`.
 - **`changelog-cli.js`** — in: `NEW_VERSION`, `BASE_MAJOR`, `BASE_MINOR`, `DATE`,
   `CHANGELOG_PATH`. out: rewrites `CHANGELOG.md` in place.
-- **`argocd-cli.js`** — in: `MANIFEST` (path in the checked-out GitOps repo),
-  `IMAGE` (repository, no tag), `VERSION`, `DIGEST`. out: rewrites `MANIFEST` in
-  place; sets `changed`, `ref`, `previous`. `changed=false` is a normal outcome
-  (a re-run of the same release), and the job then commits nothing.

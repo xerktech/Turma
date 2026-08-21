@@ -414,9 +414,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
   env — usage is counted in tokens per model, so there is no rate table.
 - **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`), and a release DEPLOYS it** (XERK-425):
-  `deploy-hub-image` rewrites that manifest's image pin to the build it just published, and the
-  Application is `automated`, so merging hub code to main is what puts it in production. It needs
-  the `ARGOCD_REPO_TOKEN` secret and fails loudly without it; detail in `.claude/rules/release.md`.
+  the last step of `build-turma-image` rewrites that manifest's image tag to the build it just
+  pushed, and the Application is `automated`, so merging hub code to main is what puts it in
+  production. It needs the `ARGOCD_REPO_TOKEN` secret and fails loudly without it; detail in
+  `.claude/rules/release.md`.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit — **except `k8x`, whose
   agent is a StatefulSet in xerktech/ArgoCD (`ai/turma-agent/`, XERK-369)**: one agent for the whole
   cluster, its kubeconfig its own ServiceAccount, and its image pinned there by tag with no
