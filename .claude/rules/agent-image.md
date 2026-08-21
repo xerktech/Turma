@@ -126,6 +126,11 @@ the size ceiling. Everything here is about what the CONTAINER does at boot and w
     `oras-go` 2.6.2 — 4.2.4 has the same v2.6.1 as 3.21.4 — so its CVE is a reviewed `.trivyignore`
     entry with an expiry, not a bump. Read the binary's own build info rather than a changelog when
     deciding which of the two a finding is.
+  - **`bws` (Bitwarden Secrets Manager) rides in the same layer**, because every credential this
+    fleet uses lives in that vault and a session that has to read or create one otherwise cannot.
+    It has **no credential file** — `BWS_ACCESS_TOKEN` and nothing else — so it is probed like
+    `aws`'s env credentials, not with the marker-file check the others use; a marker check would
+    report a properly configured host as credential-less.
   - Creds are the host's, optional, and log-only exactly like the cloud stores:
     `/root/.kube/config`, `/root/.talos/config`, `/root/.config/omni/config`, all
     `permissions.deny`-protected. **A

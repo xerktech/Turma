@@ -208,7 +208,7 @@ RUN set -eux; \
 # they are exactly the surface the Trivy gate is for, and a separate RUN keeps
 # a bump here from re-downloading the GB above it. Sizes on disk, measured by
 # running each binary in the base image: talosctl 97 MB, omnictl 67 MB, kubectl
-# 57 MB, helm 57 MB — 278 MB the tier.
+# 57 MB, helm 57 MB, bws 12 MB — 290 MB the tier.
 #
 # VERSIONS TRACK THE CLUSTER, NOT `latest`, and that is the pin that matters
 # here rather than a CVE sweep. kubectl tolerates one minor of skew either side
@@ -240,6 +240,12 @@ ARG TALOSCTL_VERSION=1.13.8
 ARG TALOSCTL_SHA256=406b56f9e4ff03b1557cc941b1f163aec8a6ebb36e28f0bbbe6d083589529261
 ARG OMNICTL_VERSION=1.10.3
 ARG OMNICTL_SHA256=8b755cf06fb132f111c7fe2f219714594223e4685e2362f37765bac8cca88ceb
+# Bitwarden Secrets Manager CLI. Every credential this fleet uses lives in that
+# vault (`.claude/rules/secrets.md` in xerktech/ArgoCD), so a session that has
+# to read or create one currently cannot — the truenas host has `bws` on PATH
+# and the container did not. Digest of the ZIP, not the binary inside it.
+ARG BWS_VERSION=2.1.0
+ARG BWS_SHA256=ba8233c3a4aee5d43e3c73bbd04d99e9bc5aba13bbbfd06d89b073abe732b860
 RUN set -eux; \
     curl -fsSL "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl; \
     echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum -c -; \
@@ -254,9 +260,13 @@ RUN set -eux; \
     curl -fsSL "https://github.com/siderolabs/omni/releases/download/v${OMNICTL_VERSION}/omnictl-linux-amd64" -o /tmp/omnictl; \
     echo "${OMNICTL_SHA256}  /tmp/omnictl" | sha256sum -c -; \
     install -m 0755 /tmp/omnictl /usr/local/bin/omnictl; \
-    rm -rf /tmp/kubectl /tmp/helm.tgz /tmp/linux-amd64 /tmp/talosctl /tmp/omnictl; \
+    curl -fsSL "https://github.com/bitwarden/sdk-sm/releases/download/bws-v${BWS_VERSION}/bws-x86_64-unknown-linux-gnu-${BWS_VERSION}.zip" -o /tmp/bws.zip; \
+    echo "${BWS_SHA256}  /tmp/bws.zip" | sha256sum -c -; \
+    unzip -q -o /tmp/bws.zip -d /tmp bws; \
+    install -m 0755 /tmp/bws /usr/local/bin/bws; \
+    rm -rf /tmp/kubectl /tmp/helm.tgz /tmp/linux-amd64 /tmp/talosctl /tmp/omnictl /tmp/bws /tmp/bws.zip; \
     kubectl version --client; helm version --short; \
-    talosctl version --client; omnictl --help >/dev/null; \
+    talosctl version --client; omnictl --help >/dev/null; bws --version; \
     rm -rf /root/.kube /root/.talos /root/.config/omni /root/.cache/helm /root/.config/helm
 
 # --- Android BUILD tooling layer (stable, ~0.5 GB) --------------------------
