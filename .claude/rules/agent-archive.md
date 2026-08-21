@@ -56,6 +56,26 @@ paths:
     still returns (at its own timeout) and logs its own failure, which is the operator's signal
     there. Only a peer that answers slowly enough to keep a socket alive is invisible otherwise.
     Tests: `TestArchiveSyncWorker`, `TestBeatLoopBudget`.
+- **The manifest window is a QUEUE, not a cliff** (XERK-424). `_archive_window` splits
+  `ARCHIVE_MANIFEST_MAX` into the newest `ARCHIVE_MANIFEST_RECENT` (so an ending session archives
+  promptly), then what the hub is KNOWN to be short of, oldest first, then a **rotation** over
+  everything else. Newest-by-mtime alone never re-offered what fell out: 10 transcripts and 51
+  sessions' raw sidecars were unarchivable on the reference host while in-window coverage was
+  perfect, and 115 of the 200 slots were sub-1KB records the hub already held, re-offered every
+  beat. An already-complete transcript costs a pass nothing — `_archive_deltas` skips it on
+  `have >= size` without a push — so rotating one back in is cheap and re-offering it is not a bug.
+  - **`_archive_known` is what the hub SAID, and absent is not zero.** A reply only carries cursors
+    for what was OFFERED, so an id that has never fit the window is missing from the map rather
+    than zero, and the rotation exists precisely to reach those. A reported cursor REPLACES what we
+    held, including downwards — a reset or evicted archive answers smaller, and a high-water mark
+    would leave that transcript looking complete here and missing there for good.
+  - **The backlog gets a reserved share of `ARCHIVE_RAW_MANIFEST_FILES_MAX`.** Spent in window
+    order the recent slice can exhaust it alone, and then the backlog's SIDECARS never ship however
+    often its transcripts are offered — which is invisible to any coverage check on transcripts,
+    since those sessions have rows and read back fine. A reservation, not a partition: the halves
+    run in sequence, so what one does not spend the other still gets.
+  - Tests: the `test_window_*`, `test_known_cursor_*` and `test_backlog_keeps_a_raw_budget_share`
+    cases in `TestArchiveSync`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,

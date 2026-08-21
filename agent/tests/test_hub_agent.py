@@ -14630,6 +14630,119 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         sm.registry = [{"id": "s", "worktreePath": wt, "status": "stopped"}]
         self.assertEqual(len(sm._archive_manifest()), 1)
 
+    # --- the manifest WINDOW (XERK-424) ---------------------------------
+
+    def _many_transcripts(self, sm, n, wt="/w/.turma/worktrees/Turma/win"):
+        """n transcripts in one slug, t0 the OLDEST and t<n-1> the newest."""
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        for i in range(n):
+            f = os.path.join(d, "t%03d.jsonl" % i)
+            write_jsonl(f, [_text_entry("u%d" % i, "user", "hi")])
+            os.utime(f, (1_800_000_000 + i, 1_800_000_000 + i))
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm.closed = []
+        return slug
+
+    def test_window_rotates_so_an_aged_out_transcript_is_offered_again(self):
+        # The bug: the manifest was newest-by-mtime and nothing else, so a
+        # transcript that fell out of ARCHIVE_MANIFEST_MAX was never offered
+        # again. On the reference host that stranded 10 transcripts and 51
+        # sessions' sidecars while in-window coverage was perfect.
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            seen = set()
+            for _ in range(20):
+                got = {m["transcriptId"] for m in sm._archive_manifest()}
+                self.assertLessEqual(len(got), 10, "the window stays bounded")
+                seen |= got
+            # Every candidate is reached, including the very oldest, which under
+            # the old rule could never be offered at all.
+            self.assertEqual(len(seen), 40)
+            self.assertIn("t000", seen)
+
+    def test_window_always_keeps_the_newest(self):
+        # The rotation must not cost an ENDING session its prompt archival —
+        # that is what the recent slice is for.
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            for _ in range(8):
+                got = [m["transcriptId"] for m in sm._archive_manifest()]
+                self.assertEqual(got[:5], ["t039", "t038", "t037", "t036", "t035"])
+
+    def test_window_prefers_what_the_hub_says_it_is_missing(self):
+        # A transcript the hub has COMPLETE must not hold a slot against one it
+        # has never seen: 115 of the reference host's 200 slots were sub-1KB
+        # records the hub already had, re-offered every beat forever.
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        sizes = {m["transcriptId"]: m["size"] for m in sm._archive_manifest()}
+        # Everything outside the recent slice is known-complete except t000.
+        sm._note_archive_known({t: sz for t, sz in sizes.items() if t != "t000"})
+        sm._note_archive_known({"t000": 0})
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            got = [m["transcriptId"] for m in sm._archive_manifest()]
+        self.assertIn("t000", got[5:], "the known-short one takes a backlog slot")
+
+    def test_known_cursor_is_replaced_downwards_and_is_bounded(self):
+        # A hub whose archive was reset answers with a SMALLER cursor. Held as a
+        # high-water mark, that transcript would look complete here and be
+        # missing there for good.
+        sm = self.make_manager()
+        sm._note_archive_known({"a": 500})
+        sm._note_archive_known({"a": 10})
+        self.assertEqual(sm._archive_known["a"], 10)
+        # Absent is NOT zero: it means the hub was never asked about that id.
+        self.assertNotIn("b", sm._archive_known)
+        with mock.patch.object(ha, "ARCHIVE_KNOWN_MAX", 5):
+            sm._note_archive_known({"k%d" % i: i for i in range(20)})
+            self.assertLessEqual(len(sm._archive_known), 5)
+        # Junk on the wire cannot poison it.
+        sm._note_archive_known({"c": "lots", "d": None, "e": 7})
+        self.assertNotIn("c", sm._archive_known)
+        self.assertEqual(sm._archive_known["e"], 7)
+        sm._note_archive_known("not a dict")
+
+    def test_backlog_keeps_a_raw_budget_share(self):
+        # Spent strictly in window order the recent slice exhausts the raw
+        # budget on its own, and then the backlog's SIDECARS never ship however
+        # often its transcripts are offered — 51 sessions on the reference host
+        # were short 57.7 MB with their rendered layer complete.
+        sm = self.make_manager()
+        slug = self._many_transcripts(sm, 40)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        for i in range(40):
+            side = os.path.join(d, "t%03d" % i, "subagents")
+            os.makedirs(side, exist_ok=True)
+            for j in range(4):
+                write_jsonl(os.path.join(side, "agent-%d.jsonl" % j), [_text_entry("x", "user", "y")])
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5), \
+             mock.patch.object(ha, "ARCHIVE_RAW_MANIFEST_FILES_MAX", 12):
+            out = sm._archive_manifest()
+        self.assertTrue(any(m.get("rawFiles") for m in out[:5]), "recent still offers sidecars")
+        self.assertTrue(any(m.get("rawFiles") for m in out[5:]),
+                        "the backlog gets sidecar budget too")
+        self.assertLessEqual(sum(len(m.get("rawFiles") or []) for m in out), 12)
+
+    def test_window_is_a_passthrough_below_the_cap(self):
+        # The common case — a host with fewer transcripts than slots — must be
+        # untouched by any of this, and must not rotate.
+        sm = self.make_manager()
+        self._many_transcripts(sm, 6)
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 5):
+            got = [m["transcriptId"] for m in sm._archive_manifest()]
+            self.assertEqual(got, ["t005", "t004", "t003", "t002", "t001", "t000"])
+            self.assertEqual(sm._archive_rotate, 0)
+
     def test_deltas_push_filtered_entries_and_resume(self):
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/aaa"
