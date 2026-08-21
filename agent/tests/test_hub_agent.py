@@ -14732,6 +14732,166 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
                         "the backlog gets sidecar budget too")
         self.assertLessEqual(sum(len(m.get("rawFiles") or []) for m in out), 12)
 
+    def test_known_map_survives_a_hostile_cursor(self):
+        # int(float("inf")) raises OverflowError, which is NOT TypeError or
+        # ValueError — and `1e400` is plain RFC-8259 JSON, so anything broken or
+        # hostile answering TURMA_URL can send it. queue_archive_sync runs on the
+        # beat loop, which is the container's main process (XERK-424 QA D1).
+        sm = self.make_manager()
+        for bad in (float("inf"), float("-inf"), float("nan"), {"a": 1}, [1], object()):
+            sm._note_archive_known({"t": bad})
+        self.assertNotIn("t", sm._archive_known)
+        # And the whole staging path must swallow it rather than kill the beat.
+        sm.queue_archive_sync({"archiveHave": {"t": float("inf")}})
+        # Keys are length-capped: bounding ENTRIES bounds no bytes on its own.
+        sm._note_archive_known({"x" * (ha.ARCHIVE_KNOWN_KEY_MAX + 1): 5, "": 5})
+        self.assertEqual([k for k in sm._archive_known if k], [])
+        # A negative cursor floors at 0 rather than reading as "less than zero".
+        sm._note_archive_known({"neg": -9})
+        self.assertEqual(sm._archive_known["neg"], 0)
+
+    def test_reply_cursors_reach_the_known_map(self):
+        # The map is the feature's only knowledge feed, and it is fed from the
+        # heartbeat reply. Nothing pinned that wiring, so deleting the call left
+        # the suite green (XERK-424 QA D5/M16).
+        sm = self.make_manager()
+        sm.queue_archive_sync({"archiveHave": {"t1": 40, "t2": 0}})
+        self.assertEqual(sm._archive_known.get("t1"), 40)
+        self.assertEqual(sm._archive_known.get("t2"), 0)
+
+    def test_rotation_survives_a_dip_below_the_cap(self):
+        # Candidates exclude WHOLE SLUGS backing a running session, and a root
+        # slug holds every root session's transcript — so one session going busy
+        # swings the count by hundreds. Resetting the cursor on every dip made
+        # the pool's head re-offered forever and its tail never reached
+        # (XERK-424 QA D2).
+        sm = self.make_manager()
+        wt_a = "/w/.turma/worktrees/Turma/aa"
+        wt_b = "/w/.turma/worktrees/Turma/bb"
+        for wt, n, base in ((wt_a, 6, 1_800_000_100), (wt_b, 8, 1_800_000_000)):
+            d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+            os.makedirs(d, exist_ok=True)
+            for i in range(n):
+                f = os.path.join(d, "%s%03d.jsonl" % (wt[-2:], i))
+                write_jsonl(f, [_text_entry("u", "user", "hi")])
+                os.utime(f, (base + i, base + i))
+        sm.usage_ledger = {w: {"repo": "Turma", "remote": "git@github.com:x/y.git",
+                               "slug": ha._project_slug(w)} for w in (wt_a, wt_b)}
+        sm.closed = []
+        seen = set()
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 7), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 3):
+            for beat in range(24):
+                # slug B goes busy on alternate beats, dipping the count under
+                # the cap and back over it.
+                sm.registry = ([{"id": "s", "worktreePath": wt_b, "status": "running"}]
+                               if beat % 2 else [])
+                seen |= {m["transcriptId"] for m in sm._archive_manifest()}
+        self.assertEqual(len(seen), 14, "a dip under the cap must not reset progress")
+
+    def test_rotation_is_not_starved_by_a_saturated_backlog(self):
+        # Given every backlog slot, transcripts that are known-short and cannot
+        # progress (a full store, a permanent per-transcript failure) squeeze the
+        # rotation to zero and nothing new is ever offered — the same cliff, one
+        # layer down (XERK-424 QA D3).
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 4):
+            # Everything the recent slice does not cover is known-short forever.
+            for m in sm._archive_manifest():
+                sm._note_archive_known({m["transcriptId"]: 0})
+            for m in sm._archive_manifest():
+                sm._note_archive_known({m["transcriptId"]: 0})
+            seen = set()
+            for _ in range(40):
+                got = sm._archive_manifest()
+                self.assertLessEqual(len(got), 10)
+                for m in got:
+                    seen.add(m["transcriptId"])
+                    sm._note_archive_known({m["transcriptId"]: 0})
+        self.assertEqual(len(seen), 40, "the rotation keeps slots of its own")
+
+    def test_backlog_is_oldest_first_and_never_duplicates(self):
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        sizes = {m["transcriptId"]: m["size"] for m in sm._archive_manifest()}
+        # Everything is known-short, so the backlog slice is fully populated.
+        sm._note_archive_known({t: 0 for t in sizes})
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 4):
+            got = [m["transcriptId"] for m in sm._archive_manifest()]
+        self.assertEqual(len(got), len(set(got)), "no id may take two slots")
+        backlog = got[4:]
+        known = [t for t in backlog if t in sizes]
+        self.assertTrue(known, "the backlog slice ran")
+        # Oldest first: t000 is the oldest, so it must beat its newer neighbours.
+        self.assertLess(known.index(min(known)), 2)
+
+    def test_a_complete_transcript_is_not_treated_as_short(self):
+        # `known <= size` instead of `<` makes every COMPLETE transcript count as
+        # missing, so the backlog slice spends itself on transcripts the hub
+        # already has while the genuinely short one waits for the rotation
+        # (XERK-424 QA D5/M07). The rotation still reaches it eventually, which
+        # is exactly why a coverage assertion does NOT catch this — the slice has
+        # to be checked for what it PICKED.
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        sizes = {m["transcriptId"]: m["size"] for m in sm._archive_manifest()}
+        # Everything complete except t010 — deliberately not the oldest, so a
+        # `<=` comparison fills the slice with older complete ones ahead of it.
+        sm._note_archive_known(sizes)
+        sm._note_archive_known({"t010": 0})
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 20), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 15):
+            got = [m["transcriptId"] for m in sm._archive_manifest()]
+        recent = got[:15]
+        self.assertNotIn("t010", recent, "the fixture only works below the recent slice")
+        self.assertIn("t010", got, "the one the hub is actually short of takes a backlog slot")
+
+    def test_known_map_evicts_least_recently_confirmed(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "ARCHIVE_KNOWN_MAX", 3):
+            sm._note_archive_known({"a": 1})
+            sm._note_archive_known({"b": 1})
+            sm._note_archive_known({"c": 1})
+            sm._note_archive_known({"a": 2})   # a is confirmed again -> youngest
+            sm._note_archive_known({"d": 1})   # evicts b, the oldest confirmation
+        self.assertEqual(sorted(sm._archive_known), ["a", "c", "d"])
+
+    def test_recent_slice_cannot_be_configured_away(self):
+        # RECENT >= MAX leaves no backlog and no rotation, silently reverting to
+        # the cliff. Both are env-settable (XERK-424 QA D5/M02).
+        sm = self.make_manager()
+        self._many_transcripts(sm, 40)
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 50):
+            seen = set()
+            for _ in range(30):
+                got = sm._archive_manifest()
+                self.assertLessEqual(len(got), 10, "the cap still bounds the heartbeat")
+                seen |= {m["transcriptId"] for m in got}
+        self.assertEqual(len(seen), 40)
+
+    def test_recent_slice_reclaims_unspent_raw_budget(self):
+        # The reservation is a FLOOR under the backlog, not a ceiling on the
+        # recent slice: what the backlog does not spend goes back (QA D4).
+        sm = self.make_manager()
+        slug = self._many_transcripts(sm, 40)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        for i in range(36, 40):   # only the NEWEST have sidecars
+            side = os.path.join(d, "t%03d" % i, "subagents")
+            os.makedirs(side, exist_ok=True)
+            for j in range(8):
+                write_jsonl(os.path.join(side, "agent-%d.jsonl" % j), [_text_entry("x", "user", "y")])
+        with mock.patch.object(ha, "ARCHIVE_MANIFEST_MAX", 10), \
+             mock.patch.object(ha, "ARCHIVE_MANIFEST_RECENT", 4), \
+             mock.patch.object(ha, "ARCHIVE_RAW_MANIFEST_FILES_MAX", 32):
+            out = sm._archive_manifest()
+        spent = sum(len(m.get("rawFiles") or []) for m in out)
+        self.assertEqual(spent, 32, "the backlog's unspent half returns to the newest")
+        self.assertLessEqual(spent, 32)
+
     def test_window_is_a_passthrough_below_the_cap(self):
         # The common case — a host with fewer transcripts than slots — must be
         # untouched by any of this, and must not rotate.

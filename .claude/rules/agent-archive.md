@@ -69,13 +69,36 @@ paths:
     than zero, and the rotation exists precisely to reach those. A reported cursor REPLACES what we
     held, including downwards — a reset or evicted archive answers smaller, and a high-water mark
     would leave that transcript looking complete here and missing there for good.
+    - **It may not raise**, because `queue_archive_sync` runs on the beat loop, which is the
+      container's main process. `int(float("inf"))` raises OverflowError — neither of the two
+      obvious exceptions — and a bare `1e400` is plain RFC-8259 JSON, so it is reachable from
+      anything broken or hostile answering `TURMA_URL`. Keys are length-capped as well as counted:
+      bounding ENTRIES bounds no bytes when one key may be a megabyte.
+  - **Three ways this reverts to a cliff, each closed deliberately.** They all look like tidying.
+    - **The rotation cursor is NEVER reset**, including on the under-the-cap passthrough.
+      Candidates exclude whole slugs backing a running session and a root slug holds every root
+      session's transcript, so one session going busy swings the count by hundreds; resetting on
+      each dip re-offered the pool's head forever and never reached its tail (200 of 400 never
+      offered in 200 beats). Taken modulo the pool size on use, so a stale cursor is always safe.
+    - **The known-short slice takes at most HALF the backlog slots.** Given all of them it starves
+      the rotation to nothing once enough transcripts are known-short and cannot progress — a full
+      store, a permanent per-transcript failure — and then nothing new is ever offered. It bites
+      the RAW layer hardest: a session whose sidecars are missing but whose transcript is complete
+      reads as known-COMPLETE, so only the rotation can ever reach it.
+    - **`ARCHIVE_MANIFEST_RECENT` is clamped to three quarters of the window.** At `>= MAX` there
+      is no backlog and no rotation at all, and both are env-settable.
   - **The backlog gets a reserved share of `ARCHIVE_RAW_MANIFEST_FILES_MAX`.** Spent in window
-    order the recent slice can exhaust it alone, and then the backlog's SIDECARS never ship however
-    often its transcripts are offered — which is invisible to any coverage check on transcripts,
-    since those sessions have rows and read back fine. A reservation, not a partition: the halves
-    run in sequence, so what one does not spend the other still gets.
-  - Tests: the `test_window_*`, `test_known_cursor_*` and `test_backlog_keeps_a_raw_budget_share`
-    cases in `TestArchiveSync`.
+    order the recent slice exhausts it alone, and then the backlog's SIDECARS never ship however
+    often its transcripts are offered — invisible to any coverage check on transcripts, since those
+    sessions have rows and read back fine. It is a FLOOR under the backlog, not a ceiling on the
+    recent slice: the backlog is served first at its floor, then a second pass hands whatever it
+    left back to the newest, so the budget is never under-spent.
+  - **`ARCHIVE_BEAT_BUDGET` deliberately has no such floor.** A manifest slot is re-contended every
+    beat where those bytes are not: running sessions are excluded, so a recent transcript's size is
+    fixed, spent down once and then skipped free on `have >= size`. A first sync costs the backlog
+    a few beats of delay, never starvation.
+  - Tests: the `test_window_*`, `test_known_map_*`, `test_rotation_*`, `test_backlog_*`,
+    `test_recent_slice_*` and `test_a_complete_transcript_*` cases in `TestArchiveSync`.
 - Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
   file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
   back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,
