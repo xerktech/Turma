@@ -117,6 +117,48 @@ release that *builds* the native agent also publishes an `agent-native-v<version
 alias release so hosts still on the legacy updater self-heal; that alias step is
 removed once the fleet is confirmed migrated.
 
+## Deploying the hub to k8x (automatic)
+
+The `k8x` hub is a Kubernetes Deployment in the private **xerktech/ArgoCD** repo
+(`ai/turma/deployment.yaml`), pinned by digest, with no Watchtower. Its Argo CD
+Application is `automated` + `selfHeal`, so a commit to that file *is* the
+deploy.
+
+`deploy-hub-image` runs after `publish` and rewrites the manifest's `image:` line
+to `ghcr.io/<owner>/turma:<version>@sha256:<digest>` — tag *and* digest, matching
+how the sibling `turma-agent` StatefulSet is pinned there. The digest comes from
+`build-turma-image`'s own build output, never re-resolved from the registry,
+because `:latest`/`:<version>` are mutable and a later release could otherwise
+hand the cluster a different image than the one that was just built.
+
+It runs **only when the `turma` component was actually built** (a carried hub is
+already the running image) and never on a dry run. Running it after `publish`
+means the cluster only ever receives an image belonging to a release that
+exists. If it fails, the release itself still stands — the tag, the images and
+the assets are already published; what the red job reports is that k8x is still
+on the previous image.
+
+The rewrite is `.github/scripts/argocd.js` (pure, unit-tested) driven by
+`argocd-cli.js`. It is a textual one-line edit on purpose: that manifest is
+mostly comments carrying the reasoning for every field, and a YAML round-trip
+would delete them on every release. It refuses to guess — no matching `image:`
+line, or more than one, fails the job rather than silently doing nothing.
+
+Configuration (Settings → Secrets and variables → Actions):
+
+- **Secret `ARGOCD_REPO_TOKEN`** *(required)* — a PAT with `contents: write` on
+  the GitOps repo. `GITHUB_TOKEN` is scoped to this repo only, so it cannot push
+  there. A missing secret **fails the job**; it deliberately does not skip,
+  because a silent skip is a cluster that quietly never updates and a pipeline
+  that still looks green.
+- **Variable `ARGOCD_REPO`** *(optional)* — defaults to `<owner>/ArgoCD`.
+- **Variable `ARGOCD_HUB_MANIFEST`** *(optional)* — defaults to
+  `ai/turma/deployment.yaml`.
+
+The cluster-side Turma **agent** (`ai/turma-agent`, a StatefulSet in the same
+repo) is still bumped by hand — deliberately, since restarting it kills every
+session that host is running.
+
 ## Known wrinkles
 
 - **Rapid merges leave patch-number gaps.** The release workflow serializes
