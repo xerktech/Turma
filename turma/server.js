@@ -3176,6 +3176,10 @@ const HEARTBEAT_MAX = BODY_INFLIGHT_MAX;
 // real task prompt; /api/trigger applies its own 10k cap on prompt alone.
 const SPAWN_FIELD_MAX = 100000;
 
+// One clone-progress line on the wire. The agent caps it too; this is the half
+// that does not trust the agent.
+const CLONE_PROGRESS_MAX = 120;
+
 // Top-level keys a heartbeat is known to carry — the agent's own payload plus
 // the on-demand `*Results` deliveries, which the handler extracts and deletes
 // from the payload itself before the spread. Anything else is bounded by
@@ -3466,6 +3470,39 @@ function normalizeRecord(a) {
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
   normalizeJira(a);
+  normalizeClones(a);
+}
+
+/**
+ * `clones[]` coerced to the shape every client types (XERK-369).
+ *
+ * There was no coercion here at all while Android types EVERY field on
+ * `CloneInfo` as a String and a full `/api/agents` decode is atomic there — so
+ * one host beating `clones: [{ status: 123 }]` threw the whole fleet array on
+ * every phone. That was latent before this change and is live the moment
+ * `progress` joins it, so both are fixed together, per the heartbeat contract
+ * in CLAUDE.md: typing a field and adding its hub-side coercion are the SAME
+ * change.
+ *
+ * Non-strings are DROPPED rather than stringified, so the client's own default
+ * ("" / absent) applies and nothing invents an "[object Object]" for the
+ * operator to read. `progress` is capped because it is agent-supplied,
+ * per-clone and unbounded on the wire otherwise — the shape that built a
+ * 23.8 MB reply and OOM-killed a hub in XERK-348.
+ */
+function normalizeClones(a) {
+  if (!a || typeof a !== "object") return;
+  if (!("clones" in a)) return;
+  if (!Array.isArray(a.clones)) { delete a.clones; return; }
+  a.clones = a.clones.filter((c) => c && typeof c === "object" && !Array.isArray(c));
+  for (const c of a.clones) {
+    for (const k of ["repo", "name", "status", "error", "source", "startedAt", "progress"]) {
+      if (k in c && typeof c[k] !== "string") delete c[k];
+    }
+    if (typeof c.progress === "string" && c.progress.length > CLONE_PROGRESS_MAX) {
+      c.progress = c.progress.slice(0, CLONE_PROGRESS_MAX);
+    }
+  }
 }
 
 /**
@@ -9295,6 +9332,8 @@ if (process.env.TURMA_TEST) {
     normalizeLocalModel,
     normalizeRetired,
     normalizeJira,
+    normalizeClones,
+    CLONE_PROGRESS_MAX,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported

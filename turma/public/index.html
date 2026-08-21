@@ -160,6 +160,10 @@
   .clone-bar.collapsed .clone-toggle .caret { transform: rotate(-90deg); }
   .clone-bar .clone-label { font-weight: 600; font-size: 13px; }
   .clone-bar .clone-note { color: var(--muted); font-weight: 400; font-size: 12px; }
+  /* The same muted note inside a running clone row, where it carries git's
+     progress line. Separate selector because .clone-note above is scoped to
+     .clone-bar and would otherwise render unstyled here. */
+  .clone-job .clone-note { color: var(--muted); font-weight: 400; font-size: 12px; }
   /* Expanded body: the picker row (search+list, free-text box, Clone button). */
   .clone-body {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px;
@@ -1133,8 +1137,15 @@ function cloneBar(a) {
   const open = cloneOpen.has(a.key);
   const clones = a.clones || [];
   const jobRows = clones.map(c => {
-    if (c.status === "cloning")
-      return `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(c.repo)}</b>…</div>`;
+    if (c.status === "cloning") {
+      // The progress line git wrote, when there is one. It arrives on the beat
+      // like everything else, so it steps rather than streams — which is still
+      // the difference between "this is moving" and a spinner that could equally
+      // be a hang. A small repo finishes inside one beat and never shows a
+      // number at all; that is fine, it also never looked stuck.
+      const prog = c.progress ? ` <span class="clone-note">${esc(c.progress)}</span>` : "";
+      return `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(c.repo)}</b>…${prog}</div>`;
+    }
     if (c.status === "done")
       return `<div class="clone-job done">✓ Cloned <b>${esc(c.name)}</b> — it should appear below shortly.</div>`;
     return `<div class="clone-job err">⚠ Clone of <b>${esc(c.repo)}</b> failed: ${esc(c.error || "unknown error")}</div>`;

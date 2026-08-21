@@ -167,5 +167,11 @@ fun cloneJobRow(job: CloneInfo): CloneJobRow = when (job.status) {
         "⚠ Clone of ${job.repo} failed: ${job.error.ifBlank { "unknown error" }}",
         done = false, failed = true,
     )
-    else -> CloneJobRow("Cloning ${job.repo}…", done = false, failed = false)
+    // Progress appended when the agent sent one, matching the web's muted note
+    // after the repo name. It arrives on the beat, so it steps rather than
+    // streams — still the difference between "moving" and a possible hang.
+    else -> CloneJobRow(
+        "Cloning ${job.repo}…".let { if (job.progress.isBlank()) it else "$it ${job.progress}" },
+        done = false, failed = false,
+    )
 }

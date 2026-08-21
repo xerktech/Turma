@@ -61,6 +61,53 @@ class CloneTest {
         assertEquals("cloning", a.clones.single().status)
     }
 
+    @Test
+    fun `a running clone shows the progress line the agent sent`() {
+        val row = cloneJobRow(
+            CloneInfo(repo = "octocat/Hello", status = "cloning",
+                      progress = "Receiving objects:  47% (2345/5000)"),
+        )
+        assertEquals("Cloning octocat/Hello… Receiving objects:  47% (2345/5000)", row.text)
+        assertFalse(row.done)
+        assertFalse(row.failed)
+    }
+
+    @Test
+    fun `no progress reads exactly as it did before`() {
+        // A repo that clones inside one beat never reports progress, and an
+        // older agent never sends the field at all. Neither may leave a
+        // trailing space or an empty note.
+        assertEquals("Cloning octocat/Hello…",
+                     cloneJobRow(CloneInfo(repo = "octocat/Hello", status = "cloning")).text)
+        assertEquals("Cloning octocat/Hello…",
+                     cloneJobRow(CloneInfo(repo = "octocat/Hello", status = "cloning",
+                                           progress = "   ")).text)
+    }
+
+    @Test
+    fun `progress is ignored once the job is no longer running`() {
+        // The agent stops sending it, but a stale one must not leak into the
+        // done/failed rows, which have their own wording.
+        assertEquals("✓ Cloned Hello — it should appear below shortly.",
+                     cloneJobRow(CloneInfo(repo = "octocat/Hello", name = "Hello",
+                                           status = "done", progress = "99%")).text)
+        assertEquals("⚠ Clone of octocat/Hello failed: boom",
+                     cloneJobRow(CloneInfo(repo = "octocat/Hello", status = "error",
+                                           error = "boom", progress = "99%")).text)
+    }
+
+    @Test
+    fun `a clone entry decodes when the hub sends no progress`() {
+        // The wire contract: an older agent omits the field entirely, and the
+        // decode must not throw for the whole fleet array.
+        val a = TurmaJson.decodeFromString(
+            AgentInfo.serializer(),
+            """{"key":"h1","online":true,
+                "clones":[{"repo":"octocat/Hello","name":"Hello","status":"cloning"}]}""",
+        )
+        assertEquals("", a.clones.single().progress)
+    }
+
     // --- candidate list -----------------------------------------------------
 
     @Test

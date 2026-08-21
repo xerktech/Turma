@@ -11720,6 +11720,57 @@ class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
         self.assertEqual(log_calls, [])            # docker logs not shelled out
         self.assertEqual(payload["logTail"], "cached")
 
+    def test_clone_progress_reads_the_last_carriage_return_token(self):
+        """`git --progress` updates IN PLACE with \r, so the log is one huge
+        line — splitting on newlines alone returns the whole thing."""
+        sm = self.make_manager()
+        import tempfile, os as _os
+        fd, path = tempfile.mkstemp()
+        with _os.fdopen(fd, "wb") as f:
+            f.write(b"Cloning into '/repos/X'...\n"
+                    b"Receiving objects:  10% (1/10)\r"
+                    b"Receiving objects:  47% (47/100)\r"
+                    b"Receiving objects:  91% (91/100)\r")
+        try:
+            job = {"status": "cloning", "logPath": path}
+            self.assertEqual(sm._clone_progress(job),
+                             "Receiving objects:  91% (91/100)")
+        finally:
+            _os.unlink(path)
+
+    def test_clone_progress_only_while_running_and_capped(self):
+        sm = self.make_manager()
+        import tempfile, os as _os
+        fd, path = tempfile.mkstemp()
+        with _os.fdopen(fd, "wb") as f:
+            f.write(b"x" * (ha.CLONE_PROGRESS_MAX + 200))
+        try:
+            # Capped: this is one status line on every beat, not a log.
+            out = sm._clone_progress({"status": "cloning", "logPath": path})
+            self.assertEqual(len(out), ha.CLONE_PROGRESS_MAX)
+            # And silent for a job that is not running, so a stale line cannot
+            # sit under a "done" row.
+            for st in ("done", "error"):
+                self.assertIsNone(sm._clone_progress({"status": st, "logPath": path}))
+        finally:
+            _os.unlink(path)
+
+    def test_clone_progress_survives_a_missing_or_partial_log(self):
+        """It is read while building a heartbeat, so nothing here may raise —
+        including a tail slice that lands mid-codepoint."""
+        sm = self.make_manager()
+        self.assertIsNone(sm._clone_progress({"status": "cloning", "logPath": None}))
+        self.assertIsNone(sm._clone_progress(
+            {"status": "cloning", "logPath": "/nonexistent/nope.log"}))
+        import tempfile, os as _os
+        fd, path = tempfile.mkstemp()
+        with _os.fdopen(fd, "wb") as f:
+            f.write(b"\xff\xfe partial")     # invalid utf-8
+        try:
+            self.assertIsNotNone(sm._clone_progress({"status": "cloning", "logPath": path}))
+        finally:
+            _os.unlink(path)
+
     def test_log_tail_throttled_across_beats(self):
         sm = self.make_manager()
         sm.registry = []
@@ -11900,6 +11951,9 @@ class TestClone(ManagerMixin, unittest.TestCase):
             # git clone <url> <dest> was launched (not a session run_ok call).
             args = popen.call_args[0][0]
             self.assertEqual(args[:2], ["git", "clone"])
+            # stdout is a FILE here, and git says nothing about progress unless
+            # asked — without this the UI has no sign a clone is moving.
+            self.assertIn("--progress", args)
             self.assertIn("https://github.com/xerktech/Turma.git", args)
             self.assertIn(dest, args)
         self.assertEqual(sm.clones["Turma"]["status"], "cloning")
@@ -11908,7 +11962,10 @@ class TestClone(ManagerMixin, unittest.TestCase):
         # The serializable view never leaks the Popen/file handles.
         payload = sm._clones_payload()[0]
         self.assertEqual(set(payload),
-                         {"name", "repo", "status", "error", "source", "startedAt"})
+                         {"name", "repo", "status", "error", "source", "startedAt",
+                          "progress"})
+        # Finished, so no stale progress rides under the "done" row.
+        self.assertIsNone(payload["progress"])
 
     def test_failed_clone_captures_error(self):
         sm = self.make_manager()

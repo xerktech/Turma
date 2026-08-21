@@ -316,6 +316,18 @@ triage and ticket-backed sessions. All of it lives in `hub-agent.py`.
 - A `clone` command `git clone`s a validated `owner/repo` (**allowlist-checked before it reaches
   git**) into `REPOS_ROOT` as a detached subprocess, reaped across later beats. Private-repo auth
   rides the system git credential helper (`gh auth git-credential`).
+  - **`--progress` is not optional.** stdout is a FILE, and git says nothing about progress unless
+    asked — without it a small repo's whole log is `Cloning into '/repos/X'...` (31 bytes, measured)
+    and the UI has no sign a clone is moving, which is how a working clone gets reported as broken.
+  - **`progress` on `_clones_payload` is ONE line, capped at both ends** (`CLONE_PROGRESS_MAX`,
+    agent and hub). It is read per running clone per beat, so it is a status line and not a log —
+    `_clone_log_tail` carries detail, and only on failure. Split on `\r` as well as `\n`: git
+    updates in place, so the log is one enormous line and a newline-only split returns all of it.
+  - **Every field on a `clones[]` entry is typed by Android**, so all of them are coerced in
+    `normalizeClones` — non-strings dropped, `progress` capped. A full `/api/agents` decode is
+    atomic there, so one host beating a number throws the whole fleet array on every phone.
+    Tests: `TestClone` in `test_hub_agent.py`, `normalizeClones` in `server.test.js`,
+    `clone.test.js`, `CloneTest.kt`.
 - **Multiple git sources (XERK-155)** — `gitSources` heartbeats the EXTRA sources beside `github`
   (contract unchanged, so gh-gated features keep reading it): the board's ADO org
   (`_apis/git/repositories`) and a GitLab host (`GITLAB_URL` + `GITLAB_TOKEN`,
