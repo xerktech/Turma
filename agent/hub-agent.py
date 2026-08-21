@@ -15317,7 +15317,9 @@ class SessionManager:
         """Push the byte-range deltas the hub is missing for each manifest entry,
         using the archiveHave cursors it returned. Append-only and bounded: at most
         ARCHIVE_BEAT_BUDGET bytes per pass, so a big backfill trickles across beats.
-        A failed POST just stops this pass — the next manifest re-offers it.
+        A failed POST costs that TRANSCRIPT, not the pass: a 4xx is permanent for
+        that chunk and skips it outright, anything else spends one of
+        ARCHIVE_FAILURES_MAX so a hub that is genuinely down still ends the pass.
 
         `shed_ids`/`store_full` are the hub's budget state from the same reply
         (XERK-267): transcripts already over their archive budget ship with their

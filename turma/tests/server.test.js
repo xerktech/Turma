@@ -1996,7 +1996,7 @@ test("the boot line states a sub-MiB archive ceiling as KiB, not as 0 MiB", () =
   assert.match(archiveChunkLabel(64 << 10), /KiB$/);
 });
 
-test("a refusal record is the NEWEST, is cleared by a chunk that lands, and is the hub's own words", async () => {
+test("a refusal record is the NEWEST, and is cleared by a chunk that lands", async () => {
   // Newest, because a transcript legitimately carries one per host after a
   // migration and the last failure is the one that explains why it is missing.
   noteArchiveRefusal("shared-tid", "hostOld", "the older reason");
@@ -2022,9 +2022,9 @@ test("a refusal record is the NEWEST, is cleared by a chunk that lands, and is t
   assert.equal(again.status, 200);
   assert.equal(archiveRefusalFor("trclear"), null, "a landed chunk clears it");
 
-  // And a store failure is recorded — and ANSWERED — in the hub's own words.
-  // `e.message` here is node:sqlite's, built out of agent-supplied fields, and
-  // this text reaches both a browser and the agent's log on the host.
+  // A non-scalar `meta` field is coerced away rather than thrown on. This is NOT
+  // a test of the 500 branch's wording — normalizeMeta makes this a 200, which is
+  // the point; the store-failure test above is the one that reaches the 500.
   const bad = await request("POST", "/api/agents/nas/archive/trbadmeta", {
     body: { startOffset: 0, endOffset: 4, size: 4, meta: { summary: { not: "text" } },
       entries: [{ uuid: "b1", role: "user", ts: null, text: "hi" }] },
@@ -2037,6 +2037,69 @@ test("a refusal record is the NEWEST, is cleared by a chunk that lands, and is t
   const view = await request("GET", "/api/archive/trbadmeta", { headers: userHeaders });
   assert.equal(view.status, 200);
   for (const [k, r] of [...archiveRefusals]) if (r.host.startsWith("host")) archiveRefusals.delete(k);
+});
+
+// Walk ARCHIVE_DIR for the organized file a transcript landed in. The name is
+// `<repo>/<date>__<summary>__<host>__<shortId>.jsonl`, and only the shortId (the
+// first 8 alnum characters of the id) is ours to predict.
+function findArchiveJsonl(transcriptId) {
+  const short = String(transcriptId).replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        const hit = walk(full);
+        if (hit) return hit;
+      } else if (e.name.endsWith(`__${short}.jsonl`)) return full;
+    }
+    return null;
+  };
+  return walk(process.env.ARCHIVE_DIR);
+}
+
+test("a store failure answers and RECORDS the hub's own words, never the driver's", async () => {
+  // This branch had no test at all: the only body the suite pushed at it was a
+  // non-scalar `meta`, which normalizeMeta now turns into a 200, so replacing
+  // the hub-authored string with `e.message` left both suites green while the
+  // hub served node:sqlite's and fs's words — built out of agent-supplied fields
+  // and carrying absolute /data paths — to a browser AND into every agent's log
+  // (XERK-356 QA pass 3, D1).
+  //
+  // So drive the failure the way it actually happens: land one chunk, then put a
+  // DIRECTORY where the archive file was, and let the next append EISDIR.
+  const tid = "trstorefail";
+  const meta = { repo: "turma", slug: "-w-sf", summary: "store fail" };
+  const first = await request("POST", `/api/agents/nas/archive/${tid}`, {
+    body: { startOffset: 0, endOffset: 4, size: 8, meta,
+      entries: [{ uuid: "s1", role: "user", ts: null, text: "hi" }] },
+    headers: agentHeaders,
+  });
+  assert.equal(first.status, 200);
+
+  const written = findArchiveJsonl(tid);
+  assert.ok(written, "the first chunk has to land somewhere before it can be broken");
+  fs.rmSync(written);
+  fs.mkdirSync(written);
+  try {
+    const boom = await request("POST", `/api/agents/nas/archive/${tid}`, {
+      body: { startOffset: 4, endOffset: 8, size: 8, meta,
+        entries: [{ uuid: "s2", role: "user", ts: null, text: "ho" }] },
+      headers: agentHeaders,
+    });
+    assert.equal(boom.status, 500);
+    // Spelled out, deliberately NOT imported from server.js: bound to the same
+    // constant the route reads, a mutation would move both and this would pass.
+    assert.equal(boom.body.error, "the hub could not store this chunk — see the hub log");
+    // The assertion the old test only claimed to make: nothing of the driver's,
+    // and no filesystem path, reaches either surface.
+    assert.doesNotMatch(boom.body.error, /EISDIR|SQLITE|sqlite|[/\\]/);
+    assert.equal(archiveRefusalFor(tid)?.error,
+      "the hub could not store this chunk — see the hub log",
+      "the record the operator reads says it too, not the driver's words");
+  } finally {
+    fs.rmSync(written, { recursive: true, force: true });
+    for (const [k, r] of [...archiveRefusals]) if (k.includes(tid)) archiveRefusals.delete(k);
+  }
 });
 
 test("one host's archive refusals cannot evict another host's", () => {

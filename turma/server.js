@@ -7455,15 +7455,11 @@ const server = http.createServer(async (req, res) => {
         archiveRefusals.delete(refusalKey(key, transcriptId));
         return json(res, 200, r);
       } catch (e) {
-        // The RECORD says what the operator can act on; the driver's own words
-        // stay in the hub log. `e.message` here is whatever `node:sqlite` or the
-        // filesystem produced from agent-supplied fields, and this record is
-        // served back to a browser (XERK-356 QA D9).
         // The driver's own words stay in the hub log, out of BOTH the record
         // and the reply: `e.message` here is whatever `node:sqlite` or the
-        // filesystem made of agent-supplied fields, the record is served to a
-        // browser, and the reply is what the agent logs on the host
-        // (XERK-356 QA D9).
+        // filesystem made of agent-supplied fields (absolute /data paths
+        // included), the record is served to a browser, and the reply is what
+        // the agent logs on the host (XERK-356 QA D9).
         console.error(`archive: could not store a chunk from ${key} for ${transcriptId}: ${e.message}`);
         const stored = "the hub could not store this chunk — see the hub log";
         noteArchiveRefusal(transcriptId, key, stored);
