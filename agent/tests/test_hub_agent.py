@@ -11720,6 +11720,55 @@ class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
         self.assertEqual(log_calls, [])            # docker logs not shelled out
         self.assertEqual(payload["logTail"], "cached")
 
+    def test_log_tail_never_publishes_dockers_own_error(self):
+        """A pod has no Docker socket, and `docker logs` then fails with its
+        error on STDERR — which this function merges into stdout. Publishing
+        that made the host card read "failed to connect to the docker API ..."
+        as if it were the agent's log, during whatever the operator happened to
+        be doing (a clone, when this was reported). Nothing was wrong with the
+        agent."""
+        class _Failed:
+            returncode = 1
+            stdout = ("failed to connect to the docker API at "
+                      "unix:///var/run/docker.sock; check if the path is correct "
+                      "and if the daemon is running: dial unix "
+                      "/var/run/docker.sock: connect: no such file or directory")
+        with mock.patch.object(ha.subprocess, "run", lambda *a, **k: _Failed()):
+            out = ha.log_tail("turma-agent-0")
+        self.assertEqual(out, ha.LOG_TAIL_UNAVAILABLE)
+        self.assertNotIn("docker API", out)
+
+    def test_log_tail_missing_binary_is_the_same_sentinel(self):
+        """And it must not be None. `_log_tail` refreshes whenever its cache is
+        None, so a None here puts a `docker logs` with a 15s timeout back on
+        EVERY beat — the beat-loop budget XERK-395 exists to protect."""
+        def _boom(*a, **k):
+            raise FileNotFoundError("docker")
+        with mock.patch.object(ha.subprocess, "run", _boom):
+            self.assertEqual(ha.log_tail("x"), ha.LOG_TAIL_UNAVAILABLE)
+        self.assertIsNotNone(ha.LOG_TAIL_UNAVAILABLE)
+
+    def test_log_tail_returns_the_log_when_docker_works(self):
+        class _Ok:
+            returncode = 0
+            stdout = "hello from the container\n"
+        with mock.patch.object(ha.subprocess, "run", lambda *a, **k: _Ok()):
+            # Byte-for-byte, trailing newline included: the success path is a
+            # tail slice and this change must not have touched it.
+            self.assertEqual(ha.log_tail("x"), "hello from the container\n")
+
+    def test_log_tail_unavailable_does_not_re_shell_every_beat(self):
+        """The sentinel is a STRING so the beat cache holds it. With a None the
+        throttle would never engage and every beat would shell out again."""
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        with mock.patch.object(ha, "log_tail",
+                               lambda cid: calls.append(cid) or ha.LOG_TAIL_UNAVAILABLE):
+            for beat in range(ha.LOG_TAIL_EVERY):
+                sm.build_payload(beat)
+        self.assertEqual(len(calls), 1, "an unavailable tail must still be cached")
+
     def test_log_tail_throttled_across_beats(self):
         sm = self.make_manager()
         sm.registry = []
