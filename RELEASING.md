@@ -130,8 +130,12 @@ it to `main`. It is skipped on a dry run (which pushes no image) and off `main`
 fails loudly if the manifest has no line to update, since a cluster that quietly
 never updates is the failure it exists to prevent.
 
-It needs one secret: **`ARGOCD_REPO_TOKEN`**, a PAT with `contents: write` on
-the GitOps repo — `GITHUB_TOKEN` is scoped to this repo only.
+It authenticates with a **write deploy key** on the GitOps repo, held as the
+secret **`ARGOCD_DEPLOY_KEY`** (the private half; the public half is a deploy
+key titled `turma-release` on that repo). Not a PAT: `GITHUB_TOKEN` is scoped to
+this repo, a classic PAT would carry a whole account into CI, and a fine-grained
+one expires — which fails as a deploy that silently stops happening. Revoke by
+deleting the deploy key.
 
 Two things it deliberately does not do. It does not fire for a **carried**
 (unchanged) hub, because the job it lives in doesn't run then; but "built" is

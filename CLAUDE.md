@@ -416,8 +416,8 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`), and a release DEPLOYS it** (XERK-425):
   the last step of `build-turma-image` rewrites that manifest's image tag to the build it just
   pushed, and the Application is `automated`, so merging hub code to main is what puts it in
-  production. It needs the `ARGOCD_REPO_TOKEN` secret and fails loudly without it; detail in
-  `.claude/rules/release.md`.
+  production. It needs the `ARGOCD_DEPLOY_KEY` secret (a write deploy key on that repo, not a
+  PAT) and fails loudly without it; detail in `.claude/rules/release.md`.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit — **except `k8x`, whose
   agent is a StatefulSet in xerktech/ArgoCD (`ai/turma-agent/`, XERK-369)**: one agent for the whole
   cluster, its kubeconfig its own ServiceAccount, and its image pinned there by tag with no

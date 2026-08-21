@@ -51,9 +51,12 @@ paths:
 - The last step of `build-turma-image` rewrites the `image:` line of the k8x hub's manifest in the
   private GitOps repo (`ai/turma/deployment.yaml` in xerktech/ArgoCD) to the tag it just pushed and
   commits it to main. That Application is `automated` + `selfHeal`, so **the commit is the deploy**.
-- **Every failure is loud**: no `ARGOCD_REPO_TOKEN` (a PAT — `GITHUB_TOKEN` can't reach another
-  repo), or no `image:` line to update, fails the step. A silent skip is a cluster that quietly
-  never updates behind a green pipeline.
+- **Every failure is loud**: no `ARGOCD_DEPLOY_KEY`, or no `image:` line to update, fails the
+  step. A silent skip is a cluster that quietly never updates behind a green pipeline.
+- It authenticates with a **write deploy key** on the GitOps repo, never a PAT — `GITHUB_TOKEN`
+  can't reach another repo, a classic PAT carries a whole account into CI, and a fine-grained one
+  **expires**, which surfaces as a deploy that silently stops happening. GitHub's host key is
+  pinned in the step rather than accepted on first use.
 - Skipped on a dry run (no image was pushed) and off **main** — `workflow_dispatch` takes any ref,
   and this is the one step that reaches production.
 - **"Built" is not "changed"**: `changes.js` maps the whole `turma/` prefix, so a test-only merge
