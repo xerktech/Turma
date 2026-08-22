@@ -34,6 +34,7 @@ that component's files.
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
 | `.claude/rules/release.md` | `.github/**`, `VERSION`, Dockerfiles | releases, PR gates, image tiers |
+| `.claude/rules/routing-eval.md` | `bench/archive/**`, the routing docs | archive-sourced replay eval: the requestId turn unit, curation gates, why routing is per-session |
 
 ### Editing these files
 
