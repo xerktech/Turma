@@ -1,7 +1,10 @@
 ---
 paths:
   - "turma/archive.js"
+  - "turma/tar.js"
   - "turma/tests/archive*.test.js"
+  - "turma/tests/restore.test.js"
+  - "turma/tests/tar.test.js"
 ---
 
 # The hub's durable archive (`turma/archive.js`)
@@ -217,3 +220,44 @@ what it ships, what bounds one delta, and when it sheds — is in `.claude/rules
   after a rebuild had read every one of them into memory. Tests: `__walkJsonl` is exported so the
   SKIP is pinned rather than that backstop.
 - Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.
+
+## Restoring an archived session onto another agent (XERK-441)
+
+`POST /api/archive/<transcriptId>/restore {host}` resumes an ENDED session on a live host. It is the
+reason the raw layer exists in a form nothing else reads: the rendered entries are a display copy
+(`{uuid, role, ts, text}`) and `claude --resume` cannot read them.
+
+- **The agent side is UNCHANGED, and must stay that way.** The hub writes the bundle
+  `_pack_transcript` would have written and queues the same `importSession`, so the download,
+  unpack, worktree re-creation and resume are the code that already moves a LIVE session. Anything
+  that makes a restore need its own agent command has gone wrong: the value here is that the risky
+  half is already proven by every migration.
+- **The layout is the contract**: members are session-relative — `<id>.jsonl` at the top, then
+  `<id>/subagents/…`, `<id>/workflows/…` — because the target unpacks straight into
+  `PROJECTS_ROOT/<slug>/`. The raw layer already stores each file under exactly that name, so the
+  two ends meet with no translation; a restore is a copy, not a conversion.
+- **A restore IS a migration record with no `srcHost`.** Nothing to export from and nothing to kill
+  on handoff (`advanceMigrations` skips the kill when the source host is absent), so it starts in
+  `exporting` — meaning "the hub is packing" — and flips to `importing` when the spool file is
+  written. Every phase, timeout, refusal and follow-the-spawn path then works unchanged, on both the
+  hub and the page. `restore: true` on the wire is what lets a client word it as a restore rather
+  than as a move from nowhere.
+- **Packing is async and off the request.** A bundle is tens of MiB read off `/data`, and the hub
+  serves every other client on one loop. The record may be failed or swept mid-pack, so the
+  completion re-checks the phase before queueing anything — the same race the relay upload settles.
+- **`turma/tar.js` streams; it must never buffer a bundle.** The hub runs at `mem_limit: 256m`, so a
+  bundle built in memory is a fraction of the container per concurrent restore. It writes plain
+  ustar — deliberately NOT the GNU/PAX long-name extension — and REPORTS what it could not name or
+  could not read in full rather than truncating a name (which would put one session's bytes under
+  another's path) or silently shipping a short file.
+- **Refusals are the product here**, not an afterthought: no raw copy, no recorded worktree, target
+  offline, target lacking the repo, and the conversation already running somewhere. That last one is
+  the invariant — a restore PRESERVES the transcript id, so two live sessions on one transcript
+  would be two claudes appending to one file and a `_session_transcript_path` that cannot say whose
+  it is.
+- **Not org-scoped, unlike a move.** `/migrate` compares the two AGENTS' orgs; an archived session
+  has no agent left to compare against, and the archive is hub-wide and already readable by whoever
+  is logged in. Do not "fix" this by inventing an org for the archive row.
+- Tests: `turma/tests/restore.test.js` (route + refusals + the bundle's bytes),
+  `turma/tests/tar.test.js` (the format, read back with python's `tarfile`),
+  the Restore cases in `turma/tests/sessions.test.js`.

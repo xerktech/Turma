@@ -189,6 +189,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     script + "\n;return { render, selectSession, followSpawn, toggleComposer, startSession,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
+      + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
       + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
@@ -579,6 +580,68 @@ test("Move excludes offline, other-org, and repo-less hosts", () => {
   assert.ok(menu.includes("hostB"), "the one eligible host is offered");
   assert.ok(!menu.includes("hostOff") && !menu.includes("hostOrg") && !menu.includes("hostNoRepo"),
     "offline / other-org / repo-less hosts are excluded");
+});
+
+// ---- restoring an archived session (XERK-441) --------------------------------
+// The archive outlives the host, so this control's targets are NOT the move's:
+// there is no source agent left to compare an org against.
+
+function restoreFleet(extra = []) {
+  const now = Date.now();
+  return { now, agents: [
+    { key: "hostA", device: "hostA", online: true, lastSeen: now,
+      repos: [{ name: "repoX" }], sessions: [] },
+    ...extra,
+  ] };
+}
+const archived = { transcriptId: "tid-1", repo: "repoX", host: "gone-host", entries: [] };
+
+test("Restore offers every online host that has the repo", () => {
+  const { beat, showRestore, toggleRestoreMenu, els } = loadPage();
+  beat(restoreFleet([
+    { key: "hostB", device: "hostB", online: true, lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [] },
+    { key: "hostOff", device: "hostOff", online: false, lastSeen: 0, repos: [{ name: "repoX" }], sessions: [] },
+    { key: "hostNoRepo", device: "hostNoRepo", online: true, lastSeen: Date.now(), repos: [{ name: "nope" }], sessions: [] },
+  ]));
+  showRestore(archived);
+  toggleRestoreMenu(click);
+  const menu = els.trRestoreMenu.innerHTML;
+  assert.ok(menu.includes("hostA") && menu.includes("hostB"), "both online hosts with the repo");
+  assert.ok(!menu.includes("hostOff"), "an offline host cannot take it");
+  assert.ok(!menu.includes("hostNoRepo"), "a host without the repo cannot take it");
+});
+
+test("Restore names the repo when nothing can take the session", () => {
+  // "No eligible agent" leaves the operator with nothing to do about it; the
+  // repo name is the actionable half — clone it somewhere.
+  const { beat, showRestore, toggleRestoreMenu, els } = loadPage();
+  beat(restoreFleet([]));
+  showRestore({ transcriptId: "tid-2", repo: "otherRepo", host: "gone-host" });
+  toggleRestoreMenu(click);
+  assert.match(els.trRestoreMenu.innerHTML, /No online agent has otherRepo cloned/);
+});
+
+test("picking a host posts the restore to the ARCHIVE, not to a source agent", () => {
+  const { beat, showRestore, toggleRestoreMenu, restoreTo, posts } =
+    loadPage({ postReply: { migrationId: "mig9" } });
+  beat(restoreFleet());
+  showRestore(archived);
+  toggleRestoreMenu(click);
+  restoreTo(click, "hostA");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/archive/tid-1/restore");
+  assert.deepEqual(posts[0].body, { host: "hostA" });
+});
+
+test("Restore is hidden until an archived transcript is open", () => {
+  const { beat, showRestore, hideRestore, toggleRestoreMenu, els } = loadPage();
+  beat(restoreFleet());
+  showRestore(archived);
+  hideRestore();
+  toggleRestoreMenu(click);
+  assert.equal(els.trRestoreMenu.innerHTML, "",
+    "with no archived view open there is nothing to restore");
+  assert.equal(els.trRestoreWrap.hidden, true);
 });
 
 test("picking a target posts the migrate command to the source host", () => {

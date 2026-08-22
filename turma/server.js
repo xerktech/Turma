@@ -34,6 +34,7 @@ const zlib = require("zlib");
 // node:sqlite FTS index). See archive.js. Lazily opens its DB on first use, so
 // requiring it is cheap and side-effect-free.
 const archive = require("./archive.js");
+const tar = require("./tar.js");
 // Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
 // FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
 const push = require("./push.js");
@@ -1495,6 +1496,9 @@ function sweepMigrationSpool() {
 function serializeMigration(m) {
   return {
     id: m.id, srcHost: m.srcHost, srcSessionId: m.srcSessionId,
+    // A restore from the archive (XERK-441) has no source session; the flag is
+    // what lets a client word it as one rather than as a move from nowhere.
+    restore: !!m.restore,
     targetHost: m.targetHost, siteKey: m.siteKey, repo: m.repo,
     transcriptId: m.transcriptId, phase: m.phase, error: m.error || null,
     importCmdId: m.importCmdId || null, targetSessionId: m.targetSessionId || null,
@@ -2006,6 +2010,123 @@ function startMigration(srcHost, s, targetHost) {
   migrations.set(id, m);
   queueCommand(srcHost, { type: "exportSession", sessionId: s.id, migrationId: id });
   publishMigrations();
+  return m;
+}
+
+// Restore an ARCHIVED session onto a live host (XERK-441).
+//
+// A migration relays a RUNNING session's transcript from the source agent. The
+// hub's own archive holds the same bytes for every session that ENDED — its raw
+// layer is a byte-for-byte copy of the session's own files (XERK-338) — so the
+// host being gone is not a reason its work is unreachable.
+//
+// The target half is unchanged: this writes the same bundle `_pack_transcript`
+// would have (`<id>.jsonl`, `<id>/subagents/…` relative to the project-slug dir)
+// into the same spool and hands it to the same `importSession`, so the agent
+// needs no new command and the download, unpack, worktree re-creation and resume
+// are the code that already moves a live session.
+//
+// The record IS a migration record with no `srcHost`: there is nothing to export
+// from and nothing to kill on handoff (`advanceMigrations` already skips the kill
+// when the source host is absent), so it starts in `exporting` — meaning "the hub
+// is packing" — and flips to `importing` once the spool file is written. That
+// keeps every phase, timeout, refusal and follow-the-spawn path exactly as it is.
+//
+// Packing is ASYNC and the route does not wait on it: a bundle is tens of MiB off
+// /data, and the hub serves every other client on this one loop.
+function startArchiveRestore(row, files, targetHost) {
+  if (migrations.size >= MIGRATIONS_MAX) {
+    let oldest = null;
+    for (const m of migrations.values()) {
+      if (m.phase === "done" || m.phase === "failed") {
+        if (!oldest || m.at < oldest.at) oldest = m;
+      }
+    }
+    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
+  }
+  const id = crypto.randomBytes(8).toString("hex");
+  const tgt = agents[targetHost] || null;
+  const m = {
+    id, srcHost: null, srcSessionId: null, targetHost,
+    // What this record IS, so the UI can word it as a restore rather than a move
+    // — a move that says "moving from nowhere" reads as a bug.
+    restore: true,
+    siteKey: siteKeyOf(tgt), repo: row.repo,
+    transcriptId: row.transcriptId,
+    meta: {
+      model: null, permissionMode: null, modelSource: null,
+      // The archive's own summary is the only name this session still has; the
+      // rest of the identity a move carries (model, mode, ticket) lived on the
+      // heartbeat of a host that is gone, so the resumed session takes the
+      // target's defaults. NOT `summaryManual`: the archive cannot tell an
+      // operator-typed name from a derived one, and claiming manual would stop
+      // the agent ever re-deriving it.
+      summary: row.summary || null, summaryManual: false,
+      label: null, ticket: null,
+    },
+    phase: "exporting",
+    blobPath: null, blobSize: 0, uploading: false,
+    importCmdId: null, targetSessionId: null,
+    refusal: null,
+    error: null, startedAt: Date.now(), at: Date.now(),
+  };
+  migrations.set(id, m);
+  publishMigrations();
+
+  const spool = migrationSpoolPath(id);
+  tar.packGzipTar(files, spool, MIGRATE_BLOB_MAX, { mtimeSec: Date.now() / 1000 })
+    .then((out) => {
+      // The record may have been failed or swept while the bytes were being
+      // written — the same race the migration relay's upload settles (a timeout
+      // can land mid-pack). Advancing anyway would queue an importSession for a
+      // restore the operator was already told had failed.
+      if (!migrations.has(id) || m.phase !== "exporting") {
+        try { fs.unlinkSync(spool); } catch {}
+        return;
+      }
+      // Never silent: a member the tar format cannot name, or a raw file shorter
+      // than the archive recorded, means the restored session is missing
+      // something. The conversation itself is checked at the route (a bundle
+      // without it is refused), so this is about the extras.
+      if (out.skipped.length || out.short.length) {
+        console.warn(`restore ${id}: bundle is incomplete — ` +
+          `${out.skipped.length} unnameable, ${out.short.length} short: ` +
+          [...out.skipped, ...out.short].slice(0, 5).join(", "));
+      }
+      m.blobPath = spool;
+      m.blobSize = out.bytes;
+      m.phase = "importing";
+      m.at = Date.now();
+      m.importCmdId = queueCommand(targetHost, {
+        type: "importSession",
+        migrationId: id,
+        transcriptId: row.transcriptId,
+        // The worktree path as the ARCHIVED host recorded it. The agent's
+        // `_localize_migrated_cwd` remaps its mount-independent
+        // `.turma/worktrees/<repo>/<dir>` tail onto THIS host's REPOS_ROOT, which
+        // is the same remap a cross-mount move relies on.
+        cwd: row.worktree,
+        repo: row.repo,
+        summary: m.meta.summary,
+        summaryManual: m.meta.summaryManual,
+        // Where this conversation came from, for the resumed session's own
+        // record. `sessionId` is null — an archived session has no live id, and
+        // inventing one would name a session that does not exist.
+        migratedFrom: { host: row.host || null, sessionId: null, at: Date.now(), fromArchive: true },
+      });
+      publishMigrations();
+    })
+    .catch((e) => {
+      if (!migrations.has(id)) return;
+      m.phase = "failed";
+      m.error = e && e.tooLarge
+        ? `this session's archived files are larger than the ${MIGRATE_BLOB_MAX}-byte bundle ceiling`
+        : "packing the archived session failed";
+      m.at = Date.now();
+      dropMigrationBlob(m);
+      publishMigrations();
+      console.error(`restore ${id}: pack failed: ${e && e.message}`);
+    });
   return m;
 }
 
@@ -7834,6 +7955,84 @@ const server = http.createServer(async (req, res) => {
           : { error: "unknown transcript" });
       }
       return json(res, 200, t);
+    }
+
+    // POST /api/archive/<transcriptId>/restore — resume an ARCHIVED session on a
+    // live host (XERK-441). Body: {host}, the target.
+    //
+    // This is the operator's own click on a session whose host may not exist any
+    // more, so it rides the user login like /migrate — and, unlike /migrate,
+    // there is no source agent to consult: everything it validates comes from the
+    // hub's own archive index and the target's heartbeat.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "restore" && parts.length === 4) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const target = typeof body.host === "string" ? body.host : "";
+      const row = archive.sessionRow(transcriptId);
+      if (!row) return json(res, 404, { error: "unknown transcript" });
+      if (!row.worktree)
+        return json(res, 409, {
+          error: "this archived session recorded no worktree path, so there is nowhere to resume it",
+        });
+      if (!row.repo)
+        return json(res, 409, { error: "this archived session recorded no repo" });
+      // The RENDERED entries are a display copy — `{uuid, role, ts, text}` — and
+      // `claude --resume` cannot read them. Only the raw layer's byte-for-byte
+      // files can be resumed, so a session archived before that layer existed, or
+      // one whose raw push never landed, is readable and not restorable. Say
+      // which, rather than failing later inside the agent.
+      const files = archive.listRawFiles(transcriptId) || [];
+      const packable = [];
+      let conversation = false;
+      for (const f of files) {
+        const full = archive.rawFileFor(transcriptId, f.path);
+        if (!full) continue;
+        if (f.path === `${transcriptId}.jsonl`) conversation = true;
+        packable.push({ name: f.path, path: full, size: f.bytes });
+      }
+      if (!conversation)
+        return json(res, 409, {
+          error: "the archive holds no raw copy of this session's conversation — " +
+                 "only the rendered transcript, which can be read but not resumed",
+        });
+      if (!target) return json(res, 400, { error: "a target host is required" });
+      const tgt = agents[target];
+      if (!tgt) return json(res, 404, { error: "unknown target host" });
+      if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
+        return json(res, 503, { error: "the target agent is offline" });
+      if (!(tgt.repos || []).some((r) => r && r.name === row.repo))
+        return json(res, 409, {
+          error: `the target agent doesn't have "${row.repo}" cloned — clone it there first`,
+        });
+      // One conversation, one session. A migration PRESERVES the transcript id,
+      // so restoring a conversation that is already running somewhere would put
+      // two live sessions on one transcript — two claudes appending to the same
+      // file, and a `_session_transcript_path` that cannot say whose it is.
+      for (const [host, a] of Object.entries(agents)) {
+        const live = (a.sessions || []).find(
+          (x) => x.transcriptId === transcriptId && x.status === "running");
+        if (live)
+          return json(res, 409, {
+            error: `that conversation is already running on ${host} — kill it there first`,
+          });
+      }
+      let inFlight = 0;
+      for (const m of migrations.values()) {
+        if (m.phase !== "exporting" && m.phase !== "importing") continue;
+        inFlight++;
+        if (m.transcriptId === transcriptId)
+          return json(res, 409, { error: "this session is already being restored" });
+      }
+      // The same ceiling a move is held to, and for the same reason: each
+      // in-flight bundle is up to 65 MiB spooled onto /data, which is shared with
+      // the archive itself.
+      if (inFlight >= MIGRATE_INFLIGHT_MAX)
+        return json(res, 503, {
+          error: `too many moves in flight (${MIGRATE_INFLIGHT_MAX}) — wait for one to finish`,
+        });
+      const m = startArchiveRestore(row, packable, target);
+      return json(res, 200, { ok: true, migrationId: m.id });
     }
 
     // GET /api/archive/<transcriptId>/raw — what the raw layer holds for that

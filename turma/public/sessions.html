@@ -199,6 +199,26 @@
   .term-bar .resume-btn:hover:not(:disabled) { filter: brightness(1.07); }
   .term-bar .resume-btn:disabled { opacity: 0.65; cursor: default; }
   .term-bar .resume-btn[hidden], .term-bar .tr-prs[hidden] { display: none; }
+  /* Restore's host picker hangs off the bar, so it needs a positioned parent of
+     its own — the bar itself scrolls its title. */
+  .term-bar .restore-wrap { position: relative; display: inline-flex; }
+  .term-bar .restore-wrap[hidden] { display: none; }
+  .term-bar .restore-menu {
+    position: absolute; top: calc(100% + 4px); right: 0; z-index: 30;
+    min-width: 180px; display: flex; flex-direction: column; padding: 4px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+  }
+  .term-bar .restore-menu button {
+    font: inherit; font-size: 12.5px; text-align: left; padding: 7px 9px;
+    background: none; border: 0; border-radius: 5px;
+    color: var(--ink); cursor: pointer; white-space: nowrap;
+  }
+  .term-bar .restore-menu button:hover { background: var(--accent-soft); }
+  .term-bar .restore-menu .restore-head,
+  .term-bar .restore-menu .restore-empty {
+    font-size: 11px; color: var(--muted); padding: 6px 9px 3px;
+  }
 
   /* New-session picker (top of the sidebar): each online host, its repos as spawn buttons. */
   details.spawn-wrap > summary {
@@ -834,6 +854,14 @@
           <span class="tr-prs" id="trPrs" hidden></span>
           <span class="verbosity" id="trVerbosity"></span>
           <button class="resume-btn" id="trResume" hidden onclick="resumeCurrentEnded()">Resume</button>
+          <!-- An ARCHIVED session (XERK-441): its host may not exist any more, so
+               the hub packs its archived files and hands them to another agent.
+               A sibling of Resume, not a replacement — Resume brings back a
+               session the hub still has a record of, on its OWN host. -->
+          <span class="restore-wrap" id="trRestoreWrap" hidden>
+            <button class="resume-btn" id="trRestore" onclick="toggleRestoreMenu(event)">Restore…</button>
+            <span id="trRestoreMenu"></span>
+          </span>
         </div>
         <div class="tr-scroll" id="trScroll"></div>
       </div>
@@ -1061,6 +1089,9 @@ function toggleCardMenu(ev, id) {
 }
 // Any click outside an open menu dismisses it (the menu itself stops the event).
 function closeCardMenu() {
+  // The restore picker lives on the stage bar rather than on a card, so it is
+  // dismissed here too — it stops its own clicks, like every other menu.
+  if (restoreMenuOpen) { restoreMenuOpen = false; renderRestoreMenu(); }
   if (menuOpenId === null && moveOpenId === null) return;
   menuOpenId = null;
   moveOpenId = null;
@@ -2881,6 +2912,81 @@ function resetEndedBar() {
   const $res = document.getElementById("trResume");
   if ($prs) { $prs.hidden = true; $prs.innerHTML = ""; }
   if ($res) { $res.hidden = true; }
+  hideRestore();
+}
+
+// ---- restoring an ARCHIVED session onto a live agent (XERK-441) --------------
+// The archive keeps a byte-for-byte copy of an ended session's own files, so the
+// conversation outlives its host. This is the control that hands those bytes to
+// an agent: the hub packs them and drives the SAME importSession a move does, so
+// what comes up is the session continuing, not a new one that read its history.
+//
+// Only the archive view offers it. The live/ended views have Resume, which is
+// the cheaper thing — the session's own host still has its worktree.
+let restoreMeta = null;     // {transcriptId, repo, host} of the open archived view
+let restoreMenuOpen = false;
+function hideRestore() {
+  restoreMeta = null;
+  restoreMenuOpen = false;
+  const $w = document.getElementById("trRestoreWrap");
+  const $m = document.getElementById("trRestoreMenu");
+  if ($m) $m.innerHTML = "";
+  if ($w) $w.hidden = true;
+}
+// Hosts that could take this session: online, and holding the repo it ran in.
+// Deliberately NOT org-scoped like eligibleMoveTargets — a move compares the two
+// AGENTS' orgs, and an archived session has no agent left to compare against;
+// the archive is hub-wide and already readable by whoever is logged in.
+function eligibleRestoreTargets(repo) {
+  return (cache.agents || []).filter(a =>
+    a.online && (a.repos || []).some(r => r && r.name === repo));
+}
+function showRestore(t) {
+  restoreMeta = { transcriptId: t.transcriptId, repo: t.repo || "", host: t.host || "" };
+  restoreMenuOpen = false;
+  const $w = document.getElementById("trRestoreWrap");
+  const $m = document.getElementById("trRestoreMenu");
+  if ($m) $m.innerHTML = "";
+  if ($w) $w.hidden = false;
+}
+function toggleRestoreMenu(ev) {
+  if (ev) ev.stopPropagation();
+  restoreMenuOpen = !restoreMenuOpen;
+  renderRestoreMenu();
+}
+function renderRestoreMenu() {
+  const $m = document.getElementById("trRestoreMenu");
+  if (!$m) return;
+  if (!restoreMenuOpen || !restoreMeta) { $m.innerHTML = ""; return; }
+  const targets = eligibleRestoreTargets(restoreMeta.repo);
+  $m.innerHTML = `<div class="restore-menu" onclick="event.stopPropagation()">
+    <div class="restore-head">Restore onto…</div>
+    ${targets.length
+      ? targets.map(a => `<button onclick="restoreTo(event,'${escJs(a.key)}')">${esc(a.device || a.key)}</button>`).join("")
+      : `<div class="restore-empty">No online agent has ${esc(restoreMeta.repo || "this repo")} cloned.</div>`}
+    <button onclick="toggleRestoreMenu(event)">Cancel</button>
+  </div>`;
+}
+async function restoreTo(ev, host) {
+  if (ev) ev.stopPropagation();
+  const meta = restoreMeta;
+  restoreMenuOpen = false;
+  renderRestoreMenu();
+  if (!meta) return;
+  // `post` toasts the hub's own refusal text and resolves null (XERK-264) — and
+  // the refusals here are the informative ones ("no raw copy", "already running
+  // on <host>"), so there is nothing to word locally.
+  const out = await post(`/api/archive/${enc(meta.transcriptId)}/restore`, { host }, "Restore");
+  if (!out) return;
+  if (out.migrationId) {
+    // Followed exactly like a move: the same migration record, the same
+    // importCmdId, so the page walks onto the restored session when it comes up.
+    pendingMigration = out.migrationId;
+    pendingMigrationFollowed = false;
+    toast("Restoring onto " + host + "…");
+  } else {
+    toast(out.error ? "Restore failed — " + out.error : "Restore failed");
+  }
 }
 async function openTranscript(id, title, hi) {
   resetEndedBar();
@@ -3070,6 +3176,7 @@ function transcriptBack() {
 // and verbosity control look identical. Falls back to null-safe when chat.js
 // somehow isn't loaded.
 function renderTranscript(t) {
+  showRestore(t);
   document.getElementById("trTitle").textContent = t.summary || t.repo || t.transcriptId;
   document.getElementById("trPath").textContent =
     [t.repo, t.host, shortDate(t.endedTs || t.createdAt)].filter(Boolean).join(" · ");

@@ -988,6 +988,19 @@ function listRawFiles(transcriptId) {
   return out;
 }
 
+/**
+ * The index row behind one archived session — where it ran and what of, which is
+ * what restoring it onto another host needs (XERK-441) and what the transcript
+ * read-back deliberately does not carry (it answers with the CONVERSATION).
+ * null when unknown.
+ */
+function sessionRow(transcriptId) {
+  openDb();
+  const row = db.prepare(`SELECT transcriptId, host, remoteKey, repo, worktree, summary,
+      createdAt, endedTs, msgCount, filePath FROM sessions WHERE transcriptId=?`).get(transcriptId);
+  return row || null;
+}
+
 /** One raw file's absolute path, for streaming it back. null when unknown. */
 function rawFileFor(transcriptId, rel) {
   openDb();
@@ -1252,7 +1265,7 @@ module.exports = {
   ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
   safeRawRel, rawDirFor, rawFilePath,
   totalArchiveBytes, totalForCeiling, __resetTotalCache,
-  searchArchive, listArchive, getTranscript,
+  searchArchive, listArchive, getTranscript, sessionRow,
   // Test seam. The raw layer's own `.jsonl` files carry no `.meta`, so the
   // rebuild would skip them anyway — this is exported so the SKIP itself can be
   // pinned rather than that backstop, because the skip is what stops a rebuild
