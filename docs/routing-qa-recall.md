@@ -37,11 +37,46 @@ marginal cost. The failures are not about reading code:
   reasoning about how a regex *executes* rather than what it matches, and both
   cloud tiers got it. Suggestive, not proven, on n=3.
 
-So fixing compaction is **necessary but not sufficient**. The hybrid experiment
-(local main model, cheap cloud model for compaction and small/fast work) is the
-right architecture and is wired and working -- both tiers behind one endpoint --
-but it did not settle the question, because compaction never fired in that run.
-**That is the experiment still to do.**
+### The compaction experiment, run
+
+The hypothesis was that compaction is the blocker: fix it and Nemotron becomes a
+contender. It was tested directly -- same task, same tree, a 90k window chosen
+to force compaction, varying only the model Claude Code uses for compaction and
+other small/fast work.
+
+| arm | compactions | recall |
+|---|---|---|
+| Nemotron compacting itself | 2 | **3/5** |
+| haiku-4-5 compacting for it | 1 | **3/5** |
+
+**Identical -- same three findings, same two misses.** Swapping the compactor
+changed nothing measurable. Both arms survived compaction and kept the task.
+
+That also retires the "empty summary" failure as a deterministic bug: here
+self-compaction worked twice in one session. It was variance, not a capability
+floor.
+
+### So compaction was never the blocker -- variance is
+
+Five local runs of the same review:
+
+| run | recall |
+|---|---|
+| unguided, self-compaction | 0/5 (looped, thrashed, died) |
+| guided, self-compaction | 4/5 |
+| no compaction fired | 2/5 |
+| forced compaction, self | 3/5 |
+| forced compaction, haiku | 3/5 |
+
+**mean 2.4/5, range 0-4.** haiku scored 4/5 and opus 5/5, each stable and
+on-task in a single run. Both compaction arms missed the same two findings --
+the specific redaction gaps and the deleted-file revert defect -- which haiku
+and opus caught.
+
+The honest conclusion: Nemotron's ceiling is real (4/5 at its best, and it did
+find the ReDoS in one run) but its *expected* value is about half of haiku's,
+and a QA gate is bought on the expected value, not the ceiling. **Fixing
+compaction does not move it.**
 
 ## Methodology note
 
