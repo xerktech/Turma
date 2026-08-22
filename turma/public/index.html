@@ -999,6 +999,13 @@ function render(data) {
     $groups.innerHTML = (data.agents || []).length
       ? `<div class="empty">No hosts report the selected orgs.<br>
          Change the org filter (or pick “All orgs”) in the header to see the rest of the fleet.</div>`
+      // "No hosts have reported yet" directly under a non-zero token tile reads
+      // as a bug. With retired spend counted (XERK-338) an empty fleet is two
+      // different situations, and only one of them is a hub nothing has ever
+      // beaten to.
+      : retired.length
+      ? `<div class="empty">No hosts are reporting.<br>
+         The tokens above were spent by ${retired.length === 1 ? "a host that has" : "hosts that have"} since been removed.</div>`
       : `<div class="empty">No hosts have reported yet.<br>
          Containers running the agent image heartbeat here automatically.</div>`;
     return;
@@ -1838,6 +1845,14 @@ function applyAgent(rec) {
   const list = cache.agents || (cache.agents = []);
   const i = list.findIndex(a => a.key === rec.key);
   if (i >= 0) list[i] = rec; else list.push(rec);
+  // A host the hub had RETIRED is beating again, so the hub has already stopped
+  // serving it on `retiredUsage` — but SSE only carries the agent record, and a
+  // page that keeps the stale retired entry counts that host's spend twice, live
+  // and retired, until something re-fetches. The poll is skipped entirely while
+  // the stream is healthy, so "until something re-fetches" is "until reload".
+  if (cache.retiredUsage && cache.retiredUsage.length) {
+    cache.retiredUsage = cache.retiredUsage.filter(r => r.key !== rec.key);
+  }
   cache.now = Date.now();
 }
 function connectSSE() {
@@ -1852,7 +1867,11 @@ function connectSSE() {
   es.addEventListener("removed", (e) => {
     try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
     catch { return; }
-    bgRender();
+    // Removing a host MOVES its spend to `retiredUsage`, which this event does
+    // not carry — so dropping it from `agents` alone makes the token tiles fall
+    // by everything that host ever spent. That is the exact disappearance this
+    // page was fixed to stop, just on a longer clock, so it costs one fetch.
+    refresh();
   });
   // An org's color pin changed (XERK-145): org.js owns the live map; patching
   // this page's cache keeps the next render's TurmaOrg.update(cache) from

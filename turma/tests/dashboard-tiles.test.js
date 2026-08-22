@@ -38,13 +38,16 @@ function makeEl() {
   return el;
 }
 
-// Load the page's inline script and hand back { render, els }. `orgFilter` is
+// Load the page's inline script and hand back { render, els, … }. `orgFilter` is
 // the header's org control, stubbed as identity ("All orgs") unless a test
-// narrows it.
-function loadDashboard(orgFilter = (a) => a || []) {
+// narrows it; `fetchReply` is what the page's own /api/agents poll resolves to,
+// so the SSE tests can watch it re-fetch.
+function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const html = fs.readFileSync(path.join(__dirname, "..", "public", "index.html"), "utf8");
   const src = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   const els = {};
+  const sse = [];
+  const fetches = [];
   const noop = () => {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
@@ -60,8 +63,20 @@ function loadDashboard(orgFilter = (a) => a || []) {
       setItem(k, v) { this._m[k] = String(v); }, removeItem(k) { delete this._m[k]; } },
     location: { pathname: "/", href: "", search: "" },
     navigator: { userAgent: "node" },
-    fetch: () => new Promise(() => {}),
-    EventSource: class { addEventListener() {} close() {} },
+    fetch: (u) => {
+      fetches.push(String(u));
+      return fetchReply
+        ? Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply()) })
+        : new Promise(() => {});
+    },
+    // Captures the page's SSE handlers so a test can deliver a real `agent` /
+    // `removed` event, which is the only way to reach the live-update path — the
+    // fallback poll is skipped entirely while the stream is healthy.
+    EventSource: class {
+      constructor() { sse.push(this); this.handlers = {}; this.readyState = 1; }
+      addEventListener(name, fn) { this.handlers[name] = fn; }
+      close() {}
+    },
     setInterval: () => 0, clearInterval: noop, setTimeout: () => 0, clearTimeout: noop,
     matchMedia: () => ({ matches: false, addEventListener: noop }),
     history: { replaceState: noop, pushState: noop },
@@ -74,10 +89,13 @@ function loadDashboard(orgFilter = (a) => a || []) {
   };
   g.window = g; g.globalThis = g;
   const keys = Object.keys(g);
-  const fn = new Function(...keys, src + "\n;return { render, fmtTokens };");
-  return Object.assign(fn(...keys.map((k) => g[k])), { els });
+  const fn = new Function(...keys, src +
+    "\n;return { render, fmtTokens, applyAgent, connectSSE," +
+    " setCache: (c) => { cache = c; }, getCache: () => cache };");
+  return Object.assign(fn(...keys.map((k) => g[k])), { els, sse, fetches });
 }
 
+const bucket = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
 const usage = (n) => ({
   totals: { input: n, output: 0, cacheWrite: 0, cacheRead: 0 },
   today: { input: n, output: 0, cacheWrite: 0, cacheRead: 0 },
@@ -164,4 +182,62 @@ test("dashboard tiles: a fleet whose only spender was removed still shows its to
   D.render({ now: Date.now(), agents: [], retiredUsage: [retiredHost("gone", 900)] });
   assert.equal(tileOf(D.els.tiles.innerHTML, "Tokens all-time").value, D.fmtTokens(900));
   assert.equal(tileOf(D.els.tiles.innerHTML, "Hosts online").value, "0 / 0");
+});
+
+test("dashboard tiles: the dominant-model hint counts a removed host's models", () => {
+  // The models line is fed from the same list as the totals; a mutant reading
+  // only `agents` there passed the whole suite, and the tile then names the
+  // wrong model on a fleet whose biggest spender has been removed.
+  const D = loadDashboard();
+  const live = liveHost("live", 10);
+  live.usage.models = [{ model: "claude-haiku-4-5", totals: bucket(10), today: bucket(10), week: bucket(10) }];
+  const gone = retiredHost("gone", 900);
+  gone.usage.models = [{ model: "claude-opus-4-8-20260101", totals: bucket(900), today: bucket(900), week: bucket(900) }];
+  D.render({ now: Date.now(), agents: [live], retiredUsage: [gone] });
+  assert.match(tileOf(D.els.tiles.innerHTML, "Tokens all-time").hint, /mostly opus-4-8/);
+});
+
+test("dashboard: an empty fleet with retired spend says where the tokens came from", () => {
+  // "No hosts have reported yet" directly under a non-zero token tile reads as a
+  // bug — and it is the one case where the tiles and the empty state can only be
+  // reconciled by saying it out loud.
+  const D = loadDashboard();
+  D.render({ now: Date.now(), agents: [], retiredUsage: [retiredHost("gone", 900)] });
+  assert.match(D.els.groups.innerHTML, /since been removed/);
+  assert.doesNotMatch(D.els.groups.innerHTML, /No hosts have reported yet/);
+
+  // A hub nothing has ever beaten to still says so.
+  const D2 = loadDashboard();
+  D2.render({ now: Date.now(), agents: [], retiredUsage: [] });
+  assert.match(D2.els.groups.innerHTML, /No hosts have reported yet/);
+});
+
+// ---- live updates: the tiles must not drift on an open page ------------------
+// The fallback poll is SKIPPED while SSE is healthy, and SSE carries only the
+// per-agent record — so anything the tiles read that is not on that record has
+// to be handled where the event lands, or the page is wrong until it reloads.
+
+test("dashboard: removing a host re-fetches, so its spend moves rather than vanishing", () => {
+  const D = loadDashboard(undefined, () => ({
+    now: Date.now(), agents: [liveHost("stay", 100)], retiredUsage: [retiredHost("gone", 900)],
+  }));
+  D.setCache({ now: Date.now(), agents: [liveHost("stay", 100), liveHost("gone", 900)], retiredUsage: [] });
+  D.connectSSE();
+  const es = D.sse[D.sse.length - 1];
+  const before = D.fetches.length;
+  es.handlers.removed({ data: JSON.stringify({ key: "gone" }) });
+  assert.ok(D.fetches.length > before && D.fetches.includes("/api/agents"),
+    "a removal is the one event that moves spend between the two lists — it must re-poll");
+});
+
+test("dashboard: a retired host that comes back is not counted twice", () => {
+  // The hub stops serving it on `retiredUsage` the moment it beats again, but
+  // this event does not carry that list — so a stale entry left in the cache
+  // charts the same host live AND retired.
+  const D = loadDashboard();
+  D.setCache({ now: Date.now(), agents: [], retiredUsage: [retiredHost("back", 900)] });
+  D.applyAgent(liveHost("back", 900));
+  D.render(D.getCache());
+  assert.equal(tileOf(D.els.tiles.innerHTML, "Tokens all-time").value, D.fmtTokens(900));
+  assert.equal((D.getCache().retiredUsage || []).length, 0);
 });

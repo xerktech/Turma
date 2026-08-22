@@ -165,6 +165,15 @@ hub half.
   `lastActivity`.
 - A hub without FCM banners "mobile push is off" (`#pushWarn`) on `pushEnabled === false` — strict,
   so an older hub never false-alarms.
+- **A live-update event carries the agent record, never `retiredUsage`** (XERK-338), and both this
+  page and `/usage` skip the fallback poll entirely while SSE is healthy — so the cached retired
+  list is whatever the page LOADED with unless the event handlers maintain it. Two do:
+  - `removed` **re-fetches**: removing a host MOVES its spend from `agents` to `retiredUsage`, so
+    patching `agents` alone drops everything that host ever spent off the token tiles — the exact
+    disappearance the tiles were fixed to stop, on a longer clock.
+  - `applyAgent` **drops that key from the cached `retiredUsage`**: a retired host beating again is
+    already off the hub's list, and a stale entry charts and totals it twice, live and retired.
+  - Tests: the live-update cases in `dashboard-tiles.test.js`, `usage.test.js`.
 
 ### Per-repo controls
 

@@ -91,7 +91,8 @@ function loadHelpers() {
     blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView,
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
-    hostLabel, hostSeries, repoSeries };`;
+    hostLabel, hostSeries, repoSeries,
+    applyAgent, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
   return Object.assign(new Function(...keys, body)(...keys.map((k) => stubs[k])), { els });
@@ -1001,4 +1002,16 @@ test("the chart itself is drawn from the retired spend too", () => {
   // the axis happening to read 20.
   H.render({ agents: [agent("live", 5)] });
   assert.ok(!seen().includes("20"), "the axis must not read 20 without the retired host");
+});
+
+test("a retired host that comes back is not charted twice", () => {
+  // The hub stops serving it on `retiredUsage` the moment it beats again, but
+  // the SSE `agent` event does not carry that list — and the fallback poll is
+  // skipped entirely while the stream is healthy. A stale entry left in the
+  // cache charts and totals the same host live AND retired until a reload.
+  const H2 = loadHelpers();
+  H2.setCache({ now: Date.now(), agents: [], retiredUsage: [retiredHost("back", 7)] });
+  H2.applyAgent({ key: "back", device: "back", online: true, usage: hostUsage(7, 7, 7), repoUsage: [] });
+  assert.equal((H2.getCache().retiredUsage || []).length, 0);
+  assert.equal(H2.getCache().agents.length, 1);
 });

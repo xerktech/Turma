@@ -54,6 +54,7 @@ import com.xerktech.turma.core.fleetSummary
 import com.xerktech.turma.core.liveState
 import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.scopedAgents
+import com.xerktech.turma.core.scopedRetired
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.core.siteKeyOf
@@ -78,7 +79,13 @@ fun FleetScreen(
     // Spend from hosts the hub no longer has (XERK-338), scoped by the same org
     // control. Feeds the TOKEN TILES only — these are not hosts, so they stay out
     // of `agents` and off the host list. See `fleetSummary`.
-    val retired = remember(fleet.retiredUsage, org) { scopedAgents(fleet.retiredUsage, org) }
+    //
+    // `scopedRetired`, not `scopedAgents`: the org self-heal is computed from the
+    // LIVE fleet, which is what org.js does. Scoping the retired list against
+    // itself counts other orgs' removed hosts under a live org's scope.
+    val retired = remember(fleet.retiredUsage, fleet.agents, org) {
+        scopedRetired(fleet.retiredUsage, fleet.agents, org)
+    }
     // Org card tints (XERK-142) come from the WHOLE fleet's org set, not the scoped
     // one, so a host card keeps its colour regardless of the header's org filter.
     val orgColors = remember(fleet.agents, fleet.orgColors) {
@@ -132,7 +139,16 @@ fun FleetScreen(
                                 fleet.agents.isNotEmpty() ->
                                     "No hosts report the selected orgs. Change the org filter (or pick “All orgs”) in the header."
                                 fleet.loading -> "Loading fleet…"
-                                else -> fleet.error ?: "No hosts reporting."
+                                // "No hosts reporting" directly under a non-zero
+                                // token tile reads as a bug. With retired spend
+                                // counted (XERK-338) an empty fleet is two
+                                // situations, and only one is a hub nothing has
+                                // ever beaten to. Worded as index.html words it.
+                                else -> fleet.error ?: if (retired.isNotEmpty()) {
+                                    "No hosts are reporting. The tokens above were spent by " +
+                                        (if (retired.size == 1) "a host that has" else "hosts that have") +
+                                        " since been removed."
+                                } else "No hosts reporting."
                             },
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

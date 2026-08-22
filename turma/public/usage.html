@@ -1384,6 +1384,14 @@ function applyAgent(rec) {
   const list = cache.agents || (cache.agents = []);
   const i = list.findIndex(a => a.key === rec.key);
   if (i >= 0) list[i] = rec; else list.push(rec);
+  // A host the hub had RETIRED is beating again, so the hub has already stopped
+  // serving it on `retiredUsage` (that list is "hosts the registry no longer
+  // has"). This event does not carry the list, and the poll that would is
+  // skipped while the stream is healthy — so a stale entry left here charts and
+  // totals that host's spend TWICE, live and retired, until the page reloads.
+  if (cache.retiredUsage && cache.retiredUsage.length) {
+    cache.retiredUsage = cache.retiredUsage.filter(r => r.key !== rec.key);
+  }
   cache.now = Date.now();
 }
 function connectSSE() {

@@ -92,6 +92,17 @@ class FleetTest {
         assertEquals(false, s.retiredCounted)
     }
 
+    // The wiring, not just the reducer: `fleetSummary` must pass the retired list
+    // to `fleetTopModels`. Asserting `fleetTopModels` directly leaves that edge
+    // unpinned — a mutant dropping it from the summary passed the whole suite.
+    @Test fun `the summary's top models count a removed host too`() {
+        val live = agent("live", usage = UsageInfo(models = listOf(
+            ModelUsage("claude-haiku-4-5", totals = bucket(10)))))
+        val gone = agent("gone", online = false, usage = UsageInfo(models = listOf(
+            ModelUsage("claude-opus-4-8-20260101", totals = bucket(100)))))
+        assertEquals("opus-4-8, haiku-4-5", fleetSummary(listOf(live), listOf(gone)).topModels)
+    }
+
     @Test fun `top models count a removed host too`() {
         val live = agent("live", usage = UsageInfo(models = listOf(
             ModelUsage("claude-haiku-4-5", totals = bucket(10)))))
