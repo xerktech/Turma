@@ -51,11 +51,13 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const timers = [];
   const noop = () => {};
   let activeTagName = null;
+  const docHandlers = {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
     createElement() { return makeEl(); },
     querySelector() { return null; }, querySelectorAll() { return []; },
-    addEventListener: noop, removeEventListener: noop,
+    addEventListener(name, fn) { (docHandlers[name] ||= []).push(fn); },
+    removeEventListener: noop,
     get activeElement() { return activeTagName ? { tagName: activeTagName } : null; },
     body: makeEl(), title: "",
   };
@@ -105,7 +107,8 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
     for (const t of due) await t.fn();
   };
   return Object.assign(api, { els, sse, fetches, timers, runTimers,
-    setActiveTagName: (t) => { activeTagName = t; } });
+    setActiveTagName: (t) => { activeTagName = t; },
+    fire: (name) => { for (const fn of docHandlers[name] || []) fn({}); } });
 }
 
 const bucket = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
@@ -313,4 +316,50 @@ test("dashboard: the empty-state line agrees with itself on one removed host", (
   D2.render({ now: Date.now(), agents: [],
     retiredUsage: [retiredHost("g1", 900), retiredHost("g2", 900)] });
   assert.match(D2.els.groups.innerHTML, /hosts that have since been removed/);
+});
+
+test("dashboard: a repaint skipped for an open <select> is re-armed, not lost", async () => {
+  // The guard's whole safety rests on "the next render will show it" — and when
+  // the hosts that were removed WERE the fleet, there is no next beat. Without a
+  // re-arm the page paints hosts that no longer exist for as long as the tab is
+  // open: measured at 30s and still counting, with cache.agents already empty.
+  const D = loadDashboard(undefined, () => ({ now: Date.now(), agents: [], retiredUsage: [retiredHost("gone", 900)] }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: [liveHost("gone", 900)], retiredUsage: [] });
+  D.render(D.getCache());
+  assert.match(D.els.tiles.innerHTML, /1 \/ 1/, "the host is on screen to begin with");
+
+  D.setActiveTagName("SELECT");
+  D.connectSSE();
+  const es = D.sse[D.sse.length - 1];
+  es.handlers.removed({ data: JSON.stringify({ key: "gone" }) });
+  await D.runTimers();
+  await settle();
+  assert.match(D.els.tiles.innerHTML, /1 \/ 1/, "still painted while the popup is open");
+
+  // The operator picks an option / clicks away.
+  D.setActiveTagName(null);
+  D.fire("focusout");
+  await D.runTimers();
+  assert.match(D.els.tiles.innerHTML, /0 \/ 0/, "and the skipped repaint lands");
+  assert.equal(tileOf(D.els.tiles.innerHTML, "Tokens all-time").value, D.fmtTokens(900));
+});
+
+test("dashboard: a LATER removal still re-fetches, after an earlier one settled", async () => {
+  // The coalescing timer clears its own handle before fetching; a mutant that
+  // drops that clear makes the first burst work and every later removal do
+  // nothing at all, forever, which no single-burst test can see.
+  const D = loadDashboard(undefined, () => ({ now: Date.now(), agents: [], retiredUsage: [] }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: [liveHost("a", 1), liveHost("b", 1)], retiredUsage: [] });
+  D.connectSSE();
+  D.fetches.length = 0;
+  const es = D.sse[D.sse.length - 1];
+  es.handlers.removed({ data: JSON.stringify({ key: "a" }) });
+  await D.runTimers();
+  await settle();
+  es.handlers.removed({ data: JSON.stringify({ key: "b" }) });
+  await D.runTimers();
+  await settle();
+  assert.equal(D.fetches.filter(u => u === "/api/agents").length, 2);
 });

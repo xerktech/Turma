@@ -173,7 +173,16 @@ hub half.
     disappearance the tiles were fixed to stop, on a longer clock.
   - `applyAgent` **drops that key from the cached `retiredUsage`**: a retired host beating again is
     already off the hub's list, and a stale entry charts and totals it twice, live and retired.
+  - Coalesced, both pages: the hub emits one `removed` PER HOST inside its registry-eviction loop,
+    so one fetch per event multiplies the hub's heaviest read by the eviction size, per open tab.
   - Tests: the live-update cases in `dashboard-tiles.test.js`, `usage.test.js`.
+- **A background repaint the `<select>` guard skips is RE-ARMED** (`bgRender` + `flushSkippedRender`
+  on `focusout`/`change`, deferred a tick so `activeElement` has moved). The guard exists because a
+  full `#groups` swap closes a native popup mid-selection, and it used to rest on "the next render
+  will show it" — but the fallback poll returns early while SSE is healthy and `bgRender` is
+  otherwise only re-entered by the next BEAT, so when the hosts that were removed WERE the fleet
+  there is no next beat and the page paints hosts that no longer exist for as long as the tab is
+  open. Any new background update must go through `bgRender`, never `render`.
 
 ### Per-repo controls
 

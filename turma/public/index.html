@@ -1826,13 +1826,29 @@ async function refresh() {
 // A full-tree innerHTML swap closes any native <select> popup the user has open
 // (the clone repo picker, the composer dropdowns) mid-selection. So background
 // updates (the poll AND the SSE push) skip the re-render while a <select> is
-// focused; the data still lands in `cache` and shows on the next render once
-// they pick an option or click away. User-driven renders (actions, toggles) go
-// through render() directly and are never gated.
+// focused; the data still lands in `cache`. User-driven renders (actions,
+// toggles) go through render() directly and are never gated.
+//
+// A skipped repaint is RE-ARMED, because nothing else will do it: the fallback
+// poll returns early while SSE is healthy, and `bgRender` is otherwise only
+// re-entered by the next beat. With no beat to come — the removed hosts WERE the
+// fleet, or the rest are offline — the page kept painting hosts that no longer
+// exist, indefinitely. So the skip is remembered and flushed when the select is
+// done with, deferred a tick so `activeElement` has actually moved by then.
+let bgSkipped = false;
 function bgRender() {
-  if (document.activeElement && document.activeElement.tagName === "SELECT") return;
+  if (document.activeElement && document.activeElement.tagName === "SELECT") {
+    bgSkipped = true;
+    return;
+  }
+  bgSkipped = false;
   render(cache);
 }
+function flushSkippedRender() {
+  if (bgSkipped) setTimeout(bgRender, 0);
+}
+document.addEventListener("focusout", flushSkippedRender);
+document.addEventListener("change", flushSkippedRender);
 
 // A background re-fetch, coalesced. Only `removed` needs one — it is the single
 // event that moves spend between `agents` and `retiredUsage`, and just that one
