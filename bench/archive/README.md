@@ -38,11 +38,15 @@ client context. Keep it outside the repo. Only `scrub.py` output is committable.
 | `classify.py` | classifies every turn and reports the split, weighted by tokens |
 | `curate.py` | builds replay tasks from sessions that landed a merge commit |
 | `scrub.py` | redacts secrets and marks client-sensitive tasks `local-only` |
-| `tasks-archive.json` | the full curated pool, 57 tasks, including what failed the gate |
+| `tasks-archive.json` | the full curated pool, 57 accepted tasks |
 | `tasks-validated.json` | **the eval set** — 25 tasks proven red-then-green and leak-free |
 
-Benchmark against `tasks-validated.json`. The pool file exists so the gate's
-decisions stay auditable, not to be run.
+Benchmark against `tasks-validated.json`. The pool file holds the curated tasks
+that did NOT pass validation as well as those that did — it does not hold the
+candidates the leak gate rejected. Those are in `curate.py --report`'s ledger,
+which records the repo, ticket, commit and reason but **not the prompt**, and is
+not committed: re-deriving it needs the corpus. Auditing whether a gate decision
+was right currently means re-running curation with the corpus to hand.
 
 ```bash
 python3 bench/archive/classify.py --corpus corpus --json classify.json

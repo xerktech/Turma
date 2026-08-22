@@ -50,6 +50,13 @@ class TestLeakGate(unittest.TestCase):
             self.assertEqual(CU._leaks_answer(prompt, self.IMPL, self.TESTS),
                              "not a user ask", prompt)
 
+    def test_the_change_marker_anywhere_in_the_prompt(self):
+        # The pattern is (?im) so it matches at any line start, not only the
+        # first. Nothing pinned that, and (?i) alone passes every other test.
+        self.assertEqual(CU._leaks_answer(
+            "Please look at this.\nTHE CHANGE: render() now clears the stage.",
+            [], []), "not a user ask")
+
     def test_research_ask_is_not_a_task(self):
         self.assertEqual(
             CU._leaks_answer("I need a deep understanding of how sessions resume",

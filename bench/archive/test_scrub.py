@@ -16,6 +16,11 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scrub import scrub, sensitivity  # noqa: E402
 
+# A real PEM body line is 64 base64 characters. Fixtures must use that length:
+# the rule discriminates key material from prose by RUN LENGTH, so a short
+# stand-in tests a threshold the real data never exercises.
+B64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDGl1sQ2Tn0aBcd"
+
 
 class TestRedaction(unittest.TestCase):
     def assert_gone(self, text, *needles):
@@ -44,8 +49,7 @@ class TestRedaction(unittest.TestCase):
         # Claude Code truncates Bash output constantly, so a rule that needs a
         # matching -----END----- misses the realistic case.
         self.assert_gone(
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n… (output truncated)",
-            "MIIEowIBAAKCAQEA")
+            f"-----BEGIN RSA PRIVATE KEY-----\n{B64}\n… (output truncated)", B64)
 
     def test_private_key_block_variant(self):
         self.assert_gone(
@@ -109,17 +113,28 @@ class TestRedaction(unittest.TestCase):
         # PEM inside a YAML block scalar: the body is indented past the few
         # whitespace characters the first fallback allowed, so it survived.
         self.assert_gone(
-            "key: |\n        -----BEGIN RSA PRIVATE KEY-----\n"
-            "        MIIEowIBAAKCAQEAzzzzzzzz\n        yyyyyyyyyyyyyyyyyyyy",
-            "MIIEowIBAAKCAQEAzzzzzzzz", "yyyyyyyyyyyyyyyyyyyy")
+            f"key: |\n        -----BEGIN RSA PRIVATE KEY-----\n"
+            f"        {B64}\n        {B64}", B64)
 
     def test_private_key_with_pem_headers(self):
         # An encrypted key puts Proc-Type/DEK-Info and a blank line before the
         # body; neither is base64-shaped, so the body survived.
         self.assert_gone(
-            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n"
-            "DEK-Info: AES-128-CBC,ABC\n\nMIIEowaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbb",
-            "MIIEowaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb")
+            f"-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n"
+            f"DEK-Info: AES-128-CBC,ABC\n\n{B64}\n{B64}", B64)
+
+    def test_key_body_on_the_headers_own_line(self):
+        # The shape a key takes once its newlines are stripped: a flattened
+        # JSON value or a single-line env var. Line-anchoring the body once
+        # stopped redacting this while fixing the prose case.
+        self.assert_gone(f"PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY----- {B64}", B64)
+
+    def test_prose_starting_a_line_is_kept(self):
+        # A long identifier at the start of a line is still prose. Anchoring on
+        # line position instead of run length redacted this.
+        out = scrub("-----BEGIN RSA PRIVATE KEY-----\n"
+                    "  reproducibleBuildConfiguration: true\n")
+        self.assertIn("reproducibleBuildConfiguration", out)
 
     def test_bare_header_in_prose_keeps_the_sentence(self):
         # The fallback must not eat prose. Long CamelCase identifiers are

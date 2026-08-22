@@ -39,10 +39,12 @@ from, not the contract.
   still shipped two, because the QA pattern anchored on `QA the|this` and missed `QA branch X` and
   `Final QA pass on X`. It also rejects a prompt echoing >=3 identifiers the merge ADDS, which is
   what a ticket carrying an implementation spec looks like. Never relax this to hit a task count.
-- **Validate SERIALLY.** Running `validate_tasks.py` beside the test suites or another curation
-  pass makes tasks fail that pass alone — contention inside `node --test` reads as "tests FAIL even
-  with the real fix applied", which is indistinguishable from a broken task. It once cost two good
-  tasks, reported as a real result.
+- **Never believe a single red — re-run that task alone** (XERK-450). `turma/tests/server.test.js`'s
+  "channel that pongs is kept past the dead-after window" fails ~1 run in 10 on an IDLE box; 9 of the
+  25 validated tasks grade on that suite and it runs twice per task, so a full pass is ~70% likely to
+  show at least one spurious "tests FAIL even with the real fix applied" — indistinguishable from a
+  broken task. It cost two good tasks, reported as a real result. Contention worsens it but is NOT
+  the cause: "validate serially" was written here once as the remedy and is wrong.
 - **`tasks-validated.json` is the eval set (25 tasks), not `tasks-archive.json` (57 curated).** Only
   the validated file has been proven red-then-green; the pool file keeps the rejects so the gate's
   decisions stay auditable. Benchmark against the validated one.

@@ -7,8 +7,9 @@
   "the task reverts, no test that grades it, and echoes fewer than two identifiers",
   "the fix introduces. Three earlier cuts of this set failed that check -- see",
   "docs/routing-eval-phase0.md -- which is why the gate is as blunt as it is.",
-  "Validate SERIALLY. Running the suites concurrently with other heavy work makes",
   "tasks fail that pass on their own, which once cost two good tasks.",
+  "A failing task must be re-run ALONE before it is believed: server.test.js has a",
+  "~10% flaky test (XERK-450) and 9 of these tasks grade on it.",
   "All tasks are Turma. The 29 Tenir candidates in tasks-archive.json cannot be",
   "graded until XERK-449 adds a dependency bootstrap step."
  ],

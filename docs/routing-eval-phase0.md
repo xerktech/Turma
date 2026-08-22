@@ -259,12 +259,22 @@ nothing. The route to the target is XERK-449 rather than a looser gate: Tenir's
 Both Turma rejections are suites that fail even with the real fix applied — a
 derived `test_cmd` that does not match the change (see Limitations).
 
-**Validate serially.** An earlier run of this table was taken while the test
-suites and a curation pass were running alongside it, and four tasks failed
-rather than two; the two extra pass on their own. Resource contention inside a
-`node --test` run reads as "tests FAIL even with the real fix applied", which is
-indistinguishable from a genuinely broken task. The numbers above are from a run
-with nothing else against the repo.
+**A red must be confirmed by re-running that task alone** (XERK-450). The repo
+has a genuinely flaky test — `control WS: a channel that pongs is kept past the
+dead-after window` in `turma/tests/server.test.js`, measured at **1 failure in
+10 runs standalone on an idle box**. Nine of the 25 validated tasks grade on
+that suite and `validate_tasks.py` runs it twice per task, so a full pass has
+roughly a **70% chance of at least one spurious failure**. A spurious failure
+prints as "tests FAIL even with the real fix applied", which is exactly what a
+genuinely broken task prints.
+
+This has already produced two wrong results here: a pass taken while other work
+ran showed four failures rather than two, and the two extra passed on their own —
+which I first wrote up as resource contention. It is not. Contention makes it
+likelier, but the flake fires on an idle machine too, so *"validate serially"*
+is not the remedy and was wrong to state as one. **Re-run any failing task by
+itself before believing it**, and treat XERK-450 as a prerequisite for trusting
+an unattended benchmark run at all.
 
 This answers the ticket's open question *"how much of the session archive is
 replayable at all"*: **25 gradeable, non-leaking tasks from 1,628 transcripts —

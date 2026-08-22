@@ -50,15 +50,19 @@ _RULES = [
                 r"(?:(?!-----BEGIN)[\s\S]){0,20000}?"
                 r"-----END [A-Z ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----"
                 r"|"
-                # No END in sight -- Claude Code truncated it. Each element must
-                # begin on its OWN LINE, which is what distinguishes key material
-                # from prose: a long CamelCase identifier following the header on
-                # the same line is a sentence, not a key. Indentation up to 40
-                # columns is allowed (PEM inside YAML block scalars), as are PEM
-                # header lines (Proc-Type:, DEK-Info:) and the blank line after
-                # them -- without those the body of an encrypted key survived.
-                r"(?:(?:\r?\n[ \t]{0,40})+"
-                r"(?:[A-Za-z0-9+/=]{16,80}|[A-Za-z][A-Za-z0-9-]{2,20}:[^\r\n]{0,120})"
+                # No END in sight -- Claude Code truncated it. What separates key
+                # material from prose here is RUN LENGTH, not line position: a
+                # PEM body line is 64 base64 characters, while the longest
+                # identifiers in an engineering transcript
+                # (ConfigurationManagerFactory, reproducibleBuildConfiguration)
+                # are around 30. Anchoring to line starts instead was wrong in
+                # both directions -- it kept eating identifiers that begin a
+                # line, and it stopped redacting a key whose newlines had been
+                # stripped, which is the shape of a flattened JSON or env-var
+                # value. Indentation up to 40 columns is allowed (PEM inside a
+                # YAML block scalar), as are PEM header lines and blank lines.
+                r"(?:[ \t]{0,40}(?:\r?\n[ \t]{0,40}){0,3}"
+                r"(?:[A-Za-z0-9+/=]{40,80}|[A-Za-z][A-Za-z0-9-]{2,20}:[^\r\n]{0,120})"
                 r"){0,500}"
                 r")"),
      "<REDACTED_PRIVATE_KEY>"),
