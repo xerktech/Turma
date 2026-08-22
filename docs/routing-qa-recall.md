@@ -6,32 +6,42 @@ by three tiers with an identical prompt, identical tree, 1500s cap.
 
 | reviewer | recall | HIGH | cost | notes |
 |---|---|---|---|---|
-| opus-4-6 | **5/5** | 1/1 | baseline | 10 findings reported |
-| haiku-4-5 | **4/5** | 1/1 | **~1/5** | 10 findings; missed only the curate.py revert defect |
-| nemotron 3.5 Lightning (local) | **0/5** | 0/1 | $0 | never completed |
-| nemotron, with explicit tool discipline | **~2/5** | 0/1 | $0 | lost the prompt to compaction |
+| opus-4-6 | **5/5** | 1/1 | baseline | 10 findings |
+| haiku-4-5 | **4/5** | 1/1 | **~1/5** | 10 findings; missed the curate.py revert defect |
+| nemotron, unguided | **0/5** | 0/1 | $0 | looped, thrashed, died at 258 bytes |
+| nemotron, tool-disciplined | **4/5** | 1/1 | $0 | compaction fired; recovered anyway |
+| nemotron, no compaction (hybrid) | **2/5** | 1/1 | $0 | stayed under the threshold |
 
 ## The result
 
 **haiku-4-5 recovers 80% of frontier recall at about a fifth of the cost**, and
 caught the one HIGH-severity finding. For QA that is a good trade, because a QA
-FAIL carries a reproduction and is therefore checkable — you do not have to
+FAIL carries a reproduction and is therefore checkable -- you do not have to
 trust the cheap tier's precision, only its recall.
 
-**The local 30B model is not a viable QA reviewer at this size.** Two distinct
-failures, neither about analysis:
+**Nemotron is a real contender on analysis and an unreliable one in practice.**
+Given explicit tool discipline it scored 4/5 -- level with haiku, at zero
+marginal cost. The failures are not about reading code:
 
-- **Unguided it does not converge.** It looped — seven repeated `cat`s of the
-  same two files plus a subagent spawn — until autocompaction thrashed and the
-  session died. 258 bytes of output, no findings.
-- **Compaction is broken for it.** With reasoning off, compaction returns an
-  *empty summary* and the session dies immediately. With reasoning on it
-  compacts but thrashes. Given explicit tool discipline it finished, but had
-  lost the original prompt to compaction and reviewed five claims it invented,
-  recovering roughly two of the five real defects.
+- **Unguided it does not converge.** It looped -- seven repeated `cat`s of the
+  same two files plus a subagent spawn -- until autocompaction thrashed and the
+  session died with no findings.
+- **Its own compaction is broken.** With reasoning off, compaction returns an
+  *empty summary* and the session dies immediately; with reasoning on it
+  compacts but thrashes. QA sessions average 84 turns, so compaction is the
+  common path for this workload.
+- **Run-to-run variance is the real blocker.** Three local runs of the same
+  review scored 0/5, 4/5 and 2/5. opus and haiku were stable. A reviewer you
+  cannot predict is hard to put in a gate.
+- **It never found the ReDoS in any run.** That is the one finding requiring
+  reasoning about how a regex *executes* rather than what it matches, and both
+  cloud tiers got it. Suggestive, not proven, on n=3.
 
-QA sessions average 84 turns, so compaction is not an edge case for this
-workload — it is the common path.
+So fixing compaction is **necessary but not sufficient**. The hybrid experiment
+(local main model, cheap cloud model for compaction and small/fast work) is the
+right architecture and is wired and working -- both tiers behind one endpoint --
+but it did not settle the question, because compaction never fired in that run.
+**That is the experiment still to do.**
 
 ## Methodology note
 
