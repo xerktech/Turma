@@ -38,6 +38,11 @@ client context. Keep it outside the repo. Only `scrub.py` output is committable.
 | `classify.py` | classifies every turn and reports the split, weighted by tokens |
 | `curate.py` | builds replay tasks from sessions that landed a merge commit |
 | `scrub.py` | redacts secrets and marks client-sensitive tasks `local-only` |
+| `tasks-archive.json` | the full curated pool, 62 tasks, including what failed the gate |
+| `tasks-validated.json` | **the eval set** — 30 tasks proven red-then-green |
+
+Benchmark against `tasks-validated.json`. The pool file exists so the gate's
+decisions stay auditable, not to be run.
 
 ```bash
 python3 bench/archive/classify.py --corpus corpus --json classify.json

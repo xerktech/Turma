@@ -32,6 +32,9 @@ from, not the contract.
 - **Files ADDED by a merge cannot be in `revert_paths`.** The runner reverts with
   `git checkout <commit>^1 -- <paths>`, which errors on a path absent from the parent; a fix that
   is pure addition cannot be expressed as a red baseline at all.
+- **`tasks-validated.json` is the eval set (30 tasks), not `tasks-archive.json` (62 curated).** Only
+  the validated file has been proven red-then-green; the pool file keeps the rejects so the gate's
+  decisions stay auditable. Benchmark against the validated one.
 - **The eval set is Turma-only until XERK-449.** Tenir validated 1/29 — it is an npm-workspaces
   monorepo with no `node_modules`, so derived `npx vitest` commands fail before reaching code. The
   harness does no install step, by design.

@@ -188,14 +188,33 @@ above the ticket's 30–50 target. Drops, in order: 288 repo not cloned locally,
 sessions, 17 no impl+test pair, 12 no derivable test command, 6 no usable
 intent.
 
-Curated is not validated. Every task is then gated by `bench/validate_tasks.py`,
-which proves red-with-fix-reverted and green-with-fix, and it cuts hard —
-see "Limitations" for what survived and what did not.
+### Validation — the set that actually grades
+
+Curated is not validated. Every task is gated by `bench/validate_tasks.py`,
+which proves red-with-fix-reverted and green-with-fix:
+
+| repo | validated | of curated |
+|---|---|---|
+| Turma | **29** | 32 |
+| Tenir | **1** | 29 |
+| Veiller | 0 | 1 (suite exceeded the cap; not attempted again) |
+| **total** | **30** | 62 |
+
+**`bench/archive/tasks-validated.json` is the eval set** — 30 tasks, each
+mechanically proven to go red then green, which meets the ticket's 30–50 target.
+`tasks-archive.json` keeps the full curated pool including what did not pass, so
+the gate's decisions stay auditable.
+
+Mix: 12 bugfix, 12 change, 6 feature; Python 10, Kotlin 11, JS 3, TS 2, other 4.
+
+The three Turma rejections are the gate working: two suites fail even with the
+real fix applied (a derived `test_cmd` that does not match the change), and one
+revert hits a path absent from the parent commit.
 
 This answers the ticket's open question *"how much of the session archive is
-replayable at all"*: **about 4% of archived transcripts**, and the binding
-constraint is not the transcripts. It is whether the repo is present and its
-test suite runs without bootstrap.
+replayable at all"*: **30 tasks from 1,628 transcripts, under 2%**, and the
+binding constraint is not the transcripts. It is whether the repo is present and
+its test suite runs without bootstrap.
 
 ### Sanitization
 
@@ -213,7 +232,8 @@ content — treat it as unproven until a sensitive repo is cloned and run.
 
 ## 5. Limitations
 
-- **The eval set is effectively Turma-only.** Tenir validated at **1/29**: it is
+- **The eval set is effectively Turma-only** — 29 of its 30 validated tasks are
+  Turma. Tenir validated at **1/29**: it is
   an npm-workspaces monorepo with no `node_modules`, so the derived `npx vitest`
   commands fail before reaching the code. Those tasks need an install step the
   harness does not perform. The 29 Tenir candidates are real work and are kept
