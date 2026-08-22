@@ -71,6 +71,14 @@ Three configuration traps, each of which looked like a model failure:
   `CLAUDE_CODE_MAX_OUTPUT_TOKENS` down and declare the window minus what is
   left, or every task dies before it starts.
 
+**Side effect to be aware of:** the gateway's `qwen3.6-27b` model group routes
+to `maxai:8000` and names the checkpoint `nvidia/Qwen3.6-27B-NVFP4`. That port
+now serves Nemotron, so the group fails with *"The model
+`nvidia/Qwen3.6-27B-NVFP4` does not exist"*. Either restore the Qwen container,
+repoint that group, or add the old id to `--served-model-name` — the last is
+cheapest but makes the gateway answer Nemotron under a Qwen name, which is worse
+than a clean failure.
+
 vLLM speaks OpenAI Chat only, so Claude Code needs an Anthropic-Messages
 translation in front of it. Switchyard is the intended answer (see the prior-art
 doc) but ships no prebuilt binary and there is no Rust toolchain on the box, so
@@ -103,6 +111,24 @@ and indistinguishable from a real result in the summary table.
 **Nemotron matches opus-4-6 on this subset and is 4–5x faster**, including one
 task (`130`) that opus failed by hitting the time cap and Nemotron solved in
 164 seconds. n=5 — this sizes an effect, it does not settle a ranking.
+
+### Cost per completed task, measured
+
+Token counts come from the bench sessions' own transcripts (deduplicated by
+`requestId`, the unit `bench/archive/classify.py` established), priced at the
+Bedrock rates above.
+
+| model | turns | cache_read | output | $ total | **$ per solved task** |
+|---|---|---|---|---|---|
+| opus-4-6 | 475 | 40.9M | 195k | $47.20 | **$15.73** (3 solved) |
+| haiku-4-5 | 513 | 47.4M | 155k | $8.34 | **$8.34** (1 solved, run incomplete) |
+| nemotron-3.5-lightning (local) | 583 | 49.0M | 140k | **$0** | **$0** (2 solved) |
+
+Two things stand out. **Cache reads are ~86k tokens per turn** — the archive's
+97.9% figure, confirmed live on a different workload. And the self-hosted tier's
+bill is GPU time, not dollars, which is why "is the local model good enough"
+dominates every routing question: at $0 it does not need to win, only to be
+adequate.
 
 Two caveats that matter more than the score:
 
@@ -175,6 +201,26 @@ Unset `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` and
 Claude Code returns to the subscription unchanged — the same path
 `docs/local-model-failover.md` already ships as `modelSource`. No proxy is on
 the critical path, because none was adopted.
+
+## Acceptance criteria, honestly
+
+The ticket lists nine. Where they stand after the spike:
+
+| criterion | status |
+|---|---|
+| Hub session store inventoried | **done** — `docs/routing-eval-phase0.md` §1 |
+| Sanitized replay set of 30-50 tasks, documented grading, local-only subset | **partial** — 25 validated tasks, under target; the local-only subset does not exist because no `local-only` task survived curation |
+| Turn-type classification showing the real weak/strong split | **done** — 52,391 turns; 86.7% execution-shaped |
+| `docs/routing-prior-art.md` with a build-vs-adopt call | **done** |
+| Benchmark table for every model on the endpoint, by turn type, cost per task | **not done** — 4 models on 5 tasks, not 266; and not broken down by turn type |
+| A local model serving behind an OpenAI-compatible endpoint via the `ai-windows` YAML | **partial** — Nemotron serves on `maxai:8000`, but deployed by hand; nothing was pushed to `dockerops` |
+| Working end-to-end routed session mixing local and cloud turns | **not done** — no router was ever run |
+| Measured cost delta vs always-frontier, with a quality comparison | **done for cost** (the table above), **weak on quality** (n=5) |
+| Rollback path documented | **done** — see below |
+
+The two that matter for a decision — what routing costs, and whether a cheap
+tier can do the work — are answered. The build-out ones are not, and the
+recommendation is that most of them should not be built as specified.
 
 ## What this spike did not settle
 
