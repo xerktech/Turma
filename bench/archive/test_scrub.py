@@ -67,6 +67,68 @@ class TestRedaction(unittest.TestCase):
         self.assert_gone("AIza" + "B" * 35, "AIza" + "B" * 35)
         self.assert_gone("npm_" + "c" * 36, "npm_" + "c" * 36)
 
+    def test_anthropic_key(self):
+        # sk-ant keys are hyphenated, so an unbroken-alnum pattern misses them.
+        # This is a corpus of Claude Code transcripts: it is the likeliest
+        # format present, and it leaked until it had its own rule.
+        key = "sk-ant-api03-" + "AbCdEfGh1234" * 4
+        self.assert_gone(f"ANTHROPIC_API_KEY={key}", key, "sk-ant-api03")
+
+    def test_other_vendor_tokens(self):
+        for token in ("sk_live_" + "a" * 24, "sk_test_" + "b" * 24,
+                      "glpat-" + "c" * 20, "hf_" + "d" * 24,
+                      "xapp-1-A01234567-" + "e" * 16):
+            self.assert_gone(f"secret is {token}", token)
+
+    def test_azure_account_key(self):
+        key = "A" * 60
+        self.assert_gone(f"AccountKey={key};EndpointSuffix=core.windows.net", key)
+
+    def test_url_basic_auth(self):
+        # Assert on the marker, not just on the secret's absence: with a dotted
+        # host the EMAIL rule removes `user:pass@host` incidentally, so a test
+        # that only checks the secret is gone passes with this rule deleted.
+        out = scrub("clone https://deploy:s3cr3tvalue@git.example.com/x.git")
+        self.assertNotIn("s3cr3tvalue", out)
+        self.assertIn("<REDACTED_URL_CREDS>", out)
+        # A host with no dot is out of the email rule's reach entirely.
+        out2 = scrub("psql postgres://admin:hunter2pass@localhost:5432/db")
+        self.assertNotIn("hunter2pass", out2)
+
+    def test_json_quoted_forms(self):
+        # JSON is the dominant shape in this corpus -- tool results, settings
+        # files, API bodies. The key's closing quote sits before the separator,
+        # which the first version of the rule had no room for.
+        self.assert_gone('{"password": "Zx9Qw8Er7Ty6Ui5Op4"}', "Zx9Qw8Er7Ty6Ui5Op4")
+        self.assert_gone('{"api_key": "Ab3defGh1jklMn0pQr5t"}', "Ab3defGh1jklMn0pQr5t")
+        self.assert_gone(
+            '"AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+    def test_private_key_indented_in_yaml(self):
+        # PEM inside a YAML block scalar: the body is indented past the few
+        # whitespace characters the first fallback allowed, so it survived.
+        self.assert_gone(
+            "key: |\n        -----BEGIN RSA PRIVATE KEY-----\n"
+            "        MIIEowIBAAKCAQEAzzzzzzzz\n        yyyyyyyyyyyyyyyyyyyy",
+            "MIIEowIBAAKCAQEAzzzzzzzz", "yyyyyyyyyyyyyyyyyyyy")
+
+    def test_private_key_with_pem_headers(self):
+        # An encrypted key puts Proc-Type/DEK-Info and a blank line before the
+        # body; neither is base64-shaped, so the body survived.
+        self.assert_gone(
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n"
+            "DEK-Info: AES-128-CBC,ABC\n\nMIIEowaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbb",
+            "MIIEowaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb")
+
+    def test_bare_header_in_prose_keeps_the_sentence(self):
+        # The fallback must not eat prose. Long CamelCase identifiers are
+        # exactly what follows a header in an engineering transcript.
+        out = scrub("-----BEGIN PRIVATE KEY----- ConfigurationManagerFactory "
+                    "reproduces this whenever InternationalizationHelper runs.")
+        self.assertIn("ConfigurationManagerFactory", out)
+        self.assertIn("InternationalizationHelper", out)
+
     def test_jwt_and_bearer(self):
         jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijkl"
         self.assert_gone(jwt, jwt)

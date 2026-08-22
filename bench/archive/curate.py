@@ -102,15 +102,21 @@ def derive_test_cmd(test_files, repo_path):
 # an agent replayed on "QA branch X" will not write the change the suite grades.
 # Anchoring on `QA the|this` alone was too narrow -- `QA branch X`, `Final QA
 # pass on branch X` and `Second QA pass please` all slipped through and shipped.
+# The QA forms are anchored to the START of the prompt. A QA invocation always
+# leads with it, while a genuine ticket may say "the QA pass on XERK-256 found
+# X, fix it" mid-sentence -- an unanchored match classified that real ask as
+# "not a user ask".
 _NOT_A_TASK = (
-    re.compile(r"(?i)^\s*(?:final|second|third|another|next)?\s*(?:re-?\s*)?QA\b"),
-    re.compile(r"(?i)\bQA\s+(?:the|this|that|branch|pass|round)\b"),
-    re.compile(r"(?i)\b(?:final|second|third|another|next|re-?)\s*QA\s+pass\b"),
-    re.compile(r"(?i)\bqa-delta\b|\bre-?QA\b"),
+    re.compile(r"(?i)\A\s*(?:please\s+)?"
+               r"(?:final|second|third|fourth|fifth|another|next)?\s*"
+               r"(?:re-?\s*)?QA\b"),
+    re.compile(r"(?i)\A\s*(?:you are the QA|adversarially\s+QA|act as the QA)\b"),
+    re.compile(r"(?i)\A[^\n]{0,120}\bQA\s+(?:branch|round)\b"),
+    re.compile(r"(?i)\bqa-delta\b"),
     re.compile(r"(?i)\bworking checkout\s*:"),
     # A prompt referring to a previous review's numbered findings is a QA reply.
     re.compile(r"(?i)\byour\s+D-?\d"),
-    re.compile(r"(?i)^\s*THE CHANGE\s*:|\n\s*THE CHANGE\s*:"),
+    re.compile(r"(?im)^\s*THE CHANGE\s*:"),
     re.compile(r"(?i)\bI need a deep understanding\b"),
     re.compile(r"(?i)\b(write up|research|investigate|summarize|explain)\b[^.]{0,60}"
                r"\b(so I can|before we|and report)\b"),
@@ -120,7 +126,7 @@ _NOT_A_TASK = (
 # quoting the implementation rather than describing a symptom.
 _IDENT_RE = re.compile(r"\b(?:[a-z]+(?:[A-Z][a-z0-9]+)+|[a-z0-9]+(?:_[a-z0-9]+)+"
                        r"|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+)\b")
-SYMBOL_ECHO_MAX = 3
+SYMBOL_ECHO_MAX = 2
 
 
 def added_identifiers(repo_path, merge, paths):

@@ -214,21 +214,21 @@ the change the suite grades.
 
 `_leaks_answer()` is therefore a hard gate, rejecting on evidence rather than on
 wording. A prompt is dropped if it contains any path in `revert_paths` or a
-distinctive basename of one, names a grading test file, **echoes three or more
+distinctive basename of one, names a grading test file, **echoes two or more
 identifiers the merge itself adds** (which is what a ticket carrying an
 implementation spec looks like), or matches a QA-invocation or research-ask
 shape. `bench/tasks.json`'s own contract already required most of this: the
 prompt carries "no file paths, no solution sketch, and no hint that regression
 tests for it already exist".
 
-It cost 50 candidates and it is not optional. A benchmark that hands over the
+It cost 51 candidates and it is not optional. A benchmark that hands over the
 answer reports a cheap model doing well at reading.
 
 ### Yield
 
-From 1,628 transcripts: **58 curated tasks** (Turma 28, Tenir 29, Veiller 1).
+From 1,628 transcripts: **57 curated tasks** (Turma 27, Tenir 29, Veiller 1).
 Drops, in order: 288 repo not cloned locally, 149 no merge commit for the ticket
-key, 114 no ticket key, **50 answer leak**, 17 no impl+test pair, 7 no derivable
+key, 114 no ticket key, **51 answer leak**, 17 no impl+test pair, 7 no derivable
 test command, 6 no usable intent, 6 duplicate sessions.
 
 ### Validation — the set that actually grades
@@ -238,30 +238,36 @@ which proves red-with-fix-reverted and green-with-fix:
 
 | repo | validated | of curated |
 |---|---|---|
-| Turma | **24** | 28 |
+| Turma | **25** | 27 |
 | Tenir | 0 | 29 — blocked on XERK-449, see Limitations |
 | Veiller | 0 | 1 — suite exceeded the cap |
-| **total** | **24** | 58 |
+| **total** | **25** | 57 |
 
-**`bench/archive/tasks-validated.json` is the eval set** — 24 tasks, each proven
+**`bench/archive/tasks-validated.json` is the eval set** — 25 tasks, each proven
 to go red then green, and each past the answer-leak gate. `tasks-archive.json`
-keeps the full curated pool including what did not pass, so the gate's decisions
-stay auditable.
+keeps the full curated pool, and the `--report` ledger records every rejection
+and its reason, so the gate's decisions stay auditable.
 
-Mix: 16 change, 5 feature, 3 bugfix; Python 9, Kotlin 8, TS 2, JS 1, other 4.
+Mix: 16 change, 6 feature, 3 bugfix; Python 9, Kotlin 8, JS 2, TS 2, other 4.
 
 **This is short of the ticket's 30–50 target, and the shortfall is real.** The
-leak gate cost 50 candidates and the Tenir bootstrap costs 29 more; neither is a
+leak gate cost 51 candidates and the Tenir bootstrap costs 29 more; neither is a
 corner to cut, since a leaking task and an ungradeable task both measure
 nothing. The route to the target is XERK-449 rather than a looser gate: Tenir's
 29 candidates are already mined and would roughly double the set.
 
-All four Turma rejections are the same class and are the gate working — suites
-that fail even with the real fix applied, i.e. a derived `test_cmd` that does
-not match the change (see Limitations).
+Both Turma rejections are suites that fail even with the real fix applied — a
+derived `test_cmd` that does not match the change (see Limitations).
+
+**Validate serially.** An earlier run of this table was taken while the test
+suites and a curation pass were running alongside it, and four tasks failed
+rather than two; the two extra pass on their own. Resource contention inside a
+`node --test` run reads as "tests FAIL even with the real fix applied", which is
+indistinguishable from a genuinely broken task. The numbers above are from a run
+with nothing else against the repo.
 
 This answers the ticket's open question *"how much of the session archive is
-replayable at all"*: **24 gradeable, non-leaking tasks from 1,628 transcripts —
+replayable at all"*: **25 gradeable, non-leaking tasks from 1,628 transcripts —
 under 2%**. The binding constraints are not the transcripts. They are whether
 the repo is present, whether its suite runs without a bootstrap, and whether the
 session's opening message was a user's ask rather than a spec.
@@ -288,14 +294,14 @@ Both committed task files carry no credentials, no internal hosts or IPs, no
 text *before* scrubbing, since redaction would hide the fact that the task
 concerns that work at all.
 
-**No `local-only` task survived curation** (all 58 are `shareable`): the tesoro
+**No `local-only` task survived curation** (all 57 are `shareable`): the tesoro
 sessions in the archive are not in locally cloned repos, so they never reached
 the task stage. The mechanism is in place and untested against real sensitive
 content — treat it as unproven until a sensitive repo is cloned and run.
 
 ## 5. Limitations
 
-- **The eval set is Turma-only**, and at 24 tasks is under the ticket's 30–50
+- **The eval set is Turma-only**, and at 25 tasks is under the ticket's 30–50
   target. Tenir is an npm-workspaces monorepo with no `node_modules`, so the
   derived `npx vitest` commands fail before reaching the code; its 29 candidates
   are real work, are kept in `tasks-archive.json`, and are unusable until

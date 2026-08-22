@@ -55,12 +55,23 @@ class TestLeakGate(unittest.TestCase):
             CU._leaks_answer("I need a deep understanding of how sessions resume",
                              self.IMPL, self.TESTS), "not a user ask")
 
+    def test_ticket_mentioning_a_qa_pass_is_still_a_task(self):
+        # An unanchored QA match classified a genuine ticket as "not a user
+        # ask" because its description said "the QA pass on XERK-256 found...".
+        self.assertIsNone(CU._leaks_answer(
+            "Work Jira ticket XERK-265. Found by the QA pass on XERK-256: the "
+            "refusal is dropped on the floor. Please fix it.", [], []))
+
     def test_symbol_echo_is_a_leak(self):
         syms = {"setModelSource", "ModelSource", "modelSource", "localModel"}
         self.assertIn("echoes", CU._leaks_answer(
             "add setModelSource and ModelSource so modelSource persists",
             [], [], syms))
-        # Under the threshold is not a leak -- a ticket may name its feature.
+        # Exactly at the threshold rejects; below it does not. Measured over the
+        # pool the distribution is 0:56, 1:1, 2:1, so 2 costs one task.
+        self.assertEqual(CU.SYMBOL_ECHO_MAX, 2)
+        self.assertIn("echoes", CU._leaks_answer(
+            "setModelSource breaks ModelSource", [], [], syms))
         self.assertIsNone(CU._leaks_answer(
             "the modelSource is not persisted on resume", [], [], syms))
 
@@ -155,12 +166,16 @@ class TestRevertSetAgainstRealGit(unittest.TestCase):
         os.makedirs(os.path.join(cls.repo, "tests"))
         for name, body in (("keep.js", "0"), ("gone.js", "0")):
             open(os.path.join(cls.repo, name), "w").write(body)
+        open(os.path.join(cls.repo, "sym.js"), "w").write(
+            "const removedLegacyIdentifier = 1;\nconst tiny = 2;\n")
         open(os.path.join(cls.repo, "tests", "a.test.js"), "w").write("0")
         run("add", "-A")
         run("commit", "-qm", "base")
         run("checkout", "-qb", "feat")
         open(os.path.join(cls.repo, "keep.js"), "w").write("1")
         open(os.path.join(cls.repo, "added.js"), "w").write("1")
+        open(os.path.join(cls.repo, "sym.js"), "w").write(
+            "const setModelSourceHandler = 1;\nconst tiny = 2;\n")
         os.remove(os.path.join(cls.repo, "gone.js"))
         open(os.path.join(cls.repo, "tests", "a.test.js"), "w").write("1")
         run("add", "-A")
@@ -188,12 +203,18 @@ class TestRevertSetAgainstRealGit(unittest.TestCase):
         self.assertEqual(keep, ["keep.js"])
         self.assertEqual(sorted(dropped), ["added.js", "gone.js"])
 
-    def test_added_identifiers_reads_the_diff(self):
+    def test_added_identifiers_reads_ADDED_lines_only(self):
         if not self.ok:
             self.skipTest("git unavailable")
-        # keep.js changes 0 -> 1, so nothing identifier-shaped is added.
-        syms = CU.added_identifiers(self.repo, self.merge, ["keep.js"])
-        self.assertEqual(syms, set())
+        # Asserting only that empty input gives an empty set lets the sign of
+        # the diff flip unnoticed, which is the same tautology as the old
+        # revert-set test. Assert on a real added identifier.
+        syms = CU.added_identifiers(self.repo, self.merge, ["sym.js"])
+        self.assertIn("setModelSourceHandler", syms)
+        # ...and NOT one the merge removed.
+        self.assertNotIn("removedLegacyIdentifier", syms)
+        # ...and short names are filtered out.
+        self.assertNotIn("tiny", syms)
         self.assertEqual(CU.added_identifiers(self.repo, self.merge, []), set())
 
 

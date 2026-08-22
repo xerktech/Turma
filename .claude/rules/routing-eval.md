@@ -39,7 +39,11 @@ from, not the contract.
   still shipped two, because the QA pattern anchored on `QA the|this` and missed `QA branch X` and
   `Final QA pass on X`. It also rejects a prompt echoing >=3 identifiers the merge ADDS, which is
   what a ticket carrying an implementation spec looks like. Never relax this to hit a task count.
-- **`tasks-validated.json` is the eval set (24 tasks), not `tasks-archive.json` (58 curated).** Only
+- **Validate SERIALLY.** Running `validate_tasks.py` beside the test suites or another curation
+  pass makes tasks fail that pass alone — contention inside `node --test` reads as "tests FAIL even
+  with the real fix applied", which is indistinguishable from a broken task. It once cost two good
+  tasks, reported as a real result.
+- **`tasks-validated.json` is the eval set (25 tasks), not `tasks-archive.json` (57 curated).** Only
   the validated file has been proven red-then-green; the pool file keeps the rejects so the gate's
   decisions stay auditable. Benchmark against the validated one.
 - **The eval set is Turma-only until XERK-449.** Tenir validated 0/29 — it is an npm-workspaces

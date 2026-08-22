@@ -1385,36 +1385,6 @@
    "prompt": "Work Jira ticket XERK-246. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-246: Open Code\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-246\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nWe need to include and ship OpenCode along side our agent. It needs to connect to and utilize our gpt oss 120b model that's deployed via Tenir and docker compose. You need to test, iterate, and optimize the best config to get the most optimal results for coding tasks. Test with actual Turma sessions history data. We need Claude to trigger open code for appropriate tasks automatically in order to save Claude token usage. NOT AT THE SAKE OF QUALITY.  But also if the Claude usage runs out we need to be able to convert an open Claude session to work with OpenCode / our local models.\n\nI'm not tied to open code specifically, I just need to best agentic coding tool for self hosted models. Test and confirm alternatives if you know of them.\n\nThe problem were addressing - running out of Claude usage completely halts all work, and that's unacceptable.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
   },
   {
-   "id": "turma-xerk-247",
-   "commit": "3029ca06f636b37ce26b28c0f7bdfcfa5880ae04",
-   "kind": "bugfix",
-   "lang": "kotlin",
-   "sensitivity": "shareable",
-   "source": {
-    "ticket": "XERK-247",
-    "repo": "turma",
-    "transcript": "c0c65909-ed77-4076-8364-a1fb9ca3c562.jsonl"
-   },
-   "revert_paths": [
-    "agent/Dockerfile",
-    "agent/hub-agent.py",
-    "agent/native/install.sh",
-    "android/app/src/main/java/com/xerktech/turma/model/Models.kt",
-    "android/app/src/main/java/com/xerktech/turma/ui/UsageScreen.kt",
-    "android/app/src/main/java/com/xerktech/turma/vm/UsageViewModel.kt",
-    "turma/public/usage.html",
-    "turma/server.js"
-   ],
-   "test_cmd": [
-    "node",
-    "--test",
-    "turma/tests/server.test.js",
-    "turma/tests/usage.test.js"
-   ],
-   "test_timeout": 900,
-   "prompt": "Work Jira ticket XERK-247. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-247: Add session and weekly limit status section to Turma Usage page\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-247\n- Status: To Do\n- Type: Story\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nGoal\n\nSurface Claude subscription session (5h) and weekly (7d) limit status directly on the Turma Usage page, so limit headroom is visible without opening Claude Settings.\n\nBackground\n\nThere is no public/official API for consumer subscription usage. Anthropic's documented Usage & Cost API and Analytics API require an Admin API key, are org-scoped, and are explicitly unavailable to individual accounts \u2014 and they report API token spend, not Pro/Max session and weekly caps.\n\nApproach options\n\nOption A \u2014 Claude Code statusLine hook (preferred, sanctioned)\n\nClaude Code (v2.1.x+) passes rate_limits.five_hour and rate_limits.seven_day on stdin to the configured statusLine script for Pro/Max subscribers \u2014 used percentage plus reset timestamps, no network call.\n\n- Configure statusLine to a wrapper script that both renders the normal status string and writes the raw JSON to a known path (or POSTs to a Turma ingest endpoint).\n- Turma Usage page reads that snapshot and renders session/weekly bars with reset countdowns.\n- Constraint: data only refreshes while a Claude Code session is active, and only after the first assistant message of that session. Snapshot must carry a timestamp so the UI can show staleness.\n\nOption B \u2014 OAuth token fallback (unofficial, fragile)\n\nCommunity statuslines call the usage endpoint directly using the OAuth token from ~/.claude/.credentials.json. Undocumented and unsupported; will break without notice, and aggressive polling returns rate_limit_error. Only consider as a gap-filler behind a feature flag.\n\nNotes / gotchas\n\n- The CLI's /usage numbers are computed from local sessions on that machine and exclude other devices and claude.ai, so they can trail the real server-side counter. Label the UI accordingly rather than presenting it as authoritative.\n- Subscription usage is a single shared pool across claude.ai, Claude Code, and other Claude surfaces.\n- Upstream feature request to watch: anthropics/claude-code#44328 (claude usage --json exposing session cap, weekly cap, and extra usage balance). If shipped, it replaces both options above.\n\nAcceptance criteria\n\n- Usage page shows session (5h) and weekly (7d) percentage used with reset countdowns.\n- Stale data is visibly marked with a last-updated timestamp.\n- No credentials or tokens are embedded in Turma; ingest path is read-only from a local snapshot.\n- Graceful empty state when no snapshot exists (e.g. no Claude Code session has run).\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
-  },
-  {
    "id": "turma-xerk-250",
    "commit": "5c78834f48105b1d886211cd6d4d0f2fbba70e7e",
    "kind": "feature",
