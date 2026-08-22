@@ -48,13 +48,15 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const els = {};
   const sse = [];
   const fetches = [];
+  const timers = [];
   const noop = () => {};
+  let activeTagName = null;
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
     createElement() { return makeEl(); },
     querySelector() { return null; }, querySelectorAll() { return []; },
     addEventListener: noop, removeEventListener: noop,
-    get activeElement() { return null; },
+    get activeElement() { return activeTagName ? { tagName: activeTagName } : null; },
     body: makeEl(), title: "",
   };
   const g = {
@@ -77,7 +79,11 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
       addEventListener(name, fn) { this.handlers[name] = fn; }
       close() {}
     },
-    setInterval: () => 0, clearInterval: noop, setTimeout: () => 0, clearTimeout: noop,
+    setInterval: () => 0, clearInterval: noop,
+    // Real enough to drive the coalescing re-fetch: a test runs the queue by
+    // hand rather than waiting on wall-clock.
+    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout: (id) => { if (id) timers[id - 1] = null; },
     matchMedia: () => ({ matches: false, addEventListener: noop }),
     history: { replaceState: noop, pushState: noop },
     TurmaNav: { preserveScroll: (_el, paint) => paint(), toast: noop },
@@ -92,7 +98,14 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
-  return Object.assign(fn(...keys.map((k) => g[k])), { els, sse, fetches });
+  const api = fn(...keys.map((k) => g[k]));
+  // Run every queued timer callback, as the browser would once they fire.
+  const runTimers = async () => {
+    const due = timers.splice(0).filter(Boolean);
+    for (const t of due) await t.fn();
+  };
+  return Object.assign(api, { els, sse, fetches, timers, runTimers,
+    setActiveTagName: (t) => { activeTagName = t; } });
 }
 
 const bucket = (n) => ({ input: n, output: 0, cacheWrite: 0, cacheRead: 0 });
@@ -115,6 +128,10 @@ const retiredHost = (key, n, siteKey) => ({
 });
 
 // The tiles are one HTML string; read a tile's value/hint back out of it by label.
+// Let the page's boot-time refresh() settle before a test asserts on what is
+// painted — with a fetchReply supplied it resolves, unlike the default stub.
+const settle = () => new Promise((r) => setImmediate(r));
+
 function tileOf(html, label) {
   const re = new RegExp(
     `<div class="label">${label}</div><div class="value">([^<]*)</div>` +
@@ -217,17 +234,61 @@ test("dashboard: an empty fleet with retired spend says where the tokens came fr
 // per-agent record — so anything the tiles read that is not on that record has
 // to be handled where the event lands, or the page is wrong until it reloads.
 
-test("dashboard: removing a host re-fetches, so its spend moves rather than vanishing", () => {
+test("dashboard: removing a host re-fetches, so its spend moves rather than vanishing", async () => {
   const D = loadDashboard(undefined, () => ({
     now: Date.now(), agents: [liveHost("stay", 100)], retiredUsage: [retiredHost("gone", 900)],
   }));
+  await settle();
   D.setCache({ now: Date.now(), agents: [liveHost("stay", 100), liveHost("gone", 900)], retiredUsage: [] });
   D.connectSSE();
+  D.fetches.length = 0;
   const es = D.sse[D.sse.length - 1];
-  const before = D.fetches.length;
   es.handlers.removed({ data: JSON.stringify({ key: "gone" }) });
-  assert.ok(D.fetches.length > before && D.fetches.includes("/api/agents"),
+  await D.runTimers();
+  await settle();
+  assert.ok(D.fetches.includes("/api/agents"),
     "a removal is the one event that moves spend between the two lists — it must re-poll");
+  assert.equal(tileOf(D.els.tiles.innerHTML, "Tokens all-time").value, D.fmtTokens(1000),
+    "and the spend must MOVE, not drop");
+});
+
+test("dashboard: a burst of removals costs one re-fetch, not one per host", async () => {
+  // The hub emits `removed` PER HOST inside its registry-eviction loop, and
+  // /api/agents is its heaviest read (hundreds of KB) against a 256 MiB hub. One
+  // fetch per event multiplies an eviction sweep by every open tab.
+  const D = loadDashboard(undefined, () => ({ now: Date.now(), agents: [], retiredUsage: [] }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: ["a", "b", "c", "d"].map(k => liveHost(k, 1)), retiredUsage: [] });
+  D.connectSSE();
+  D.fetches.length = 0;
+  const es = D.sse[D.sse.length - 1];
+  for (const key of ["a", "b", "c", "d"]) es.handlers.removed({ data: JSON.stringify({ key }) });
+  await D.runTimers();
+  await settle();
+  assert.equal(D.fetches.filter(u => u === "/api/agents").length, 1);
+});
+
+test("dashboard: a removal does not repaint under an open <select>", async () => {
+  // A full #groups swap closes a native popup mid-selection, which is why every
+  // BACKGROUND repaint goes through bgRender — the SSE push included. Re-fetching
+  // through `refresh()` walked straight past that guard.
+  const D = loadDashboard(undefined, () => ({
+    now: Date.now(), agents: [liveHost("stay", 100)], retiredUsage: [retiredHost("gone", 900)],
+  }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: [liveHost("stay", 100), liveHost("gone", 900)], retiredUsage: [] });
+  D.render(D.getCache());
+  const painted = D.els.groups.innerHTML;
+  D.setActiveTagName("SELECT");
+  D.connectSSE();
+  D.fetches.length = 0;
+  const es = D.sse[D.sse.length - 1];
+  es.handlers.removed({ data: JSON.stringify({ key: "gone" }) });
+  await D.runTimers();
+  await settle();
+  assert.ok(D.fetches.includes("/api/agents"), "the data still lands");
+  assert.equal(D.els.groups.innerHTML, painted,
+    "but nothing is repainted while a <select> popup is open");
 });
 
 test("dashboard: a retired host that comes back is not counted twice", () => {
@@ -240,4 +301,16 @@ test("dashboard: a retired host that comes back is not counted twice", () => {
   D.render(D.getCache());
   assert.equal(tileOf(D.els.tiles.innerHTML, "Tokens all-time").value, D.fmtTokens(900));
   assert.equal((D.getCache().retiredUsage || []).length, 0);
+});
+
+test("dashboard: the empty-state line agrees with itself on one removed host", () => {
+  // Singular/plural is the whole content of this sentence; a mutant flipping it
+  // changed the only words the line says and nothing noticed.
+  const D = loadDashboard();
+  D.render({ now: Date.now(), agents: [], retiredUsage: [retiredHost("gone", 900)] });
+  assert.match(D.els.groups.innerHTML, /a host that has since been removed/);
+  const D2 = loadDashboard();
+  D2.render({ now: Date.now(), agents: [],
+    retiredUsage: [retiredHost("g1", 900), retiredHost("g2", 900)] });
+  assert.match(D2.els.groups.innerHTML, /hosts that have since been removed/);
 });

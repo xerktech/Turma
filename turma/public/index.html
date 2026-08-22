@@ -1834,6 +1834,27 @@ function bgRender() {
   render(cache);
 }
 
+// A background re-fetch, coalesced. Only `removed` needs one — it is the single
+// event that moves spend between `agents` and `retiredUsage`, and just that one
+// list rides `/api/agents` — but the hub emits one `removed` PER HOST inside its
+// registry-eviction loop, so an eviction sweep of K hosts would otherwise cost K
+// full fetches of the hub's heaviest read, per open tab. One timer collapses the
+// burst into a single fetch, and the repaint goes through `bgRender` like every
+// other background update.
+let refetchTimer = null;
+function refetchSoon() {
+  if (refetchTimer) return;
+  refetchTimer = setTimeout(async () => {
+    refetchTimer = null;
+    try {
+      const r = await fetch("/api/agents");
+      if (r.status === 401) return void (location.href = "/login");
+      cache = await r.json();
+    } catch { return; }   // keep the last data; the next beat or poll corrects it
+    bgRender();
+  }, 250);
+}
+
 // ---- live push (FIX 1/#1): server-sent per-agent updates on each heartbeat --
 // Rides the login cookie (same-origin EventSource), so no extra auth. Each
 // `agent` event carries one host record shaped like /api/agents' per-agent
@@ -1871,7 +1892,12 @@ function connectSSE() {
     // not carry — so dropping it from `agents` alone makes the token tiles fall
     // by everything that host ever spent. That is the exact disappearance this
     // page was fixed to stop, just on a longer clock, so it costs one fetch.
-    refresh();
+    //
+    // NOT `refresh()`: that repaints through `render` directly, which swaps
+    // `#groups` out from under a focused <select> and closes an open composer
+    // popup mid-selection — the very thing `bgRender` exists to prevent for
+    // background updates, the SSE push included.
+    refetchSoon();
   });
   // An org's color pin changed (XERK-145): org.js owns the live map; patching
   // this page's cache keeps the next render's TurmaOrg.update(cache) from
