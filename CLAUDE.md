@@ -217,9 +217,14 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     and a full `/api/agents` decode is atomic there, so an agent putting `retired:"yes"` on its own
     beat emptied every OTHER host from every phone's fleet list — and it persisted into `state.json`.
     Typing a field on `AgentInfo` and adding its hub-side coercion are the SAME change.
-  - **Only the Usage surfaces may read `retiredUsage`.** Its entries are agent-SHAPED so those two
-    can chart them with the code they already have, and they carry no sessions, repos or commands —
-    anything else treating one as a host invents a host that does not exist.
+  - **`retiredUsage` is read by the surfaces that COUNT SPEND, and by no other.** Its entries are
+    agent-SHAPED so those surfaces chart them with the code they already have, and they carry no
+    sessions, repos or commands — anything treating one as a HOST invents a host that does not
+    exist. That is the line: the Usage page/screen, and the dashboard's three TOKEN TILES
+    (`turma/public/index.html`, android `core/Fleet.kt`'s `fleetSummary(agents, retired)`), which
+    count them and say `incl. removed hosts`; the host cards, the online count, the session ceiling
+    and every session surface never see them. Counting spend on one side and not the other is what
+    made the front page disagree with `/usage` after a busy host was removed.
   - **Removing a host is not a purge**: `DELETE /api/agents/<host>` keeps the spend, `?usage=purge`
     is the deliberate second step. Never make a removal imply one.
   - The archive does NOT already hold this. It stores displayable entries and no token counts, never

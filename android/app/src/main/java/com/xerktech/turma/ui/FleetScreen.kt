@@ -75,6 +75,10 @@ fun FleetScreen(
     // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
     // the tiles, the host cards, their repos and their sessions in one move.
     val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
+    // Spend from hosts the hub no longer has (XERK-338), scoped by the same org
+    // control. Feeds the TOKEN TILES only — these are not hosts, so they stay out
+    // of `agents` and off the host list. See `fleetSummary`.
+    val retired = remember(fleet.retiredUsage, org) { scopedAgents(fleet.retiredUsage, org) }
     // Org card tints (XERK-142) come from the WHOLE fleet's org set, not the scoped
     // one, so a host card keeps its colour regardless of the header's org filter.
     val orgColors = remember(fleet.agents, fleet.orgColors) {
@@ -110,8 +114,13 @@ fun FleetScreen(
                 if (!fleet.pushEnabled) {
                     item(key = "pushWarn") { PushOffBanner() }
                 }
-                if (agents.isNotEmpty()) {
-                    item(key = "tiles") { FleetTiles(remember(agents) { fleetSummary(agents) }) }
+                // Tiles whenever there is anything to count — a fleet whose only
+                // spender has been REMOVED still has token totals to show, and
+                // index.html renders them unconditionally.
+                if (agents.isNotEmpty() || retired.isNotEmpty()) {
+                    item(key = "tiles") {
+                        FleetTiles(remember(agents, retired) { fleetSummary(agents, retired) })
+                    }
                 }
                 if (agents.isEmpty()) {
                     item {
@@ -613,10 +622,12 @@ private fun FleetTiles(s: FleetSummary) {
             if (s.maxSessions != null) "${s.running} / ${s.maxSessions}" else s.running.toString(),
             "${s.totalSessions} total", tileMod)
         SummaryTile("Waiting on you", s.waiting.toString(), "sessions with a question", tileMod)
-        SummaryTile("Tokens today", fmtTokens(s.tokensToday), "all sessions, incl. cache", tileMod)
-        SummaryTile("Tokens this week", fmtTokens(s.tokensWeek), "last 7 days (UTC)", tileMod)
+        val retiredNote = if (s.retiredCounted) " · incl. removed hosts" else ""
+        SummaryTile("Tokens today", fmtTokens(s.tokensToday), "all sessions, incl. cache$retiredNote", tileMod)
+        SummaryTile("Tokens this week", fmtTokens(s.tokensWeek), "last 7 days (UTC)$retiredNote", tileMod)
         SummaryTile("Tokens all-time", fmtTokens(s.tokensAllTime),
-            if (s.topModels == "–") "every session ever" else "mostly ${s.topModels}", tileMod)
+            (if (s.topModels == "–") "every session ever" else "mostly ${s.topModels}") + retiredNote,
+            tileMod)
     }
 }
 
