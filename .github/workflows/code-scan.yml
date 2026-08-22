@@ -200,6 +200,15 @@ jobs:
           exit "$fail"
       - name: Python unit tests (agent/hub-agent.py)
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
+      # bench/archive holds the XERK-445 routing-eval tooling, including
+      # scrub.py -- the redactor that decides what may leave the box. Nothing
+      # under bench/ was executed by any gate until this step existed, and a QA
+      # pass proved it: max->sum in the token reducer, the error-recovery
+      # precedence rule, and the entire scrub rule loop were each deleted in
+      # turn and every project suite stayed green. A security control with no
+      # test rots silently.
+      - name: Python unit tests (bench/archive routing-eval tooling)
+        run: python3 -m unittest discover -s bench/archive -p "test_*.py" -t bench/archive -v
       - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
         run: node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
       # entrypoint.sh is PID 1 and decides which uid every session runs as —

@@ -89,7 +89,7 @@ That is the unit here.
 `code_edit`, `file_read_search`, `narration`, `summarization`) are **86.7% of
 turns and 85.2% of output tokens**. Planning, error recovery and delegation —
 the turns that plausibly need a frontier model — are 13.3% of turns and 14.8% of
-output. `Bash` alone is 40,594 of 52,391 tool calls.
+output. `Bash` accounts for 44,804 of the corpus's 56,053 tool calls (79.9%), and 40,594 of the 52,391 turns call it at least once.
 
 Sidechain (subagent) turns are **26.0%** of the corpus. Models seen:
 `claude-opus-5` 39,359, `claude-fable-5` 7,140, `claude-opus-4-8` 4,016, plus
@@ -125,17 +125,33 @@ no prompt cache for the conversation. It re-ingests the whole context at
 cache-creation price instead of cache-read price:
 
 ```
-average output per turn                 841 tokens ->    4,203 price units
 p50 context read from cache         163,030 tokens ->   16,303 price units
 p50 context re-created after a switch                -> 203,788 price units
-                                        cost of one switch:  187,484 units
+                     cost of returning to the frontier:  187,484 units
+
+what routing ONE turn to a free weak tier avoids on the frontier:
+  its cache read   163,030 x 0.1  ->  16,303
+  its output           841 x 5.0  ->   4,203
+                                      20,506 units per turn
 ```
 
-**One tier switch costs ~45x an entire average turn's output** at median
-context, and ~114x at p90. The most a perfect router can save on a turn is that
-turn's output cost. The arithmetic does not close: a router that switches tiers
-even once every 45 turns has already spent everything a *free* weak tier could
-save on those turns.
+**An excursion to the cheap tier has to last about 9 turns to pay for the trip
+back** — 9.1 at median context, 10.4 at p90. Per-turn routing therefore cannot
+win: it pays the return fare on every single turn.
+
+That is the honest form of this argument. An earlier draft compared the switch
+cost against only the *output* a cheap turn saves and got ~45 turns; that is
+wrong by ~5x, because routing a turn away also avoids its input-side cost on the
+frontier. The conclusion is unchanged — 9 turns is still far more than 1 — but
+the margin is five times narrower than first stated, which matters for any
+policy tuned near the boundary.
+
+Two things make even 9 an upper bound, both pushing the real figure lower.
+Anthropic's prompt cache is prefix-keyed, so returning to a model within the TTL
+over an unchanged prefix re-creates only the delta rather than the whole
+context. And a weak tier that is merely cheap rather than free saves slightly
+less per turn (10.2 turns at a 10x-cheaper tier). Treat ~9 as the order of
+magnitude, not a threshold to tune against.
 
 This is the same trap `docs/local-model-failover.md` documented for automatic
 delegation — "the expensive part is diagnosis, not the edit" — arriving from the
@@ -180,13 +196,32 @@ drop-in for the committed `run_bench.py`. No model judges anything.
 A session qualifies only if it **landed**: a merge commit touching both
 implementation and test files. That is what "known-good outcome" means here.
 
+### The leak gate, and why the construction alone was not enough
+
+The argument above is sound in principle and **was not sufficient in practice**.
+It assumes the first user message is a user's ask. In this corpus it frequently
+is not: many sessions are started with a Jira ticket pasted in whole — often
+carrying an implementation spec, function signatures and constant names — and
+many others are QA invocations that name the files under test. A first cut of
+this set shipped 30 validated tasks of which **14 named a file they reverted and
+11 named the test that graded them**. Those tasks measured nothing.
+
+`_leaks_answer()` is therefore a hard gate, rejecting on evidence rather than on
+wording: a prompt that contains any path in `revert_paths` (or a distinctive
+basename of one), or that names a grading test file, is dropped — as are QA
+invocations and research asks with no gradeable outcome. `bench/tasks.json`'s
+own contract already required this: the prompt carries "no file paths, no
+solution sketch, and no hint that regression tests for it already exist".
+
+It cost 42 candidates and it is not optional. A benchmark that hands over the
+answer reports a cheap model doing well at reading.
+
 ### Yield
 
-From 1,628 transcripts: **62 curated tasks** (Turma 32, Tenir 29, Veiller 1) —
-above the ticket's 30–50 target. Drops, in order: 288 repo not cloned locally,
-149 no merge commit for the ticket key, 114 no ticket key, 47 duplicate
-sessions, 17 no impl+test pair, 12 no derivable test command, 6 no usable
-intent.
+From 1,628 transcripts: **58 curated tasks** (Turma 28, Tenir 29, Veiller 1).
+Drops, in order: 288 repo not cloned locally, 149 no merge commit for the ticket
+key, 114 no ticket key, **42 answer leak**, 17 no impl+test pair, 12 duplicate
+sessions, 7 no derivable test command, 6 no usable intent.
 
 ### Validation — the set that actually grades
 
@@ -195,32 +230,52 @@ which proves red-with-fix-reverted and green-with-fix:
 
 | repo | validated | of curated |
 |---|---|---|
-| Turma | **29** | 32 |
-| Tenir | **1** | 29 |
-| Veiller | 0 | 1 (suite exceeded the cap; not attempted again) |
-| **total** | **30** | 62 |
+| Turma | **26** | 28 |
+| Tenir | 0 | 29 — blocked on XERK-449, see Limitations |
+| Veiller | 0 | 1 — suite exceeded the cap |
+| **total** | **26** | 58 |
 
-**`bench/archive/tasks-validated.json` is the eval set** — 30 tasks, each
-mechanically proven to go red then green, which meets the ticket's 30–50 target.
-`tasks-archive.json` keeps the full curated pool including what did not pass, so
-the gate's decisions stay auditable.
+**`bench/archive/tasks-validated.json` is the eval set** — 26 tasks, each proven
+to go red then green, and each past the answer-leak gate. `tasks-archive.json`
+keeps the full curated pool including what did not pass, so the gate's decisions
+stay auditable.
 
-Mix: 12 bugfix, 12 change, 6 feature; Python 10, Kotlin 11, JS 3, TS 2, other 4.
+Mix: 15 change, 6 bugfix, 5 feature; Python 9, Kotlin 9, JS 2, TS 2, other 4.
 
-The three Turma rejections are the gate working: two suites fail even with the
-real fix applied (a derived `test_cmd` that does not match the change), and one
-revert hits a path absent from the parent commit.
+**This is short of the ticket's 30–50 target, and the shortfall is real.** The
+leak gate cost 42 candidates and the Tenir bootstrap costs 29 more; neither is a
+corner to cut, since a leaking task and an ungradeable task both measure
+nothing. The route to the target is XERK-449 rather than a looser gate: Tenir's
+29 candidates are already mined and would roughly double the set.
+
+The two Turma rejections are the gate working — both are suites that fail even
+with the real fix applied, i.e. a derived `test_cmd` that does not match the
+change.
 
 This answers the ticket's open question *"how much of the session archive is
-replayable at all"*: **30 tasks from 1,628 transcripts, under 2%**, and the
-binding constraint is not the transcripts. It is whether the repo is present and
-its test suite runs without bootstrap.
+replayable at all"*: **26 gradeable, non-leaking tasks from 1,628 transcripts —
+under 2%**. The binding constraints are not the transcripts. They are whether
+the repo is present, whether its suite runs without a bootstrap, and whether the
+session's opening message was a user's ask rather than a spec.
 
 ### Sanitization
 
-`bench/archive/scrub.py` redacts API keys, GitHub tokens, AWS keys, JWTs, bearer
-tokens, private keys, `*.xerktech.com`, internal IPs, host names, emails and
-home paths from anything that gets committed. `sensitivity()` marks a task
+`bench/archive/scrub.py` redacts API keys (OpenAI, Slack, Google, npm), the
+whole GitHub token family (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`),
+AWS access keys **and secret keys**, JWTs, bearer tokens, private-key blocks
+(including PGP variants and output truncated before its `-----END-----`),
+`*.xerktech.com`, `xerktech.atlassian.net`, all RFC1918 ranges, host names,
+emails, Jira `Assignee:`/`Reporter:` lines, and `/home` and `/mnt` paths.
+
+Three properties are load-bearing and are pinned by `test_scrub.py`. The email
+rule runs **before** the host rules, or `ops@mail.xerktech.com` keeps its local
+part. Every quantifier is bounded — the unbounded version was quadratic, 14s on
+80KB, i.e. a hang on the path everything leaving the box takes. And no rule may
+fire on text holding no secret: `apiKey: process.env.ANTHROPIC_API_KEY` is not a
+credential, and redacting it silently rewrites a benchmark prompt.
+
+Both committed task files carry no credentials, no internal hosts or IPs, no
+`atlassian.net`, no internal paths and no personal names. `sensitivity()` marks a task
 `local-only` if it touches NCHFA, YPrime or Tesoro work — checked on the raw
 text *before* scrubbing, since redaction would hide the fact that the task
 concerns that work at all.
@@ -232,12 +287,11 @@ content — treat it as unproven until a sensitive repo is cloned and run.
 
 ## 5. Limitations
 
-- **The eval set is effectively Turma-only** — 29 of its 30 validated tasks are
-  Turma. Tenir validated at **1/29**: it is
-  an npm-workspaces monorepo with no `node_modules`, so the derived `npx vitest`
-  commands fail before reaching the code. Those tasks need an install step the
-  harness does not perform. The 29 Tenir candidates are real work and are kept
-  in the file, but they are not usable until that is fixed.
+- **The eval set is Turma-only**, and at 26 tasks is under the ticket's 30–50
+  target. Tenir is an npm-workspaces monorepo with no `node_modules`, so the
+  derived `npx vitest` commands fail before reaching the code; its 29 candidates
+  are real work, are kept in `tasks-archive.json`, and are unusable until
+  **XERK-449** adds a bootstrap step.
 - **`test_cmd` is derived from file extensions**, which is why Tenir failed and
   why some Turma tasks carry a suite that does not match their language (a
   Kotlin change graded by a JS suite). The validator rejects those rather than

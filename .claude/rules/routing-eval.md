@@ -32,7 +32,12 @@ from, not the contract.
 - **Files ADDED by a merge cannot be in `revert_paths`.** The runner reverts with
   `git checkout <commit>^1 -- <paths>`, which errors on a path absent from the parent; a fix that
   is pure addition cannot be expressed as a red baseline at all.
-- **`tasks-validated.json` is the eval set (30 tasks), not `tasks-archive.json` (62 curated).** Only
+- **The prompt must not name a file the task reverts, nor the test that grades it.** `curate.py`'s
+  `_leaks_answer` is a hard gate: this corpus's first user messages are often a pasted Jira ticket
+  carrying an implementation spec, or a QA invocation naming the files under test. A first cut
+  shipped 30 tasks of which 14 named a reverted file and 11 named their grading test. Never relax
+  this to hit a task count.
+- **`tasks-validated.json` is the eval set (26 tasks), not `tasks-archive.json` (58 curated).** Only
   the validated file has been proven red-then-green; the pool file keeps the rejects so the gate's
   decisions stay auditable. Benchmark against the validated one.
 - **The eval set is Turma-only until XERK-449.** Tenir validated 1/29 — it is an npm-workspaces
@@ -43,9 +48,12 @@ from, not the contract.
   No such task has survived curation yet, so the mechanism is unexercised — do not describe it as
   proven.
 - **Route per session or per phase, never per turn.** 97.9% of corpus tokens are cache reads (70.3%
-  price-weighted), so switching tier mid-conversation re-ingests the whole context at cache-creation
-  price: ~45x an average turn's entire output at median context, ~114x at p90. A router that
-  switches even once every 45 turns has spent everything a *free* weak tier could have saved.
+  price-weighted), so switching tier mid-conversation re-ingests the context at cache-creation
+  price — 187,484 price units at median context against the 20,506 a free weak tier saves per turn.
+  **An excursion must last ~9 turns to pay for the trip back** (9.1 at p50, 10.4 at p90); per-turn
+  routing pays that fare every turn. Do not restate this as "45x an average turn's output" — that
+  earlier figure compared the switch against output ALONE and overstated the margin fivefold.
+  Prefix-keyed caching makes 9 an upper bound; treat it as an order of magnitude, not a threshold.
   Switchyard's own calibrated profile agrees (`classify_trigger = "user_turn"`, holding the target
   across the tool calls between). Subagent routing is the cache-safe split — delegated work carries
   its own context — and is 26% of turns.

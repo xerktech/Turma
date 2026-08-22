@@ -38,8 +38,8 @@ client context. Keep it outside the repo. Only `scrub.py` output is committable.
 | `classify.py` | classifies every turn and reports the split, weighted by tokens |
 | `curate.py` | builds replay tasks from sessions that landed a merge commit |
 | `scrub.py` | redacts secrets and marks client-sensitive tasks `local-only` |
-| `tasks-archive.json` | the full curated pool, 62 tasks, including what failed the gate |
-| `tasks-validated.json` | **the eval set** — 30 tasks proven red-then-green |
+| `tasks-archive.json` | the full curated pool, 58 tasks, including what failed the gate |
+| `tasks-validated.json` | **the eval set** — 26 tasks proven red-then-green and leak-free |
 
 Benchmark against `tasks-validated.json`. The pool file exists so the gate's
 decisions stay auditable, not to be run.
@@ -65,6 +65,12 @@ the prompt — it reported 21.1B tokens against a true 11.1B — and files the
 text-only half of a split turn under "summarization", which mislabeled 39% of
 the corpus. `_reduce_usage` takes the max of each counter, which is correct for
 both shapes.
+
+**A prompt that names the fix is not a task.** This corpus's first user messages
+are often a pasted Jira ticket carrying an implementation spec, or a QA
+invocation naming the files under test. `_leaks_answer` rejects any prompt
+containing a path in `revert_paths` or the name of a grading test. A first cut
+shipped 30 tasks of which 14 leaked. Do not relax it to hit a task count.
 
 **Curated is not validated.** `curate.py` is deliberately over-inclusive; merge
 commits bundle unrelated files and some sessions are research asks that no test

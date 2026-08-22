@@ -95,6 +95,46 @@ def derive_test_cmd(test_files, repo_path):
     return None
 
 
+# Prompts that are not a user's ask at all. A QA invocation names the branch and
+# the files under test; a research ask has no gradeable outcome even when its
+# merge commit happens to make the suite green.
+_NOT_A_TASK = (
+    re.compile(r"(?i)^\s*QA\s+(the|this)\b"),
+    re.compile(r"(?i)\bworking checkout\s*:"),
+    re.compile(r"(?i)\bre-?QA\b|\bqa-delta\b"),
+    re.compile(r"(?i)\bI need a deep understanding\b"),
+    re.compile(r"(?i)\b(write up|research|investigate|summarize|explain)\b[^.]{0,60}"
+               r"\b(so I can|before we|and report)\b"),
+)
+
+
+def _leaks_answer(intent, impl, tests):
+    """Return a reason string if this prompt hands over the answer, else None.
+
+    Two independent checks. The path check is the objective one: a prompt that
+    names a file the task reverts, or the test that grades it, has given the
+    game away regardless of how it is worded. bench/tasks.json's own contract
+    says the prompt carries "no file paths ... and no hint that regression tests
+    for it already exist".
+    """
+    for pat in _NOT_A_TASK:
+        if pat.search(intent):
+            return "not a user ask"
+    lowered = intent.lower()
+    for path in impl:
+        if path.lower() in lowered:
+            return f"names reverted file {path}"
+        base = os.path.basename(path)
+        # A bare basename is only evidence when it is distinctive; short or
+        # generic names (index.js, main.py) appear in ordinary prose.
+        if len(base) > 8 and base.lower() in lowered:
+            return f"names reverted file {base}"
+    for path in tests:
+        if path.lower() in lowered or os.path.basename(path).lower() in lowered:
+            return f"names grading test {os.path.basename(path)}"
+    return None
+
+
 def classify_kind(intent, impl_files):
     blob = (intent or "").lower()
     if any(w in blob for w in ("bug", "broken", "fails", "wrong", "regress",
@@ -207,19 +247,42 @@ def main():
         # nothing, the change was pure addition and this construction cannot
         # express it as a red baseline; drop it rather than ship a task whose
         # revert step errors.
+        # The runner reverts with `git checkout <commit>^1 -- <paths>` and the
+        # validator restores with `git checkout <commit> -- <paths>`, so a path
+        # must exist on BOTH sides. A file the merge ADDED breaks the revert; a
+        # file the merge DELETED breaks the restore. Require both trees.
         rc, present = run(["git", "ls-tree", "-r", "--name-only", f"{merge}^1"],
                           repo_path, timeout=120)
-        if rc != 0:
-            reasons["parent tree unavailable"] += 1
+        rc2, at_merge = run(["git", "ls-tree", "-r", "--name-only", merge],
+                            repo_path, timeout=120)
+        if rc != 0 or rc2 != 0:
+            reasons["tree listing unavailable"] += 1
             continue
         parent_files = set(present.split("\n"))
-        added = [f for f in impl if f not in parent_files]
-        impl = [f for f in impl if f in parent_files]
+        merge_files = set(at_merge.split("\n"))
+        both = parent_files & merge_files
+        dropped = [f for f in impl if f not in both]
+        impl = [f for f in impl if f in both]
         if not impl:
-            reasons["fix is pure addition (nothing to revert)"] += 1
+            reasons["fix is pure addition/deletion (nothing revertable)"] += 1
             continue
-        if added:
-            reasons["_note: dropped added-only files from revert set"] += len(added)
+        if dropped:
+            reasons["_note: dropped added/deleted files from revert set"] += len(dropped)
+
+        # --- the answer-leak gate -------------------------------------------
+        # The construction assumes the first user message is a user's ASK. In
+        # this corpus it frequently is not: it is a Jira ticket carrying an
+        # implementation spec, or a QA invocation naming the files to look at.
+        # Either hands the replayed agent the answer, and 14 of the first 30
+        # validated tasks did exactly that. Reject on evidence, not on shape
+        # alone: if the prompt names a file the task reverts, or names the test
+        # that grades it, it is not a task.
+        leak = _leaks_answer(intent, impl, tests)
+        if leak:
+            reasons[f"answer leak: {leak}"] += 1
+            ledger.append(dict(repo=repo_dir, key=key_used, commit=merge,
+                               status="rejected", why=f"answer leak: {leak}"))
+            continue
 
         test_cmd = derive_test_cmd(tests, repo_path)
         if not test_cmd:
