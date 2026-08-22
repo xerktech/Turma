@@ -15,9 +15,13 @@ Three rules this file has to keep, each of which was a real defect:
    host rules so a host match cannot chop a token in half. But the EMAIL rule
    must also run before the host rules, or `ops@mail.xerktech.com` becomes
    `ops@<INTERNAL_HOST>` and the local part survives.
-2. **Every quantifier is bounded.** The unbounded character classes here are
-   quadratic on adversarial input -- 14s on 80KB of `a.a.a...`, so ~40 minutes
-   on a 1MB blob. This runs on anything leaving the box, so that is a hang.
+2. **Every quantifier is bounded, and the hard case is not a regex at all.**
+   Unbounded character classes here are quadratic on adversarial input -- 14s on
+   80KB of `a.a.a...`, so ~40 minutes on a 1MB blob. Two adjacent ``\\s*`` after a
+   multiline ``^`` are worse, because ``\\s`` crosses newlines. And PEM blocks are
+   matched by `_redact_private_keys()`, a scanner, after the regex form produced
+   five defects in both directions. This runs on anything leaving the box, so a
+   hang here is not a performance bug, it is an outage.
 3. **A rule may not fire on text that holds no secret.** `apiKey:
    process.env.ANTHROPIC_API_KEY` is not a credential, and redacting it
    silently rewrites a benchmark prompt.
@@ -38,34 +42,8 @@ _NOT_A_SECRET = re.compile(
 
 _RULES = [
     # ---- credentials, first: a host or email rule must not chop one in half --
-    # The body is matched as base64-shaped RUNS, not as "anything up to END".
-    # Requiring a matching -----END----- misses output Claude Code truncated;
-    # allowing `|$` instead made a bare header in prose swallow the rest of the
-    # text, destroying two sentences of a real ask. Base64 lines are unbroken
-    # runs of >=16; prose words are not, so prose stops the match at the header.
-    (re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----"
-                r"(?:"
-                # A complete block: anything up to its own END, whatever the
-                # body looks like (short bodies and PGP armour included).
-                r"(?:(?!-----BEGIN)[\s\S]){0,20000}?"
-                r"-----END [A-Z ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----"
-                r"|"
-                # No END in sight -- Claude Code truncated it. What separates key
-                # material from prose here is RUN LENGTH, not line position: a
-                # PEM body line is 64 base64 characters, while the longest
-                # identifiers in an engineering transcript
-                # (ConfigurationManagerFactory, reproducibleBuildConfiguration)
-                # are around 30. Anchoring to line starts instead was wrong in
-                # both directions -- it kept eating identifiers that begin a
-                # line, and it stopped redacting a key whose newlines had been
-                # stripped, which is the shape of a flattened JSON or env-var
-                # value. Indentation up to 40 columns is allowed (PEM inside a
-                # YAML block scalar), as are PEM header lines and blank lines.
-                r"(?:[ \t]{0,40}(?:\r?\n[ \t]{0,40}){0,3}"
-                r"(?:[A-Za-z0-9+/=]{40,80}|[A-Za-z][A-Za-z0-9-]{2,20}:[^\r\n]{0,120})"
-                r"){0,500}"
-                r")"),
-     "<REDACTED_PRIVATE_KEY>"),
+    # Private keys are handled by _redact_private_keys(), not by a rule here.
+    # See that function for why.
     # Anthropic keys are hyphenated (`sk-ant-api03-...`), so an unbroken-alnum
     # pattern misses them entirely. This is a corpus of Claude Code transcripts:
     # it is the single most likely key format present, and it was leaking.
@@ -109,7 +87,12 @@ _RULES = [
     (re.compile(r"(?i)\b(truenas0?\d?|maxai|k8x|talos0\d)\b"), "<INTERNAL_HOST>"),
     # ---- people and local paths --------------------------------------------
     # Jira exports carry these verbatim; they are the PII in our own tickets.
-    (re.compile(r"(?im)^(\s*[-*]?\s*(?:Assignee|Reporter|Author|Owner))\s*:\s*.+$"),
+    # `[ \t]*`, never `\s*`: `\s` matches newlines, so two adjacent `\s*` after a
+    # multiline `^` backtrack across the whole document -- measured as a hang on
+    # 820KB of indented blank lines. Leading whitespace on a line cannot contain
+    # a newline anyway.
+    (re.compile(r"(?im)^([ \t]*[-*]?[ \t]*(?:Assignee|Reporter|Author|Owner))"
+                r"[ \t]*:[ \t]*.+$"),
      r"\1: <REDACTED_NAME>"),
     (re.compile(r"/(?:home|Users)/[^/\s]{1,64}"), "/home/<USER>"),
     (re.compile(r"/mnt/[^\s\"']{0,200}"), "<INTERNAL_PATH>"),
@@ -122,6 +105,122 @@ _RULES = [
                 r"(['\"]?\s*[=:]\s*)(['\"]?)([A-Za-z0-9/+._\-]{16,200})\3"),
      "_generic_secret"),
 ]
+
+
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----")
+_PEM_END = re.compile(r"-----END [A-Z ]{0,40}PRIVATE KEY[A-Z ]{0,10}-----")
+_B64_LINE = re.compile(r"[A-Za-z0-9+/=]+\Z")
+_PEM_HEADER = re.compile(r"(?:Proc-Type|DEK-Info):")
+# A PEM body line is 64 base64 characters. The longest identifiers in an
+# engineering transcript -- ConfigurationManagerFactory,
+# reproducibleBuildConfiguration -- are around 30, so 40 separates them.
+_B64_MIN = 40
+_B64_TAIL_MIN = 4        # a truncated key ends mid-line
+_MAX_BODY_LINES = 500
+_MAX_BLOCK_CHARS = 20000
+
+
+def _redact_private_keys(text):
+    """Replace PEM private-key blocks with a marker.
+
+    Deliberately a scanner and not a regular expression. Five separate defects
+    came out of the regex this replaces, in both directions:
+
+      * requiring a matching -----END----- missed output Claude Code truncated,
+        which is most of it;
+      * allowing "anything to end of string" instead swallowed the prose after a
+        bare header, destroying two sentences of a real task prompt;
+      * anchoring the body to line starts stopped redacting a key whose newlines
+        had been stripped -- a flattened JSON value or a single-line env var;
+      * accepting any `Word:` line as a PEM header destroyed ordinary prose,
+        including `apiKey: process.env.ANTHROPIC_API_KEY`, which rule 3 in this
+        module's docstring says must never be rewritten;
+      * and the nested optional whitespace inside a bounded repeat backtracked
+        cubically -- 31 seconds on 8KB of indented non-body, which is a hang on
+        the path everything leaving the box takes.
+
+    A left-to-right scan has none of those failure modes and is trivially
+    linear. It costs more lines than the regex and is worth every one.
+    """
+    if not text or "PRIVATE KEY" not in text:
+        return text
+
+    out = []
+    pos = 0
+    while True:
+        begin = _PEM_BEGIN.search(text, pos)
+        if not begin:
+            out.append(text[pos:])
+            return "".join(out)
+        out.append(text[pos:begin.start()])
+
+        # A complete block ends at its own END marker, whatever the body holds
+        # (short bodies and PGP armour included). Another BEGIN first means this
+        # header's block was truncated.
+        #
+        # The END search is BOUNDED, by the next BEGIN and by _MAX_BLOCK_CHARS.
+        # Searching to end-of-string made a document of N headers with no END
+        # quadratic -- each header rescanned the whole tail -- which is a hang
+        # on exactly the shape this function exists to handle.
+        next_begin = _PEM_BEGIN.search(text, begin.end())
+        limit = min(next_begin.start() if next_begin else len(text),
+                    begin.end() + _MAX_BLOCK_CHARS)
+        end = _PEM_END.search(text, begin.end(), limit)
+        if end:
+            out.append("<REDACTED_PRIVATE_KEY>")
+            pos = end.end()
+            continue
+
+        # Truncated: consume forward while what follows still looks like key
+        # material. Segments are split on real newlines AND on the literal \n
+        # escape, which is how a service-account key rides inside JSON.
+        cur = begin.end()
+        consumed = cur
+        lines = 0
+        while lines < _MAX_BODY_LINES:
+            seg_start = cur
+            while seg_start < len(text) and text[seg_start] in " \t":
+                seg_start += 1
+            if text.startswith("\\n", seg_start):
+                seg_start += 2
+            elif seg_start < len(text) and text[seg_start] in "\r\n":
+                seg_start += 1
+                if text.startswith("\n", seg_start):   # CRLF
+                    seg_start += 1
+            while seg_start < len(text) and text[seg_start] in " \t":
+                seg_start += 1
+
+            seg_end = seg_start
+            while seg_end < len(text) and text[seg_end] not in "\r\n":
+                if text.startswith("\\n", seg_end):
+                    break
+                seg_end += 1
+            seg = text[seg_start:seg_end].rstrip()
+
+            if _PEM_HEADER.match(seg):
+                consumed = cur = seg_start + len(seg)
+                lines += 1
+                continue
+            if not seg:                                # blank line inside a key
+                # Must make progress, or a trailing blank spins forever.
+                if seg_start <= cur or seg_start >= len(text):
+                    break
+                cur = seg_start
+                lines += 1
+                continue
+            if _B64_LINE.match(seg) and len(seg) >= _B64_MIN:
+                consumed = cur = seg_start + len(seg)
+                lines += 1
+                continue
+            # A short trailing base64 run is the last partial line of a
+            # truncated key -- but only immediately after real body lines.
+            if (consumed > begin.end() and _B64_LINE.match(seg)
+                    and len(seg) >= _B64_TAIL_MIN):
+                consumed = seg_start + len(seg)
+            break
+
+        out.append("<REDACTED_PRIVATE_KEY>")
+        pos = consumed
 
 
 def _generic_secret(m):
@@ -139,6 +238,10 @@ def scrub(text):
     """Redact secrets and internal identifiers from one string."""
     if not text:
         return text
+    # Private keys first, for the same reason the credential rules lead: a host
+    # or email rule firing inside a key body would split it, and half a
+    # redacted key is a leaked key.
+    text = _redact_private_keys(text)
     for pattern, repl in _RULES:
         text = pattern.sub(_generic_secret if repl == "_generic_secret" else repl,
                            text)

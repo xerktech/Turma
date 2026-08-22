@@ -172,19 +172,19 @@ class TestRevertSetAgainstRealGit(unittest.TestCase):
         run("config", "user.name", "t")
         os.makedirs(os.path.join(cls.repo, "tests"))
         for name, body in (("keep.js", "0"), ("gone.js", "0")):
-            open(os.path.join(cls.repo, name), "w").write(body)
-        open(os.path.join(cls.repo, "sym.js"), "w").write(
+            _write(os.path.join(cls.repo, name), body)
+        _write(os.path.join(cls.repo, "sym.js"), 
             "const removedLegacyIdentifier = 1;\nconst tiny = 2;\n")
-        open(os.path.join(cls.repo, "tests", "a.test.js"), "w").write("0")
+        _write(os.path.join(cls.repo, "tests", "a.test.js"), "0")
         run("add", "-A")
         run("commit", "-qm", "base")
         run("checkout", "-qb", "feat")
-        open(os.path.join(cls.repo, "keep.js"), "w").write("1")
-        open(os.path.join(cls.repo, "added.js"), "w").write("1")
-        open(os.path.join(cls.repo, "sym.js"), "w").write(
+        _write(os.path.join(cls.repo, "keep.js"), "1")
+        _write(os.path.join(cls.repo, "added.js"), "1")
+        _write(os.path.join(cls.repo, "sym.js"), 
             "const setModelSourceHandler = 1;\nconst tiny = 2;\n")
         os.remove(os.path.join(cls.repo, "gone.js"))
-        open(os.path.join(cls.repo, "tests", "a.test.js"), "w").write("1")
+        _write(os.path.join(cls.repo, "tests", "a.test.js"), "1")
         run("add", "-A")
         run("commit", "-qm", "work")
         run("checkout", "-q", "main")
@@ -223,6 +223,11 @@ class TestRevertSetAgainstRealGit(unittest.TestCase):
         # ...and short names are filtered out.
         self.assertNotIn("tiny", syms)
         self.assertEqual(CU.added_identifiers(self.repo, self.merge, []), set())
+
+
+def _write(path, body):
+    with open(path, "w", encoding="utf8") as fh:
+        fh.write(body)
 
 
 def shutil_which_git():

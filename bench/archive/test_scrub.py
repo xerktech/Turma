@@ -136,6 +136,41 @@ class TestRedaction(unittest.TestCase):
                     "  reproducibleBuildConfiguration: true\n")
         self.assertIn("reproducibleBuildConfiguration", out)
 
+    def test_prose_after_bare_header_is_kept_in_every_shape(self):
+        # The scanner replaced a regex that got this wrong four different ways.
+        # Each of these destroyed a real sentence at some point.
+        for text, keep in (
+            ("-----BEGIN RSA PRIVATE KEY----- Note: rotate this key please, "
+             "it is in the log", "rotate this key please"),
+            ("-----BEGIN RSA PRIVATE KEY-----\n    apiKey: "
+             "process.env.ANTHROPIC_API_KEY", "process.env.ANTHROPIC_API_KEY"),
+            ("-----BEGIN RSA PRIVATE KEY-----\nhttps://github.com/x/y/pull/482 "
+             "has the details", "has the details"),
+            ("-----BEGIN RSA PRIVATE KEY-----\nNote: this file was committed "
+             "by mistake, please rotate", "committed by mistake"),
+        ):
+            self.assertIn(keep, scrub(text), text[:60])
+
+    def test_key_inside_json_with_escaped_newlines(self):
+        # A service-account key: the only residual shape measured in the real
+        # corpus, 9 occurrences. The separator is a literal backslash-n, so a
+        # scanner keyed on real newlines matched nothing and the body survived.
+        self.assert_gone(
+            '{"private_key":"-----BEGIN PRIVATE KEY-----\\n' + B64 +
+            '\\n' + B64 + '\\n-----END PRIVATE KEY-----\\n"}', B64)
+
+    def test_truncated_key_trailing_partial_line(self):
+        # A truncated key ends mid-line, so the last run is shorter than a full
+        # body line and was being left in clear.
+        self.assert_gone(f"-----BEGIN RSA PRIVATE KEY-----\n{B64}\nc2gtcn",
+                         "c2gtcn")
+
+    def test_body_separator_variants(self):
+        for text in (f"-----BEGIN RSA PRIVATE KEY-----\r\n{B64}\r\n{B64}",
+                     f"-----BEGIN RSA PRIVATE KEY-----\n\n\n\n\n{B64}",
+                     "-----BEGIN RSA PRIVATE KEY-----\n" + " " * 80 + B64):
+            self.assert_gone(text, B64)
+
     def test_bare_header_in_prose_keeps_the_sentence(self):
         # The fallback must not eat prose. Long CamelCase identifiers are
         # exactly what follows a header in an engineering transcript.
@@ -204,6 +239,17 @@ class TestNoCatastrophicBacktracking(unittest.TestCase):
 
     def test_repeated_begin_markers(self):
         self._under("-----BEGIN X PRIVATE KEY-----\n" * 2000, 2.0)
+
+    def test_headerless_blocks_are_not_quadratic(self):
+        # Searching for -----END----- to end-of-string made N headers with no
+        # END rescan the whole tail apiece.
+        self._under(("-----BEGIN X PRIVATE KEY-----\n" + B64 + "\n") * 3000, 3.0)
+
+    def test_indented_blank_lines(self):
+        # 31s on 8KB before the scan replaced the regex, and a second hang in
+        # the Jira-name rule where two adjacent `\s*` spanned newlines.
+        self._under("-----BEGIN RSA PRIVATE KEY-----" + ("\n" + " " * 40) * 20000,
+                    3.0)
 
     def test_at_signs(self):
         self._under("a@" * 40000, 2.0)
