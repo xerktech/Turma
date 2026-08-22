@@ -100,17 +100,28 @@ and indistinguishable from a real result in the summary table.
 
 ### Results
 
-| task | opus-4-6 (cloud) | nemotron-3.5-lightning (local, thinking off) |
-|---|---|---|
-| turma-xerk-101 | **solved** 345s | not solved 280s |
-| turma-xerk-122 | **solved** 667s | **solved** 121s |
-| turma-xerk-130 | not solved (hit cap) | **solved** 164s |
-| turma-xerk-145 | — | not solved 88s |
-| turma-xerk-147 | — | not solved 47s |
+Five tasks, Claude Code as the harness, 600s cap, scored only by the repo's own
+tests.
 
-**Nemotron matches opus-4-6 on this subset and is 4–5x faster**, including one
-task (`130`) that opus failed by hitting the time cap and Nemotron solved in
-164 seconds. n=5 — this sizes an effect, it does not settle a ranking.
+| model | solved | committed | note |
+|---|---|---|---|
+| opus-4-6 (cloud) | **3/5** | 1/5 | the frontier baseline |
+| haiku-4-5 (cloud) | 2/5 | **3/5** | best at the delivery contract |
+| nemotron-3.5-lightning (local) | 2/5 | 0/5 | free, 4-5x faster |
+| qwen3-coder-next (cloud) | 1/3 | 0/3 | run incomplete |
+| sonnet-4-6 (cloud) | 0/5 | 0/5 | **403 under load** — infrastructure, not capability |
+
+n=5. This sizes effects; it does not rank models.
+
+Two things worth more than the ranking:
+
+- **Nemotron matches opus-4-6's solve count at 4-5x the speed and zero marginal
+  cost**, including `turma-xerk-130`, which opus failed by hitting the time cap
+  and Nemotron solved in 164 seconds.
+- **haiku-4-5 commits more often than opus-4-6 does** (3/5 against 1/5) while
+  solving less. Solving and delivering are different skills, and the cheap tier
+  is better at the second one. The delivery-contract gap is not a small-model
+  problem.
 
 ### Cost per completed task, measured
 
