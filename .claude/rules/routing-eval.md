@@ -35,12 +35,14 @@ from, not the contract.
 - **The prompt must not name a file the task reverts, nor the test that grades it.** `curate.py`'s
   `_leaks_answer` is a hard gate: this corpus's first user messages are often a pasted Jira ticket
   carrying an implementation spec, or a QA invocation naming the files under test. A first cut
-  shipped 30 tasks of which 14 named a reverted file and 11 named their grading test. Never relax
-  this to hit a task count.
-- **`tasks-validated.json` is the eval set (26 tasks), not `tasks-archive.json` (58 curated).** Only
+  shipped 30 tasks of which 14 named a reverted file and 11 named their grading test; a second cut
+  still shipped two, because the QA pattern anchored on `QA the|this` and missed `QA branch X` and
+  `Final QA pass on X`. It also rejects a prompt echoing >=3 identifiers the merge ADDS, which is
+  what a ticket carrying an implementation spec looks like. Never relax this to hit a task count.
+- **`tasks-validated.json` is the eval set (24 tasks), not `tasks-archive.json` (58 curated).** Only
   the validated file has been proven red-then-green; the pool file keeps the rejects so the gate's
   decisions stay auditable. Benchmark against the validated one.
-- **The eval set is Turma-only until XERK-449.** Tenir validated 1/29 — it is an npm-workspaces
+- **The eval set is Turma-only until XERK-449.** Tenir validated 0/29 — it is an npm-workspaces
   monorepo with no `node_modules`, so derived `npx vitest` commands fail before reaching code. The
   harness does no install step, by design.
 - **`sensitivity()` is checked on RAW text, before scrubbing.** Redaction would hide that a task

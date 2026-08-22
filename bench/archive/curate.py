@@ -98,17 +98,65 @@ def derive_test_cmd(test_files, repo_path):
 # Prompts that are not a user's ask at all. A QA invocation names the branch and
 # the files under test; a research ask has no gradeable outcome even when its
 # merge commit happens to make the suite green.
+# A QA invocation is not a task in EITHER direction: it hands over the fix, and
+# an agent replayed on "QA branch X" will not write the change the suite grades.
+# Anchoring on `QA the|this` alone was too narrow -- `QA branch X`, `Final QA
+# pass on branch X` and `Second QA pass please` all slipped through and shipped.
 _NOT_A_TASK = (
-    re.compile(r"(?i)^\s*QA\s+(the|this)\b"),
+    re.compile(r"(?i)^\s*(?:final|second|third|another|next)?\s*(?:re-?\s*)?QA\b"),
+    re.compile(r"(?i)\bQA\s+(?:the|this|that|branch|pass|round)\b"),
+    re.compile(r"(?i)\b(?:final|second|third|another|next|re-?)\s*QA\s+pass\b"),
+    re.compile(r"(?i)\bqa-delta\b|\bre-?QA\b"),
     re.compile(r"(?i)\bworking checkout\s*:"),
-    re.compile(r"(?i)\bre-?QA\b|\bqa-delta\b"),
+    # A prompt referring to a previous review's numbered findings is a QA reply.
+    re.compile(r"(?i)\byour\s+D-?\d"),
+    re.compile(r"(?i)^\s*THE CHANGE\s*:|\n\s*THE CHANGE\s*:"),
     re.compile(r"(?i)\bI need a deep understanding\b"),
     re.compile(r"(?i)\b(write up|research|investigate|summarize|explain)\b[^.]{0,60}"
                r"\b(so I can|before we|and report)\b"),
 )
 
+# Identifiers distinctive enough that a prompt containing several of them is
+# quoting the implementation rather than describing a symptom.
+_IDENT_RE = re.compile(r"\b(?:[a-z]+(?:[A-Z][a-z0-9]+)+|[a-z0-9]+(?:_[a-z0-9]+)+"
+                       r"|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+)\b")
+SYMBOL_ECHO_MAX = 3
 
-def _leaks_answer(intent, impl, tests):
+
+def added_identifiers(repo_path, merge, paths):
+    """Distinctive identifiers the merge ADDS, from its own diff.
+
+    A pasted Jira ticket that names three symbols the fix introduces has
+    specified the implementation, whatever else it says.
+    """
+    if not paths:
+        return set()
+    rc, diff = run(["git", "diff", "--unified=0", f"{merge}^1", merge, "--"]
+                   + list(paths), repo_path, timeout=180)
+    if rc != 0:
+        return set()
+    idents = set()
+    for line in diff.split("\n"):
+        if line.startswith("+") and not line.startswith("+++"):
+            for m in _IDENT_RE.findall(line):
+                if len(m) > 8:
+                    idents.add(m)
+    return idents
+
+
+def revertable_paths(impl, parent_files, merge_files):
+    """Split impl into (revertable, dropped).
+
+    The runner reverts with `git checkout <commit>^1 -- <paths>` and the
+    validator restores with `git checkout <commit> -- <paths>`, so a path must
+    exist in BOTH trees. A file the merge ADDED breaks the revert; a file it
+    DELETED breaks the restore, which is how turma-xerk-251 failed.
+    """
+    both = parent_files & merge_files
+    return [f for f in impl if f in both], [f for f in impl if f not in both]
+
+
+def _leaks_answer(intent, impl, tests, added_syms=()):
     """Return a reason string if this prompt hands over the answer, else None.
 
     Two independent checks. The path check is the objective one: a prompt that
@@ -132,6 +180,9 @@ def _leaks_answer(intent, impl, tests):
     for path in tests:
         if path.lower() in lowered or os.path.basename(path).lower() in lowered:
             return f"names grading test {os.path.basename(path)}"
+    echoed = sorted(sym for sym in added_syms if sym in intent)
+    if len(echoed) >= SYMBOL_ECHO_MAX:
+        return f"echoes {len(echoed)} added identifiers ({', '.join(echoed[:3])})"
     return None
 
 
@@ -241,12 +292,6 @@ def main():
             reasons["merge lacks impl+test pair"] += 1
             continue
 
-        # The runner reverts with `git checkout <commit>^1 -- <paths>`, which
-        # fails outright on a file the merge ADDED -- it does not exist at the
-        # parent. Keep only impl files that exist on both sides. If that leaves
-        # nothing, the change was pure addition and this construction cannot
-        # express it as a red baseline; drop it rather than ship a task whose
-        # revert step errors.
         # The runner reverts with `git checkout <commit>^1 -- <paths>` and the
         # validator restores with `git checkout <commit> -- <paths>`, so a path
         # must exist on BOTH sides. A file the merge ADDED breaks the revert; a
@@ -258,11 +303,8 @@ def main():
         if rc != 0 or rc2 != 0:
             reasons["tree listing unavailable"] += 1
             continue
-        parent_files = set(present.split("\n"))
-        merge_files = set(at_merge.split("\n"))
-        both = parent_files & merge_files
-        dropped = [f for f in impl if f not in both]
-        impl = [f for f in impl if f in both]
+        impl, dropped = revertable_paths(impl, set(present.split("\n")),
+                                         set(at_merge.split("\n")))
         if not impl:
             reasons["fix is pure addition/deletion (nothing revertable)"] += 1
             continue
@@ -277,7 +319,8 @@ def main():
         # validated tasks did exactly that. Reject on evidence, not on shape
         # alone: if the prompt names a file the task reverts, or names the test
         # that grades it, it is not a task.
-        leak = _leaks_answer(intent, impl, tests)
+        leak = _leaks_answer(intent, impl, tests,
+                             added_identifiers(repo_path, merge, impl))
         if leak:
             reasons[f"answer leak: {leak}"] += 1
             ledger.append(dict(repo=repo_dir, key=key_used, commit=merge,

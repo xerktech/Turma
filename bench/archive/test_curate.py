@@ -39,8 +39,13 @@ class TestLeakGate(unittest.TestCase):
             "Make sure test_hub_agent.py passes.", self.IMPL, self.TESTS))
 
     def test_qa_invocation_is_not_a_task(self):
-        for prompt in ("QA the XERK-162 change in the Turma repo",
+        # Anchoring on `QA the|this` alone let all of the first three ship.
+        for prompt in ("QA branch `XERK-252` and confirm the fix",
+                       "Final QA pass on branch `XERK-246`.",
+                       "Second QA pass please, verify the render path",
+                       "QA the XERK-162 change in the Turma repo",
                        "Re-QA the fix",
+                       "Your D-1 finding is still present",
                        "Fix it.\nWorking checkout: /somewhere"):
             self.assertEqual(CU._leaks_answer(prompt, self.IMPL, self.TESTS),
                              "not a user ask", prompt)
@@ -49,6 +54,15 @@ class TestLeakGate(unittest.TestCase):
         self.assertEqual(
             CU._leaks_answer("I need a deep understanding of how sessions resume",
                              self.IMPL, self.TESTS), "not a user ask")
+
+    def test_symbol_echo_is_a_leak(self):
+        syms = {"setModelSource", "ModelSource", "modelSource", "localModel"}
+        self.assertIn("echoes", CU._leaks_answer(
+            "add setModelSource and ModelSource so modelSource persists",
+            [], [], syms))
+        # Under the threshold is not a leak -- a ticket may name its feature.
+        self.assertIsNone(CU._leaks_answer(
+            "the modelSource is not persisted on resume", [], [], syms))
 
     def test_clean_user_voice_prompt_passes(self):
         self.assertIsNone(CU._leaks_answer(
@@ -90,8 +104,42 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(CU.classify_kind("tweak", ["deploy.yaml"]), "infra")
 
 
+class TestRevertablePaths(unittest.TestCase):
+    """Calls the real function. The previous version of this test re-implemented
+    `set(parent) & set(merge)` inline, so reverting the D4 fix outright left the
+    suite green -- a test that cannot fail is not a test."""
+
+    def test_added_and_deleted_both_dropped(self):
+        keep, dropped = CU.revertable_paths(
+            ["keep.js", "added.js", "gone.js"],
+            parent_files={"keep.js", "gone.js"},      # gone.js existed before
+            merge_files={"keep.js", "added.js"})      # added.js exists after
+        self.assertEqual(keep, ["keep.js"])
+        self.assertEqual(sorted(dropped), ["added.js", "gone.js"])
+
+    def test_added_only_breaks_the_revert(self):
+        keep, dropped = CU.revertable_paths(
+            ["added.js"], parent_files=set(), merge_files={"added.js"})
+        self.assertEqual(keep, [])
+        self.assertEqual(dropped, ["added.js"])
+
+    def test_deleted_only_breaks_the_restore(self):
+        # turma-xerk-251 failed on exactly this: the revert succeeded and the
+        # RESTORE errored, so a parent-only check does not catch it.
+        keep, dropped = CU.revertable_paths(
+            ["gone.js"], parent_files={"gone.js"}, merge_files=set())
+        self.assertEqual(keep, [])
+        self.assertEqual(dropped, ["gone.js"])
+
+    def test_order_is_preserved(self):
+        keep, _ = CU.revertable_paths(["b.js", "a.js"], {"a.js", "b.js"},
+                                      {"a.js", "b.js"})
+        self.assertEqual(keep, ["b.js", "a.js"])
+
+
 class TestRevertSetAgainstRealGit(unittest.TestCase):
-    """A path in revert_paths must exist at BOTH the parent and the merge."""
+    """End-to-end against a real merge, so the tree listings feeding
+    revertable_paths are the shape git actually produces."""
 
     @classmethod
     def setUpClass(cls):
@@ -126,7 +174,7 @@ class TestRevertSetAgainstRealGit(unittest.TestCase):
         import shutil
         shutil.rmtree(cls.repo, ignore_errors=True)
 
-    def test_added_and_deleted_are_excluded(self):
+    def test_real_trees_through_revertable_paths(self):
         if not self.ok:
             self.skipTest("git unavailable")
         rc, parent = CU.run(["git", "ls-tree", "-r", "--name-only",
@@ -134,10 +182,19 @@ class TestRevertSetAgainstRealGit(unittest.TestCase):
         rc2, at_merge = CU.run(["git", "ls-tree", "-r", "--name-only",
                                 self.merge], self.repo)
         self.assertEqual((rc, rc2), (0, 0))
-        both = set(parent.split("\n")) & set(at_merge.split("\n"))
-        self.assertIn("keep.js", both)
-        self.assertNotIn("added.js", both)   # would break the revert
-        self.assertNotIn("gone.js", both)    # would break the restore
+        keep, dropped = CU.revertable_paths(
+            ["keep.js", "added.js", "gone.js"],
+            set(parent.split("\n")), set(at_merge.split("\n")))
+        self.assertEqual(keep, ["keep.js"])
+        self.assertEqual(sorted(dropped), ["added.js", "gone.js"])
+
+    def test_added_identifiers_reads_the_diff(self):
+        if not self.ok:
+            self.skipTest("git unavailable")
+        # keep.js changes 0 -> 1, so nothing identifier-shaped is added.
+        syms = CU.added_identifiers(self.repo, self.merge, ["keep.js"])
+        self.assertEqual(syms, set())
+        self.assertEqual(CU.added_identifiers(self.repo, self.merge, []), set())
 
 
 def shutil_which_git():

@@ -39,7 +39,7 @@ client context. Keep it outside the repo. Only `scrub.py` output is committable.
 | `curate.py` | builds replay tasks from sessions that landed a merge commit |
 | `scrub.py` | redacts secrets and marks client-sensitive tasks `local-only` |
 | `tasks-archive.json` | the full curated pool, 58 tasks, including what failed the gate |
-| `tasks-validated.json` | **the eval set** — 26 tasks proven red-then-green and leak-free |
+| `tasks-validated.json` | **the eval set** — 24 tasks proven red-then-green and leak-free |
 
 Benchmark against `tasks-validated.json`. The pool file exists so the gate's
 decisions stay auditable, not to be run.

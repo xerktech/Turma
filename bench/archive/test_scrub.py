@@ -140,6 +140,13 @@ class TestSensitivity(unittest.TestCase):
                   "NCHFA", "NC Housing Finance Agency", "Tesoro pipeline"):
             self.assertEqual(sensitivity(t), "local-only", t)
 
+    def test_unicode_variants(self):
+        # The [^a-z0-9] strip removes fullwidth characters entirely, so without
+        # an NFKC normalise first the gate is defeated by a keyboard mode.
+        for t in ("\uff39-\uff30\uff52\uff49\uff4d\uff45", "\uff34\uff45\uff53\uff4f\uff52\uff4f",
+                  "N.C.H.F.A.", "Te-so-ro"):
+            self.assertEqual(sensitivity(t), "local-only", repr(t))
+
     def test_ordinary_work_is_shareable(self):
         for t in ("fix the linkify bug", "add a kanban column", ""):
             self.assertEqual(sensitivity(t), "shareable", t)

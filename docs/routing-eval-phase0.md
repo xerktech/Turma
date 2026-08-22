@@ -172,7 +172,8 @@ Three corollaries:
 
 Caveat: the local tier is self-hosted, so its own re-ingestion costs GPU time
 rather than money, and vLLM is already running with `--enable-prefix-caching`.
-The 45x is the cost on the **cloud** side, which is the side with a bill.
+The break-even above is the cost on the **cloud** side, which is the side
+with a bill.
 
 ## 4. The replay task set
 
@@ -202,26 +203,33 @@ The argument above is sound in principle and **was not sufficient in practice**.
 It assumes the first user message is a user's ask. In this corpus it frequently
 is not: many sessions are started with a Jira ticket pasted in whole — often
 carrying an implementation spec, function signatures and constant names — and
-many others are QA invocations that name the files under test. A first cut of
-this set shipped 30 validated tasks of which **14 named a file they reverted and
-11 named the test that graded them**. Those tasks measured nothing.
+many others are QA invocations that name the files under test.
+
+It took two goes to close. A first cut shipped 30 validated tasks of which **14
+named a file they reverted and 11 named the test that graded them**. A second
+cut still shipped two, because the QA pattern anchored on `QA the|this` and so
+missed `QA branch X` and `Final QA pass on X` — and a QA invocation is not a
+task in either direction, since an agent replayed on "QA branch X" never writes
+the change the suite grades.
 
 `_leaks_answer()` is therefore a hard gate, rejecting on evidence rather than on
-wording: a prompt that contains any path in `revert_paths` (or a distinctive
-basename of one), or that names a grading test file, is dropped — as are QA
-invocations and research asks with no gradeable outcome. `bench/tasks.json`'s
-own contract already required this: the prompt carries "no file paths, no
-solution sketch, and no hint that regression tests for it already exist".
+wording. A prompt is dropped if it contains any path in `revert_paths` or a
+distinctive basename of one, names a grading test file, **echoes three or more
+identifiers the merge itself adds** (which is what a ticket carrying an
+implementation spec looks like), or matches a QA-invocation or research-ask
+shape. `bench/tasks.json`'s own contract already required most of this: the
+prompt carries "no file paths, no solution sketch, and no hint that regression
+tests for it already exist".
 
-It cost 42 candidates and it is not optional. A benchmark that hands over the
+It cost 50 candidates and it is not optional. A benchmark that hands over the
 answer reports a cheap model doing well at reading.
 
 ### Yield
 
 From 1,628 transcripts: **58 curated tasks** (Turma 28, Tenir 29, Veiller 1).
 Drops, in order: 288 repo not cloned locally, 149 no merge commit for the ticket
-key, 114 no ticket key, **42 answer leak**, 17 no impl+test pair, 12 duplicate
-sessions, 7 no derivable test command, 6 no usable intent.
+key, 114 no ticket key, **50 answer leak**, 17 no impl+test pair, 7 no derivable
+test command, 6 no usable intent, 6 duplicate sessions.
 
 ### Validation — the set that actually grades
 
@@ -230,30 +238,30 @@ which proves red-with-fix-reverted and green-with-fix:
 
 | repo | validated | of curated |
 |---|---|---|
-| Turma | **26** | 28 |
+| Turma | **24** | 28 |
 | Tenir | 0 | 29 — blocked on XERK-449, see Limitations |
 | Veiller | 0 | 1 — suite exceeded the cap |
-| **total** | **26** | 58 |
+| **total** | **24** | 58 |
 
-**`bench/archive/tasks-validated.json` is the eval set** — 26 tasks, each proven
+**`bench/archive/tasks-validated.json` is the eval set** — 24 tasks, each proven
 to go red then green, and each past the answer-leak gate. `tasks-archive.json`
 keeps the full curated pool including what did not pass, so the gate's decisions
 stay auditable.
 
-Mix: 15 change, 6 bugfix, 5 feature; Python 9, Kotlin 9, JS 2, TS 2, other 4.
+Mix: 16 change, 5 feature, 3 bugfix; Python 9, Kotlin 8, TS 2, JS 1, other 4.
 
 **This is short of the ticket's 30–50 target, and the shortfall is real.** The
-leak gate cost 42 candidates and the Tenir bootstrap costs 29 more; neither is a
+leak gate cost 50 candidates and the Tenir bootstrap costs 29 more; neither is a
 corner to cut, since a leaking task and an ungradeable task both measure
 nothing. The route to the target is XERK-449 rather than a looser gate: Tenir's
 29 candidates are already mined and would roughly double the set.
 
-The two Turma rejections are the gate working — both are suites that fail even
-with the real fix applied, i.e. a derived `test_cmd` that does not match the
-change.
+All four Turma rejections are the same class and are the gate working — suites
+that fail even with the real fix applied, i.e. a derived `test_cmd` that does
+not match the change (see Limitations).
 
 This answers the ticket's open question *"how much of the session archive is
-replayable at all"*: **26 gradeable, non-leaking tasks from 1,628 transcripts —
+replayable at all"*: **24 gradeable, non-leaking tasks from 1,628 transcripts —
 under 2%**. The binding constraints are not the transcripts. They are whether
 the repo is present, whether its suite runs without a bootstrap, and whether the
 session's opening message was a user's ask rather than a spec.
@@ -280,14 +288,14 @@ Both committed task files carry no credentials, no internal hosts or IPs, no
 text *before* scrubbing, since redaction would hide the fact that the task
 concerns that work at all.
 
-**No `local-only` task survived curation** (all 62 are `shareable`): the tesoro
+**No `local-only` task survived curation** (all 58 are `shareable`): the tesoro
 sessions in the archive are not in locally cloned repos, so they never reached
 the task stage. The mechanism is in place and untested against real sensitive
 content — treat it as unproven until a sensitive repo is cloned and run.
 
 ## 5. Limitations
 
-- **The eval set is Turma-only**, and at 26 tasks is under the ticket's 30–50
+- **The eval set is Turma-only**, and at 24 tasks is under the ticket's 30–50
   target. Tenir is an npm-workspaces monorepo with no `node_modules`, so the
   derived `npx vitest` commands fail before reaching the code; its 29 candidates
   are real work, are kept in `tasks-archive.json`, and are unusable until
@@ -306,7 +314,7 @@ content — treat it as unproven until a sensitive repo is cloned and run.
   not ground truth about intent.
 - **`cwd`/`gitBranch` come from the agent**, so a session that changed branch
   mid-run maps to whichever ticket key appeared first.
-- The 45x cache figure uses Anthropic's published price *ratios*, not our
+- The break-even figure uses Anthropic's published price *ratios*, not our
   invoice. The ratios are what the conclusion rests on and they are stable; the
   absolute numbers are not claimed.
 

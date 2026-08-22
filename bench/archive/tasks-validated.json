@@ -4,8 +4,9 @@
   "passed bench/validate_tasks.py: with the fix reverted the repo's own tests FAIL,",
   "and with it restored they PASS. No model judges anything.",
   "Every task has also passed curate.py's answer-leak gate: the prompt names no file",
-  "the task reverts and no test that grades it. A first cut of this set failed that",
-  "check on 14 of 30 tasks, which is why the gate exists.",
+  "the task reverts, no test that grades it, and echoes fewer than three identifiers",
+  "the fix introduces. Two earlier cuts of this set failed that check -- see",
+  "docs/routing-eval-phase0.md -- which is why the gate is as blunt as it is.",
   "All tasks are Turma. The 29 Tenir candidates in tasks-archive.json cannot be",
   "graded until XERK-449 adds a dependency bootstrap step."
  ],
@@ -389,34 +390,6 @@
    "prompt": "Work Jira ticket XERK-226. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-226: ADO PR Chips\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-226\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nADO agent sessions should also have PR chips with all of the same functionality as github chips\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
   },
   {
-   "id": "turma-xerk-227",
-   "commit": "7f59e0bfb984396df2d206a0e99a6e0d7ee00f52",
-   "kind": "bugfix",
-   "lang": "js",
-   "sensitivity": "shareable",
-   "source": {
-    "ticket": "XERK-227",
-    "repo": "turma",
-    "transcript": "2475d121-116e-421e-8963-4ff84806112f.jsonl"
-   },
-   "revert_paths": [
-    "agent/hub-agent.py",
-    "glasses/src/vendor/chat.cjs",
-    "turma/public/chat.js",
-    "turma/public/sessions.html",
-    "turma/server.js"
-   ],
-   "test_cmd": [
-    "node",
-    "--test",
-    "turma/tests/chat.test.js",
-    "turma/tests/server.test.js",
-    "turma/tests/sessions.test.js"
-   ],
-   "test_timeout": 900,
-   "prompt": "Work Jira ticket XERK-227. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-227: Input Text box Limit\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-227\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nIn the session chat page input text box there is a character count limit that doesn't exist on the terminal size. Sometimes I need to be able to paste in long messages, but I can't.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
-  },
-  {
    "id": "turma-xerk-235",
    "commit": "ad682b2d8b8a0a8f98089ab31e30b8c93bb6bd46",
    "kind": "bugfix",
@@ -496,39 +469,6 @@
    "prompt": "Work Jira ticket XERK-241. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-241: Multi agent Ticket creation\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-241\n- Status: To Do\n- Type: Bug\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nFor my xerktech org one of the hosts was down, but the other wasn't. When I went to make a new ticket I'd get an error saying that it couldn't be created, so I retried a couple times. And then it ended up there were 4 tickets created. I'm assuming it's an issue around multi agent orgs, and which agent the ticket creation is routed through. This should auto load balance to reduce issues.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
   },
   {
-   "id": "turma-xerk-246",
-   "commit": "104cebf21138a5a3ea6cbbd9bedde74f7111dfe8",
-   "kind": "bugfix",
-   "lang": "kotlin",
-   "sensitivity": "shareable",
-   "source": {
-    "ticket": "XERK-246",
-    "repo": "turma",
-    "transcript": "agent-a21a83efae32ea0f4.jsonl"
-   },
-   "revert_paths": [
-    "VERSION",
-    "android/app/build.gradle.kts",
-    "android/app/src/main/java/com/xerktech/turma/AppContainer.kt",
-    "android/app/src/main/java/com/xerktech/turma/model/Models.kt",
-    "android/app/src/main/java/com/xerktech/turma/net/HubApi.kt",
-    "android/app/src/main/java/com/xerktech/turma/ui/ChatScreen.kt",
-    "android/app/src/main/java/com/xerktech/turma/ui/FleetDialogs.kt",
-    "android/app/src/main/java/com/xerktech/turma/ui/FleetScreen.kt",
-    "android/app/src/main/java/com/xerktech/turma/ui/SessionsScreen.kt",
-    "android/app/src/main/java/com/xerktech/turma/vm/ChatViewModel.kt",
-    "android/app/src/main/java/com/xerktech/turma/vm/FleetViewModel.kt",
-    "turma/server.js"
-   ],
-   "test_cmd": [
-    "node",
-    "--test",
-    "turma/tests/server.test.js"
-   ],
-   "test_timeout": 900,
-   "prompt": "Final QA pass on branch `XERK-246` (repo <INTERNAL_PATH> commit `91e3a4d`. Suites: **1184 python, 999 js**.\n\n**Scope this tightly.** Five passes have run; each found genuinely smaller things. I need a confirm-or-deny on the specific fixes plus a shippability verdict \u2014 not a fresh exhaustive sweep. Please prioritise in this order and stop when you've covered them:\n\n1. **Your D-1 (resume-any picked the OLDEST closed record).** Now `reversed(self.closed)`, so the worktree fallback takes the newest record for that lineage. Re-run your exact repro (spawn local \u2192 restart \u2192 kill \u2192 resume-any \u2192 switch to subscription \u2192 restart \u2192 kill \u2192 resume-any the original transcript) and confirm it now lands on `subscription`. Mutation-verify.\n\n2. **Your D-2 (guard did not deny reading the credential file).** `_GUARD_DENY_PATH_RULES` now carries `Read(~/.turma/local-model.env)` and `Edit(...)`. Run the real `agent/hooks/guard.py` against `cat`/`grep`/`head` of that path and tell me whether a session can still read the key \u2014 including obvious evasions (`sh -c`, a relative path from `~/.turma`, a symlink, `env`, `python3 -c open(...)`). If the deny is trivially bypassable, say so plainly; I would rather know than ship a comment claiming protection it does not have.\n\n3. **The four feature-killing mutations you found.** I re-tested all four as CAUGHT: dropping `set -a` (the env test now runs the real prefix through a real shell and asserts the *exported* environment, not the file), deleting the `setModelSource` dispatch arm, deleting the chat control's `fetch`, and deleting `body.modelSource` in `startSession`. Plus `ANTHROPIC_SMALL_FAST_MODEL` and the partial-config reason log. Independently re-run those mutations and confirm my results.\n\n4. **Did anything I changed this round break something?** New this round: `reversed()` in the lookup, two new guard deny rules (do they perturb `build_guard_settings` or the operator-permission merge?), `sess.pop(\"pendingModel\")` on a switch to local, and a rewritten `_launch_env` test helper that now shells out.\n\n5. **A shippability verdict**, given these documented-and-accepted limitations: ticket sessions subscription-only; local tokens in usage totals; the switch discards an in-flight turn; no single-flight on rapid toggling; Android parity gaps; and \u2014 the big one \u2014 **no key on this host can reach `gpt-oss:120b`, so real-model behaviour is unexercised by all of us.** I will state that plainly in the PR. Given that, is this shippable as a *fallback* that is off by default until `LOCAL_MODEL_*` is set in the DockerOps compose?\n\nDo NOT re-report the accepted limitations as defects. If you find something new and genuinely serious, report it; if what remains is small, say so and let me ship.\n\n## Same hard constraints\n- **Production on this host**: real turma-agent under systemd, ~78 live worktrees. Do not stop/restart/command it; don't touch tmux/worktrees you didn't create; private `TMUX_TMPDIR`, `TMUX` unset.\n- Scratch `CLAUDE_CONFIG_DIR`; never the real `~/.claude`.\n- Hub on a spare port with `STATE_FILE`/`DEVICES_FILE`/`ARCHIVE_*` under scratch; never `/data`.\n- Never paste the API key into output.\n- Scratch under `/root/tmp/...`; remove it afterwards.\n\nReport PASS / PARTIAL / FAIL with file:line evidence."
-  },
-  {
    "id": "turma-xerk-247",
    "commit": "3029ca06f636b37ce26b28c0f7bdfcfa5880ae04",
    "kind": "bugfix",
@@ -587,13 +527,13 @@
   {
    "id": "turma-xerk-251",
    "commit": "de0a3e799d4cc75803c871786c340990d416a7a4",
-   "kind": "bugfix",
+   "kind": "change",
    "lang": "ts",
    "sensitivity": "shareable",
    "source": {
     "ticket": "XERK-251",
     "repo": "turma",
-    "transcript": "agent-a0a0aabfe9d554de1.jsonl"
+    "transcript": "5132b30c-46cb-4381-b957-483c8005797d.jsonl"
    },
    "revert_paths": [
     "android/app/src/main/java/com/xerktech/turma/core/ChatItems.kt",
@@ -623,7 +563,7 @@
     "turma/tests/chat.test.js"
    ],
    "test_timeout": 900,
-   "prompt": "QA branch `XERK-252` in the Turma repo at <INTERNAL_PATH> (one commit, 05ceb86, on top of origin/main which now contains the merged XERK-251). Read `qa.md` first \u2014 you updated it last run, and \u00a73.1 (fake tunnel-agent) plus \u00a72.5 (Android in the agent image) are exactly what this needs.\n\nBACKGROUND: this fixes the pre-existing defect your last run found and recorded in qa.md \u00a76.2 \u2014 \"an agent tunnel flap permanently kills an open chat's live stream\". Jira XERK-252. Diagnosis: the hub is fine (it holds the browser's `/live` socket across a control-channel flap and re-arms the agent's watch on reconnect); `turma/public/sessions.html`'s `render()` vanish check was treating `terminalOnline === false` as the session having vanished and calling `clearStage()`. Production logs show this is routine, not exotic: every hub restart flaps all six hosts' tunnels at once (6/6 reconnects in the same second, twice on 11 Aug), so every deploy evicted every operator mid-read.\n\nTHE CHANGE:\n- `render()` now clears the stage only on positive evidence about the SESSION: `sessionRecord(currentId)` (whole fleet, unfiltered) + `agentByKey(currentHostKey)`. Clear iff the host is reporting AND (no record OR `status !== \"running\"`). Hold when the host is absent from the payload, and hold when its tunnel is merely down.\n- Reading the unfiltered fleet also means narrowing the header's org filter no longer closes the staged session (XERK-62 says scoping is a sidebar concern).\n- `setStageTunnel(online)` paints a `\u26a0 tunnel offline` chip in both the chat and terminal bars, and on the false\u2192true TRANSITION only: calls `TurmaChat.reconnectNow()` and, in terminal view, re-navigates the ttyd iframe.\n- `chat.js`: new `reconnectNow()` (no-op when the socket is OPEN/CONNECTING or no session; else clears the retry timer, resets backoff, reopens). `loadHistory()` bails before building its URL when gen is stale or the ids are null (kills the `/api/agents/null/sessions/null/history` 404).\n- `android/`: `ChatUiState.tunnelOnline` off the fleet heartbeat, rendered in the chat header (\"\u26a0 tunnel offline\" outranking \"\u00b7 live\", because our own socket stays open across a flap).\n- Vendored `chat.cjs` re-copied to glasses + veiller; `.claude/rules/turma.md` documents the rule.\n\nCLAIMS TO FALSIFY \u2014 please attack each in a real browser against a real hub, not from the diff:\n1. Dropping the agent's `/agent/control` channel while a chat is open no longer clears the stage: the conversation stays on screen, the chip appears, and when the fake agent reconnects the live stream RESUMES ON ITS OWN (new `{turn}`/`{tail}` frames render) without the operator touching anything. This is the exact scenario you reproduced last run \u2014 re-run your old script and confirm it now recovers.\n2. Same for the terminal view: the ttyd iframe is re-navigated on tunnel return (transition only \u2014 a steady stream of online beats must not re-navigate, which would restart the terminal every few seconds).\n3. A session that genuinely goes (killed elsewhere \u2192 host reports it stopped or drops it from `sessions`) STILL clears the stage. This must not regress into a stage that never lets go.\n4. A payload that omits the host entirely (hub restarted before the first heartbeat, failed refresh, `agents: []`) holds the stage rather than clearing.\n5. Narrowing the org filter while a session is staged keeps it on the stage.\n6. No `/api/agents/null/...` request is ever issued after a stage is cleared (watch the hub's access log / your CDP network capture).\n7. Nothing else on the Sessions page regressed \u2014 selection, kill/rename/move menus, ended-session views, deep links (`?session=`, `?spawn=`, `?ended=`), the compose draft carry, verbosity, terminal toggle.\n\nAlso please probe for what I might have got wrong rather than only confirming: e.g. does the stage now hold a session whose HOST went away for good (agent machine off) in a way that misleads \u2014 can the operator still tell, and can they still leave? Does `currentHostKey` go stale after a session is migrated to another host (XERK-101) or after a resume under a new id? Is there any path where `reconnectNow()` fires against a session that is no longer the staged one?\n\nWHAT I ALREADY RAN: turma `node --test turma/tests/*.test.js` 920 pass (incl. 5 new tests: 3 in sessions.test.js, plus the new turma/tests/chat-live.test.js); agent node 95 + python unittest 1258 pass; glasses tsc clean + 455 vitest; veiller tsc clean + 344 bun; Android `gradle :app:testDebugUnitTest` in the agent image \u2192 278 tests, 0 failures (I used your qa.md \u00a72.5 recipe; it works). I mutation-checked my own new tests: reverting the vanish-check change fails 4 of them, reverting the two chat.js guards fails 2 more. Please still re-run what you need \u2014 and note I did NOT drive any of this in a browser, and did not build the Android APK or drive its UI."
+   "prompt": "Work Jira ticket XERK-251. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-251: Remove Text Streaming\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-251\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nThere is no need for text streaming in the chat sessions page. It can just appear, or auto update, or whatever would be natural. Text streaming is contributing nothing.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
   },
   {
    "id": "turma-xerk-254",
