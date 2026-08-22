@@ -151,6 +151,47 @@ class TestRedaction(unittest.TestCase):
         ):
             self.assertIn(keep, scrub(text), text[:60])
 
+    def test_prefixed_credential_names(self):
+        # `\b` does not exist after `_`, so anchoring the NAME there matched
+        # bare `token` while missing every prefixed form -- measured at 873 of
+        # 992 real credential assignments in the corpus surviving untouched.
+        # Prefixes are what real config uses, so that was nearly all of them.
+        for name in ("TURMA_TOKEN", "POSTGRES_PASSWORD", "VAULT_TOKEN",
+                     "LITELLM_API_KEY", "db_password", "APP_SECRET",
+                     "IMMICH_API_TOKEN", "MY-TOKEN", "token", "password"):
+            self.assert_gone(f'{name}: "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"',
+                             "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6")
+
+    def test_prefixed_name_still_refuses_non_secrets(self):
+        # Widening the name is only safe while the VALUE check bounds it.
+        for t in ("MY_TOKEN: ${VAULT_TOKEN}",
+                  "APP_SECRET: process.env.APP_SECRET",
+                  "DB_PASSWORD: hunter"):
+            self.assertEqual(scrub(t), t, t)
+
+    def test_decorated_key_body_lines(self):
+        # A key body rarely arrives bare: it comes inside a diff, a quoted
+        # reply, a line-numbered file read or a JSON string. Any one of those
+        # made the scan stop at the first body line and leak all the rest.
+        for prefix in ("+ ", "> ", "12| ", '"'):
+            self.assert_gone(
+                f"-----BEGIN RSA PRIVATE KEY-----\n{prefix}{B64}\n"
+                f"{prefix}{B64}\n{prefix}{B64}", B64)
+
+    def test_truncated_key_with_escaped_newlines(self):
+        # The complete-block case is redacted by the END path and never
+        # exercises the literal-\n split at all, so pinning the escape logic
+        # needs a TRUNCATED block.
+        self.assert_gone(
+            '{"private_key":"-----BEGIN PRIVATE KEY-----\\n' + B64 +
+            '\\n' + B64, B64)
+
+    def test_short_alnum_word_is_not_key_material(self):
+        # _B64_MIN is the whole basis for telling a body line from an
+        # identifier. Lowering it must fail, not just raising it.
+        out = scrub("-----BEGIN RSA PRIVATE KEY-----\nabcdefgh is the marker")
+        self.assertIn("abcdefgh", out)
+
     def test_key_inside_json_with_escaped_newlines(self):
         # A service-account key: the only residual shape measured in the real
         # corpus, 9 occurrences. The separator is a literal backslash-n, so a
@@ -242,8 +283,14 @@ class TestNoCatastrophicBacktracking(unittest.TestCase):
 
     def test_headerless_blocks_are_not_quadratic(self):
         # Searching for -----END----- to end-of-string made N headers with no
-        # END rescan the whole tail apiece.
-        self._under(("-----BEGIN X PRIVATE KEY-----\n" + B64 + "\n") * 3000, 3.0)
+        # END rescan the whole tail apiece. The budget is tight on purpose: a
+        # loose one passed with the bound removed.
+        self._under(("-----BEGIN X PRIVATE KEY-----\n" + B64 + "\n") * 3000, 0.5)
+
+    def test_newline_free_headers_are_not_quadratic(self):
+        # The SEGMENT scan needs the same bound as the END search. With it
+        # applied to only one of the two, 229KB took 10s and 671KB took 74s.
+        self._under(("-----BEGIN X PRIVATE KEY-----" + "x" * 200) * 3000, 1.0)
 
     def test_indented_blank_lines(self):
         # 31s on 8KB before the scan replaced the regex, and a second hang in

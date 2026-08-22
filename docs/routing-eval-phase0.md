@@ -120,60 +120,63 @@ context.
 
 ### Why per-turn routing loses
 
-Routing turn *N* to a different model than turn *N-1* means the new model has
-no prompt cache for the conversation. It re-ingests the whole context at
-cache-creation price instead of cache-read price:
+**This section was derived from archived token counts and then measured
+directly against the gateway. The conclusion held; the mechanism did not.**
 
-```
-p50 context read from cache         163,030 tokens ->   16,303 price units
-p50 context re-created after a switch                -> 203,788 price units
-                     cost of returning to the frontier:  187,484 units
+The original reasoning was that routing turn *N* to a different model leaves it
+with no prompt cache, so it re-ingests the whole conversation at cache-creation
+price — putting break-even at tens of turns. **That is wrong.** Measured:
 
-what routing ONE turn to a free weak tier avoids on the frontier:
-  its cache read   163,030 x 0.1  ->  16,303
-  its output           841 x 5.0  ->   4,203
-                                      20,506 units per turn
-```
+- **Prompt caches are per-model and independent.** Switching away does not
+  invalidate the origin model's cache. Coming back to it within the TTL reads
+  from a still-warm cache and is charged nothing extra (`cache_creation=0`,
+  `cache_read=30,615` on the return turn).
+- **In a growing conversation each turn creates cache for the DELTA only**, not
+  for the whole context — 6,776 tokens per turn in the probe, against a context
+  that reached 40k.
 
-**An excursion to the cheap tier has to last about 9 turns to pay for the trip
-back** — 9.1 at median context, 10.4 at p90. Per-turn routing therefore cannot
-win: it pays the return fare on every single turn.
+The real penalty is narrower and still decisive: **a model that skipped a turn
+must create cache for the turns it missed.** Alternating two tiers therefore
+makes *both* of them pay for the gaps, and cache-creation volume goes up.
 
-That is the honest form of this argument. An earlier draft compared the switch
-cost against only the *output* a cheap turn saves and got ~45 turns; that is
-wrong by ~5x, because routing a turn away also avoids its input-side cost on the
-frontier. The conclusion is unchanged — 9 turns is still far more than 1 — but
-the margin is five times narrower than first stated, which matters for any
-policy tuned near the boundary.
+Six turns of growing context, `bench/archive/` probe, salted so no scenario
+reads another's warm cache:
 
-Two things make even 9 an upper bound, both pushing the real figure lower.
-Anthropic's prompt cache is prefix-keyed, so returning to a model within the TTL
-over an unchanged prefix re-creates only the delta rather than the whole
-context. And a weak tier that is merely cheap rather than free saves slightly
-less per turn (10.2 turns at a 10x-cheaper tier). Treat ~9 as the order of
-magnitude, not a threshold to tune against.
+| scenario | tier split | cache_create | vs always-frontier |
+|---|---|---|---|
+| A — always frontier (opus-4-6) | 100/0 | 40,657 | — |
+| B — per-turn alternating opus/haiku | 50/50 | **74,538** | **-8.2%** |
+| D — phase routing, 3 opus then 3 haiku | 50/50 | 60,449 | **-36.3%** |
+| C — all-cheap (haiku-4-5) | 0/100 | 40,657 | **-80.0%** |
 
-This is the same trap `docs/local-model-failover.md` documented for automatic
-delegation — "the expensive part is diagnosis, not the edit" — arriving from the
-cost side rather than the capability side.
+**B and D move the same half of the turns to the same cheap model.** The only
+difference is how often the tier changes, and it is worth 4.4x.
 
-Three corollaries:
+Alternating raises cache creation **1.83x**. haiku-4-5 is exactly **5x** cheaper
+per token than opus-4-6 ($1.10/$5.50 in, $5.50/$27.50 out), so moving half the
+turns onto it should save something like 40%.
 
-- **Route per session or per phase, never per turn.** NVIDIA's own calibrated
-  profile agrees: `classify_trigger = "user_turn"` with the comment *"hold that
-  target across the tool calls in between, so a tool chain never switches tier
-  mid-task"*, and `new_session` classifies once. See `docs/routing-prior-art.md`.
-- **Subagent routing is cache-safe by construction** — a subagent carries its
-  own context, so pinning delegated work to the local tier breaks no cache in
-  the parent conversation. At 26% of turns this is the largest split available
-  that costs nothing to take.
-- **`llm_classifier` per turn is doubly wrong for us**: it adds a model call
-  *and* is the trigger shape most likely to switch mid-chain.
+**It saves 8.2%.** The cache-creation penalty eats four fifths of the benefit —
+while the same split applied as one phase switch saves **36.3%**. Simply
+*staying* on the cheap tier saves **80%**.
+
+So the ticket's instinct — push execution turns down — is right, and the
+turn-by-turn way of doing it is the one shape that cannot pay. What saves money
+is committing to a tier and staying there:
+
+- **Route per session or per phase**, so a switch is amortised over many turns.
+  NVIDIA's own calibrated profile does this (`classify_trigger = "user_turn"`,
+  holding the target across the tool calls between); `new_session` classifies
+  once. See `docs/routing-prior-art.md`.
+- **Subagent routing is still the cache-safe split**, and for a stronger reason
+  than first stated: a subagent has its own context, so pinning delegated work
+  to a cheap tier creates no gap in the parent's cache at all. 26% of turns.
+- **`llm_classifier` per turn is the worst shape available** — it adds a model
+  call *and* maximises the number of gaps.
 
 Caveat: the local tier is self-hosted, so its own re-ingestion costs GPU time
-rather than money, and vLLM is already running with `--enable-prefix-caching`.
-The break-even above is the cost on the **cloud** side, which is the side
-with a bill.
+rather than money, and vLLM runs with `--enable-prefix-caching`. The figures
+above are the cost on the **cloud** side, which is the side with a bill.
 
 ## 4. The replay task set
 

@@ -97,12 +97,20 @@ _RULES = [
     (re.compile(r"/(?:home|Users)/[^/\s]{1,64}"), "/home/<USER>"),
     (re.compile(r"/mnt/[^\s\"']{0,200}"), "<INTERNAL_PATH>"),
     # ---- generic key=value, last and deliberately narrow --------------------
-    # Only fires on a value that actually looks like a secret: >=16 chars with
-    # both a letter and a digit, and not an env-var reference. The separator is
-    # preserved -- rewriting `:` to `=` corrupts YAML and JSON.
-    (re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|auth[_-]?token|token"
-                r"|aws_secret_access_key)"
-                r"(['\"]?\s*[=:]\s*)(['\"]?)([A-Za-z0-9/+._\-]{16,200})\3"),
+    # Matches ANY identifier = value in one greedy token, and lets
+    # _generic_secret decide whether the NAME reads as a credential and the
+    # VALUE as a secret. Two reasons it is shaped this way:
+    #
+    # A leading `\b` does not exist after `_`, so anchoring there matched bare
+    # `token` while missing `TURMA_TOKEN`, `POSTGRES_PASSWORD`, `VAULT_TOKEN` --
+    # 873 of 992 real credential assignments in this corpus survived untouched.
+    # And spelling the prefix as a lazy `{0,40}?` before an alternation costs 40
+    # backtracks per position: 70s on 687KB, which is a hang on the path
+    # everything leaving the box takes. One greedy token is linear.
+    (re.compile(r"(?:^|(?<=[^A-Za-z0-9_.\-]))"
+                r"([A-Za-z0-9_.\-]{1,60})"
+                r"(['\"]?[ \t]*[=:][ \t]*)(['\"]?)"
+                r"([A-Za-z0-9/+._\-]{16,200})\3"),
      "_generic_secret"),
 ]
 
@@ -118,6 +126,31 @@ _B64_MIN = 40
 _B64_TAIL_MIN = 4        # a truncated key ends mid-line
 _MAX_BODY_LINES = 500
 _MAX_BLOCK_CHARS = 20000
+
+
+# A key body rarely arrives bare in a transcript. It comes inside a diff, a
+# quoted reply, a line-numbered file read, or a JSON string -- and any one of
+# those decorations made the scan stop at the first body line and leave every
+# remaining line in clear.
+_DECORATION = re.compile(r"""^(?:
+      [+\->]\s?          # diff +/- , quoted reply >
+    | \d{1,6}\s*[|:]\s?  # line numbers from a file read
+    | ["'`]              # a JSON / quoted string opening
+)""", re.X)
+# JSON/YAML closers too: a key inside a JSON string ends `...KEY-----\n"}`,
+# and a body line that keeps its `"}` is not recognised as base64.
+_TRAILING = re.compile(r"""["'`,;\]}]+$""")
+
+
+def _undecorate(segment):
+    """Strip transcript decoration so a body line is recognised as one."""
+    seg = segment.strip()
+    for _ in range(3):                 # e.g. `+ 12| <body>` -- bounded, not while
+        stripped = _DECORATION.sub("", seg, count=1)
+        if stripped == seg:
+            break
+        seg = stripped.lstrip()
+    return _TRAILING.sub("", seg).rstrip()
 
 
 def _redact_private_keys(text):
@@ -174,57 +207,77 @@ def _redact_private_keys(text):
         # Truncated: consume forward while what follows still looks like key
         # material. Segments are split on real newlines AND on the literal \n
         # escape, which is how a service-account key rides inside JSON.
+        #
+        # `limit` bounds this scan too, for the same reason it bounds the END
+        # search. Without it a segment with no newline in it runs to end of
+        # string, so N headers in newline-free text each rescan the whole tail:
+        # 229KB took 10s and 671KB took 74s, against 0.006s for the regex this
+        # replaced. Applying the bound to one of the two scans and not the other
+        # was the whole defect.
         cur = begin.end()
         consumed = cur
         lines = 0
         while lines < _MAX_BODY_LINES:
             seg_start = cur
-            while seg_start < len(text) and text[seg_start] in " \t":
+            while seg_start < limit and text[seg_start] in " \t":
                 seg_start += 1
             if text.startswith("\\n", seg_start):
                 seg_start += 2
-            elif seg_start < len(text) and text[seg_start] in "\r\n":
+            elif seg_start < limit and text[seg_start] in "\r\n":
                 seg_start += 1
                 if text.startswith("\n", seg_start):   # CRLF
                     seg_start += 1
-            while seg_start < len(text) and text[seg_start] in " \t":
+            while seg_start < limit and text[seg_start] in " \t":
                 seg_start += 1
 
-            seg_end = seg_start
-            while seg_end < len(text) and text[seg_end] not in "\r\n":
-                if text.startswith("\\n", seg_end):
-                    break
-                seg_end += 1
-            seg = text[seg_start:seg_end].rstrip()
+            # Delimiter search by find(), not a per-character loop: the loop
+            # ran 91k times per header on newline-free input (73M startswith
+            # calls over 800 headers) and made the whole scan quadratic.
+            # `limit` bounds it for the same reason it bounds the END search.
+            cand = [limit]
+            for delim in ("\r", "\n", "\\n"):
+                i = text.find(delim, seg_start, limit)
+                if i != -1:
+                    cand.append(i)
+            seg_end = min(cand)
+            seg = _undecorate(text[seg_start:seg_end])
 
             if _PEM_HEADER.match(seg):
-                consumed = cur = seg_start + len(seg)
+                consumed = cur = seg_end
                 lines += 1
                 continue
             if not seg:                                # blank line inside a key
                 # Must make progress, or a trailing blank spins forever.
-                if seg_start <= cur or seg_start >= len(text):
+                if seg_start <= cur or seg_start >= limit:
                     break
                 cur = seg_start
                 lines += 1
                 continue
             if _B64_LINE.match(seg) and len(seg) >= _B64_MIN:
-                consumed = cur = seg_start + len(seg)
+                consumed = cur = seg_end
                 lines += 1
                 continue
             # A short trailing base64 run is the last partial line of a
             # truncated key -- but only immediately after real body lines.
             if (consumed > begin.end() and _B64_LINE.match(seg)
                     and len(seg) >= _B64_TAIL_MIN):
-                consumed = seg_start + len(seg)
+                consumed = seg_end
             break
 
         out.append("<REDACTED_PRIVATE_KEY>")
         pos = consumed
 
 
+# A name is a credential name if it ENDS with one of these, so any prefix
+# (TURMA_, POSTGRES_, aws_) is covered without the regex having to express it.
+_SECRET_NAME = re.compile(
+    r"(?:api[_-]?key|secret|password|passwd|auth[_-]?token|token|apikey)$", re.I)
+
+
 def _generic_secret(m):
     key, sep, quote, value = m.group(1), m.group(2), m.group(3), m.group(4)
+    if not _SECRET_NAME.search(key):
+        return m.group(0)
     if _NOT_A_SECRET.match(value):
         return m.group(0)
     if not (re.search(r"[A-Za-z]", value) and re.search(r"\d", value)):

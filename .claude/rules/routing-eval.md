@@ -55,13 +55,21 @@ from, not the contract.
   concerns NCHFA/YPrime/Tesoro work at all. A `local-only` task must never reach a cloud endpoint.
   No such task has survived curation yet, so the mechanism is unexercised — do not describe it as
   proven.
-- **Route per session or per phase, never per turn.** 97.9% of corpus tokens are cache reads (70.3%
-  price-weighted), so switching tier mid-conversation re-ingests the context at cache-creation
-  price — 187,484 price units at median context against the 20,506 a free weak tier saves per turn.
-  **An excursion must last ~9 turns to pay for the trip back** (9.1 at p50, 10.4 at p90); per-turn
-  routing pays that fare every turn. Do not restate this as "45x an average turn's output" — that
-  earlier figure compared the switch against output ALONE and overstated the margin fivefold.
-  Prefix-keyed caching makes 9 an upper bound; treat it as an order of magnitude, not a threshold.
-  Switchyard's own calibrated profile agrees (`classify_trigger = "user_turn"`, holding the target
-  across the tool calls between). Subagent routing is the cache-safe split — delegated work carries
-  its own context — and is 26% of turns.
+- **Route per session or per phase, never per turn — MEASURED, not derived.** 97.9% of corpus
+  tokens are cache reads (70.3% price-weighted). Prompt caches are **per-model and independent**:
+  switching away does NOT invalidate the origin's cache, and returning within the TTL is charged
+  nothing. In a growing conversation each turn creates cache for the DELTA only. The real penalty
+  is that a model which skipped a turn must create cache for the turns it MISSED, so alternating
+  makes both tiers pay for the gaps — measured at **1.83x cache-creation volume**.
+  - At real Bedrock rates (opus-4-6 $5.50/$27.50, haiku-4-5 $1.10/$5.50 per Mtok — exactly 5x),
+    moving half the turns to the cheap tier "should" save ~40%. **Per-turn alternating saves 8.2%;
+    the SAME 50/50 split as one phase switch saves 36.3%** — 4.4x, decided purely by switch
+    FREQUENCY. All-cheap saves 80%.
+  - So **routing accuracy is worth far less than routing stability**. `stage_router` and
+    `llm_classifier` are both per-turn decisions; a smarter per-turn classifier optimises the term
+    that barely matters and adds a model call to do it.
+  - **Do not restate this as "45x an average turn's output" or "an excursion must last ~9 turns"**
+    — both were earlier derivations from the archive that measurement superseded. They assumed a
+    switch re-creates the WHOLE context; it does not.
+  - Subagent routing is the cache-safe split, and for a stronger reason than first stated: a
+    subagent carries its own context, so delegating creates no gap in the parent's cache. 26% of turns.

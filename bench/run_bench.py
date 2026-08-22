@@ -26,7 +26,11 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIGS = os.path.join(HERE, "configs")
-MODEL = "gpt-oss:120b"
+# The model every harness is pointed at. Overridable so one task set can be run
+# across a whole model matrix -- which is the point of XERK-445 Phase 3: the
+# harness is held fixed and the MODEL is the variable, the inverse of the
+# bake-off this directory was built for.
+MODEL = os.environ.get("TURMA_LOCAL_MODEL", "gpt-oss:120b")
 
 # Appended verbatim to every task prompt, for every harness. Kept out of
 # tasks.json so a harness can never be measured against different wording.
@@ -57,7 +61,13 @@ AIDER = _bin("/root/.local/bin/aider", "/usr/local/bin/aider")
 
 def base_env():
     env = os.environ.copy()
-    env.setdefault("TMPDIR", "/root/tmp")
+    # Not /root/tmp: this used to run as root and the hardcoded path is simply
+    # unwritable for anyone else, which surfaces as every task "abandoning" in
+    # ~7s with EACCES rather than as a setup error.
+    tmp = os.environ.get("TMPDIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "turma-bench-tmp")
+    os.makedirs(tmp, exist_ok=True)
+    env["TMPDIR"] = tmp
     # Keep every harness from picking up an ambient cloud login: the bench is
     # explicitly about the SELF-HOSTED model, and a stray key would silently
     # benchmark someone else's frontier model instead.
