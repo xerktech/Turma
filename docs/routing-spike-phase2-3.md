@@ -244,3 +244,46 @@ recommendation is that most of them should not be built as specified.
   untested in practice.
 - **`qwen3-coder-next` and the other open-weight candidates** were probed but
   not benchmarked to completion.
+
+## Where the spend actually is, and what to do about it
+
+Measured over the 695-session archive, priced at opus-4-6 rates: **$8,505, or
+$12.24 per session.** `cache_read` is **70.3%** of that; output is 14.2%.
+
+That reframes the whole ticket. Cache reads are `turns x context`, and both
+factors are independent of which model you pick — so **the model you run
+multiplies the dominant term**, while a routing policy only re-allocates it.
+
+Levers, ranked by measured saving:
+
+| lever | saving | basis |
+|---|---|---|
+| Everything on haiku-4-5 | **80%** | measured on the cache probe; haiku is exactly 5x cheaper |
+| Execution sessions on local Nemotron | up to **87%** of turns at $0 | 86.7% of turns are execution-shaped |
+| Phase routing, one switch per session | **36%** | measured |
+| Halve the fixed per-turn overhead | **12%** | 34,453 tokens x 61 turns/session, zero quality risk |
+| QA subagents to haiku | **6.3%** | 9% of sessions, 4/5 recall at 1/5 cost |
+| **Per-turn routing (what the ticket specifies)** | **8.2%** | measured; the cache penalty eats four fifths of it |
+
+**The router is the smallest lever on the list and the most complex to build.**
+
+### The overhead lever is free money
+
+**34% of every turn's context is fixed** — system prompt, tool definitions and
+instruction files — and it is re-read on all 61 turns of a median session:
+2.1M cache-read tokens per session, $1.16 at opus rates, before any work
+happens. Halving it costs nothing in quality, needs no routing, and applies to
+every model at once. `CLAUDE.md` alone is 38,581 characters, 96% of the ceiling
+this repo sets for itself.
+
+### Recommended order
+
+1. **Default sessions to haiku-4-5, escalate on evidence.** The actuator already
+   exists (`modelSource`); only `spawn_ticket` needs it plumbed. haiku solved
+   2/5 and *committed 3/5* — better delivery than opus-4-6's 1/5.
+2. **Send QA subagents to haiku.** No classifier needed, no cache gap, 4/5
+   recall.
+3. **Trim the fixed overhead.** Pure housekeeping, ~12%, no risk.
+4. **Local Nemotron for well-scoped execution work**, where failure is cheap and
+   mechanically detectable. Not for adversarial review — mean 2.4/5, range 0-4.
+5. **Do not build per-turn routing.**
