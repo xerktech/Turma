@@ -1,0 +1,16 @@
+{
+  "name": "@turma/poc-turma-2.0",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Proof of concept for Turma 2.0 multi-host dsh architecture",
+  "scripts": {
+    "hub": "cd fleet-hub && npm run dev",
+    "test": "npx tsx test-standalone.ts",
+    "setup": "cd fleet-hub && npm install && cd ../fleet-agent-plugin && npm install"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "ws": "^8.16.0",
+    "@types/ws": "^8.5.10"
+  }
+}
