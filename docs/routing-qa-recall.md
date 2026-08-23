@@ -6,8 +6,9 @@ by three tiers with an identical prompt, identical tree, 1500s cap.
 
 | reviewer | recall | HIGH | cost | notes |
 |---|---|---|---|---|
-| opus-4-6 | **5/5** | 1/1 | baseline | 10 findings |
-| haiku-4-5 | **4/5** | 1/1 | **~1/5** | 10 findings; missed the curate.py revert defect |
+| opus-4-6 | **5/5** | 1/1 | 1.00x | 10 findings |
+| sonnet-4-5 | **4/5** | 1/1 | 0.60x | found the revert defect, missed the false-positive class |
+| haiku-4-5 | **4/5** | 1/1 | **0.20x** | found the false-positive class, missed the revert defect |
 | nemotron, unguided | **0/5** | 0/1 | $0 | looped, thrashed, died at 258 bytes |
 | nemotron, tool-disciplined | **4/5** | 1/1 | $0 | compaction fired; recovered anyway |
 | nemotron, no compaction (hybrid) | **2/5** | 1/1 | $0 | stayed under the threshold |
@@ -77,6 +78,23 @@ The honest conclusion: Nemotron's ceiling is real (4/5 at its best, and it did
 find the ReDoS in one run) but its *expected* value is about half of haiku's,
 and a QA gate is bought on the expected value, not the ceiling. **Fixing
 compaction does not move it.**
+
+### Recall per dollar
+
+| model | recall | rel. cost | recall per unit cost |
+|---|---|---|---|
+| opus-4-6 | 5/5 | 1.00x | 5.0 |
+| sonnet-4-5 | 4/5 | 0.60x | 6.7 |
+| haiku-4-5 | 4/5 | **0.20x** | **20.0** |
+
+haiku is **4x more efficient than opus and 3x more than sonnet** at finding
+these defects.
+
+Sonnet and haiku each scored 4/5 but found *different* fours — sonnet caught the
+curate.py revert defect, haiku caught the damages-clean-text class. Their union
+is 5/5, i.e. opus-level, at 0.80x. That is barely cheaper than simply running
+opus, so **stacking two cheap tiers is not worth the complexity**; run haiku
+alone and escalate.
 
 ## Methodology note
 

@@ -98,30 +98,33 @@ the harness, 600s cap, scored only by the repo's own tests.
 `429` from the gateway and scored every model 0/8 — throttling, not capability,
 and indistinguishable from a real result in the summary table.
 
-### Results
+### Results — opus vs sonnet vs haiku vs local
 
 Five tasks, Claude Code as the harness, 600s cap, scored only by the repo's own
-tests.
+tests. Costs are measured from the sessions' own token counts.
 
-| model | solved | committed | note |
-|---|---|---|---|
-| opus-4-6 (cloud) | **3/5** | 1/5 | the frontier baseline |
-| haiku-4-5 (cloud) | 2/5 | **3/5** | best at the delivery contract |
-| nemotron-3.5-lightning (local) | 2/5 | 0/5 | free, 4-5x faster |
-| qwen3-coder-next (cloud) | 1/3 | 0/3 | run incomplete |
-| sonnet-4-6 (cloud) | 0/5 | 0/5 | **403 under load** — infrastructure, not capability |
+| model | rel. price | solved | committed | $ total | **$ / solved** |
+|---|---|---|---|---|---|
+| opus-4-6 | 1.00x | **3/5** | 1/5 | $47.20 | $15.73 |
+| sonnet-4-5 | 0.60x | 1/5 | 2/5 | $16.62 | **$16.62** |
+| haiku-4-5 | 0.20x | 2/5 | **3/5** | $13.13 | **$6.56** |
+| nemotron-3.5-lightning (local) | free | 2/5 | 0/5 | **$0** | **$0** |
 
-n=5. This sizes effects; it does not rank models.
+`sonnet-4-6` is not usable at all — 0/4 on repeated probes across every regional
+variant, an AWS Marketplace subscription error. `sonnet-4-5` is what "sonnet"
+means here.
 
-Two things worth more than the ranking:
+**Sonnet is dominated on both axes.** It costs 3x haiku and solved half as much;
+its cost per solved task ($16.62) is *worse than opus-4-6's* ($15.73) despite
+being 40% cheaper per token. On this evidence it occupies no useful point on the
+frontier: haiku is cheaper and more efficient, opus is more capable.
 
-- **Nemotron matches opus-4-6's solve count at 4-5x the speed and zero marginal
-  cost**, including `turma-xerk-130`, which opus failed by hitting the time cap
-  and Nemotron solved in 164 seconds.
-- **haiku-4-5 commits more often than opus-4-6 does** (3/5 against 1/5) while
-  solving less. Solving and delivering are different skills, and the cheap tier
-  is better at the second one. The delivery-contract gap is not a small-model
-  problem.
+**haiku-4-5 is the value winner by a wide margin** — $6.56 per solved task
+against opus's $15.73 — and it commits more often than either (3/5 against 1/5
+and 2/5). Solving and delivering are different skills and the cheap tier is
+better at the second.
+
+n=5. This sizes effects; it does not settle a ranking.
 
 ### Cost per completed task, measured
 
