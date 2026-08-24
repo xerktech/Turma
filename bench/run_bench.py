@@ -259,7 +259,8 @@ def score(task, dest, baseline):
 # activity, is retried rather than scored as a capability failure.
 INFRA_ERROR_RE = re.compile(
     r"Unable to connect|Cannot connect to API|ECONNRESET|ECONNREFUSED|ETIMEDOUT|"
-    r"socket hang up|502 Bad Gateway|503 Service|504 Gateway|Connection error",
+    r"socket hang up|502 Bad Gateway|503 Service|504 Gateway|Connection error|"
+    r"Request rejected \(429\)|Too many tokens|rate.limited",
     re.I)
 # Evidence the harness actually got a model turn back and acted on it. Kept to
 # capitalised tool NAMES and unambiguous markers: bare words like "shell" appear
