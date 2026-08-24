@@ -2435,6 +2435,38 @@ test("http: an old agent's bare-string usage models are coerced on ingest", asyn
   assert.deepEqual(rec.usage.totals, legacy.totals);
 });
 
+test("http: a NON-ARRAY usage.models cannot blank the dashboard for everyone", async () => {
+  // The coercion above only ran when `models` was ALREADY an array, so an object
+  // rode through raw. The dashboard walks it with `for (const m of list || [])`,
+  // which throws on an object, and it builds tiles + host list in one pass — so
+  // one agent-authed beat left EVERY operator with nothing but the nav. Android
+  // types `models` (defaulted to empty, so absent is safe) and decodes the whole
+  // /api/agents array atomically, so the same beat empties every other host from
+  // every phone. Absent, not `[]`: absent is "can't tell you", `[]` asserts the
+  // host spent on no models.
+  for (const bad of [{ evil: { totals: { input: 5 } } }, "opus", 7, true]) {
+    assert.equal(
+      (await request("POST", "/api/heartbeat", {
+        body: {
+          device: "bad-models-host",
+          usage: { totals: { input: 1, output: 0, cacheWrite: 0, cacheRead: 0 }, models: bad },
+          repoUsage: [{ repo: "Turma", usage: { models: bad } }],
+          sessions: [{ id: "s1", repo: "Turma", status: "running", usage: { models: bad } }],
+        },
+        headers: agentHeaders,
+      })).status,
+      200
+    );
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const rec = res.body.agents.find((a) => a.key === "bad-models-host");
+    assert.equal("models" in rec.usage, false, `usage.models survived ${JSON.stringify(bad)}`);
+    assert.equal("models" in rec.repoUsage[0].usage, false);
+    assert.equal("models" in rec.sessions[0].usage, false);
+    // Everything else in the block still rides through.
+    assert.equal(rec.usage.totals.input, 1);
+  }
+});
+
 test("http: a current agent's per-model usage is left exactly as reported", async () => {
   const models = [{ model: "claude-opus-5", totals: { input: 3, output: 4, cacheWrite: 5, cacheRead: 6 },
                     today: { input: 1, output: 0, cacheWrite: 0, cacheRead: 0 },

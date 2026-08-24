@@ -2085,7 +2085,20 @@ function advanceMigrations() {
 // old host). A name-less entry is DROPPED — it can't be rendered or merged by
 // name, and carries no windows worth keeping.
 function normalizeModelUsage(usage) {
-  if (!usage || !Array.isArray(usage.models)) return;
+  if (!usage) return;
+  // A non-array `models` is DELETED, not left alone. Returning early here only
+  // held while `models` was untyped: `for (const m of list || [])` throws on an
+  // object, and the dashboard builds its whole body in one pass, so ONE host
+  // beating `"models": {...}` blanked the front page for EVERY operator — tiles,
+  // host list and all, nav only. Android types it (`List<ModelUsage>`, defaulted
+  // to empty), and a full /api/agents decode is atomic there, so the same beat
+  // empties every OTHER host from every phone's fleet. Absent is the value all
+  // three clients already read as "this agent can't tell you"; a fabricated
+  // empty array would instead assert that the host spent on no models at all.
+  if (!Array.isArray(usage.models)) {
+    delete usage.models;
+    return;
+  }
   usage.models = usage.models
     .map((m) => (typeof m === "string" ? { model: m } : m))
     .filter((m) => m && typeof m.model === "string" && m.model);
