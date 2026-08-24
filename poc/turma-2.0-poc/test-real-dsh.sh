@@ -8,8 +8,9 @@
 #   FLEET_DEVICE=my-host ./test-real-dsh.sh
 #   DSH_PORT=3081 FLEET_DEVICE=host-2 ./test-real-dsh.sh   # second worker
 #
-# Everything installs into a throwaway DSH_HOME under this directory, so your
-# real ~/.dsh profile is never touched. Nothing here needs a global dsh install.
+# By DEFAULT everything installs into a throwaway DSH_HOME under this
+# directory, leaving your real ~/.dsh alone. Overriding DSH_HOME removes that
+# protection -- see the guard below. Nothing here needs a global dsh install.
 #
 # Why the install looks like this: dsh resolves plugins through a PROFILE
 # BUNDLE, not through --patch. A `--patch` overlay can only override an entry
@@ -29,18 +30,74 @@ DSH_PORT="${DSH_PORT:-3080}"
 FLEET_DEVICE="${FLEET_DEVICE:-dsh-test-host}"
 HUB_URL="ws://localhost:${HUB_PORT}/ws"
 
+# The device name is interpolated into YAML below. Keep it to characters that
+# cannot restructure the document -- a name containing ':' breaks the parse,
+# and one containing a newline injects sibling keys into the plugin entry.
+if ! printf '%s' "$FLEET_DEVICE" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+  echo "FAIL: FLEET_DEVICE must match [A-Za-z0-9][A-Za-z0-9._-]* (got: $FLEET_DEVICE)"
+  exit 1
+fi
+
 # Per-device by default, so two workers never share a profile (and so the
 # second run's config patch cannot disturb the first worker).
-export DSH_HOME="${DSH_HOME:-$SCRIPT_DIR/.dsh-test-home/$FLEET_DEVICE}"
+DSH_HOME_DEFAULT="$SCRIPT_DIR/.dsh-test-home/$FLEET_DEVICE"
+export DSH_HOME="${DSH_HOME:-$DSH_HOME_DEFAULT}"
 PROFILE_DIR="$DSH_HOME/profiles/web"
 
+# This script REWRITES $PROFILE_DIR/package.json and OVERWRITES its
+# cordis.patch.yml. Pointed at a real profile that would clobber the user's own
+# configuration, so a non-throwaway DSH_HOME has to be opted into explicitly.
+if [ "$DSH_HOME" != "$DSH_HOME_DEFAULT" ] && [ "${DSH_HOME_ALLOW_CLOBBER:-}" != "1" ]; then
+  echo "FAIL: DSH_HOME is overridden to a profile this script would rewrite:"
+  echo "        $DSH_HOME"
+  echo "      It overwrites profiles/web/cordis.patch.yml and edits package.json."
+  echo "      Re-run with DSH_HOME_ALLOW_CLOBBER=1 if that is really what you want."
+  exit 1
+fi
+
+LOG_DIR="${TMPDIR:-/tmp}"
+HUB_LOG="$LOG_DIR/turma-hub-$HUB_PORT.log"
+DSH_LOG="$LOG_DIR/turma-dsh-$FLEET_DEVICE.log"
+
+# ---------------------------------------------------------------- teardown
+# npm/tsx spawn grandchildren, so killing the recorded pid leaves the real node
+# processes behind, reparented to init. Those orphans hold the ports AND keep
+# their hub registration alive, which makes the next run either fail to bind or
+# -- worse -- pass on a stale entry. Tear down the whole descendant tree.
 HUB_PID=""
 DSH_PID=""
-cleanup() {
-  [ -n "$DSH_PID" ] && kill "$DSH_PID" 2>/dev/null || true
-  [ -n "$HUB_PID" ] && kill "$HUB_PID" 2>/dev/null || true
+
+kill_tree() {
+  local pid="$1" sig="${2:-TERM}" child
+  [ -n "$pid" ] || return 0
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    kill_tree "$child" "$sig"
+  done
+  kill "-$sig" "$pid" 2>/dev/null || true
 }
-trap cleanup EXIT
+
+alive_tree() {
+  local pid="$1" child
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null && return 0
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    alive_tree "$child" && return 0
+  done
+  return 1
+}
+
+cleanup() {
+  local pid
+  for pid in "$DSH_PID" "$HUB_PID"; do kill_tree "$pid" TERM; done
+  for _ in $(seq 1 20); do
+    alive_tree "$DSH_PID" || alive_tree "$HUB_PID" || return 0
+    sleep 0.25
+  done
+  for pid in "$DSH_PID" "$HUB_PID"; do kill_tree "$pid" KILL; done
+}
+trap cleanup EXIT INT TERM
+
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3<&- ; }
 
 echo "=== Turma 2.0: real dsh + Fleet Hub integration test ==="
 echo "  DSH_HOME : $DSH_HOME"
@@ -49,10 +106,32 @@ echo "  hub      : http://localhost:$HUB_PORT"
 echo "  dsh      : http://localhost:$DSH_PORT"
 echo
 
+# ------------------------------------------------------------- 0. preflight
+# An orphan from an earlier run is the failure mode this catches. Note `ss` is
+# absent on some minimal images, so check by connecting, not by listing.
+if port_busy "$DSH_PORT"; then
+  echo "FAIL: port $DSH_PORT is already in use -- most likely a dsh left over"
+  echo "      from an earlier run. Find and stop it with:"
+  echo "        pgrep -af 'profile web'"
+  echo "      (or pick another port: DSH_PORT=3081 $0)"
+  exit 1
+fi
+
+# A stale registration under this device name would make the final assertion
+# pass without this run proving anything.
+if curl -sf "http://localhost:$HUB_PORT/api/agents" 2>/dev/null | grep -q "\"$FLEET_DEVICE\""; then
+  echo "FAIL: '$FLEET_DEVICE' is ALREADY registered with the hub on :$HUB_PORT."
+  echo "      A leftover dsh is still connected, so a PASS here would be"
+  echo "      meaningless. Stop it (pgrep -af 'profile web') or use a"
+  echo "      different FLEET_DEVICE."
+  exit 1
+fi
+
 # ---------------------------------------------------------------- 1. build
 echo "[1/5] Building the fleet-agent plugin..."
-npm install --silent
-( cd fleet-agent-plugin && npm install --silent && npm run --silent build && rm -f ./*.tgz && npm pack --silent >/dev/null )
+echo "      (first run installs dependencies -- this can take 10+ minutes)"
+npm install
+( cd fleet-agent-plugin && npm install && npm run build && rm -f ./*.tgz && npm pack >/dev/null )
 TARBALL="$(cd fleet-agent-plugin && ls ./*.tgz | head -1)"
 TARBALL="$SCRIPT_DIR/fleet-agent-plugin/${TARBALL#./}"
 echo "      packed $(basename "$TARBALL")"
@@ -65,7 +144,7 @@ test -d "$PROFILE_DIR" || { echo "FAIL: dsh did not scaffold $PROFILE_DIR"; exit
 
 # ------------------------------------------------- 3. install as a bundle
 echo "[3/5] Installing the plugin into the profile as a bundle..."
-( cd "$PROFILE_DIR" && npm install --silent "$TARBALL" )
+( cd "$PROFILE_DIR" && npm install "$TARBALL" )
 
 # Register the plugin in dsh.profile.bundles (idempotent).
 node -e '
@@ -78,13 +157,14 @@ node -e '
 
 # The profile patch layer overrides the bundle entry config for THIS run.
 # The `name` must match the bundle entry exactly or dsh skips the patch.
+# Values are quoted; FLEET_DEVICE is character-restricted above.
 cat > "$PROFILE_DIR/cordis.patch.yml" <<EOF
 # Written by test-real-dsh.sh -- overrides the fleet-agent entry for this run.
 - id: turma-fleet-agent
   name: '@turma/dsh-fleet-agent'
   config:
-    hubUrl: $HUB_URL
-    device: $FLEET_DEVICE
+    hubUrl: '$HUB_URL'
+    device: '$FLEET_DEVICE'
 EOF
 
 # Prove the entry actually made it into the composed tree before booting.
@@ -102,18 +182,19 @@ echo "[4/5] Starting the Fleet Hub and dsh..."
 if curl -sf "http://localhost:$HUB_PORT/api/agents" >/dev/null 2>&1; then
   echo "      hub already running on :$HUB_PORT, reusing it"
 else
-  ( cd fleet-hub && npm install --silent && npm run dev ) >/tmp/turma-hub.log 2>&1 &
+  # The hub reads PORT, not HUB_PORT.
+  ( cd fleet-hub && npm install && PORT="$HUB_PORT" npm run dev ) >"$HUB_LOG" 2>&1 &
   HUB_PID=$!
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 60); do
     curl -sf "http://localhost:$HUB_PORT/api/agents" >/dev/null 2>&1 && break
     sleep 1
   done
   curl -sf "http://localhost:$HUB_PORT/api/agents" >/dev/null 2>&1 || {
-    echo "FAIL: Fleet Hub never came up on :$HUB_PORT"; tail -20 /tmp/turma-hub.log; exit 1; }
+    echo "FAIL: Fleet Hub never came up on :$HUB_PORT"; tail -20 "$HUB_LOG"; exit 1; }
   echo "      hub up"
 fi
 
-npm exec -- dsh --profile web --no-open --port "$DSH_PORT" >/tmp/turma-dsh.log 2>&1 &
+npm exec -- dsh --profile web --no-open --port "$DSH_PORT" >"$DSH_LOG" 2>&1 &
 DSH_PID=$!
 
 # --------------------------------------------------------------- 5. assert
@@ -125,8 +206,8 @@ for _ in $(seq 1 30); do
     break
   fi
   # Surface a dsh boot crash immediately rather than burning the full timeout.
-  if ! kill -0 "$DSH_PID" 2>/dev/null; then
-    echo "FAIL: dsh exited during boot"; tail -30 /tmp/turma-dsh.log; exit 1
+  if ! alive_tree "$DSH_PID"; then
+    echo "FAIL: dsh exited during boot"; tail -30 "$DSH_LOG"; exit 1
   fi
   sleep 1
 done
@@ -140,6 +221,8 @@ if [ -n "$REGISTERED" ]; then
   echo
   echo "Fleet dashboard : http://localhost:$HUB_PORT"
   echo "dsh web UI      : http://localhost:$DSH_PORT"
+  echo "Logs            : $HUB_LOG"
+  echo "                  $DSH_LOG"
   echo
   echo "Both are still running. Press Ctrl+C to stop."
   wait "$DSH_PID"
@@ -147,6 +230,6 @@ else
   echo "=== FAIL ==="
   echo "'$FLEET_DEVICE' never appeared in /api/agents."
   echo "--- hub sees ---"; curl -s "http://localhost:$HUB_PORT/api/agents"; echo
-  echo "--- dsh log ---";  tail -30 /tmp/turma-dsh.log
+  echo "--- dsh log ---";  tail -30 "$DSH_LOG"
   exit 1
 fi
