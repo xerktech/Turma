@@ -1,0 +1,8 @@
+node_modules/
+package-lock.json
+
+# Throwaway dsh profile created by test-real-dsh.sh
+.dsh-test-home/
+
+# Plugin tarballs produced by `npm pack`
+*.tgz

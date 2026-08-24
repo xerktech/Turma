@@ -1,8 +1,0 @@
-# Cordis patch for host-1
-# Usage: dsh web --port 3080 --patch cordis.patch.host1.yml
-
-- id: turma-fleet-agent
-  name: '@turma/dsh-fleet-agent-poc'
-  config:
-    hubUrl: ws://localhost:3000/ws
-    device: host-1
