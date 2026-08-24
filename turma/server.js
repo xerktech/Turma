@@ -2200,16 +2200,26 @@ function advanceMigrations() {
     // above; read after that handoff so a completed restore always wins the tie.
     if (m.restore && (m.phase === "exporting" || m.phase === "importing")) {
       for (const [host, a] of Object.entries(agents)) {
+        // ONLINE hosts only, exactly as at admission. A host that died with the
+        // session running keeps `status: "running"` for PRUNE_AFTER_MS — seven
+        // days — so without this the restore is admitted (the admission check
+        // skips it) and then killed one tick later by the same dead host, with an
+        // error asserting it "came back up". That is worse than the old refusal:
+        // the operator has now also spent an in-flight slot, a spool file and a
+        // pack, and the agent 404s the download it was told to make.
+        if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
         const live = (a.sessions || []).find(
           (s) => s.transcriptId === m.transcriptId && s.status === "running" &&
-                 // The migration's OWN imported session is the success case, not
-                 // a rival — and it does not always carry the minted importCmdId
-                 // that the handoff above matches on. Skipping the whole TARGET
-                 // instead would leave the one host that actually unpacks
-                 // unchecked: `import_session` downloads and unpacks BEFORE
-                 // `_resume_at_cwd` refuses, so a conversation resumed locally on
-                 // the target between admission and its next beat has the
-                 // archived bytes written over it.
+                 // Never the migration's OWN imported session. Belt-and-braces
+                 // today — the handoff above matches the same predicate and
+                 // `continue`s first, so this cannot currently fire — but it is
+                 // what makes the rule true independently of that ordering.
+                 //
+                 // What it must NOT do is skip the whole TARGET, which leaves the
+                 // one host that actually unpacks unchecked: `import_session`
+                 // downloads and unpacks BEFORE `_resume_at_cwd` refuses, so a
+                 // conversation resumed locally on the target between admission
+                 // and its next beat has the archived bytes written over it.
                  s.spawnCmdId !== m.importCmdId);
         if (!live) continue;
         m.phase = "failed";
@@ -8056,6 +8066,18 @@ const server = http.createServer(async (req, res) => {
       //   - a repo-dir session, `<REPOS_ROOT>/<repo>`, identified the same way.
       // Anything else the agent would refuse anyway, so refusing here only saves
       // an in-flight slot and a spool file. A `..` component is never legitimate.
+      // A `~/.claude/projects/<slug>` dir is a TRANSCRIPT STORE, never a cwd, and
+      // no agent can resume one. It is the overwhelming majority of what the
+      // archive records for `(root)` rows — `repo == "(root)"` is also the
+      // agent's catch-all bucket for any cwd it could not attribute to a repo, so
+      // the repo alone does not mean "root session". Refusing them here is what
+      // keeps admitting root rows from spending a slot, a pack and a spool file
+      // on ~1228 rows the agent would refuse a minute later.
+      if (/(^|\/)\.claude\/projects(\/|$)/.test(row.worktree))
+        return json(res, 409, {
+          error: "this archived session recorded a transcript directory rather than a working " +
+                 "directory, so there is nowhere to resume it",
+        });
       const wtParts = row.worktree.split("/").filter(Boolean);
       const isWorktree = /(^|\/)\.turma\/worktrees\/[^/]+\/[^/]+\/?$/.test(row.worktree);
       const isRoot = row.repo === ROOT_REPO_NAME;

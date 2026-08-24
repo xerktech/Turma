@@ -266,9 +266,12 @@ reason the raw layer exists in a form nothing else reads: the rendered entries a
     back beating that conversation as running; finishing anyway is the thing the admission check
     exists to prevent. The TARGET is skipped — its own imported session is the success case, and
     it does not always carry the minted `importCmdId` that the handoff matches on.
-  - **Only ONLINE hosts get a veto.** A host that died with the session running keeps
-    `status: "running"` in its last record forever, so gating on it refused the restore naming a
-    host the operator cannot kill it on — on exactly the population this feature exists for.
+  - **Only ONLINE hosts get a veto, at BOTH the admission check and the tick.** A host that died
+    with the session running keeps `status: "running"` for `PRUNE_AFTER_MS` (seven days), so gating
+    on it refused the restore naming a host the operator cannot kill it on — on exactly the
+    population this feature exists for. Fixing only admission is worse than not fixing it: the
+    restore is admitted, spends a slot and a pack, and the same dead host kills it one tick later
+    with an error claiming it "came back up".
   - The re-check skips **the migration's own session** (`spawnCmdId === importCmdId`), NEVER the
     whole target host: `import_session` downloads and unpacks BEFORE `_resume_at_cwd` refuses, so a
     conversation resumed locally on the target between admission and its next beat gets the archived
@@ -277,11 +280,19 @@ reason the raw layer exists in a form nothing else reads: the rendered entries a
   hub does not know a target's REPOS_ROOT — hosts mount it at different paths on purpose — so the
   check accepts each shape `_resumable_cwd_class` does: a `.turma/worktrees/<repo>/<dir>` tail (the
   only mount-independent one), a ROOT session identified by `repo === "(root)"`, and a repo dir whose
-  last segment is the row's repo. **Root sessions are the MAJORITY of the archive** (822 of the
-  stranded production rows against 178 with a worktree tail), and requiring a tail made every one of
-  them permanently unrestorable — the agent supports them, so nothing but the hub was refusing. A
-  `..` component is never legitimate. Anything else the agent refuses anyway, with a reason that
-  reaches the operator (XERK-265), so the check only saves an in-flight slot and a spool file.
+  last segment is the row's repo. Requiring the tail made every ROOT session permanently
+  unrestorable, and the agent supports them, so nothing but the hub was refusing.
+  - **`repo == "(root)"` does NOT mean "root session".** It is also the agent's catch-all bucket for
+    any cwd it could not attribute to a repo, so most rows carrying it record a
+    `~/.claude/projects/<slug>` TRANSCRIPT STORE rather than a working directory — 1228 of the 1262
+    restorable `(root)` rows measured on the production hub, against 34 with a real repos-root path.
+    Those are refused explicitly: no agent can resume one, and admitting them spends a slot, a pack
+    and a spool file to learn what the path already said. Real recovery is ~291 rows, not ~1519 —
+    don't restate the admitted count as the recoverable one.
+  - A `..` component is never legitimate, and is pinned on its own: every other case in the shape
+    matrix fails for a different reason, so removing the guard changed no test.
+  - Anything else the agent refuses anyway, with a reason that reaches the operator (XERK-265), so
+    the check only saves an in-flight slot and a spool file.
 - **An INCOMPLETE bundle is on the record, never only in the log** (`m.incomplete`, capped at
   `INCOMPLETE_NAMES_MAX` names since it rides `/api/agents` and every SSE frame). The archive's
   `safeRawRel` accepts 255 bytes per component and ustar carries 100 + a 155 prefix, so a long

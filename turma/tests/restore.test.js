@@ -567,3 +567,76 @@ test("restore: the incomplete list is CAPPED on the wire", async () => {
   const sm = res.body.migrations.find((x) => x.id === m.id);
   assert.equal(sm.incomplete.skipped.length, 20);
 });
+
+test("restore: an offline host cannot veto at the TICK either, not just admission", async () => {
+  // Fixing admission alone made the outcome WORSE than the refusal it replaced:
+  // the restore was admitted, spent an in-flight slot and a pack, and was then
+  // killed by the same dead host one tick later, with an error asserting it "came
+  // back up". A host keeps `status: "running"` for PRUNE_AFTER_MS — seven days.
+  releaseInFlight();
+  const tid = "60606060-1111-2222-3333-444444444444";
+  seedArchive(tid);
+  await beat("k8x");
+  await beat("tombstone", { sessions: [{ id: "ghost", status: "running", repo: "Widget",
+                                         transcriptId: tid, spawnCmdId: "OLDSPAWN" }] });
+  agents["tombstone"].lastSeen = Date.now() - 10 * 60 * 1000;
+
+  const r = await request("POST", `/api/archive/${tid}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const m = migrations.get(r.body.migrationId);
+  assert.equal(await waitPacked(m), "importing", m.error || "");
+
+  advanceMigrations();
+  assert.equal(m.phase, "importing", `a dead host killed it: ${m.error}`);
+});
+
+test("restore: a `..` in the recorded worktree is refused whatever else it looks like", async () => {
+  // The traversal guard has to be pinned on its own: every case in the shape
+  // matrix also fails the shape test, so removing the guard changed nothing there
+  // and the suite stayed green over it.
+  releaseInFlight();
+  await beat("k8x");
+  for (const [n, bad] of Object.entries({
+    // Shaped exactly like a worktree, and `(root)`/repo-dir shaped, so ONLY the
+    // `..` check can refuse each of these.
+    worktreeish: "/mnt/tank/repos/.turma/worktrees/Widget/..",
+    rootish: "/mnt/tank/repos/..",
+    repodirish: "/mnt/tank/repos/../Widget",
+  })) {
+    const tid = `7777${n.padEnd(4, "0").slice(0, 4)}-1111-2222-3333-444444444444`;
+    archive.ingestChunk("truenas", tid, {
+      repo: n === "rootish" ? "(root)" : "Widget", remoteKey: "", worktree: bad,
+      summary: "s", createdAt: "2026-08-01T00:00:00Z", endedTs: "2026-08-02T00:00:00Z",
+    }, 0, CONVERSATION.length, [{ uuid: "u1", role: "user", ts: 1, text: "one" }]);
+    archive.ingestRaw("truenas", tid, `${tid}.jsonl`, 0, Buffer.from(CONVERSATION));
+    const r = await request("POST", `/api/archive/${tid}/restore`,
+      { headers: userHeaders, body: { host: "k8x" } });
+    assert.equal(r.status, 409, `${n}: ${JSON.stringify(r.body)}`);
+  }
+});
+
+test("restore: a transcript directory is refused up front, not packed and then refused", async () => {
+  // `repo == "(root)"` is ALSO the agent's catch-all for a cwd it could not
+  // attribute to a repo, so accepting root rows on the repo alone admitted every
+  // row whose recorded "worktree" is really a ~/.claude/projects/<slug> store —
+  // 1228 of the 1262 restorable (root) rows on the production hub. No agent can
+  // resume one, so each cost a slot, a pack and a spool file to learn that.
+  releaseInFlight();
+  await beat("k8x", { repos: ["Widget", "(root)"] });
+  for (const [n, dir] of Object.entries({
+    root: "/root/.claude/projects/-mnt-data-Docker-git-Turma",
+    home: "/home/mhabeeb/.claude/projects/-home-mhabeeb-git-Other",
+  })) {
+    const tid = `8888${n.padEnd(4, "0").slice(0, 4)}-1111-2222-3333-444444444444`;
+    archive.ingestChunk("truenas", tid, {
+      repo: "(root)", remoteKey: "", worktree: dir,
+      summary: "s", createdAt: "2026-08-01T00:00:00Z", endedTs: "2026-08-02T00:00:00Z",
+    }, 0, CONVERSATION.length, [{ uuid: "u1", role: "user", ts: 1, text: "one" }]);
+    archive.ingestRaw("truenas", tid, `${tid}.jsonl`, 0, Buffer.from(CONVERSATION));
+    const r = await request("POST", `/api/archive/${tid}/restore`,
+      { headers: userHeaders, body: { host: "k8x" } });
+    assert.equal(r.status, 409, `${n}: ${JSON.stringify(r.body)}`);
+    assert.match(r.body.error, /transcript directory/);
+  }
+});
