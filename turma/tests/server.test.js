@@ -2528,7 +2528,15 @@ test("a models block that is ABSENT, or has nothing usable, stays absent", async
   assert.equal("models" in absent, false, "a host that sent none must not be given one");
 
   for (const junk of [{}, { available: [] }, { available: [1, 2, null] },
-                      { available: "nope", defaultLabel: 5, at: [] }, [1, 2], "x", 0, false, ""]) {
+                      { available: "nope", defaultLabel: 5, at: [] }, [1, 2], "x", 0, false, "",
+                      // The survivors of an all-fields guard: a block whose only
+                      // usable value is `at` or `defaultLabel` is still empty
+                      // where it counts, and a fresh `at` is exactly what wins
+                      // the freshest-probe compare and clears a real host's
+                      // default label.
+                      { available: "nope", at: "2099-01-01" },
+                      { available: [], defaultLabel: "Opus 5" },
+                      { at: "2099-01-01", defaultLabel: "Opus 5" }]) {
     const rec = { device: "junk-models-host", models: junk };
     hub.normalizeRecord(rec);
     assert.equal("models" in rec, false, `rebuilt an empty block from ${JSON.stringify(junk)}`);

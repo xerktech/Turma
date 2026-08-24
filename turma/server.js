@@ -3327,10 +3327,6 @@ const HEARTBEAT_MAX = BODY_INFLIGHT_MAX;
 // real task prompt; /api/trigger applies its own 10k cap on prompt alone.
 const SPAWN_FIELD_MAX = 100000;
 
-// One clone-progress line on the wire. The agent caps it too; this is the half
-// that does not trust the agent.
-const CLONE_PROGRESS_MAX = 120;
-
 // Top-level keys a heartbeat is known to carry — the agent's own payload plus
 // the on-demand `*Results` deliveries, which the handler extracts and deletes
 // from the payload itself before the spread. Anything else is bounded by
@@ -3556,56 +3552,6 @@ function normalizeSubagentHistory(a) {
  * entry, never a plausible default — since a fabricated reason would end an
  * operator's spawn wait with text no agent ever said.
  */
-// The host login's own model list (`models`, XERK-33) — NOT the per-model usage
-// block above, which is a different field with a different shape. Android types
-// it (`ModelsInfo?`) and decodes /api/agents atomically, so one host beating
-// `models: "x"` — or a number, or an object whose `available` is a string —
-// throws for the WHOLE array and empties every other host from every phone's
-// fleet list, while the tile still reads "N / N online". The web guards this one
-// with Array.isArray, so it fails only on the client that fails silently.
-//
-// Unusable becomes ABSENT, and that means absent — never a rebuilt empty block.
-// An empty one passes `board.js`'s `Array.isArray(mb.available)` gate and joins
-// the freshest-probe compare, where it can take the DEFAULT LABEL off a host that
-// probed properly; absent is skipped there, and is what the ticket model picker
-// already reads as "this agent can't tell you", falling back to the static family
-// aliases. `Board.kt` has the identical compare.
-//
-// The bounds are INLINE LITERALS on purpose. `normalizeRecord` is reached from
-// `loadState`'s restore loop near the top of this file, which resolves these
-// functions only because declarations hoist — a module `const` below is in its
-// TDZ there, the ReferenceError lands in the restore's catch, and the WHOLE
-// registry is emptied, after which the save timer rewrites state.json from only
-// the hosts that have re-beaten. That is XERK-301, and shipping it again is what
-// the sibling normalizers inline their own bounds to avoid.
-function normalizeModels(payload) {
-  if (!payload || typeof payload !== "object") return;
-  if (!("models" in payload)) return;   // absent stays absent — never fabricated
-  const m = payload.models;
-  if (!m || typeof m !== "object" || Array.isArray(m)) {
-    delete payload.models;
-    return;
-  }
-  // Each NAME is bounded too, not just the count: 100 entries of 70 KiB is a
-  // 7 MiB block on /api/agents and on every SSE frame, which a count cap alone
-  // waves through. Capping one field of several is the XERK-348 mistake.
-  const available = Array.isArray(m.available)
-    ? m.available
-        .filter((x) => typeof x === "string" && x)   // DROPPED, never String()'d —
-        .slice(0, 100)                               // a coerced number is a model
-        .map((x) => x.slice(0, 120))                 // name that does not exist
-    : [];
-  const defaultLabel = typeof m.defaultLabel === "string" ? m.defaultLabel.slice(0, 120) : "";
-  const at = typeof m.at === "string" ? m.at.slice(0, 120) : "";
-  // Nothing usable left: drop it rather than serve a block that says this login
-  // can run no models at all.
-  if (!available.length && !defaultLabel && !at) {
-    delete payload.models;
-    return;
-  }
-  payload.models = { available, defaultLabel, at };
-}
-
 function normalizeSpawnRefusals(a) {
   if (!a || typeof a !== "object") return;
   const raw = a.spawnRefusals;
@@ -3701,8 +3647,14 @@ function normalizeClones(a) {
     for (const k of ["repo", "name", "status", "error", "source", "startedAt", "progress"]) {
       if (k in c && typeof c[k] !== "string") delete c[k];
     }
-    if (typeof c.progress === "string" && c.progress.length > CLONE_PROGRESS_MAX) {
-      c.progress = c.progress.slice(0, CLONE_PROGRESS_MAX);
+    // 120 INLINE, not a module `const`: `normalizeClones` is reached from
+    // `loadState`'s restore loop near the top of this file, where a const
+    // declared below is in its TDZ — the ReferenceError lands in the restore's
+    // catch and the whole registry is emptied (XERK-301). One clone-progress
+    // line on the wire; the agent caps it too, this is the half that does not
+    // trust the agent.
+    if (typeof c.progress === "string" && c.progress.length > 120) {
+      c.progress = c.progress.slice(0, 120);
     }
   }
 }
@@ -3725,6 +3677,60 @@ function normalizeJira(a) {
   const j = a.jira;
   if (!j || typeof j !== "object" || Array.isArray(j)) return;
   if ("siteKey" in j && typeof j.siteKey !== "string") delete j.siteKey;
+}
+
+// The host login's own model list (`models`, XERK-33) — NOT the per-model usage
+// block above, which is a different field with a different shape. Android types
+// it (`ModelsInfo?`) and decodes /api/agents atomically, so one host beating
+// `models: "x"` — or a number, or an object whose `available` is a string —
+// throws for the WHOLE array and empties every other host from every phone's
+// fleet list, while the tile still reads "N / N online". The web guards this one
+// with Array.isArray, so it fails only on the client that fails silently.
+//
+// Unusable becomes ABSENT, and that means absent — never a rebuilt empty block.
+// An empty one passes `board.js`'s `Array.isArray(mb.available)` gate and joins
+// the freshest-probe compare, where it can take the DEFAULT LABEL off a host that
+// probed properly; absent is skipped there, and is what the ticket model picker
+// already reads as "this agent can't tell you", falling back to the static family
+// aliases. `Board.kt` has the identical compare.
+//
+// The bounds are INLINE LITERALS on purpose. `normalizeRecord` is reached from
+// `loadState`'s restore loop near the top of this file, which resolves these
+// functions only because declarations hoist — a module `const` below is in its
+// TDZ there, the ReferenceError lands in the restore's catch, and the WHOLE
+// registry is emptied, after which the save timer rewrites state.json from only
+// the hosts that have re-beaten. That is XERK-301, and shipping it again is what
+// the sibling normalizers inline their own bounds to avoid.
+function normalizeModels(payload) {
+  if (!payload || typeof payload !== "object") return;
+  if (!("models" in payload)) return;   // absent stays absent — never fabricated
+  const m = payload.models;
+  if (!m || typeof m !== "object" || Array.isArray(m)) {
+    delete payload.models;
+    return;
+  }
+  // Each NAME is bounded too, not just the count: 100 entries of 70 KiB is a
+  // 7 MiB block on /api/agents and on every SSE frame, which a count cap alone
+  // waves through. Capping one field of several is the XERK-348 mistake.
+  const available = Array.isArray(m.available)
+    ? m.available
+        .filter((x) => typeof x === "string" && x)   // DROPPED, never String()'d —
+        .slice(0, 100)                               // a coerced number is a model
+        .map((x) => x.slice(0, 120))                 // name that does not exist
+    : [];
+  const defaultLabel = typeof m.defaultLabel === "string" ? m.defaultLabel.slice(0, 120) : "";
+  const at = typeof m.at === "string" ? m.at.slice(0, 120) : "";
+  // The LIST is what makes the block worth serving. A `defaultLabel` or an `at`
+  // with no usable `available` is still the rebuilt-empty block this function
+  // exists to avoid: it passes board.js's `Array.isArray(mb.available)` gate,
+  // joins the freshest-probe compare, and — with a newer `at` than a host that
+  // probed properly — takes that host's default label off the picker. Checking
+  // all three fields let `{available: "nope", at: "2099-01-01"}` do exactly that.
+  if (!available.length) {
+    delete payload.models;
+    return;
+  }
+  payload.models = { available, defaultLabel, at };
 }
 
 /**
@@ -9603,7 +9609,7 @@ if (process.env.TURMA_TEST) {
     normalizeRetired,
     normalizeJira,
     normalizeClones,
-    CLONE_PROGRESS_MAX,
+    CLONE_PROGRESS_MAX: 120,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
