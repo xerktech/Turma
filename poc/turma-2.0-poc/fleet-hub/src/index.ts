@@ -275,7 +275,8 @@ const dashboardHtml = `<!DOCTYPE html>
   </div>
 
   <script>
-    const ws = new WebSocket(\`ws://\${location.host}/ws?type=dashboard\`)
+    const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws'
+    const ws = new WebSocket(\`\${wsScheme}://\${location.host}/ws?type=dashboard\`)
     let state = { agents: [] }
 
     ws.onmessage = (e) => {

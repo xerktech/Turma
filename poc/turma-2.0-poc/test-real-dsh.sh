@@ -58,4 +58,4 @@ cd ..
 FLEET_DEVICE="test-host-1" npm exec -- dsh web --port 3080 --patch fleet-agent-plugin/cordis.patch.yml
 
 # Cleanup on exit
-trap "kill $HUB_PID 2>/dev/null" EXIT
+trap 'kill $HUB_PID 2>/dev/null' EXIT
