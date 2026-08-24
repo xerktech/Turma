@@ -99,24 +99,46 @@ Code as the harness, 1500s cap, scored only by the repo's own tests.
 took a hard `429` from the gateway and scored every model 0/8 — throttling, not
 capability, and indistinguishable from a real result in the summary table.
 
-### Results — full 25-task matrix (haiku, sonnet, opus)
+### Results — full 25-task matrix
 
-| model | rel. price | solved | committed | avg time (solved) |
-|---|---|---|---|---|
-| haiku-4-5 | 0.20x | **18/25 (72%)** | 18/25 | 460s |
-| sonnet-4-5 | 0.60x | **18/25 (72%)** | 18/25 | 327s |
-| opus-4-6 | 1.00x | 2/2 valid | 2/2 | 439s |
+| model | solved | avg TPS | avg time | avg output tok | avg total tok/task |
+|---|---|---|---|---|---|
+| haiku-4-5 | **18/25 (72%)** | 58.4 | 447s | 26,080 | 9,697,080 |
+| sonnet-4-5 | **18/25 (72%)** | 83.8 | 320s | 26,811 | 7,864,476 |
+| opus-4-5 | *in progress* | — | — | — | — |
+| opus-4-6 | 2/2 valid | — | 439s | — | — |
+| deepseek-v4-flash | **2/25 (8%)** | 67.4 | 90s | 6,100 | 498,079 |
+| qwen-3.8-27b | *in progress* | — | — | — | — |
 
 `sonnet-4-6` is not usable at all (AWS Marketplace subscription error).
-`sonnet-4-5` is what "sonnet" means here.
+`sonnet-4-5` is what "sonnet" means here. TPS is output tokens / wall-clock
+seconds (includes tool execution and network, not just generation).
 
-**Opus was gated by a daily token quota on the LiteLLM/Bedrock gateway**, not by
-capability. Every run past the first two tasks received `429 "Too many tokens per
-day"` with zero tool activity — indistinguishable from "scored 0" without
-inspecting the log. The infra-failure detector now catches this
-(`run_bench.py`), but the quota is a gateway-level constraint, not retryable.
-The two valid opus tasks solved and committed, including **xerk-122 which neither
-haiku nor sonnet could solve**.
+**Token accounting note.** Anthropic models report most input as
+`cache_read_input_tokens` (haiku: 9.49M avg, sonnet: 7.61M avg), so the raw
+`input_tokens` field (~400–1,400) is only the uncached delta. DeepSeek reports
+all input as `input_tokens` (101K avg) with some `cache_read` (390K from vLLM
+prefix caching). The "avg total tok/task" column sums all four fields.
+
+**Opus-4-6 was gated by a daily token quota on the LiteLLM/Bedrock gateway**,
+not by capability. The infra-failure detector now catches this, but only 2 tasks
+ran validly. **Opus-4-5 has better quota limits** and is running the full 25-task
+set via Bedrock — results pending.
+
+**DeepSeek V4 Flash solved 2/25.** Running locally via LiteLLM at
+`10.10.10.36:8888`, it is fast (67 TPS, 90s avg) but solves almost nothing on
+this task set. Most tasks fail in under 60s with no commits — the model abandons
+rather than attempting a fix. The two solves (xerk-186, xerk-250) both took ~170s
+and are tasks haiku/sonnet also solve.
+
+**Qwen 3.8-27B** required a custom vLLM chat template to work with Claude Code.
+Claude Code interleaves `system` messages throughout the conversation
+(`<system-reminder>` blocks), and Qwen3's default template rejects any system
+message after the first user turn. The fix renders non-initial system messages as
+user messages (`qwen3-allow-system.jinja2`, passed via `--chat-template`). The
+`TURMA_LOCAL_EFFORT=medium` env var is also required because Qwen rejects Claude
+Code's default `reasoning_effort: high`. Running via LiteLLM on maxai — results
+pending.
 
 **The n=5 result was misleading.** At n=5, sonnet appeared dominated (1/5 vs
 haiku's 2/5). At n=25, they are **identical in solve rate (72%)** but solve
@@ -130,15 +152,15 @@ haiku's 2/5). At n=25, they are **identical in solve rate (72%)** but solve
 | Neither | 4 | xerk-{122, 218, 222, 254} |
 | **Union (either solves)** | **21** | |
 
-Sonnet is ~30% faster per task (avg 320s vs 447s). Every task both solved, sonnet
-finished first on 14 of 15.
+Sonnet is ~30% faster per task (avg 320s vs 447s) and 43% higher TPS (83.8 vs
+58.4). Every task both solved, sonnet finished first on 14 of 15.
 
 **The "neither" set is small (4/25) and opus cracked one of them.** xerk-122 is
-the hardest task in the set — both cheaper models failed it, opus solved it in
-722s. The other three (xerk-218, 222, 254) remain unsolved by any model.
+the hardest task in the set — both cheaper models failed it, opus-4-6 solved it
+in 722s. The other three (xerk-218, 222, 254) remain unsolved by any model.
 
 n=25 on one repo. This settles the haiku-vs-sonnet ranking (they are tied) but
-not the opus question (n=2).
+not the opus question (n=2 for 4-6, in progress for 4-5).
 
 ### Cost per completed task, measured (n=5 pilot)
 
@@ -254,8 +276,8 @@ The ticket lists nine. Where they stand after the spike:
 | Sanitized replay set of 30-50 tasks, documented grading, local-only subset | **partial** — 25 validated tasks, under target; the local-only subset does not exist because no `local-only` task survived curation |
 | Turn-type classification showing the real weak/strong split | **done** — 52,391 turns; 86.7% execution-shaped |
 | `docs/routing-prior-art.md` with a build-vs-adopt call | **done** |
-| Benchmark table for every model on the endpoint, by turn type, cost per task | **partial** — 3 models on 25 tasks (opus limited to 2 by quota); not broken down by turn type |
-| A local model serving behind an OpenAI-compatible endpoint via the `ai-windows` YAML | **partial** — Nemotron serves on `maxai:8000`, but deployed by hand; nothing was pushed to `dockerops` |
+| Benchmark table for every model on the endpoint, by turn type, cost per task | **partial** — 5 models on 25 tasks (haiku, sonnet, dsv4 complete; opus-4-5 and qwen-3.8 in progress); not broken down by turn type |
+| A local model serving behind an OpenAI-compatible endpoint via the `ai-windows` YAML | **partial** — Qwen3.8-27B on `maxai:8000` via vLLM, DeepSeek V4 Flash on `10.10.10.36:8888`; both deployed by hand |
 | Working end-to-end routed session mixing local and cloud turns | **not done** — no router was ever run |
 | Measured cost delta vs always-frontier, with a quality comparison | **done for cost** (the table above), **solid on quality** (n=25 for haiku/sonnet, n=2 for opus) |
 | Rollback path documented | **done** — see below |
@@ -266,9 +288,9 @@ recommendation is that most of them should not be built as specified.
 
 ## What this spike did not settle
 
-- **Opus at scale.** The gateway's daily token quota limited opus to 2 valid
-  tasks. Both solved. Whether opus hits 80%+ or 90%+ on the full 25 is unknown
-  and depends on lifting the quota or running against a different endpoint.
+- **Opus at scale.** Opus-4-6 was gated by a daily token quota (n=2). Opus-4-5
+  is running the full 25-task set via Bedrock with better quotas — results
+  pending. Whether opus hits 80%+ or 90%+ is unknown until this completes.
 - **Cross-model retry.** The "try haiku, retry on sonnet" policy would reach
   21/25 in theory; whether the second model solves reliably on a retry (not just
   on a fresh attempt) is untested.
@@ -278,8 +300,12 @@ recommendation is that most of them should not be built as specified.
 - **No sensitive/local-only subset was exercised** — no `local-only` task has
   survived curation, so the on-prem argument for local serving is still
   untested in practice.
-- **`qwen3-coder-next` and the other open-weight candidates** were probed but
-  not benchmarked to completion.
+- **DeepSeek V4 Flash is fast but nearly useless on this task set** (2/25).
+  Whether this is fundamental to the model or a configuration/prompt issue is
+  not investigated.
+- **Qwen 3.8-27B is running** but needed two workarounds to function with Claude
+  Code: a custom chat template for interleaved system messages and an effort
+  override. Results pending.
 
 ## Where the spend actually is, and what to do about it
 
