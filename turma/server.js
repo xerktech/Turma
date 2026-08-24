@@ -3719,7 +3719,19 @@ function normalizeModels(payload) {
         .map((x) => x.slice(0, 120))                 // name that does not exist
     : [];
   const defaultLabel = typeof m.defaultLabel === "string" ? m.defaultLabel.slice(0, 120) : "";
-  const at = typeof m.at === "string" ? m.at.slice(0, 120) : "";
+  // NO LABEL MEANS NO CLAIM ON THE LABEL. Both mirrors gate the label write on
+  // `at` being at least the incumbent's (`board.js` mergeSites and its Board.kt
+  // twin), so a block with a fresh `at` and an empty label wins that compare and
+  // CLEARS the label of a host that probed properly — the picker drops to
+  // "Default" from "Default (Opus 5)". A real agent reaches this honestly: the
+  // probe returns `label or None` when it finds no "Current model:" line.
+  //
+  // Blanking `at` loses that compare to any dated incumbent while the block still
+  // contributes its `available` entries, which is the whole of what it knows.
+  // Fixed HERE rather than in the compare because `mergeSites` is mirrored across
+  // board.js, its two vendored copies and Board.kt — one hub-side line beats a
+  // five-way change, and the hub is where the value is untrusted anyway.
+  const at = !defaultLabel ? "" : (typeof m.at === "string" ? m.at.slice(0, 120) : "");
   // The LIST is what makes the block worth serving. A `defaultLabel` or an `at`
   // with no usable `available` is still the rebuilt-empty block this function
   // exists to avoid: it passes board.js's `Array.isArray(mb.available)` gate,

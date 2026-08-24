@@ -12606,3 +12606,25 @@ test("the drift warning is rate-limited per host, and capped on both sides", () 
   }
 });
 
+
+test("a models block with no usable label cannot clear a real host's label", async () => {
+  // `mergeSites` (board.js, its vendored copies, and Board.kt) writes the label
+  // whenever `at` is at least the incumbent's, so a block with a FRESH `at` and an
+  // empty label takes "Opus 5" off a host that probed properly — the picker drops
+  // to "Default". A real agent reaches this honestly: the probe returns
+  // `label or None` when there is no "Current model:" line to read.
+  for (const bad of [{ available: ["Opus 5"], defaultLabel: 5, at: "2099-01-01" },
+                     { available: ["Opus 5"], defaultLabel: null, at: "2099-01-01" },
+                     { available: ["Opus 5"], at: "2099-01-01" }]) {
+    const rec = { device: "labelless-host", models: bad };
+    hub.normalizeRecord(rec);
+    assert.deepEqual(rec.models.available, ["Opus 5"], "the list it does know still rides");
+    assert.equal(rec.models.defaultLabel, "");
+    assert.equal(rec.models.at, "", `a labelless block kept its claim: ${JSON.stringify(bad)}`);
+  }
+  // A block that HAS a label keeps its date, or it could never win legitimately.
+  const good = { device: "real-host",
+                 models: { available: ["Opus 5"], defaultLabel: "Opus 5", at: "2026-01-01" } };
+  hub.normalizeRecord(good);
+  assert.equal(good.models.at, "2026-01-01");
+});
