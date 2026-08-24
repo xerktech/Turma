@@ -22,13 +22,18 @@
 
 set -euo pipefail
 
+# Job control, so each background job below lands in its OWN process group and
+# can be torn down as a group. Without it they share the script's group and
+# `kill -- -$pid` would signal the script itself.
+set -m
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 HUB_PORT="${HUB_PORT:-3000}"
 DSH_PORT="${DSH_PORT:-3080}"
 FLEET_DEVICE="${FLEET_DEVICE:-dsh-test-host}"
-HUB_URL="ws://localhost:${HUB_PORT}/ws"
+
 
 # FLEET_DEVICE and the ports are interpolated into YAML below, so validate
 # them as WHOLE strings. `grep` is the wrong tool here: it matches per line, so
@@ -43,22 +48,40 @@ esac
 
 for _port_var in HUB_PORT DSH_PORT; do
   eval "_port_val=\$$_port_var"
+  # Bound the LENGTH in the glob. A digits-only value can still overflow
+  # bash's integer range, and `[ ... -lt ... ]` then errors -- which `set -e`
+  # does not catch inside an `if` condition, so the run continued with a
+  # nonsense port after printing a raw interpreter error.
   case "$_port_val" in
-    ''|*[!0-9]*)
-      echo "FAIL: $_port_var must be a number"
+    ''|*[!0-9]*|?????*)
+      echo "FAIL: $_port_var must be a number of 1-5 digits"
       printf '      got: %q\n' "$_port_val"
       exit 1 ;;
   esac
+  # Force base 10 so a leading zero is not read as octal, and normalize the
+  # value so "008" does not reach the URLs verbatim.
+  _port_val=$((10#$_port_val))
   if [ "$_port_val" -lt 1 ] || [ "$_port_val" -gt 65535 ]; then
     echo "FAIL: $_port_var out of range: $_port_val"
     exit 1
   fi
+  eval "$_port_var=\$_port_val"
 done
 unset _port_var _port_val
+
+# Built AFTER the ports are validated and normalized, so a rejected or
+# odd-looking value can never reach the URL handed to the plugin.
+HUB_URL="ws://localhost:${HUB_PORT}/ws"
 
 # Proves THIS run's dsh is the one that registered. A device name cannot: an
 # abandoned dsh reconnects every 5s under the same name, so asserting on the
 # name alone passes on a stale process (and did -- QA reproduced exactly that).
+#
+# It is handed to dsh through the ENVIRONMENT, never through cordis.patch.yml.
+# dsh hot-reloads its config and every dsh sharing this DSH_HOME reads the same
+# file, so an id written there is adopted by abandoned instances too -- which
+# reproduced the same false PASS one layer down. Env is fixed per process at
+# exec time.
 RUN_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
 
 # Per-device by default, so two workers never share a profile (and so the
@@ -113,18 +136,33 @@ alive_tree() {
   return 1
 }
 
+# Signal a whole process group, plus the snapshotted tree as a fallback.
+# `set -m` (above) puts each background job in its OWN process group with
+# pgid == pid, so `kill -- -$pid` reaches every descendant INCLUDING any
+# forked after we started signalling -- which a pid list cannot, since a
+# late fork appears in no snapshot and reparents away from any walk.
+signal_job() {
+  local pid="$1" sig="$2" p
+  [ -n "$pid" ] || return 0
+  kill "-$sig" -- "-$pid" 2>/dev/null || true
+  for p in $(collect_tree "$pid"); do kill "-$sig" "$p" 2>/dev/null || true; done
+}
+
+job_alive() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 -- "-$pid" 2>/dev/null && return 0
+  alive_tree "$pid"
+}
+
 cleanup() {
-  local pids p still
-  pids="$(collect_tree "$DSH_PID"; collect_tree "$HUB_PID")"
-  [ -n "$pids" ] || return 0
-  for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
+  local pid
+  for pid in "$DSH_PID" "$HUB_PID"; do signal_job "$pid" TERM; done
   for _ in $(seq 1 20); do
-    still=""
-    for p in $pids; do kill -0 "$p" 2>/dev/null && { still=1; break; }; done
-    [ -n "$still" ] || return 0
+    job_alive "$DSH_PID" || job_alive "$HUB_PID" || return 0
     sleep 0.25
   done
-  for p in $pids; do kill -KILL "$p" 2>/dev/null || true; done
+  for pid in "$DSH_PID" "$HUB_PID"; do signal_job "$pid" KILL; done
 }
 trap cleanup EXIT INT TERM
 
@@ -137,10 +175,13 @@ registered_this_run() {
     process.stdin.on("data", d => s += d).on("end", () => {
       try {
         const agents = JSON.parse(s)
-        process.exit(agents.some(a => a.instanceId === process.argv[1] && a.online) ? 0 : 1)
+        const [runId, device] = process.argv.slice(1)
+        process.exit(
+          agents.some(a => a.instanceId === runId && a.device === device && a.online) ? 0 : 1,
+        )
       } catch { process.exit(1) }
     })
-  ' "$RUN_ID"
+  ' "$RUN_ID" "$FLEET_DEVICE"
 }
 
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3<&- ; }
@@ -218,7 +259,6 @@ cat > "$PROFILE_DIR/cordis.patch.yml" <<EOF
   config:
     hubUrl: '$HUB_URL'
     device: '$FLEET_DEVICE'
-    instanceId: '$RUN_ID'
 EOF
 
 # Prove the entry actually made it into the composed tree before booting.
@@ -248,7 +288,8 @@ else
   echo "      hub up"
 fi
 
-npm exec -- dsh --profile web --no-open --port "$DSH_PORT" >"$DSH_LOG" 2>&1 &
+TURMA_FLEET_INSTANCE_ID="$RUN_ID" \
+  npm exec -- dsh --profile web --no-open --port "$DSH_PORT" >"$DSH_LOG" 2>&1 &
 DSH_PID=$!
 
 # --------------------------------------------------------------- 5. assert
