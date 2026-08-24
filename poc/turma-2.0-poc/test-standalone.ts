@@ -44,12 +44,12 @@ class MockAgent {
 
       this.ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        console.log(`[${this.device}] Received:`, msg.type)
+        console.log('[%s] Received:', this.device, msg.type)
         this.handleMessage(msg)
       })
 
       this.ws.on('error', (err) => {
-        console.error(`[${this.device}] Error:`, err.message)
+        console.error('[%s] Error:', this.device, err.message)
         reject(err)
       })
 
