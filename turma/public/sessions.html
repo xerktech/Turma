@@ -2957,7 +2957,20 @@ function eligibleRestoreTargets(repo) {
   return (cache.agents || []).filter(a =>
     a.online && (a.repos || []).some(r => r && r.name === repo));
 }
+// Whether this row is restorable AT ALL, mirroring the route's own first two
+// refusals. Most archived rows are not: `repo == "(root)"` is the agent's
+// catch-all for a cwd it could not attribute, so what they record is a
+// `~/.claude/projects/<slug>` TRANSCRIPT STORE rather than a working directory —
+// 1246 of the 1537 restorable rows on the production hub. Offering a working-
+// looking picker that always 409s is a worse failure than not offering one.
+function restorableRow(t) {
+  const wt = (t && t.worktree) || "";
+  if (!wt) return false;
+  if (/(^|\/)\.claude\/projects(\/|$)/.test(wt)) return false;
+  return !wt.split("/").includes("..");
+}
 function showRestore(t) {
+  if (!restorableRow(t)) return hideRestore();
   restoreMeta = { transcriptId: t.transcriptId, repo: t.repo || "", host: t.host || "" };
   restoreMenuOpen = false;
   const $w = document.getElementById("trRestoreWrap");

@@ -1158,7 +1158,8 @@ function listArchive(opts) {
 // organized file (not the index). null when unknown/missing.
 function getTranscript(transcriptId) {
   openDb();
-  const row = db.prepare("SELECT filePath, repo, host, summary, endedTs, createdAt FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = db.prepare("SELECT filePath, repo, host, worktree, summary, endedTs, createdAt "
+    + "FROM sessions WHERE transcriptId=?").get(transcriptId);
   if (!row || !row.filePath) return null;
   const paths = filePaths(row.filePath);
   let raw;
@@ -1177,7 +1178,10 @@ function getTranscript(transcriptId) {
   }
   return {
     transcriptId, repo: row.repo, host: row.host, summary: row.summary,
-    endedTs: row.endedTs, createdAt: row.createdAt, entries,
+    // The recorded cwd, so the page can tell a session that CAN be restored from
+    // one whose "worktree" is really a transcript store — the majority of the
+    // archive — instead of offering a control that always refuses.
+    worktree: row.worktree, endedTs: row.endedTs, createdAt: row.createdAt, entries,
   };
 }
 

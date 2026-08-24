@@ -627,6 +627,10 @@ test("restore: a transcript directory is refused up front, not packed and then r
   for (const [n, dir] of Object.entries({
     root: "/root/.claude/projects/-mnt-data-Docker-git-Turma",
     home: "/home/mhabeeb/.claude/projects/-home-mhabeeb-git-Other",
+    // The exact-end and trailing-slash shapes, so a tightening to
+    // `\.claude\/projects\/` cannot ship green.
+    exact: "/root/.claude/projects",
+    slash: "/root/.claude/projects/",
   })) {
     const tid = `8888${n.padEnd(4, "0").slice(0, 4)}-1111-2222-3333-444444444444`;
     archive.ingestChunk("truenas", tid, {
@@ -639,4 +643,21 @@ test("restore: a transcript directory is refused up front, not packed and then r
     assert.equal(r.status, 409, `${n}: ${JSON.stringify(r.body)}`);
     assert.match(r.body.error, /transcript directory/);
   }
+});
+
+test("restore: the transcript-dir check does not swallow a legitimate path", () => {
+  // A refusal that over-matches is worse than the admission it replaced, and the
+  // anchors are what stop it: without them `foo.claude/projects` and
+  // `projects-old` are refused, and nothing else in the matrix would notice.
+  const ok = [
+    "/repos/projects/.turma/worktrees/projects/ab12c",  // a repo genuinely named `projects`
+    "/repos/.claude/.turma/worktrees/Widget/ab12c",     // a repos root under a `.claude` dir
+    "/repos/foo.claude/projects/x",                     // `.claude` is not a component here
+    "/repos/.claude/projects-old",                      // not the `projects` component
+    "/repos/myclaude/projects/slug",
+  ];
+  for (const wt of ok)
+    assert.equal(/(^|\/)\.claude\/projects(\/|$)/.test(wt), false, wt);
+  for (const wt of ["/root/.claude/projects", "/root/.claude/projects/", "/root/.claude/projects/slug"])
+    assert.equal(/(^|\/)\.claude\/projects(\/|$)/.test(wt), true, wt);
 });

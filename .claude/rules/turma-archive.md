@@ -287,8 +287,12 @@ reason the raw layer exists in a form nothing else reads: the rendered entries a
     `~/.claude/projects/<slug>` TRANSCRIPT STORE rather than a working directory — 1228 of the 1262
     restorable `(root)` rows measured on the production hub, against 34 with a real repos-root path.
     Those are refused explicitly: no agent can resume one, and admitting them spends a slot, a pack
-    and a spool file to learn what the path already said. Real recovery is ~291 rows, not ~1519 —
-    don't restate the admitted count as the recoverable one.
+    and a spool file to learn what the path already said. Measured on the production hub: 2678 rows,
+    1537 with a raw conversation, of which **291 are restorable** and 1246 are transcript stores.
+    Don't restate the admitted count as the recoverable one.
+  - **The page hides the control on a row the route would refuse** (`restorableRow` in
+    `sessions.html`, mirroring the first two refusals), because a working-looking picker that always
+    409s is a worse failure than no picker. That is why `getTranscript` carries `worktree`.
   - A `..` component is never legitimate, and is pinned on its own: every other case in the shape
     matrix fails for a different reason, so removing the guard changed no test.
   - Anything else the agent refuses anyway, with a reason that reaches the operator (XERK-265), so

@@ -594,7 +594,8 @@ function restoreFleet(extra = []) {
     ...extra,
   ] };
 }
-const archived = { transcriptId: "tid-1", repo: "repoX", host: "gone-host", entries: [] };
+const archived = { transcriptId: "tid-1", repo: "repoX", host: "gone-host",
+                   worktree: "/repos/.turma/worktrees/repoX/ab12c", entries: [] };
 
 test("Restore offers every online host that has the repo", () => {
   const { beat, showRestore, toggleRestoreMenu, els } = loadPage();
@@ -616,7 +617,8 @@ test("Restore names the repo when nothing can take the session", () => {
   // repo name is the actionable half — clone it somewhere.
   const { beat, showRestore, toggleRestoreMenu, els } = loadPage();
   beat(restoreFleet([]));
-  showRestore({ transcriptId: "tid-2", repo: "otherRepo", host: "gone-host" });
+  showRestore({ transcriptId: "tid-2", repo: "otherRepo", host: "gone-host",
+                worktree: "/repos/.turma/worktrees/otherRepo/cd34e" });
   toggleRestoreMenu(click);
   assert.match(els.trRestoreMenu.innerHTML, /No online agent has otherRepo cloned/);
 });
@@ -2131,4 +2133,32 @@ test("XERK-304: an ordinary agent row is untouched — no picker, straight to it
   await page.openSubagentView("Explore", "Map the code");
   assert.equal(page.chat.rendered.length, 1);
   assert.equal(page.els.trBackLabel.textContent, " Session");
+});
+
+test("Restore is not offered on a row that can never be restored", () => {
+  // Most of the archive is not restorable: `repo == "(root)"` is the agent's
+  // catch-all for a cwd it could not attribute, so those rows record a
+  // `~/.claude/projects/<slug>` transcript store — 1246 of the 1537 restorable
+  // rows on the production hub. A picker that always 409s is a worse failure
+  // than no picker, and the route refuses each of these anyway.
+  const { beat, showRestore, els } = loadPage();
+  beat(restoreFleet([
+    { key: "hostB", device: "hostB", online: true, lastSeen: Date.now(),
+      repos: [{ name: "repoX" }, { name: "(root)" }], sessions: [] },
+  ]));
+  for (const [why, wt] of Object.entries({
+    "a transcript store": "/root/.claude/projects/-mnt-data-Docker-git-Turma",
+    "a transcript store, exactly": "/root/.claude/projects",
+    "a traversal": "/repos/.turma/worktrees/repoX/..",
+    "nothing recorded": "",
+  })) {
+    showRestore({ ...archived, repo: "(root)", worktree: wt });
+    assert.equal(els.trRestoreWrap.hidden, true, why);
+  }
+  // And a row that CAN be restored still gets it — including a root session,
+  // whose cwd is the source host's REPOS_ROOT and has no worktree tail.
+  for (const wt of ["/repos/.turma/worktrees/repoX/ab12c", "/home/me/git", "/repos/.claude/x/y"]) {
+    showRestore({ ...archived, worktree: wt });
+    assert.equal(els.trRestoreWrap.hidden, false, wt);
+  }
 });
