@@ -1433,6 +1433,11 @@ const MIGRATE_SPOOL_DIR = process.env.MIGRATE_SPOOL_DIR || "/data/migrations";
 // best-effort with no retry, so refusing one strands a migration, while
 // refusing the operator's click just says "not right now" on the Move control.
 const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
+// How many names an incomplete restore lists on its record. It rides /api/agents
+// and every SSE frame, and the names come from the archive's raw layer — bounded
+// per name but not in COUNT, so a session with thousands of subagent files could
+// otherwise put every one of them on a payload a 256 MiB hub serves to every tab.
+const INCOMPLETE_NAMES_MAX = 20;
 
 // The id `crypto.randomBytes(8).toString("hex")` produces in startMigration, and
 // the filename that makes — the second being the ONLY thing the boot sweep may
@@ -1502,6 +1507,10 @@ function serializeMigration(m) {
     targetHost: m.targetHost, siteKey: m.siteKey, repo: m.repo,
     transcriptId: m.transcriptId, phase: m.phase, error: m.error || null,
     importCmdId: m.importCmdId || null, targetSessionId: m.targetSessionId || null,
+    // Files the archive holds that the bundle could not carry (XERK-441). Absent
+    // on a complete restore, so a client can word a partial one as partial; the
+    // conversation is never among them, because that fails the restore outright.
+    incomplete: m.incomplete || null,
     at: m.at,
   };
 }
@@ -2088,10 +2097,32 @@ function startArchiveRestore(row, files, targetHost) {
       // than the archive recorded, means the restored session is missing
       // something. The conversation itself is checked at the route (a bundle
       // without it is refused), so this is about the extras.
-      if (out.skipped.length || out.short.length) {
+      const missing = [...out.skipped, ...out.short];
+      if (missing.length) {
         console.warn(`restore ${id}: bundle is incomplete — ` +
           `${out.skipped.length} unnameable, ${out.short.length} short: ` +
-          [...out.skipped, ...out.short].slice(0, 5).join(", "));
+          missing.slice(0, 5).join(", "));
+        // The CONVERSATION itself cannot be one of them. A skipped `<id>.jsonl`
+        // restores an empty session and a NUL-padded one restores a corrupt
+        // transcript, and `claude --resume` would present either as the operator's
+        // history. Better to refuse the restore than to hand back a damaged one.
+        const conv = `${row.transcriptId}.jsonl`;
+        if (missing.includes(conv)) {
+          m.phase = "failed";
+          m.error = "the archived conversation could not be packed intact";
+          m.at = Date.now();
+          try { fs.unlinkSync(spool); } catch {}
+          publishMigrations();
+          return;
+        }
+        // Everything else rides, but the record SAYS SO. A restore that silently
+        // drops a subagent transcript and reports `done` tells the operator they
+        // have their session back when part of it is gone.
+        m.incomplete = {
+          skipped: out.skipped.slice(0, INCOMPLETE_NAMES_MAX),
+          short: out.short.slice(0, INCOMPLETE_NAMES_MAX),
+          total: missing.length,
+        };
       }
       m.blobPath = spool;
       m.blobSize = out.bytes;
@@ -2154,6 +2185,30 @@ function advanceMigrations() {
         publishMigrations();
         continue;
       }
+    }
+    // A RESTORE only. The "one conversation, one session" check runs at
+    // admission, and the importing window is up to MIGRATE_TIMEOUT_MS — long
+    // enough for the archived host to come back and beat in with that very
+    // conversation running, at which point finishing would put two claudes on one
+    // transcript, exactly what the admission check exists to prevent. A live
+    // move needs no equivalent: its source is running BY DESIGN, and it is killed
+    // at handoff. The target is skipped, since its own import is the success
+    // above; read after that handoff so a completed restore always wins the tie.
+    if (m.restore && (m.phase === "exporting" || m.phase === "importing")) {
+      for (const [host, a] of Object.entries(agents)) {
+        if (host === m.targetHost) continue;
+        const live = (a.sessions || []).find(
+          (s) => s.transcriptId === m.transcriptId && s.status === "running");
+        if (!live) continue;
+        m.phase = "failed";
+        m.error = `that conversation came back up on ${host} — the restore was ` +
+                  "abandoned rather than run a second claude on it";
+        dropMigrationBlob(m);
+        m.at = now;
+        publishMigrations();
+        break;
+      }
+      if (m.phase === "failed") continue;
     }
     // The agent REFUSED its half of the move and said so on a beat (XERK-265):
     // fail now, carrying its reason, instead of leaving the operator watching a
@@ -7974,6 +8029,16 @@ const server = http.createServer(async (req, res) => {
       if (!row.worktree)
         return json(res, 409, {
           error: "this archived session recorded no worktree path, so there is nowhere to resume it",
+        });
+      // A recorded worktree is only usable if it looks like one. The path is
+      // replayed as the agent's `cwd`, and `_localize_migrated_cwd` remaps it by
+      // its `.turma/worktrees/<repo>/<dir>` tail — so a row without that tail
+      // (or carrying `..`) can only be refused by the agent, after it has already
+      // burned an in-flight slot and a spool file for the whole timeout.
+      if (!/(^|\/)\.turma\/worktrees\/[^/]+\/[^/]+\/?$/.test(row.worktree) ||
+          row.worktree.split("/").includes(".."))
+        return json(res, 409, {
+          error: "this archived session's recorded worktree path is not a session worktree",
         });
       if (!row.repo)
         return json(res, 409, { error: "this archived session recorded no repo" });

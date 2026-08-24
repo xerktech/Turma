@@ -250,11 +250,33 @@ reason the raw layer exists in a form nothing else reads: the rendered entries a
   ustar — deliberately NOT the GNU/PAX long-name extension — and REPORTS what it could not name or
   could not read in full rather than truncating a name (which would put one session's bytes under
   another's path) or silently shipping a short file.
-- **Refusals are the product here**, not an afterthought: no raw copy, no recorded worktree, target
-  offline, target lacking the repo, and the conversation already running somewhere. That last one is
-  the invariant — a restore PRESERVES the transcript id, so two live sessions on one transcript
-  would be two claudes appending to one file and a `_session_transcript_path` that cannot say whose
-  it is.
+- **`packGzipTar` creates the spool dir itself.** `MIGRATE_SPOOL_DIR` is otherwise made only by
+  `spoolRawBody`, on the migration-UPLOAD path, and `sweepMigrationSpool` tolerates its absence — so
+  a hub that has never relayed a live move (a fresh deploy, a recreated volume, or exactly the
+  one-agent fleet this feature exists for) failed EVERY restore with an ENOENT the operator was
+  shown as a corrupt archive. Do not let a test create that directory: `restore.test.js` names a
+  path that does not exist, which is the only thing keeping the check honest.
+- **Refusals are the product here**, not an afterthought: no raw copy, no recorded worktree, a
+  worktree that is not shaped like one, target offline, target lacking the repo, and the
+  conversation already running somewhere. That last one is the invariant — a restore PRESERVES the
+  transcript id, so two live sessions on one transcript would be two claudes appending to one file
+  and a `_session_transcript_path` that cannot say whose it is.
+  - **It is re-checked EVERY TICK, not just at admission** (`advanceMigrations`, restores only).
+    The importing window is up to `MIGRATE_TIMEOUT_MS`, long enough for the archived host to come
+    back beating that conversation as running; finishing anyway is the thing the admission check
+    exists to prevent. The TARGET is skipped — its own imported session is the success case, and
+    it does not always carry the minted `importCmdId` that the handoff matches on.
+  - The recorded worktree must end in a `.turma/worktrees/<repo>/<dir>` tail, because that tail is
+    what `_localize_migrated_cwd` remaps. Without the check only the agent can refuse it, after the
+    hub has spent an in-flight slot and a spool file for the whole timeout.
+- **An INCOMPLETE bundle is on the record, never only in the log** (`m.incomplete`, capped at
+  `INCOMPLETE_NAMES_MAX` names since it rides `/api/agents` and every SSE frame). The archive's
+  `safeRawRel` accepts 255 bytes per component and ustar carries 100 + a 155 prefix, so a long
+  basename is nameable in the archive and not in the tar — and a restore that drops a subagent
+  transcript while reporting `done` tells the operator they have their session back when part of it
+  is gone. **The conversation itself is never merely reported**: `<id>.jsonl` skipped or short FAILS
+  the restore, because an empty or NUL-padded transcript is one `claude --resume` presents as the
+  operator's own history.
 - **Not org-scoped, unlike a move.** `/migrate` compares the two AGENTS' orgs; an archived session
   has no agent left to compare against, and the archive is hub-wide and already readable by whoever
   is logged in. Do not "fix" this by inventing an org for the archive row.

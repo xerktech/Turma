@@ -142,6 +142,13 @@ async function packGzipTar(files, destPath, maxBytes, opts) {
   }
 
   let bytes = 0;
+  // The spool dir is created HERE, because nothing else guarantees it exists.
+  // `spoolRawBody` makes it on the migration-UPLOAD path and `sweepMigrationSpool`
+  // tolerates its absence, so on a hub that has never relayed a live migration —
+  // a fresh deploy, a recreated volume, or exactly the one-agent fleet this
+  // feature exists for — every restore died with ENOENT reported as a corrupt
+  // archive.
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
   const gz = zlib.createGzip();
   const out = fs.createWriteStream(destPath);
   const counter = async function* (src) {
