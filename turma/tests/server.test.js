@@ -2444,7 +2444,10 @@ test("http: a NON-ARRAY usage.models cannot blank the dashboard for everyone", a
   // /api/agents array atomically, so the same beat empties every other host from
   // every phone. Absent, not `[]`: absent is "can't tell you", `[]` asserts the
   // host spent on no models.
-  for (const bad of [{ evil: { totals: { input: 5 } } }, "opus", 7, true]) {
+  // 0, false and "" matter: an all-truthy fixture let a `if (usage.models)`
+  // guard on the delete pass the whole suite, and all three are decode-fatal
+  // on Android (only an explicit null is survivable, via coerceInputValues).
+  for (const bad of [{ evil: { totals: { input: 5 } } }, "opus", 7, true, 0, false, ""]) {
     assert.equal(
       (await request("POST", "/api/heartbeat", {
         body: {
@@ -2465,6 +2468,77 @@ test("http: a NON-ARRAY usage.models cannot blank the dashboard for everyone", a
     // Everything else in the block still rides through.
     assert.equal(rec.usage.totals.input, 1);
   }
+});
+
+test("a dropped models block is TALLIED, not silently deleted", async () => {
+  // Before the coercion the failure was loud — the dashboard went blank. Silent
+  // deletion turns it into invisible data loss with nothing to alert on, while
+  // every sibling coercion in this file names what it dropped.
+  const warnings = [];
+  const realWarn = console.warn;
+  hub.resetUsageCoercionLog();
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    const rec = { device: "silent-host", usage: { models: { evil: 1 } } };
+    hub.normalizeRecord(rec);
+    assert.ok(!("models" in rec.usage), "dropped");
+    assert.equal(warnings.length, 1, "and said so");
+    assert.match(warnings[0], /silent-host/);
+    assert.match(warnings[0], /models/);
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+test("http: a malformed top-level models block cannot empty every phone's fleet", async () => {
+  // The same failure class as usage.models, one field up and a different shape.
+  // Android types `models` as `ModelsInfo?` and decodes /api/agents atomically,
+  // so one host beating a string here throws for the WHOLE array — every OTHER
+  // host vanishes from the fleet list while the tile still says "N / N online".
+  // The web guards this one, so it fails on the client that fails silently.
+  for (const bad of ["x", 5, [1, 2], true, 0, "", { available: "x" }, { available: [1, 2] }]) {
+    assert.equal(
+      (await request("POST", "/api/heartbeat", {
+        body: { device: "bad-topmodels-host", models: bad },
+        headers: agentHeaders,
+      })).status,
+      200
+    );
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const rec = res.body.agents.find((a) => a.key === "bad-topmodels-host");
+    const m = rec.models;
+    if (m === undefined) continue;            // dropped outright — fine
+    assert.equal(typeof m, "object", `models stayed ${JSON.stringify(bad)}`);
+    assert.ok(Array.isArray(m.available), `available stayed ${JSON.stringify(bad)}`);
+    assert.ok(m.available.every((x) => typeof x === "string"));
+    assert.equal(typeof m.defaultLabel, "string");
+    assert.equal(typeof m.at, "string");
+  }
+});
+
+test("http: a good top-level models block rides through, bounded", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "good-topmodels-host",
+            models: { available: ["opus", "sonnet"], defaultLabel: "Opus", at: "2026-08-01" } },
+    headers: agentHeaders,
+  });
+  let res = await request("GET", "/api/agents", { headers: userHeaders });
+  let rec = res.body.agents.find((a) => a.key === "good-topmodels-host");
+  assert.deepEqual(rec.models, { available: ["opus", "sonnet"], defaultLabel: "Opus", at: "2026-08-01" });
+
+  // It rides /api/agents and every SSE frame, and every field of it is
+  // agent-asserted, so none of them may be unbounded.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "good-topmodels-host",
+            models: { available: Array.from({ length: 500 }, (_, i) => `m${i}`),
+                      defaultLabel: "z".repeat(5000), at: "z".repeat(5000) } },
+    headers: agentHeaders,
+  });
+  res = await request("GET", "/api/agents", { headers: userHeaders });
+  rec = res.body.agents.find((a) => a.key === "good-topmodels-host");
+  assert.equal(rec.models.available.length, 100);
+  assert.equal(rec.models.defaultLabel.length, 120);
+  assert.equal(rec.models.at.length, 120);
 });
 
 test("http: a current agent's per-model usage is left exactly as reported", async () => {

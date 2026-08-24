@@ -2084,7 +2084,7 @@ function advanceMigrations() {
 // each of the three clients (none of which then needs a release to survive an
 // old host). A name-less entry is DROPPED — it can't be rendered or merged by
 // name, and carries no windows worth keeping.
-function normalizeModelUsage(usage) {
+function normalizeModelUsage(usage, tally) {
   if (!usage) return;
   // A non-array `models` is DELETED, not left alone. Returning early here only
   // held while `models` was untyped: `for (const m of list || [])` throws on an
@@ -2092,11 +2092,21 @@ function normalizeModelUsage(usage) {
   // beating `"models": {...}` blanked the front page for EVERY operator — tiles,
   // host list and all, nav only. Android types it (`List<ModelUsage>`, defaulted
   // to empty), and a full /api/agents decode is atomic there, so the same beat
-  // empties every OTHER host from every phone's fleet. Absent is the value all
-  // three clients already read as "this agent can't tell you"; a fabricated
-  // empty array would instead assert that the host spent on no models at all.
+  // empties every OTHER host from every phone's fleet.
+  //
+  // Absent rather than `[]`, matching the siblings: absent is what every client
+  // reads as "this agent can't tell you". The distinction is weak downstream —
+  // an ARRAY of junk still ends up `[]` below, and the ledger re-serves `[]` for
+  // any host with history — so this is consistency, not a guarantee to lean on.
+  //
+  // And it is TALLIED. Before this the failure was loud (a blank dashboard); a
+  // silent delete is invisible data loss with nothing to alert on, while every
+  // other coercion in this file says what it dropped.
   if (!Array.isArray(usage.models)) {
-    delete usage.models;
+    if ("models" in usage) {
+      delete usage.models;
+      noteUsageCoercion(tally, "models");
+    }
     return;
   }
   usage.models = usage.models
@@ -2229,7 +2239,7 @@ function normalizeUsageTokens(usage, tally) {
 
 // Every coercion a usage block needs, wherever one rides the heartbeat.
 function normalizeUsageBlock(usage, tally) {
-  normalizeModelUsage(usage);
+  normalizeModelUsage(usage, tally);
   normalizeSubagentUsage(usage);
   normalizeUsageTokens(usage, tally);
 }
@@ -2415,6 +2425,41 @@ function normalizeSubscription(payload) {
 //
 // Anything unusable becomes null, which every client already reads as "this host
 // cannot fail over" — the same degradation as an agent too old to report it.
+// The host login's own model list (`models`, XERK-33) — NOT the per-model usage
+// block above, which is a different field with a different shape. Android types
+// it (`ModelsInfo?`) and decodes /api/agents atomically, so one host beating
+// `models: "x"` — or a number, a bare array, or an object whose `available` is a
+// string — throws for the WHOLE array and empties every other host from every
+// phone's fleet list, while the tile still reads "N / N online". The web guards
+// this one with Array.isArray, so it is Android-only: the half that fails
+// silently.
+//
+// Anything unusable becomes ABSENT rather than a fabricated empty list, because
+// absent is what the ticket model picker already reads as "this agent can't
+// tell you" and falls back to the static family aliases for; an empty
+// `available` would instead assert this login can run no models at all.
+function normalizeModels(payload) {
+  if (!payload || typeof payload !== "object") return;
+  if (!("models" in payload)) return;
+  const m = payload.models;
+  if (!m || typeof m !== "object" || Array.isArray(m)) {
+    delete payload.models;
+    return;
+  }
+  const available = Array.isArray(m.available)
+    ? m.available.filter((x) => typeof x === "string" && x).slice(0, MODELS_AVAILABLE_MAX)
+    : [];
+  payload.models = {
+    available,
+    defaultLabel: typeof m.defaultLabel === "string" ? m.defaultLabel.slice(0, MODEL_NAME_MAX) : "",
+    at: typeof m.at === "string" ? m.at.slice(0, MODEL_NAME_MAX) : "",
+  };
+}
+// Bounded because this rides /api/agents and every SSE frame, and the whole
+// block is agent-asserted.
+const MODELS_AVAILABLE_MAX = 100;
+const MODEL_NAME_MAX = 120;
+
 function normalizeLocalModel(payload) {
   if (!payload || typeof payload !== "object") return;
   const lm = payload.localModel;
@@ -3604,6 +3649,7 @@ function normalizeRecord(a) {
   normalizeLimits(a);
   normalizeSubscription(a);
   normalizeLocalModel(a);
+  normalizeModels(a);
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
   normalizeJira(a);
