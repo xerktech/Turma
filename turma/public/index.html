@@ -947,15 +947,33 @@ function render(data) {
   // (XERK-235).
   const waiting = sess.filter(x => x.s.status === "running" && x.s.session &&
     (x.s.session.question || (x.s.session.panePrompt && x.s.session.panePrompt.prompt)));
-  // Token tiles read each host's persistent `usage` block — which the agent
-  // aggregates from EVERY transcript on the box — rather than summing the live
-  // session list, so killed, deleted and pruned work still counts toward the
-  // fleet's totals. An older agent that reports no such block falls back to the
-  // sessions it does report (understating, but only for that host).
-  const fleetTokens = (w) => agents.reduce((t, a) => t + (a.usage
+  // Spend OUTLIVES the host that made it (XERK-338), so the token tiles count
+  // `retiredUsage` — a removed, pruned or evicted host — alongside the live
+  // fleet. Reading `agents` alone made the front page disagree with the Usage
+  // page, which has always counted both: removing one busy host silently erased
+  // most of the fleet's all-time tokens from the dashboard while the Usage page
+  // still charted them, which reads as lost data rather than as a narrower
+  // question being asked.
+  //
+  // Counted for the TOKEN TILES ONLY. A retired entry is NOT a host — it carries
+  // no sessions, repos or capacity — so it must never reach `agents`, which is
+  // what the host cards, the online count and the session ceiling are built from.
+  // Org-filtered like the live fleet, off the same `jira.siteKey` the hub carries
+  // on it for exactly that reason.
+  const retired = TurmaOrg.filter(data.retiredUsage || []);
+  const spenders = [...agents, ...retired];
+  // Each host's persistent `usage` block — which the agent aggregates from EVERY
+  // transcript on the box — rather than a sum over the live session list, so
+  // killed, deleted and pruned work still counts toward the fleet's totals. An
+  // older agent that reports no such block falls back to the sessions it does
+  // report (understating, but only for that host).
+  const fleetTokens = (w) => spenders.reduce((t, a) => t + (a.usage
     ? (totalTokens(a.usage[w]) || 0)
     : (a.sessions || []).reduce((n, s) => n + (totalTokens(s.usage?.[w]) || 0), 0)), 0);
-  const models = shortModels(mergeModels(agents.map(a => a.usage?.models)));
+  const models = shortModels(mergeModels(spenders.map(a => a.usage?.models)));
+  // Said on the tiles rather than left to be discovered: a total larger than the
+  // hosts on screen can account for reads as a bug otherwise.
+  const retiredNote = retired.length ? " · incl. removed hosts" : "";
   // MAX_SESSIONS is a PER-AGENT ceiling (agent capacity.maxSessions), so the cap
   // for the current selection is the SUM across the scoped hosts — an org with
   // several agents can run more than one host's worth. Only hosts that report the
@@ -970,10 +988,10 @@ function render(data) {
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
     tile("Running sessions", runningValue, sess.length + " total") +
     tile("Waiting on you", String(waiting.length), "sessions with a question") +
-    tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache") +
-    tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)") +
+    tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache" + retiredNote) +
+    tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)" + retiredNote) +
     tile("Tokens all-time", fmtTokens(fleetTokens("totals")),
-         models === "–" ? "every session ever" : "mostly " + models);
+         (models === "–" ? "every session ever" : "mostly " + models) + retiredNote);
 
   if (!agents.length) {
     // Distinguish an empty fleet from one the org filter has narrowed to
@@ -981,6 +999,13 @@ function render(data) {
     $groups.innerHTML = (data.agents || []).length
       ? `<div class="empty">No hosts report the selected orgs.<br>
          Change the org filter (or pick “All orgs”) in the header to see the rest of the fleet.</div>`
+      // "No hosts have reported yet" directly under a non-zero token tile reads
+      // as a bug. With retired spend counted (XERK-338) an empty fleet is two
+      // different situations, and only one of them is a hub nothing has ever
+      // beaten to.
+      : retired.length
+      ? `<div class="empty">No hosts are reporting.<br>
+         The tokens above were spent by ${retired.length === 1 ? "a host that has" : "hosts that have"} since been removed.</div>`
       : `<div class="empty">No hosts have reported yet.<br>
          Containers running the agent image heartbeat here automatically.</div>`;
     return;
@@ -1801,12 +1826,68 @@ async function refresh() {
 // A full-tree innerHTML swap closes any native <select> popup the user has open
 // (the clone repo picker, the composer dropdowns) mid-selection. So background
 // updates (the poll AND the SSE push) skip the re-render while a <select> is
-// focused; the data still lands in `cache` and shows on the next render once
-// they pick an option or click away. User-driven renders (actions, toggles) go
-// through render() directly and are never gated.
+// focused; the data still lands in `cache`. User-driven renders (actions,
+// toggles) go through render() directly and are never gated.
+//
+// A skipped repaint is RE-ARMED, because nothing else will do it: the fallback
+// poll returns early while SSE is healthy, and `bgRender` is otherwise only
+// re-entered by the next beat. With no beat to come — the removed hosts WERE the
+// fleet, or the rest are offline — the page kept painting hosts that no longer
+// exist, indefinitely. So the skip is remembered and flushed when the select is
+// done with, deferred a tick so `activeElement` has actually moved by then.
+//
+// The flush WAITS OUT A MOUSE INTERACTION, and that is the whole reason this is
+// not a bare `focusout` handler. `focusout` fires on MOUSEDOWN, so a repaint
+// scheduled there swaps `#groups` before mouseup: the two land on different
+// nodes, the browser dispatches NO `click` at all, and the button the operator
+// pressed does nothing at all with no feedback — every control in `#groups`, Start
+// and Remove host included. So a flush holds while a pointer is down, and resumes
+// one task AFTER `pointerup`, because `click` is dispatched in that same task.
+// `pointercancel` and `click` also clear the flag, so a lost `pointerup` (a
+// release outside the window) cannot strand every later flush.
+let bgSkipped = false;
+let pointerDown = false;
 function bgRender() {
-  if (document.activeElement && document.activeElement.tagName === "SELECT") return;
+  if (document.activeElement && document.activeElement.tagName === "SELECT") {
+    bgSkipped = true;
+    return;
+  }
+  bgSkipped = false;
   render(cache);
+}
+function flushSkippedRender() {
+  if (!bgSkipped || pointerDown) return;
+  setTimeout(bgRender, 0);
+}
+function endPointer() {
+  pointerDown = false;
+  setTimeout(flushSkippedRender, 0);
+}
+document.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+document.addEventListener("pointerup", endPointer, true);
+document.addEventListener("pointercancel", endPointer, true);
+document.addEventListener("click", endPointer, true);
+document.addEventListener("focusout", flushSkippedRender);
+
+// A background re-fetch, coalesced. Only `removed` needs one — it is the single
+// event that moves spend between `agents` and `retiredUsage`, and just that one
+// list rides `/api/agents` — but the hub emits one `removed` PER HOST inside its
+// registry-eviction loop, so an eviction sweep of K hosts would otherwise cost K
+// full fetches of the hub's heaviest read, per open tab. One timer collapses the
+// burst into a single fetch, and the repaint goes through `bgRender` like every
+// other background update.
+let refetchTimer = null;
+function refetchSoon() {
+  if (refetchTimer) return;
+  refetchTimer = setTimeout(async () => {
+    refetchTimer = null;
+    try {
+      const r = await fetch("/api/agents");
+      if (r.status === 401) return void (location.href = "/login");
+      cache = await r.json();
+    } catch { return; }   // keep the last data; the next beat or poll corrects it
+    bgRender();
+  }, 250);
 }
 
 // ---- live push (FIX 1/#1): server-sent per-agent updates on each heartbeat --
@@ -1820,6 +1901,14 @@ function applyAgent(rec) {
   const list = cache.agents || (cache.agents = []);
   const i = list.findIndex(a => a.key === rec.key);
   if (i >= 0) list[i] = rec; else list.push(rec);
+  // A host the hub had RETIRED is beating again, so the hub has already stopped
+  // serving it on `retiredUsage` — but SSE only carries the agent record, and a
+  // page that keeps the stale retired entry counts that host's spend twice, live
+  // and retired, until something re-fetches. The poll is skipped entirely while
+  // the stream is healthy, so "until something re-fetches" is "until reload".
+  if (cache.retiredUsage && cache.retiredUsage.length) {
+    cache.retiredUsage = cache.retiredUsage.filter(r => r.key !== rec.key);
+  }
   cache.now = Date.now();
 }
 function connectSSE() {
@@ -1834,7 +1923,16 @@ function connectSSE() {
   es.addEventListener("removed", (e) => {
     try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
     catch { return; }
-    bgRender();
+    // Removing a host MOVES its spend to `retiredUsage`, which this event does
+    // not carry — so dropping it from `agents` alone makes the token tiles fall
+    // by everything that host ever spent. That is the exact disappearance this
+    // page was fixed to stop, just on a longer clock, so it costs one fetch.
+    //
+    // NOT `refresh()`: that repaints through `render` directly, which swaps
+    // `#groups` out from under a focused <select> and closes an open composer
+    // popup mid-selection — the very thing `bgRender` exists to prevent for
+    // background updates, the SSE push included.
+    refetchSoon();
   });
   // An org's color pin changed (XERK-145): org.js owns the live map; patching
   // this page's cache keeps the next render's TurmaOrg.update(cache) from

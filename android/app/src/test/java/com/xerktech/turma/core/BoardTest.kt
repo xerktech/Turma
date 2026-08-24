@@ -515,6 +515,30 @@ class BoardTest {
         assertEquals(listOf("h1", "h2"), scopedAgents(listOf(a, b), setOf("gone")).map { it.key })
     }
 
+    // XERK-338/XERK-441 parity: retired spend is scoped by the LIVE fleet's orgs.
+    // Passing the retired list to `scopedAgents` derives the self-heal from the
+    // removed hosts' own orgs, which diverges from org.js in both directions —
+    // and the damaging direction adds another org's removed spend to a scoped
+    // total. Both types are List<AgentInfo>, so only a test catches it.
+    @Test fun `scopedRetired takes its self-heal from the live fleet, not the retired list`() {
+        val at = "2026-07-16T01:00:00Z"
+        val live = listOf(agent("live", true, JiraBlock(siteKey = "beta", user = "u", fetchedAt = at)))
+        val retired = listOf(
+            agent("goneAcme", false, JiraBlock(siteKey = "acme", user = "u", fetchedAt = at)),
+            agent("goneNoOrg", false, null),
+        )
+        // Scoped to the LIVE org: neither retired host belongs to it, so neither
+        // counts. `scopedAgents(retired, …)` would self-heal "beta" away — no
+        // retired host reports it — and hand back BOTH.
+        assertEquals(emptyList<String>(), scopedRetired(retired, live, setOf("beta")).map { it.key })
+        assertEquals(listOf("goneAcme", "goneNoOrg"), scopedAgents(retired, setOf("beta")).map { it.key })
+        // Scoped to an org no LIVE host reports: the pick self-heals away and
+        // everything shows, exactly as it does for the live fleet.
+        assertEquals(listOf("goneAcme", "goneNoOrg"), scopedRetired(retired, live, setOf("acme")).map { it.key })
+        // No pick at all is every retired host.
+        assertEquals(listOf("goneAcme", "goneNoOrg"), scopedRetired(retired, live, emptySet()).map { it.key })
+    }
+
     @Test fun `storedOrg migrates the board-only pick forward exactly once`() {
         // Nothing stored either way.
         assertEquals(null, storedOrg(null, null))
