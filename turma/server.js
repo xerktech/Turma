@@ -1438,6 +1438,10 @@ const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
 // per name but not in COUNT, so a session with thousands of subagent files could
 // otherwise put every one of them on a payload a 256 MiB hub serves to every tab.
 const INCOMPLETE_NAMES_MAX = 20;
+// The agent's own name for the repos-root pseudo-repo (`ROOT_REPO_NAME` in
+// hub-agent.py). A root session's recorded cwd is the source host's REPOS_ROOT,
+// which carries no shape the hub can check, so the row's repo is what says so.
+const ROOT_REPO_NAME = "(root)";
 
 // The id `crypto.randomBytes(8).toString("hex")` produces in startMigration, and
 // the filename that makes — the second being the ONLY thing the boot sweep may
@@ -2196,9 +2200,17 @@ function advanceMigrations() {
     // above; read after that handoff so a completed restore always wins the tie.
     if (m.restore && (m.phase === "exporting" || m.phase === "importing")) {
       for (const [host, a] of Object.entries(agents)) {
-        if (host === m.targetHost) continue;
         const live = (a.sessions || []).find(
-          (s) => s.transcriptId === m.transcriptId && s.status === "running");
+          (s) => s.transcriptId === m.transcriptId && s.status === "running" &&
+                 // The migration's OWN imported session is the success case, not
+                 // a rival — and it does not always carry the minted importCmdId
+                 // that the handoff above matches on. Skipping the whole TARGET
+                 // instead would leave the one host that actually unpacks
+                 // unchecked: `import_session` downloads and unpacks BEFORE
+                 // `_resume_at_cwd` refuses, so a conversation resumed locally on
+                 // the target between admission and its next beat has the
+                 // archived bytes written over it.
+                 s.spawnCmdId !== m.importCmdId);
         if (!live) continue;
         m.phase = "failed";
         m.error = `that conversation came back up on ${host} — the restore was ` +
@@ -8030,13 +8042,27 @@ const server = http.createServer(async (req, res) => {
         return json(res, 409, {
           error: "this archived session recorded no worktree path, so there is nowhere to resume it",
         });
-      // A recorded worktree is only usable if it looks like one. The path is
-      // replayed as the agent's `cwd`, and `_localize_migrated_cwd` remaps it by
-      // its `.turma/worktrees/<repo>/<dir>` tail — so a row without that tail
-      // (or carrying `..`) can only be refused by the agent, after it has already
-      // burned an in-flight slot and a spool file for the whole timeout.
-      if (!/(^|\/)\.turma\/worktrees\/[^/]+\/[^/]+\/?$/.test(row.worktree) ||
-          row.worktree.split("/").includes(".."))
+      // A recorded worktree is only usable if it is one of the three shapes the
+      // agent's `_resumable_cwd_class` accepts, checked against what the ROW says
+      // rather than guessed from the path: the hub does not know a target's
+      // REPOS_ROOT, and hosts mount it at different paths on purpose.
+      //   - a worktree session, `.turma/worktrees/<repo>/<dir>` — the only
+      //     mount-independent shape, and the only one `_localize_migrated_cwd`
+      //     can remap across differing mounts;
+      //   - a ROOT session, whose cwd IS the source's REPOS_ROOT. There is no
+      //     tail to match and nothing hub-side to compare it to, so the row's own
+      //     repo is what identifies it. These are the MAJORITY of archived
+      //     sessions — refusing them by shape made every one unrestorable;
+      //   - a repo-dir session, `<REPOS_ROOT>/<repo>`, identified the same way.
+      // Anything else the agent would refuse anyway, so refusing here only saves
+      // an in-flight slot and a spool file. A `..` component is never legitimate.
+      const wtParts = row.worktree.split("/").filter(Boolean);
+      const isWorktree = /(^|\/)\.turma\/worktrees\/[^/]+\/[^/]+\/?$/.test(row.worktree);
+      const isRoot = row.repo === ROOT_REPO_NAME;
+      const isRepoDir = wtParts.length > 0 && wtParts[wtParts.length - 1] === row.repo &&
+                        !/(^|\/)\.turma(\/|$)/.test(row.worktree);
+      if (row.worktree.split("/").includes("..") ||
+          !(isWorktree || isRoot || isRepoDir))
         return json(res, 409, {
           error: "this archived session's recorded worktree path is not a session worktree",
         });
@@ -8075,6 +8101,11 @@ const server = http.createServer(async (req, res) => {
       // two live sessions on one transcript — two claudes appending to the same
       // file, and a `_session_transcript_path` that cannot say whose it is.
       for (const [host, a] of Object.entries(agents)) {
+        // ONLINE hosts only. A host that died with the session running keeps
+        // `status: "running"` in its last record forever, so gating on it refused
+        // the restore with "kill it there first" naming a host the operator
+        // cannot reach — on exactly the population this feature exists for.
+        if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
         const live = (a.sessions || []).find(
           (x) => x.transcriptId === transcriptId && x.status === "running");
         if (live)

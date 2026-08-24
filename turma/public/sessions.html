@@ -1073,7 +1073,23 @@ function advanceMigrationFollow() {
     pendingMigrationFollowed = true;
     followSpawn(m.importCmdId); // the target session comes up under this cmdId
   }
-  if (m.phase === "done") pendingMigration = null;
+  if (m.phase === "done") {
+    // A restore the hub could not carry whole (XERK-441). The session IS back —
+    // the conversation is checked at the pack, so a bundle missing THAT fails
+    // outright — but a subagent or workflow transcript the archive holds did not
+    // make it. Saying so is the difference between "your session is restored" and
+    // a session quietly missing part of itself. The toast is the page's one
+    // failure surface, so this is the only place it can be said.
+    if (m.incomplete && m.incomplete.total) {
+      const names = [...(m.incomplete.skipped || []), ...(m.incomplete.short || [])];
+      const shown = names.slice(0, 2).join(", ");
+      const more = m.incomplete.total - Math.min(names.length, 2);
+      toast(`Restored, but ${m.incomplete.total} archived file` +
+            `${m.incomplete.total === 1 ? "" : "s"} could not be carried: ` +
+            shown + (more > 0 ? ` and ${more} more` : ""));
+    }
+    pendingMigration = null;
+  }
 }
 // The page's failures all go through the chrome's one toast (XERK-264), so a
 // refused command reads the same here, on the dashboard, and from the chat.

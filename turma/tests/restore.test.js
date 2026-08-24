@@ -42,6 +42,35 @@ const archive = require("../archive.js");
 // The same module object server.js holds, so a test can stand in for the packer.
 const tarmod = require("../tar.js");
 const { agents, migrations, advanceMigrations, server } = hub;
+// Every restore leaves a record holding an in-flight slot and MIGRATE_INFLIGHT_MAX
+// is 4, so a run of them starves itself. The tests above deliberately chain (one
+// looks up the record the last one made), so this is called by the independent
+// tests below rather than from a beforeEach.
+// Packing is async and off the request. The budget is deliberately generous: a
+// tight one made this suite fail only in the parallel full-tree run, which reads
+// as a real defect and is not one.
+// `dropMigrationBlob` unlinks with the ASYNC fs.unlink, so an existsSync fired
+// on the next line races it — the file is released, just not yet.
+async function spoolGone(id) {
+  const f = path.join(process.env.MIGRATE_SPOOL_DIR, `${id}.bin`);
+  for (let i = 0; i < 200 && fs.existsSync(f); i++)
+    await new Promise((r) => setTimeout(r, 10));
+  return !fs.existsSync(f);
+}
+async function waitPacked(m) {
+  for (let i = 0; i < 600 && m.phase === "exporting"; i++)
+    await new Promise((r) => setTimeout(r, 25));
+  return m.phase;
+}
+function releaseInFlight() {
+  for (const m of [...migrations.values()]) {
+    if (m.phase !== "exporting" && m.phase !== "importing") continue;
+    migrations.delete(m.id);
+    // The record is what owns the spool file; dropping one without the other
+    // leaves bytes behind that the spool-is-empty assertions then trip over.
+    try { fs.unlinkSync(path.join(process.env.MIGRATE_SPOOL_DIR, `${m.id}.bin`)); } catch {}
+  }
+}
 
 let baseUrl = "";
 test.before(async () => {
@@ -151,7 +180,7 @@ test("restore: an archived session is packed and imported onto a live host", asy
   assert.equal(m.transcriptId, TID);
 
   // Packing is async; the record flips to `importing` once the spool is written.
-  for (let i = 0; i < 100 && m.phase === "exporting"; i++) await new Promise((r2) => setTimeout(r2, 20));
+  await waitPacked(m);
   assert.equal(m.phase, "importing", m.error || "");
   assert.ok(m.importCmdId);
 
@@ -174,8 +203,16 @@ test("restore: an archived session is packed and imported onto a live host", asy
 });
 
 test("restore: the bundle the target downloads is the archived bytes, byte for byte", async () => {
-  const m = [...migrations.values()].find((x) => x.transcriptId === TID && x.phase === "importing");
-  assert.ok(m, "the restore from the previous test is still in flight");
+  // Its own restore rather than the previous test's: scanning `migrations` for
+  // one still in `importing` couples the test to how fast the last pack ran,
+  // which made this suite fail under parallel load and nowhere else.
+  releaseInFlight();
+  await beat("k8x");
+  const r0 = await request("POST", `/api/archive/${TID}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(r0.status, 200, JSON.stringify(r0.body));
+  const m = migrations.get(r0.body.migrationId);
+  assert.equal(await waitPacked(m), "importing", m.error || "");
   const blob = await request("GET", `/api/agents/k8x/migrations/${m.id}/blob`,
     { headers: agentHeaders });
   assert.equal(blob.status, 200);
@@ -188,8 +225,16 @@ test("restore: the bundle the target downloads is the archived bytes, byte for b
 });
 
 test("restore: the handoff finishes without killing anything", async () => {
-  const m = [...migrations.values()].find((x) => x.transcriptId === TID && x.phase === "importing");
-  assert.ok(m);
+  // Its own restore rather than the previous test's: scanning `migrations` for
+  // one still in `importing` couples the test to how fast the last pack ran,
+  // which made this suite fail under parallel load and nowhere else.
+  releaseInFlight();
+  await beat("k8x");
+  const r0 = await request("POST", `/api/archive/${TID}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(r0.status, 200, JSON.stringify(r0.body));
+  const m = migrations.get(r0.body.migrationId);
+  assert.equal(await waitPacked(m), "importing", m.error || "");
   // The target reports the imported session up, under the importSession cmdId.
   await beat("k8x", { sessions: [{ id: "s-new", status: "running", spawnCmdId: m.importCmdId,
     repo: "Widget", transcriptId: TID }] });
@@ -204,7 +249,7 @@ test("restore: the handoff finishes without killing anything", async () => {
   }
   // And the spool file is released like any settled move.
   assert.equal(m.blobPath, null);
-  assert.equal(fs.readdirSync(process.env.MIGRATE_SPOOL_DIR).length, 0);
+  assert.equal(await spoolGone(m.id), true, "the spool file is released");
 });
 
 test("restore: a session with no RAW copy is readable and refused, in the hub's words", async () => {
@@ -293,6 +338,7 @@ test("restore: the route is the operator's, never an agent's", async () => {
 const LONG_NAME = "q".repeat(150) + ".jsonl";
 
 test("restore: a bundle that could not carry everything says so on the record", async () => {
+  releaseInFlight();
   // Dropping a subagent transcript and reporting `done` tells the operator they
   // have their session back when part of it is not there — and the only trace
   // used to be a line in the hub's own stderr.
@@ -304,7 +350,7 @@ test("restore: a bundle that could not carry everything says so on the record", 
     { headers: userHeaders, body: { host: "k8x" } });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   const m = migrations.get(r.body.migrationId);
-  for (let i = 0; i < 100 && m.phase === "exporting"; i++) await new Promise((r2) => setTimeout(r2, 20));
+  await waitPacked(m);
 
   // It still restores — the conversation itself is intact.
   assert.equal(m.phase, "importing", m.error || "");
@@ -319,6 +365,7 @@ test("restore: a bundle that could not carry everything says so on the record", 
 });
 
 test("restore: a conversation that cannot be packed intact FAILS, it does not half-restore", async () => {
+  releaseInFlight();
   // A skipped `<id>.jsonl` restores an empty session and a NUL-padded one a
   // corrupt transcript, and `claude --resume` presents either as the operator's
   // own history. Refusing is the only honest outcome.
@@ -340,7 +387,7 @@ test("restore: a conversation that cannot be packed intact FAILS, it does not ha
       { headers: userHeaders, body: { host: "k8x" } });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const m = migrations.get(r.body.migrationId);
-    for (let i = 0; i < 100 && m.phase === "exporting"; i++) await new Promise((r2) => setTimeout(r2, 20));
+    await waitPacked(m);
     assert.equal(m.phase, "failed");
     assert.match(m.error, /could not be packed intact/);
     assert.equal(m.importCmdId, null, "nothing was queued on the target");
@@ -352,6 +399,7 @@ test("restore: a conversation that cannot be packed intact FAILS, it does not ha
 });
 
 test("restore: a conversation that comes back up mid-restore aborts it", async () => {
+  releaseInFlight();
   // The admission check is a snapshot, and the importing window is minutes: the
   // archived host can revive, or someone can resume that transcript by hand, and
   // finishing would put two claudes on one file.
@@ -362,7 +410,7 @@ test("restore: a conversation that comes back up mid-restore aborts it", async (
     { headers: userHeaders, body: { host: "k8x" } });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   const m = migrations.get(r.body.migrationId);
-  for (let i = 0; i < 100 && m.phase === "exporting"; i++) await new Promise((r2) => setTimeout(r2, 20));
+  await waitPacked(m);
   assert.equal(m.phase, "importing", m.error || "");
 
   // The host that ran it turns back up, with that conversation live.
@@ -370,10 +418,11 @@ test("restore: a conversation that comes back up mid-restore aborts it", async (
   advanceMigrations();
   assert.equal(m.phase, "failed");
   assert.match(m.error, /came back up on revived/);
-  assert.equal(fs.existsSync(path.join(process.env.MIGRATE_SPOOL_DIR, `${m.id}.bin`)), false);
+  assert.equal(await spoolGone(m.id), true, "the spool file is released");
 });
 
 test("restore: the TARGET reporting the session up is a success, not a clash", async () => {
+  releaseInFlight();
   // The same re-check must not read the target's own imported session as a rival
   // claude, or every restore would abort at the moment it succeeded.
   const tid = "eeeeeeee-1111-2222-3333-444444444444";
@@ -382,7 +431,7 @@ test("restore: the TARGET reporting the session up is a success, not a clash", a
   const r = await request("POST", `/api/archive/${tid}/restore`,
     { headers: userHeaders, body: { host: "k8x" } });
   const m = migrations.get(r.body.migrationId);
-  for (let i = 0; i < 100 && m.phase === "exporting"; i++) await new Promise((r2) => setTimeout(r2, 20));
+  await waitPacked(m);
   await beat("k8x", { sessions: [{ id: "s-imported", status: "running", repo: "Widget",
                                   transcriptId: tid, spawnCmdId: m.importCmdId }] });
   advanceMigrations();
@@ -391,6 +440,7 @@ test("restore: the TARGET reporting the session up is a success, not a clash", a
 });
 
 test("restore: a recorded worktree that is not a session worktree is refused up front", async () => {
+  releaseInFlight();
   // The path is replayed as the agent's cwd and remapped by its
   // `.turma/worktrees/<repo>/<dir>` tail. Without that tail only the agent can
   // refuse it — after the hub has spent an in-flight slot and a spool file, and
@@ -411,23 +461,109 @@ test("restore: a recorded worktree that is not a session worktree is refused up 
   }
 });
 
-test("restore: the target's own session is never mistaken for a rival claude", async () => {
-  // The handoff above catches the ordinary case, because the imported session
-  // carries the importCmdId the hub minted. It does NOT always: an agent that
-  // reports the session up under a different spawnCmdId — a re-register, a
-  // resume — leaves the handoff unmatched, and without the target skip the very
-  // next tick would abort the restore for clashing with itself.
-  const tid = "abababab-1111-2222-3333-444444444444";
+test("restore: a ROOT session is restorable — its cwd has no worktree tail to match", async () => {
+  releaseInFlight();
+  // The repos-root pseudo-repo's cwd IS the source host's REPOS_ROOT. Requiring a
+  // `.turma/worktrees/<repo>/<dir>` tail refused every archived root session —
+  // 822 of the stranded rows on the production hub, against 178 the tail accepts.
+  // The agent supports them (`_resumable_cwd_class` -> is_root), so the row's own
+  // repo is what identifies one; there is no shape for the hub to check.
+  const tid = "10101010-1111-2222-3333-444444444444";
+  archive.ingestChunk("truenas", tid, {
+    repo: "(root)", remoteKey: "", worktree: "/mnt/tank/repos",
+    summary: "Root work", createdAt: "2026-08-01T00:00:00Z", endedTs: "2026-08-02T00:00:00Z",
+  }, 0, CONVERSATION.length, [{ uuid: "u1", role: "user", ts: 1, text: "one" }]);
+  archive.ingestRaw("truenas", tid, `${tid}.jsonl`, 0, Buffer.from(CONVERSATION));
+  await beat("k8x", { repos: ["Widget", "(root)"] });
+  const r = await request("POST", `/api/archive/${tid}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const m = migrations.get(r.body.migrationId);
+  await waitPacked(m);
+  assert.equal(m.phase, "importing", m.error || "");
+  const cmd = (agents["k8x"].commands || []).find((c) => c.cmdId === m.importCmdId);
+  assert.equal(cmd.cwd, "/mnt/tank/repos", "the source's REPOS_ROOT rides unchanged");
+});
+
+test("restore: a repo-dir session is restorable too", async () => {
+  releaseInFlight();
+  // `<REPOS_ROOT>/<repo>`, the third shape `_resumable_cwd_class` accepts. Same
+  // problem as root: no tail, so the row's repo is what says the last segment is
+  // a repo rather than an arbitrary directory.
+  const tid = "20202020-1111-2222-3333-444444444444";
+  seedArchive(tid, { worktree: "/mnt/tank/repos/Widget" });
+  await beat("k8x");
+  const r = await request("POST", `/api/archive/${tid}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+});
+
+test("restore: a host that is OFFLINE cannot veto a restore forever", async () => {
+  releaseInFlight();
+  // A host that died with the session running keeps `status: "running"` in its
+  // last record for good, so gating on it answered "kill it there first" naming a
+  // host the operator cannot reach — on precisely the population this feature is
+  // for. Only ONLINE hosts get a say.
+  const tid = "30303030-1111-2222-3333-444444444444";
+  seedArchive(tid);
+  await beat("k8x");
+  await beat("deadbox", { sessions: [{ id: "ghost", status: "running", repo: "Widget", transcriptId: tid }] });
+  // While it is online, it does veto.
+  const live = await request("POST", `/api/archive/${tid}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(live.status, 409);
+  assert.match(live.body.error, /already running on deadbox/);
+
+  agents["deadbox"].lastSeen = Date.now() - 10 * 60 * 1000;
+  const r = await request("POST", `/api/archive/${tid}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+});
+
+test("restore: a rival claude ON THE TARGET is caught, not skipped with the host", async () => {
+  releaseInFlight();
+  // `import_session` downloads and unpacks BEFORE `_resume_at_cwd` refuses, so a
+  // conversation resumed locally on the target between admission and its next
+  // beat has the archived bytes written over it. Skipping the whole target host
+  // left the one machine that actually unpacks unchecked; only the migration's
+  // OWN session may be skipped.
+  const tid = "40404040-1111-2222-3333-444444444444";
   seedArchive(tid);
   await beat("k8x");
   const r = await request("POST", `/api/archive/${tid}/restore`,
     { headers: userHeaders, body: { host: "k8x" } });
   const m = migrations.get(r.body.migrationId);
-  for (let i = 0; i < 100 && m.phase === "exporting"; i++) await new Promise((r2) => setTimeout(r2, 20));
+  await waitPacked(m);
   assert.equal(m.phase, "importing", m.error || "");
 
-  await beat("k8x", { sessions: [{ id: "s-mine", status: "running", repo: "Widget",
-                                   transcriptId: tid, spawnCmdId: "some-other-cmd" }] });
+  // The target itself turns out to be running that conversation already, under a
+  // spawnCmdId that is NOT this migration's.
+  await beat("k8x", { sessions: [{ id: "local-resume", status: "running", repo: "Widget",
+                                   transcriptId: tid, spawnCmdId: "unrelated" }] });
   advanceMigrations();
-  assert.equal(m.phase, "importing", `aborted against its own target: ${m.error}`);
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /came back up on k8x/);
+});
+
+test("restore: the incomplete list is CAPPED on the wire", async () => {
+  releaseInFlight();
+  // It rides /api/agents and every SSE frame, and the names come from the raw
+  // layer — bounded per name, unbounded in COUNT. `total` still tells the truth.
+  const tid = "50505050-1111-2222-3333-444444444444";
+  seedArchive(tid);
+  for (let i = 0; i < 25; i++) {
+    archive.ingestRaw("truenas", tid, `${tid}/subagents/${"z".repeat(150)}${i}.jsonl`,
+                      0, Buffer.from(SUBAGENT));
+  }
+  await beat("k8x");
+  const r = await request("POST", `/api/archive/${tid}/restore`,
+    { headers: userHeaders, body: { host: "k8x" } });
+  const m = migrations.get(r.body.migrationId);
+  await waitPacked(m);
+  assert.equal(m.phase, "importing", m.error || "");
+  assert.equal(m.incomplete.total, 25, "the count is the truth");
+  assert.equal(m.incomplete.skipped.length, 20, "the NAMES are capped");
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const sm = res.body.migrations.find((x) => x.id === m.id);
+  assert.equal(sm.incomplete.skipped.length, 20);
 });
