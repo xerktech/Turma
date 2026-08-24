@@ -2104,8 +2104,12 @@ function normalizeModelUsage(usage, tally) {
   // other coercion in this file says what it dropped.
   if (!Array.isArray(usage.models)) {
     if ("models" in usage) {
+      const deliberate = usage.models === null;
       delete usage.models;
-      noteUsageCoercion(tally, "models");
+      // A null is the agent saying "nothing to report", exactly as it is for the
+      // usage block itself two functions down — tallying it would warn that this
+      // host's "token figures understate what it really spent", which is false.
+      if (!deliberate) noteUsageCoercion(tally, "models");
     }
     return;
   }
@@ -2425,41 +2429,6 @@ function normalizeSubscription(payload) {
 //
 // Anything unusable becomes null, which every client already reads as "this host
 // cannot fail over" — the same degradation as an agent too old to report it.
-// The host login's own model list (`models`, XERK-33) — NOT the per-model usage
-// block above, which is a different field with a different shape. Android types
-// it (`ModelsInfo?`) and decodes /api/agents atomically, so one host beating
-// `models: "x"` — or a number, a bare array, or an object whose `available` is a
-// string — throws for the WHOLE array and empties every other host from every
-// phone's fleet list, while the tile still reads "N / N online". The web guards
-// this one with Array.isArray, so it is Android-only: the half that fails
-// silently.
-//
-// Anything unusable becomes ABSENT rather than a fabricated empty list, because
-// absent is what the ticket model picker already reads as "this agent can't
-// tell you" and falls back to the static family aliases for; an empty
-// `available` would instead assert this login can run no models at all.
-function normalizeModels(payload) {
-  if (!payload || typeof payload !== "object") return;
-  if (!("models" in payload)) return;
-  const m = payload.models;
-  if (!m || typeof m !== "object" || Array.isArray(m)) {
-    delete payload.models;
-    return;
-  }
-  const available = Array.isArray(m.available)
-    ? m.available.filter((x) => typeof x === "string" && x).slice(0, MODELS_AVAILABLE_MAX)
-    : [];
-  payload.models = {
-    available,
-    defaultLabel: typeof m.defaultLabel === "string" ? m.defaultLabel.slice(0, MODEL_NAME_MAX) : "",
-    at: typeof m.at === "string" ? m.at.slice(0, MODEL_NAME_MAX) : "",
-  };
-}
-// Bounded because this rides /api/agents and every SSE frame, and the whole
-// block is agent-asserted.
-const MODELS_AVAILABLE_MAX = 100;
-const MODEL_NAME_MAX = 120;
-
 function normalizeLocalModel(payload) {
   if (!payload || typeof payload !== "object") return;
   const lm = payload.localModel;
@@ -3587,6 +3556,56 @@ function normalizeSubagentHistory(a) {
  * entry, never a plausible default — since a fabricated reason would end an
  * operator's spawn wait with text no agent ever said.
  */
+// The host login's own model list (`models`, XERK-33) — NOT the per-model usage
+// block above, which is a different field with a different shape. Android types
+// it (`ModelsInfo?`) and decodes /api/agents atomically, so one host beating
+// `models: "x"` — or a number, or an object whose `available` is a string —
+// throws for the WHOLE array and empties every other host from every phone's
+// fleet list, while the tile still reads "N / N online". The web guards this one
+// with Array.isArray, so it fails only on the client that fails silently.
+//
+// Unusable becomes ABSENT, and that means absent — never a rebuilt empty block.
+// An empty one passes `board.js`'s `Array.isArray(mb.available)` gate and joins
+// the freshest-probe compare, where it can take the DEFAULT LABEL off a host that
+// probed properly; absent is skipped there, and is what the ticket model picker
+// already reads as "this agent can't tell you", falling back to the static family
+// aliases. `Board.kt` has the identical compare.
+//
+// The bounds are INLINE LITERALS on purpose. `normalizeRecord` is reached from
+// `loadState`'s restore loop near the top of this file, which resolves these
+// functions only because declarations hoist — a module `const` below is in its
+// TDZ there, the ReferenceError lands in the restore's catch, and the WHOLE
+// registry is emptied, after which the save timer rewrites state.json from only
+// the hosts that have re-beaten. That is XERK-301, and shipping it again is what
+// the sibling normalizers inline their own bounds to avoid.
+function normalizeModels(payload) {
+  if (!payload || typeof payload !== "object") return;
+  if (!("models" in payload)) return;   // absent stays absent — never fabricated
+  const m = payload.models;
+  if (!m || typeof m !== "object" || Array.isArray(m)) {
+    delete payload.models;
+    return;
+  }
+  // Each NAME is bounded too, not just the count: 100 entries of 70 KiB is a
+  // 7 MiB block on /api/agents and on every SSE frame, which a count cap alone
+  // waves through. Capping one field of several is the XERK-348 mistake.
+  const available = Array.isArray(m.available)
+    ? m.available
+        .filter((x) => typeof x === "string" && x)   // DROPPED, never String()'d —
+        .slice(0, 100)                               // a coerced number is a model
+        .map((x) => x.slice(0, 120))                 // name that does not exist
+    : [];
+  const defaultLabel = typeof m.defaultLabel === "string" ? m.defaultLabel.slice(0, 120) : "";
+  const at = typeof m.at === "string" ? m.at.slice(0, 120) : "";
+  // Nothing usable left: drop it rather than serve a block that says this login
+  // can run no models at all.
+  if (!available.length && !defaultLabel && !at) {
+    delete payload.models;
+    return;
+  }
+  payload.models = { available, defaultLabel, at };
+}
+
 function normalizeSpawnRefusals(a) {
   if (!a || typeof a !== "object") return;
   const raw = a.spawnRefusals;

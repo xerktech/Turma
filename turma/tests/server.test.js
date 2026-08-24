@@ -2516,6 +2516,57 @@ test("http: a malformed top-level models block cannot empty every phone's fleet"
   }
 });
 
+test("a models block that is ABSENT, or has nothing usable, stays absent", async () => {
+  // Absent is the property the coercion sells: it is what the ticket model picker
+  // reads as "this agent can't tell you" and falls back to the static aliases for.
+  // A REBUILT empty block is worse than nothing — it passes board.js's
+  // `Array.isArray(mb.available)` gate, joins the freshest-probe compare, and can
+  // take the default label off a host that probed properly. `Board.kt` compares
+  // the same way.
+  const absent = { device: "no-models-host" };
+  hub.normalizeRecord(absent);
+  assert.equal("models" in absent, false, "a host that sent none must not be given one");
+
+  for (const junk of [{}, { available: [] }, { available: [1, 2, null] },
+                      { available: "nope", defaultLabel: 5, at: [] }, [1, 2], "x", 0, false, ""]) {
+    const rec = { device: "junk-models-host", models: junk };
+    hub.normalizeRecord(rec);
+    assert.equal("models" in rec, false, `rebuilt an empty block from ${JSON.stringify(junk)}`);
+  }
+});
+
+test("a models block's entries are DROPPED when unusable, never stringified", async () => {
+  // A coerced `5` becomes the model name "5", which names a model that does not
+  // exist — the picker would offer it and the spawn would fail. And each name is
+  // length-bounded, not just the list: 100 entries of 70 KiB is a 7 MiB block on
+  // /api/agents and on every SSE frame, which a count cap alone waves through.
+  const rec = { device: "mixed-models-host",
+                models: { available: ["opus", 5, null, "", { m: 1 }, "z".repeat(500)] } };
+  hub.normalizeRecord(rec);
+  assert.deepEqual(rec.models.available, ["opus", "z".repeat(120)]);
+});
+
+test("a models block that was absent does not warn about lost tokens", async () => {
+  // `models` carries no tokens, so it must never reach the usage tally — a line
+  // saying this host's "token figures understate what it really spent" would be
+  // a lie, and at one per beat it buries the hosts genuinely sending bad shapes.
+  const warnings = [];
+  const realWarn = console.warn;
+  hub.resetUsageCoercionLog();
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    hub.normalizeRecord({ device: "quiet-models-host" });
+    hub.normalizeRecord({ device: "quiet-models-host2", models: { available: ["opus"] } });
+    hub.normalizeRecord({ device: "quiet-models-host3", models: "junk" });
+    // And a usage.models of explicit null is the agent's deliberate "nothing to
+    // report", exactly as a null usage block is.
+    hub.normalizeRecord({ device: "quiet-models-host4", usage: { models: null } });
+    assert.deepEqual(warnings, [], `nothing here spends tokens: ${warnings[0] || ""}`);
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
 test("http: a good top-level models block rides through, bounded", async () => {
   await request("POST", "/api/heartbeat", {
     body: { device: "good-topmodels-host",
