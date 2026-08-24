@@ -104,7 +104,7 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString())
-        handleAgentMessage(device, msg)
+        handleAgentMessage(device, ws, msg)
       } catch (e) {
         console.error('Invalid agent message:', e)
       }
@@ -126,10 +126,17 @@ wss.on('connection', (ws, req) => {
   }
 })
 
-// Handle messages from agents
-function handleAgentMessage(device: string, msg: { type: string; [key: string]: unknown }) {
+// Handle messages from agents.
+//
+// `ws` is the socket the message arrived on. Two processes can claim one
+// device name, and only the one holding the record is the registered agent --
+// commands route to ITS socket. Accepting state from a non-holder let an
+// abandoned agent keep the record's identity current while every command went
+// to the other process, so what the record says and what it does disagreed.
+function handleAgentMessage(device: string, ws: WebSocket, msg: { type: string; [key: string]: unknown }) {
   const agent = agents.get(device)
   if (!agent) return
+  if (agent.ws !== ws) return
 
   switch (msg.type) {
     case 'heartbeat':

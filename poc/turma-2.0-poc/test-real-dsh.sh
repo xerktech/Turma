@@ -5,8 +5,14 @@
 #
 # Usage:
 #   ./test-real-dsh.sh                    # single worker, asserts it registers
+#   ./test-real-dsh.sh --once             # exit 0 on PASS instead of staying up
 #   FLEET_DEVICE=my-host ./test-real-dsh.sh
 #   DSH_PORT=3081 FLEET_DEVICE=host-2 ./test-real-dsh.sh   # second worker
+#
+# Without --once a PASS leaves the hub and dsh RUNNING so you can browse them,
+# so the script does not return -- bound it with `timeout` and match on
+# "=== PASS ===" if you are driving it from another script. With --once it
+# tears everything down and exits 0, which is what makes it usable as a gate.
 #
 # By DEFAULT everything installs into a throwaway DSH_HOME under this
 # directory, leaving your real ~/.dsh alone. Overriding DSH_HOME removes that
@@ -25,10 +31,28 @@ set -euo pipefail
 # Job control, so each background job below lands in its OWN process group and
 # can be torn down as a group. Without it they share the script's group and
 # `kill -- -$pid` would signal the script itself.
+#
+# Two consequences are handled where the jobs are started, NOT here:
+#   - every background job gets `</dev/null`. In its own process group a job
+#     that reads the terminal takes SIGTTIN and STOPS; `tsx watch` does read
+#     stdin, so without this the hub never binds when run from a terminal.
+#   - job control is switched back off once the jobs exist (their process
+#     groups are already assigned), so bash's "[1]+ Terminated" notices stay
+#     out of the script's own output.
 set -m
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+ONCE=""
+for _arg in "$@"; do
+  case "$_arg" in
+    --once) ONCE=1 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "FAIL: unknown argument: $_arg"; exit 1 ;;
+  esac
+done
+unset _arg
 
 HUB_PORT="${HUB_PORT:-3000}"
 DSH_PORT="${DSH_PORT:-3080}"
@@ -52,8 +76,11 @@ for _port_var in HUB_PORT DSH_PORT; do
   # bash's integer range, and `[ ... -lt ... ]` then errors -- which `set -e`
   # does not catch inside an `if` condition, so the run continued with a
   # nonsense port after printing a raw interpreter error.
+  # `??????*` is SIX quoted marks: it matches length >= 6, leaving 1-5 digits
+  # valid. Five marks would reject every 5-digit port -- i.e. 10000-65535 --
+  # and make the range check below dead code.
   case "$_port_val" in
-    ''|*[!0-9]*|?????*)
+    ''|*[!0-9]*|??????*)
       echo "FAIL: $_port_var must be a number of 1-5 digits"
       printf '      got: %q\n' "$_port_val"
       exit 1 ;;
@@ -277,7 +304,7 @@ if curl -sf "http://localhost:$HUB_PORT/api/agents" >/dev/null 2>&1; then
   echo "      hub already running on :$HUB_PORT, reusing it"
 else
   # The hub reads PORT, not HUB_PORT.
-  ( cd fleet-hub && npm install && PORT="$HUB_PORT" npm run dev ) >"$HUB_LOG" 2>&1 &
+  ( cd fleet-hub && npm install && PORT="$HUB_PORT" npm run dev ) >"$HUB_LOG" 2>&1 </dev/null &
   HUB_PID=$!
   for _ in $(seq 1 60); do
     curl -sf "http://localhost:$HUB_PORT/api/agents" >/dev/null 2>&1 && break
@@ -289,8 +316,12 @@ else
 fi
 
 TURMA_FLEET_INSTANCE_ID="$RUN_ID" \
-  npm exec -- dsh --profile web --no-open --port "$DSH_PORT" >"$DSH_LOG" 2>&1 &
+  npm exec -- dsh --profile web --no-open --port "$DSH_PORT" >"$DSH_LOG" 2>&1 </dev/null &
 DSH_PID=$!
+
+# Both jobs exist and own their process groups now, so job control has done
+# its work; turn it off so its notices don't land in this script's output.
+set +m
 
 # --------------------------------------------------------------- 5. assert
 echo "[5/5] Waiting for '$FLEET_DEVICE' to register with the hub..."
@@ -320,6 +351,10 @@ if [ -n "$REGISTERED" ]; then
   echo "Logs            : $HUB_LOG"
   echo "                  $DSH_LOG"
   echo
+  if [ -n "$ONCE" ]; then
+    echo "(--once: shutting down)"
+    exit 0
+  fi
   echo "Both are still running. Press Ctrl+C to stop."
   wait "$DSH_PID"
 else
