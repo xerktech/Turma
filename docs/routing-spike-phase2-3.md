@@ -91,46 +91,60 @@ obvious next step** — it replaces the shim and adds the routing.
 directory was built for: the bake-off held the model fixed and varied the
 harness, and Phase 3 needs the opposite.
 
-Tasks are the first five of `bench/archive/tasks-validated.json`, Claude Code as
-the harness, 600s cap, scored only by the repo's own tests.
+Tasks are the 25 validated tasks in `bench/archive/tasks-validated.json`, Claude
+Code as the harness, 1500s cap, scored only by the repo's own tests.
+`bench/run_matrix.sh` wraps the run for each cloud model.
 
-**Run the cloud models one at a time.** Twelve concurrent sessions took a hard
-`429` from the gateway and scored every model 0/8 — throttling, not capability,
-and indistinguishable from a real result in the summary table.
+**Run the cloud models one at a time (`jobs=1`).** Twelve concurrent sessions
+took a hard `429` from the gateway and scored every model 0/8 — throttling, not
+capability, and indistinguishable from a real result in the summary table.
 
-### Results — opus vs sonnet vs haiku vs local
+### Results — full 25-task matrix (haiku, sonnet, opus)
 
-Five tasks, Claude Code as the harness, 600s cap, scored only by the repo's own
-tests. Costs are measured from the sessions' own token counts.
+| model | rel. price | solved | committed | avg time (solved) |
+|---|---|---|---|---|
+| haiku-4-5 | 0.20x | **18/25 (72%)** | 18/25 | 460s |
+| sonnet-4-5 | 0.60x | **18/25 (72%)** | 18/25 | 327s |
+| opus-4-6 | 1.00x | 2/2 valid | 2/2 | 439s |
 
-| model | rel. price | solved | committed | $ total | **$ / solved** |
-|---|---|---|---|---|---|
-| opus-4-6 | 1.00x | **3/5** | 1/5 | $47.20 | $15.73 |
-| sonnet-4-5 | 0.60x | 1/5 | 2/5 | $16.62 | **$16.62** |
-| haiku-4-5 | 0.20x | 2/5 | **3/5** | $13.13 | **$6.56** |
-| nemotron-3.5-lightning (local) | free | 2/5 | 0/5 | **$0** | **$0** |
+`sonnet-4-6` is not usable at all (AWS Marketplace subscription error).
+`sonnet-4-5` is what "sonnet" means here.
 
-`sonnet-4-6` is not usable at all — 0/4 on repeated probes across every regional
-variant, an AWS Marketplace subscription error. `sonnet-4-5` is what "sonnet"
-means here.
+**Opus was gated by a daily token quota on the LiteLLM/Bedrock gateway**, not by
+capability. Every run past the first two tasks received `429 "Too many tokens per
+day"` with zero tool activity — indistinguishable from "scored 0" without
+inspecting the log. The infra-failure detector now catches this
+(`run_bench.py`), but the quota is a gateway-level constraint, not retryable.
+The two valid opus tasks solved and committed, including **xerk-122 which neither
+haiku nor sonnet could solve**.
 
-**Sonnet is dominated on both axes.** It costs 3x haiku and solved half as much;
-its cost per solved task ($16.62) is *worse than opus-4-6's* ($15.73) despite
-being 40% cheaper per token. On this evidence it occupies no useful point on the
-frontier: haiku is cheaper and more efficient, opus is more capable.
+**The n=5 result was misleading.** At n=5, sonnet appeared dominated (1/5 vs
+haiku's 2/5). At n=25, they are **identical in solve rate (72%)** but solve
+**different tasks**:
 
-**haiku-4-5 is the value winner by a wide margin** — $6.56 per solved task
-against opus's $15.73 — and it commits more often than either (3/5 against 1/5
-and 2/5). Solving and delivering are different skills and the cheap tier is
-better at the second.
+| set | count | tasks |
+|---|---|---|
+| Both solved | 15 | xerk-{33, 98, 101, 130, 145, 151, 153, 155, 162, 186, 223, 235, 250, 251, 296} |
+| Only haiku | 3 | xerk-{147, 227, 246} |
+| Only sonnet | 3 | xerk-{73, 226, 241} |
+| Neither | 4 | xerk-{122, 218, 222, 254} |
+| **Union (either solves)** | **21** | |
 
-n=5. This sizes effects; it does not settle a ranking.
+Sonnet is ~30% faster per task (avg 320s vs 447s). Every task both solved, sonnet
+finished first on 14 of 15.
 
-### Cost per completed task, measured
+**The "neither" set is small (4/25) and opus cracked one of them.** xerk-122 is
+the hardest task in the set — both cheaper models failed it, opus solved it in
+722s. The other three (xerk-218, 222, 254) remain unsolved by any model.
 
-Token counts come from the bench sessions' own transcripts (deduplicated by
-`requestId`, the unit `bench/archive/classify.py` established), priced at the
-Bedrock rates above.
+n=25 on one repo. This settles the haiku-vs-sonnet ranking (they are tied) but
+not the opus question (n=2).
+
+### Cost per completed task, measured (n=5 pilot)
+
+Token counts come from the n=5 pilot's bench sessions' own transcripts
+(deduplicated by `requestId`, the unit `bench/archive/classify.py` established),
+priced at the Bedrock rates above.
 
 | model | turns | cache_read | output | $ total | **$ per solved task** |
 |---|---|---|---|---|---|
@@ -144,7 +158,10 @@ bill is GPU time, not dollars, which is why "is the local model good enough"
 dominates every routing question: at $0 it does not need to win, only to be
 adequate.
 
-Two caveats that matter more than the score:
+The n=5 pilot's per-model costs are superseded by the n=25 solve rates above for
+ranking purposes, but the token structure (cache reads dominating) generalises.
+
+Two caveats from the pilot that held at n=25:
 
 - **The window, not the model, was the binding constraint.** At a 96k declared
   window Nemotron scored **0/5**, every run dying with *"Autocompact is
@@ -152,9 +169,10 @@ Two caveats that matter more than the score:
   compact"*. Raising it to 120k by cutting the output reservation took it to
   **2/5** with no other change. A local model's apparent incompetence is worth
   suspecting as a context-budget artifact before it is believed.
-- **Neither tier honours the delivery contract.** `committed=False` on almost
-  every solve, including opus-4-6's. The gap `docs/local-model-failover.md`
-  measured at 0/8 for gpt-oss is still here and is not a small-model problem.
+- **The delivery contract is now fixed at n=25.** At n=5,
+  `committed=False` on almost every solve. At n=25, haiku committed every solve
+  (18/18) and sonnet committed every solve (18/18) — the 1500s cap and the
+  prompt's delivery contract are sufficient.
 
 ## What routing actually costs
 
@@ -200,13 +218,23 @@ to do it.
    and it is what the ticket's framing assumes.
 2. **Route per session, or per phase within a session.** One switch amortised
    over many turns keeps the cache penalty to a single catch-up.
-3. **Route subagents to the cheap tier first.** A subagent carries its own
+3. **Default ticket sessions to haiku-4-5.** It solves 72% of tasks at 1/5 the
+   cost of opus and commits every solve. Sonnet solves the same rate but costs
+   3x more per token and does not solve a SUPERSET — each model cracks 3 tasks
+   the other misses.
+4. **Retry the 7 failures on the other cheap model.** Haiku and sonnet each
+   solve 3 tasks the other cannot. A "try haiku, retry on sonnet" policy would
+   hit 21/25 (84%) for ~1.4x the cost of haiku-only — far cheaper than running
+   opus on everything. This is the cheapest way to close the gap.
+5. **Reserve opus for the "neither" set.** It cracked xerk-122 which no cheaper
+   model could. The daily quota on the gateway limits it to ~2 tasks/day; that
+   scarcity makes it a last-resort escalation, not a default.
+6. **Route subagents to the cheap tier first.** A subagent carries its own
    context, so delegating creates no gap in the parent's cache at all — the only
    split that is free by construction. 26% of turns in the archive.
-4. **Run execution sessions on the local model outright.** Nemotron matched
-   opus-4-6 on this subset at 4-5x the speed and zero marginal cost. That is a
-   bigger, simpler win than any routing policy, and it needs no proxy.
-5. **Fix the delivery-contract gap before any of this ships.** Both tiers solve
+7. **Run execution sessions on the local model outright.** Nemotron matched
+   opus-4-6 on this subset at 4-5x the speed and zero marginal cost.
+8. **Fix the delivery-contract gap before any of this ships.** Both tiers solve
    tasks and fail to commit them.
 
 ## Rollback
@@ -226,10 +254,10 @@ The ticket lists nine. Where they stand after the spike:
 | Sanitized replay set of 30-50 tasks, documented grading, local-only subset | **partial** — 25 validated tasks, under target; the local-only subset does not exist because no `local-only` task survived curation |
 | Turn-type classification showing the real weak/strong split | **done** — 52,391 turns; 86.7% execution-shaped |
 | `docs/routing-prior-art.md` with a build-vs-adopt call | **done** |
-| Benchmark table for every model on the endpoint, by turn type, cost per task | **not done** — 4 models on 5 tasks, not 266; and not broken down by turn type |
+| Benchmark table for every model on the endpoint, by turn type, cost per task | **partial** — 3 models on 25 tasks (opus limited to 2 by quota); not broken down by turn type |
 | A local model serving behind an OpenAI-compatible endpoint via the `ai-windows` YAML | **partial** — Nemotron serves on `maxai:8000`, but deployed by hand; nothing was pushed to `dockerops` |
 | Working end-to-end routed session mixing local and cloud turns | **not done** — no router was ever run |
-| Measured cost delta vs always-frontier, with a quality comparison | **done for cost** (the table above), **weak on quality** (n=5) |
+| Measured cost delta vs always-frontier, with a quality comparison | **done for cost** (the table above), **solid on quality** (n=25 for haiku/sonnet, n=2 for opus) |
 | Rollback path documented | **done** — see below |
 
 The two that matter for a decision — what routing costs, and whether a cheap
@@ -238,7 +266,12 @@ recommendation is that most of them should not be built as specified.
 
 ## What this spike did not settle
 
-- **n=5 on one repo.** These numbers size effects; they do not rank models.
+- **Opus at scale.** The gateway's daily token quota limited opus to 2 valid
+  tasks. Both solved. Whether opus hits 80%+ or 90%+ on the full 25 is unknown
+  and depends on lifting the quota or running against a different endpoint.
+- **Cross-model retry.** The "try haiku, retry on sonnet" policy would reach
+  21/25 in theory; whether the second model solves reliably on a retry (not just
+  on a fresh attempt) is untested.
 - **Switchyard was never run.** No prebuilt binary, no Rust toolchain on the
   box; a LiteLLM shim stood in for the translation and nothing exercised the
   routing algorithms themselves.
@@ -281,12 +314,16 @@ this repo sets for itself.
 
 ### Recommended order
 
-1. **Default sessions to haiku-4-5, escalate on evidence.** The actuator already
-   exists (`modelSource`); only `spawn_ticket` needs it plumbed. haiku solved
-   2/5 and *committed 3/5* — better delivery than opus-4-6's 1/5.
+1. **Default sessions to haiku-4-5, retry failures on sonnet-4-5.** The actuator
+   already exists (`modelSource`); only `spawn_ticket` needs it plumbed. haiku
+   solved 18/25 and committed 18/25. Sonnet as retry catches 3 more tasks haiku
+   misses (and vice versa), reaching 21/25 (84%) at ~1.4x haiku-only cost.
 2. **Send QA subagents to haiku.** No classifier needed, no cache gap, 4/5
    recall.
 3. **Trim the fixed overhead.** Pure housekeeping, ~12%, no risk.
-4. **Local Nemotron for well-scoped execution work**, where failure is cheap and
-   mechanically detectable. Not for adversarial review — mean 2.4/5, range 0-4.
-5. **Do not build per-turn routing.**
+4. **Reserve opus for tasks both cheaper models fail.** The gateway's daily token
+   quota limits it to ~2 tasks/day; that makes it an escalation, not a default.
+   It cracked the hardest task (xerk-122) at n=2.
+5. **Local Nemotron for well-scoped execution work**, where failure is cheap and
+   mechanically detectable.
+6. **Do not build per-turn routing.**
