@@ -53,7 +53,7 @@ class TestRedaction(unittest.TestCase):
 
     def test_private_key_block_variant(self):
         self.assert_gone(
-            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nSECRETBYTES\n"
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nSECRETBYTES\n"  # nosemgrep: detected-pgp-private-key-block
             "-----END PGP PRIVATE KEY BLOCK-----", "SECRETBYTES")
 
     def test_subdomained_email_local_part(self):
@@ -221,7 +221,7 @@ class TestRedaction(unittest.TestCase):
         self.assertIn("InternationalizationHelper", out)
 
     def test_jwt_and_bearer(self):
-        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijkl"
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijkl"  # nosemgrep: detected-jwt-token
         self.assert_gone(jwt, jwt)
         self.assert_gone("Authorization: Bearer abcdef1234567890XYZ",
                          "abcdef1234567890XYZ")
