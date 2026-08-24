@@ -14,6 +14,12 @@ interface AgentInfo {
   ws: WebSocket
   sessions: SessionInfo[]
   lastHeartbeat: number
+  /**
+   * Per-process identity reported by the agent. A device name is reusable --
+   * an abandoned agent reconnects under the same one -- so this is what tells
+   * two processes claiming the same device apart.
+   */
+  instanceId?: string
 }
 
 interface SessionInfo {
@@ -51,6 +57,7 @@ function getFleetState() {
       device: info.device,
       sessions: info.sessions,
       online: Date.now() - info.lastHeartbeat < 30000,
+      ...(info.instanceId === undefined ? {} : { instanceId: info.instanceId }),
     })),
   }
 }
@@ -120,6 +127,7 @@ function handleAgentMessage(device: string, msg: { type: string; [key: string]: 
     case 'heartbeat':
       agent.lastHeartbeat = Date.now()
       agent.sessions = (msg.sessions as SessionInfo[]) || []
+      if (typeof msg.instanceId === 'string') agent.instanceId = msg.instanceId
       broadcastToDashboard(getFleetState())
       break
 

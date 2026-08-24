@@ -147,11 +147,28 @@ fleet-agent-plugin/
 
 ## Success Criteria
 
-- [x] Multiple workers connect to one hub
-- [x] Dashboard shows all hosts and their sessions
-- [x] Can spawn session on specific host from dashboard
-- [x] Can send input to any session from dashboard
-- [x] Session events stream to dashboard in real-time
+Split by what actually proves each one — the two are not equivalent evidence,
+and conflating them was overclaiming.
+
+**Proven against real dsh** (`test-real-dsh.sh`):
+
+- [x] A real dsh instance loads the plugin and registers with the hub
+- [x] Multiple real dsh instances register with one hub
+- [x] The dashboard lists every registered host
+
+**Proven only against MOCK workers** (`test-multi-host.ts`, `test-standalone.ts`)
+— these exercise the hub and the wire protocol, not the plugin's dsh-side code:
+
+- [x] Can spawn a session on a specific host from the dashboard
+- [x] Can send input to any session from the dashboard
+- [x] Session events stream to the dashboard in real time
+
+**Not yet proven anywhere:**
+
+- [ ] `spawn` / `input` / `kill` driven end to end against a real dsh — the
+      plugin's `handleSpawn` / `handleInput` / `handleKill` have never executed
+      against a live `ctx.agents`. This is the biggest remaining gap in the
+      PoC's evidence.
 
 ## Validation Results (2026-08-24)
 

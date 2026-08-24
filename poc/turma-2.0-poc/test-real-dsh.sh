@@ -30,13 +30,36 @@ DSH_PORT="${DSH_PORT:-3080}"
 FLEET_DEVICE="${FLEET_DEVICE:-dsh-test-host}"
 HUB_URL="ws://localhost:${HUB_PORT}/ws"
 
-# The device name is interpolated into YAML below. Keep it to characters that
-# cannot restructure the document -- a name containing ':' breaks the parse,
-# and one containing a newline injects sibling keys into the plugin entry.
-if ! printf '%s' "$FLEET_DEVICE" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
-  echo "FAIL: FLEET_DEVICE must match [A-Za-z0-9][A-Za-z0-9._-]* (got: $FLEET_DEVICE)"
-  exit 1
-fi
+# FLEET_DEVICE and the ports are interpolated into YAML below, so validate
+# them as WHOLE strings. `grep` is the wrong tool here: it matches per line, so
+# any payload whose first line is clean slips through and the trailing lines
+# land in the document as sibling keys. `case` globs have no such blind spot.
+case "$FLEET_DEVICE" in
+  ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+    echo "FAIL: FLEET_DEVICE must start alphanumeric and contain only [A-Za-z0-9._-]"
+    printf '      got: %q\n' "$FLEET_DEVICE"
+    exit 1 ;;
+esac
+
+for _port_var in HUB_PORT DSH_PORT; do
+  eval "_port_val=\$$_port_var"
+  case "$_port_val" in
+    ''|*[!0-9]*)
+      echo "FAIL: $_port_var must be a number"
+      printf '      got: %q\n' "$_port_val"
+      exit 1 ;;
+  esac
+  if [ "$_port_val" -lt 1 ] || [ "$_port_val" -gt 65535 ]; then
+    echo "FAIL: $_port_var out of range: $_port_val"
+    exit 1
+  fi
+done
+unset _port_var _port_val
+
+# Proves THIS run's dsh is the one that registered. A device name cannot: an
+# abandoned dsh reconnects every 5s under the same name, so asserting on the
+# name alone passes on a stale process (and did -- QA reproduced exactly that).
+RUN_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
 
 # Per-device by default, so two workers never share a profile (and so the
 # second run's config patch cannot disturb the first worker).
@@ -67,13 +90,17 @@ DSH_LOG="$LOG_DIR/turma-dsh-$FLEET_DEVICE.log"
 HUB_PID=""
 DSH_PID=""
 
-kill_tree() {
-  local pid="$1" sig="${2:-TERM}" child
+# Collect a pid and every descendant. The list is SNAPSHOTTED before any
+# signal goes out: `pgrep -P` walks parent links, so once a parent exits its
+# children become invisible to a second walk -- which made the KILL escalation
+# below unreachable for precisely the process that ignored TERM.
+collect_tree() {
+  local pid="$1" child
   [ -n "$pid" ] || return 0
+  printf '%s\n' "$pid"
   for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    kill_tree "$child" "$sig"
+    collect_tree "$child"
   done
-  kill "-$sig" "$pid" 2>/dev/null || true
 }
 
 alive_tree() {
@@ -87,15 +114,34 @@ alive_tree() {
 }
 
 cleanup() {
-  local pid
-  for pid in "$DSH_PID" "$HUB_PID"; do kill_tree "$pid" TERM; done
+  local pids p still
+  pids="$(collect_tree "$DSH_PID"; collect_tree "$HUB_PID")"
+  [ -n "$pids" ] || return 0
+  for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
   for _ in $(seq 1 20); do
-    alive_tree "$DSH_PID" || alive_tree "$HUB_PID" || return 0
+    still=""
+    for p in $pids; do kill -0 "$p" 2>/dev/null && { still=1; break; }; done
+    [ -n "$still" ] || return 0
     sleep 0.25
   done
-  for pid in "$DSH_PID" "$HUB_PID"; do kill_tree "$pid" KILL; done
+  for p in $pids; do kill -KILL "$p" 2>/dev/null || true; done
 }
 trap cleanup EXIT INT TERM
+
+# Does the hub currently list an agent whose instanceId is THIS run's?
+# Parsed as JSON rather than grepped -- a grep pattern built from a variable
+# can match the wrong agent's row.
+registered_this_run() {
+  curl -sf "http://localhost:$HUB_PORT/api/agents" 2>/dev/null | node -e '
+    let s = ""
+    process.stdin.on("data", d => s += d).on("end", () => {
+      try {
+        const agents = JSON.parse(s)
+        process.exit(agents.some(a => a.instanceId === process.argv[1] && a.online) ? 0 : 1)
+      } catch { process.exit(1) }
+    })
+  ' "$RUN_ID"
+}
 
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3<&- ; }
 
@@ -139,7 +185,14 @@ echo "      packed $(basename "$TARBALL")"
 # ------------------------------------------------- 2. scaffold the profile
 echo "[2/5] Scaffolding a throwaway dsh profile..."
 # Booting any dsh command creates $DSH_HOME/profiles/web on first use.
-npm exec -- dsh --profile web --dump-default-config >/dev/null
+# Catch the failure ourselves -- under `set -e` dsh's own stack trace would be
+# the last thing on screen, which reads as a script bug rather than a bad path.
+if ! npm exec -- dsh --profile web --dump-default-config >/dev/null 2>"$LOG_DIR/turma-scaffold.log"; then
+  echo "FAIL: dsh could not scaffold a profile under DSH_HOME=$DSH_HOME"
+  echo "      (is the path writable?)"
+  tail -5 "$LOG_DIR/turma-scaffold.log"
+  exit 1
+fi
 test -d "$PROFILE_DIR" || { echo "FAIL: dsh did not scaffold $PROFILE_DIR"; exit 1; }
 
 # ------------------------------------------------- 3. install as a bundle
@@ -165,6 +218,7 @@ cat > "$PROFILE_DIR/cordis.patch.yml" <<EOF
   config:
     hubUrl: '$HUB_URL'
     device: '$FLEET_DEVICE'
+    instanceId: '$RUN_ID'
 EOF
 
 # Prove the entry actually made it into the composed tree before booting.
@@ -199,9 +253,10 @@ DSH_PID=$!
 
 # --------------------------------------------------------------- 5. assert
 echo "[5/5] Waiting for '$FLEET_DEVICE' to register with the hub..."
+echo "      (matching instanceId $RUN_ID, so only THIS run's dsh counts)"
 REGISTERED=""
 for _ in $(seq 1 30); do
-  if curl -sf "http://localhost:$HUB_PORT/api/agents" 2>/dev/null | grep -q "\"$FLEET_DEVICE\""; then
+  if registered_this_run; then
     REGISTERED=1
     break
   fi
@@ -228,7 +283,9 @@ if [ -n "$REGISTERED" ]; then
   wait "$DSH_PID"
 else
   echo "=== FAIL ==="
-  echo "'$FLEET_DEVICE' never appeared in /api/agents."
+  echo "No agent with this run's instanceId ($RUN_ID) appeared in /api/agents."
+  echo "If '$FLEET_DEVICE' IS listed below, that is a DIFFERENT dsh process --"
+  echo "an abandoned one still holding the name. Stop it: pgrep -af 'profile web'"
   echo "--- hub sees ---"; curl -s "http://localhost:$HUB_PORT/api/agents"; echo
   echo "--- dsh log ---";  tail -30 "$DSH_LOG"
   exit 1

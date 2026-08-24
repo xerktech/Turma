@@ -97,6 +97,13 @@ interface UserMessage {
 export interface Config {
   hubUrl: string
   device: string
+  /**
+   * Opaque per-process identity, echoed back by the hub on /api/agents.
+   * A device NAME cannot prove which process is connected -- an abandoned
+   * instance reconnects under the same name -- so a harness that needs to
+   * assert "the dsh I just started is the one registered" matches on this.
+   */
+  instanceId?: string
 }
 
 // Plugin metadata
@@ -175,6 +182,7 @@ export function apply(ctx: Context, config: Config) {
     ws.send(JSON.stringify({
       type: 'heartbeat',
       sessions,
+      instanceId: config.instanceId,
     }))
   }
 

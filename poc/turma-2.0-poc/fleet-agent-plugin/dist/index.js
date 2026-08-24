@@ -72,6 +72,7 @@ export function apply(ctx, config) {
         ws.send(JSON.stringify({
             type: 'heartbeat',
             sessions,
+            instanceId: config.instanceId,
         }));
     }
     function getSessionStatus(session) {
