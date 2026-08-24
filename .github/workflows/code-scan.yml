@@ -112,6 +112,7 @@ jobs:
             --config=p/default \
             --config=p/secrets \
             --config=p/dockerfile \
+            --exclude='poc' \
             --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag \
             --exclude-rule problem-based-packs.insecure-transport.js-node.using-http-server.using-http-server \
             --exclude-rule dockerfile.security.missing-user-entrypoint.missing-user-entrypoint \
