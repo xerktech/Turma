@@ -47,8 +47,11 @@ function makeEl() {
 // default, which is "All orgs".
 let orgFilter = (agents) => agents;
 
-function loadHelpers() {
+function loadHelpers(fetchReply = null) {
   const els = {};
+  const sse = [];
+  const fetches = [];
+  const timers = [];
   const noop = () => {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
@@ -68,10 +71,23 @@ function loadHelpers() {
     },
     location: { href: "", search: "", pathname: "/usage" },
     navigator: { userAgent: "node" },
-    fetch: () => new Promise(() => {}),
-    EventSource: class { addEventListener() {} close() {} },
+    fetch: (u) => {
+      fetches.push(String(u));
+      return fetchReply
+        ? Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply()) })
+        : new Promise(() => {});
+    },
+    // Captures the page's SSE handlers so a test can deliver a real `removed`
+    // event — the fallback poll is skipped while the stream is healthy, so that
+    // handler is the only thing that keeps `retiredUsage` current.
+    EventSource: class {
+      constructor() { sse.push(this); this.handlers = {}; this.readyState = 1; }
+      addEventListener(name, fn) { this.handlers[name] = fn; }
+      close() {}
+    },
     setInterval: () => 0, clearInterval: noop,
-    setTimeout: () => 0, clearTimeout: noop,
+    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout: (id) => { if (id) timers[id - 1] = null; },
     requestAnimationFrame: () => 0, cancelAnimationFrame: noop,
     matchMedia: () => ({ matches: false, addEventListener: noop }),
     history: { replaceState: noop, pushState: noop },
@@ -91,10 +107,15 @@ function loadHelpers() {
     blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView,
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
-    hostLabel, hostSeries, repoSeries };`;
+    hostLabel, hostSeries, repoSeries,
+    applyAgent, connectSSE, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
-  return Object.assign(new Function(...keys, body)(...keys.map((k) => stubs[k])), { els });
+  const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
+  const runTimers = async () => {
+    for (const t of timers.splice(0).filter(Boolean)) await t.fn();
+  };
+  return Object.assign(api, { els, sse, fetches, timers, runTimers });
 }
 
 const H = loadHelpers();
@@ -1001,4 +1022,32 @@ test("the chart itself is drawn from the retired spend too", () => {
   // the axis happening to read 20.
   H.render({ agents: [agent("live", 5)] });
   assert.ok(!seen().includes("20"), "the axis must not read 20 without the retired host");
+});
+
+test("a retired host that comes back is not charted twice", () => {
+  // The hub stops serving it on `retiredUsage` the moment it beats again, but
+  // the SSE `agent` event does not carry that list — and the fallback poll is
+  // skipped entirely while the stream is healthy. A stale entry left in the
+  // cache charts and totals the same host live AND retired until a reload.
+  const H2 = loadHelpers();
+  H2.setCache({ now: Date.now(), agents: [], retiredUsage: [retiredHost("back", 7)] });
+  H2.applyAgent({ key: "back", device: "back", online: true, usage: hostUsage(7, 7, 7), repoUsage: [] });
+  assert.equal((H2.getCache().retiredUsage || []).length, 0);
+  assert.equal(H2.getCache().agents.length, 1);
+});
+
+test("a removal re-polls once, however many hosts the hub evicts", async () => {
+  // A removed host's spend MOVES to `retiredUsage`, which no SSE event carries —
+  // so this handler is the only thing that keeps the chart honest while the
+  // stream is healthy. But the hub emits one `removed` PER HOST inside its
+  // eviction loop, and /api/agents is its heaviest read.
+  const H2 = loadHelpers(() => ({ now: Date.now(), agents: [], retiredUsage: [] }));
+  await new Promise((r) => setImmediate(r));
+  H2.connectSSE();
+  H2.fetches.length = 0;
+  const es = H2.sse[H2.sse.length - 1];
+  for (const key of ["a", "b", "c"]) es.handlers.removed({ data: JSON.stringify({ key }) });
+  await H2.runTimers();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(H2.fetches.filter((u) => u === "/api/agents").length, 1);
 });

@@ -1367,6 +1367,13 @@ async function refresh() {
   } catch { /* keep last render */ }
   if (cache) render(cache);
 }
+// A background re-fetch, coalesced — see the `removed` handler below for why only
+// that event needs one, and why it must not be one fetch per event.
+let refetchTimer = null;
+function refetchSoon() {
+  if (refetchTimer) return;
+  refetchTimer = setTimeout(() => { refetchTimer = null; refresh(); }, 250);
+}
 renderViewbar();
 
 // ---- live push (FIX 1/#1): server-sent per-agent updates ---------------------
@@ -1384,6 +1391,14 @@ function applyAgent(rec) {
   const list = cache.agents || (cache.agents = []);
   const i = list.findIndex(a => a.key === rec.key);
   if (i >= 0) list[i] = rec; else list.push(rec);
+  // A host the hub had RETIRED is beating again, so the hub has already stopped
+  // serving it on `retiredUsage` (that list is "hosts the registry no longer
+  // has"). This event does not carry the list, and the poll that would is
+  // skipped while the stream is healthy — so a stale entry left here charts and
+  // totals that host's spend TWICE, live and retired, until the page reloads.
+  if (cache.retiredUsage && cache.retiredUsage.length) {
+    cache.retiredUsage = cache.retiredUsage.filter(r => r.key !== rec.key);
+  }
   cache.now = Date.now();
 }
 function connectSSE() {
@@ -1402,7 +1417,11 @@ function connectSSE() {
     // /api/agents and has no SSE event of its own (XERK-338) — so patching the
     // cache alone would drop its spend off the chart until the 30s poll, which
     // is SKIPPED while the stream is healthy. A removal is rare; re-poll for it.
-    refresh();
+    //
+    // Coalesced, because the hub emits one `removed` PER HOST inside its
+    // registry-eviction loop: an eviction sweep of K hosts would otherwise cost
+    // K full fetches of the hub's heaviest read, per open tab.
+    refetchSoon();
   });
   // An org's color pin changed (XERK-145): org.js owns the live map; patching
   // this page's cache keeps the next render's TurmaOrg.update(cache) from

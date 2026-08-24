@@ -200,3 +200,17 @@ CVE-2026-56865 exp:2026-10-17
 # how every chart in xerktech/ArgoCD is fetched. The expiry forces the revisit
 # once upstream ships a helm built against 2.6.2.
 CVE-2026-50163 exp:2026-10-24
+
+# CVE-2026-73566 — HIGH DoS in node-tar through 7.5.20: a crafted long-path tar
+# entry drives unbounded work (fixed in 7.5.21). Present ONLY in the npm bundled
+# inside the node base image
+# (/usr/local/lib/node_modules/npm/node_modules/tar), a transitive dep of npm
+# itself — the same carrier as the brace-expansion and ip-address entries above.
+# NPM_VERSION already pins npm ahead of the base image for exactly this, but
+# checked 2026-08-24 by unpacking the published tarballs: npm 11.18.0 (pinned)
+# and npm 12.0.2 (the newest release) BOTH vendor tar 7.5.19, so there is
+# nothing to bump to. Not first-party — the hub runs zero npm deps (node-core
+# only) and never invokes npm at runtime, so no tar is ever extracted in this
+# image. Revisit on the expiry: the first npm vendoring tar 7.5.21+ clears it
+# with an NPM_VERSION bump.
+CVE-2026-73566 exp:2026-10-24
