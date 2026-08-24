@@ -170,6 +170,22 @@ and conflating them was overclaiming.
       against a live `ctx.agents`. This is the biggest remaining gap in the
       PoC's evidence.
 
+## Known limitations
+
+- **The hub identifies an agent by DEVICE NAME, and holds one record per
+  name.** Two processes claiming one name share that record; the hub treats
+  whichever socket registered last as the agent and ignores the other. That is
+  why the harness asserts on a per-run `instanceId` rather than the name — a
+  name cannot say *which process* is connected.
+  - Consequence not yet fixed: when the holding socket closes, the record is
+    dropped even if another live socket for that name is still connected, and
+    that socket can never re-register without reconnecting first. Fixing it
+    means tracking a set of sockets per device and promoting one on close —
+    a registry design change, so it is deliberately not folded into the
+    harness work. Tracked as XERK-456.
+- **The hub is unauthenticated** and binds all interfaces. It is a prototype;
+  do not expose it.
+
 ## Validation Results (2026-08-24)
 
 All tests pass:

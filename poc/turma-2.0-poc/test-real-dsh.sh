@@ -191,7 +191,30 @@ cleanup() {
   done
   for pid in "$DSH_PID" "$HUB_PID"; do signal_job "$pid" KILL; done
 }
-trap cleanup EXIT INT TERM
+
+# Set once a verdict has been printed, so the exit hook can tell "finished
+# with a result" from "died on the way there".
+VERDICT=""
+
+on_exit() {
+  local rc=$?
+  cleanup
+  # Every non-zero exit must carry a verdict line. A step that aborts on its
+  # own -- two same-device runs colliding over the shared profile is the known
+  # case -- otherwise exits non-zero having printed neither PASS nor FAIL, so
+  # anything scanning for a verdict sees nothing at all.
+  if [ "$rc" -ne 0 ] && [ -z "$VERDICT" ]; then
+    echo
+    echo "=== FAIL ==="
+    echo "Aborted before reaching a verdict (exit $rc). The error is above."
+    echo "If another run is using device '$FLEET_DEVICE' right now, give this"
+    echo "one its own FLEET_DEVICE -- they share a profile directory."
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Does the hub currently list an agent whose instanceId is THIS run's?
 # Parsed as JSON rather than grepped -- a grep pattern built from a variable
@@ -341,6 +364,7 @@ done
 
 echo
 if [ -n "$REGISTERED" ]; then
+  VERDICT=1
   echo "=== PASS ==="
   echo "The dsh instance registered with the hub:"
   curl -s "http://localhost:$HUB_PORT/api/agents"
@@ -358,6 +382,7 @@ if [ -n "$REGISTERED" ]; then
   echo "Both are still running. Press Ctrl+C to stop."
   wait "$DSH_PID"
 else
+  VERDICT=1
   echo "=== FAIL ==="
   echo "No agent with this run's instanceId ($RUN_ID) appeared in /api/agents."
   echo "If '$FLEET_DEVICE' IS listed below, that is a DIFFERENT dsh process --"
