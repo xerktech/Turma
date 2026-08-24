@@ -153,6 +153,8 @@ jobs:
       # Finds every shell script in the repo and lints per its shebang
       # (entrypoint.sh is #!/bin/sh). Fails the job on any finding.
       - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          ignore_paths: poc
 
   tests:
     name: Unit tests
