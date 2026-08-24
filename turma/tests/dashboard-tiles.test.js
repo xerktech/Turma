@@ -363,3 +363,65 @@ test("dashboard: a LATER removal still re-fetches, after an earlier one settled"
   await settle();
   assert.equal(D.fetches.filter(u => u === "/api/agents").length, 2);
 });
+
+test("dashboard: a flush held by a mouse press does not swallow the click", async () => {
+  // `focusout` fires on MOUSEDOWN. A repaint scheduled there swaps #groups before
+  // mouseup, so the two land on different nodes and the browser dispatches no
+  // `click` at all — the operator presses Start, or Remove host, and nothing
+  // happens with no feedback. The repaint has to wait out the whole press.
+  const D = loadDashboard(undefined, () => ({ now: Date.now(), agents: [], retiredUsage: [retiredHost("gone", 900)] }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: [liveHost("gone", 900)], retiredUsage: [] });
+  D.render(D.getCache());
+
+  D.setActiveTagName("SELECT");
+  D.connectSSE();
+  const es = D.sse[D.sse.length - 1];
+  es.handlers.removed({ data: JSON.stringify({ key: "gone" }) });
+  await D.runTimers();
+  await settle();
+  assert.match(D.els.tiles.innerHTML, /1 \/ 1/, "skipped while the popup is open");
+
+  // The browser's own order for a click on a button elsewhere in #groups.
+  D.fire("pointerdown");
+  D.setActiveTagName(null);
+  D.fire("focusout");
+  await D.runTimers();
+  assert.match(D.els.tiles.innerHTML, /1 \/ 1/, "held: the press is still down");
+
+  D.fire("pointerup");
+  D.fire("click");
+  assert.match(D.els.tiles.innerHTML, /1 \/ 1/,
+    "the tree the click lands on is the tree it was pressed on");
+
+  await D.runTimers();
+  await D.runTimers();
+  assert.match(D.els.tiles.innerHTML, /0 \/ 0/, "and only then does the repaint land");
+});
+
+test("dashboard: a flushed repaint disarms itself", async () => {
+  // Leaving the flag set makes every later focusout repaint the whole tree for
+  // nothing — and turns the click-swallow above from one-shot into permanent.
+  const D = loadDashboard(undefined, () => ({ now: Date.now(), agents: [], retiredUsage: [] }));
+  await settle();
+  D.setCache({ now: Date.now(), agents: [liveHost("a", 1)], retiredUsage: [] });
+  D.render(D.getCache());
+
+  D.setActiveTagName("SELECT");
+  D.connectSSE();
+  const es = D.sse[D.sse.length - 1];
+  es.handlers.agent({ data: JSON.stringify(liveHost("b", 1)) });
+  await D.runTimers();
+  D.setActiveTagName(null);
+  D.fire("focusout");
+  await D.runTimers();
+  await D.runTimers();
+  assert.match(D.els.tiles.innerHTML, /2 \/ 2/, "the skipped repaint landed");
+
+  // Nothing was skipped this time, so nothing may repaint.
+  D.setCache({ now: Date.now(), agents: [liveHost("a", 1), liveHost("b", 1), liveHost("c", 1)], retiredUsage: [] });
+  D.fire("focusout");
+  await D.runTimers();
+  await D.runTimers();
+  assert.match(D.els.tiles.innerHTML, /2 \/ 2/, "and the flag did not stay armed");
+});

@@ -1835,7 +1835,18 @@ async function refresh() {
 // fleet, or the rest are offline — the page kept painting hosts that no longer
 // exist, indefinitely. So the skip is remembered and flushed when the select is
 // done with, deferred a tick so `activeElement` has actually moved by then.
+//
+// The flush WAITS OUT A MOUSE INTERACTION, and that is the whole reason this is
+// not a bare `focusout` handler. `focusout` fires on MOUSEDOWN, so a repaint
+// scheduled there swaps `#groups` before mouseup: the two land on different
+// nodes, the browser dispatches NO `click` at all, and the button the operator
+// pressed does nothing at all with no feedback — every control in `#groups`, Start
+// and Remove host included. So a flush holds while a pointer is down, and resumes
+// one task AFTER `pointerup`, because `click` is dispatched in that same task.
+// `pointercancel` and `click` also clear the flag, so a lost `pointerup` (a
+// release outside the window) cannot strand every later flush.
 let bgSkipped = false;
+let pointerDown = false;
 function bgRender() {
   if (document.activeElement && document.activeElement.tagName === "SELECT") {
     bgSkipped = true;
@@ -1845,10 +1856,18 @@ function bgRender() {
   render(cache);
 }
 function flushSkippedRender() {
-  if (bgSkipped) setTimeout(bgRender, 0);
+  if (!bgSkipped || pointerDown) return;
+  setTimeout(bgRender, 0);
 }
+function endPointer() {
+  pointerDown = false;
+  setTimeout(flushSkippedRender, 0);
+}
+document.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+document.addEventListener("pointerup", endPointer, true);
+document.addEventListener("pointercancel", endPointer, true);
+document.addEventListener("click", endPointer, true);
 document.addEventListener("focusout", flushSkippedRender);
-document.addEventListener("change", flushSkippedRender);
 
 // A background re-fetch, coalesced. Only `removed` needs one — it is the single
 // event that moves spend between `agents` and `retiredUsage`, and just that one
