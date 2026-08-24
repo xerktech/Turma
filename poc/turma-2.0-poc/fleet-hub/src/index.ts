@@ -14,6 +14,12 @@ interface AgentInfo {
   ws: WebSocket
   sessions: SessionInfo[]
   lastHeartbeat: number
+  /**
+   * Per-process identity reported by the agent. A device name is reusable --
+   * an abandoned agent reconnects under the same one -- so this is what tells
+   * two processes claiming the same device apart.
+   */
+  instanceId?: string
 }
 
 interface SessionInfo {
@@ -51,6 +57,7 @@ function getFleetState() {
       device: info.device,
       sessions: info.sessions,
       online: Date.now() - info.lastHeartbeat < 30000,
+      ...(info.instanceId === undefined ? {} : { instanceId: info.instanceId }),
     })),
   }
 }
@@ -97,13 +104,21 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString())
-        handleAgentMessage(device, msg)
+        handleAgentMessage(device, ws, msg)
       } catch (e) {
         console.error('Invalid agent message:', e)
       }
     })
 
     ws.on('close', () => {
+      // The registry is keyed by device NAME, so two processes claiming one
+      // name share a record. Only retract the registration if THIS socket is
+      // still the one holding it -- otherwise an abandoned agent closing
+      // deletes the live agent that replaced it.
+      if (agents.get(device)?.ws !== ws) {
+        console.log(`Stale agent socket closed: ${device} (registration retained)`)
+        return
+      }
       console.log(`Agent disconnected: ${device}`)
       agents.delete(device)
       broadcastToDashboard(getFleetState())
@@ -111,15 +126,23 @@ wss.on('connection', (ws, req) => {
   }
 })
 
-// Handle messages from agents
-function handleAgentMessage(device: string, msg: { type: string; [key: string]: unknown }) {
+// Handle messages from agents.
+//
+// `ws` is the socket the message arrived on. Two processes can claim one
+// device name, and only the one holding the record is the registered agent --
+// commands route to ITS socket. Accepting state from a non-holder let an
+// abandoned agent keep the record's identity current while every command went
+// to the other process, so what the record says and what it does disagreed.
+function handleAgentMessage(device: string, ws: WebSocket, msg: { type: string; [key: string]: unknown }) {
   const agent = agents.get(device)
   if (!agent) return
+  if (agent.ws !== ws) return
 
   switch (msg.type) {
     case 'heartbeat':
       agent.lastHeartbeat = Date.now()
       agent.sessions = (msg.sessions as SessionInfo[]) || []
+      if (typeof msg.instanceId === 'string') agent.instanceId = msg.instanceId
       broadcastToDashboard(getFleetState())
       break
 
@@ -160,7 +183,7 @@ function handleAgentMessage(device: string, msg: { type: string; [key: string]: 
 function handleDashboardMessage(ws: WebSocket, msg: { type: string; [key: string]: unknown }) {
   switch (msg.type) {
     case 'spawn': {
-      const { device, repo, prompt } = msg as { device: string; repo?: string; prompt?: string }
+      const { device, repo, prompt } = msg as unknown as { device: string; repo?: string; prompt?: string }
       const agent = agents.get(device)
       if (!agent || agent.ws.readyState !== WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'error', message: `Agent ${device} not available` }))
@@ -173,7 +196,7 @@ function handleDashboardMessage(ws: WebSocket, msg: { type: string; [key: string
     }
 
     case 'input': {
-      const { device, sessionId, message } = msg as { device: string; sessionId: string; message: string }
+      const { device, sessionId, message } = msg as unknown as { device: string; sessionId: string; message: string }
       const agent = agents.get(device)
       if (!agent || agent.ws.readyState !== WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'error', message: `Agent ${device} not available` }))
@@ -184,7 +207,7 @@ function handleDashboardMessage(ws: WebSocket, msg: { type: string; [key: string
     }
 
     case 'kill': {
-      const { device, sessionId } = msg as { device: string; sessionId: string }
+      const { device, sessionId } = msg as unknown as { device: string; sessionId: string }
       const agent = agents.get(device)
       if (!agent || agent.ws.readyState !== WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'error', message: `Agent ${device} not available` }))

@@ -1,0 +1,11 @@
+node_modules/
+
+# Throwaway dsh profile created by test-real-dsh.sh
+.dsh-test-home/
+
+# Plugin tarballs produced by `npm pack`
+*.tgz
+
+# package-lock.json is deliberately NOT ignored: without it a clean checkout
+# re-resolves ~460 packages (13 minutes here), and the floating dsh
+# ^0.1.1-rc.2 range would silently change what the PoC is testing.

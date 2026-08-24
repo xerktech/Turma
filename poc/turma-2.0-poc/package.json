@@ -5,7 +5,10 @@
   "description": "Proof of concept for Turma 2.0 multi-host dsh architecture",
   "scripts": {
     "hub": "cd fleet-hub && npm run dev",
-    "test": "npx tsx test-standalone.ts",
+    "test": "./test-real-dsh.sh --once",
+    "test:mock": "npm exec -- tsx test-standalone.ts",
+    "test:mock-multi": "npm exec -- tsx test-multi-host.ts",
+    "typecheck": "cd fleet-hub && npm exec -- tsc --noEmit -p . && cd ../fleet-agent-plugin && npm exec -- tsc --noEmit -p .",
     "setup": "cd fleet-hub && npm install && cd ../fleet-agent-plugin && npm install"
   },
   "devDependencies": {

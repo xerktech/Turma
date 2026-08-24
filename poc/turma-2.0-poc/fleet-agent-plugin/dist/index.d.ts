@@ -96,6 +96,20 @@ interface UserMessage {
 export interface Config {
     hubUrl: string;
     device: string;
+    /**
+     * Opaque per-process identity, echoed back by the hub on /api/agents.
+     * A device NAME cannot prove which process is connected -- an abandoned
+     * instance reconnects under the same name -- so a harness that needs to
+     * assert "the dsh I just started is the one registered" matches on this.
+     *
+     * Prefer the TURMA_FLEET_INSTANCE_ID environment variable (read below).
+     * Setting it HERE is unsafe for that purpose: this file is a dsh config,
+     * dsh hot-reloads config, and every dsh sharing the DSH_HOME reads the same
+     * one -- so an abandoned instance adopts whatever id is written here and
+     * reports it as its own. An environment variable is fixed per process at
+     * exec time and cannot be adopted by an already-running one.
+     */
+    instanceId?: string;
 }
 export declare const name = "turma-fleet-agent";
 export declare const inject: string[];

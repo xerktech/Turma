@@ -97,6 +97,20 @@ interface UserMessage {
 export interface Config {
   hubUrl: string
   device: string
+  /**
+   * Opaque per-process identity, echoed back by the hub on /api/agents.
+   * A device NAME cannot prove which process is connected -- an abandoned
+   * instance reconnects under the same name -- so a harness that needs to
+   * assert "the dsh I just started is the one registered" matches on this.
+   *
+   * Prefer the TURMA_FLEET_INSTANCE_ID environment variable (read below).
+   * Setting it HERE is unsafe for that purpose: this file is a dsh config,
+   * dsh hot-reloads config, and every dsh sharing the DSH_HOME reads the same
+   * one -- so an abandoned instance adopts whatever id is written here and
+   * reports it as its own. An environment variable is fixed per process at
+   * exec time and cannot be adopted by an already-running one.
+   */
+  instanceId?: string
 }
 
 // Plugin metadata
@@ -105,6 +119,10 @@ export const inject = ['sessions', 'agents']
 
 // Plugin entry point
 export function apply(ctx: Context, config: Config) {
+  // Env wins over config: it is per-process, so a second dsh sharing this
+  // DSH_HOME cannot pick it up on a config hot-reload. See Config.instanceId.
+  const instanceId = process.env.TURMA_FLEET_INSTANCE_ID || config.instanceId
+
   let ws: WebSocket | null = null
   let reconnectTimer: NodeJS.Timeout | null = null
   let heartbeatTimer: NodeJS.Timeout | null = null
@@ -175,6 +193,7 @@ export function apply(ctx: Context, config: Config) {
     ws.send(JSON.stringify({
       type: 'heartbeat',
       sessions,
+      instanceId,
     }))
   }
 

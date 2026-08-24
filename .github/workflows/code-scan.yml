@@ -40,6 +40,15 @@ on:
       # bench/ was covered only when some OTHER component's PR happened to
       # trigger this workflow — a bench-only PR ran zero SAST over its Python.
       - "bench/**"
+      # And again for poc/. ShellCheck lints every shell script in the repo and
+      # Semgrep scans the whole tree, so a poc-only PR ran zero checks over
+      # files that every OTHER component's PR is then judged against: #484
+      # landed a poc script with SC2064 and a poc dashboard hardcoding an
+      # insecure WebSocket scheme, which turned three of five blocking gates
+      # red on main itself until aca5eb9 cleaned them up. Gate the PR that
+      # introduces them. (Spelling that scheme out literally here trips the
+      # very rule this paragraph is about — Semgrep reads comments too.)
+      - "poc/**"
       # Every workflow, not just this one: Semgrep's shell-injection rules read
       # the workflows themselves, so scoping this to code-scan.yml meant a
       # `run:` step interpolating ${{ }} could land in any OTHER workflow

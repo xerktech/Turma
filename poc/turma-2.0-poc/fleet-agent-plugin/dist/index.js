@@ -10,6 +10,9 @@ export const name = 'turma-fleet-agent';
 export const inject = ['sessions', 'agents'];
 // Plugin entry point
 export function apply(ctx, config) {
+    // Env wins over config: it is per-process, so a second dsh sharing this
+    // DSH_HOME cannot pick it up on a config hot-reload. See Config.instanceId.
+    const instanceId = process.env.TURMA_FLEET_INSTANCE_ID || config.instanceId;
     let ws = null;
     let reconnectTimer = null;
     let heartbeatTimer = null;
@@ -72,6 +75,7 @@ export function apply(ctx, config) {
         ws.send(JSON.stringify({
             type: 'heartbeat',
             sessions,
+            instanceId,
         }));
     }
     function getSessionStatus(session) {
