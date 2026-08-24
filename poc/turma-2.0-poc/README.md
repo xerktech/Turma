@@ -120,8 +120,46 @@ fleet-agent-plugin/
 
 ## Success Criteria
 
-- [ ] Two dsh instances connect to one hub
-- [ ] Dashboard shows all hosts and their sessions
-- [ ] Can spawn session on specific host from dashboard
-- [ ] Can send input to any session from dashboard
-- [ ] Session events stream to dashboard in real-time
+- [x] Multiple workers connect to one hub
+- [x] Dashboard shows all hosts and their sessions
+- [x] Can spawn session on specific host from dashboard
+- [x] Can send input to any session from dashboard
+- [x] Session events stream to dashboard in real-time
+
+## Validation Results (2026-08-24)
+
+All tests pass:
+
+```
+============================================================
+Turma 2.0 Multi-Host Federation Test
+============================================================
+
+Test 1: Connect multiple workers to hub
+✓ 3 agents connected (truenas-1, truenas-2, k8x)
+
+Test 2: Spawn sessions on different workers
+✓ 3 sessions created across 3 workers
+
+Test 3: Verify event streaming to dashboard
+✓ 54 events received from all workers
+  Event types: session/created, user/message, assistant/chunk,
+               turn/start, request/header, assistant/message, turn/end
+
+Test 4: Route input to specific worker
+✓ Input routed to k8x, received 16 new events
+  ✓ User message event received
+  ✓ Assistant message event received
+
+============================================================
+VALIDATION COMPLETE
+============================================================
+
+Proven capabilities:
+  ✓ Multiple workers can connect to single hub
+  ✓ Sessions from all workers visible in one dashboard
+  ✓ Session events stream from workers to dashboard
+  ✓ Commands can be routed to specific workers
+```
+
+This validates the Coordinator Pattern for multi-host dsh federation.
