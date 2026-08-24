@@ -1,7 +1,10 @@
 ---
 paths:
   - "turma/archive.js"
+  - "turma/tar.js"
   - "turma/tests/archive*.test.js"
+  - "turma/tests/restore.test.js"
+  - "turma/tests/tar.test.js"
 ---
 
 # The hub's durable archive (`turma/archive.js`)
@@ -217,3 +220,94 @@ what it ships, what bounds one delta, and when it sheds — is in `.claude/rules
   after a rebuild had read every one of them into memory. Tests: `__walkJsonl` is exported so the
   SKIP is pinned rather than that backstop.
 - Tests: `archive.test.js`, `archive-budget.test.js`, `server.test.js`.
+
+## Restoring an archived session onto another agent (XERK-441)
+
+`POST /api/archive/<transcriptId>/restore {host}` resumes an ENDED session on a live host. It is the
+reason the raw layer exists in a form nothing else reads: the rendered entries are a display copy
+(`{uuid, role, ts, text}`) and `claude --resume` cannot read them.
+
+- **The agent side is UNCHANGED, and must stay that way.** The hub writes the bundle
+  `_pack_transcript` would have written and queues the same `importSession`, so the download,
+  unpack, worktree re-creation and resume are the code that already moves a LIVE session. Anything
+  that makes a restore need its own agent command has gone wrong: the value here is that the risky
+  half is already proven by every migration.
+- **The layout is the contract**: members are session-relative — `<id>.jsonl` at the top, then
+  `<id>/subagents/…`, `<id>/workflows/…` — because the target unpacks straight into
+  `PROJECTS_ROOT/<slug>/`. The raw layer already stores each file under exactly that name, so the
+  two ends meet with no translation; a restore is a copy, not a conversion.
+- **A restore IS a migration record with no `srcHost`.** Nothing to export from and nothing to kill
+  on handoff (`advanceMigrations` skips the kill when the source host is absent), so it starts in
+  `exporting` — meaning "the hub is packing" — and flips to `importing` when the spool file is
+  written. Every phase, timeout, refusal and follow-the-spawn path then works unchanged, on both the
+  hub and the page. `restore: true` on the wire is what lets a client word it as a restore rather
+  than as a move from nowhere.
+- **Packing is async and off the request.** A bundle is tens of MiB read off `/data`, and the hub
+  serves every other client on one loop. The record may be failed or swept mid-pack, so the
+  completion re-checks the phase before queueing anything — the same race the relay upload settles.
+- **`turma/tar.js` streams; it must never buffer a bundle.** The hub runs at `mem_limit: 256m`, so a
+  bundle built in memory is a fraction of the container per concurrent restore. It writes plain
+  ustar — deliberately NOT the GNU/PAX long-name extension — and REPORTS what it could not name or
+  could not read in full rather than truncating a name (which would put one session's bytes under
+  another's path) or silently shipping a short file.
+- **`packGzipTar` creates the spool dir itself.** `MIGRATE_SPOOL_DIR` is otherwise made only by
+  `spoolRawBody`, on the migration-UPLOAD path, and `sweepMigrationSpool` tolerates its absence — so
+  a hub that has never relayed a live move (a fresh deploy, a recreated volume, or exactly the
+  one-agent fleet this feature exists for) failed EVERY restore with an ENOENT the operator was
+  shown as a corrupt archive. Do not let a test create that directory: `restore.test.js` names a
+  path that does not exist, which is the only thing keeping the check honest.
+- **Refusals are the product here**, not an afterthought: no raw copy, no recorded worktree, a
+  worktree that is not shaped like one, target offline, target lacking the repo, and the
+  conversation already running somewhere. That last one is the invariant — a restore PRESERVES the
+  transcript id, so two live sessions on one transcript would be two claudes appending to one file
+  and a `_session_transcript_path` that cannot say whose it is.
+  - **It is re-checked EVERY TICK, not just at admission** (`advanceMigrations`, restores only).
+    The importing window is up to `MIGRATE_TIMEOUT_MS`, long enough for the archived host to come
+    back beating that conversation as running; finishing anyway is the thing the admission check
+    exists to prevent. The TARGET is skipped — its own imported session is the success case, and
+    it does not always carry the minted `importCmdId` that the handoff matches on.
+  - **Only ONLINE hosts get a veto, at BOTH the admission check and the tick.** A host that died
+    with the session running keeps `status: "running"` for `PRUNE_AFTER_MS` (seven days), so gating
+    on it refused the restore naming a host the operator cannot kill it on — on exactly the
+    population this feature exists for. Fixing only admission is worse than not fixing it: the
+    restore is admitted, spends a slot and a pack, and the same dead host kills it one tick later
+    with an error claiming it "came back up".
+  - The re-check skips **the migration's own session** (`spawnCmdId === importCmdId`), NEVER the
+    whole target host: `import_session` downloads and unpacks BEFORE `_resume_at_cwd` refuses, so a
+    conversation resumed locally on the target between admission and its next beat gets the archived
+    bytes written over it. Skipping the host left the one machine that actually unpacks unchecked.
+- **The recorded worktree is checked against what the ROW says, never guessed from the path.** The
+  hub does not know a target's REPOS_ROOT — hosts mount it at different paths on purpose — so the
+  check accepts each shape `_resumable_cwd_class` does: a `.turma/worktrees/<repo>/<dir>` tail (the
+  only mount-independent one), a ROOT session identified by `repo === "(root)"`, and a repo dir whose
+  last segment is the row's repo. Requiring the tail made every ROOT session permanently
+  unrestorable, and the agent supports them, so nothing but the hub was refusing.
+  - **`repo == "(root)"` does NOT mean "root session".** It is also the agent's catch-all bucket for
+    any cwd it could not attribute to a repo, so most rows carrying it record a
+    `~/.claude/projects/<slug>` TRANSCRIPT STORE rather than a working directory — 1228 of the 1262
+    restorable `(root)` rows measured on the production hub, against 34 with a real repos-root path.
+    Those are refused explicitly: no agent can resume one, and admitting them spends a slot, a pack
+    and a spool file to learn what the path already said. Measured on the production hub: 2678 rows,
+    1537 with a raw conversation, of which **291 are restorable** and 1246 are transcript stores.
+    Don't restate the admitted count as the recoverable one.
+  - **The page hides the control on a row the route would refuse** (`restorableRow` in
+    `sessions.html`, mirroring the first two refusals), because a working-looking picker that always
+    409s is a worse failure than no picker. That is why `getTranscript` carries `worktree`.
+  - A `..` component is never legitimate, and is pinned on its own: every other case in the shape
+    matrix fails for a different reason, so removing the guard changed no test.
+  - Anything else the agent refuses anyway, with a reason that reaches the operator (XERK-265), so
+    the check only saves an in-flight slot and a spool file.
+- **An INCOMPLETE bundle is on the record, never only in the log** (`m.incomplete`, capped at
+  `INCOMPLETE_NAMES_MAX` names since it rides `/api/agents` and every SSE frame). The archive's
+  `safeRawRel` accepts 255 bytes per component and ustar carries 100 + a 155 prefix, so a long
+  basename is nameable in the archive and not in the tar — and a restore that drops a subagent
+  transcript while reporting `done` tells the operator they have their session back when part of it
+  is gone. **The conversation itself is never merely reported**: `<id>.jsonl` skipped or short FAILS
+  the restore, because an empty or NUL-padded transcript is one `claude --resume` presents as the
+  operator's own history.
+- **Not org-scoped, unlike a move.** `/migrate` compares the two AGENTS' orgs; an archived session
+  has no agent left to compare against, and the archive is hub-wide and already readable by whoever
+  is logged in. Do not "fix" this by inventing an org for the archive row.
+- Tests: `turma/tests/restore.test.js` (route + refusals + the bundle's bytes),
+  `turma/tests/tar.test.js` (the format, read back with python's `tarfile`),
+  the Restore cases in `turma/tests/sessions.test.js`.

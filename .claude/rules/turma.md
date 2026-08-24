@@ -165,6 +165,32 @@ hub half.
   `lastActivity`.
 - A hub without FCM banners "mobile push is off" (`#pushWarn`) on `pushEnabled === false` — strict,
   so an older hub never false-alarms.
+- **A live-update event carries the agent record, never `retiredUsage`** (XERK-338), and both this
+  page and `/usage` skip the fallback poll entirely while SSE is healthy — so the cached retired
+  list is whatever the page LOADED with unless the event handlers maintain it. Two do:
+  - `removed` **re-fetches**: removing a host MOVES its spend from `agents` to `retiredUsage`, so
+    patching `agents` alone drops everything that host ever spent off the token tiles — the exact
+    disappearance the tiles were fixed to stop, on a longer clock.
+  - `applyAgent` **drops that key from the cached `retiredUsage`**: a retired host beating again is
+    already off the hub's list, and a stale entry charts and totals it twice, live and retired.
+  - Coalesced, both pages: the hub emits one `removed` PER HOST inside its registry-eviction loop,
+    so one fetch per event multiplies the hub's heaviest read by the eviction size, per open tab.
+  - Tests: the live-update cases in `dashboard-tiles.test.js`, `usage.test.js`.
+- **A background repaint the `<select>` guard skips is RE-ARMED** (`bgRender` + `flushSkippedRender`
+  on `focusout`, deferred a tick so `activeElement` has moved). The guard exists because a
+  full `#groups` swap closes a native popup mid-selection, and it used to rest on "the next render
+  will show it" — but the fallback poll returns early while SSE is healthy and `bgRender` is
+  otherwise only re-entered by the next BEAT, so when the hosts that were removed WERE the fleet
+  there is no next beat and the page paints hosts that no longer exist for as long as the tab is
+  open. Any new background update must go through `bgRender`, never `render`.
+  - **The flush WAITS OUT A MOUSE PRESS** (`pointerDown`, released on `pointerup`/`pointercancel`/
+    `click`, each deferred a task so the `click` dispatched alongside `pointerup` lands first).
+    `focusout` fires on MOUSEDOWN, so flushing there swaps `#groups` before mouseup, the two land on
+    different nodes and the browser dispatches NO `click` at all — every control in `#groups`, Start
+    and Remove host included, silently ignoring the operator's first press. Three release paths, so
+    a `pointerup` lost outside the window cannot strand every later flush.
+  - Tests: the `<select>` cases in `dashboard-tiles.test.js`, mutation-checked against dropping the
+    press hold and dropping `bgSkipped = false`.
 
 ### Per-repo controls
 

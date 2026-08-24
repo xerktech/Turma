@@ -268,10 +268,14 @@ fi
 echo "[1/5] Building the fleet-agent plugin..."
 echo "      (first run installs dependencies -- this can take 10+ minutes)"
 npm install
-( cd fleet-agent-plugin && npm install && npm run build && rm -f ./*.tgz && npm pack >/dev/null )
-TARBALL="$(cd fleet-agent-plugin && ls ./*.tgz | head -1)"
-TARBALL="$SCRIPT_DIR/fleet-agent-plugin/${TARBALL#./}"
-echo "      packed $(basename "$TARBALL")"
+( cd fleet-agent-plugin && npm install && npm run build && rm -f ./*.tgz )
+# Take the filename from `npm pack` itself rather than globbing the directory:
+# it prints exactly what it wrote, so there is no listing to parse and no
+# ambiguity if a stale tarball ever survives the rm above.
+TARBALL_NAME="$(cd fleet-agent-plugin && npm pack --silent | tail -1)"
+TARBALL="$SCRIPT_DIR/fleet-agent-plugin/$TARBALL_NAME"
+test -f "$TARBALL" || { echo "FAIL: npm pack did not produce $TARBALL"; exit 1; }
+echo "      packed $TARBALL_NAME"
 
 # ------------------------------------------------- 2. scaffold the profile
 echo "[2/5] Scaffolding a throwaway dsh profile..."

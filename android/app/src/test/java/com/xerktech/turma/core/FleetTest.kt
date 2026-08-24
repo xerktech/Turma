@@ -57,6 +57,60 @@ class FleetTest {
         assertEquals("opus-4-8, haiku-4-5", fleetTopModels(listOf(a, b)))
     }
 
+    // XERK-338 parity: `retiredUsage` is spend from a host the hub no longer has.
+    // The Usage screen has always counted it; the dashboard tiles did not, so
+    // removing one busy host erased most of the fleet's all-time tokens from this
+    // screen while /usage still charted them.
+    @Test fun `a removed host's spend still counts toward the fleet totals`() {
+        val live = agent("live", usage = UsageInfo(today = bucket(10), week = bucket(20), totals = bucket(100)))
+        val gone = agent("gone", online = false,
+            usage = UsageInfo(today = bucket(1), week = bucket(2), totals = bucket(900)))
+        val s = fleetSummary(listOf(live), listOf(gone))
+        assertEquals(11, s.tokensToday)
+        assertEquals(22, s.tokensWeek)
+        assertEquals(1000, s.tokensAllTime)
+        assertEquals(true, s.retiredCounted)
+    }
+
+    @Test fun `a retired entry is spend, never a host`() {
+        // It carries no sessions, repos or capacity, so counting one as a host
+        // invents a host that does not exist — an inflated "Hosts online", a
+        // session ceiling counting a box that is gone.
+        val live = agent("live", capacity = Capacity(maxSessions = 4))
+        val gone = agent("gone", online = false, usage = UsageInfo(totals = bucket(900)))
+        val s = fleetSummary(listOf(live), listOf(gone))
+        assertEquals(1, s.hostsTotal)
+        assertEquals(1, s.hostsOnline)
+        assertEquals(listOf("live"), s.devices)
+        assertEquals(4, s.maxSessions)
+    }
+
+    @Test fun `no retired usage leaves the tiles exactly as they were`() {
+        val live = agent("live", usage = UsageInfo(totals = bucket(100)))
+        val s = fleetSummary(listOf(live))
+        assertEquals(100, s.tokensAllTime)
+        assertEquals(false, s.retiredCounted)
+    }
+
+    // The wiring, not just the reducer: `fleetSummary` must pass the retired list
+    // to `fleetTopModels`. Asserting `fleetTopModels` directly leaves that edge
+    // unpinned — a mutant dropping it from the summary passed the whole suite.
+    @Test fun `the summary's top models count a removed host too`() {
+        val live = agent("live", usage = UsageInfo(models = listOf(
+            ModelUsage("claude-haiku-4-5", totals = bucket(10)))))
+        val gone = agent("gone", online = false, usage = UsageInfo(models = listOf(
+            ModelUsage("claude-opus-4-8-20260101", totals = bucket(100)))))
+        assertEquals("opus-4-8, haiku-4-5", fleetSummary(listOf(live), listOf(gone)).topModels)
+    }
+
+    @Test fun `top models count a removed host too`() {
+        val live = agent("live", usage = UsageInfo(models = listOf(
+            ModelUsage("claude-haiku-4-5", totals = bucket(10)))))
+        val gone = agent("gone", online = false, usage = UsageInfo(models = listOf(
+            ModelUsage("claude-opus-4-8-20260101", totals = bucket(100)))))
+        assertEquals("opus-4-8, haiku-4-5", fleetTopModels(listOf(live, gone)))
+    }
+
     @Test fun `top models is a dash when nothing reported`() {
         assertEquals("–", fleetTopModels(listOf(agent("h1"))))
     }
