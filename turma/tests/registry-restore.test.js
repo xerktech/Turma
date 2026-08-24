@@ -219,6 +219,7 @@ test("every field the restore coerces is reachable from the restore's own line",
                 capturedAt: 1_786_400_000, source: "statusline" },
       subscription: { key: "abc123", source: "login" },
       localModel: { available: true, model: "qwen", contextTokens: 128000 },
+      models: { available: ["opus", "sonnet"], defaultLabel: "Opus 5", at: "2026-08-01" },
     },
     junk: {
       key: "junk", device: "junk", lastSeen: Date.now(), repos: [],
@@ -234,6 +235,11 @@ test("every field the restore coerces is reachable from the restore's own line",
       limits: { fiveHour: { usedPct: "lots" }, capturedAt: "soon" },
       subscription: { key: 7, source: 9 },
       localModel: { available: "yes", contextTokens: "many" },
+      models: { available: "nope", defaultLabel: 5, at: [] },
+      // Over the 120-char wire cap, so `normalizeClones`' bound is REACHED at
+      // boot — it was a module const below the restore line, i.e. a second
+      // live instance of the same TDZ, and no fixture exercised the branch.
+      clones: [{ repo: "Turma", progress: "z".repeat(300) }],
     },
   }));
   // A successful restore logs its own "loaded N agents" line to stdout, so the

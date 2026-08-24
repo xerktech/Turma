@@ -2435,6 +2435,171 @@ test("http: an old agent's bare-string usage models are coerced on ingest", asyn
   assert.deepEqual(rec.usage.totals, legacy.totals);
 });
 
+test("http: a NON-ARRAY usage.models cannot blank the dashboard for everyone", async () => {
+  // The coercion above only ran when `models` was ALREADY an array, so an object
+  // rode through raw. The dashboard walks it with `for (const m of list || [])`,
+  // which throws on an object, and it builds tiles + host list in one pass — so
+  // one agent-authed beat left EVERY operator with nothing but the nav. Android
+  // types `models` (defaulted to empty, so absent is safe) and decodes the whole
+  // /api/agents array atomically, so the same beat empties every other host from
+  // every phone. Absent, not `[]`: absent is "can't tell you", `[]` asserts the
+  // host spent on no models.
+  // 0, false and "" matter: an all-truthy fixture let a `if (usage.models)`
+  // guard on the delete pass the whole suite, and all three are decode-fatal
+  // on Android (only an explicit null is survivable, via coerceInputValues).
+  for (const bad of [{ evil: { totals: { input: 5 } } }, "opus", 7, true, 0, false, ""]) {
+    assert.equal(
+      (await request("POST", "/api/heartbeat", {
+        body: {
+          device: "bad-models-host",
+          usage: { totals: { input: 1, output: 0, cacheWrite: 0, cacheRead: 0 }, models: bad },
+          repoUsage: [{ repo: "Turma", usage: { models: bad } }],
+          sessions: [{ id: "s1", repo: "Turma", status: "running", usage: { models: bad } }],
+        },
+        headers: agentHeaders,
+      })).status,
+      200
+    );
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const rec = res.body.agents.find((a) => a.key === "bad-models-host");
+    assert.equal("models" in rec.usage, false, `usage.models survived ${JSON.stringify(bad)}`);
+    assert.equal("models" in rec.repoUsage[0].usage, false);
+    assert.equal("models" in rec.sessions[0].usage, false);
+    // Everything else in the block still rides through.
+    assert.equal(rec.usage.totals.input, 1);
+  }
+});
+
+test("a dropped models block is TALLIED, not silently deleted", async () => {
+  // Before the coercion the failure was loud — the dashboard went blank. Silent
+  // deletion turns it into invisible data loss with nothing to alert on, while
+  // every sibling coercion in this file names what it dropped.
+  const warnings = [];
+  const realWarn = console.warn;
+  hub.resetUsageCoercionLog();
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    const rec = { device: "silent-host", usage: { models: { evil: 1 } } };
+    hub.normalizeRecord(rec);
+    assert.ok(!("models" in rec.usage), "dropped");
+    assert.equal(warnings.length, 1, "and said so");
+    assert.match(warnings[0], /silent-host/);
+    assert.match(warnings[0], /models/);
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+test("http: a malformed top-level models block cannot empty every phone's fleet", async () => {
+  // The same failure class as usage.models, one field up and a different shape.
+  // Android types `models` as `ModelsInfo?` and decodes /api/agents atomically,
+  // so one host beating a string here throws for the WHOLE array — every OTHER
+  // host vanishes from the fleet list while the tile still says "N / N online".
+  // The web guards this one, so it fails on the client that fails silently.
+  for (const bad of ["x", 5, [1, 2], true, 0, "", { available: "x" }, { available: [1, 2] }]) {
+    assert.equal(
+      (await request("POST", "/api/heartbeat", {
+        body: { device: "bad-topmodels-host", models: bad },
+        headers: agentHeaders,
+      })).status,
+      200
+    );
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    const rec = res.body.agents.find((a) => a.key === "bad-topmodels-host");
+    const m = rec.models;
+    if (m === undefined) continue;            // dropped outright — fine
+    assert.equal(typeof m, "object", `models stayed ${JSON.stringify(bad)}`);
+    assert.ok(Array.isArray(m.available), `available stayed ${JSON.stringify(bad)}`);
+    assert.ok(m.available.every((x) => typeof x === "string"));
+    assert.equal(typeof m.defaultLabel, "string");
+    assert.equal(typeof m.at, "string");
+  }
+});
+
+test("a models block that is ABSENT, or has nothing usable, stays absent", async () => {
+  // Absent is the property the coercion sells: it is what the ticket model picker
+  // reads as "this agent can't tell you" and falls back to the static aliases for.
+  // A REBUILT empty block is worse than nothing — it passes board.js's
+  // `Array.isArray(mb.available)` gate, joins the freshest-probe compare, and can
+  // take the default label off a host that probed properly. `Board.kt` compares
+  // the same way.
+  const absent = { device: "no-models-host" };
+  hub.normalizeRecord(absent);
+  assert.equal("models" in absent, false, "a host that sent none must not be given one");
+
+  for (const junk of [{}, { available: [] }, { available: [1, 2, null] },
+                      { available: "nope", defaultLabel: 5, at: [] }, [1, 2], "x", 0, false, "",
+                      // The survivors of an all-fields guard: a block whose only
+                      // usable value is `at` or `defaultLabel` is still empty
+                      // where it counts, and a fresh `at` is exactly what wins
+                      // the freshest-probe compare and clears a real host's
+                      // default label.
+                      { available: "nope", at: "2099-01-01" },
+                      { available: [], defaultLabel: "Opus 5" },
+                      { at: "2099-01-01", defaultLabel: "Opus 5" }]) {
+    const rec = { device: "junk-models-host", models: junk };
+    hub.normalizeRecord(rec);
+    assert.equal("models" in rec, false, `rebuilt an empty block from ${JSON.stringify(junk)}`);
+  }
+});
+
+test("a models block's entries are DROPPED when unusable, never stringified", async () => {
+  // A coerced `5` becomes the model name "5", which names a model that does not
+  // exist — the picker would offer it and the spawn would fail. And each name is
+  // length-bounded, not just the list: 100 entries of 70 KiB is a 7 MiB block on
+  // /api/agents and on every SSE frame, which a count cap alone waves through.
+  const rec = { device: "mixed-models-host",
+                models: { available: ["opus", 5, null, "", { m: 1 }, "z".repeat(500)] } };
+  hub.normalizeRecord(rec);
+  assert.deepEqual(rec.models.available, ["opus", "z".repeat(120)]);
+});
+
+test("a models block that was absent does not warn about lost tokens", async () => {
+  // `models` carries no tokens, so it must never reach the usage tally — a line
+  // saying this host's "token figures understate what it really spent" would be
+  // a lie, and at one per beat it buries the hosts genuinely sending bad shapes.
+  const warnings = [];
+  const realWarn = console.warn;
+  hub.resetUsageCoercionLog();
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    hub.normalizeRecord({ device: "quiet-models-host" });
+    hub.normalizeRecord({ device: "quiet-models-host2", models: { available: ["opus"] } });
+    hub.normalizeRecord({ device: "quiet-models-host3", models: "junk" });
+    // And a usage.models of explicit null is the agent's deliberate "nothing to
+    // report", exactly as a null usage block is.
+    hub.normalizeRecord({ device: "quiet-models-host4", usage: { models: null } });
+    assert.deepEqual(warnings, [], `nothing here spends tokens: ${warnings[0] || ""}`);
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+test("http: a good top-level models block rides through, bounded", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "good-topmodels-host",
+            models: { available: ["opus", "sonnet"], defaultLabel: "Opus", at: "2026-08-01" } },
+    headers: agentHeaders,
+  });
+  let res = await request("GET", "/api/agents", { headers: userHeaders });
+  let rec = res.body.agents.find((a) => a.key === "good-topmodels-host");
+  assert.deepEqual(rec.models, { available: ["opus", "sonnet"], defaultLabel: "Opus", at: "2026-08-01" });
+
+  // It rides /api/agents and every SSE frame, and every field of it is
+  // agent-asserted, so none of them may be unbounded.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "good-topmodels-host",
+            models: { available: Array.from({ length: 500 }, (_, i) => `m${i}`),
+                      defaultLabel: "z".repeat(5000), at: "z".repeat(5000) } },
+    headers: agentHeaders,
+  });
+  res = await request("GET", "/api/agents", { headers: userHeaders });
+  rec = res.body.agents.find((a) => a.key === "good-topmodels-host");
+  assert.equal(rec.models.available.length, 100);
+  assert.equal(rec.models.defaultLabel.length, 120);
+  assert.equal(rec.models.at.length, 120);
+});
+
 test("http: a current agent's per-model usage is left exactly as reported", async () => {
   const models = [{ model: "claude-opus-5", totals: { input: 3, output: 4, cacheWrite: 5, cacheRead: 6 },
                     today: { input: 1, output: 0, cacheWrite: 0, cacheRead: 0 },
@@ -12441,3 +12606,25 @@ test("the drift warning is rate-limited per host, and capped on both sides", () 
   }
 });
 
+
+test("a models block with no usable label cannot clear a real host's label", async () => {
+  // `mergeSites` (board.js, its vendored copies, and Board.kt) writes the label
+  // whenever `at` is at least the incumbent's, so a block with a FRESH `at` and an
+  // empty label takes "Opus 5" off a host that probed properly — the picker drops
+  // to "Default". A real agent reaches this honestly: the probe returns
+  // `label or None` when there is no "Current model:" line to read.
+  for (const bad of [{ available: ["Opus 5"], defaultLabel: 5, at: "2099-01-01" },
+                     { available: ["Opus 5"], defaultLabel: null, at: "2099-01-01" },
+                     { available: ["Opus 5"], at: "2099-01-01" }]) {
+    const rec = { device: "labelless-host", models: bad };
+    hub.normalizeRecord(rec);
+    assert.deepEqual(rec.models.available, ["Opus 5"], "the list it does know still rides");
+    assert.equal(rec.models.defaultLabel, "");
+    assert.equal(rec.models.at, "", `a labelless block kept its claim: ${JSON.stringify(bad)}`);
+  }
+  // A block that HAS a label keeps its date, or it could never win legitimately.
+  const good = { device: "real-host",
+                 models: { available: ["Opus 5"], defaultLabel: "Opus 5", at: "2026-01-01" } };
+  hub.normalizeRecord(good);
+  assert.equal(good.models.at, "2026-01-01");
+});

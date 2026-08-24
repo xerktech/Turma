@@ -2282,8 +2282,35 @@ function advanceMigrations() {
 // each of the three clients (none of which then needs a release to survive an
 // old host). A name-less entry is DROPPED — it can't be rendered or merged by
 // name, and carries no windows worth keeping.
-function normalizeModelUsage(usage) {
-  if (!usage || !Array.isArray(usage.models)) return;
+function normalizeModelUsage(usage, tally) {
+  if (!usage) return;
+  // A non-array `models` is DELETED, not left alone. Returning early here only
+  // held while `models` was untyped: `for (const m of list || [])` throws on an
+  // object, and the dashboard builds its whole body in one pass, so ONE host
+  // beating `"models": {...}` blanked the front page for EVERY operator — tiles,
+  // host list and all, nav only. Android types it (`List<ModelUsage>`, defaulted
+  // to empty), and a full /api/agents decode is atomic there, so the same beat
+  // empties every OTHER host from every phone's fleet.
+  //
+  // Absent rather than `[]`, matching the siblings: absent is what every client
+  // reads as "this agent can't tell you". The distinction is weak downstream —
+  // an ARRAY of junk still ends up `[]` below, and the ledger re-serves `[]` for
+  // any host with history — so this is consistency, not a guarantee to lean on.
+  //
+  // And it is TALLIED. Before this the failure was loud (a blank dashboard); a
+  // silent delete is invisible data loss with nothing to alert on, while every
+  // other coercion in this file says what it dropped.
+  if (!Array.isArray(usage.models)) {
+    if ("models" in usage) {
+      const deliberate = usage.models === null;
+      delete usage.models;
+      // A null is the agent saying "nothing to report", exactly as it is for the
+      // usage block itself two functions down — tallying it would warn that this
+      // host's "token figures understate what it really spent", which is false.
+      if (!deliberate) noteUsageCoercion(tally, "models");
+    }
+    return;
+  }
   usage.models = usage.models
     .map((m) => (typeof m === "string" ? { model: m } : m))
     .filter((m) => m && typeof m.model === "string" && m.model);
@@ -2414,7 +2441,7 @@ function normalizeUsageTokens(usage, tally) {
 
 // Every coercion a usage block needs, wherever one rides the heartbeat.
 function normalizeUsageBlock(usage, tally) {
-  normalizeModelUsage(usage);
+  normalizeModelUsage(usage, tally);
   normalizeSubagentUsage(usage);
   normalizeUsageTokens(usage, tally);
 }
@@ -3498,10 +3525,6 @@ const HEARTBEAT_MAX = BODY_INFLIGHT_MAX;
 // real task prompt; /api/trigger applies its own 10k cap on prompt alone.
 const SPAWN_FIELD_MAX = 100000;
 
-// One clone-progress line on the wire. The agent caps it too; this is the half
-// that does not trust the agent.
-const CLONE_PROGRESS_MAX = 120;
-
 // Top-level keys a heartbeat is known to carry — the agent's own payload plus
 // the on-demand `*Results` deliveries, which the handler extracts and deletes
 // from the payload itself before the spread. Anything else is bounded by
@@ -3789,6 +3812,7 @@ function normalizeRecord(a) {
   normalizeLimits(a);
   normalizeSubscription(a);
   normalizeLocalModel(a);
+  normalizeModels(a);
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
   normalizeJira(a);
@@ -3821,8 +3845,14 @@ function normalizeClones(a) {
     for (const k of ["repo", "name", "status", "error", "source", "startedAt", "progress"]) {
       if (k in c && typeof c[k] !== "string") delete c[k];
     }
-    if (typeof c.progress === "string" && c.progress.length > CLONE_PROGRESS_MAX) {
-      c.progress = c.progress.slice(0, CLONE_PROGRESS_MAX);
+    // 120 INLINE, not a module `const`: `normalizeClones` is reached from
+    // `loadState`'s restore loop near the top of this file, where a const
+    // declared below is in its TDZ — the ReferenceError lands in the restore's
+    // catch and the whole registry is emptied (XERK-301). One clone-progress
+    // line on the wire; the agent caps it too, this is the half that does not
+    // trust the agent.
+    if (typeof c.progress === "string" && c.progress.length > 120) {
+      c.progress = c.progress.slice(0, 120);
     }
   }
 }
@@ -3845,6 +3875,72 @@ function normalizeJira(a) {
   const j = a.jira;
   if (!j || typeof j !== "object" || Array.isArray(j)) return;
   if ("siteKey" in j && typeof j.siteKey !== "string") delete j.siteKey;
+}
+
+// The host login's own model list (`models`, XERK-33) — NOT the per-model usage
+// block above, which is a different field with a different shape. Android types
+// it (`ModelsInfo?`) and decodes /api/agents atomically, so one host beating
+// `models: "x"` — or a number, or an object whose `available` is a string —
+// throws for the WHOLE array and empties every other host from every phone's
+// fleet list, while the tile still reads "N / N online". The web guards this one
+// with Array.isArray, so it fails only on the client that fails silently.
+//
+// Unusable becomes ABSENT, and that means absent — never a rebuilt empty block.
+// An empty one passes `board.js`'s `Array.isArray(mb.available)` gate and joins
+// the freshest-probe compare, where it can take the DEFAULT LABEL off a host that
+// probed properly; absent is skipped there, and is what the ticket model picker
+// already reads as "this agent can't tell you", falling back to the static family
+// aliases. `Board.kt` has the identical compare.
+//
+// The bounds are INLINE LITERALS on purpose. `normalizeRecord` is reached from
+// `loadState`'s restore loop near the top of this file, which resolves these
+// functions only because declarations hoist — a module `const` below is in its
+// TDZ there, the ReferenceError lands in the restore's catch, and the WHOLE
+// registry is emptied, after which the save timer rewrites state.json from only
+// the hosts that have re-beaten. That is XERK-301, and shipping it again is what
+// the sibling normalizers inline their own bounds to avoid.
+function normalizeModels(payload) {
+  if (!payload || typeof payload !== "object") return;
+  if (!("models" in payload)) return;   // absent stays absent — never fabricated
+  const m = payload.models;
+  if (!m || typeof m !== "object" || Array.isArray(m)) {
+    delete payload.models;
+    return;
+  }
+  // Each NAME is bounded too, not just the count: 100 entries of 70 KiB is a
+  // 7 MiB block on /api/agents and on every SSE frame, which a count cap alone
+  // waves through. Capping one field of several is the XERK-348 mistake.
+  const available = Array.isArray(m.available)
+    ? m.available
+        .filter((x) => typeof x === "string" && x)   // DROPPED, never String()'d —
+        .slice(0, 100)                               // a coerced number is a model
+        .map((x) => x.slice(0, 120))                 // name that does not exist
+    : [];
+  const defaultLabel = typeof m.defaultLabel === "string" ? m.defaultLabel.slice(0, 120) : "";
+  // NO LABEL MEANS NO CLAIM ON THE LABEL. Both mirrors gate the label write on
+  // `at` being at least the incumbent's (`board.js` mergeSites and its Board.kt
+  // twin), so a block with a fresh `at` and an empty label wins that compare and
+  // CLEARS the label of a host that probed properly — the picker drops to
+  // "Default" from "Default (Opus 5)". A real agent reaches this honestly: the
+  // probe returns `label or None` when it finds no "Current model:" line.
+  //
+  // Blanking `at` loses that compare to any dated incumbent while the block still
+  // contributes its `available` entries, which is the whole of what it knows.
+  // Fixed HERE rather than in the compare because `mergeSites` is mirrored across
+  // board.js, its two vendored copies and Board.kt — one hub-side line beats a
+  // five-way change, and the hub is where the value is untrusted anyway.
+  const at = !defaultLabel ? "" : (typeof m.at === "string" ? m.at.slice(0, 120) : "");
+  // The LIST is what makes the block worth serving. A `defaultLabel` or an `at`
+  // with no usable `available` is still the rebuilt-empty block this function
+  // exists to avoid: it passes board.js's `Array.isArray(mb.available)` gate,
+  // joins the freshest-probe compare, and — with a newer `at` than a host that
+  // probed properly — takes that host's default label off the picker. Checking
+  // all three fields let `{available: "nope", at: "2099-01-01"}` do exactly that.
+  if (!available.length) {
+    delete payload.models;
+    return;
+  }
+  payload.models = { available, defaultLabel, at };
 }
 
 /**
@@ -9842,7 +9938,7 @@ if (process.env.TURMA_TEST) {
     normalizeRetired,
     normalizeJira,
     normalizeClones,
-    CLONE_PROGRESS_MAX,
+    CLONE_PROGRESS_MAX: 120,
     normalizeSpawnRefusals,
     // The KEY half of that pair, shared by the ingest and the restore for the
     // same anti-drift reason (XERK-269). `dropUnusableHostKeys` is exported
