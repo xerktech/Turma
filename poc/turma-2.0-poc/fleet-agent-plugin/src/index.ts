@@ -1,50 +1,96 @@
 /**
- * @turma/dsh-fleet-agent-poc
+ * @turma/dsh-fleet-agent
  *
- * PoC plugin that connects a dsh instance to the Turma Fleet Hub.
- * Demonstrates multi-host coordination via WebSocket.
+ * Real dsh plugin that connects a dsh instance to the Turma Fleet Hub.
+ * Streams session events to the hub and handles commands (spawn, input, kill).
  */
 
 import { WebSocket } from 'ws'
 
-// Cordis types (simplified for PoC)
+// Cordis Context types (from @deepseek-ai/cordis)
 interface Context {
-  sessions: {
-    list(): Session[]
+  sessions: SessionStore
+  agents: AgentRegistry
+  on(event: string, handler: (...args: unknown[]) => void, options?: { global?: boolean }): () => void
+  effect(fn: () => (() => void) | void, name?: string): void
+  logger: {
+    info(message: string): void
+    warn(message: string): void
+    error(message: string): void
   }
-  agents: {
-    create(opts: CreateAgentOpts): Promise<AgentHandle>
-    get(id: string): Agent | undefined
-  }
-  on(event: string, handler: (...args: unknown[]) => void): () => void
-  effect(fn: () => (() => void) | void): void
+}
+
+interface SessionStore {
+  list(): Session[]
+  get(id: string): Session | undefined
+  create(id?: string, options?: CreateSessionOptions): Session
+}
+
+interface CreateSessionOptions {
+  seed?: SessionEvent[]
+  meta?: SessionMeta
+}
+
+interface SessionMeta {
+  cwd?: string
+  createdAt?: number
+  parentSession?: string
+  origin?: { type: string; host?: string }
 }
 
 interface Session {
   id: string
-  header: { cwd?: string }
+  header: SessionHeader
+  events: SessionEvent[]
+  append(type: string, data: unknown): SessionEvent
+}
+
+interface SessionHeader {
+  id: string
+  cwd?: string
+  createdAt: number
+  parentSession?: string
+  origin?: { type: string; host?: string }
+}
+
+interface SessionEvent {
+  type: string
+  seq: number
+  time: number
+  data: unknown
+}
+
+interface AgentRegistry {
+  get(id: string): Agent | undefined
+  resume(options: ResumeOptions): Promise<{ agent: Agent }>
+}
+
+interface ResumeOptions {
+  resumeSessionId?: string
+  cwd?: string
+  prompt?: string
+  agentOptions?: AgentOptions
+}
+
+interface AgentOptions {
+  instructions?: string
 }
 
 interface Agent {
   id: string
   session: Session
   status: 'running' | 'idle'
-  followup(message: UserMessage): void
-  cancel(): void
-}
-
-interface AgentHandle {
-  agent: Agent
-  dispose(): Promise<void>
-}
-
-interface CreateAgentOpts {
-  cwd?: string
-  prompt?: string
+  inbox: {
+    append(target: 'next-turn' | 'next-step', message: UserMessage): void
+  }
+  cancel(): Promise<void>
 }
 
 interface UserMessage {
-  content: string
+  id: string
+  role: 'user'
+  source: { kind: string; clientId?: string }
+  content: Array<{ type: 'text'; text: string }>
 }
 
 // Plugin configuration
@@ -54,7 +100,7 @@ export interface Config {
 }
 
 // Plugin metadata
-export const name = 'turma-fleet-agent-poc'
+export const name = 'turma-fleet-agent'
 export const inject = ['sessions', 'agents']
 
 // Plugin entry point
@@ -62,15 +108,16 @@ export function apply(ctx: Context, config: Config) {
   let ws: WebSocket | null = null
   let reconnectTimer: NodeJS.Timeout | null = null
   let heartbeatTimer: NodeJS.Timeout | null = null
+  const pendingCommands = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
 
   function connect() {
     const url = `${config.hubUrl}?device=${encodeURIComponent(config.device)}`
-    console.log(`[fleet] Connecting to hub: ${url}`)
+    ctx.logger.info(`[fleet] Connecting to hub: ${url}`)
 
     ws = new WebSocket(url)
 
     ws.on('open', () => {
-      console.log(`[fleet] Connected to hub as ${config.device}`)
+      ctx.logger.info(`[fleet] Connected to hub as ${config.device}`)
       startHeartbeat()
     })
 
@@ -79,18 +126,18 @@ export function apply(ctx: Context, config: Config) {
         const msg = JSON.parse(data.toString())
         handleHubMessage(msg)
       } catch (e) {
-        console.error('[fleet] Invalid message from hub:', e)
+        ctx.logger.error(`[fleet] Invalid message from hub: ${e}`)
       }
     })
 
     ws.on('close', () => {
-      console.log('[fleet] Disconnected from hub, reconnecting in 5s...')
+      ctx.logger.info('[fleet] Disconnected from hub, reconnecting in 5s...')
       stopHeartbeat()
       scheduleReconnect()
     })
 
     ws.on('error', (err) => {
-      console.error('[fleet] WebSocket error:', err.message)
+      ctx.logger.error(`[fleet] WebSocket error: ${err.message}`)
     })
   }
 
@@ -122,6 +169,7 @@ export function apply(ctx: Context, config: Config) {
       id: s.id,
       status: getSessionStatus(s),
       cwd: s.header.cwd,
+      eventCount: s.events.length,
     }))
 
     ws.send(JSON.stringify({
@@ -138,7 +186,7 @@ export function apply(ctx: Context, config: Config) {
   function handleHubMessage(msg: { type: string; [key: string]: unknown }) {
     switch (msg.type) {
       case 'spawn':
-        handleSpawn(msg as { type: string; cmdId: string; repo?: string; prompt?: string })
+        handleSpawn(msg as { type: string; cmdId: string; cwd?: string; prompt?: string })
         break
       case 'input':
         handleInput(msg as { type: string; sessionId: string; message: string })
@@ -147,19 +195,21 @@ export function apply(ctx: Context, config: Config) {
         handleKill(msg as { type: string; sessionId: string })
         break
       default:
-        console.log(`[fleet] Unknown message type: ${msg.type}`)
+        ctx.logger.info(`[fleet] Unknown message type: ${msg.type}`)
     }
   }
 
-  async function handleSpawn(msg: { cmdId: string; repo?: string; prompt?: string }) {
-    console.log(`[fleet] Spawn request: ${msg.cmdId}`)
+  async function handleSpawn(msg: { cmdId: string; cwd?: string; prompt?: string }) {
+    ctx.logger.info(`[fleet] Spawn request: ${msg.cmdId}`)
     try {
-      const handle = await ctx.agents.create({
-        cwd: msg.repo,
+      // Create or resume an agent
+      const result = await ctx.agents.resume({
+        cwd: msg.cwd,
         prompt: msg.prompt,
       })
-      sendCommandResult(msg.cmdId, { sessionId: handle.agent.id })
+      sendCommandResult(msg.cmdId, { sessionId: result.agent.id })
     } catch (e) {
+      ctx.logger.error(`[fleet] Spawn failed: ${e}`)
       sendCommandResult(msg.cmdId, null, String(e))
     }
   }
@@ -167,19 +217,27 @@ export function apply(ctx: Context, config: Config) {
   function handleInput(msg: { sessionId: string; message: string }) {
     const agent = ctx.agents.get(msg.sessionId)
     if (!agent) {
-      console.log(`[fleet] Session not found: ${msg.sessionId}`)
+      ctx.logger.warn(`[fleet] Session not found for input: ${msg.sessionId}`)
       return
     }
-    agent.followup({ content: msg.message })
+
+    // Queue user message to the agent's inbox
+    const userMessage: UserMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      source: { kind: 'fleet', clientId: config.device },
+      content: [{ type: 'text', text: msg.message }],
+    }
+    agent.inbox.append('next-turn', userMessage)
   }
 
-  function handleKill(msg: { sessionId: string }) {
+  async function handleKill(msg: { sessionId: string }) {
     const agent = ctx.agents.get(msg.sessionId)
     if (!agent) {
-      console.log(`[fleet] Session not found: ${msg.sessionId}`)
+      ctx.logger.warn(`[fleet] Session not found for kill: ${msg.sessionId}`)
       return
     }
-    agent.cancel()
+    await agent.cancel()
   }
 
   function sendCommandResult(cmdId: string, result: unknown, error?: string) {
@@ -192,29 +250,52 @@ export function apply(ctx: Context, config: Config) {
     }))
   }
 
-  // Forward session events to hub
-  ctx.on('session/event', (session: Session, event: unknown) => {
+  function sendSessionEvent(sessionId: string, event: SessionEvent) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({
       type: 'session-event',
       event: {
-        sessionId: session.id,
-        ...(event as object),
+        sessionId,
+        type: event.type,
+        seq: event.seq,
+        time: event.time,
+        data: event.data,
       },
     }))
-  })
+  }
+
+  // Forward session events to hub
+  ctx.on('session/event', (...args: unknown[]) => {
+    const session = args[0] as Session
+    const event = args[1] as SessionEvent
+    sendSessionEvent(session.id, event)
+  }, { global: true })
+
+  // Announce new sessions
+  ctx.on('session/created', (...args: unknown[]) => {
+    const session = args[0] as Session
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({
+      type: 'session-created',
+      session: {
+        id: session.id,
+        cwd: session.header.cwd,
+        createdAt: session.header.createdAt,
+      },
+    }))
+  }, { global: true })
 
   // Connect on plugin load
   connect()
 
   // Cleanup on plugin unload
   ctx.effect(() => () => {
-    console.log('[fleet] Plugin unloading, disconnecting...')
+    ctx.logger.info('[fleet] Plugin unloading, disconnecting...')
     if (reconnectTimer) clearTimeout(reconnectTimer)
     stopHeartbeat()
     if (ws) {
       ws.close()
       ws = null
     }
-  })
+  }, 'fleet-agent.cleanup')
 }

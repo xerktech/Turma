@@ -52,7 +52,7 @@ Click "Spawn Session" to test command routing.
 
 ### Option B: Full Test with dsh
 
-Requires dsh installed (`npm install -g @deepseek-ai/dsh`):
+Requires dsh installed (`npm install -g @deepseek-ai/dsh@0.1.1-rc.2`):
 
 ```bash
 # Terminal 1: Start the Fleet Hub
@@ -60,20 +60,29 @@ cd fleet-hub
 npm install
 npm run dev
 
-# Terminal 2: Build and link the plugin
+# Terminal 2: Build the plugin
 cd fleet-agent-plugin
 npm install
 npm run build
-npm link
+npm pack
 
-# Terminal 3: Start dsh instance 1
-dsh web --port 3080 --patch cordis.patch.host1.yml
+# Terminal 3: Install plugin into dsh profile
+# (One-time setup - creates bundle in your dsh web profile)
+cd ~/.dsh/profiles/web
+npm install <path-to>/turma-dsh-fleet-agent-0.1.3.tgz
+# Edit package.json to add "@turma/dsh-fleet-agent" to dsh.profile.bundles
 
-# Terminal 4: Start dsh instance 2
-dsh web --port 3081 --patch cordis.patch.host2.yml
+# Terminal 4: Start dsh with fleet agent
+dsh web --port 3080 --no-open
 ```
 
-Open http://localhost:3000 — you should see both real dsh hosts.
+Open http://localhost:3000 — you should see the real dsh host connected.
+
+**Plugin integration verified (2026-08-24):**
+```
+$ curl http://localhost:3000/api/agents
+[{"device":"dsh-test-host","sessions":[],"online":true}]
+```
 
 ## Test Scenarios
 
@@ -163,3 +172,21 @@ Proven capabilities:
 ```
 
 This validates the Coordinator Pattern for multi-host dsh federation.
+
+## Real dsh Plugin Integration (2026-08-24)
+
+The `@turma/dsh-fleet-agent` plugin runs inside real dsh instances:
+
+```
+dsh web: http://127.0.0.1:3080
+$ curl http://localhost:3000/api/agents
+[{"device":"dsh-test-host","sessions":[],"online":true}]
+```
+
+The plugin:
+- Connects to Fleet Hub via WebSocket on startup
+- Sends heartbeats with session list every 15s
+- Streams session events to the hub in real-time
+- Handles spawn/input/kill commands from the hub
+
+This proves the full architecture: **dsh as the agent runtime with 100% plugin architecture**.

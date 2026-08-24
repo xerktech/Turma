@@ -142,6 +142,17 @@ function handleAgentMessage(device: string, msg: { type: string; [key: string]: 
         error: msg.error,
       })
       break
+
+    case 'session-created':
+      // Forward session creation to dashboard
+      broadcastToDashboard({
+        type: 'session-created',
+        device,
+        session: msg.session,
+      })
+      // Trigger a state refresh for any waiting dashboards
+      broadcastToDashboard(getFleetState())
+      break
   }
 }
 

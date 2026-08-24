@@ -1,0 +1,8 @@
+# Insert fleet agent plugin at the end of the plugin list
+- insert: after-last
+  entries:
+    - id: turma-fleet-agent
+      name: file:./dist/index.js
+      config:
+        hubUrl: ws://localhost:3000/ws
+        device: dsh-test-host
