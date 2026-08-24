@@ -34,6 +34,7 @@ const zlib = require("zlib");
 // node:sqlite FTS index). See archive.js. Lazily opens its DB on first use, so
 // requiring it is cheap and side-effect-free.
 const archive = require("./archive.js");
+const tar = require("./tar.js");
 // Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
 // FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
 const push = require("./push.js");
@@ -1432,6 +1433,15 @@ const MIGRATE_SPOOL_DIR = process.env.MIGRATE_SPOOL_DIR || "/data/migrations";
 // best-effort with no retry, so refusing one strands a migration, while
 // refusing the operator's click just says "not right now" on the Move control.
 const MIGRATE_INFLIGHT_MAX = Number(process.env.MIGRATE_INFLIGHT_MAX) || 4;
+// How many names an incomplete restore lists on its record. It rides /api/agents
+// and every SSE frame, and the names come from the archive's raw layer — bounded
+// per name but not in COUNT, so a session with thousands of subagent files could
+// otherwise put every one of them on a payload a 256 MiB hub serves to every tab.
+const INCOMPLETE_NAMES_MAX = 20;
+// The agent's own name for the repos-root pseudo-repo (`ROOT_REPO_NAME` in
+// hub-agent.py). A root session's recorded cwd is the source host's REPOS_ROOT,
+// which carries no shape the hub can check, so the row's repo is what says so.
+const ROOT_REPO_NAME = "(root)";
 
 // The id `crypto.randomBytes(8).toString("hex")` produces in startMigration, and
 // the filename that makes — the second being the ONLY thing the boot sweep may
@@ -1495,9 +1505,16 @@ function sweepMigrationSpool() {
 function serializeMigration(m) {
   return {
     id: m.id, srcHost: m.srcHost, srcSessionId: m.srcSessionId,
+    // A restore from the archive (XERK-441) has no source session; the flag is
+    // what lets a client word it as one rather than as a move from nowhere.
+    restore: !!m.restore,
     targetHost: m.targetHost, siteKey: m.siteKey, repo: m.repo,
     transcriptId: m.transcriptId, phase: m.phase, error: m.error || null,
     importCmdId: m.importCmdId || null, targetSessionId: m.targetSessionId || null,
+    // Files the archive holds that the bundle could not carry (XERK-441). Absent
+    // on a complete restore, so a client can word a partial one as partial; the
+    // conversation is never among them, because that fails the restore outright.
+    incomplete: m.incomplete || null,
     at: m.at,
   };
 }
@@ -2009,6 +2026,145 @@ function startMigration(srcHost, s, targetHost) {
   return m;
 }
 
+// Restore an ARCHIVED session onto a live host (XERK-441).
+//
+// A migration relays a RUNNING session's transcript from the source agent. The
+// hub's own archive holds the same bytes for every session that ENDED — its raw
+// layer is a byte-for-byte copy of the session's own files (XERK-338) — so the
+// host being gone is not a reason its work is unreachable.
+//
+// The target half is unchanged: this writes the same bundle `_pack_transcript`
+// would have (`<id>.jsonl`, `<id>/subagents/…` relative to the project-slug dir)
+// into the same spool and hands it to the same `importSession`, so the agent
+// needs no new command and the download, unpack, worktree re-creation and resume
+// are the code that already moves a live session.
+//
+// The record IS a migration record with no `srcHost`: there is nothing to export
+// from and nothing to kill on handoff (`advanceMigrations` already skips the kill
+// when the source host is absent), so it starts in `exporting` — meaning "the hub
+// is packing" — and flips to `importing` once the spool file is written. That
+// keeps every phase, timeout, refusal and follow-the-spawn path exactly as it is.
+//
+// Packing is ASYNC and the route does not wait on it: a bundle is tens of MiB off
+// /data, and the hub serves every other client on this one loop.
+function startArchiveRestore(row, files, targetHost) {
+  if (migrations.size >= MIGRATIONS_MAX) {
+    let oldest = null;
+    for (const m of migrations.values()) {
+      if (m.phase === "done" || m.phase === "failed") {
+        if (!oldest || m.at < oldest.at) oldest = m;
+      }
+    }
+    if (oldest) { dropMigrationBlob(oldest); migrations.delete(oldest.id); }
+  }
+  const id = crypto.randomBytes(8).toString("hex");
+  const tgt = agents[targetHost] || null;
+  const m = {
+    id, srcHost: null, srcSessionId: null, targetHost,
+    // What this record IS, so the UI can word it as a restore rather than a move
+    // — a move that says "moving from nowhere" reads as a bug.
+    restore: true,
+    siteKey: siteKeyOf(tgt), repo: row.repo,
+    transcriptId: row.transcriptId,
+    meta: {
+      model: null, permissionMode: null, modelSource: null,
+      // The archive's own summary is the only name this session still has; the
+      // rest of the identity a move carries (model, mode, ticket) lived on the
+      // heartbeat of a host that is gone, so the resumed session takes the
+      // target's defaults. NOT `summaryManual`: the archive cannot tell an
+      // operator-typed name from a derived one, and claiming manual would stop
+      // the agent ever re-deriving it.
+      summary: row.summary || null, summaryManual: false,
+      label: null, ticket: null,
+    },
+    phase: "exporting",
+    blobPath: null, blobSize: 0, uploading: false,
+    importCmdId: null, targetSessionId: null,
+    refusal: null,
+    error: null, startedAt: Date.now(), at: Date.now(),
+  };
+  migrations.set(id, m);
+  publishMigrations();
+
+  const spool = migrationSpoolPath(id);
+  tar.packGzipTar(files, spool, MIGRATE_BLOB_MAX, { mtimeSec: Date.now() / 1000 })
+    .then((out) => {
+      // The record may have been failed or swept while the bytes were being
+      // written — the same race the migration relay's upload settles (a timeout
+      // can land mid-pack). Advancing anyway would queue an importSession for a
+      // restore the operator was already told had failed.
+      if (!migrations.has(id) || m.phase !== "exporting") {
+        try { fs.unlinkSync(spool); } catch {}
+        return;
+      }
+      // Never silent: a member the tar format cannot name, or a raw file shorter
+      // than the archive recorded, means the restored session is missing
+      // something. The conversation itself is checked at the route (a bundle
+      // without it is refused), so this is about the extras.
+      const missing = [...out.skipped, ...out.short];
+      if (missing.length) {
+        console.warn(`restore ${id}: bundle is incomplete — ` +
+          `${out.skipped.length} unnameable, ${out.short.length} short: ` +
+          missing.slice(0, 5).join(", "));
+        // The CONVERSATION itself cannot be one of them. A skipped `<id>.jsonl`
+        // restores an empty session and a NUL-padded one restores a corrupt
+        // transcript, and `claude --resume` would present either as the operator's
+        // history. Better to refuse the restore than to hand back a damaged one.
+        const conv = `${row.transcriptId}.jsonl`;
+        if (missing.includes(conv)) {
+          m.phase = "failed";
+          m.error = "the archived conversation could not be packed intact";
+          m.at = Date.now();
+          try { fs.unlinkSync(spool); } catch {}
+          publishMigrations();
+          return;
+        }
+        // Everything else rides, but the record SAYS SO. A restore that silently
+        // drops a subagent transcript and reports `done` tells the operator they
+        // have their session back when part of it is gone.
+        m.incomplete = {
+          skipped: out.skipped.slice(0, INCOMPLETE_NAMES_MAX),
+          short: out.short.slice(0, INCOMPLETE_NAMES_MAX),
+          total: missing.length,
+        };
+      }
+      m.blobPath = spool;
+      m.blobSize = out.bytes;
+      m.phase = "importing";
+      m.at = Date.now();
+      m.importCmdId = queueCommand(targetHost, {
+        type: "importSession",
+        migrationId: id,
+        transcriptId: row.transcriptId,
+        // The worktree path as the ARCHIVED host recorded it. The agent's
+        // `_localize_migrated_cwd` remaps its mount-independent
+        // `.turma/worktrees/<repo>/<dir>` tail onto THIS host's REPOS_ROOT, which
+        // is the same remap a cross-mount move relies on.
+        cwd: row.worktree,
+        repo: row.repo,
+        summary: m.meta.summary,
+        summaryManual: m.meta.summaryManual,
+        // Where this conversation came from, for the resumed session's own
+        // record. `sessionId` is null — an archived session has no live id, and
+        // inventing one would name a session that does not exist.
+        migratedFrom: { host: row.host || null, sessionId: null, at: Date.now(), fromArchive: true },
+      });
+      publishMigrations();
+    })
+    .catch((e) => {
+      if (!migrations.has(id)) return;
+      m.phase = "failed";
+      m.error = e && e.tooLarge
+        ? `this session's archived files are larger than the ${MIGRATE_BLOB_MAX}-byte bundle ceiling`
+        : "packing the archived session failed";
+      m.at = Date.now();
+      dropMigrationBlob(m);
+      publishMigrations();
+      console.error(`restore ${id}: pack failed: ${e && e.message}`);
+    });
+  return m;
+}
+
 // Drive every in-flight migration one step (called from the target's heartbeat
 // for a fast handoff, and from the sweep interval for timeouts/cleanup). Pure
 // bookkeeping over `migrations` + the fleet — safe to call often.
@@ -2033,6 +2189,48 @@ function advanceMigrations() {
         publishMigrations();
         continue;
       }
+    }
+    // A RESTORE only. The "one conversation, one session" check runs at
+    // admission, and the importing window is up to MIGRATE_TIMEOUT_MS — long
+    // enough for the archived host to come back and beat in with that very
+    // conversation running, at which point finishing would put two claudes on one
+    // transcript, exactly what the admission check exists to prevent. A live
+    // move needs no equivalent: its source is running BY DESIGN, and it is killed
+    // at handoff. The target is skipped, since its own import is the success
+    // above; read after that handoff so a completed restore always wins the tie.
+    if (m.restore && (m.phase === "exporting" || m.phase === "importing")) {
+      for (const [host, a] of Object.entries(agents)) {
+        // ONLINE hosts only, exactly as at admission. A host that died with the
+        // session running keeps `status: "running"` for PRUNE_AFTER_MS — seven
+        // days — so without this the restore is admitted (the admission check
+        // skips it) and then killed one tick later by the same dead host, with an
+        // error asserting it "came back up". That is worse than the old refusal:
+        // the operator has now also spent an in-flight slot, a spool file and a
+        // pack, and the agent 404s the download it was told to make.
+        if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+        const live = (a.sessions || []).find(
+          (s) => s.transcriptId === m.transcriptId && s.status === "running" &&
+                 // Never the migration's OWN imported session. Belt-and-braces
+                 // today — the handoff above matches the same predicate and
+                 // `continue`s first, so this cannot currently fire — but it is
+                 // what makes the rule true independently of that ordering.
+                 //
+                 // What it must NOT do is skip the whole TARGET, which leaves the
+                 // one host that actually unpacks unchecked: `import_session`
+                 // downloads and unpacks BEFORE `_resume_at_cwd` refuses, so a
+                 // conversation resumed locally on the target between admission
+                 // and its next beat has the archived bytes written over it.
+                 s.spawnCmdId !== m.importCmdId);
+        if (!live) continue;
+        m.phase = "failed";
+        m.error = `that conversation came back up on ${host} — the restore was ` +
+                  "abandoned rather than run a second claude on it";
+        dropMigrationBlob(m);
+        m.at = now;
+        publishMigrations();
+        break;
+      }
+      if (m.phase === "failed") continue;
     }
     // The agent REFUSED its half of the move and said so on a beat (XERK-265):
     // fail now, carrying its reason, instead of leaving the operator watching a
@@ -7834,6 +8032,125 @@ const server = http.createServer(async (req, res) => {
           : { error: "unknown transcript" });
       }
       return json(res, 200, t);
+    }
+
+    // POST /api/archive/<transcriptId>/restore — resume an ARCHIVED session on a
+    // live host (XERK-441). Body: {host}, the target.
+    //
+    // This is the operator's own click on a session whose host may not exist any
+    // more, so it rides the user login like /migrate — and, unlike /migrate,
+    // there is no source agent to consult: everything it validates comes from the
+    // hub's own archive index and the target's heartbeat.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "archive" &&
+        parts[3] === "restore" && parts.length === 4) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const target = typeof body.host === "string" ? body.host : "";
+      const row = archive.sessionRow(transcriptId);
+      if (!row) return json(res, 404, { error: "unknown transcript" });
+      if (!row.worktree)
+        return json(res, 409, {
+          error: "this archived session recorded no worktree path, so there is nowhere to resume it",
+        });
+      // A recorded worktree is only usable if it is one of the three shapes the
+      // agent's `_resumable_cwd_class` accepts, checked against what the ROW says
+      // rather than guessed from the path: the hub does not know a target's
+      // REPOS_ROOT, and hosts mount it at different paths on purpose.
+      //   - a worktree session, `.turma/worktrees/<repo>/<dir>` — the only
+      //     mount-independent shape, and the only one `_localize_migrated_cwd`
+      //     can remap across differing mounts;
+      //   - a ROOT session, whose cwd IS the source's REPOS_ROOT. There is no
+      //     tail to match and nothing hub-side to compare it to, so the row's own
+      //     repo is what identifies it. These are the MAJORITY of archived
+      //     sessions — refusing them by shape made every one unrestorable;
+      //   - a repo-dir session, `<REPOS_ROOT>/<repo>`, identified the same way.
+      // Anything else the agent would refuse anyway, so refusing here only saves
+      // an in-flight slot and a spool file. A `..` component is never legitimate.
+      // A `~/.claude/projects/<slug>` dir is a TRANSCRIPT STORE, never a cwd, and
+      // no agent can resume one. It is the overwhelming majority of what the
+      // archive records for `(root)` rows — `repo == "(root)"` is also the
+      // agent's catch-all bucket for any cwd it could not attribute to a repo, so
+      // the repo alone does not mean "root session". Refusing them here is what
+      // keeps admitting root rows from spending a slot, a pack and a spool file
+      // on ~1228 rows the agent would refuse a minute later.
+      if (/(^|\/)\.claude\/projects(\/|$)/.test(row.worktree))
+        return json(res, 409, {
+          error: "this archived session recorded a transcript directory rather than a working " +
+                 "directory, so there is nowhere to resume it",
+        });
+      const wtParts = row.worktree.split("/").filter(Boolean);
+      const isWorktree = /(^|\/)\.turma\/worktrees\/[^/]+\/[^/]+\/?$/.test(row.worktree);
+      const isRoot = row.repo === ROOT_REPO_NAME;
+      const isRepoDir = wtParts.length > 0 && wtParts[wtParts.length - 1] === row.repo &&
+                        !/(^|\/)\.turma(\/|$)/.test(row.worktree);
+      if (row.worktree.split("/").includes("..") ||
+          !(isWorktree || isRoot || isRepoDir))
+        return json(res, 409, {
+          error: "this archived session's recorded worktree path is not a session worktree",
+        });
+      if (!row.repo)
+        return json(res, 409, { error: "this archived session recorded no repo" });
+      // The RENDERED entries are a display copy — `{uuid, role, ts, text}` — and
+      // `claude --resume` cannot read them. Only the raw layer's byte-for-byte
+      // files can be resumed, so a session archived before that layer existed, or
+      // one whose raw push never landed, is readable and not restorable. Say
+      // which, rather than failing later inside the agent.
+      const files = archive.listRawFiles(transcriptId) || [];
+      const packable = [];
+      let conversation = false;
+      for (const f of files) {
+        const full = archive.rawFileFor(transcriptId, f.path);
+        if (!full) continue;
+        if (f.path === `${transcriptId}.jsonl`) conversation = true;
+        packable.push({ name: f.path, path: full, size: f.bytes });
+      }
+      if (!conversation)
+        return json(res, 409, {
+          error: "the archive holds no raw copy of this session's conversation — " +
+                 "only the rendered transcript, which can be read but not resumed",
+        });
+      if (!target) return json(res, 400, { error: "a target host is required" });
+      const tgt = agents[target];
+      if (!tgt) return json(res, 404, { error: "unknown target host" });
+      if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
+        return json(res, 503, { error: "the target agent is offline" });
+      if (!(tgt.repos || []).some((r) => r && r.name === row.repo))
+        return json(res, 409, {
+          error: `the target agent doesn't have "${row.repo}" cloned — clone it there first`,
+        });
+      // One conversation, one session. A migration PRESERVES the transcript id,
+      // so restoring a conversation that is already running somewhere would put
+      // two live sessions on one transcript — two claudes appending to the same
+      // file, and a `_session_transcript_path` that cannot say whose it is.
+      for (const [host, a] of Object.entries(agents)) {
+        // ONLINE hosts only. A host that died with the session running keeps
+        // `status: "running"` in its last record forever, so gating on it refused
+        // the restore with "kill it there first" naming a host the operator
+        // cannot reach — on exactly the population this feature exists for.
+        if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+        const live = (a.sessions || []).find(
+          (x) => x.transcriptId === transcriptId && x.status === "running");
+        if (live)
+          return json(res, 409, {
+            error: `that conversation is already running on ${host} — kill it there first`,
+          });
+      }
+      let inFlight = 0;
+      for (const m of migrations.values()) {
+        if (m.phase !== "exporting" && m.phase !== "importing") continue;
+        inFlight++;
+        if (m.transcriptId === transcriptId)
+          return json(res, 409, { error: "this session is already being restored" });
+      }
+      // The same ceiling a move is held to, and for the same reason: each
+      // in-flight bundle is up to 65 MiB spooled onto /data, which is shared with
+      // the archive itself.
+      if (inFlight >= MIGRATE_INFLIGHT_MAX)
+        return json(res, 503, {
+          error: `too many moves in flight (${MIGRATE_INFLIGHT_MAX}) — wait for one to finish`,
+        });
+      const m = startArchiveRestore(row, packable, target);
+      return json(res, 200, { ok: true, migrationId: m.id });
     }
 
     // GET /api/archive/<transcriptId>/raw — what the raw layer holds for that

@@ -988,6 +988,19 @@ function listRawFiles(transcriptId) {
   return out;
 }
 
+/**
+ * The index row behind one archived session — where it ran and what of, which is
+ * what restoring it onto another host needs (XERK-441) and what the transcript
+ * read-back deliberately does not carry (it answers with the CONVERSATION).
+ * null when unknown.
+ */
+function sessionRow(transcriptId) {
+  openDb();
+  const row = db.prepare(`SELECT transcriptId, host, remoteKey, repo, worktree, summary,
+      createdAt, endedTs, msgCount, filePath FROM sessions WHERE transcriptId=?`).get(transcriptId);
+  return row || null;
+}
+
 /** One raw file's absolute path, for streaming it back. null when unknown. */
 function rawFileFor(transcriptId, rel) {
   openDb();
@@ -1145,7 +1158,8 @@ function listArchive(opts) {
 // organized file (not the index). null when unknown/missing.
 function getTranscript(transcriptId) {
   openDb();
-  const row = db.prepare("SELECT filePath, repo, host, summary, endedTs, createdAt FROM sessions WHERE transcriptId=?").get(transcriptId);
+  const row = db.prepare("SELECT filePath, repo, host, worktree, summary, endedTs, createdAt "
+    + "FROM sessions WHERE transcriptId=?").get(transcriptId);
   if (!row || !row.filePath) return null;
   const paths = filePaths(row.filePath);
   let raw;
@@ -1164,7 +1178,10 @@ function getTranscript(transcriptId) {
   }
   return {
     transcriptId, repo: row.repo, host: row.host, summary: row.summary,
-    endedTs: row.endedTs, createdAt: row.createdAt, entries,
+    // The recorded cwd, so the page can tell a session that CAN be restored from
+    // one whose "worktree" is really a transcript store — the majority of the
+    // archive — instead of offering a control that always refuses.
+    worktree: row.worktree, endedTs: row.endedTs, createdAt: row.createdAt, entries,
   };
 }
 
@@ -1252,7 +1269,7 @@ module.exports = {
   ingestRaw, rawCursors, rawLimits, listRawFiles, rawFileFor,
   safeRawRel, rawDirFor, rawFilePath,
   totalArchiveBytes, totalForCeiling, __resetTotalCache,
-  searchArchive, listArchive, getTranscript,
+  searchArchive, listArchive, getTranscript, sessionRow,
   // Test seam. The raw layer's own `.jsonl` files carry no `.meta`, so the
   // rebuild would skip them anyway — this is exported so the SKIP itself can be
   // pinned rather than that backstop, because the skip is what stops a rebuild
