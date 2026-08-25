@@ -839,6 +839,28 @@ fun scopedAgents(agents: List<AgentInfo>, stored: Set<String>): List<AgentInfo> 
     filterAgents(agents, effectiveOrgs(stored, mergeSites(agents)))
 
 /**
+ * Spend from hosts the hub no longer has (`retiredUsage`, XERK-338), scoped by
+ * the same pick.
+ *
+ * The self-heal keys come from the LIVE fleet, never from the retired list —
+ * that is org.js's rule (`TurmaOrg.update(data)` builds `sites` from
+ * `data.agents`, and `filter` then applies those keys to whatever list it is
+ * handed), and the two must agree. Passing the retired list to `scopedAgents`
+ * instead computes the self-heal from the retired hosts' OWN orgs, which is a
+ * different rule in both directions: a scope naming an org no live host reports
+ * stops self-healing away (so the screen shows only that org's removed spend
+ * where the web shows everything), and a scope naming a live org self-heals to
+ * "all" over the retired list (so the screen adds OTHER orgs' removed spend to
+ * a scoped total — the damaging half). Nothing in the types catches it: both
+ * are `List<AgentInfo>`.
+ */
+fun scopedRetired(
+    retired: List<AgentInfo>,
+    live: List<AgentInfo>,
+    stored: Set<String>,
+): List<AgentInfo> = filterAgents(retired, effectiveOrgs(stored, mergeSites(live)))
+
+/**
  * The org pick to persist on first read, migrating the board-only preference
  * (`turma_board`/`org`) into the fleet-wide one — an operator's existing board
  * filter carries into the new global control rather than silently resetting to

@@ -27,6 +27,9 @@ data class FleetSummary(
     val tokensWeek: Long,
     val tokensAllTime: Long,
     val topModels: String,
+    // Whether a removed host's spend is inside the three token totals, so the
+    // tiles can say so (index.html's `retiredNote`).
+    val retiredCounted: Boolean = false,
 )
 
 private fun bucket(u: UsageInfo, w: UsageWindow) = when (w) {
@@ -65,7 +68,22 @@ fun fleetTopModels(agents: List<AgentInfo>): String {
     }
 }
 
-fun fleetSummary(agents: List<AgentInfo>): FleetSummary {
+/**
+ * The six dashboard tiles for the scoped fleet.
+ *
+ * `retired` is the scoped `AgentsResponse.retiredUsage` (XERK-338) — spend from
+ * hosts the hub no longer has. It feeds the TOKEN TILES ONLY, matching
+ * index.html: a retired entry is not a host, so it carries no sessions, repos or
+ * capacity and must never reach the host counts. Reading only `agents` made this
+ * screen disagree with the Usage screen, which has always counted both — removing
+ * one busy host erased most of the fleet's all-time tokens here while Usage still
+ * charted them.
+ */
+fun fleetSummary(
+    agents: List<AgentInfo>,
+    retired: List<AgentInfo> = emptyList(),
+): FleetSummary {
+    val spenders = agents + retired
     val sessions = agents.flatMap { it.sessions }
     // MAX_SESSIONS is per-agent, so the scoped fleet's ceiling is the sum across
     // hosts that report a capacity block; null when none do (pre-capacity fleet),
@@ -79,9 +97,12 @@ fun fleetSummary(agents: List<AgentInfo>): FleetSummary {
         totalSessions = sessions.size,
         maxSessions = if (capHosts.isEmpty()) null else capHosts.sumOf { it.maxSessions },
         waiting = sessions.count { it.status == "running" && !it.session?.question.isNullOrBlank() },
-        tokensToday = fleetTokens(agents, UsageWindow.TODAY),
-        tokensWeek = fleetTokens(agents, UsageWindow.WEEK),
-        tokensAllTime = fleetTokens(agents, UsageWindow.TOTALS),
-        topModels = fleetTopModels(agents),
+        tokensToday = fleetTokens(spenders, UsageWindow.TODAY),
+        tokensWeek = fleetTokens(spenders, UsageWindow.WEEK),
+        tokensAllTime = fleetTokens(spenders, UsageWindow.TOTALS),
+        topModels = fleetTopModels(spenders),
+        // Said on the tiles rather than left to be discovered: a total larger
+        // than the hosts on screen can account for reads as a bug otherwise.
+        retiredCounted = retired.isNotEmpty(),
     )
 }

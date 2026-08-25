@@ -175,6 +175,55 @@ paths:
   `usagePurged:false`; `?usage=purge` is the deliberate second step, with no way back, and is never
   implied by removing the card.
 
+### Recovering a wiped host's history (`turma/tools/recover-usage-from-archive.js`)
+
+- **A host wiped before the ledger ever saw it cannot be recovered from anything measured**, and the
+  archive is not the exception people reach for: its rendered layer carries no token counts, and its
+  raw layer only ever held what was still on the host's disk when the sync ran — after a wipe, nothing
+  older than it. Re-deriving every raw copy MaxAI has reproduced the ledger's own days exactly for
+  2026-08-16 → 08-21 (all four figures; 08-22 → 08-25 come back lower, having live sessions the
+  archive has not taken yet) and produced NO earlier day at all — the first half says the parser is
+  faithful, the second that the raw layer cannot cross a wipe.
+- So the tool ESTIMATES, from the rendered text: tokens-per-rendered-character calibrated on sessions
+  holding both layers, applied to the rendered-only sessions before the wipe. Accurate in bulk (±20%
+  over ~250 sessions), useless per day (±2–6x), and biased LOW on purpose (`--drift`), since a max-rule
+  bucket that is too high can never be corrected downwards.
+- **Nothing in the ledger marks a bucket as estimated**, so every run must be recorded here **once it
+  has actually been applied**, or a later reader reads fabrication as fact — and a run recorded before
+  it happens is worse than no record, since it labels measured days as estimates. Runs applied to the
+  live ledger, in full:
+  - **MaxAI, 2026-06-16 → 2026-08-15, 48 days, 5,379,447,205 estimated tokens** (`--drift 0.8`),
+    applied 2026-08-25. OS wipe ~08-15; the ledger was created 08-18, after it, so it held that host
+    from 08-16 only. Days from 08-16 are the hub's own measured record and were left alone (verified:
+    the 08-16 bucket is byte-identical either side of the merge). The run's own report is
+    `/data/recover-maxai-2026-08-25.json` and the pre-merge file
+    `/data/usage-ledger.json.pre-recover.2026-08-25T10-57-38-917Z`. Served result: 58 day buckets,
+    73 repo rows, 7.465B all-time against the 2.086B that host reports.
+- **A figure above `TOKEN_MAX` counts as 0 there too.** `num()` refuses a non-safe integer, so one
+  absurd value in a calibration transcript poisons the rate and lands a day bucket that loads back
+  ZEROED — destroying the measured figures in it. An estimator that writes into this store has to
+  coerce like `_token_count`, not merely like a number.
+- **The hub is killed from OUTSIDE the container, immediately after the write, and the result is then
+  VERIFIED.** It rewrites the whole ledger from memory on its next save, so anything short of a fresh
+  boot loses the merge — and two plausible recipes already did, each silently:
+  - `kubectl delete pod` alone: SIGTERM is unhandled, the old process beats through its 30s grace
+    period and saves over the merge (04:14:00 → gone 04:15).
+  - `kill -9 1` inside the container: PID 1 is immune to signals it has no handler for when they come
+    from its OWN namespace, SIGKILL included, so nothing happens at all — `RESTARTS` stays 0 and the
+    snapshot timer takes the merge ~4 minutes later.
+  `--force --grace-period=0` makes the kubelet SIGKILL it, which works. Pass `--json /data/…` so the
+  run's report survives a restarted container's empty `/tmp`.
+- **A run's figures are as-of that run.** Its calibration set is the archive, which grows, so the same
+  command a day later lands ~1% different — and a wiped host's old project slugs return as repo series
+  (for MaxAI, 67 against the 6 it reports live, ~19% of the estimate in bare-name and `hub-agent-mgr-*`
+  keys). They are kept: host totals are held independently, so dropping them would leave the page's
+  per-repo view under-counting its per-host view.
+- Attribution is the `.meta` **`host`** field, never the host segment of an archived file's NAME — a
+  migrated session keeps the name it was first archived under, so reading the name credits its spend
+  to the wrong host. Repo keys fold a bare name onto a URL key when exactly one URL key claims that
+  display name (`reposOf` keys on `remoteKey || repo`, so a repo archived before its origin was
+  readable would otherwise chart as a second series).
+
 ### Bounds
 
 - **`models` is capped (`USAGE_LEDGER_MODELS`), every agent-supplied NAME is length-bounded, and each

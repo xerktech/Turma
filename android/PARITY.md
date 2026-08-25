@@ -386,6 +386,14 @@ those are marked `[MODEL]`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
+- **P1 Restore an archived session onto another agent (XERK-441).** The web archive viewer's bar has
+  a "Restore…" button with a host picker: `POST /api/archive/<transcriptId>/restore {host}` packs the
+  session's archived raw files hub-side and drives the same `importSession` a move does, so a session
+  whose host has been REMOVED can be resumed elsewhere. Android's history/archive view has no such
+  control, so on a phone an archived session is still read-only. The hub does all the work — the port
+  is a button, an eligible-host list (online + has the repo, deliberately NOT org-scoped: an archived
+  session has no agent left to compare an org against), and following the returned `migrationId`
+  through the `migrations` payload exactly as the existing Move flow does.
 - **P2 Say when a start was REFUSED (XERK-265).** Agents now report a declined resume/import on the
   heartbeat, and the hub serves it per cmdId as `agent.spawnRefusals[cmdId] = {error, at}`. The web
   ends its spawn-follow wait and toasts the reason ("Couldn't start session: the host is at

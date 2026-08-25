@@ -40,6 +40,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.util.Locale
 import com.xerktech.turma.core.scopedAgents
+import com.xerktech.turma.core.scopedRetired
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.UsageViewModel
 
@@ -90,7 +91,15 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
     // Live hosts PLUS the usage of hosts the hub no longer has (XERK-338) — the
     // only place a deleted, pruned or wiped host's spend still exists. Scoped by
     // the same org rule; a retired entry carries the siteKey it last reported.
-    val scoped = remember(fleet, org) { scopedAgents(fleet.agents + fleet.retiredUsage, org) }
+    // Live hosts plus the spend of hosts the hub no longer has (XERK-338), each
+    // scoped by the header's org pick. The self-heal keys come from the LIVE
+    // fleet in both halves — org.js's rule, and the one the Dashboard follows.
+    // Scoping the COMBINED list instead derived them from the retired hosts too,
+    // which is a third rule: a pick naming an org only a REMOVED host reported
+    // stopped self-healing away here while it still did on every other screen.
+    val scoped = remember(fleet, org) {
+        scopedAgents(fleet.agents, org) + scopedRetired(fleet.retiredUsage, fleet.agents, org)
+    }
     val ui = remember(scoped) { UsageViewModel.compute(fleet.copy(agents = scoped)) }
     // Grouping pick + legend toggles persist across visits (web usage.html's
     // localStorage `turma-usage-mode` / `turma-hidden-sessions`).
