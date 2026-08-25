@@ -44,6 +44,7 @@ interface Context {
     userQuestions?: UserQuestionService;
     approval?: ApprovalService;
     systemPrompt?: SystemPromptService;
+    get(name: string): any;
     on(name: string, listener: (...args: any[]) => any, options?: boolean | {
         global?: boolean;
     }): Disposable;
@@ -62,12 +63,14 @@ interface CreateAgentOptions {
     sessionId: string;
     meta?: {
         cwd?: string;
+        agentPreset?: string;
     };
     agentOptions?: {
         provider?: string;
         model?: string;
         maxTokens?: number;
     };
+    setup?: (agentCtx: unknown) => void | Promise<void>;
 }
 interface AgentHandle {
     agent: Agent;

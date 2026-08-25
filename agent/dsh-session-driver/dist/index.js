@@ -105,11 +105,30 @@ export function apply(ctx, config) {
         }
     }
     // ---- one agent, on the pinned session id ---------------------------------
-    ;
+    // The setup hook MUST compose the agent from a preset, or it is created with
+    // no tools — no bash/edit/ask-user/approval — so the model can neither do work
+    // nor raise a HITL request (it just prints tool JSON as prose). dsh's own hosts
+    // do this via composeAgent(); we mount the default preset directly. A rosterless
+    // deployment (no presets — tools live in the global host layer) has no default
+    // to mount, so a mount failure there is tolerated rather than rolling the agent
+    // back; in a roster deployment (the `web` profile) the mount is what delivers
+    // the tools.
+    const setup = async (agentCtx) => {
+        const presets = ctx.get('agentPresets');
+        if (!presets || typeof presets.mount !== 'function')
+            return;
+        try {
+            await presets.mount(agentCtx); // undefined id -> the roster's default preset
+        }
+        catch (e) {
+            ctx.logger.warn(`[turma-dsh] preset mount skipped (${e}); if this host uses `
+                + `presets the agent will have no tools`);
+        }
+    };
     (async () => {
         try {
             const agentOptions = (provider || model) ? { provider, model } : undefined;
-            handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions });
+            handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions, setup });
             ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} created (cwd ${cwd})`);
         }
         catch (e) {
@@ -150,7 +169,15 @@ export function apply(ctx, config) {
             return;
         switch (msg.op) {
             case 'input': {
-                const agent = ctx.agents.get(sessionId);
+                // Wait briefly for the agent to be registered: create() is async (its
+                // setup composes the preset), so an input that arrives right after the
+                // socket binds — the initial prompt — can beat it. Without this the first
+                // turn is silently dropped as "agent not ready".
+                let agent = ctx.agents.get(sessionId);
+                for (let i = 0; i < 100 && !agent; i++) {
+                    await new Promise((r) => setTimeout(r, 100));
+                    agent = ctx.agents.get(sessionId);
+                }
                 if (!agent) {
                     ack(sock, false, 'agent not ready');
                     return;
@@ -210,6 +237,10 @@ export function apply(ctx, config) {
                 ack(sock, false, 'unknown op');
         }
     }
+    // A single control frame is bounded so a same-uid peer streaming bytes without
+    // a newline cannot grow the dsh process's memory without limit. Generous above
+    // INPUT_MAX_CHARS (100k, capped hub-side); applies to ONE line.
+    const LINE_MAX_BYTES = 4 << 20;
     const server = net.createServer((sock) => {
         clients.add(sock);
         let buf = '';
@@ -222,6 +253,11 @@ export function apply(ctx, config) {
                 buf = buf.slice(nl + 1);
                 if (line)
                     void handleOp(sock, line);
+            }
+            if (buf.length > LINE_MAX_BYTES) {
+                ctx.logger.warn(`[turma-dsh] dropping an oversize control frame `
+                    + `(${buf.length} bytes, no newline)`);
+                buf = '';
             }
         });
         sock.on('close', () => clients.delete(sock));

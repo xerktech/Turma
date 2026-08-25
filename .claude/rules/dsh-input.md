@@ -70,6 +70,18 @@ the PLUGIN maps them to dsh's native answer — a question option LABEL, or an a
 - **`inject` must include `agentLoop`.** `@deepseek-ai/dsh-agent-loop` registers the agent factory
   (`agents.setFactory`); without injecting it the driver can load first and `agents.create()` throws
   "no agent factory registered".
+- **`agents.create` MUST pass a `setup` that mounts a preset — or the agent has NO tools.** With no
+  `setup`, the agent is created with no bash/edit/ask-user/approval tools, so the model can neither
+  do work nor raise a HITL request (it just prints tool JSON as prose) — the whole vertical looks
+  alive but does nothing. dsh's own hosts compose a preset (`composeAgent`); the driver's setup calls
+  `ctx.get('agentPresets').mount(agentCtx)` (default preset). A mount failure is tolerated only for a
+  rosterless deployment (tools live in the global host layer); in the `web` profile the mount is what
+  delivers the tools. Because the async setup adds latency, the `input` op waits for the agent to be
+  registered before `followup`, or the initial prompt races ahead and is dropped.
+- **A DshControl callback must never call a send method.** `on_interaction`/`on_state`/
+  `on_interaction_end` run on the reader thread; `input`/`answer`/`state`/`kill` block on an ack that
+  the reader delivers, so calling one from a callback deadlocks. In hub-agent the answer is sent from
+  the beat thread (`_dsh_answer`), never a callback — hold that invariant.
 - **The single user-questions provider is owned by POLL-AND-DISPLACE.** The `dsh web` host
   (apiproxy) registers it during load and the service throws `DUPLICATE_PROVIDER` on a second
   registration — whichever registers SECOND throws. The driver waits until an incumbent is present,

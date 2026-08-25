@@ -78,10 +78,16 @@ class DshControl:
 
     `on_interaction(payload)` is called (on the reader thread) for each
     `{evt:"interaction", ...}` the plugin raises — the hub writes it to the
-    AskUserQuestion rendezvous file. `on_state(payload)` is called for each
-    `{evt:"state", ...}` (an agent turn/status edge) — the input to a dsh
-    session's "Working" signal, owned by [D]. Both callbacks must be cheap and
-    must not raise; this class guards them anyway.
+    AskUserQuestion rendezvous file. `on_state(payload)` and
+    `on_interaction_end(payload)` are called for `{evt:"state"}` / `{evt:
+    "interaction_end"}`. All three run on the READER THREAD.
+
+    **A callback MUST NOT call input()/answer()/state()/kill()**: those block
+    waiting for an ack that only the reader thread delivers, so calling one from
+    a callback deadlocks until the ack timeout. Callbacks only touch local state
+    (write a file, set a dict). In hub-agent the operator's answer arrives on the
+    beat thread (`_dsh_answer`), never from a callback, so this holds by
+    construction. Callbacks must also be cheap and must not raise; guarded anyway.
     """
 
     def __init__(self, sock_path, on_interaction=None, on_state=None,

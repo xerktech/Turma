@@ -12604,6 +12604,16 @@ class SessionManager:
         if tail is not None:
             tail.stop()
         self.dsh_status.pop(sid, None)
+        # Drop the per-session control socket and its env file. The env file holds
+        # the model API key (0600); leaving it would accumulate a credential file
+        # per session id. The plugin unlinks the socket on a clean exit, but a hard
+        # _kill_tmux may leave it — remove both here. Best-effort.
+        for p in (os.path.join(DSH_SOCKET_DIR, f"{sid}.sock"),
+                  os.path.join(DSH_SOCKET_DIR, f"{sid}.env")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     def _forget_session_caches(self, sid):
         # Safety net for any teardown path that reaches here without the explicit

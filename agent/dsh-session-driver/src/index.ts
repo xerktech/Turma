@@ -53,10 +53,19 @@ interface Context {
   userQuestions?: UserQuestionService
   approval?: ApprovalService
   systemPrompt?: SystemPromptService
+  get(name: string): any
   on(name: string, listener: (...args: any[]) => any,
      options?: boolean | { global?: boolean }): Disposable
   effect(execute: () => Disposable | void, label?: string): unknown
   logger: { info(m: string): void; warn(m: string): void; error(m: string): void }
+}
+
+// The agent-presets service (dsh-agent-presets, name "agentPresets"): mount()
+// composes an agent from a preset (its tools + prompt sections). Called in the
+// create() setup hook — without it, the agent has NO tools (no bash/edit/
+// ask-user/approval), which is what dsh's own hosts avoid via composeAgent().
+interface AgentPresetsService {
+  mount(agentCtx: unknown, id?: string): Promise<unknown>
 }
 
 interface AgentRegistry {
@@ -65,8 +74,9 @@ interface AgentRegistry {
 }
 interface CreateAgentOptions {
   sessionId: string
-  meta?: { cwd?: string }
+  meta?: { cwd?: string; agentPreset?: string }
   agentOptions?: { provider?: string; model?: string; maxTokens?: number }
+  setup?: (agentCtx: unknown) => void | Promise<void>
 }
 interface AgentHandle { agent: Agent; dispose(): Promise<void> }
 interface Agent {
@@ -213,10 +223,28 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // ---- one agent, on the pinned session id ---------------------------------
+  // The setup hook MUST compose the agent from a preset, or it is created with
+  // no tools — no bash/edit/ask-user/approval — so the model can neither do work
+  // nor raise a HITL request (it just prints tool JSON as prose). dsh's own hosts
+  // do this via composeAgent(); we mount the default preset directly. A rosterless
+  // deployment (no presets — tools live in the global host layer) has no default
+  // to mount, so a mount failure there is tolerated rather than rolling the agent
+  // back; in a roster deployment (the `web` profile) the mount is what delivers
+  // the tools.
+  const setup = async (agentCtx: unknown): Promise<void> => {
+    const presets = ctx.get('agentPresets') as AgentPresetsService | undefined
+    if (!presets || typeof presets.mount !== 'function') return
+    try {
+      await presets.mount(agentCtx)   // undefined id -> the roster's default preset
+    } catch (e) {
+      ctx.logger.warn(`[turma-dsh] preset mount skipped (${e}); if this host uses `
+        + `presets the agent will have no tools`)
+    }
+  }
   ;(async () => {
     try {
       const agentOptions = (provider || model) ? { provider, model } : undefined
-      handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions })
+      handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions, setup })
       ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} created (cwd ${cwd})`)
     } catch (e) {
       ctx.logger.error(`[turma-dsh] agent create failed: ${e}`)
@@ -249,7 +277,15 @@ export function apply(ctx: Context, config: Config) {
     if (!msg || typeof msg !== 'object') return
     switch (msg.op) {
       case 'input': {
-        const agent = ctx.agents.get(sessionId)
+        // Wait briefly for the agent to be registered: create() is async (its
+        // setup composes the preset), so an input that arrives right after the
+        // socket binds — the initial prompt — can beat it. Without this the first
+        // turn is silently dropped as "agent not ready".
+        let agent = ctx.agents.get(sessionId)
+        for (let i = 0; i < 100 && !agent; i++) {
+          await new Promise((r) => setTimeout(r, 100))
+          agent = ctx.agents.get(sessionId)
+        }
         if (!agent) { ack(sock, false, 'agent not ready'); return }
         const kind = (msg.source && typeof msg.source.kind === 'string') ? msg.source.kind : 'user'
         agent.followup(userMessage(String(msg.text || ''), dshSource(kind)))
@@ -291,6 +327,10 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  // A single control frame is bounded so a same-uid peer streaming bytes without
+  // a newline cannot grow the dsh process's memory without limit. Generous above
+  // INPUT_MAX_CHARS (100k, capped hub-side); applies to ONE line.
+  const LINE_MAX_BYTES = 4 << 20
   const server = net.createServer((sock) => {
     clients.add(sock)
     let buf = ''
@@ -302,6 +342,11 @@ export function apply(ctx: Context, config: Config) {
         const line = buf.slice(0, nl).trim()
         buf = buf.slice(nl + 1)
         if (line) void handleOp(sock, line)
+      }
+      if (buf.length > LINE_MAX_BYTES) {
+        ctx.logger.warn(`[turma-dsh] dropping an oversize control frame `
+          + `(${buf.length} bytes, no newline)`)
+        buf = ''
       }
     })
     sock.on('close', () => clients.delete(sock))
