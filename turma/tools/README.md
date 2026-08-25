@@ -97,25 +97,35 @@ every measured day back in scope for an estimate.
 
 Add `--write` to merge. It backs the ledger up beside itself first.
 
-**Write and kill the hub in the SAME exec.** The hub holds the ledger in memory and
-rewrites the whole file on its next save, so the merge only survives if no save
-happens between the write and a fresh load:
+**The hub must be killed from OUTSIDE the container, immediately after the write.**
+It holds the ledger in memory and rewrites the whole file on its next save, so the
+merge only survives if no save happens between the write and a fresh boot:
 
 ```sh
 kubectl -n ai exec -i <turma-pod> -- sh -c 'cat > /tmp/recover.js && \
-  node /tmp/recover.js --host maxai --ledger-host MaxAI --before 2026-08-16 \
-    --json /data/recover-<host>-<date>.json --write; kill -9 1' \
-  < turma/tools/recover-usage-from-archive.js
+  node /tmp/recover.js --host <host> --ledger-host <Host> --before <YYYY-MM-DD> \
+    --json /data/recover-<host>-<date>.json --write' \
+  < turma/tools/recover-usage-from-archive.js \
+  && kubectl -n ai delete pod <turma-pod> --force --grace-period=0
 ```
 
-`kill -9 1` is the hub process; the container restarts in place and loads the merged
-file. `--json` on `/data` is how you read the run's report back afterwards, since the
-restarted container's `/tmp` is empty — and it is the durable record of exactly what
-was injected.
+Then **verify** — read the day count back out of the file through a new pod, because
+two plausible-looking recipes have already lost a completed merge:
 
-**`kubectl delete pod` is NOT a restart for this purpose, and it has already eaten one
-merge.** SIGTERM is not handled, so the old process runs on for its full 30-second
-grace period, beats, and saves its own copy over yours — observed as a merge written
-at 04:14:00 and gone at 04:15. Anything the hub saves between the tool's read and the
-kill is discarded too, but that is bounded by one run (~10 s) and the next beat
-re-reports it. Treat the backup as the way back.
+- **`kubectl delete pod` alone is not enough.** SIGTERM is unhandled, so the old
+  process runs on for its full 30-second grace period, beats, and saves its own copy
+  over yours. Observed: merged 04:14:00, gone by 04:15. `--force --grace-period=0`
+  is what makes the kubelet SIGKILL it instead.
+- **`kill -9 1` from inside the container does nothing at all.** PID 1 in its own PID
+  namespace is immune to signals it has no handler for, SIGKILL included, when they
+  come from within that namespace. The container does not restart (`RESTARTS` stays
+  0), the hub keeps running, and its next save takes the merge with it. Observed:
+  merged 04:52:55, gone ~4 minutes later, on the snapshot timer.
+
+`--json` writes onto `/data` because the restarted container's `/tmp` is empty — it
+is the durable record of exactly what a run injected.
+
+The residual window is the round-trip of that second `kubectl` call against a save
+cycle of `USAGE_LEDGER_SNAPSHOT_MS` (5 minutes), so a loss is unlikely but possible:
+verify, and re-run if it did not stick. Re-running is safe — the merge is idempotent
+under the max rule. Treat the backup as the way back.

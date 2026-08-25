@@ -200,11 +200,16 @@ paths:
   absurd value in a calibration transcript poisons the rate and lands a day bucket that loads back
   ZEROED — destroying the measured figures in it. An estimator that writes into this store has to
   coerce like `_token_count`, not merely like a number.
-- **The write and the hub's restart must be ONE step** (`… --write; kill -9 1` in a single exec, the
-  container restarting in place). The hub rewrites the whole ledger from memory on its next save and
-  handles no SIGTERM, so `kubectl delete pod` leaves the old process beating for its full 30s grace
-  period — it saved its unmerged copy over a completed merge one minute after it landed. Pass
-  `--json /data/…` so the run's report survives the restart the container's `/tmp` does not.
+- **The hub is killed from OUTSIDE the container, immediately after the write, and the result is then
+  VERIFIED.** It rewrites the whole ledger from memory on its next save, so anything short of a fresh
+  boot loses the merge — and two plausible recipes already did, each silently:
+  - `kubectl delete pod` alone: SIGTERM is unhandled, the old process beats through its 30s grace
+    period and saves over the merge (04:14:00 → gone 04:15).
+  - `kill -9 1` inside the container: PID 1 is immune to signals it has no handler for when they come
+    from its OWN namespace, SIGKILL included, so nothing happens at all — `RESTARTS` stays 0 and the
+    snapshot timer takes the merge ~4 minutes later.
+  `--force --grace-period=0` makes the kubelet SIGKILL it, which works. Pass `--json /data/…` so the
+  run's report survives a restarted container's empty `/tmp`.
 - **A run's figures are as-of that run.** Its calibration set is the archive, which grows, so the same
   command a day later lands ~1% different — and a wiped host's old project slugs return as repo series
   (for MaxAI, 67 against the 6 it reports live, ~19% of the estimate in bare-name and `hub-agent-mgr-*`
