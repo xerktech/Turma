@@ -405,6 +405,31 @@ ARCHIVE_RAW_COMPONENT_MAX = 255
 ARCHIVE_RAW_REL_DEPTH_MAX = 10
 ARCHIVE_RAW_REL_LEN_MAX = 400
 
+# Where a dsh session's canonical native event log lives on disk (XERK-469,
+# [dsh][E]). It sits UNDER the project-slug session directory
+# (`<slug>/<sessionId>/dsh/`), NOT in the worktree, precisely so it rides the
+# raw archive layer with no new code: `_session_files` walks `<tid>/**`, the same
+# way it carries subagents/, workflows/ and tool-results/. D3's retention
+# obligation (`.claude/rules/dsh.md`) is that the native, event-sourced log is
+# kept in full for metrics/resume/migration; that is only true if it is archived,
+# and the raw layer archives the project-slug tree, never the worktree (worktree
+# contents are what prune/delete key on and the raw layer excludes on purpose).
+# This RECONCILES the [B] design-of-record (docs/dsh-session-lifecycle.md), which
+# proposed the worktree — a location the raw archive reaches into for nothing.
+#
+# Migration ([K], a separate follow-up already flagged out of scope for [B] v1)
+# is the OTHER consumer of these bytes and is NOT free yet: `_pack_bytes` packs
+# `<tid>.jsonl` + `<tid>/subagents/` + `<tid>/workflows/` by name, not the whole
+# `<tid>/` subtree, so [K] adds one `tar.add(<tid>/dsh)` in the same convention.
+# Placing the store here is what makes that a one-liner rather than a new path.
+#
+# Only APPEND-ONLY files belong here. The raw layer's per-file cursor ships new
+# bytes past a byte offset, which is correct for an event-sourced JSONL log and
+# WRONG for a page-mutating SQLite index (an in-place rewrite leaves the archived
+# early bytes stale). dsh's SQLite is a derived index it rebuilds from the log,
+# so it is not the archived artifact and must not be written into this dir.
+DSH_STORE_DIRNAME = "dsh"
+
 
 def _archivable_rel(rel):
     """Whether the hub's allowlist can name this session-relative path."""
@@ -15684,7 +15709,12 @@ class SessionManager:
           <tid>/subagents/agent-x.jsonl      each delegated agent (+ its .meta.json)
           <tid>/workflows/wf_<run>.json      the workflow run records (XERK-304)
           <tid>/tool-results/<id>.txt        overflowed tool output
+          <tid>/dsh/...                      a dsh session's native event log (XERK-469)
           <tid>/...                          whatever Claude Code adds next
+
+        A dsh session's canonical native log (D3, `.claude/rules/dsh.md`) is
+        written under `<tid>/dsh/` for exactly this reason — placed here it is a
+        raw sidecar like any other and needs no special case (DSH_STORE_DIRNAME).
 
         Deliberately NOT filtered to `*.jsonl`: the point of the raw layer is that
         nobody has to have predicted what would be worth keeping, and the files

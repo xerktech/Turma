@@ -16080,6 +16080,182 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(calls), 1)  # one attempt, then it bails (no loop)
 
 
+class TestDshArchiveSync(TestArchiveSync):
+    """A dsh session archives with BOTH layers and no new archive code (XERK-469,
+    [dsh][E]).
+
+    The whole point of the S1/D3 architecture is symmetry: the dsh->Claude-JSONL
+    projection needs no new READER because it is named `<slug>/<sid>.jsonl` like
+    any transcript, and the native event log needs no new WRITER in the archive
+    because it is placed under `<slug>/<sid>/dsh/` like any raw sidecar. These
+    tests pin that a dsh-SHAPED session on disk — projection at the top level,
+    native event log under `<sid>/dsh/` — flows through the existing manifest and
+    both delta pushes unchanged. There is no live dsh launcher yet (XERK-466 is a
+    stub), so the session is built the way S1's tests build one: from real dsh
+    events (`dsh_corpus.json`) run through the real projector.
+    """
+
+    def _dt(self):
+        """Load the real dsh projector (agent/dsh_transcript.py), as S1's own
+        test does — the projection under test is genuine dsh output, not a
+        hand-rolled JSONL fixture that could drift from the real shape."""
+        path = os.path.join(AGENT_DIR, "dsh_transcript.py")
+        spec = importlib.util.spec_from_file_location("dsh_transcript", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _dsh_events(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "dsh_corpus.json")) as f:
+            return json.load(f)
+
+    def _build_dsh_session(self, sm, wt="/w/.turma/worktrees/Turma/dsh1", sid="d1"):
+        """Lay a dsh session on disk the way the launcher (XERK-466) will:
+
+          <slug>/<sid>.jsonl        the S1 projection (rendered layer reads this)
+          <slug>/<sid>/dsh/events.jsonl   the native, append-only event log (raw)
+
+        Returns (slug, native_rel, native_bytes)."""
+        dt = self._dt()
+        events = self._dsh_events()
+        # The projection — exactly what the launcher appends incrementally.
+        entries = dt.project_log(events, sid, cwd=wt)
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, sid + ".jsonl"),
+                    [json.dumps(e, ensure_ascii=False) for e in entries])
+        # The native event log — dsh's canonical record, retained in full (D3).
+        # Its bytes are the append-only event stream, which is what the raw
+        # layer's per-file cursor is built for.
+        native = b"".join(
+            (json.dumps(e, ensure_ascii=False) + "\n").encode() for e in events)
+        native_rel = os.path.join(sid, ha.DSH_STORE_DIRNAME, "events.jsonl")
+        self._nested(slug, sid, os.path.join(ha.DSH_STORE_DIRNAME, "events.jsonl"),
+                     native)
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm.closed = [{"id": "s", "worktreePath": wt, "summary": "dsh task",
+                      "createdAt": "2026-07-01T00:00:00Z"}]
+        return slug, native_rel, native
+
+    def test_the_store_dir_is_a_fixed_named_contract(self):
+        # The launcher (XERK-466) and this layer must agree on ONE dir name, so a
+        # rename can't strand the native log outside the archive silently.
+        self.assertEqual(ha.DSH_STORE_DIRNAME, "dsh")
+
+    def test_a_dsh_session_appears_in_the_manifest_with_both_layers(self):
+        sm = self.make_manager()
+        slug, native_rel, _ = self._build_dsh_session(sm)
+        manifest = sm._archive_manifest()
+        self.assertEqual(len(manifest), 1)
+        m = manifest[0]
+        # RENDERED: the projection is the transcript the manifest enumerates.
+        self.assertEqual(m["transcriptId"], "d1")
+        self.assertEqual(m["repo"], "Turma")
+        self.assertGreater(m["size"], 0)
+        # RAW: the native event log rides as a sidecar, no special case.
+        rels = [rel for rel, _s in (m["rawFiles"] or [])]
+        self.assertIn("d1.jsonl", rels)
+        self.assertIn(native_rel, rels)
+
+    def test_session_files_lists_the_native_dsh_log(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_dsh_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        sizes = dict(sm._session_files(proj, "d1"))
+        self.assertIn(native_rel, sizes)
+        self.assertEqual(sizes[native_rel], len(native))
+        # Everything the raw layer offers is under the project-slug SESSION tree
+        # (`<sid>.jsonl` or `<sid>/...`) — never the worktree. That subtree is
+        # exactly what a migration ([K]) will pack, so archive and migration
+        # coverage cannot diverge on where the store lives.
+        for rel in sizes:
+            self.assertTrue(rel == "d1.jsonl" or rel.startswith("d1" + os.sep),
+                            rel)
+
+    def test_the_rendered_layer_ships_the_projection(self):
+        sm = self.make_manager()
+        self._build_dsh_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+
+        def fake_chunk(tid, body):
+            # The rendered push carries pre-parsed entries; enough here is that
+            # the projection transcript is what ships and the cursor advances.
+            pushed.append((tid, body.get("startOffset"), body.get("endOffset")))
+            return {"bytesStored": body.get("endOffset")}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fake_chunk):
+            sm._archive_deltas({})
+        self.assertTrue(pushed, "the dsh projection ships through the rendered layer")
+        self.assertEqual({t for t, _s, _e in pushed}, {"d1"})
+
+    def test_the_raw_layer_ships_the_native_log_byte_for_byte(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_dsh_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((tid, rel, start, raw))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        got = {rel: b"".join(r for _t, rl, _s, r in pushed if rl == rel)
+               for _t, rel, _s, _r in pushed}
+        # The native event log went up byte-for-byte, not a rendering of it —
+        # this is D3's canonical record, kept in full for metrics/resume.
+        self.assertIn(native_rel, got)
+        self.assertEqual(got[native_rel], native)
+
+    def test_a_resumed_dsh_log_ships_only_the_appended_bytes(self):
+        # dsh resume (XERK-466) reloads the persisted native log and appends new
+        # events to the SAME file; the raw layer's per-file cursor ships only the
+        # tail, exactly as it does for a resumed Claude transcript — and this is
+        # what a MIGRATION relies on too (same id, byte-identical prefix).
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_dsh_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        path = os.path.join(proj, native_rel)
+        first = os.path.getsize(path)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((rel, start, len(raw)))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        self.assertEqual(stored[native_rel], first)
+
+        # Resume: append one more event line, re-manifest, sync with the hub's
+        # cursor at `first`. Only the appended bytes go up.
+        with open(path, "ab") as f:
+            f.write(json.dumps({"type": "user/message", "seq": 99, "time": 1,
+                                "data": {"message": {"role": "user",
+                                "content": "again"}}}).encode() + b"\n")
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed.clear()
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"d1": {native_rel: first}})
+        tail = [p for p in pushed if p[0] == native_rel]
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0][1], first)  # started at the old EOF, not 0
+        self.assertEqual(stored[native_rel], os.path.getsize(path))
+
+
 class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):
     """The archive's SendUserFile payload budget (XERK-267): the previews are
     bounded per delivery but unbounded relative to the transcript, so a
