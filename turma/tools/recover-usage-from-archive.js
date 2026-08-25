@@ -49,6 +49,9 @@ const fs = require("fs");
 const path = require("path");
 
 const KEYS = ["input", "output", "cacheWrite", "cacheRead"];
+// `hub-agent.py`'s TOKEN_MAX. Above it a figure is not a count, and every layer
+// downstream — this ledger's `num()`, Android's Kotlin `Long` — refuses it.
+const TOKEN_MAX = Number.MAX_SAFE_INTEGER;
 // The raw transcript's own names for the same four figures, in the same order.
 const RAW_KEYS = [
   "input_tokens",
@@ -84,15 +87,30 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument: ${a}`);
   }
   if (!out.host) throw new Error("--host is required (the archive's host name, case-insensitive)");
-  if (!out.before || !/^\d{4}-\d{2}-\d{2}$/.test(out.before)) {
-    throw new Error("--before is required, as YYYY-MM-DD: the first day the ledger's own record is trusted");
+  // A real date, not merely a date-SHAPED string: the day comparison is
+  // lexicographic, so `2026-13-45` silently makes every recorded day estimable —
+  // including the measured ones the cutoff exists to protect.
+  if (!out.before || !isDay(out.before)) {
+    throw new Error("--before is required, as a real YYYY-MM-DD date: the first day the ledger's own record is trusted");
   }
-  if (!Number.isFinite(out.drift) || out.drift <= 0) throw new Error("--drift must be a positive number");
+  const asDate = new Date(`${out.before}T00:00:00Z`);
+  if (Number.isNaN(asDate.getTime()) || asDate.toISOString().slice(0, 10) !== out.before) {
+    throw new Error(`--before ${out.before} is not a real date`);
+  }
+  // Bounded for the same reason: drift multiplies every figure written, and a
+  // large one lands numbers the ledger's own `num()` will coerce back to zero.
+  if (!Number.isFinite(out.drift) || out.drift <= 0 || out.drift > DRIFT_MAX) {
+    throw new Error(`--drift must be a positive number no greater than ${DRIFT_MAX}`);
+  }
   if (!out.calibrateHost) out.calibrateHost = out.host;
   return out;
 }
 
 const blank = () => ({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0 });
+const blankSeries = () => ({
+  pre: blank(), days: {}, models: {}, cutoff: null, subagent: null, sessions: 0, lastActivity: null,
+});
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const tokensOf = (b) => KEYS.reduce((n, k) => n + (b[k] || 0), 0);
 function addInto(dst, src) {
   for (const k of KEYS) dst[k] = (dst[k] || 0) + (src[k] || 0);
@@ -103,13 +121,26 @@ function raiseInto(dst, src) {
   return dst;
 }
 const isDay = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+// Anything above this is an operator typo, not a calibration.
+const DRIFT_MAX = 10;
 
-/** Count a raw usage block the way `_token_count` does: non-negative integers only. */
+/**
+ * One raw usage block, coerced the way `_token_count` does — including its
+ * `TOKEN_MAX` ceiling, which is the half of it that matters here.
+ *
+ * A figure above 2^53-1 is not a token count, and letting one through does not
+ * merely inflate an estimate: the rate it poisons is written to the ledger, and
+ * `usage-ledger.js`'s `num()` refuses a non-safe-integer, so the whole day
+ * bucket loads back as ZERO — destroying measured days the estimate merely
+ * touched. Archived bytes come from every host in the fleet, so this reads
+ * untrusted input.
+ */
 function countRaw(usage) {
   const out = blank();
   RAW_KEYS.forEach((raw, i) => {
     const v = usage[raw];
-    out[KEYS[i]] = typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.trunc(v) : 0;
+    const ok = typeof v === "number" && Number.isFinite(v) && v > 0 && v <= TOKEN_MAX;
+    out[KEYS[i]] = ok ? Math.trunc(v) : 0;
   });
   return out;
 }
@@ -123,6 +154,9 @@ function walkJsonl(dir, files) {
   }
   for (const e of ents) {
     const p = path.join(dir, e.name);
+    // Only REGULAR files, on both branches, for the reason `_project_transcripts`
+    // gives: a directory named `*.jsonl` would read as a transcript, and a FIFO
+    // named one blocks the read forever.
     if (e.isDirectory()) walkJsonl(p, files);
     else if (e.isFile() && e.name.endsWith(".jsonl")) files.push(p);
   }
@@ -158,7 +192,10 @@ function rawUsage(rawDir) {
       const usage = msg && msg.usage;
       if (!usage || typeof usage !== "object") continue;
       const id = typeof msg.id === "string" ? msg.id : "";
-      const key = `${id}|${o.requestId || ""}`;
+      // The agent keys on the TUPLE (id, requestId). Joining them on a separator
+      // makes ("a|b","c") and ("a","b|c") one message, and a numeric requestId 5
+      // the same as "5" — so encode, rather than concatenate.
+      const key = JSON.stringify([id, o.requestId === undefined ? null : o.requestId]);
       if (id && seen.has(key)) continue;
       seen.add(key);
       const day = String(o.timestamp || "").slice(0, 10);
@@ -174,6 +211,7 @@ function rawUsage(rawDir) {
 function renderedChars(file) {
   let txt;
   try {
+    if (!fs.lstatSync(file).isFile()) return null; // never open a FIFO or a link
     txt = fs.readFileSync(file, "utf8");
   } catch {
     return null;
@@ -221,6 +259,11 @@ function inventory(archiveDir) {
     }
     for (const name of names) {
       if (!name.endsWith(".jsonl")) continue;
+      try {
+        if (!fs.lstatSync(path.join(dir, name)).isFile()) continue;
+      } catch {
+        continue;
+      }
       let meta = null;
       try {
         meta = JSON.parse(fs.readFileSync(path.join(dir, `${name}.meta`), "utf8"));
@@ -326,12 +369,18 @@ function main() {
   const repos = Object.create(null);
   let estimated = 0;
   let skippedRaw = 0;
+  let emptyRaw = 0;
   const folded = new Map();
   for (const r of mine) {
-    if (r.rawDir) {
+    // A session with a raw copy is MEASURED — its exact figures are already what
+    // the ledger holds — but only if that copy actually carries usage lines. A
+    // raw directory that yields none gave the ledger nothing either, so treating
+    // its mere existence as "measured" silently drops that session's spend.
+    if (r.rawDir && rawUsage(r.rawDir).entries) {
       skippedRaw += 1;
       continue;
     }
+    if (r.rawDir) emptyRaw += 1;
     const rendered = renderedChars(path.join(r.dir, r.name));
     if (!rendered || !rendered.entries) continue;
     const key = canonical(r.remoteKey, r.repo);
@@ -367,7 +416,12 @@ function main() {
       tokensPerChar: cal.rate,
       appliedTokensPerChar: rate,
     },
-    sessions: { archived: mine.length, measuredSkipped: skippedRaw, estimated },
+    sessions: {
+      archived: mine.length, measuredSkipped: skippedRaw, estimated,
+      // Had a raw copy that carried no usage line at all, so it is estimated
+      // like any rendered-only session rather than trusted as measured.
+      rawWithoutUsage: emptyRaw,
+    },
     days: { count: days.length, first: days[0] || null, last: days[days.length - 1] || null },
     estimatedTokens: total,
     foldedRepoKeys: Object.fromEntries(folded),
@@ -405,7 +459,10 @@ function main() {
   // Raise, never overwrite: the ledger's rule is a per-day high-water mark, and
   // a day it already holds was MEASURED — an estimate must not lower it.
   const merge = (series, dayMap) => {
-    series.days = series.days && typeof series.days === "object" ? series.days : {};
+    if (!series || typeof series !== "object") throw new Error("ledger series is not an object");
+    series.days = series.days && typeof series.days === "object" && !Array.isArray(series.days)
+      ? series.days
+      : {};
     let added = 0;
     for (const [d, b] of Object.entries(dayMap)) {
       if (series.cutoff && d <= series.cutoff) continue; // already folded into `pre`
@@ -415,19 +472,30 @@ function main() {
     return added;
   };
 
-  entry.host = entry.host || { pre: blank(), days: {}, models: {}, cutoff: null, subagent: null, sessions: 0, lastActivity: null };
-  let addedDays = merge(entry.host, hostDays);
-  entry.repos = entry.repos && typeof entry.repos === "object" ? entry.repos : {};
+  if (!entry.host || typeof entry.host !== "object" || Array.isArray(entry.host)) entry.host = blankSeries();
+  const addedDays = merge(entry.host, hostDays);
+  if (!entry.repos || typeof entry.repos !== "object" || Array.isArray(entry.repos)) entry.repos = {};
   let addedRepos = 0;
+  let raisedRepos = 0;
   for (const [key, r] of Object.entries(repos)) {
-    if (!key || key === "__proto__") continue;
-    if (!entry.repos[key]) {
+    if (!key) continue;
+    // `has`, not truthiness: `entry.repos.constructor` INHERITS a function from
+    // Object.prototype, so a repo literally named `constructor` (or `toString`,
+    // `valueOf`, …) read as an existing row and then dereferenced undefined.
+    // `entryOf` drops `__proto__` outright, so a series under that key would be
+    // written and never loaded — it goes to the host series only, loudly.
+    if (key === "__proto__") {
+      console.warn(`skipping repo series "${key}": the ledger's loader drops it — its tokens remain in the host series`);
+      continue;
+    }
+    if (!has(entry.repos, key)) {
       addedRepos += 1;
-      entry.repos[key] = {
-        repo: r.repo,
-        remote: "",
-        series: { pre: blank(), days: {}, models: {}, cutoff: null, subagent: null, sessions: 0, lastActivity: null },
-      };
+      entry.repos[key] = { repo: r.repo, remote: "", series: blankSeries() };
+    } else {
+      raisedRepos += 1;
+      const row = entry.repos[key];
+      if (!row || typeof row !== "object") throw new Error(`ledger repo "${key}" is not an object`);
+      if (!row.series || typeof row.series !== "object" || Array.isArray(row.series)) row.series = blankSeries();
     }
     merge(entry.repos[key].series, r.days);
   }
@@ -437,9 +505,11 @@ function main() {
   entry.augments = true;
 
   fs.writeFileSync(opts.ledger, `${JSON.stringify(parsed)}\n`);
+  const touched = Object.keys(hostDays).length;
   console.log(
-    `\nwrote ${opts.ledger}: +${addedDays} day bucket(s) on the host series, ` +
-      `${addedRepos} new repo series (backup: ${backup})`
+    `\nwrote ${opts.ledger}: ${touched} day(s) merged into the host series ` +
+      `(${addedDays} new, ${touched - addedDays} already recorded and raised where the estimate was higher), ` +
+      `${addedRepos} new repo series, ${raisedRepos} existing (backup: ${backup})`
   );
   console.log("RESTART THE HUB — it rewrites this file from memory on its next save.");
 }

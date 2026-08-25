@@ -191,3 +191,145 @@ test("refuses a host with no archived session at all", () => {
     (e) => /no archived sessions for host "nobody"/.test(String(e.stderr))
   );
 });
+
+test("leaves days at or after the cutoff to the hub's own measured record", () => {
+  const { root, archive } = fixture();
+  // Rendered-only AND after the cutoff: the hub measured that day itself, so the
+  // estimator must not touch it. Without the guard this session is estimated and
+  // the max rule can raise a measured bucket with a guess.
+  session(archive, "turma", "2026-08-18__after__wiped__eeee.jsonl", {
+    meta: { transcriptId: "eeee", host: "WIPED", remoteKey: "github.com/x/turma", repo: "Turma" },
+    rendered: [asst("2026-08-18", "w".repeat(5000))],
+  });
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  const out = JSON.parse(
+    run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+      "--archive", archive, "--ledger", ledger, "--drift", "1"]).split("\n-- dry")[0]
+  );
+  assert.deepEqual(out.days, { count: 1, first: "2026-07-01", last: "2026-07-01" });
+  assert.equal(out.estimatedTokens, 2020);
+});
+
+test("skips a day a series has already folded into `pre`", () => {
+  const { root, archive } = fixture();
+  const ledger = ledgerFile(root, {
+    WIPED: {
+      device: "WIPED",
+      // Everything up to 2026-07-05 is inside `pre` already; re-admitting the
+      // 07-01 bucket would have the next trim add it to `pre` a SECOND time.
+      host: { ...series({}), cutoff: "2026-07-05" },
+      repos: {},
+    },
+  });
+  run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+    "--archive", archive, "--ledger", ledger, "--drift", "1", "--write"]);
+  const after = JSON.parse(fs.readFileSync(ledger, "utf8")).hosts.WIPED;
+  assert.deepEqual(Object.keys(after.host.days), []);
+  // The repo series is new, so it has no cutoff and does take the day.
+  assert.deepEqual(Object.keys(after.repos["github.com/x/turma"].series.days), ["2026-07-01"]);
+});
+
+test("a token figure above TOKEN_MAX counts as zero, and cannot destroy a measured day", () => {
+  const root = tmp();
+  const archive = path.join(root, "archive");
+  session(archive, "turma", "2026-08-20__cal__wiped__aaaa.jsonl", {
+    meta: { transcriptId: "aaaa", host: "WIPED", remoteKey: "github.com/x/turma", repo: "Turma" },
+    rendered: [asst("2026-08-20", "x".repeat(100))],
+    raw: [{
+      timestamp: "2026-08-20T10:00:00Z",
+      requestId: "r1",
+      message: { id: "m1", model: "claude-opus-5", usage: {
+        // Not a token count. Left unbounded it poisons the rate, the estimate is
+        // written as 1e+308, and `usage-ledger.js`'s `num()` — which requires a
+        // safe integer — loads the whole bucket back as 0, taking the measured
+        // figures beside it with it.
+        input_tokens: 1e308, output_tokens: Number.MAX_SAFE_INTEGER + 2,
+        cache_creation_input_tokens: -5, cache_read_input_tokens: 700,
+      } },
+    }],
+  });
+  session(archive, "turma", "2026-07-01__old__wiped__bbbb.jsonl", {
+    meta: { transcriptId: "bbbb", host: "WIPED", remoteKey: "github.com/x/turma", repo: "Turma" },
+    rendered: [asst("2026-07-01", "y".repeat(100))],
+  });
+  const measured = { input: 111, output: 222, cacheWrite: 333, cacheRead: 444 };
+  const ledger = ledgerFile(root, {
+    WIPED: { device: "WIPED", host: series({ "2026-07-01": measured }), repos: {} },
+  });
+  run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+    "--archive", archive, "--ledger", ledger, "--drift", "1", "--write"]);
+  const day = JSON.parse(fs.readFileSync(ledger, "utf8")).hosts.WIPED.host.days["2026-07-01"];
+  assert.equal(day.input, 111); // the unusable figures counted 0, so nothing rose
+  assert.equal(day.output, 222);
+  assert.equal(day.cacheWrite, 333);
+  assert.equal(day.cacheRead, 700); // the one real figure did
+  for (const v of Object.values(day)) assert.ok(Number.isSafeInteger(v), `${v} is not a safe integer`);
+});
+
+test("a repo named after an Object.prototype member neither crashes nor pollutes", () => {
+  const { root, archive } = fixture();
+  for (const name of ["constructor", "toString"]) {
+    session(archive, "turma", `2026-07-04__${name}__wiped__f${name}.jsonl`, {
+      meta: { transcriptId: `f${name}`, host: "WIPED", remoteKey: name, repo: name },
+      rendered: [asst("2026-07-04", "p".repeat(100))],
+    });
+  }
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+    "--archive", archive, "--ledger", ledger, "--drift", "1", "--write"]);
+  const after = JSON.parse(fs.readFileSync(ledger, "utf8")).hosts.WIPED;
+  assert.ok(Object.keys(after.repos).includes("constructor"));
+  assert.deepEqual(Object.keys(after.repos.toString.series.days), ["2026-07-04"]);
+  assert.equal({}.repo, undefined);
+});
+
+test("a raw copy carrying no usage line is estimated, not written off as measured", () => {
+  const { root, archive } = fixture();
+  session(archive, "turma", "2026-07-05__emptyraw__wiped__gggg.jsonl", {
+    meta: { transcriptId: "gggg", host: "WIPED", remoteKey: "github.com/x/turma", repo: "Turma" },
+    rendered: [asst("2026-07-05", "e".repeat(100))],
+    // Synced, but nothing in it carries a usage block — so the ledger got nothing
+    // from it either, and skipping it as "measured" would drop the session.
+    raw: [{ type: "mode", mode: "normal" }],
+  });
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  const out = JSON.parse(
+    run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+      "--archive", archive, "--ledger", ledger, "--drift", "1"]).split("\n-- dry")[0]
+  );
+  assert.equal(out.sessions.rawWithoutUsage, 1);
+  assert.equal(out.sessions.estimated, 2);
+  assert.deepEqual(out.days.first, "2026-07-01");
+  assert.deepEqual(out.days.last, "2026-07-05");
+});
+
+test("refuses a date-shaped non-date and an absurd drift", () => {
+  const { root, archive } = fixture();
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  const base = ["--host", "wiped", "--ledger-host", "WIPED", "--archive", archive, "--ledger", ledger];
+  // Lexicographic comparison: a typo'd month puts every measured day back in
+  // scope for an estimate.
+  assert.throws(
+    () => run([...base, "--before", "2026-13-45"], { stdio: "pipe" }),
+    (e) => /not a real date/.test(String(e.stderr))
+  );
+  assert.throws(
+    () => run([...base, "--before", "2026-08-16", "--drift", "1e308"], { stdio: "pipe" }),
+    (e) => /--drift must be a positive number no greater than/.test(String(e.stderr))
+  );
+});
+
+test("never opens a non-regular file where a transcript is expected", () => {
+  const { root, archive } = fixture();
+  // A DIRECTORY named *.jsonl inside a raw copy would read as a transcript; the
+  // FIFO of the same shape is what actually wedges a walk forever.
+  const rawDir = path.join(archive, "turma", "2026-08-20__cal__wiped__aaaa.jsonl.raw", "aaaa");
+  fs.mkdirSync(path.join(rawDir, "nested.jsonl"), { recursive: true });
+  fs.mkdirSync(path.join(archive, "turma", "2026-07-09__dir__wiped__hhhh.jsonl"), { recursive: true });
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  const out = JSON.parse(
+    run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+      "--archive", archive, "--ledger", ledger, "--drift", "1"]).split("\n-- dry")[0]
+  );
+  assert.equal(out.estimatedTokens, 2020);
+});

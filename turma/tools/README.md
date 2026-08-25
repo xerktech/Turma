@@ -23,8 +23,12 @@ format marks a bucket as estimated, and nothing downstream distinguishes one, so
   token counts.
 - The archive's **raw** layer does carry the transcripts' own usage blocks, but it
   only ever held what was still on the host's disk when the sync ran. After a wipe
-  that is nothing older than the wipe, so it re-derives exactly the days the
-  ledger already has (verified: day-for-day identical on MaxAI, 2026-08-16 → 25).
+  that is nothing older than the wipe, so it re-derives the days the ledger already
+  has and nothing else. Verified on MaxAI's 148 raw copies: **2026-08-16 → 08-21
+  come back identical to the ledger, all four figures**, and 08-22 → 08-25 come
+  back LOWER because those days still have live sessions the archive has not taken
+  yet. That agreement is what says the parser is faithful; the absence of any
+  earlier day is what says the raw layer cannot cross a wipe.
 - The ledger's per-day high-water rule preserves only days it was **told** about
   before the wipe.
 
@@ -49,6 +53,11 @@ estimate can never lower a measured day.
 - **Not reconstructed:** the per-model breakdown and the sub-agent split. Both are
   stored as totals with no day buckets, so there is no anchor to apportion against
   and doing it anyway would be fabrication.
+- **A figure above `TOKEN_MAX` (2^53-1) counts as zero**, as `_token_count` does.
+  Not for tidiness: the ledger's `num()` refuses a non-safe integer, so one absurd
+  value in a CALIBRATION transcript poisons the rate, is written out as `1e+308`,
+  and loads back as a zeroed day — taking the measured figures in that bucket with
+  it. The tool reads archived bytes from every host in the fleet.
 
 ### Running it
 
@@ -68,6 +77,12 @@ kubectl -n ai exec -i <turma-pod> -- sh -c 'cat > /tmp/recover.js && node /tmp/r
 - `--before` is the first day the ledger's own record is trusted; days at or after
   it are left exactly as the hub recorded them.
 
+`--drift` is capped and `--before` must be a real date, not merely a date-shaped
+string: the day comparison is lexicographic, so a typo'd `2026-13-45` would put
+every measured day back in scope for an estimate.
+
 Add `--write` to merge. It backs the ledger up beside itself first, and **the hub
 must be restarted afterwards** — it holds the ledger in memory and rewrites the
-whole file on its next save, which would otherwise throw the merge away.
+whole file on its next save, which would otherwise throw the merge away. For the
+same reason, anything the hub saves BETWEEN the tool's read and that restart is
+discarded — keep the gap short, and treat the backup as the way back.

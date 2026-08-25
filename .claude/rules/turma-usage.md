@@ -180,8 +180,10 @@ paths:
 - **A host wiped before the ledger ever saw it cannot be recovered from anything measured**, and the
   archive is not the exception people reach for: its rendered layer carries no token counts, and its
   raw layer only ever held what was still on the host's disk when the sync ran — after a wipe, nothing
-  older than it. Re-deriving MaxAI's raw layer reproduced the ledger's own days EXACTLY (2026-08-16 →
-  25, all four figures), which is the proof that the raw layer adds nothing across a wipe.
+  older than it. Re-deriving MaxAI's 148 raw copies reproduced the ledger's own days exactly for
+  2026-08-16 → 08-21 (all four figures; 08-22 → 08-25 come back lower, having live sessions the
+  archive has not taken yet) and produced NO earlier day at all — the first half says the parser is
+  faithful, the second that the raw layer cannot cross a wipe.
 - So the tool ESTIMATES, from the rendered text: tokens-per-rendered-character calibrated on sessions
   holding both layers, applied to the rendered-only sessions before the wipe. Accurate in bulk (±20%
   over ~250 sessions), useless per day (±2–6x), and biased LOW on purpose (`--drift`), since a max-rule
@@ -190,6 +192,10 @@ paths:
   PR, or a later reader reads fabrication as fact. Runs to date:
   - **MaxAI, 2026-06-16 → 2026-08-15, 48 days, ~5.34B tokens, injected 2026-08-25.** OS wipe ~08-15;
     the ledger was created 08-18, after it. Days from 08-16 are the hub's own measured record.
+- **A figure above `TOKEN_MAX` counts as 0 there too.** `num()` refuses a non-safe integer, so one
+  absurd value in a calibration transcript poisons the rate and lands a day bucket that loads back
+  ZEROED — destroying the measured figures in it. An estimator that writes into this store has to
+  coerce like `_token_count`, not merely like a number.
 - Attribution is the `.meta` **`host`** field, never the host segment of an archived file's NAME — a
   migrated session keeps the name it was first archived under, so reading the name credits its spend
   to the wrong host. Repo keys fold a bare name onto a URL key when exactly one URL key claims that
