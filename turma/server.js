@@ -207,6 +207,13 @@ function localModelAvailable(agent) {
   return Boolean(agent && agent.localModel && agent.localModel.available);
 }
 
+// Whether a host offers the dsh runtime (XERK-460) — the capability gate the
+// composer's runtime selector is shown on, and the spawn route validates a
+// `dsh` choice against. An ABSENT flag (a pre-dsh agent) means "cannot do it".
+function dshAvailable(agent) {
+  return Boolean(agent && agent.dsh && agent.dsh.available);
+}
+
 // Whether `model` is one the host's discovered set serves (XERK-489) — the
 // membership check that makes the dropdown honest, mirroring checkSpawnModelSource.
 // An EMPTY set (older agent, or discovery not landed) cannot DISPROVE membership,
@@ -254,6 +261,21 @@ function checkSpawnModelSource(cmd, hostKey) {
   if (cmd.localModel != null && cmd.modelSource === "local" &&
       !localModelServes(agents[hostKey], cmd.localModel)) {
     return { status: 409, error: "host does not serve that local model" };
+  }
+  return null;
+}
+
+// Same enum + capability gate for the runtime choice (XERK-460): a dsh spawn is
+// refused for a host that does not offer dsh, so a stale composer's click gets a
+// clear 409 rather than a session the host silently drops. The agent re-validates
+// too (resolve_agent_type) — this is the hub half of that contract.
+function checkSpawnAgentType(cmd, hostKey) {
+  if (cmd.agentType == null) return null;
+  if (!["claude", "dsh"].includes(cmd.agentType)) {
+    return { status: 400, error: "agentType must be claude or dsh" };
+  }
+  if (cmd.agentType === "dsh" && !dshAvailable(agents[hostKey])) {
+    return { status: 409, error: "host does not offer the dsh runtime" };
   }
   return null;
 }
@@ -2034,6 +2056,10 @@ function startMigration(srcHost, s, targetHost) {
       // move onto a host without one falls back rather than launching at an
       // endpoint that isn't there.
       modelSource: s.modelSource || null,
+      // Which runtime the moved session ran on (XERK-460), re-validated against
+      // the target's own dsh capability (a move onto a host without dsh falls
+      // back to claude), the same story as modelSource above.
+      agentType: s.agentType || null,
       // And WHICH self-hosted model + window (XERK-489), carried so a moved
       // local session keeps it — the target re-validates against its own
       // discovered set and falls back to its default when it serves a different
@@ -2103,7 +2129,7 @@ function startArchiveRestore(row, files, targetHost) {
     siteKey: siteKeyOf(tgt), repo: row.repo,
     transcriptId: row.transcriptId,
     meta: {
-      model: null, permissionMode: null, modelSource: null,
+      model: null, permissionMode: null, modelSource: null, agentType: null,
       // The archive's own summary is the only name this session still has; the
       // rest of the identity a move carries (model, mode, ticket) lived on the
       // heartbeat of a host that is gone, so the resumed session takes the
@@ -2754,6 +2780,22 @@ function normalizeLocalModel(payload) {
     models,
     defaultModel,
   };
+}
+
+// The dsh-runtime capability flag (XERK-460), the exact shape and threat model as
+// normalizeLocalModel: Android decodes /api/agents atomically into typed fields,
+// so one host's `dsh.available: "yes"` would fail the whole fleet decode. Strictly
+// boolean, so a non-`true` value — a truthy string included — reads as "this host
+// cannot do dsh", which is what makes the composer HIDE the runtime selector for
+// it rather than queue a spawn the host will refuse.
+function normalizeDsh(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const d = payload.dsh;
+  if (!d || typeof d !== "object" || Array.isArray(d)) {
+    if ("dsh" in payload) payload.dsh = null;
+    return;
+  }
+  payload.dsh = { available: d.available === true };
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
@@ -3608,7 +3650,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "gitSources", "github", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "uploadMaxBytes", "usage",
   "historyResults", "subagentHistoryResults", "jiraIssueResults",
@@ -3888,6 +3930,7 @@ function normalizeRecord(a) {
   normalizeLimits(a);
   normalizeSubscription(a);
   normalizeLocalModel(a);
+  normalizeDsh(a);
   normalizeModels(a);
   normalizeSpawnRefusals(a);
   normalizeRetired(a);
@@ -4113,7 +4156,7 @@ function normalizeSessions(payload) {
     if (live && "agents" in live) {
       live.agents = sanitizeLiveAgents(live.agents) || [];
     }
-    for (const k of ["modelSource", "modelSourceAt"]) {
+    for (const k of ["modelSource", "modelSourceAt", "agentType"]) {
       if (k in s && typeof s[k] !== "string") s[k] = "";
     }
   }
@@ -8079,6 +8122,7 @@ const server = http.createServer(async (req, res) => {
         model: m.meta.model,
         permissionMode: m.meta.permissionMode,
         modelSource: m.meta.modelSource,
+        agentType: m.meta.agentType,
         localModelName: m.meta.localModelName,
         localModelContext: m.meta.localModelContext,
         summary: m.meta.summary,
@@ -8501,13 +8545,15 @@ const server = http.createServer(async (req, res) => {
       }
       const cmd = { type: "spawn", repo, prompt };
       for (const f of ["label", "baseRef", "model", "permissionMode",
-                       "modelSource", "localModel"]) {
+                       "modelSource", "localModel", "agentType"]) {
         if (typeof body[f] === "string" && body[f].trim()) cmd[f] = body[f].trim();
       }
       // Same enum as the switch route: a spawn is the OTHER way onto the local
       // model, so junk must 400 here rather than land as an errored session card.
       const spawnSourceErr = checkSpawnModelSource(cmd, hostname);
       if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
+      const spawnTypeErr = checkSpawnAgentType(cmd, hostname);
+      if (spawnTypeErr) return json(res, spawnTypeErr.status, { error: spawnTypeErr.error });
       const cmdId = queueCommand(hostname, cmd);
       return json(res, 200, { ok: true, cmdId });
     }
@@ -8533,7 +8579,7 @@ const server = http.createServer(async (req, res) => {
         }
         const cmd = { type: "spawn", repo: body.repo };
         for (const f of ["prompt", "label", "baseRef", "model", "permissionMode",
-                         "modelSource", "localModel"]) {
+                         "modelSource", "localModel", "agentType"]) {
           if (body[f] != null && body[f] !== "") {
             if (typeof body[f] !== "string") {
               return json(res, 400, { error: `${f} must be a string` });
@@ -8549,6 +8595,8 @@ const server = http.createServer(async (req, res) => {
         }
         const spawnSourceErr = checkSpawnModelSource(cmd, key);
         if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
+        const spawnTypeErr = checkSpawnAgentType(cmd, key);
+        if (spawnTypeErr) return json(res, spawnTypeErr.status, { error: spawnTypeErr.error });
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
@@ -10033,6 +10081,7 @@ if (process.env.TURMA_TEST) {
     // the one both the ingest path and the state.json restore call.
     normalizeRecord,
     normalizeLocalModel,
+    normalizeDsh,
     normalizeRetired,
     normalizeJira,
     normalizeClones,

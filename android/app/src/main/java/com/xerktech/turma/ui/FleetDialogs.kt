@@ -37,6 +37,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.xerktech.turma.core.ModelSource
+import com.xerktech.turma.core.Runtime
+import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.LocalModelInfo
 import com.xerktech.turma.model.RepoInfo
 
@@ -58,8 +60,9 @@ fun SpawnDialog(
     repo: String,
     isRoot: Boolean,
     localModel: LocalModelInfo? = null,
+    dsh: DshInfo? = null,
     onDismiss: () -> Unit,
-    onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String, modelSource: String) -> Unit,
+    onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String, modelSource: String, agentType: String) -> Unit,
 ) {
     var prompt by remember { mutableStateOf("") }
     var label by remember { mutableStateOf("") }
@@ -67,13 +70,21 @@ fun SpawnDialog(
     var model by remember { mutableStateOf("default") }
     var mode by remember { mutableStateOf("auto") }
     var modelSource by remember { mutableStateOf(ModelSource.SUBSCRIPTION) }
+    var agentType by remember { mutableStateOf(Runtime.CLAUDE) }
     val sourceOpts = remember(localModel) { ModelSource.options(localModel) }
+    val runtimeOpts = remember { Runtime.options() }
     // Never keep a choice the operator can no longer see. If the host stops
     // reporting a local model while the composer is open, the "Run against" row
     // disappears — and a `local` left behind in state would spawn into a
     // guaranteed 409 with nothing on screen explaining it or able to change it.
     LaunchedEffect(localModel?.available) {
         if (!ModelSource.composerOffers(localModel)) modelSource = ModelSource.SUBSCRIPTION
+    }
+    // Same for the runtime: if the host stops offering dsh while the composer is
+    // open, the "Runtime" row disappears, so a `dsh` left in state would spawn
+    // into a guaranteed 409 with nothing on screen to explain or change it.
+    LaunchedEffect(dsh?.available) {
+        if (!Runtime.composerOffers(dsh)) agentType = Runtime.CLAUDE
     }
 
     AlertDialog(
@@ -110,6 +121,16 @@ fun SpawnDialog(
                 // would silently give an Android-spawned session a different
                 // model from a web-spawned one. Only the CHAT bar fixes the
                 // model, because there the picker would break a live session.
+                // Runtime leads the model/permission rows when offered: it picks
+                // WHICH agent runs, on the same capability gate as "Run against".
+                if (Runtime.composerOffers(dsh)) {
+                    DropdownField(
+                        label = "Runtime",
+                        options = runtimeOpts.map { it.first },
+                        selected = agentType,
+                        optionLabel = { v -> runtimeOpts.firstOrNull { it.first == v }?.second ?: v },
+                    ) { agentType = it }
+                }
                 DropdownField("Model", MODELS, model) { model = it }
                 DropdownField("Permission mode", MODES, mode) { mode = it }
                 if (ModelSource.composerOffers(localModel)) {
@@ -123,7 +144,7 @@ fun SpawnDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = { onSpawn(prompt, label, baseRef, model, mode, modelSource) }) {
+            TextButton(onClick = { onSpawn(prompt, label, baseRef, model, mode, modelSource, agentType) }) {
                 Text("Spawn")
             }
         },

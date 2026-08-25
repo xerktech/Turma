@@ -2,6 +2,9 @@
 paths:
   - "poc/turma-2.0-poc/**"
   - "agent/**"
+  - "turma/server.js"
+  - "turma/public/sessions.html"
+  - "android/**"
 ---
 
 # dsh integration — architecture decisions (ADR)
@@ -28,6 +31,37 @@ files as each child ships, and this file's `paths:` widens then.
   `resume`), `agent.followup(msg)` (not `inbox.append`, which never wakes the driver), and
   `handle.dispose()` (not arg-less `cancel`). The model rides a hand-declared OpenAI-compatible
   `dsh-llm-pi-ai` route (D5). Detail + recorded run in `poc/turma-2.0-poc/README.md`.
+
+## [A] (XERK-465) shipped: runtime field + capability flag
+
+The runtime-SELECTION plumbing is in place; the dsh LAUNCHER is [B] (XERK-466). What landed, and the
+invariants a later child must not undo:
+
+- **`agentType` ∈ {"claude","dsh"} is a per-session record field**, default "claude", validated at
+  spawn (`resolve_agent_type`) like every spawn enum and carried on every record-rebuild path
+  (spawn, `_remember_closed`, resume, resume-transcript, `_resume_at_cwd`, `receive_migration`) plus
+  `_session_payload`. It is PRESENTATIONAL — it grants nothing and says nothing about the dsh
+  process model. An agent predating it reports nothing; the hub coerces the session field to `""` in
+  `normalizeSessions`, which reads as claude.
+- **`dsh` is the heartbeat capability block `{available}`**, mirroring `localModel`: backed by
+  `dsh_configured()` (env gate `TURMA_DSH`, OFF by default so every current host degrades),
+  coerced strict-boolean by `normalizeDsh`, a `HEARTBEAT_KNOWN_KEYS` member, typed on Android
+  (`AgentInfo.dsh: DshInfo?`). Absent/false = "this host cannot do dsh", so the composer HIDES the
+  runtime selector rather than queue a spawn the host refuses. Both spawn routes 409 a `dsh` choice
+  at a host with no capability (`checkSpawnAgentType`), and the agent re-validates
+  (`resolve_agent_type`).
+- **`_launch_tmux` is the single launch choke point, and its FIRST action is the runtime dispatch**:
+  `if sess.agentType == "dsh": self._launch_dsh(sess); return`. `_launch_dsh` is [A]'s stub — it
+  refuses via `_set_error("dsh runtime launcher not yet available (XERK-466)")`. **XERK-466 replaces
+  that method's BODY with the real per-session dsh launch**; the dispatch line and choke point stay.
+  Do not hoist the dispatch to the ~6 callers — they all funnel through `_launch_tmux`.
+- **Composer + card**: `sessions.html` gates a "Runtime" `<select>` on `a.dsh.available` and sends
+  `agentType` only when "dsh" (a bare spawn is unchanged); `runtimeMarkHtml` badges a dsh card.
+  Android mirrors the composer (`core/Runtime.kt`, `SpawnDialog`'s Runtime row); the dsh card badge
+  is deferred in `android/PARITY.md` alongside the local-model card mark.
+- Tests: `TestSpawnOptionHelpers`/`TestSessionLifecycle` (agent), `normalizeDsh`/spawn-route/restore
+  cases (`server.test.js`), the Runtime cases in `sessions.test.js`, `RuntimeTest`/`SpawnRequestTest`/
+  `SpawnComposerTest`/`AgentDecodeTest` (android).
 
 ## D1 — Where dsh runs: inside the existing agent container
 

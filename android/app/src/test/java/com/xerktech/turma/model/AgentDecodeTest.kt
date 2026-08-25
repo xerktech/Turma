@@ -126,6 +126,32 @@ class AgentDecodeTest {
         assertEquals("subscription", off.sessions[0].modelSource)
     }
 
+    // XERK-460: the dsh capability flag + per-session runtime. Typing these is
+    // what makes them decode-fatal if wrong, so the shape is pinned here — the
+    // available/absent block and the session's agentType.
+    @Test fun `the dsh block and session agentType decode`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "on", "device": "on", "online": true,
+                "dsh": { "available": true },
+                "sessions": [ { "id": "s1", "agentType": "dsh" } ] },
+              { "key": "off", "device": "off", "online": true,
+                "dsh": { "available": false },
+                "sessions": [ { "id": "s2", "agentType": "claude" } ] },
+              { "key": "old", "device": "old", "online": true,
+                "sessions": [ { "id": "s3" } ] }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        assertEquals(true, resp.agents[0].dsh?.available)
+        assertEquals("dsh", resp.agents[0].sessions[0].agentType)
+        assertEquals(false, resp.agents[1].dsh?.available)
+        assertEquals("claude", resp.agents[1].sessions[0].agentType)
+        // A pre-dsh agent sends neither; both read as absent/default, never a throw.
+        assertNull(resp.agents[2].dsh)
+        assertEquals("", resp.agents[2].sessions[0].agentType)
+    }
+
     // What hub-agent actually emits for a session that never moved:
     // `_session_payload` sends `modelSourceAt: sess.get("modelSourceAt")`, i.e.
     // a JSON null, on EVERY such session. A non-nullable field would throw and
