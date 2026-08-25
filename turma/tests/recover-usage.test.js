@@ -172,6 +172,16 @@ test("folds a bare repo name onto the URL key exactly one repo claims", () => {
   assert.deepEqual(Object.keys(out.byRepo), ["github.com/x/turma"]);
 });
 
+test("refuses a host row that is not an object, rather than overwriting it", () => {
+  const { root, archive } = fixture();
+  const ledger = ledgerFile(root, { WIPED: null });
+  assert.throws(
+    () => run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+      "--archive", archive, "--ledger", ledger, "--write"], { stdio: "pipe" }),
+    (e) => /host "WIPED" is not an object/.test(String(e.stderr))
+  );
+});
+
 test("refuses a host the ledger does not hold, naming the ones it does", () => {
   const { root, archive } = fixture();
   const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
@@ -207,6 +217,64 @@ test("leaves days at or after the cutoff to the hub's own measured record", () =
       "--archive", archive, "--ledger", ledger, "--drift", "1"]).split("\n-- dry")[0]
   );
   assert.deepEqual(out.days, { count: 1, first: "2026-07-01", last: "2026-07-01" });
+  assert.equal(out.estimatedTokens, 2020);
+});
+
+test("says what it WROTE, not what it was offered, when a cutoff skips a day", () => {
+  const { root, archive } = fixture();
+  const ledger = ledgerFile(root, {
+    WIPED: { device: "WIPED", host: { ...series({}), cutoff: "2026-07-05" }, repos: {} },
+  });
+  const out = run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+    "--archive", archive, "--ledger", ledger, "--drift", "1", "--write"]);
+  // Every offered day is inside `pre` already, so nothing lands on the host
+  // series — a summary that counted the offer would read as 1 day recovered.
+  assert.match(out, /host series 0 day\(s\) added, 0 already recorded and raised[^;]*, 1 skipped as already inside/);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(ledger, "utf8")).hosts.WIPED.host.days), []);
+});
+
+test("dedupes on the (id, requestId) TUPLE, not on the two joined", () => {
+  const root = tmp();
+  const archive = path.join(root, "archive");
+  session(archive, "turma", "2026-08-20__cal__wiped__aaaa.jsonl", {
+    meta: { transcriptId: "aaaa", host: "WIPED", remoteKey: "github.com/x/turma", repo: "Turma" },
+    rendered: [asst("2026-08-20", "x".repeat(100))],
+    raw: [
+      // Two DIFFERENT turns that a separator-joined key collapses into one, and
+      // a numeric id, which the agent dedupes on and a string-typed one does not.
+      turn("2026-08-20", "a|b", "c", usage(10)),
+      turn("2026-08-20", "a", "b|c", usage(10)),
+      turn("2026-08-20", 7, "r", usage(10)),
+      turn("2026-08-20", 7, "r", usage(10)),
+    ],
+  });
+  session(archive, "turma", "2026-07-01__old__wiped__bbbb.jsonl", {
+    meta: { transcriptId: "bbbb", host: "WIPED", remoteKey: "github.com/x/turma", repo: "Turma" },
+    rendered: [asst("2026-07-01", "y".repeat(100))],
+  });
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  const out = JSON.parse(
+    run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+      "--archive", archive, "--ledger", ledger, "--drift", "1"]).split("\n-- dry")[0]
+  );
+  // Three distinct turns at 1010 tokens each over 100 calibration characters,
+  // applied to 100 estimated characters.
+  assert.equal(out.estimatedTokens, 3030);
+});
+
+test("a FIFO named like a transcript does not wedge the walk", () => {
+  const { root, archive } = fixture();
+  const fifo = path.join(archive, "turma", "2026-07-06__fifo__wiped__iiii.jsonl");
+  // The case that actually hangs: `readFileSync` on a FIFO with no writer blocks
+  // forever, on a tool an operator runs inside the hub container. A DIRECTORY of
+  // the same name throws EISDIR instead, so it does not reproduce this.
+  execFileSync("mkfifo", [fifo]);
+  fs.writeFileSync(`${fifo}.meta`, JSON.stringify({ transcriptId: "iiii", host: "WIPED", remoteKey: "github.com/x/turma", repo: "Turma" }));
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  const out = JSON.parse(
+    run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+      "--archive", archive, "--ledger", ledger, "--drift", "1"], { timeout: 20000 }).split("\n-- dry")[0]
+  );
   assert.equal(out.estimatedTokens, 2020);
 });
 

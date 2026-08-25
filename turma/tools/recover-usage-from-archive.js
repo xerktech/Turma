@@ -191,7 +191,10 @@ function rawUsage(rawDir) {
       const msg = o && o.message;
       const usage = msg && msg.usage;
       if (!usage || typeof usage !== "object") continue;
-      const id = typeof msg.id === "string" ? msg.id : "";
+      // Any truthy id, not just a string: `_accumulate_usage` dedupes on
+      // `key[0] and key in acc.seen`, so a numeric id dedupes there and would
+      // inflate the calibration rate here if it did not dedupe too.
+      const id = msg.id === undefined ? null : msg.id;
       // The agent keys on the TUPLE (id, requestId). Joining them on a separator
       // makes ("a|b","c") and ("a","b|c") one message, and a numeric requestId 5
       // the same as "5" — so encode, rather than concatenate.
@@ -446,7 +449,10 @@ function main() {
   if (!parsed || typeof parsed !== "object" || !parsed.hosts || typeof parsed.hosts !== "object") {
     throw new Error(`${opts.ledger} has no \`hosts\` object`);
   }
-  const entry = parsed.hosts[ledgerHost];
+  const entry = has(parsed.hosts, ledgerHost) ? parsed.hosts[ledgerHost] : undefined;
+  if (has(parsed.hosts, ledgerHost) && (!entry || typeof entry !== "object" || Array.isArray(entry))) {
+    throw new Error(`${opts.ledger}'s host "${ledgerHost}" is not an object — refusing to overwrite it`);
+  }
   if (!entry) {
     throw new Error(
       `${opts.ledger} holds no host "${ledgerHost}" (has: ${Object.keys(parsed.hosts).join(", ")}) — ` +
@@ -463,17 +469,24 @@ function main() {
     series.days = series.days && typeof series.days === "object" && !Array.isArray(series.days)
       ? series.days
       : {};
-    let added = 0;
+    // Counted as WRITTEN, never as offered: a day at or below the series' cutoff
+    // is skipped, and reporting it as merged tells an operator days were
+    // recovered where none landed.
+    const n = { added: 0, raised: 0, skipped: 0 };
     for (const [d, b] of Object.entries(dayMap)) {
-      if (series.cutoff && d <= series.cutoff) continue; // already folded into `pre`
-      if (!series.days[d]) added += 1;
+      if (series.cutoff && d <= series.cutoff) {
+        n.skipped += 1; // already folded into `pre`
+        continue;
+      }
+      if (has(series.days, d)) n.raised += 1;
+      else n.added += 1;
       raiseInto((series.days[d] ||= blank()), b);
     }
-    return added;
+    return n;
   };
 
   if (!entry.host || typeof entry.host !== "object" || Array.isArray(entry.host)) entry.host = blankSeries();
-  const addedDays = merge(entry.host, hostDays);
+  const hostMerge = merge(entry.host, hostDays);
   if (!entry.repos || typeof entry.repos !== "object" || Array.isArray(entry.repos)) entry.repos = {};
   let addedRepos = 0;
   let raisedRepos = 0;
@@ -505,10 +518,10 @@ function main() {
   entry.augments = true;
 
   fs.writeFileSync(opts.ledger, `${JSON.stringify(parsed)}\n`);
-  const touched = Object.keys(hostDays).length;
   console.log(
-    `\nwrote ${opts.ledger}: ${touched} day(s) merged into the host series ` +
-      `(${addedDays} new, ${touched - addedDays} already recorded and raised where the estimate was higher), ` +
+    `\nwrote ${opts.ledger}: host series ${hostMerge.added} day(s) added, ` +
+      `${hostMerge.raised} already recorded and raised where the estimate was higher, ` +
+      `${hostMerge.skipped} skipped as already inside \`pre\` (the series cutoff is ${entry.host.cutoff}); ` +
       `${addedRepos} new repo series, ${raisedRepos} existing (backup: ${backup})`
   );
   console.log("RESTART THE HUB — it rewrites this file from memory on its next save.");

@@ -180,7 +180,7 @@ paths:
 - **A host wiped before the ledger ever saw it cannot be recovered from anything measured**, and the
   archive is not the exception people reach for: its rendered layer carries no token counts, and its
   raw layer only ever held what was still on the host's disk when the sync ran — after a wipe, nothing
-  older than it. Re-deriving MaxAI's 148 raw copies reproduced the ledger's own days exactly for
+  older than it. Re-deriving every raw copy MaxAI has reproduced the ledger's own days exactly for
   2026-08-16 → 08-21 (all four figures; 08-22 → 08-25 come back lower, having live sessions the
   archive has not taken yet) and produced NO earlier day at all — the first half says the parser is
   faithful, the second that the raw layer cannot cross a wipe.
@@ -200,6 +200,11 @@ paths:
   absurd value in a calibration transcript poisons the rate and lands a day bucket that loads back
   ZEROED — destroying the measured figures in it. An estimator that writes into this store has to
   coerce like `_token_count`, not merely like a number.
+- **A run's figures are as-of that run.** Its calibration set is the archive, which grows, so the same
+  command a day later lands ~1% different — and a wiped host's old project slugs return as repo series
+  (for MaxAI, 67 against the 6 it reports live, ~19% of the estimate in bare-name and `hub-agent-mgr-*`
+  keys). They are kept: host totals are held independently, so dropping them would leave the page's
+  per-repo view under-counting its per-host view.
 - Attribution is the `.meta` **`host`** field, never the host segment of an archived file's NAME — a
   migrated session keeps the name it was first archived under, so reading the name credits its spend
   to the wrong host. Repo keys fold a bare name onto a URL key when exactly one URL key claims that

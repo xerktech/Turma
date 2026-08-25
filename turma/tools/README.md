@@ -24,7 +24,7 @@ format marks a bucket as estimated, and nothing downstream distinguishes one, so
 - The archive's **raw** layer does carry the transcripts' own usage blocks, but it
   only ever held what was still on the host's disk when the sync ran. After a wipe
   that is nothing older than the wipe, so it re-derives the days the ledger already
-  has and nothing else. Verified on MaxAI's 148 raw copies: **2026-08-16 → 08-21
+  has and nothing else. Verified on every raw copy MaxAI has (~150): **2026-08-16 → 08-21
   come back identical to the ledger, all four figures**, and 08-22 → 08-25 come
   back LOWER because those days still have live sessions the archive has not taken
   yet. That agreement is what says the parser is faithful; the absence of any
@@ -58,6 +58,20 @@ estimate can never lower a measured day.
   value in a CALIBRATION transcript poisons the rate, is written out as `1e+308`,
   and loads back as a zeroed day — taking the measured figures in that bucket with
   it. The tool reads archived bytes from every host in the fleet.
+
+### What a run costs the usage page
+
+- **The estimate is as-of the minute it runs.** The calibration set is the archive
+  itself, which grows, so two runs a day apart differ by ~1% with no code change.
+  Whatever is written is whatever the archive looked like then; the report the run
+  prints is the record of it.
+- **A wiped host's old project slugs come back as repo series** — for MaxAI, 67 new
+  ones against the 6 it reports live, of which ~55 are bare names no live report can
+  produce (`git`, `mhabeeb`, `.turma`, 45 `hub-agent-mgr-*` scratch slugs), carrying
+  about 19% of the estimate. They are kept rather than dropped: the host totals are
+  held independently, so dropping them would make the page's per-repo view
+  under-count its per-host view by that much, and the spend was real. Expect that
+  host's repo list to grow several-fold, permanently.
 
 ### Running it
 
