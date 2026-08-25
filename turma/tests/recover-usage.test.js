@@ -229,8 +229,29 @@ test("says what it WROTE, not what it was offered, when a cutoff skips a day", (
     "--archive", archive, "--ledger", ledger, "--drift", "1", "--write"]);
   // Every offered day is inside `pre` already, so nothing lands on the host
   // series — a summary that counted the offer would read as 1 day recovered.
-  assert.match(out, /host series 0 day\(s\) added, 0 already recorded and raised[^;]*, 1 skipped as already inside/);
+  assert.match(out, /host series 0 day\(s\) added, 0 already recorded[^;]*1 skipped as already inside `pre` \(cutoff 2026-07-05\)/);
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(ledger, "utf8")).hosts.WIPED.host.days), []);
+});
+
+test("counts the repo series' days too, so a repo cutoff cannot read as work landed", () => {
+  const { root, archive } = fixture();
+  const ledger = ledgerFile(root, {
+    WIPED: {
+      device: "WIPED",
+      host: series({}),
+      // `trimDays` sets a cutoff on repo series as well, and the days this tool
+      // writes are exactly the old ones a cutoff swallows.
+      repos: { "github.com/x/turma": { repo: "Turma", remote: "", series: { ...series({}), cutoff: "2026-12-31" } } },
+    },
+  });
+  const out = run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+    "--archive", archive, "--ledger", ledger, "--drift", "1", "--write"]);
+  assert.match(out, /repo series 0 new and 1 existing, 0 day\(s\) added, 0 already recorded[^;]*1 skipped as already inside/);
+  const after = JSON.parse(fs.readFileSync(ledger, "utf8")).hosts.WIPED;
+  assert.deepEqual(Object.keys(after.repos["github.com/x/turma"].series.days), []);
+  // With no cutoff of its own the host series still takes the day, so the
+  // summary's two halves genuinely differ.
+  assert.deepEqual(Object.keys(after.host.days), ["2026-07-01"]);
 });
 
 test("dedupes on the (id, requestId) TUPLE, not on the two joined", () => {
@@ -260,6 +281,20 @@ test("dedupes on the (id, requestId) TUPLE, not on the two joined", () => {
   // Three distinct turns at 1010 tokens each over 100 calibration characters,
   // applied to 100 estimated characters.
   assert.equal(out.estimatedTokens, 3030);
+});
+
+test("a FIFO inside a raw copy does not wedge the walk either", () => {
+  const { root, archive } = fixture();
+  // The raw walk is a SECOND path to the same hang, and its guard is separate:
+  // the rendered test below cannot reach it.
+  const inRaw = path.join(archive, "turma", "2026-08-20__cal__wiped__aaaa.jsonl.raw", "aaaa", "zz.jsonl");
+  execFileSync("mkfifo", [inRaw]);
+  const ledger = ledgerFile(root, { WIPED: { device: "WIPED", host: series({}), repos: {} } });
+  const out = JSON.parse(
+    run(["--host", "wiped", "--ledger-host", "WIPED", "--before", "2026-08-16",
+      "--archive", archive, "--ledger", ledger, "--drift", "1"], { timeout: 20000 }).split("\n-- dry")[0]
+  );
+  assert.equal(out.estimatedTokens, 2020);
 });
 
 test("a FIFO named like a transcript does not wedge the walk", () => {

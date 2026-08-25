@@ -490,6 +490,11 @@ function main() {
   if (!entry.repos || typeof entry.repos !== "object" || Array.isArray(entry.repos)) entry.repos = {};
   let addedRepos = 0;
   let raisedRepos = 0;
+  // Counted like the host series': `trimDays` sets a cutoff on EVERY series, repo
+  // ones included, and the days this tool writes are exactly the old ones a
+  // cutoff swallows — so "N existing repo series" alone can report work that
+  // landed nowhere.
+  const repoDays = { added: 0, raised: 0, skipped: 0 };
   for (const [key, r] of Object.entries(repos)) {
     if (!key) continue;
     // `has`, not truthiness: `entry.repos.constructor` INHERITS a function from
@@ -510,7 +515,10 @@ function main() {
       if (!row || typeof row !== "object") throw new Error(`ledger repo "${key}" is not an object`);
       if (!row.series || typeof row.series !== "object" || Array.isArray(row.series)) row.series = blankSeries();
     }
-    merge(entry.repos[key].series, r.days);
+    const m = merge(entry.repos[key].series, r.days);
+    repoDays.added += m.added;
+    repoDays.raised += m.raised;
+    repoDays.skipped += m.skipped;
   }
   // `augments` is what tells the hub this host's stored history holds more than
   // its next report will. It is recomputed on that report, but the file is served
@@ -518,11 +526,14 @@ function main() {
   entry.augments = true;
 
   fs.writeFileSync(opts.ledger, `${JSON.stringify(parsed)}\n`);
+  const tally = (n, cutoff) =>
+    `${n.added} day(s) added, ${n.raised} already recorded and raised where the estimate was higher` +
+    // A null cutoff has skipped nothing and naming it reads like a missing value.
+    (n.skipped ? `, ${n.skipped} skipped as already inside \`pre\`${cutoff ? ` (cutoff ${cutoff})` : ""}` : "");
   console.log(
-    `\nwrote ${opts.ledger}: host series ${hostMerge.added} day(s) added, ` +
-      `${hostMerge.raised} already recorded and raised where the estimate was higher, ` +
-      `${hostMerge.skipped} skipped as already inside \`pre\` (the series cutoff is ${entry.host.cutoff}); ` +
-      `${addedRepos} new repo series, ${raisedRepos} existing (backup: ${backup})`
+    `\nwrote ${opts.ledger}: host series ${tally(hostMerge, entry.host.cutoff)}; ` +
+      `repo series ${addedRepos} new and ${raisedRepos} existing, ${tally(repoDays)} across them ` +
+      `(backup: ${backup})`
   );
   console.log("RESTART THE HUB — it rewrites this file from memory on its next save.");
 }
