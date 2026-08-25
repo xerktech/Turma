@@ -129,13 +129,14 @@ files as each child ships, and this file's `paths:` widens then.
   from Claude-authored work (e.g. carrying `agentType` onto the PR chip). Not required for
   correctness; a product call.
 
-## D5 — Models: dsh selects its own; Claude-Code local-model failover is NOT extended to it
+## D5 — Models: the runtime picks the model mechanism; a dsh session has NO Claude failover
 
-- **Decision: local-model failover stays a CLAUDE-CODE-runtime feature, unchanged, for Claude
-  sessions. It is NOT extended to dsh and dsh is NOT folded into it. dsh selects models through its
-  own `@deepseek-ai/dsh-llm-pi-ai` adapter (YAML provider config: DeepSeek API natively, plus any
-  OpenAI-compatible local endpoint — LiteLLM / Ollama / vLLM).** The two runtimes have parallel,
-  independent model-selection mechanisms; G0 does not try to unify them.
+- **Decision: model selection is PER SESSION and follows the session's runtime. If `agentType` is
+  `dsh`, there is NO Claude-Code local-model failover in play at all — the dsh model selector
+  (`@deepseek-ai/dsh-llm-pi-ai`, YAML provider config: DeepSeek API natively, plus any
+  OpenAI-compatible local endpoint — LiteLLM / Ollama / vLLM) is the WHOLE story for that session.
+  If `agentType` is `claude`, its existing local-model failover stays exactly as today.** The two
+  mechanisms never coexist within one session and G0 does not try to unify them.
 - **Why not unify.** Claude's failover is subscription-limit-driven and specific to the Claude
   runtime (`LOCAL_MODEL_*` env, `localModel.available` capability flag). dsh has no subscription
   limit and no such concept — it just points its adapter at whichever providers are configured, and
