@@ -1,0 +1,6 @@
+node_modules/
+*.tgz
+# dist/ is intentionally committed: _ensure_dsh_profile installs this plugin into
+# the dsh profile with `npm install`, which copies the package as-is without a
+# build step, so the compiled output must be present. The agent image rebuilds it
+# (Dockerfile) — keep dist in sync with src by running `npm run build`.
