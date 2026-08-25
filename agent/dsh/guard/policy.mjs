@@ -102,6 +102,12 @@ function globToRegExp(glob) {
       re += c
     }
   }
+  // The glob is a TRUSTED path rule from build_dsh_guard_config (the operator's
+  // and repo's own deny list), compiled ONCE at plugin load, and every produced
+  // token is linear (`.*`, `[^/]*`, `[^/]`, escaped literals) with no nested
+  // quantifier, so there is no catastrophic-backtracking surface. Not built from
+  // any tool argument.
+  // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
   return new RegExp('^' + re + '$')
 }
 
