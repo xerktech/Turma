@@ -153,6 +153,11 @@ function walkJsonl(dir, files) {
     return files;
   }
   for (const e of ents) {
+    // Not path-traversable: every component is a NAME read back from readdirSync
+    // under the operator-supplied archive root, so none can hold a separator or
+    // '..'. Nothing here joins a path an agent supplied — `safeRawRel` in
+    // archive.js is what guards those, at the point they arrive.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const p = path.join(dir, e.name);
     // Only REGULAR files, on both branches, for the reason `_project_transcripts`
     // gives: a directory named `*.jsonl` would read as a transcript, and a FIFO
@@ -253,6 +258,11 @@ function inventory(archiveDir) {
   }
   for (const ent of repoDirs) {
     if (!ent.isDirectory()) continue;
+    // Not path-traversable: every component is a NAME read back from readdirSync
+    // under the operator-supplied archive root, so none can hold a separator or
+    // '..'. Nothing here joins a path an agent supplied — `safeRawRel` in
+    // archive.js is what guards those, at the point they arrive.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const dir = path.join(archiveDir, ent.name);
     let names;
     try {
@@ -263,16 +273,19 @@ function inventory(archiveDir) {
     for (const name of names) {
       if (!name.endsWith(".jsonl")) continue;
       try {
+        // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
         if (!fs.lstatSync(path.join(dir, name)).isFile()) continue;
       } catch {
         continue;
       }
       let meta = null;
       try {
+        // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
         meta = JSON.parse(fs.readFileSync(path.join(dir, `${name}.meta`), "utf8"));
       } catch {
         meta = null;
       }
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
       const rawDir = path.join(dir, `${name}.raw`);
       rows.push({
         dir,
@@ -295,6 +308,7 @@ function calibrate(rows, host) {
   let sessions = 0;
   for (const r of rows) {
     if (r.host !== host || !r.rawDir) continue;
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const rendered = renderedChars(path.join(r.dir, r.name));
     if (!rendered) continue;
     const c = Object.values(rendered.days).reduce((n, v) => n + v, 0);
@@ -384,6 +398,7 @@ function main() {
       continue;
     }
     if (r.rawDir) emptyRaw += 1;
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const rendered = renderedChars(path.join(r.dir, r.name));
     if (!rendered || !rendered.entries) continue;
     const key = canonical(r.remoteKey, r.repo);
