@@ -208,5 +208,78 @@ class TestDshProjectionEdgeCases(unittest.TestCase):
         self.assertEqual(proj.feed(ev), [])
 
 
+class TestDshToolNameMapping(unittest.TestCase):
+    """dsh's shell tool is `name:"bash"` (lowercase); the read side keys PR
+    attribution and the Bash card on `"Bash"`. The projector must map it in the
+    seam — teaching the readers about dsh names is the mirror multiplication this
+    exists to avoid. (Real-dsh regression: the corpus must use the real name.)"""
+
+    def test_corpus_uses_the_real_lowercase_tool_name(self):
+        # Guards against a fixture regressing to a faked `Bash` — which is what
+        # made the first QA pass fail: the test was green against a shape real dsh
+        # never emits.
+        corpus = _corpus()
+        tool_calls = [
+            b for e in corpus if e.get("type") == "assistant/message"
+            for b in (e["data"].get("message", {}).get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "tool-call"
+        ]
+        self.assertTrue(tool_calls)
+        self.assertTrue(all(b["name"] == "bash" for b in tool_calls),
+                        "corpus must carry dsh's real lowercase `bash`")
+
+    def test_bash_is_mapped_to_Bash(self):
+        proj = dt.DshProjector(SID)
+        ev = {"type": "assistant/message", "seq": 1, "time": 0, "data": {
+            "turn": 1, "step": 1, "message": {
+                "id": "m", "role": "assistant", "source": {"kind": "model", "model": "x"},
+                "content": [{"type": "tool-call", "id": "c", "name": "bash",
+                             "arguments": '{"command": "ls"}'}]}}}
+        tu = proj.feed(ev)[0]["message"]["content"][0]
+        self.assertEqual(tu["name"], "Bash")
+
+    def test_unknown_tool_name_passes_through(self):
+        proj = dt.DshProjector(SID)
+        ev = {"type": "assistant/message", "seq": 1, "time": 0, "data": {
+            "turn": 1, "step": 1, "message": {
+                "id": "m", "role": "assistant", "source": {"kind": "model", "model": "x"},
+                "content": [{"type": "tool-call", "id": "c", "name": "str_replace_editor",
+                             "arguments": "{}"}]}}}
+        tu = proj.feed(ev)[0]["message"]["content"][0]
+        self.assertEqual(tu["name"], "str_replace_editor")
+
+
+class TestDshFeedNeverCrashes(unittest.TestCase):
+    """feed() runs per streamed event in the launcher, so no plausible/hostile
+    event may abort the projection. These are the escapes the first QA pass found."""
+
+    def test_out_of_range_and_infinite_time(self):
+        proj = dt.DshProjector(SID)
+        for bad_time in (float("inf"), float("nan"), 1e999 if False else 10 ** 30,
+                         -(10 ** 30), "1e999"):
+            ev = {"type": "user/message", "seq": 1, "time": bad_time,
+                  "data": {"role": "user", "source": {"kind": "user"},
+                           "content": [{"type": "text", "text": "hi"}]}}
+            out = proj.feed(ev)  # must not raise
+            self.assertEqual(out[0]["timestamp"], "")
+
+    def test_json_infinity_literal_time(self):
+        # `1e999` is legal JSON and decodes to inf; int(inf) raises OverflowError.
+        proj = dt.DshProjector(SID)
+        ev = json.loads('{"type":"user/message","seq":1,"time":1e999,'
+                        '"data":{"role":"user","content":[{"type":"text","text":"x"}]}}')
+        self.assertEqual(proj.feed(ev)[0]["timestamp"], "")
+
+    def test_tool_result_non_dict_source(self):
+        proj = dt.DshProjector(SID)
+        for src in ("tool", 1, ["x"], True):
+            ev = {"type": "tool/result", "seq": 1, "time": 0, "data": {"message": {
+                "role": "user", "source": src,
+                "content": [{"type": "tool-result", "content": [
+                    {"type": "text", "text": "ok"}]}]}}}
+            out = proj.feed(ev)  # must not raise
+            self.assertEqual(out[0]["message"]["content"][0]["type"], "tool_result")
+
+
 if __name__ == "__main__":
     unittest.main()

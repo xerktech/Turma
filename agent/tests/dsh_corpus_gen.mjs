@@ -63,9 +63,13 @@ const asstMsg = createAssistantMessage({
     { type: 'reasoning', text: 'The change is small; I will open a PR.' },
     { type: 'text', text: "I'll open the PR now." },
     {
+      // dsh's shell tool registers as `name:"bash"` (lowercase), verified in
+      // @deepseek-ai/dsh-tool-bash — NOT Claude's "Bash". The projector must map
+      // it, or PR attribution and the Bash card break; the corpus uses the REAL
+      // name so the test exercises the mapping, not a faked shape (the G1 lesson).
       type: 'tool-call',
       id: 'call_abc123',
-      name: 'Bash',
+      name: 'bash',
       arguments: JSON.stringify({
         command: 'gh pr create --title "Fix" --body "..."',
         description: 'Open the PR',
@@ -91,7 +95,7 @@ events.push(
 // 5. tool/call — redundant with the assistant tool-call block above; MUST project
 //    to nothing so the tool_use is not duplicated.
 events.push(ev('tool/call', {
-  turn: 1, step: 1, callId: 'call_abc123', name: 'Bash',
+  turn: 1, step: 1, callId: 'call_abc123', name: 'bash',
   arguments: JSON.stringify({ command: 'gh pr create --title "Fix" --body "..."' }),
 }))
 

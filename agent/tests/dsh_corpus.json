@@ -31,7 +31,7 @@
         }
       ],
       "role": "user",
-      "id": "1ed8f04d-dd69-4b34-9925-36cf48b64a34"
+      "id": "c4e5866e-b557-4f3d-989b-d9de61b3bbda"
     }
   },
   {
@@ -66,7 +66,7 @@
           {
             "type": "tool-call",
             "id": "call_abc123",
-            "name": "Bash",
+            "name": "bash",
             "arguments": "{\"command\":\"gh pr create --title \\\"Fix\\\" --body \\\"...\\\"\",\"description\":\"Open the PR\"}"
           }
         ],
@@ -75,7 +75,7 @@
           "provider": "dsh-llm-pi-ai",
           "model": "bedrock/claude-haiku"
         },
-        "id": "9c497de8-a500-41c7-9a93-d5c07832cd7d"
+        "id": "bba5732c-d732-4a39-9c13-ffce80269043"
       },
       "usage": {
         "inputTokens": 1200,
@@ -94,7 +94,7 @@
       "turn": 1,
       "step": 1,
       "callId": "call_abc123",
-      "name": "Bash",
+      "name": "bash",
       "arguments": "{\"command\":\"gh pr create --title \\\"Fix\\\" --body \\\"...\\\"\"}"
     }
   },
@@ -124,7 +124,7 @@
           }
         ],
         "role": "user",
-        "id": "7edce8d0-04fe-4750-ad0e-ba9862dcc789"
+        "id": "f9568a98-2613-4e5a-9a86-d2c950a9c24b"
       }
     }
   },
@@ -157,7 +157,7 @@
           "provider": "dsh-llm-pi-ai",
           "model": "bedrock/claude-haiku"
         },
-        "id": "984fad4e-dec0-4926-b342-f02ee829ac9b"
+        "id": "4b08302c-6095-4c58-b2d5-be84a3f720e7"
       },
       "usage": {
         "inputTokens": 60,
@@ -199,7 +199,7 @@
         }
       ],
       "role": "user",
-      "id": "ed8ba54e-9c2a-4152-9023-7931de787fe9"
+      "id": "3e1e2343-15b7-4964-a2b4-47babb2d109c"
     }
   },
   {
@@ -242,7 +242,7 @@
           }
         ],
         "role": "user",
-        "id": "9e2327c9-2e3a-4259-9d71-002e9d9852be"
+        "id": "2fee1bff-2d8d-4a16-bd5b-b3ba43f1fa47"
       }
     }
   }

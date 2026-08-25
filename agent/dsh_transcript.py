@@ -70,18 +70,36 @@ SURFACE_EVENT_TYPES = ("user/message", "assistant/message", "tool/result")
 # in hub-agent.py / tunnel-agent.js matches it and renders it as an interrupt row.
 INTERRUPT_MARKER = "[Request interrupted by user]"
 
+# dsh tool name -> the Claude-Code tool name the read side keys on. Only `bash`
+# is mapped, and it is a CORRECTNESS requirement, not cosmetics: dsh's shell tool
+# registers as `name:"bash"` (`@deepseek-ai/dsh-tool-bash`, verified) with an
+# `args.command`, but `_scan_pr_line`'s PR attribution (D4) and `_tool_use_detail`'s
+# Bash card both key on the name being `"Bash"` — so an unmapped `bash` running
+# `gh pr create` (or `glab mr create` / `az repos pr create`, all of which run
+# THROUGH the one bash tool in dsh) silently fails to chip the PR the session
+# opened. The mapping lives HERE, in the one seam, rather than teaching every
+# reader mirror about dsh names — which is the multiplication this seam exists to
+# avoid. Other dsh tools (`str_replace_editor`, `web`, …) pass through under their
+# own names: no reader keys on them AND their argument shapes do not match the
+# Claude tool the name would imply, so a rename would misrepresent the call. They
+# still render as generic tool cards, correctly.
+_TOOL_NAME_MAP = {"bash": "Bash"}
+
 
 def _iso(ms):
     """dsh event `time` (Unix epoch milliseconds) -> the millisecond ISO-8601 Z
     string Claude Code stamps on every entry (`2026-08-25T20:39:22.322Z`). The
     archive dates rows off this (`_last_activity_ts`) and usage buckets off its
-    date prefix, so the shape has to match. A non-numeric/absent time yields an
-    empty string, which those readers already treat as undated."""
+    date prefix, so the shape has to match. Anything unusable — non-numeric,
+    NaN/inf (`int(inf)` raises OverflowError, and `1e999` is legal JSON), or a
+    year out of `datetime`'s range — yields an empty string, which those readers
+    already treat as undated. `feed()` runs per streamed event in the launcher,
+    so a single bad `time` must NEVER abort the projection."""
     try:
         ms = int(ms)
-    except (TypeError, ValueError):
+        dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
         return ""
-    dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
@@ -96,9 +114,13 @@ def _map_usage(usage):
     `cache_creation_input_tokens`, `cache_read_input_tokens`). dsh's counts are
     disjoint (uncached input in `inputTokens`; cache split out), which is exactly
     Claude's own convention, so the mapping is 1:1. `cacheWriteTokens` is the
-    creation half. Returns None when there is nothing countable, so a usage-less
-    step projects no `"usage"` key (and thus costs the ledger nothing) rather than
-    a fabricated zero."""
+    creation half. `reasoningTokens` is deliberately NOT mapped: the pi-ai adapter
+    folds reasoning INTO `outputTokens` (`dsh-llm-pi-ai` mapUsage: "reasoning
+    folded into output by pi-ai"), exactly as Claude's `output_tokens` includes
+    thinking, so counting it again would double-count the model's spend. Returns
+    None when there is nothing countable, so a usage-less step projects no
+    `"usage"` key (and thus costs the ledger nothing) rather than a fabricated
+    zero."""
     if not isinstance(usage, dict):
         return None
     out = {
@@ -177,7 +199,9 @@ def _assistant_content(content):
                 inp = {}
             if not isinstance(inp, dict):
                 inp = {"_value": inp}
-            block = {"type": "tool_use", "name": str(b.get("name") or ""), "input": inp}
+            name = str(b.get("name") or "")
+            name = _TOOL_NAME_MAP.get(name, name)
+            block = {"type": "tool_use", "name": name, "input": inp}
             if b.get("id"):
                 block["id"] = str(b["id"])
             blocks.append(block)
@@ -295,7 +319,11 @@ class DshProjector:
         # correlated callId and the model-facing inner content.
         content = msg.get("content")
         trb = content[0] if isinstance(content, list) and content and isinstance(content[0], dict) else {}
-        call_id = trb.get("toolCallId") or (msg.get("source") or {}).get("callId")
+        # `source` is a dict on a well-formed event, but a truthy non-dict (`"tool"`,
+        # a list) would make `(source or {}).get(...)` raise — feed() must not crash
+        # on a malformed event, so guard with isinstance like the sibling handlers.
+        src = msg.get("source") if isinstance(msg.get("source"), dict) else {}
+        call_id = trb.get("toolCallId") or src.get("callId")
         inner = _content_to_text_blocks(trb.get("content"))
         result_block = {"type": "tool_result"}
         if call_id:
