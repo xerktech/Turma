@@ -95,8 +95,27 @@ kubectl -n ai exec -i <turma-pod> -- sh -c 'cat > /tmp/recover.js && node /tmp/r
 string: the day comparison is lexicographic, so a typo'd `2026-13-45` would put
 every measured day back in scope for an estimate.
 
-Add `--write` to merge. It backs the ledger up beside itself first, and **the hub
-must be restarted afterwards** — it holds the ledger in memory and rewrites the
-whole file on its next save, which would otherwise throw the merge away. For the
-same reason, anything the hub saves BETWEEN the tool's read and that restart is
-discarded — keep the gap short, and treat the backup as the way back.
+Add `--write` to merge. It backs the ledger up beside itself first.
+
+**Write and kill the hub in the SAME exec.** The hub holds the ledger in memory and
+rewrites the whole file on its next save, so the merge only survives if no save
+happens between the write and a fresh load:
+
+```sh
+kubectl -n ai exec -i <turma-pod> -- sh -c 'cat > /tmp/recover.js && \
+  node /tmp/recover.js --host maxai --ledger-host MaxAI --before 2026-08-16 \
+    --json /data/recover-<host>-<date>.json --write; kill -9 1' \
+  < turma/tools/recover-usage-from-archive.js
+```
+
+`kill -9 1` is the hub process; the container restarts in place and loads the merged
+file. `--json` on `/data` is how you read the run's report back afterwards, since the
+restarted container's `/tmp` is empty — and it is the durable record of exactly what
+was injected.
+
+**`kubectl delete pod` is NOT a restart for this purpose, and it has already eaten one
+merge.** SIGTERM is not handled, so the old process runs on for its full 30-second
+grace period, beats, and saves its own copy over yours — observed as a merge written
+at 04:14:00 and gone at 04:15. Anything the hub saves between the tool's read and the
+kill is discarded too, but that is bounded by one run (~10 s) and the next beat
+re-reports it. Treat the backup as the way back.
