@@ -10796,6 +10796,16 @@ test("http: spawn validates modelSource like the switch route does", async () =>
     body: { repo: "Turma", modelSource: "local" }, headers: userHeaders,
   });
   assert.equal(ok.status, 200);
+  // A named endpoint model is charset-gated exactly like the /model-source route
+  // — including when modelSource is OMITTED, so parity holds on every entry.
+  const badLm = await request("POST", "/api/agents/lm5/sessions", {
+    body: { repo: "Turma", localModel: "bad name!" }, headers: userHeaders,
+  });
+  assert.equal(badLm.status, 400);
+  const badLmLocal = await request("POST", "/api/agents/lm5/sessions", {
+    body: { repo: "Turma", modelSource: "local", localModel: "has/space !" }, headers: userHeaders,
+  });
+  assert.equal(badLmLocal.status, 400);
 });
 
 test("http: spawning onto local is refused on a host without one", async () => {
@@ -10806,14 +10816,17 @@ test("http: spawning onto local is refused on a host without one", async () => {
   assert.equal(res.status, 409);
 });
 
-test("http: /model refuses a session running on the self-hosted model", async () => {
-  // Mirror of /model-source's 409: every alias the picker could offer is one
-  // the gateway rejects, so a silent 200 would let an out-of-parity client
-  // break the session with nothing to show for it.
+test("http: /model on a local session picks an ENDPOINT model, validated by membership", async () => {
+  // XERK-489: a local session's model is an endpoint model, not a Claude alias,
+  // so the /model route no longer 409s it — the agent rewrites the env and
+  // relaunches. But it accepts ONLY a model the host's discovered set serves,
+  // and against the endpoint charset (ids carry ':' the Claude-alias regex bars).
   await request("POST", "/api/heartbeat", {
     body: {
       device: "lm7",
-      localModel: { available: true, model: "gpt-oss:120b" },
+      localModel: { available: true, model: "gpt-oss:120b", defaultModel: "gpt-oss:120b",
+        models: [{ id: "gpt-oss:120b", contextTokens: 81920 },
+                 { id: "qwen:32b", contextTokens: 32768 }] },
       sessions: [
         { id: "loc", repo: "R", status: "running", modelSource: "local" },
         { id: "sub", repo: "R", status: "running", modelSource: "subscription" },
@@ -10821,14 +10834,21 @@ test("http: /model refuses a session running on the self-hosted model", async ()
     },
     headers: agentHeaders,
   });
-  const refused = await request("POST", "/api/agents/lm7/sessions/loc/model", {
-    body: { model: "opus" }, headers: userHeaders,
-  });
-  assert.equal(refused.status, 409);
-  const ok = await request("POST", "/api/agents/lm7/sessions/sub/model", {
-    body: { model: "opus" }, headers: userHeaders,
+  // A served endpoint model (note the colon) is accepted.
+  const ok = await request("POST", "/api/agents/lm7/sessions/loc/model", {
+    body: { model: "qwen:32b" }, headers: userHeaders,
   });
   assert.equal(ok.status, 200);
+  // One the host does NOT serve is refused 409.
+  const refused = await request("POST", "/api/agents/lm7/sessions/loc/model", {
+    body: { model: "not-served" }, headers: userHeaders,
+  });
+  assert.equal(refused.status, 409);
+  // A subscription session still takes a Claude alias through the picker path.
+  const sub = await request("POST", "/api/agents/lm7/sessions/sub/model", {
+    body: { model: "opus" }, headers: userHeaders,
+  });
+  assert.equal(sub.status, 200);
 });
 
 test("heartbeat: localModel is a known key, not an unknown-field remnant", async () => {
@@ -11424,25 +11444,27 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
     return p.localModel;
   };
 
-  // A good block passes through unchanged.
+  // A good block passes through unchanged. With no discovered list the models[]
+  // is [] and defaultModel falls back to the single `model` (XERK-489).
   assert.deepEqual(
     norm({ available: true, model: "gpt-oss:120b", contextTokens: 81920 }),
-    { available: true, model: "gpt-oss:120b", contextTokens: 81920 },
+    { available: true, model: "gpt-oss:120b", contextTokens: 81920,
+      models: [], defaultModel: "gpt-oss:120b" },
   );
 
   // `available` is STRICTLY boolean: a truthy string would offer the switch on
   // a host that cannot do it, and the command would be acked and dropped.
   assert.deepEqual(norm({ available: "yes", model: "x" }),
-    { available: false, model: null, contextTokens: null });
+    { available: false, model: null, contextTokens: null, models: [], defaultModel: null });
   assert.deepEqual(norm({ available: 1 }),
-    { available: false, model: null, contextTokens: null });
+    { available: false, model: null, contextTokens: null, models: [], defaultModel: null });
 
   // A non-string model and an out-of-Int contextTokens degrade to null rather
   // than failing the decode. contextTokens is unused by the UI, so this is free.
   assert.deepEqual(norm({ available: true, model: 12345, contextTokens: 9999999999 }),
-    { available: true, model: null, contextTokens: null });
+    { available: true, model: null, contextTokens: null, models: [], defaultModel: null });
   assert.deepEqual(norm({ available: true, model: "m", contextTokens: 1.5 }),
-    { available: true, model: "m", contextTokens: null });
+    { available: true, model: "m", contextTokens: null, models: [], defaultModel: "m" });
 
   // The name is BOUNDED, and cut on code points. A UTF-16 `slice` through an
   // astral pair emits a lone surrogate — unencodable, and it kills Android's
@@ -11482,6 +11504,77 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
   const old = { device: "h" };
   hub.normalizeLocalModel(old);
   assert.ok(!("localModel" in old));
+});
+
+test("normalizeLocalModel bounds and sanitizes the discovered models[] (XERK-489)", () => {
+  // The discovered set rides the heartbeat and Android decodes /api/agents
+  // ATOMICALLY into `List<LocalModelInfo>` — so an endpoint answering thousands
+  // of ids, or one malformed entry, from ONE host must not drop the whole fleet.
+  // This is the PEER_CELL_MAX / retiredUsage failure class the ticket names, and
+  // the length bound is the load-bearing part: without a test, removing the cap
+  // leaves every other assertion green (mutation-proven).
+  const norm = (localModel) => {
+    const p = { device: "h", localModel };
+    hub.normalizeLocalModel(p);
+    return p.localModel;
+  };
+
+  // LENGTH BOUND: an endpoint answering thousands of ids is capped at 200.
+  const many = Array.from({ length: 5000 }, (_, i) => ({ id: `m${i}`, contextTokens: 1000 }));
+  const capped = norm({ available: true, model: "m0", models: many });
+  assert.equal(capped.models.length, 200, "models[] must be length-bounded");
+  assert.equal(capped.models[0].id, "m0");   // taken in order, not sampled
+
+  // PER-ELEMENT: a nameless id is DROPPED (a row the dropdown can't label); a
+  // non-object element is skipped; contextTokens is int-safe or null.
+  const mixed = norm({
+    available: true, model: "a",
+    models: [
+      { id: "keep", contextTokens: 128000 },
+      { id: "", contextTokens: 1 },          // sanitizes to "" -> dropped
+      { id: 12345, contextTokens: 1 },       // non-string id -> dropped
+      "not-an-object",                       // -> skipped
+      { id: "flt", contextTokens: 1.5 },     // float -> null
+      { id: "neg", contextTokens: -5 },      // negative -> null
+      { id: "huge", contextTokens: 9999999999 }, // out of Int -> null
+      { id: "nowin" },                       // absent -> null
+    ],
+  });
+  assert.deepEqual(mixed.models, [
+    { id: "keep", contextTokens: 128000 },
+    { id: "flt", contextTokens: null },
+    { id: "neg", contextTokens: null },
+    { id: "huge", contextTokens: null },
+    { id: "nowin", contextTokens: null },
+  ]);
+
+  // DEDUP: a doubled id can't pad the list past its real size.
+  const deduped = norm({
+    available: true, model: "a",
+    models: [{ id: "x", contextTokens: 1 }, { id: "x", contextTokens: 2 }, { id: "y" }],
+  });
+  assert.deepEqual(deduped.models.map((m) => m.id), ["x", "y"]);
+
+  // Each id runs through the SAME XML-illegal / astral sanitize as `model` — an
+  // id that would kill Android's uiautomator must not survive in the list.
+  const evil = norm({ available: true, model: "a",
+    models: [{ id: "qwen￿bad" }, { id: "x".repeat(59) + "😀" + "tail" }] });
+  assert.equal(evil.models[0].id, "qwenbad");
+  assert.equal([...evil.models[1].id].length, 60);
+  assert.ok(evil.models[1].id.isWellFormed());
+
+  // defaultModel must be one the SANITIZED list carries, else fall back to the
+  // single `model` — the dropdown must never preselect a value it can't show.
+  assert.equal(norm({ available: true, model: "a",
+    models: [{ id: "b" }, { id: "c" }], defaultModel: "c" }).defaultModel, "c");
+  assert.equal(norm({ available: true, model: "a",
+    models: [{ id: "b" }], defaultModel: "gone" }).defaultModel, "a");  // fallback
+  assert.equal(norm({ available: true, model: "a",
+    models: [{ id: "b" }], defaultModel: 999 }).defaultModel, "a");     // non-string
+
+  // A non-array models[] is simply []; the block stays decodable.
+  assert.deepEqual(norm({ available: true, model: "a", models: "lots" }).models, []);
+  assert.deepEqual(norm({ available: true, model: "a", models: { id: "x" } }).models, []);
 });
 
 test("isPlainHostKey refuses exactly the names the hub cannot address", () => {
@@ -11562,7 +11655,7 @@ test("the state.json restore coerces too, not just the ingest path", () => {
   };
   hub.normalizeLocalModel(restored);
   assert.deepEqual(restored.localModel,
-    { available: false, model: null, contextTokens: null });
+    { available: false, model: null, contextTokens: null, models: [], defaultModel: null });
 
   // The durable form of "the restore can't fall behind the ingest": both go
   // through ONE function, so there is no list here to keep in step. A previous
@@ -11650,7 +11743,7 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
   assert.match(out, /loaded 1 agents from/,
     "the restore did not run — it threw into its own catch");
   const rec = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>"))).h1;
-  assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null });
+  assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null, models: [], defaultModel: null });
   assert.equal(rec.limits, null);
   assert.equal(rec.sessions.length, 1, "non-object session elements must be dropped");
   assert.equal(rec.sessions[0].modelSource, "");
@@ -11746,8 +11839,12 @@ test("normalizeLocalModel bounds the name BEFORE spreading it", () => {
   // So the budget runs at 32 MiB (`HEARTBEAT_MAX`, the largest a beat can carry)
   // with ~10x headroom, and a STRUCTURAL assertion holds the ordering exactly.
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  const spread = src.slice(src.indexOf("const name = typeof lm.model"), src.indexOf(".slice(0, 60)"));
-  assert.match(spread, /\[\.\.\.lm\.model\.slice\(/,
+  // The name coercion now lives in the shared sanitizeModelName helper (reused
+  // for every discovered id too, XERK-489). It must slice(0, 512) BEFORE the
+  // per-code-point spread that materialises the array.
+  const fn = src.slice(src.indexOf("function sanitizeModelName"),
+    src.indexOf("function sanitizeContextTokens"));
+  assert.match(fn, /\[\.\.\.s\.slice\(0, 512\)/,
     "the model name must be bounded BEFORE the per-code-point spread");
 
   const huge = { device: "h", localModel: { available: true, model: "x".repeat(32 << 20) } };

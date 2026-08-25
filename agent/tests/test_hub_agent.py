@@ -5365,7 +5365,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.save = mock.Mock()
         sm.handle_commands([{"cmdId": "ms1", "type": "setModelSource",
                              "sessionId": "abcde", "modelSource": "local"}])
-        sm.set_model_source.assert_called_once_with("abcde", "local")
+        sm.set_model_source.assert_called_once_with("abcde", "local", model=None)
 
     def test_dedup_and_dispatch(self):
         sm = self.make_manager()
@@ -5384,7 +5384,8 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         # plus the cmdId, which it echoes onto the session it creates.
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
-            model=None, permission_mode=None, model_source=None, cmd_id="c1",
+            model=None, permission_mode=None, model_source=None,
+            local_model=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -5432,7 +5433,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
             model="opus", permission_mode="plan", model_source=None,
-            cmd_id="c9",
+            local_model=None, cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -6044,6 +6045,34 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
         with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="", LOCAL_MODEL_API_KEY=""):
             sm.spawn("Turma", model_source="local")
+        self.assertEqual(sm.registry[-1]["status"], "error")
+
+    def test_spawn_onto_a_chosen_local_model(self):
+        """The composer can start on a SPECIFIC endpoint model (XERK-489), not
+        only the host default."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY="sk-abc",
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"), \
+             mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "gpt-oss:120b", "contextTokens": 81920},
+                                {"id": "qwen:32b", "contextTokens": 32768}]):
+            sm.spawn("Turma", model_source="local", local_model="qwen:32b")
+            sess = sm.registry[-1]
+            self.assertEqual(sess["localModelName"], "qwen:32b")
+            cmd = next(c[-1] for c in self.run_ok_calls if "new-session" in c)
+            self.assertIn("local-model.env", cmd)
+
+    def test_spawn_onto_an_unserved_local_model_errors(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY="sk-abc",
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"), \
+             mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "gpt-oss:120b", "contextTokens": 81920}]):
+            sm.spawn("Turma", model_source="local", local_model="not-served")
         self.assertEqual(sm.registry[-1]["status"], "error")
 
     def test_spawn_defaults_to_the_subscription(self):
@@ -10013,6 +10042,121 @@ class TestLocalModelConfig(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOCAL_MODEL_CONTEXT": "131072"}):
             self.assertEqual(ha._positive_int_env("LOCAL_MODEL_CONTEXT", 65536), 131072)
 
+    # --- endpoint model discovery (XERK-489) --------------------------------
+
+    def test_configured_without_a_name_needs_a_discovered_list(self):
+        """LOCAL_MODEL_NAME is optional now: with only base+key, the host is not
+        usable until discovery lands a model — then it is (zero-config)."""
+        with self._configured(LOCAL_MODEL_NAME=""):
+            with mock.patch.object(ha, "_local_model_discovered", None):
+                self.assertFalse(ha.local_model_configured())
+            with mock.patch.object(ha, "_local_model_discovered",
+                                   [{"id": "gpt-oss:120b", "contextTokens": 81920}]):
+                self.assertTrue(ha.local_model_configured())
+
+    def test_default_is_configured_name_else_first_discovered(self):
+        with self._configured(LOCAL_MODEL_NAME="gpt-oss:120b"), \
+             mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "other", "contextTokens": 1000}]):
+            self.assertEqual(ha.local_model_default(), "gpt-oss:120b")  # configured wins
+        with self._configured(LOCAL_MODEL_NAME=""), \
+             mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "first", "contextTokens": 1000},
+                                {"id": "second", "contextTokens": 2000}]):
+            self.assertEqual(ha.local_model_default(), "first")
+        with self._configured(LOCAL_MODEL_NAME=""), \
+             mock.patch.object(ha, "_local_model_discovered", None):
+            self.assertIsNone(ha.local_model_default())
+
+    def test_context_is_discovered_else_fallback(self):
+        with self._configured(), \
+             mock.patch.object(ha, "LOCAL_MODEL_CONTEXT", 81920), \
+             mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "big", "contextTokens": 131072},
+                                {"id": "nowin", "contextTokens": None}]):
+            self.assertEqual(ha.local_model_context("big"), 131072)     # discovered
+            self.assertEqual(ha.local_model_context("nowin"), 81920)    # no window
+            self.assertEqual(ha.local_model_context("unknown"), 81920)  # absent
+
+    def test_member_accepts_only_served_when_the_set_is_known(self):
+        with self._configured(LOCAL_MODEL_NAME="gpt-oss:120b"):
+            with mock.patch.object(ha, "_local_model_discovered",
+                                   [{"id": "gpt-oss:120b"}, {"id": "qwen:32b"}]):
+                self.assertTrue(ha.local_model_member("qwen:32b"))
+                self.assertFalse(ha.local_model_member("nope"))
+                self.assertFalse(ha.local_model_member("bad name!"))    # charset gate
+                self.assertTrue(ha.local_model_member("gpt-oss:120b"))  # the default
+            # An EMPTY set can't disprove membership (discovery not landed yet) —
+            # accept charset-valid so a switch isn't refused during the gap.
+            with mock.patch.object(ha, "_local_model_discovered", None):
+                self.assertTrue(ha.local_model_member("anything-valid"))
+                self.assertFalse(ha.local_model_member("bad name!"))
+
+    def test_payload_carries_the_discovered_set_and_default(self):
+        with self._configured(LOCAL_MODEL_NAME="gpt-oss:120b"), \
+             mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "gpt-oss:120b", "contextTokens": 81920},
+                                {"id": "qwen:32b", "contextTokens": 32768}]):
+            p = ha.local_model_payload()
+        self.assertTrue(p["available"])
+        self.assertEqual(p["defaultModel"], "gpt-oss:120b")
+        self.assertEqual(p["model"], "gpt-oss:120b")   # back-compat single field
+        self.assertEqual(p["contextTokens"], 81920)
+        self.assertEqual([m["id"] for m in p["models"]], ["gpt-oss:120b", "qwen:32b"])
+        with self._configured(LOCAL_MODEL_API_KEY=""):
+            off = ha.local_model_payload()
+        self.assertFalse(off["available"])
+        self.assertEqual(off["models"], [])
+        self.assertIsNone(off["defaultModel"])
+
+    def test_discover_parses_ids_and_litellm_contexts(self):
+        """/v1/models gives ids; /model/info gives per-model windows. An
+        off-charset id is dropped (it would reach a launch command line)."""
+        root = "https://gw.example.com"
+
+        def fake_get(url):
+            if url == f"{root}/v1/models":
+                return {"data": [{"id": "gpt-oss:120b"}, {"id": "qwen:32b"},
+                                 {"id": "bad name!"}]}
+            if url == f"{root}/model/info":
+                return {"data": [
+                    {"model_name": "gpt-oss:120b",
+                     "model_info": {"max_input_tokens": 81920}},
+                    {"model_name": "qwen:32b",
+                     "model_info": {"max_tokens": 32768}}]}
+            return None
+        with self._configured(), \
+             mock.patch.object(ha, "_local_model_discovered", None), \
+             mock.patch.object(ha, "_discovery_get_json", fake_get):
+            ha.discover_local_models_once()
+            got = ha.discovered_local_models()
+        self.assertEqual(got, [{"id": "gpt-oss:120b", "contextTokens": 81920},
+                               {"id": "qwen:32b", "contextTokens": 32768}])
+
+    def test_discovery_failure_keeps_the_last_good_list(self):
+        """A transient endpoint failure must not blank a working dropdown."""
+        good = [{"id": "gpt-oss:120b", "contextTokens": 81920}]
+        with self._configured(), \
+             mock.patch.object(ha, "_local_model_discovered", list(good)), \
+             mock.patch.object(ha, "_discovery_get_json", lambda url: None):
+            ha.discover_local_models_once()
+            self.assertEqual(ha.discovered_local_models(), good)
+
+    def test_bare_openai_endpoint_gives_null_windows(self):
+        """No /model/info route (a plain OpenAI-compatible endpoint) -> every
+        window null, and local_model_context falls back to the configured one."""
+        with self._configured(LOCAL_MODEL_NAME=""), \
+             mock.patch.object(ha, "LOCAL_MODEL_CONTEXT", 65536), \
+             mock.patch.object(ha, "_local_model_discovered", None), \
+             mock.patch.object(
+                 ha, "_discovery_get_json",
+                 lambda url: {"data": [{"id": "llama3"}]}
+                 if url.endswith("/v1/models") else None):
+            ha.discover_local_models_once()
+            self.assertEqual(ha.discovered_local_models(),
+                             [{"id": "llama3", "contextTokens": None}])
+            self.assertEqual(ha.local_model_context("llama3"), 65536)
+
 
 class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
     """Moving a running session onto the self-hosted model and back (XERK-246).
@@ -10213,17 +10357,43 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm._launch_tmux(sess)
         self.assertIn("--model sonnet", self._launches()[-1])
 
-    def test_set_model_refused_on_a_local_session(self):
-        """The picker only offers Claude aliases the gateway refuses — including
-        'Default', which resolves to the login default. Accepting one would
-        break the session with nothing in errorMsg and no way back from the
-        chip."""
+    def test_local_model_switch_relaunches_with_the_new_model(self):
+        """A local session's model is an ENDPOINT model, not a Claude alias
+        (XERK-489). set_model rewrites the env and relaunches via --resume rather
+        than driving the /model picker (whose rows the gateway all refuse)."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        self._pin_transcript(sess)
+        with mock.patch.object(
+                ha, "_local_model_discovered",
+                [{"id": "gpt-oss:120b", "contextTokens": 81920},
+                 {"id": "qwen:32b", "contextTokens": 32768}]):
+            sm.set_model("abcde", "qwen:32b")
+        self.assertEqual(sess["localModelName"], "qwen:32b")
+        self.assertEqual(sess["localModelContext"], 32768)
+        cmd = self._launches()[-1]
+        self.assertIn("--resume 11111111-1111-4111-8111-111111111111", cmd)
+        self.assertNotIn("--session-id", cmd)   # never a fresh context
+        env = self._launch_env()
+        self.assertIn("ANTHROPIC_MODEL=qwen:32b", env)
+        self.assertIn("ANTHROPIC_SMALL_FAST_MODEL=qwen:32b", env)
+        # The window MATCHES the served figure — the constraint the feature turns
+        # on (an overstated window compacts too late and the tail truncates).
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768", env)
+
+    def test_local_model_switch_refuses_a_model_the_host_does_not_serve(self):
+        """Validated against the discovered set before the gateway sees it — a
+        model the endpoint doesn't serve errors the card rather than 403ing every
+        turn silently, and does NOT relaunch."""
         sm = self.make_manager()
         sess = self._session(sm, source="local")
         self.run_calls.clear()
-        sm.set_model("abcde", "sonnet")
-        self.assertIsNone(sess.get("model"))
-        # The picker is never opened and no keys are sent to the pane.
+        with mock.patch.object(
+                ha, "_local_model_discovered",
+                [{"id": "gpt-oss:120b", "contextTokens": 81920}]):
+            sm.set_model("abcde", "not-served")
+        self.assertIsNotNone(sess.get("errorMsg"))
+        # No relaunch — the picker is never opened and no keys reach the pane.
         self.assertEqual([c for c in self.run_calls if "tmux" in c], [])
 
     def test_switch_keeps_the_conversation(self):
@@ -10296,6 +10466,43 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         revived = sm._find(sess["id"])
         self.assertEqual(revived["modelSource"], "local")
         self.assertNotIn("--model", self._launches()[-1])
+
+    def test_kill_then_resume_keeps_the_chosen_local_model(self):
+        """A local session's CHOSEN endpoint model + window survive kill->resume
+        (XERK-489), not just the source."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess.update({"repo": "Turma", "repoPath": os.path.join(self.tmp, "Turma"),
+                     "localModelName": "qwen:32b", "localModelContext": 20000})
+        os.makedirs(sess["repoPath"], exist_ok=True)
+        sm._remember_closed(sess)
+        self.assertEqual(sm.closed[0].get("localModelName"), "qwen:32b")
+        self.assertEqual(sm.closed[0].get("localModelContext"), 20000)
+        sm.registry = []
+        with mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "qwen:32b", "contextTokens": 32768}]):
+            sm.resume(sess["id"])
+            env = self._launch_env()
+        revived = sm._find(sess["id"])
+        self.assertEqual(revived["localModelName"], "qwen:32b")
+        self.assertIn("ANTHROPIC_MODEL=qwen:32b", env)
+        # Stored 20000 <= served 32768, so the (shrinking) override is honoured.
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=20000", env)
+
+    def test_local_session_launches_before_discovery_lands(self):
+        """A local session resuming before the discovery worker's first pass has
+        an EMPTY list and maybe no configured default — but its stored model is
+        enough to launch, and it must NOT demote to the subscription (XERK-489),
+        which would strand it on every restart."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["localModelName"] = "qwen:32b"
+        with mock.patch.object(ha, "LOCAL_MODEL_NAME", ""), \
+             mock.patch.object(ha, "_local_model_discovered", None):
+            sm._launch_tmux(sess)
+            env = self._launch_env()
+        self.assertEqual(sess["modelSource"], "local")     # not demoted
+        self.assertIn("ANTHROPIC_MODEL=qwen:32b", env)
 
     def _migrate_in(self, sm, source, launch=True):
         """Run the shared migration/resume-any record build for a moved session.
