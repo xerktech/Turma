@@ -10837,6 +10837,56 @@ test("heartbeat: localModel is a known key, not an unknown-field remnant", async
   assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("localModel"));
 });
 
+test("heartbeat: dsh flag + session agentType survive into the fleet payload (XERK-465)", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "dsh1",
+      dsh: { available: true },
+      sessions: [{ id: "s1", repo: "Turma", status: "running", agentType: "dsh" }],
+    },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = res.body.agents.find((a) => a.device === "dsh1");
+  assert.equal(host.dsh.available, true);
+  // The per-session runtime the card chips off must reach clients too.
+  assert.equal(host.sessions[0].agentType, "dsh");
+});
+
+test("http: spawn validates agentType like modelSource does (XERK-465)", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "dsh2", dsh: { available: true } }, headers: agentHeaders,
+  });
+  // Junk must 400 here rather than land as an errored session card on the host.
+  const bad = await request("POST", "/api/agents/dsh2/sessions", {
+    body: { repo: "Turma", agentType: "codex; rm -rf /" }, headers: userHeaders,
+  });
+  assert.equal(bad.status, 400);
+  const ok = await request("POST", "/api/agents/dsh2/sessions", {
+    body: { repo: "Turma", agentType: "dsh" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test("http: spawning dsh is refused on a host that does not offer it (XERK-465)", async () => {
+  // No dsh block -> capability absent -> a stale composer's dsh click gets a
+  // clear 409 rather than a session the host silently drops.
+  await request("POST", "/api/heartbeat", { body: { device: "dsh3" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/dsh3/sessions", {
+    body: { repo: "Turma", agentType: "dsh" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 409);
+  // ...but plain claude still spawns.
+  const ok = await request("POST", "/api/agents/dsh3/sessions", {
+    body: { repo: "Turma", agentType: "claude" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test("heartbeat: dsh is a known key, not an unknown-field remnant (XERK-465)", async () => {
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("dsh"));
+});
+
 
 // ---- XERK-273: the concurrent-connection cap ---------------------------------
 
@@ -11484,6 +11534,34 @@ test("normalizeLocalModel coerces the block so one host cannot hide the fleet", 
   assert.ok(!("localModel" in old));
 });
 
+test("normalizeDsh coerces the capability flag strictly boolean (XERK-465)", () => {
+  // Same atomic-decode hazard as normalizeLocalModel: one host's bad `dsh`
+  // block would fail Android's whole /api/agents decode and empty the fleet.
+  const norm = (dsh) => {
+    const p = { device: "h", dsh };
+    hub.normalizeDsh(p);
+    return p.dsh;
+  };
+  // A good block passes through.
+  assert.deepEqual(norm({ available: true }), { available: true });
+  // Strictly boolean: a truthy non-true value reads as "cannot do dsh", so the
+  // composer hides the selector rather than queue a spawn the host refuses.
+  assert.deepEqual(norm({ available: "yes" }), { available: false });
+  assert.deepEqual(norm({ available: 1 }), { available: false });
+  assert.deepEqual(norm({ available: false }), { available: false });
+  // Any extra keys a newer agent adds are dropped down to the one flag Android
+  // types — the block is rebuilt, not spread.
+  assert.deepEqual(norm({ available: true, model: "deepseek" }), { available: true });
+  // Not an object at all -> null, which every client reads as "cannot do dsh".
+  assert.equal(norm("yes"), null);
+  assert.equal(norm([1]), null);
+  assert.equal(norm(null), null);
+  // A pre-dsh agent sends nothing; the key stays absent, not an explicit null.
+  const old = { device: "h" };
+  hub.normalizeDsh(old);
+  assert.ok(!("dsh" in old));
+});
+
 test("isPlainHostKey refuses exactly the names the hub cannot address", () => {
   // Prototype keys (XERK-235) and URL dot segments (XERK-269): the first is not
   // a host at all, the second is a host no /api/agents/<host>/... route can
@@ -11624,10 +11702,11 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
     h1: {
       device: "h1", online: true,
       localModel: { available: "yes", model: 12345, contextTokens: 9999999999 },
+      dsh: { available: "yes" },                     // XERK-465 capability flag
       limits: { fiveHour: { usedPct: "lots" } },
       sessions: [
         null,                                        // decode-fatal element
-        { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"],
+        { id: "s1", modelSource: { a: 1 }, modelSourceAt: ["x"], agentType: { a: 1 },
           session: { agents: [{ sel: "yes", type: { a: 1 }, label: ["x"] }] } },
         "not-a-session",
       ],
@@ -11651,10 +11730,12 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
     "the restore did not run — it threw into its own catch");
   const rec = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>"))).h1;
   assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null });
+  assert.deepEqual(rec.dsh, { available: false });
   assert.equal(rec.limits, null);
   assert.equal(rec.sessions.length, 1, "non-object session elements must be dropped");
   assert.equal(rec.sessions[0].modelSource, "");
   assert.equal(rec.sessions[0].modelSourceAt, "");
+  assert.equal(rec.sessions[0].agentType, "");
   assert.deepEqual(rec.sessions[0].session.agents,
     [{ sel: true, type: "[object Object]", label: "x" }]);
 });

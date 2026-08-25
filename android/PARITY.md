@@ -363,6 +363,24 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   compose-bar chip already names the model. The chip's missing tooltip is a deliberate difference,
   recorded above.
 
+## Done (XERK-465 — dsh runtime selection + capability flag)
+
+- **Type the field + capability flag** so `/api/agents` keeps decoding once agents report them:
+  `SessionInfo.agentType` ("claude"|"dsh", "" for a pre-dsh agent, coerced hub-side) and
+  `AgentInfo.dsh: DshInfo?` (the `{available}` capability block, mirroring `localModel`). Both are
+  the "typed on Android in the same change" half of the wire contract — a field is only
+  decode-fatal once a client types it.
+- **A "Runtime" row in the spawn composer**, gated on the target host's `dsh.available` exactly as
+  "Run against" is gated on `localModel.available` — a host that doesn't offer dsh renders no row,
+  so nobody picks a runtime the host would only refuse (the hub 409s it). Defaults to Claude Code;
+  only a real "dsh" pick reaches the wire (`SpawnRequest.agentType`), so a bare spawn is unchanged.
+  A host that stops offering dsh while the composer is open resets a picked dsh back to claude
+  (`LaunchedEffect`), the same reset the local-model row has.
+- Pure half in `core/Runtime.kt` (`RuntimeTest.kt`); the composer call site in
+  `ui/SpawnComposerTest.kt`; the wire body in `vm/SpawnRequestTest.kt`.
+- **Still open:** the dsh runtime BADGE on live/ended session CARDS (see below) — the field decodes,
+  so it is a pure render add, in the same boat as the local-model card mark below.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -405,6 +423,11 @@ those are marked `[MODEL]`.
   glance at the list says which sessions are on the weaker model without opening each one. Read
   `session.modelSource == "local"`, titled with `modelSourceAt`. Both fields already decode onto
   `SessionInfo`.
+- **P2 dsh runtime badge on session CARDS (XERK-465 remainder).** The composer selector and the
+  `agentType`/`dsh` typing are done (see Done above); what's left is the web's `⚙ dsh` chip on live
+  and ended session cards (`.runtime-mark` in `sessions.html`), so a glance says which sessions run
+  on dsh. Read `Runtime.isDsh(session.agentType)`; claude sessions (the default) carry none. The
+  field already decodes onto `SessionInfo`.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
 - ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
   see Done above; the read-only review itself was XERK-70).

@@ -199,6 +199,23 @@ data class AgentInfo(
      * queue a command the host would ack and drop.
      */
     val localModel: LocalModelInfo? = null,
+    /**
+     * Whether this host offers the dsh runtime as a per-session choice (XERK-460).
+     * Doubles as the capability flag, exactly like [localModel]: an agent
+     * predating dsh — or one that hasn't opted in — reports nothing, and an
+     * ABSENT block means "that host cannot do it", never "assume it can". Clients
+     * hide the runtime selector rather than queue a spawn the host would refuse.
+     */
+    val dsh: DshInfo? = null,
+)
+
+/**
+ * A host's dsh-runtime capability (hub-agent's `dsh` block). Mirrors
+ * [LocalModelInfo]'s role: [available] is the whole flag the composer gates on.
+ */
+@Serializable
+data class DshInfo(
+    val available: Boolean = false,
 )
 
 /**
@@ -603,6 +620,12 @@ data class SessionInfo(
     val modelSource: String = "",
     /** When it was last switched; "" for a session that never moved. */
     val modelSourceAt: String = "",
+    /**
+     * Which runtime this session runs on (XERK-460): "claude" or "dsh". An agent
+     * predating the field reports nothing, coerced to "" hub-side, which reads as
+     * claude — the runtime every session had before this existed. Presentational.
+     */
+    val agentType: String = "",
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
     /**

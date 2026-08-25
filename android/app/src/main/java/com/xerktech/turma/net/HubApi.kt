@@ -404,6 +404,10 @@ data class SpawnRequest(
     // operator picked one, so a bare spawn is the exact body it always was; the
     // hub 409s "local" at a host reporting no local model.
     val modelSource: String? = null,
+    // Which runtime the new session runs on (XERK-460). Omitted unless the
+    // operator picked "dsh", so a bare spawn is unchanged; the hub 409s "dsh" at
+    // a host that does not offer it.
+    val agentType: String? = null,
 )
 
 @Serializable

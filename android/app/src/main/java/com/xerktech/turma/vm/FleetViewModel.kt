@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.ModelSource
+import com.xerktech.turma.core.Runtime
 import com.xerktech.turma.net.AnswerRequest
 import com.xerktech.turma.net.CloneRequest
 import com.xerktech.turma.net.InputRequest
@@ -112,11 +113,11 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun spawn(
         host: String, repo: String, prompt: String? = null, label: String? = null,
         baseRef: String? = null, model: String? = null, permissionMode: String? = null,
-        modelSource: String? = null,
+        modelSource: String? = null, agentType: String? = null,
     ) = run("session queued") {
         container.client.api.spawnSession(
             host,
-            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource),
+            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource, agentType),
         )
     }
 
@@ -194,7 +195,7 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         fun spawnRequest(
             repo: String, prompt: String? = null, label: String? = null,
             baseRef: String? = null, model: String? = null, permissionMode: String? = null,
-            modelSource: String? = null,
+            modelSource: String? = null, agentType: String? = null,
         ) = SpawnRequest(
             repo = repo,
             prompt = prompt?.ifBlank { null },
@@ -203,6 +204,9 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             model = model?.ifBlank { null },
             permissionMode = permissionMode?.ifBlank { null },
             modelSource = ModelSource.spawnValue(modelSource),
+            // Sent ONLY for dsh (XERK-460); "claude" is what a spawn already
+            // meant, so a bare spawn stays byte-identical.
+            agentType = Runtime.spawnValue(agentType),
         )
 
         /** The in-flight action kind for a session, or null (web sessPending). */

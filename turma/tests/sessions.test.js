@@ -192,7 +192,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
-      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
+      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, runtimeMarkHtml,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -1980,6 +1980,56 @@ test("composer: the chosen 'Run against' actually reaches the spawn request", ()
   assert.equal(spawnWith("local").body.modelSource, "local");
   // The default is not sent at all, so a host without a local model is unaffected.
   assert.equal(spawnWith("subscription").body.modelSource, undefined);
+});
+
+test("composer: 'Runtime' appears only when the host reports the dsh capability (XERK-465)", () => {
+  // The selector is gated on the dsh capability exactly like 'Run against' is on
+  // localModel — a host that cannot launch dsh renders no choice, so nobody can
+  // pick a runtime the host would only ack and drop.
+  const open = (h) => {
+    const page = loadPage();
+    const { now } = host([]);
+    page.setCache({ now, agents: [h] });
+    page.render({ now, agents: [h] });
+    page.toggleComposer("hostA::repoX", "repoX");
+    return page.els.spawn.innerHTML;
+  };
+  const base = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
+  };
+  assert.match(open({ ...base, dsh: { available: true } }), /Runtime/);
+  // Absent block or false capability -> no selector at all.
+  assert.doesNotMatch(open({ ...base, dsh: { available: false } }), /Runtime/);
+  assert.doesNotMatch(open(base), /Runtime/);
+});
+
+test("composer: the chosen Runtime actually reaches the spawn request (XERK-465)", () => {
+  const spawnWith = (value) => {
+    const page = loadPage();
+    const now = Date.now();
+    const h = {
+      key: "hostA", device: "hostA", online: true, terminalOnline: true,
+      lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
+      dsh: { available: true },
+    };
+    page.setCache({ now, agents: [h] });
+    page.render({ now, agents: [h] });
+    page.toggleComposer("hostA::repoX", "repoX");
+    page.els["cmp-type-hostA__repoX"] = { value };
+    page.startSession("hostA", "repoX");
+    return page.posts.find((p) => p.url.endsWith("/sessions"));
+  };
+  assert.equal(spawnWith("dsh").body.agentType, "dsh");
+  // claude is the default and is never sent, so a non-dsh host is unaffected.
+  assert.equal(spawnWith("claude").body.agentType, undefined);
+});
+
+test("session card shows a dsh runtime badge, and none for claude (XERK-465)", () => {
+  const { runtimeMarkHtml } = loadPage();
+  assert.match(runtimeMarkHtml({ agentType: "dsh" }), /dsh/);
+  assert.equal(runtimeMarkHtml({ agentType: "claude" }), "");
+  assert.equal(runtimeMarkHtml({}), "");
 });
 
 // XERK-162: the sidebar's own prBadgeHtml copy labels a GitLab MR / ADO PR

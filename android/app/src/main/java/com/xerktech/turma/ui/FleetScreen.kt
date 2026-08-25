@@ -185,9 +185,10 @@ fun FleetScreen(
             // offer it. Pure + tested, because "the wrong loop" is a shape this
             // repo has shipped before.
             localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
+            dsh = com.xerktech.turma.core.Runtime.hostDsh(fleet.agents, host),
             onDismiss = { spawnFor = null },
-            onSpawn = { prompt, label, baseRef, model, mode, source ->
-                vm.spawn(host, repo, prompt, label, baseRef, model, mode, source); spawnFor = null
+            onSpawn = { prompt, label, baseRef, model, mode, source, agentType ->
+                vm.spawn(host, repo, prompt, label, baseRef, model, mode, source, agentType); spawnFor = null
             },
         )
     }
