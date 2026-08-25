@@ -1977,6 +1977,209 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         self.assertIsNone(rep["panePrompt"])
 
 
+class TestDshState(unittest.TestCase):
+    """parse_dsh_state / dsh_pane_busy — the pure mapping from a dsh
+    control-socket `state` object to the paneBusy tri-state (XERK-468 [D])."""
+
+    def test_parse_normalizes_status_and_counts(self):
+        self.assertEqual(
+            ha.parse_dsh_state({"status": "running", "eventCount": 7,
+                                "pendingInteraction": False}),
+            {"status": "running", "eventCount": 7, "pendingInteraction": False})
+        # The ack shape (an inline snapshot on {"ok":true,...}) parses the same.
+        self.assertEqual(
+            ha.parse_dsh_state({"ok": True, "status": "idle"}),
+            {"status": "idle", "eventCount": None, "pendingInteraction": False})
+
+    def test_parse_rejects_junk_without_raising(self):
+        self.assertIsNone(ha.parse_dsh_state("running"))
+        self.assertIsNone(ha.parse_dsh_state(None))
+        # Unknown status -> None status (not an error), eventCount coerced.
+        self.assertEqual(ha.parse_dsh_state({"status": "weird"})["status"], None)
+        # A bool is not an eventCount (True is an int in Python — the guard is
+        # load-bearing), and a negative one is dropped.
+        self.assertIsNone(ha.parse_dsh_state({"eventCount": True})["eventCount"])
+        self.assertIsNone(ha.parse_dsh_state({"eventCount": -3})["eventCount"])
+        self.assertIsNone(ha.parse_dsh_state({"eventCount": 1.5})["eventCount"])
+
+    def test_pane_busy_tri_state(self):
+        run = {"status": "running", "eventCount": 1, "pendingInteraction": False}
+        idle = {"status": "idle", "eventCount": 1, "pendingInteraction": False}
+        self.assertIs(ha.dsh_pane_busy(run), True)
+        self.assertIs(ha.dsh_pane_busy(idle), False)
+        # Missing / unknown status -> None ("can't tell", falls back to
+        # transcript freshness downstream, like an uncapturable Claude pane).
+        self.assertIsNone(ha.dsh_pane_busy(None))
+        self.assertIsNone(ha.dsh_pane_busy({"status": None}))
+
+    def test_pending_interaction_reads_not_working(self):
+        # Blocked on a human is NOT its own turn — like a Claude panePrompt that
+        # suppresses the busy hint. False even if dsh still calls itself running.
+        self.assertIs(ha.dsh_pane_busy(
+            {"status": "running", "pendingInteraction": True}), False)
+
+
+class TestDshQueryState(unittest.TestCase):
+    """dsh_query_state speaks the control-socket contract
+    (docs/dsh-session-lifecycle.md) against a real fake UNIX-socket server."""
+
+    def _serve(self, reply_bytes, *, accept=True):
+        """Bind a fake driver-plugin socket that answers one `state` request
+        with `reply_bytes`. Returns its path; torn down at test end."""
+        d = tempfile.mkdtemp(prefix="dsh-sock-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "s.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def run():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                if not accept:
+                    return
+                conn.recv(4096)          # the {"op":"state"} request
+                conn.sendall(reply_bytes)
+        threading.Thread(target=run, daemon=True).start()
+        return path
+
+    def test_reads_a_running_snapshot(self):
+        path = self._serve(
+            b'{"ok":true,"status":"running","eventCount":3,'
+            b'"pendingInteraction":false}\n')
+        self.assertEqual(
+            ha.dsh_query_state(path, timeout=5),
+            {"status": "running", "eventCount": 3, "pendingInteraction": False})
+
+    def test_no_socket_returns_none(self):
+        self.assertIsNone(ha.dsh_query_state("/no/such/dsh.sock", timeout=1))
+
+    def test_malformed_reply_returns_none(self):
+        path = self._serve(b'not json at all\n')
+        self.assertIsNone(ha.dsh_query_state(path, timeout=5))
+
+    def test_a_flood_without_newline_is_bounded(self):
+        # A hostile/broken plugin streaming one unterminated line must not become
+        # an unbounded read on the agent.
+        path = self._serve(b"x" * (ha.DSH_SOCK_LINE_MAX + 4096))
+        self.assertIsNone(ha.dsh_query_state(path, timeout=5))
+
+
+class TestDshLivenessInReport(ProjectDirMixin, unittest.TestCase):
+    """A dsh session sources paneBusy from its cached control-socket status
+    instead of a pane scrape, reusing the same wire field so every working/ready
+    mirror is unchanged (XERK-468 [D]). Everything else in the report still
+    comes from the (projected) transcript."""
+
+    def _txn(self, role, text, tool_use=False):
+        content = [{"type": "text", "text": text}]
+        if tool_use:
+            content.append({"type": "tool_use", "name": "Bash",
+                            "input": {"command": "ls"}})
+        return {"type": role, "message": {"role": role, "content": content}}
+
+    def test_dsh_busy_from_status_never_scrapes_the_pane(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "done")])
+        status = {"status": "running", "eventCount": 2,
+                  "pendingInteraction": False}
+        # A tmux_name is passed, but a dsh session has no Claude pane — assert
+        # _pane_status is never consulted, so a stray capture can't fake a read.
+        with mock.patch.object(ha, "_pane_status",
+                               side_effect=AssertionError("pane scraped")):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-dsh",
+                                    agent_type="dsh", dsh_status=status)
+        self.assertIs(rep["paneBusy"], True)
+        self.assertIsNone(rep["modeActual"])
+        self.assertIsNone(rep["panePrompt"])
+        # Transcript-derived ready inputs still populate for a dsh session — this
+        # is what makes readyForReview's finished-turn branch work unchanged.
+        self.assertEqual(rep["lastRole"], "assistant")
+        self.assertIs(rep["lastHasToolUse"], False)
+        self.assertIsNotNone(rep["transcriptAgeSec"])
+
+    def test_dsh_idle_and_unknown(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "hi")])
+        with mock.patch.object(ha, "_pane_status",
+                               side_effect=AssertionError("pane scraped")):
+            idle = ha.session_report(self.WORKDIR, {}, "agent-dsh",
+                                     agent_type="dsh",
+                                     dsh_status={"status": "idle"})
+            # No cached status yet (launcher's reader hasn't reported) -> None,
+            # which falls back to transcript freshness downstream.
+            unknown = ha.session_report(self.WORKDIR, {}, "agent-dsh",
+                                        agent_type="dsh", dsh_status=None)
+        self.assertIs(idle["paneBusy"], False)
+        self.assertIsNone(unknown["paneBusy"])
+
+    def test_a_claude_session_still_scrapes_the_pane(self):
+        # The dsh branch must not touch the Claude path.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "hi")])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "plan", None)) as ps:
+            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.assertIs(rep["paneBusy"], True)
+        self.assertEqual(rep["modeActual"], "plan")
+        ps.assert_called_once()
+
+
+class TestDshLivenessSeam(unittest.TestCase):
+    """The manager-side seam the launcher's socket reader feeds (XERK-468 [D])."""
+
+    def test_ingest_state_event_updates_cache(self):
+        sm = ha.SessionManager()
+        sm._ingest_dsh_event("s1", {"evt": "state", "status": "running",
+                                    "eventCount": 4})
+        self.assertEqual(sm.dsh_status["s1"],
+                         {"status": "running", "eventCount": 4,
+                          "pendingInteraction": False})
+
+    def test_ingest_interaction_is_left_to_C(self):
+        # [D] owns the `state` event; the `interaction` event is [C]'s, so [D]
+        # touches neither the cache nor anything else for it.
+        sm = ha.SessionManager()
+        sm._ingest_dsh_event("s1", {"evt": "interaction", "requestId": "r1",
+                                    "prompt": "pick"})
+        self.assertNotIn("s1", sm.dsh_status)
+
+    def test_ingest_tolerates_junk(self):
+        sm = ha.SessionManager()
+        sm._ingest_dsh_event("s1", "nope")
+        sm._ingest_dsh_event("", {"evt": "state", "status": "running"})
+        sm._ingest_dsh_event("s1", {"evt": "state", "status": "bogus"})
+        self.assertEqual(sm.dsh_status, {})
+
+    def test_set_none_clears_a_disconnected_session(self):
+        sm = ha.SessionManager()
+        sm._set_dsh_status("s1", {"status": "running"})
+        sm._set_dsh_status("s1", None)          # what the reader does on disconnect
+        self.assertNotIn("s1", sm.dsh_status)
+
+    def test_forget_caches_drops_dsh_status(self):
+        sm = ha.SessionManager()
+        sm.dsh_status["s1"] = {"status": "running"}
+        sm._forget_session_caches("s1")
+        self.assertNotIn("s1", sm.dsh_status)
+
+    def test_refresh_reads_the_socket_off_beat(self):
+        sm = ha.SessionManager()
+        snap = {"status": "running", "eventCount": 1, "pendingInteraction": False}
+        with mock.patch.object(ha, "dsh_query_state", return_value=snap) as q:
+            self.assertEqual(sm.refresh_dsh_status("s1"), snap)
+        self.assertEqual(sm.dsh_status["s1"], snap)
+        self.assertEqual(q.call_args[0][0], ha.dsh_sock_path("s1"))
+        # A failed query clears the cache rather than freezing a stale read.
+        with mock.patch.object(ha, "dsh_query_state", return_value=None):
+            self.assertIsNone(sm.refresh_dsh_status("s1"))
+        self.assertNotIn("s1", sm.dsh_status)
+
+
 class TestStablePaneBusy(unittest.TestCase):
     """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
     capture would otherwise cause: a busy read is instant, an idle read is
