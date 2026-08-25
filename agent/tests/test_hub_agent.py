@@ -2064,9 +2064,44 @@ class TestDshQueryState(unittest.TestCase):
 
     def test_a_flood_without_newline_is_bounded(self):
         # A hostile/broken plugin streaming one unterminated line must not become
-        # an unbounded read on the agent.
-        path = self._serve(b"x" * (ha.DSH_SOCK_LINE_MAX + 4096))
-        self.assertIsNone(ha.dsh_query_state(path, timeout=5))
+        # an unbounded read on the agent. The server here NEVER sends a newline
+        # and NEVER closes — it streams past DSH_SOCK_LINE_MAX continuously — so
+        # only the byte bound can end the read. (A finite blob that then closes
+        # would return None on the recv->empty path whether or not the bound
+        # existed, which is a vacuous test: with the bound deleted it still
+        # passes. Here, deleting the bound makes the read run to the timeout, so
+        # the FAST return is the proof the bound fired.)
+        d = tempfile.mkdtemp(prefix="dsh-flood-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "s.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def run():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                conn.recv(4096)                 # the {"op":"state"} request
+                chunk = b"x" * 65536
+                while not stop.is_set():
+                    try:
+                        conn.sendall(chunk)     # no newline, ever
+                    except OSError:
+                        return                  # client hung up (the bound fired)
+        threading.Thread(target=run, daemon=True).start()
+
+        start = time.monotonic()
+        # Generous timeout: WITH the bound this returns in milliseconds; WITHOUT
+        # it the read runs until the 30s timeout — so a fast None is the guard,
+        # a slow one is the timeout masking a removed bound.
+        self.assertIsNone(ha.dsh_query_state(path, timeout=30))
+        self.assertLess(time.monotonic() - start, 5)
 
 
 class TestDshLivenessInReport(ProjectDirMixin, unittest.TestCase):
