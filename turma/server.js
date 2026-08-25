@@ -207,6 +207,19 @@ function localModelAvailable(agent) {
   return Boolean(agent && agent.localModel && agent.localModel.available);
 }
 
+// Whether `model` is one the host's discovered set serves (XERK-489) — the
+// membership check that makes the dropdown honest, mirroring checkSpawnModelSource.
+// An EMPTY set (older agent, or discovery not landed) cannot DISPROVE membership,
+// so it accepts — the agent re-validates on launch and demotes if truly absent.
+// Blank model = "use the host default", always fine.
+function localModelServes(agent, model) {
+  if (!model) return true;
+  const lm = agent && agent.localModel;
+  const list = (lm && Array.isArray(lm.models)) ? lm.models : [];
+  if (!list.length) return true;
+  return list.some((m) => m && m.id === model);
+}
+
 // Which model source a host reports for one of its sessions, "" when unknown.
 function sessionModelSource(hostKey, sessionId) {
   const s = (agents[hostKey]?.sessions || []).find((x) => x.id === sessionId);
@@ -218,12 +231,29 @@ function sessionModelSource(hostKey, sessionId) {
 // how you start NEW work once usage is gone, so it gets the same enum check and
 // the same capability gate rather than failing later as an errored session card.
 function checkSpawnModelSource(cmd, hostKey) {
+  // A named endpoint model (XERK-489) is charset-validated FIRST, even when the
+  // caller omits modelSource — strict parity with the /model-source route, which
+  // checks localModel regardless. Before this ran ahead of the modelSource==null
+  // early-return, a bad localModel with no source was queued unchecked (inert on
+  // the agent, but a silent inconsistency). Same charset gate as both switch
+  // routes; endpoint ids carry ':'/'/'.
+  if (cmd.localModel != null &&
+      (typeof cmd.localModel !== "string" || cmd.localModel.length > 60 ||
+       !/^[A-Za-z0-9._:/-]+$/.test(cmd.localModel))) {
+    return { status: 400, error: "invalid localModel" };
+  }
   if (cmd.modelSource == null) return null;
   if (!["subscription", "local"].includes(cmd.modelSource)) {
     return { status: 400, error: "modelSource must be subscription or local" };
   }
   if (cmd.modelSource === "local" && !localModelAvailable(agents[hostKey])) {
     return { status: 409, error: "host has no local model configured" };
+  }
+  // Membership is a LOCAL spawn concern only — an unserved model matters only
+  // when this spawn is actually going onto the endpoint.
+  if (cmd.localModel != null && cmd.modelSource === "local" &&
+      !localModelServes(agents[hostKey], cmd.localModel)) {
+    return { status: 409, error: "host does not serve that local model" };
   }
   return null;
 }
@@ -2004,6 +2034,12 @@ function startMigration(srcHost, s, targetHost) {
       // move onto a host without one falls back rather than launching at an
       // endpoint that isn't there.
       modelSource: s.modelSource || null,
+      // And WHICH self-hosted model + window (XERK-489), carried so a moved
+      // local session keeps it — the target re-validates against its own
+      // discovered set and falls back to its default when it serves a different
+      // one.
+      localModelName: s.localModelName || null,
+      localModelContext: s.localModelContext || null,
       summary: s.summary || null,
       summaryManual: s.summaryManual || null,
       label: s.label || null,
@@ -2627,6 +2663,31 @@ function normalizeSubscription(payload) {
 //
 // Anything unusable becomes null, which every client already reads as "this host
 // cannot fail over" — the same degradation as an agent too old to report it.
+//
+// XERK-489 adds the discovered `models[]` and `defaultModel`. The array is a
+// WHITELIST, bounded in LENGTH and per-element — Android decodes /api/agents
+// atomically, so an endpoint answering thousands of ids, or one malformed
+// entry, from ONE host would drop the whole fleet from every phone (the
+// PEER_CELL_MAX / retiredUsage failure class the ticket calls out).
+const LOCAL_MODEL_LIST_MAX = 200;
+// Bound a model name to 60 code points, stripping the XML-illegal class that
+// breaks Android's uiautomator dump, exactly like the single `model` field
+// below. Cut on CODE POINTS (after the strip) so a slice never manufactures a
+// lone surrogate. Returns "" for anything unusable.
+function sanitizeModelName(s) {
+  if (typeof s !== "string") return "";
+  return [...s.slice(0, 512)
+    .replace(/\p{Surrogate}/gu, "�")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f￾￿]/g, "")
+    .trim()]
+    .slice(0, 60).join("");
+}
+// A positive int-safe context window, or null — the field is Int? on Android,
+// so a float / out-of-range / non-number must degrade to null, never throw.
+function sanitizeContextTokens(ctx) {
+  return typeof ctx === "number" && Number.isSafeInteger(ctx) &&
+    ctx > 0 && ctx <= 2_147_483_647 ? ctx : null;
+}
 function normalizeLocalModel(payload) {
   if (!payload || typeof payload !== "object") return;
   const lm = payload.localModel;
@@ -2637,7 +2698,10 @@ function normalizeLocalModel(payload) {
   // Strictly boolean: a truthy string would turn a host that cannot fail over
   // into one the UI offers the switch on, and the command would be dropped.
   if (lm.available !== true) {
-    payload.localModel = { available: false, model: null, contextTokens: null };
+    payload.localModel = {
+      available: false, model: null, contextTokens: null,
+      models: [], defaultModel: null,
+    };
     return;
   }
   // Nothing XML-ILLEGAL may leave here, from either direction — the whole class,
@@ -2659,24 +2723,36 @@ function normalizeLocalModel(payload) {
   // control plane. 512 UTF-16 units is far more than the 60 code points that
   // survive, and cutting there can only split an astral pair — which the
   // surrogate replace immediately below then handles.
-  const name = typeof lm.model === "string"
-    ? [...lm.model.slice(0, 512)
-        .replace(/\p{Surrogate}/gu, "�")     // unpaired halves -> replacement
-        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]/g, "")  // XML-illegal
-        .trim()]
-      .slice(0, 60).join("")
-    : "";
-  const ctx = lm.contextTokens;
+  const name = sanitizeModelName(lm.model);
+  // The discovered set: [{id, contextTokens|null}]. Bound the length first, then
+  // sanitize each entry; an id that sanitizes to "" is DROPPED (a nameless row
+  // the dropdown could not label). Deduped by id so a doubled entry can't pad it.
+  const models = [];
+  const seen = new Set();
+  if (Array.isArray(lm.models)) {
+    for (const m of lm.models) {
+      if (models.length >= LOCAL_MODEL_LIST_MAX) break;
+      if (!m || typeof m !== "object" || Array.isArray(m)) continue;
+      const id = sanitizeModelName(m.id);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      models.push({ id, contextTokens: sanitizeContextTokens(m.contextTokens) });
+    }
+  }
+  // defaultModel must be one the sanitized list carries (else the dropdown would
+  // preselect a value it can't show); fall back to the single `name`.
+  const def = sanitizeModelName(lm.defaultModel);
+  const defaultModel = (def && seen.has(def)) ? def : (name || null);
   payload.localModel = {
     available: true,
     // The name is display-only here (the agent validates its own charset before
     // launching), but it must be A STRING or the decode dies.
     model: name || null,
-    // Int-safe or nothing: the field is unused by the UI, so dropping a bad one
-    // costs nothing and keeps the fleet decodable.
-    contextTokens:
-      typeof ctx === "number" && Number.isSafeInteger(ctx) &&
-      ctx > 0 && ctx <= 2_147_483_647 ? ctx : null,
+    // Int-safe or nothing: dropping a bad one costs nothing and keeps the fleet
+    // decodable.
+    contextTokens: sanitizeContextTokens(lm.contextTokens),
+    models,
+    defaultModel,
   };
 }
 
@@ -8003,6 +8079,8 @@ const server = http.createServer(async (req, res) => {
         model: m.meta.model,
         permissionMode: m.meta.permissionMode,
         modelSource: m.meta.modelSource,
+        localModelName: m.meta.localModelName,
+        localModelContext: m.meta.localModelContext,
         summary: m.meta.summary,
         summaryManual: m.meta.summaryManual,
         label: m.meta.label,
@@ -8422,7 +8500,8 @@ const server = http.createServer(async (req, res) => {
         return json(res, 404, { error: "unknown repo" });
       }
       const cmd = { type: "spawn", repo, prompt };
-      for (const f of ["label", "baseRef", "model", "permissionMode", "modelSource"]) {
+      for (const f of ["label", "baseRef", "model", "permissionMode",
+                       "modelSource", "localModel"]) {
         if (typeof body[f] === "string" && body[f].trim()) cmd[f] = body[f].trim();
       }
       // Same enum as the switch route: a spawn is the OTHER way onto the local
@@ -8454,7 +8533,7 @@ const server = http.createServer(async (req, res) => {
         }
         const cmd = { type: "spawn", repo: body.repo };
         for (const f of ["prompt", "label", "baseRef", "model", "permissionMode",
-                         "modelSource"]) {
+                         "modelSource", "localModel"]) {
           if (body[f] != null && body[f] !== "") {
             if (typeof body[f] !== "string") {
               return json(res, 400, { error: `${f} must be a string` });
@@ -8659,12 +8738,19 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse((await readBody(req)) || "{}");
         const model = typeof body.model === "string" ? body.model : "";
         if (!model) return json(res, 400, { error: "model required" });
-        // A session on the self-hosted model takes its model from the host
-        // configuration; the agent refuses this and every alias the picker could
-        // offer is one the gateway rejects. Refuse here too, so the mirror case
-        // of /model-source's 409 is not a silent 200 for an out-of-parity client.
+        // A LOCAL session's model is an ENDPOINT model, not a Claude alias
+        // (XERK-489). The agent rewrites the env and relaunches rather than
+        // driving the /model picker (whose Claude rows the gateway all reject),
+        // so accept it here — but against the endpoint charset (ids carry `:`/`/`
+        // that the Claude-alias regex forbids) and only when the host's
+        // discovered set actually serves it (409, mirroring the switch route).
         if (sessionModelSource(key, sessionId) === "local") {
-          return json(res, 409, { error: "session runs on the self-hosted model" });
+          if (model.length > 60 || !/^[A-Za-z0-9._:/-]+$/.test(model))
+            return json(res, 400, { error: "invalid model" });
+          if (!localModelServes(agents[key], model))
+            return json(res, 409, { error: "host does not serve that local model" });
+          const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
+          return json(res, 200, { ok: true, cmdId });
         }
         if (model.length > 60 || !/^[a-z0-9.[\]-]+$/i.test(model))
           return json(res, 400, { error: "invalid model" });
@@ -8710,7 +8796,19 @@ const server = http.createServer(async (req, res) => {
         if (modelSource === "local" && !localModelAvailable(agents[key])) {
           return json(res, 409, { error: "host has no local model configured" });
         }
-        const cmdId = queueCommand(key, { type: "setModelSource", sessionId, modelSource });
+        // Optionally land on a CHOSEN endpoint model in the same step (XERK-489);
+        // validate membership like the /model route. Ignored for a subscription
+        // switch.
+        const localModel = typeof body.localModel === "string" ? body.localModel : "";
+        if (localModel) {
+          if (localModel.length > 60 || !/^[A-Za-z0-9._:/-]+$/.test(localModel))
+            return json(res, 400, { error: "invalid localModel" });
+          if (modelSource === "local" && !localModelServes(agents[key], localModel))
+            return json(res, 409, { error: "host does not serve that local model" });
+        }
+        const cmd = { type: "setModelSource", sessionId, modelSource };
+        if (localModel && modelSource === "local") cmd.localModel = localModel;
+        const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
