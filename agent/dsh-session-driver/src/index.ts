@@ -237,8 +237,12 @@ export function apply(ctx: Context, config: Config) {
     try {
       await presets.mount(agentCtx)   // undefined id -> the roster's default preset
     } catch (e) {
-      ctx.logger.warn(`[turma-dsh] preset mount skipped (${e}); if this host uses `
-        + `presets the agent will have no tools`)
+      // Tolerated ONLY for a rosterless deployment (tools live in the global
+      // host layer). Logged at ERROR, not warn: in a roster deployment (the web
+      // profile) a mount failure silently reproduces the original no-tools bug,
+      // so it must be loud enough for an operator to catch.
+      ctx.logger.error(`[turma-dsh] preset mount FAILED (${e}) — if this host uses `
+        + `presets the agent has NO TOOLS`)
     }
   }
   ;(async () => {
@@ -344,9 +348,15 @@ export function apply(ctx: Context, config: Config) {
         if (line) void handleOp(sock, line)
       }
       if (buf.length > LINE_MAX_BYTES) {
-        ctx.logger.warn(`[turma-dsh] dropping an oversize control frame `
-          + `(${buf.length} bytes, no newline)`)
+        // No complete line and already over the cap: a broken/hostile stream.
+        // Close the connection rather than reset the buffer — resetting leaves
+        // the flood's tail to corrupt the next op on the same socket. The hub
+        // client reconnects; the hub never sends a frame this large.
+        ctx.logger.warn(`[turma-dsh] oversize control frame (${buf.length} bytes, `
+          + `no newline) — closing the connection`)
         buf = ''
+        try { sock.destroy() } catch { /* already gone */ }
+        return
       }
     })
     sock.on('close', () => clients.delete(sock))

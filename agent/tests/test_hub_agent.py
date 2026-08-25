@@ -3507,10 +3507,21 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
             def stop(self): self.stopped = True
         tail = _FakeTail()
         sm.dsh_tails["dsh1"] = tail
-        sm._teardown_dsh("dsh1", kill=True)
+        # Teardown must also unlink the per-session socket and the 0600 env file
+        # (which holds the model API key) so they don't accumulate per session.
+        dsh_dir = os.path.join(self.tmp, "dshsock")
+        os.makedirs(dsh_dir, exist_ok=True)
+        sock_f = os.path.join(dsh_dir, "dsh1.sock")
+        env_f = os.path.join(dsh_dir, "dsh1.env")
+        open(sock_f, "w").close()
+        open(env_f, "w").close()
+        with mock.patch.object(ha, "DSH_SOCKET_DIR", dsh_dir):
+            sm._teardown_dsh("dsh1", kill=True)
         self.assertTrue(ctl.killed)
         self.assertTrue(ctl.closed)
         self.assertTrue(tail.stopped)
+        self.assertFalse(os.path.exists(sock_f))
+        self.assertFalse(os.path.exists(env_f))
         self.assertNotIn("dsh1", sm.dsh_controls)
         self.assertNotIn("dsh1", sm.dsh_tails)
 
