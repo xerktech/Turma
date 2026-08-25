@@ -1,13 +1,18 @@
 #!/bin/bash
 #
 # End-to-end test: a REAL dsh instance running the fleet-agent plugin,
-# registering with the Fleet Hub.
+# registering with the Fleet Hub -- and, with --drive, driven through all four
+# G1 operations (spawn / input / transcript / kill) against real dsh (XERK-463).
 #
 # Usage:
 #   ./test-real-dsh.sh                    # single worker, asserts it registers
 #   ./test-real-dsh.sh --once             # exit 0 on PASS instead of staying up
+#   ./test-real-dsh.sh --drive            # spawn+input+transcript+kill, no mock
 #   FLEET_DEVICE=my-host ./test-real-dsh.sh
 #   DSH_PORT=3081 FLEET_DEVICE=host-2 ./test-real-dsh.sh   # second worker
+#
+# --drive needs a reachable model gateway; it defaults to this fleet's LiteLLM.
+# Override with MODEL_PROVIDER / MODEL_ID / MODEL_BASE_URL / MODEL_API_KEY_ENV.
 #
 # Without --once a PASS leaves the hub and dsh RUNNING so you can browse them,
 # so the script does not return -- bound it with `timeout` and match on
@@ -45,9 +50,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 ONCE=""
+DRIVE=""
 for _arg in "$@"; do
   case "$_arg" in
     --once) ONCE=1 ;;
+    # Drive the four G1 operations (spawn/input/transcript/kill) against the
+    # real dsh session once it registers, then tear everything down. Implies
+    # --once. This is the XERK-463 go/no-go: a scripted end-to-end run, no mock.
+    --drive) DRIVE=1; ONCE=1 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "FAIL: unknown argument: $_arg"; exit 1 ;;
   esac
@@ -57,6 +67,20 @@ unset _arg
 HUB_PORT="${HUB_PORT:-3000}"
 DSH_PORT="${DSH_PORT:-3080}"
 FLEET_DEVICE="${FLEET_DEVICE:-dsh-test-host}"
+
+# ---- Model provider for a driven run (XERK-462 D5: dsh's own selector) ----
+# A driven session must reach a real model. dsh has no Claude failover, so the
+# dsh-llm-pi-ai provider route is the whole story: point a hand-declared,
+# OpenAI-compatible route at whatever gateway is available (LiteLLM/Ollama/vLLM
+# or DeepSeek). Defaults target this fleet's LiteLLM; override per run.
+#   MODEL_PROVIDER   pi-ai route key we declare (also the agentOptions.provider)
+#   MODEL_ID         model id sent to the gateway
+#   MODEL_BASE_URL   OpenAI-compatible base (…/v1)
+#   MODEL_API_KEY_ENV  env var the gateway credential is read from
+MODEL_PROVIDER="${MODEL_PROVIDER:-litellm}"
+MODEL_ID="${MODEL_ID:-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0}"
+MODEL_BASE_URL="${MODEL_BASE_URL:-${LOCAL_MODEL_BASE_URL:-http://litellm.ai.svc.cluster.local:4000}/v1}"
+MODEL_API_KEY_ENV="${MODEL_API_KEY_ENV:-LOCAL_MODEL_API_KEY}"
 
 
 # FLEET_DEVICE and the ports are interpolated into YAML below, so validate
@@ -306,13 +330,43 @@ node -e '
 # The profile patch layer overrides the bundle entry config for THIS run.
 # The `name` must match the bundle entry exactly or dsh skips the patch.
 # Values are quoted; FLEET_DEVICE is character-restricted above.
+# The MODEL_* values below interpolate into YAML scalars. They are operator-set
+# env for a local harness, not untrusted input; keep them plain (a route key,
+# a base URL, a model id, an env-var name).
 cat > "$PROFILE_DIR/cordis.patch.yml" <<EOF
-# Written by test-real-dsh.sh -- overrides the fleet-agent entry for this run.
+# Written by test-real-dsh.sh -- overrides the fleet-agent entry for this run,
+# and (for --drive) points dsh's model selector at an OpenAI-compatible gateway.
 - id: turma-fleet-agent
   name: '@turma/dsh-fleet-agent'
   config:
     hubUrl: '$HUB_URL'
     device: '$FLEET_DEVICE'
+    provider: '$MODEL_PROVIDER'
+    model: '$MODEL_ID'
+# Hand-declared pi-ai route: pi-ai ships nothing under this key, so we supply the
+# whole provider (endpoint, protocol, one model). Credential rides apiKeyEnv, so
+# no secret lands in this file. Non-reasoning by construction (hand-declared).
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      $MODEL_PROVIDER:
+        api: openai-completions
+        baseURL: '$MODEL_BASE_URL'
+        apiKeyEnv: '$MODEL_API_KEY_ENV'
+        compat:
+          supportsDeveloperRole: false
+          maxTokensField: max_tokens
+        models:
+          - id: '$MODEL_ID'
+            contextWindow: 200000
+            maxTokens: 4096
+# Fallback for any session created without an explicit agentOptions selection.
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: '$MODEL_PROVIDER'
+    model: '$MODEL_ID'
 EOF
 
 # Prove the entry actually made it into the composed tree before booting.
@@ -379,6 +433,25 @@ if [ -n "$REGISTERED" ]; then
   echo "Logs            : $HUB_LOG"
   echo "                  $DSH_LOG"
   echo
+
+  # ----------------------------------------------- 6. drive the four G1 ops
+  # The go/no-go: spawn a real dsh session, feed it input, watch its transcript
+  # stream back, and kill it -- all through the hub, no mock. Registration
+  # above only proved the plugin connected; this proves command routing works.
+  if [ -n "$DRIVE" ]; then
+    echo "[6/6] Driving spawn/input/transcript/kill against the real dsh session..."
+    echo "      model: $MODEL_PROVIDER / $MODEL_ID"
+    if npm exec -- node drive-four-ops.mjs \
+         --hub-port "$HUB_PORT" --device "$FLEET_DEVICE"; then
+      echo "(--drive: four operations passed; shutting down)"
+      exit 0
+    else
+      echo "(--drive: four operations FAILED; dsh log tail follows)"
+      tail -40 "$DSH_LOG"
+      exit 1
+    fi
+  fi
+
   if [ -n "$ONCE" ]; then
     echo "(--once: shutting down)"
     exit 0

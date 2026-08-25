@@ -21,6 +21,13 @@ files as each child ships, and this file's `paths:` widens then.
 - **No production code touches dsh yet.** Every `agentType`/`agent_type` in `hub-agent.py` and
   `server.js` is about Task-tool SUBAGENTS, unrelated to dsh. dsh lives only in `poc/` and `docs/`.
   These decisions are greenfield, not a description of scaffolding.
+- **G1 (XERK-463) is done: go/no-go = GO.** All four operations are proven end-to-end against real
+  dsh 0.1.1-rc.2, no mock, via `poc/turma-2.0-poc/test-real-dsh.sh --drive`. The go/no-go corrected
+  the PoC plugin, which had spawn/input/kill written against a *guessed* `ctx.agents` API the mock
+  never checked: real dsh is `agents.create({sessionId,meta:{cwd},agentOptions})`→handle (not
+  `resume`), `agent.followup(msg)` (not `inbox.append`, which never wakes the driver), and
+  `handle.dispose()` (not arg-less `cancel`). The model rides a hand-declared OpenAI-compatible
+  `dsh-llm-pi-ai` route (D5). Detail + recorded run in `poc/turma-2.0-poc/README.md`.
 
 ## D1 — Where dsh runs: inside the existing agent container
 
