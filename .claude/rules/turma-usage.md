@@ -188,10 +188,14 @@ paths:
   holding both layers, applied to the rendered-only sessions before the wipe. Accurate in bulk (±20%
   over ~250 sessions), useless per day (±2–6x), and biased LOW on purpose (`--drift`), since a max-rule
   bucket that is too high can never be corrected downwards.
-- **Nothing in the ledger marks a bucket as estimated**, so every run must be recorded here and in its
-  PR, or a later reader reads fabrication as fact. Runs to date:
-  - **MaxAI, 2026-06-16 → 2026-08-15, 48 days, ~5.34B tokens, injected 2026-08-25.** OS wipe ~08-15;
-    the ledger was created 08-18, after it. Days from 08-16 are the hub's own measured record.
+- **Nothing in the ledger marks a bucket as estimated**, so every run must be recorded here **once it
+  has actually been applied**, or a later reader reads fabrication as fact — and a run recorded before
+  it happens is worse than no record, since it labels measured days as estimates. Runs applied to the
+  live ledger, in full:
+  - *(none yet)* — the MaxAI backfill below is prepared but NOT applied.
+  - Prepared: **MaxAI, 2026-06-16 → 2026-08-15, 48 days, ~5.30B tokens** (`--drift 0.8`). OS wipe
+    ~08-15; the ledger was created 08-18, after it, so it holds that host from 08-16 only. Days from
+    08-16 are the hub's own measured record and the tool leaves them alone.
 - **A figure above `TOKEN_MAX` counts as 0 there too.** `num()` refuses a non-safe integer, so one
   absurd value in a calibration transcript poisons the rate and lands a day bucket that loads back
   ZEROED — destroying the measured figures in it. An estimator that writes into this store has to
