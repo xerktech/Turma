@@ -162,6 +162,20 @@ async function main() {
     TURN_TIMEOUT_MS,
     'assistant/message session-event',
   )
+  // dsh reports a failed turn with `turn/end {kind:'error'}` (e.g. an
+  // unreachable model gateway) after its own retries -- watch for it so a
+  // failed turn fails THIS run fast with dsh's reason, rather than eating the
+  // whole --turn-timeout waiting for an assistant/message that never comes.
+  const gotTurnError = onMessage(
+    (m) =>
+      m.type === 'session-event' &&
+      m.event?.sessionId === sessionId &&
+      String(m.event?.type).includes('turn/end') &&
+      turnErrorReason(m.event?.data) !== null,
+    TURN_TIMEOUT_MS,
+    'turn/end error session-event',
+  )
+  gotTurnError.catch(() => {}) // may lose the race; don't leak an unhandled rejection
   // Record the whole session-event stream for the report.
   const recorder = (m) => {
     if (m.type === 'session-event' && m.event?.sessionId === sessionId) events.push(m.event)
@@ -172,7 +186,17 @@ async function main() {
 
   await gotUserMsg.catch((e) => fail('input', e))
   console.log('[drive]   input recorded as a user/message event')
-  const assistantMsg = await gotAssistant.catch((e) => fail('transcript', e))
+  const outcome = await Promise.race([
+    gotAssistant.then((m) => ({ assistant: m })),
+    gotTurnError.then((m) => ({ turnError: m })),
+  ]).catch((e) => fail('transcript', e))
+  if (outcome.turnError) {
+    fail(
+      'transcript',
+      new Error(`dsh turn ended with an error: ${turnErrorReason(outcome.turnError.event?.data)}`),
+    )
+  }
+  const assistantMsg = outcome.assistant
   listeners.delete(recorder)
 
   const assistantText = extractText(assistantMsg.event?.data)
@@ -212,6 +236,20 @@ async function main() {
   )
   ws.close()
   process.exit(0)
+}
+
+// If a `turn/end` event carries an error, return a human reason; else null.
+// dsh shapes it as `data.reason = { kind: 'error', error: { message, code } }`.
+function turnErrorReason(data) {
+  const reason = data?.reason
+  if (!reason || reason.kind !== 'error') return null
+  const err = reason.error
+  const text =
+    (typeof err === 'string' && err) ||
+    err?.message ||
+    (typeof reason.message === 'string' && reason.message) ||
+    ''
+  return text || JSON.stringify(err ?? reason).slice(0, 200)
 }
 
 // dsh assistant-message event data carries model-facing content blocks; pull

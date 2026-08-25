@@ -82,6 +82,27 @@ MODEL_ID="${MODEL_ID:-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0}"
 MODEL_BASE_URL="${MODEL_BASE_URL:-${LOCAL_MODEL_BASE_URL:-http://litellm.ai.svc.cluster.local:4000}/v1}"
 MODEL_API_KEY_ENV="${MODEL_API_KEY_ENV:-LOCAL_MODEL_API_KEY}"
 
+# These interpolate into single-quoted YAML scalars in cordis.patch.yml. They
+# are operator-set local-harness env, not untrusted input -- but a stray quote,
+# backslash, or control char would break out of the scalar, so reject those
+# rather than emit a malformed profile. (MODEL_PROVIDER is also a bare YAML key,
+# so hold it to a route-name charset.) Same `case`-glob discipline the ports and
+# FLEET_DEVICE use above; grep would miss a payload whose first line is clean.
+case "$MODEL_PROVIDER" in
+  ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+    echo "FAIL: MODEL_PROVIDER must start alphanumeric and contain only [A-Za-z0-9._-]"
+    printf '      got: %q\n' "$MODEL_PROVIDER"; exit 1 ;;
+esac
+for _mv in MODEL_ID MODEL_BASE_URL MODEL_API_KEY_ENV; do
+  eval "_mval=\$$_mv"
+  case "$_mval" in
+    ''|*[\'\\]*|*[$'\n\r\t']*)
+      echo "FAIL: $_mv must be non-empty and free of quotes, backslashes, and control characters"
+      printf '      got: %q\n' "$_mval"; exit 1 ;;
+  esac
+done
+unset _mv _mval
+
 
 # FLEET_DEVICE and the ports are interpolated into YAML below, so validate
 # them as WHOLE strings. `grep` is the wrong tool here: it matches per line, so
