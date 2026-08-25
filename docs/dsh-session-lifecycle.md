@@ -87,6 +87,13 @@ Fleet Hub to a local per-session socket.
 | `state` | `{"evt":"state","status":"running"\|"idle","eventCount":N}` | agent turn/status edge — the input to "Working" for a dsh session. |
 | `interaction` | `{"evt":"interaction","requestId":"...","kind":"approval"\|"question","prompt":"...","options"?:[{"number","label"}],"detail"?}` | dsh raised a `dsh-interaction`/approval. `hub-agent.py` writes it to `~/.turma/questions/<sid>.req.json` (reusing the AskUserQuestion bridge shape); [C] answers via the `answer` op. |
 
+- **Option indexing is 0-based positional, matching Claude's AskUserQuestion bridge.** The
+  `interaction` event's `options[]` carry a `number` for **display parity only** (1-based, i.e.
+  position + 1, like `parse_pane_prompt`'s shape). `answer.optionIndex` / `optionIndices` are the
+  **0-based positions into that same `options[]` array — never the `number` value.** [C] therefore
+  passes the same 0-based indices it already uses for `answer_question` and does **no** translation;
+  the driver plugin ([B]) maps a 0-based position back to dsh's native selection (including dsh's own
+  1-based `number`, which stays a plugin concern and never crosses the socket as an answer key).
 - **Display session events are NOT streamed here.** They are written to the projection JSONL on disk
   and read by the existing tail/history/archive surfaces. The socket stays small and never duplicates
   S1's projection.
