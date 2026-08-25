@@ -1,0 +1,58 @@
+[
+ [
+  {
+   "t": "text",
+   "text": "Open a PR for the fix, then summarize."
+  }
+ ],
+ [
+  {
+   "t": "thinking",
+   "text": "The change is small; I will open a PR."
+  },
+  {
+   "t": "text",
+   "text": "I'll open the PR now."
+  },
+  {
+   "t": "tool_use",
+   "name": "Bash",
+   "input": "gh pr create --title \"Fix\" --body \"...\"",
+   "id": "call_abc123",
+   "desc": "Open the PR"
+  }
+ ],
+ [
+  {
+   "t": "tool_result",
+   "text": "https://github.com/xerktech/Turma/pull/999",
+   "forId": "call_abc123"
+  }
+ ],
+ [
+  {
+   "t": "text",
+   "text": "Done — PR #999 is open."
+  }
+ ],
+ [
+  {
+   "t": "text",
+   "text": "Also refactor everything"
+  }
+ ],
+ [
+  {
+   "t": "interrupt",
+   "text": "[Request interrupted by user]"
+  }
+ ],
+ [
+  {
+   "t": "tool_result",
+   "text": "command not found: frobnicate",
+   "forId": "call_err",
+   "isError": true
+  }
+ ]
+]

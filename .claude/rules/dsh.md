@@ -156,6 +156,46 @@ files as each child ships, and this file's `paths:` widens then.
   all, or dsh runs local-only first; and whether dsh defaults local-first. Neither blocks the code
   shape decided here.
 
+## S1 — the projection, implemented (`agent/dsh_transcript.py`, XERK-464)
+
+D3's dsh→Claude-JSONL projection is built as a pure, stdlib-only module the dsh launcher (D1)
+imports. `DshProjector.feed(event)` returns the 0+ Claude-JSONL entry dicts one dsh event projects
+to; `project_log()` is the batch form. Invariants a change here must not undo:
+
+- **Incremental, one file, no new reader.** The launcher appends each event's projected entries to
+  the pinned `<claudeSessionId>.jsonl` as events arrive, and the EXISTING `_entry_blocks`/
+  `entryBlocks`, `_entry_text`, usage accountancy, PR scan and live tail read it unchanged. There is
+  **no JS translator** — the projection runs only in Python, and the "py/js parity" this ticket
+  names is that the projected JSONL renders IDENTICALLY under `_entry_blocks` (py) and `entryBlocks`
+  (js). Adding a second reader/shape is the mirror multiplication the whole seam exists to avoid.
+- **Only the three dsh SURFACE types project to entries** (`user/message`, `assistant/message`,
+  `tool/result`). Every other event is log-only and projects to `[]` — turn/step boundaries,
+  `assistant/chunk`, `request/*`, `todo/write`, `session/*`. A user-cancelled `turn/end`
+  (reason `aborted`/`user`) projects the `[Request interrupted by user]` marker.
+- **Tool calls ride the assistant message, NOT the `tool/call` event.** dsh appends BOTH an
+  `assistant/message` whose `content` includes the `tool-call` blocks AND a redundant standalone
+  `tool/call` event (verified in `dsh-agent-loop/lib/index.js`: the loop itself reads calls back via
+  `message.content.filter(b => b.type === "tool-call")`). The projector emits tool_use from the
+  assistant message and SKIPS `tool/call`, so exactly one tool_use appears — which is what makes PR
+  attribution (D4) work: `gh pr create` lands as a real tool_use/tool_result pair, not opaque text.
+- **Liveness is deliberately NOT in the projection.** dsh has no pane, so `paneBusy` has no
+  transcript equivalent; a dsh session's "working" signal is an in-flight turn (`turn/start` with no
+  `turn/end`, i.e. `agent.status === 'running'`), reported as a heartbeat field by [D] and read from
+  dsh directly. Injecting a turn marker into the JSONL would force `entryBlocks` to grow a case.
+- **usage + model ride the assistant entry** (D4): dsh `TokenUsage` maps 1:1 to Claude's disjoint
+  `input/output/cache_read/cache_creation` counts, and `message.model` comes from the event's
+  `message.source.model`. A step with no usage projects no `usage` key (never a fabricated zero,
+  which would poison the per-model denominator).
+- **uuids are deterministic** (uuid5 over session id + seq), so replaying the retained native log
+  re-projects byte-identically without forking the file.
+- **Verification is against real dsh 0.1.1-rc.2**, not a mock (the G1 lesson): the corpus
+  (`dsh_corpus.json`) is built by `dsh_corpus_gen.mjs` from dsh's OWN `createUserMessage`/
+  `createAssistantMessage`/`createToolResultMessage`, and the event shapes and loop behaviour were
+  read from the cached `@deepseek-ai/*` `.d.ts` + `dsh-agent-loop` source. `dsh_projected.jsonl` +
+  `dsh_expected_blocks.json` are the SAME artifacts the py test and the js test in
+  `tunnel-agent.test.js` both assert against — pinning both readers to one expected result.
+- Tests: `test_dsh_transcript.py`, the `dsh projection` case in `tunnel-agent.test.js`.
+
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
 1. **Image + resource + retention sizing.** Is growing the agent image with dsh's node/npm tree

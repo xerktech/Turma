@@ -1,0 +1,249 @@
+[
+  {
+    "type": "turn/start",
+    "seq": 1,
+    "time": 1756150001000,
+    "data": {
+      "turn": 1
+    }
+  },
+  {
+    "type": "step/start",
+    "seq": 2,
+    "time": 1756150002000,
+    "data": {
+      "turn": 1,
+      "step": 1
+    }
+  },
+  {
+    "type": "user/message",
+    "seq": 3,
+    "time": 1756150003000,
+    "data": {
+      "source": {
+        "kind": "user"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Open a PR for the fix, then summarize."
+        }
+      ],
+      "role": "user",
+      "id": "c4e5866e-b557-4f3d-989b-d9de61b3bbda"
+    }
+  },
+  {
+    "type": "request/header",
+    "seq": 4,
+    "time": 1756150004000,
+    "data": {
+      "header": {
+        "config": {}
+      },
+      "reason": "initial"
+    }
+  },
+  {
+    "type": "assistant/message",
+    "seq": 5,
+    "time": 1756150005000,
+    "data": {
+      "turn": 1,
+      "step": 1,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "The change is small; I will open a PR."
+          },
+          {
+            "type": "text",
+            "text": "I'll open the PR now."
+          },
+          {
+            "type": "tool-call",
+            "id": "call_abc123",
+            "name": "bash",
+            "arguments": "{\"command\":\"gh pr create --title \\\"Fix\\\" --body \\\"...\\\"\",\"description\":\"Open the PR\"}"
+          }
+        ],
+        "source": {
+          "kind": "model",
+          "provider": "dsh-llm-pi-ai",
+          "model": "bedrock/claude-haiku"
+        },
+        "id": "bba5732c-d732-4a39-9c13-ffce80269043"
+      },
+      "usage": {
+        "inputTokens": 1200,
+        "outputTokens": 340,
+        "cacheReadTokens": 5000,
+        "cacheWriteTokens": 800,
+        "reasoningTokens": 90
+      }
+    }
+  },
+  {
+    "type": "tool/call",
+    "seq": 6,
+    "time": 1756150006000,
+    "data": {
+      "turn": 1,
+      "step": 1,
+      "callId": "call_abc123",
+      "name": "bash",
+      "arguments": "{\"command\":\"gh pr create --title \\\"Fix\\\" --body \\\"...\\\"\"}"
+    }
+  },
+  {
+    "type": "tool/result",
+    "seq": 7,
+    "time": 1756150007000,
+    "data": {
+      "turn": 1,
+      "step": 1,
+      "message": {
+        "source": {
+          "kind": "tool",
+          "callId": "call_abc123"
+        },
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "call_abc123",
+            "content": [
+              {
+                "type": "text",
+                "text": "https://github.com/xerktech/Turma/pull/999"
+              }
+            ],
+            "isError": false
+          }
+        ],
+        "role": "user",
+        "id": "f9568a98-2613-4e5a-9a86-d2c950a9c24b"
+      }
+    }
+  },
+  {
+    "type": "step/end",
+    "seq": 8,
+    "time": 1756150008000,
+    "data": {
+      "turn": 1,
+      "step": 1
+    }
+  },
+  {
+    "type": "assistant/message",
+    "seq": 9,
+    "time": 1756150009000,
+    "data": {
+      "turn": 1,
+      "step": 2,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Done — PR #999 is open."
+          }
+        ],
+        "source": {
+          "kind": "model",
+          "provider": "dsh-llm-pi-ai",
+          "model": "bedrock/claude-haiku"
+        },
+        "id": "4b08302c-6095-4c58-b2d5-be84a3f720e7"
+      },
+      "usage": {
+        "inputTokens": 60,
+        "outputTokens": 12
+      }
+    }
+  },
+  {
+    "type": "turn/end",
+    "seq": 10,
+    "time": 1756150010000,
+    "data": {
+      "turn": 1,
+      "reason": {
+        "kind": "completed"
+      }
+    }
+  },
+  {
+    "type": "turn/start",
+    "seq": 11,
+    "time": 1756150011000,
+    "data": {
+      "turn": 2
+    }
+  },
+  {
+    "type": "user/message",
+    "seq": 12,
+    "time": 1756150012000,
+    "data": {
+      "source": {
+        "kind": "user"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Also refactor everything"
+        }
+      ],
+      "role": "user",
+      "id": "3e1e2343-15b7-4964-a2b4-47babb2d109c"
+    }
+  },
+  {
+    "type": "turn/end",
+    "seq": 13,
+    "time": 1756150013000,
+    "data": {
+      "turn": 2,
+      "reason": {
+        "kind": "aborted",
+        "reason": {
+          "kind": "user"
+        }
+      }
+    }
+  },
+  {
+    "type": "tool/result",
+    "seq": 14,
+    "time": 1756150014000,
+    "data": {
+      "turn": 3,
+      "step": 1,
+      "message": {
+        "source": {
+          "kind": "tool",
+          "callId": "call_err"
+        },
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "call_err",
+            "content": [
+              {
+                "type": "text",
+                "text": "command not found: frobnicate"
+              }
+            ],
+            "isError": true
+          }
+        ],
+        "role": "user",
+        "id": "2fee1bff-2d8d-4a16-bd5b-b3ba43f1fa47"
+      }
+    }
+  }
+]
