@@ -51,10 +51,18 @@ Fleet Hub to a local per-session socket.
      the projection by name with no new resolver — the XERK-6 trap stays closed, per D3);
   2. binds the per-session control socket and speaks the protocol below to `hub-agent.py`;
   3. subscribes to `session/event` and **writes two things to disk**: the native dsh event log
-     (SQLite + telemetry JSONL, retained under the worktree's `.dsh/` for the raw archive layer and
-     the host-wide viewer — D3's canonical record) **and** the derived Claude-JSONL **projection**
-     `<slug>/<sessionId>.jsonl` using S1's mapping (XERK-464). The projection is what every existing
-     display surface reads; the socket carries control + liveness only, never the display stream.
+     (append-only telemetry JSONL, retained under **`<slug>/<sessionId>/dsh/`** for the raw archive
+     layer and the host-wide viewer — D3's canonical record) **and** the derived Claude-JSONL
+     **projection** `<slug>/<sessionId>.jsonl` using S1's mapping (XERK-464). The projection is what
+     every existing display surface reads; the socket carries control + liveness only, never the
+     display stream.
+     - **XERK-469 [E] fixed the native-log LOCATION**: the raw archive layer and the migration bundle
+       are both scoped to the project-slug session tree and exclude the worktree on purpose (worktree
+       contents are what prune/delete key on). So the native log lives under `<slug>/<sessionId>/dsh/`
+       (`DSH_STORE_DIRNAME`), where `_session_files` already walks it — NOT the worktree's `.dsh/`
+       this doc first proposed, which the raw layer would have retained for nothing. dsh's SQLite is a
+       derived index it rebuilds from the log and is NOT archived (the raw cursor is append-only; a
+       page-mutating DB is not). See `.claude/rules/dsh.md` [E] and `.claude/rules/agent-archive.md`.
   4. connects to **no** hub (D2).
 - **Model selection follows D5:** `agentOptions.provider`/`model` come from the validated per-session
   spawn enum; there is **no Claude local-model failover** for a dsh session. The provider route
@@ -116,19 +124,23 @@ dsh call is made.
   goes through **`_refuse_start` / `spawnFailures`** exactly as [A]'s placeholder guard does — the
   XERK-265 channel, so the card's Start wait ends with the reason (never a bare `log()`).
 - **kill:** send `kill` (clean `dispose`) then `_kill_tmux` as backstop; `_kill_ttyd`. Worktree +
-  projection + native `.dsh/` log KEPT (resumable). Reuses `kill()` / `_remember_closed`.
+  projection + native `<sid>/dsh/` log KEPT (resumable). Reuses `kill()` / `_remember_closed`.
 - **restart (clear context):** `_kill_tmux`, drop caches, relaunch dsh with a **fresh** agent (new
   dsh session → new projection transcript id, moved onto the record like Claude's `claudeSessionId`).
   Reuses `restart()`.
 - **resume / start:** relaunch dsh, and the plugin uses **`ctx.agents.resume({ resumeSessionId })`**
-  (not `create`) to reload the persisted dsh session from its retained `.dsh/` log — this is the one
+  (not `create`) to reload the persisted dsh session from its retained `<sid>/dsh/` log — this is the one
   place dsh's `resume` vs `create` distinction matters (G1). The pinned transcript id (hence the
   projection) is preserved, so PR chips / usage / ticket links re-derive with no new code. Reuses
   `start()` / `resume()` / `_resume_at_cwd`.
-- **delete:** `_kill_tmux` + `_worktree_remove` (the native `.dsh/` store lives in the worktree and
-  goes with it); drop record + closed + uploads. Reuses `delete()`.
-- **migration (XERK-101):** out of scope for [B] v1 — the migration bundle packs Claude transcript
-  bytes; a dsh session's resumable bytes are its native `.dsh/` store, a separate follow-up.
+- **delete:** `_kill_tmux` + `_worktree_remove`; drop record + closed + uploads. Reuses `delete()`.
+  The native `<sid>/dsh/` store lives under the project-slug session dir (XERK-469), so — like the
+  projection transcript — it is durable and survives the worktree removal (and by then has been
+  archived), rather than being destroyed with the worktree.
+- **migration (XERK-101):** out of scope for [B] v1 — `_pack_bytes` packs `<tid>.jsonl` +
+  `subagents/` + `workflows/`, not the whole `<tid>/` tree, so a dsh session's resumable native
+  `<sid>/dsh/` store is not yet carried. [K] adds one `tar.add(<tid>/dsh)` — a one-liner because
+  XERK-469 [E] put the store in exactly that subtree (see `.claude/rules/dsh.md` [E]).
 
 ## Consequences to fold into the cross-cutting contracts (when the code ships)
 
