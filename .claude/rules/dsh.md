@@ -65,28 +65,41 @@ files as each child ships, and this file's `paths:` widens then.
   remains a SEPARATE future question (Q3 below). This decision only says the rewrite is not how
   XERK-460 ships.
 
-## D3 — Transcript format: translate dsh events to Claude JSONL at the agent
+## D3 — Transcript format: dsh's native event log is CANONICAL; Claude JSONL is a display projection
 
-- **Decision: the agent translates dsh's event log into Claude-Code JSONL, written to the same
-  `<claudeSessionId>.jsonl` path under the cwd's project slug that a Claude session uses. Every
-  downstream surface keeps reading ONE transcript shape.** Feeds S1.
-- **Why.** Turma's read side is a web of parity contracts that already cost five-way edits:
-  `readyForReview` (five mirrors), "Working" = paneBusy OR live agents (six mirrors), the board
-  column rule (`categoryOf`, five mirrors), and the whole `hub-agent.py` ↔ `tunnel-agent.js` py/js
-  parity set. Teaching the archive and every client (hub, android, glasses, veiller) a SECOND
-  transcript shape multiplies each of those. Translating once, at the agent, means five mirrors stay
-  five, not ten — the exact reason the ticket names.
-- **Session identity is preserved by construction.** The agent still pins a session id at launch and
-  names the translated JSONL by it, so `_session_transcript_path()` resolves a dsh session with no
-  new resolver and no newest-mtime fallback (the XERK-6 trap). dsh's own internal session id is an
-  implementation detail the agent maps to the pinned id.
-- **The raw dsh log is NOT thrown away — it rides the archive's raw layer.** XERK-338's raw archive
-  layer already stores each session's own files byte-for-byte; dsh's SQLite / telemetry JSONL belongs
-  there. So the translation is lossy for DISPLAY (dsh's per-token chunks, step boundaries, and
-  structured telemetry flatten into JSONL turns) but nothing is lost from the record — the rich
-  analytics the integration doc wants (per-turn tokens, tool success rates, timings) are a LATER
-  child built over the preserved raw layer, not a reason to widen the display shape now.
-- **Parity obligation.** The dsh→JSONL translator is itself a py/js parity surface if any of it runs
+- **Decision: dsh's native event-sourced log is the CANONICAL session record and is retained in full
+  fidelity — it is the better representation and the one we collect metrics from. The agent ALSO
+  emits a derived Claude-Code JSONL PROJECTION of it, purely so the existing display surfaces keep
+  reading one shape. The projection is lossy and is NOT the source of truth; the native log is never
+  down-sampled to feed it.** Feeds S1.
+- **Why keep dsh's format.** dsh manages session data far better than Claude Code's transcript: its
+  Trajectory view breaks out every input, output, and tool call with the time each arrived, because
+  a session is an append-only log of typed events (`turn/*`, `step/*`, `tool/call`, `tool/result`,
+  `assistant/message` with token usage). That granularity is exactly what later metrics want —
+  per-turn tokens, tool success rates, step timings, error rates — and flattening it into Claude
+  JSONL turns would throw it away. So the native log is what we KEEP; the JSONL is what we DERIVE.
+- **Why derive the JSONL at all (the projection).** Turma's read side is a web of parity contracts
+  that already cost N-way edits: `readyForReview` (five mirrors), "Working" = paneBusy OR live agents
+  (six mirrors), the board column rule (`categoryOf`, five mirrors), and the whole `hub-agent.py` ↔
+  `tunnel-agent.js` py/js parity set. Teaching the archive and every client (hub, android, glasses,
+  veiller) a SECOND transcript shape multiplies each of those (N → 2N). A single agent-side
+  projection into the shape they already read keeps the mirrors at N — the exact reason the ticket
+  names — WITHOUT making that projection the record. Display reads the projection; metrics read the
+  native log. Neither impersonates the other.
+- **Retention obligation — this is the load-bearing part of the decision.** The native dsh log
+  (SQLite + telemetry JSONL) MUST be persisted durably and in full, not summarized. It rides
+  XERK-338's raw archive layer, which already stores each session's own files byte-for-byte and is
+  the only place anything Turma does not render survives the host. Two consequences for children:
+  the raw-layer ceilings (`ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES`, and that the layer excludes
+  background-agent transcripts) must be checked against real dsh session sizes so metrics data is not
+  silently truncated — fold into the sizing follow-up (Q1); and a future metrics / Trajectory surface
+  is a downstream child that reads these retained native events directly, never the JSONL projection.
+- **Session identity is preserved by construction.** The agent pins a session id at launch and names
+  the projection JSONL by it, so `_session_transcript_path()` resolves a dsh session with no new
+  resolver and no newest-mtime fallback (the XERK-6 trap). dsh's own internal session id is mapped to
+  the pinned id, and the retained native log is keyed by that same id so the two representations of
+  one session stay joinable.
+- **Parity obligation.** The dsh→JSONL projection is itself a py/js parity surface if any of it runs
   in `tunnel-agent.js` for live tail; keep the mapping in one place and mirror it under test, the way
   `_entry_blocks`/`entryBlocks` are. The `corpus-eval` skill is the tool for proving old-vs-new here.
 
@@ -107,7 +120,8 @@ files as each child ships, and this file's `paths:` widens then.
   against the SAME host. The translator MUST populate the JSONL token-usage fields AND a real model
   id from dsh's `assistant/message` events — otherwise a dsh session spends tokens the ledger cannot
   attribute to a model. New (local / DeepSeek) model ids simply appear in the per-model breakdown;
-  the ledger needs no schema change, only correct input.
+  the ledger needs no schema change, only correct input. This covers the accounting TOTALS only;
+  the richer per-turn / per-tool metrics come from the retained native log (D3), not the projection.
 - **Consequence for the credential-binding contract.** Nothing in XERK-268 changes: the host is
   still proved by its token, not by what it types, and a dsh session cannot assert a different host
   or org. The `agentType` on a session is presentational, like a label — it grants nothing.
@@ -136,9 +150,12 @@ files as each child ships, and this file's `paths:` widens then.
 
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
-1. **Image + resource sizing.** Is growing the agent image with dsh's node/npm tree acceptable, and
-   do `mem_limit` / `pids_limit` need raising in DockerOps before dsh sessions run beside Claude
-   sessions? A DockerOps sizing follow-up, not code here.
+1. **Image + resource + retention sizing.** Is growing the agent image with dsh's node/npm tree
+   acceptable, and do `mem_limit` / `pids_limit` need raising in DockerOps before dsh sessions run
+   beside Claude sessions? Also: does the archive raw-layer ceiling
+   (`ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES`) fit real dsh session sizes so the canonical native log we
+   keep for metrics (D3) is not silently truncated? A DockerOps / archive sizing follow-up, not code
+   here.
 2. **Attribution granularity.** Should PR/commit attribution visibly distinguish dsh-authored from
    Claude-authored work, or is host-level attribution enough? Not needed for correctness.
 3. **Fate of the full rewrite.** These decisions treat the PoC Fleet Hub + dsh-plugin rewrite as out
