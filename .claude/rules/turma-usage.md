@@ -175,6 +175,27 @@ paths:
   `usagePurged:false`; `?usage=purge` is the deliberate second step, with no way back, and is never
   implied by removing the card.
 
+### Recovering a wiped host's history (`turma/tools/recover-usage-from-archive.js`)
+
+- **A host wiped before the ledger ever saw it cannot be recovered from anything measured**, and the
+  archive is not the exception people reach for: its rendered layer carries no token counts, and its
+  raw layer only ever held what was still on the host's disk when the sync ran — after a wipe, nothing
+  older than it. Re-deriving MaxAI's raw layer reproduced the ledger's own days EXACTLY (2026-08-16 →
+  25, all four figures), which is the proof that the raw layer adds nothing across a wipe.
+- So the tool ESTIMATES, from the rendered text: tokens-per-rendered-character calibrated on sessions
+  holding both layers, applied to the rendered-only sessions before the wipe. Accurate in bulk (±20%
+  over ~250 sessions), useless per day (±2–6x), and biased LOW on purpose (`--drift`), since a max-rule
+  bucket that is too high can never be corrected downwards.
+- **Nothing in the ledger marks a bucket as estimated**, so every run must be recorded here and in its
+  PR, or a later reader reads fabrication as fact. Runs to date:
+  - **MaxAI, 2026-06-16 → 2026-08-15, 48 days, ~5.34B tokens, injected 2026-08-25.** OS wipe ~08-15;
+    the ledger was created 08-18, after it. Days from 08-16 are the hub's own measured record.
+- Attribution is the `.meta` **`host`** field, never the host segment of an archived file's NAME — a
+  migrated session keeps the name it was first archived under, so reading the name credits its spend
+  to the wrong host. Repo keys fold a bare name onto a URL key when exactly one URL key claims that
+  display name (`reposOf` keys on `remoteKey || repo`, so a repo archived before its origin was
+  readable would otherwise chart as a second series).
+
 ### Bounds
 
 - **`models` is capped (`USAGE_LEDGER_MODELS`), every agent-supplied NAME is length-bounded, and each
