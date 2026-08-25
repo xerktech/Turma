@@ -277,6 +277,37 @@ not undo:
   `_ingest_dsh_event` and this lights up. Tests: `TestDshState`, `TestDshQueryState`,
   `TestDshLivenessInReport`, `TestDshLivenessSeam` in `test_hub_agent.py`.
 
+## [E] (XERK-469) shipped: archive sync (rendered + raw) for dsh sessions
+
+D3's retention obligation made concrete — a dsh session archives with BOTH layers and no new archive
+code, which is the same symmetry S1 buys the read side: the projection needs no new READER, the
+native log needs no new WRITER.
+
+- **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — `_archive_manifest`
+  enumerates every ledger slug's top-level `*.jsonl`, and a dsh session is in the usage ledger like
+  any other. The native log (`<slug>/<sid>/dsh/...`) is nested, so it is NOT mistaken for a rendered
+  transcript.
+- **The native event log rides the RAW layer unchanged** because it is placed under the project-slug
+  session dir at **`<slug>/<sid>/dsh/`** (`DSH_STORE_DIRNAME`), which `_session_files` already walks.
+  This RECONCILES the [B] design-of-record (`docs/dsh-session-lifecycle.md`), which proposed the
+  worktree's `.dsh/` — a location the raw layer reaches into for nothing (it excludes the worktree on
+  purpose; those bytes are what prune/delete key on). The launcher (XERK-466) MUST write the store
+  here, not in the worktree, or D3's canonical record is retained by nothing.
+- **dsh's "raw" bytes are its append-only event log, not its SQLite.** The raw cursor ships bytes
+  past an offset — right for an event-sourced JSONL stream, wrong for a page-mutating DB. The SQLite
+  is a derived index dsh rebuilds from the log, so it is not the archived artifact and must not land
+  under `<sid>/dsh/`.
+- **Resume/migration de-dup is free**: a resumed dsh session appends to the same native log under the
+  same pinned id, so the per-file cursor ships only the tail — the same property a resumed Claude
+  transcript has, and what a migration relies on (same id, byte-identical prefix).
+- **Migration ([K]) is the one thing NOT free yet.** `_pack_bytes` packs `<tid>.jsonl` +
+  `<tid>/subagents/` + `<tid>/workflows/` by name, not the whole `<tid>/` subtree, so [K] adds a
+  single `tar.add(<tid>/dsh)` in that same convention — a one-liner precisely because the store lives
+  in this subtree. Flagged out of scope for [B] v1 already.
+- **No beat-loop budget regression**: archive sync stays on the sync worker (XERK-395); [E] adds no
+  code to the beat or the archive functions, only the store-dir contract. Tests: `TestDshArchiveSync`
+  (agent), and the existing `TestArchiveSyncWorker` / `TestBeatLoopBudget`.
+
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
 1. **Image + resource + retention sizing.** Is growing the agent image with dsh's node/npm tree
