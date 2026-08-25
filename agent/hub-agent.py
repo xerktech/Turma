@@ -2066,6 +2066,134 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     }
 
 
+# --- dsh safety guard (the "--settings equivalent" for the dsh runtime) -------
+#
+# dsh (XERK-460) is a SECOND agent runtime. It has no `--settings` file and no
+# external PreToolUse hook process: it gates tool calls INSIDE the agent process
+# through `ctx.tools` (see `agent/dsh/guard/` and `.claude/rules/dsh-guard.md`).
+# So the dsh equivalent of `build_guard_settings()` is not a settings dict claude
+# reads — it is the config the `@turma/dsh-guard` cordis plugin receives when the
+# dsh session driver (XERK-466 [B]) composes it, PLUS the two profile pins
+# (sandbox mode + approval policy) the guard composes on top of.
+#
+# The deny POLICY is NOT re-derived here. `build_dsh_guard_config()` reads the
+# SAME rule set `build_guard_settings()` produces and hands the guard the two
+# hook SCRIPT paths, so both runtimes deny by one policy that lives in one place.
+
+# dsh's file sandbox mode pinned for every Turma dsh session: writes are confined
+# to the session workspace (the worktree), the dsh analogue of a Claude session
+# running in its worktree. `danger-full-access` would remove that confinement;
+# `read-only` would stop ordinary dev work.
+DSH_SANDBOX_MODE = "workspace-write"
+
+# dsh's approval policy pinned for every Turma dsh session: `ask` delegates an
+# escalation to the composed answerer (the control-socket bridge, [C] XERK-467)
+# and FAILS CLOSED to a denial when none is composed — never a silent allow.
+# `never` would auto-reject every escalation without ever reaching the operator.
+DSH_APPROVAL_POLICY = "ask"
+
+# Per-call budget for the guard.py/fileguard.py subprocess the dsh guard shells
+# out to, mirrored into the plugin config as `hookTimeoutMs`.
+DSH_GUARD_HOOK_TIMEOUT_MS = 5000
+
+
+def dsh_guard_plugin_path():
+    """Absolute path to the `@turma/dsh-guard` cordis plugin, resolved both in
+    the repo (``agent/dsh/guard``) and in the image, since the guard sits in a
+    ``dsh/guard/`` dir next to this file in both layouts (like the hooks)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsh", "guard")
+
+
+def _parse_perm_rule(rule):
+    """Turn one Claude ``Read(P)``/``Edit(P)`` permission rule into
+    ``('read'|'write', <absolute path glob>)`` for the dsh guard, or ``None`` for
+    a bare tool rule (e.g. ``ListAgents``) that names no path.
+
+    Two quirks of ``build_guard_settings()``'s Claude-specific formatting are
+    undone so the glob reads as an ordinary absolute path the dsh guard resolves
+    itself: `runtime_code_deny_rules` emits a DOUBLED leading slash (Claude reads
+    a single `/` relative to the settings-file dir) and glob-escapes metacharacters
+    with a backslash (`_glob_literal`). The dsh guard does its own matching against
+    a realpath'd target, so both are reversed here."""
+    m = re.match(r"^(Read|Edit)\((.*)\)$", rule.strip())
+    if not m:
+        return None
+    op = "read" if m.group(1) == "Read" else "write"
+    p = m.group(2)
+    p = re.sub(r"\\(.)", r"\1", p)          # undo _glob_literal's backslash escapes
+    if p.startswith("~"):
+        p = os.path.expanduser(p)
+    p = re.sub(r"^/{2,}", "/", p)           # collapse the Claude-relative // anchor
+    return (op, p)
+
+
+def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None,
+                           local_settings_path=None):
+    """Build the config a Turma dsh session launches with — the dsh analogue of
+    ``build_guard_settings()``. Returns::
+
+        {
+          "plugin": { ... },        # passed to @turma/dsh-guard's apply(ctx, cfg)
+          "pluginPath": "...",      # where the driver composes it from
+          "sandboxMode": "workspace-write",
+          "approvalPolicy": "ask",
+        }
+
+    The `plugin` block carries the two hook script paths (guard.py / fileguard.py
+    — the shared deny policy) and the credential/roster path globs, DERIVED FROM
+    the same ``build_guard_settings()`` rule set so there is one policy, not two.
+    `sessionId` and `cwd` are filled in per-launch by the driver plugin, since
+    they are per-session.
+
+    The `sandboxMode`/`approvalPolicy` pins are what the driver writes into the
+    dsh profile so the guard composes over a fail-closed base: workspace-confined
+    writes + an approval seam that denies an unanswered escalation.
+    """
+    python_exe = python_exe or sys.executable or "python3"
+    guard_path = guard_path or guard_script_path()
+    fileguard_path = fileguard_path or fileguard_script_path()
+    settings = build_guard_settings(python_exe=python_exe, guard_path=guard_path,
+                                    local_settings_path=local_settings_path,
+                                    fileguard_path=fileguard_path)
+    perms = settings.get("permissions", {})
+    deny_write, deny_read, allow_read = [], [], []
+    for rule in perms.get("deny", []):
+        parsed = _parse_perm_rule(rule)
+        if parsed is None:
+            continue                        # bare tool rule (ListAgents) — dsh has no such tool
+        op, path_glob = parsed
+        (deny_write if op == "write" else deny_read).append(path_glob)
+    for rule in perms.get("allow", []):
+        parsed = _parse_perm_rule(rule)
+        if parsed is None:
+            continue
+        op, path_glob = parsed
+        if op == "read":
+            allow_read.append(path_glob)    # a write-allow can't override a deny (deny wins), so it is a no-op
+
+    plugin = {
+        "pythonExe": python_exe,
+        "guardScript": guard_path,
+        "fileguardScript": fileguard_path if os.path.exists(fileguard_path) else None,
+        "denyWrite": deny_write,
+        "denyRead": deny_read,
+        # `~/.turma/uploads/**` is already in here from _GUARD_ALLOW_PATH_RULES, so
+        # a staged attachment under uploads/<sessionId>/ is readable with no
+        # approval prompt — the cross-child contract [C] (XERK-467) depends on.
+        "allowRead": allow_read,
+        "hookTimeoutMs": DSH_GUARD_HOOK_TIMEOUT_MS,
+    }
+    if plugin["fileguardScript"] is None:
+        log(f"dsh guard: fileguard hook missing at {fileguard_path}; ~/.claude "
+            f"is protected by write-deny globs only (see .claude/rules/dsh-guard.md)")
+    return {
+        "plugin": plugin,
+        "pluginPath": dsh_guard_plugin_path(),
+        "sandboxMode": DSH_SANDBOX_MODE,
+        "approvalPolicy": DSH_APPROVAL_POLICY,
+    }
+
+
 def build_limits_settings(python_exe=None, statusline_path=None):
     """Build the dict passed to ``claude --settings`` by the LIMITS PROBE alone
     (XERK-247): a ``statusLine`` command wired to ``hooks/statusline.py``, which
@@ -11939,6 +12067,19 @@ class SessionManager:
         self._guard_settings_path = path
         return path
 
+    def _dsh_guard_config(self):
+        """The dsh safety-guard config for this host (XERK-470), memoized on the
+        manager like ``_ensure_guard_settings`` — the dsh analogue of the Claude
+        ``--settings`` file, minus the per-session `sessionId`/`cwd` the driver
+        fills in at launch. Content is host-fixed (hook paths, interpreter, the
+        credential globs, the operator's snapshotted local perms), so it is built
+        once and reused. See ``build_dsh_guard_config`` / ``.claude/rules/dsh-guard.md``."""
+        cached = getattr(self, "_dsh_guard_config_cache", None)
+        if cached is None:
+            cached = build_dsh_guard_config()
+            self._dsh_guard_config_cache = cached
+        return cached
+
     def _launch_dsh(self, sess):
         """Launch a session on the dsh runtime (XERK-460).
 
@@ -11950,7 +12091,16 @@ class SessionManager:
         rather than silently launched as claude, which would mislabel the runtime
         on every surface. Refusing here keeps the choke point (and the guard's
         one-line dispatch above) exactly where XERK-466 plugs the real launcher
-        in."""
+        in.
+
+        The SAFETY GUARD is ready at this choke point regardless (XERK-470): the
+        launcher XERK-466 fills in MUST compose the `@turma/dsh-guard` plugin with
+        `cfg["plugin"]` (per-session `sessionId`/`cwd` added) and pin the dsh
+        profile's sandbox mode + approval policy from `cfg["sandboxMode"]` /
+        `cfg["approvalPolicy"]` — the dsh equivalent of passing `--settings`. The
+        config is built here so the seam is wired and exercised even while the
+        process launcher is pending. See `.claude/rules/dsh-guard.md`."""
+        cfg = self._dsh_guard_config()  # noqa: F841 — the guard seam XERK-466 consumes
         self._set_error(sess, "dsh runtime launcher not yet available (XERK-466)")
 
     def _launch_tmux(self, sess, resume=False, prompt=None, resume_id=None):
