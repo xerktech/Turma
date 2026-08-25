@@ -1,0 +1,21 @@
+{
+  "name": "@turma/dsh-guard",
+  "version": "0.1.0",
+  "description": "Turma dsh safety guard — deny policy + file guard + uploads read carve-out, mapped onto dsh's tool pipeline (XERK-470)",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./policy": "./policy.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "policy.mjs"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  }
+}
