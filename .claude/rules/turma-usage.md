@@ -192,14 +192,27 @@ paths:
   has actually been applied**, or a later reader reads fabrication as fact — and a run recorded before
   it happens is worse than no record, since it labels measured days as estimates. Runs applied to the
   live ledger, in full:
-  - *(none yet)* — the MaxAI backfill below is prepared but NOT applied.
-  - Prepared: **MaxAI, 2026-06-16 → 2026-08-15, 48 days, ~5.30B tokens** (`--drift 0.8`). OS wipe
-    ~08-15; the ledger was created 08-18, after it, so it holds that host from 08-16 only. Days from
-    08-16 are the hub's own measured record and the tool leaves them alone.
+  - **MaxAI, 2026-06-16 → 2026-08-15, 48 days, 5,379,447,205 estimated tokens** (`--drift 0.8`),
+    applied 2026-08-25. OS wipe ~08-15; the ledger was created 08-18, after it, so it held that host
+    from 08-16 only. Days from 08-16 are the hub's own measured record and were left alone (verified:
+    the 08-16 bucket is byte-identical either side of the merge). The run's own report is
+    `/data/recover-maxai-2026-08-25.json` and the pre-merge file
+    `/data/usage-ledger.json.pre-recover.2026-08-25T10-57-38-917Z`. Served result: 58 day buckets,
+    73 repo rows, 7.465B all-time against the 2.086B that host reports.
 - **A figure above `TOKEN_MAX` counts as 0 there too.** `num()` refuses a non-safe integer, so one
   absurd value in a calibration transcript poisons the rate and lands a day bucket that loads back
   ZEROED — destroying the measured figures in it. An estimator that writes into this store has to
   coerce like `_token_count`, not merely like a number.
+- **The hub is killed from OUTSIDE the container, immediately after the write, and the result is then
+  VERIFIED.** It rewrites the whole ledger from memory on its next save, so anything short of a fresh
+  boot loses the merge — and two plausible recipes already did, each silently:
+  - `kubectl delete pod` alone: SIGTERM is unhandled, the old process beats through its 30s grace
+    period and saves over the merge (04:14:00 → gone 04:15).
+  - `kill -9 1` inside the container: PID 1 is immune to signals it has no handler for when they come
+    from its OWN namespace, SIGKILL included, so nothing happens at all — `RESTARTS` stays 0 and the
+    snapshot timer takes the merge ~4 minutes later.
+  `--force --grace-period=0` makes the kubelet SIGKILL it, which works. Pass `--json /data/…` so the
+  run's report survives a restarted container's empty `/tmp`.
 - **A run's figures are as-of that run.** Its calibration set is the archive, which grows, so the same
   command a day later lands ~1% different — and a wiped host's old project slugs return as repo series
   (for MaxAI, 67 against the 6 it reports live, ~19% of the estimate in bare-name and `hub-agent-mgr-*`
