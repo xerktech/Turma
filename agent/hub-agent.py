@@ -1320,6 +1320,141 @@ def resolve_agent_type(agent_type):
     return agent_type
 
 
+# ---- dsh session liveness / control socket (XERK-468 [D]) -------------------
+#
+# A dsh session runs HEADLESS (docs/dsh-session-lifecycle.md, XERK-466 [B]):
+# there is no Claude-style TUI pane to scrape, so `paneBusy` — the "is its own
+# turn running" signal every working/ready mirror keys on — cannot come from
+# `_pane_status`. It comes instead from the dsh driver plugin's control socket,
+# whose `state` event/ack reports status running|idle. (The S1 projection
+# carries the DISPLAY stream; the socket carries control + liveness only, and
+# liveness is deliberately NOT in the projection — a long dsh tool call emits no
+# transcript entry for minutes, so transcript-freshness would read it idle,
+# exactly the false-idle paneBusy's "esc to interrupt" was invented to avoid.)
+#
+# [D] reuses the EXISTING `paneBusy` wire field rather than adding a dsh-only
+# one, so every downstream mirror (sessionWorking, liveState, the five
+# readyForReview mirrors, the ready-for-review alert, summaries) is UNCHANGED
+# and cannot drift — the same reason S1 projects into the one transcript shape
+# instead of teaching every client a second one. So the whole dsh liveness
+# change lives HERE, agent-side: `session_report` sources paneBusy from the
+# cached dsh status for a dsh session, and nothing on the wire or in any client
+# learns a new field.
+#
+# The PRODUCER of that status — the persistent per-session socket connection
+# that streams `state`/`interaction` events — is the launcher's (XERK-466
+# implementation phase, gated on standing up real dsh in the image). [D] owns
+# the CONSUMER: the one-shot protocol helper (`dsh_query_state`), the ingest
+# seam (`_ingest_dsh_event`) the launcher's reader forwards each event to, the
+# in-memory cache `session_report` reads OFF the beat, and the paneBusy mapping.
+# Reading the socket is off-beat by construction (the beat only ever reads the
+# cache), so a wedged plugin can never stall the heartbeat past OFFLINE_AFTER_MS
+# (the XERK-395 rule).
+
+DSH_SOCK_DIR = os.path.join(REGISTRY_DIR, "dsh")
+# The one-shot `state` query's socket timeout. Off the beat (the launcher/poller
+# calls it, never `session_report`), so this bounds the POLLER, not the
+# heartbeat — kept short so an off-beat refresh across many sessions can't add
+# up, and so a wedged plugin costs at most this per query.
+DSH_STATE_QUERY_TIMEOUT_SEC = 2.0
+# A control-socket line is a small status object; this bounds a malformed or
+# hostile plugin flooding one unterminated line into an unbounded read.
+DSH_SOCK_LINE_MAX = 64 * 1024
+
+
+def dsh_sock_path(sid):
+    """The per-session control socket path (docs/dsh-session-lifecycle.md).
+    Under the agent-owned ~/.turma the guard already governs — NEVER a worktree,
+    where prune/delete key on the uncommitted work a socket would look like."""
+    return os.path.join(DSH_SOCK_DIR, f"{sid}.sock")
+
+
+def parse_dsh_state(obj):
+    """Normalize a dsh control-socket `state` ack/event into
+    {"status": "running"|"idle"|None, "eventCount": int|None,
+     "pendingInteraction": bool}, or None when it carries no usable status.
+
+    Tolerant of a malformed object: the peer is an in-container plugin, but a
+    liveness read must never crash a caller (it runs behind the beat), so an
+    unknown status is None, a non-int/negative eventCount is None, and
+    pendingInteraction defaults False. A bool is not an int here (True/False
+    are ints in Python, so the explicit guard is load-bearing)."""
+    if not isinstance(obj, dict):
+        return None
+    status = obj.get("status")
+    status = status if status in ("running", "idle") else None
+    ec = obj.get("eventCount")
+    if isinstance(ec, bool) or not isinstance(ec, int) or ec < 0:
+        ec = None
+    return {
+        "status": status,
+        "eventCount": ec,
+        "pendingInteraction": obj.get("pendingInteraction") is True,
+    }
+
+
+def dsh_query_state(sock_path, timeout=DSH_STATE_QUERY_TIMEOUT_SEC):
+    """One-shot liveness snapshot over the control socket: connect, send
+    {"op":"state"}, read one line-delimited JSON reply, return `parse_dsh_state`
+    of it (or None on ANY failure — no socket, refused, timeout, malformed).
+
+    This is the OFF-BEAT primitive the launcher's reader/poller uses to seed the
+    cache `session_report` reads; it does socket I/O and so must never be called
+    on the heartbeat path (XERK-395). The `state` op is acked with the snapshot
+    inline, so either the ack shape ({"ok":true,"status":...}) or a bare state
+    object parses the same way."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(sock_path)
+            s.sendall(b'{"op":"state"}\n')
+            buf = bytearray()
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > DSH_SOCK_LINE_MAX:
+                    return None
+    except (OSError, socket.timeout):
+        return None
+    line = bytes(buf).split(b"\n", 1)[0]
+    try:
+        obj = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return parse_dsh_state(obj)
+
+
+def dsh_pane_busy(status):
+    """Map a cached dsh status snapshot onto the paneBusy tri-state every
+    working/ready mirror reads: running -> True, idle -> False, and
+    unknown/missing -> None ("can't tell", so the mirrors fall back exactly as
+    they do for a Claude session whose pane could not be captured).
+
+    A pending interaction reads as NOT working (False), like a Claude
+    `panePrompt` that suppresses the busy hint: the session is blocked on a
+    human, not running its own turn — and the interaction itself surfaces as a
+    `question` through the AskUserQuestion bridge (that half is [C], XERK-467),
+    which is what leads it into Ready-for-review.
+
+    Deliberately NOT time-expired: a long dsh tool call emits no status edge for
+    minutes, so expiring a stale "running" by age would reintroduce the very
+    transcript-freshness false-idle the socket signal exists to avoid. The
+    producer clears the status to unknown on socket disconnect, and the
+    host-offline gate zeroes it when the host dies; neither is this map's job."""
+    if not isinstance(status, dict):
+        return None
+    if status.get("pendingInteraction"):
+        return False
+    st = status.get("status")
+    if st == "running":
+        return True
+    if st == "idle":
+        return False
+    return None
+
+
 def _messages_api_base(url):
     """Trim a configured OpenAI-style `/v1` base back to what Claude Code wants.
 
@@ -7326,7 +7461,7 @@ def _post_to_inbox(sock_path, pid, claude_sid, text):
 
 
 def session_report(workdir, state, tmux_name=None, session_id=None,
-                   claude_sid=None):
+                   claude_sid=None, agent_type=None, dsh_status=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
     state carries per-file byte offsets between beats so the PR-URL scan only
@@ -7343,7 +7478,18 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
-    pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
+    if agent_type == "dsh":
+        # A dsh session is HEADLESS — no Claude pane to scrape (XERK-468 [D]).
+        # paneBusy comes from the dsh control socket's cached `state`, reused as
+        # the same wire field so every working/ready mirror is unchanged; there
+        # is no mode footer or blocking-dialog pane to read either (mode is the
+        # spawn value, and an interaction surfaces via the question bridge, [C]).
+        # `dsh_status` is the off-beat cache the launcher's socket reader fills;
+        # None ("can't tell") falls back to transcript freshness downstream,
+        # exactly as an uncapturable Claude pane does.
+        pane_busy, mode_actual, pane_prompt = dsh_pane_busy(dsh_status), None, None
+    else:
+        pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
@@ -10764,6 +10910,12 @@ class SessionManager:
         self.resumable = {}                      # repo name -> [resumable entry]
         self.ttyd = {}                           # id -> ttyd Popen (in-memory)
         self.sess_state = {}                     # id -> session_report offsets
+        # id -> latest dsh control-socket liveness snapshot (XERK-468 [D]),
+        # {status, eventCount, pendingInteraction}. Filled off the beat by the
+        # launcher's per-session socket reader via _ingest_dsh_event; read on the
+        # beat by session_report to source a dsh session's paneBusy. Empty until
+        # the dsh launcher (XERK-466 impl) exists, so no current host is touched.
+        self.dsh_status = {}
         self.usage_cache = {}                    # id -> usage_report result
         self.slug_usage = {}                     # project slug -> {acc, offsets}
                                                  # persistent incremental usage fold,
@@ -12306,6 +12458,7 @@ class SessionManager:
 
     def _forget_session_caches(self, sid):
         self.sess_state.pop(sid, None)
+        self.dsh_status.pop(sid, None)  # dsh liveness dies with the session (XERK-468)
         self.usage_cache.pop(sid, None)
         # Not slug_usage: the transcript survives kill/delete and still counts
         # toward the persistent per-repo/host usage. It's keyed by slug (not
@@ -13555,6 +13708,7 @@ class SessionManager:
         try:
             self._kill_tmux(sess)          # ends the current claude
             self.sess_state.pop(sid, None)  # fresh freshness/PR tracking
+            self.dsh_status.pop(sid, None)  # restart-clear-context = a fresh dsh agent (XERK-468)
             self._clear_question_files(sid)  # drop any question the old claude was blocked on
             # A message queued for the pre-restart conversation is contextually
             # gone with it — never re-inject it into the fresh one (XERK-47).
@@ -14530,6 +14684,52 @@ class SessionManager:
                 os.remove(path)
             except OSError:
                 pass
+
+    # ---- dsh liveness seam (XERK-468 [D]) -----------------------------------
+    #
+    # The launcher's per-session control-socket reader (XERK-466 impl, off the
+    # beat) forwards each streamed `state`/`interaction` line to
+    # `_ingest_dsh_event`, and clears the cache with `_set_dsh_status(sid, None)`
+    # when the socket disconnects (so a dropped connection reads as "can't tell",
+    # not a frozen "running"). `refresh_dsh_status` is the off-beat one-shot a
+    # poller can use instead. `session_report` only ever READS the cache these
+    # fill, so the heartbeat never does socket I/O (XERK-395).
+
+    def _set_dsh_status(self, sid, snap):
+        """Store a session's latest dsh liveness snapshot (or None to mark it
+        unknown)."""
+        if not sid:
+            return
+        if snap is None:
+            self.dsh_status.pop(sid, None)
+        else:
+            self.dsh_status[sid] = snap
+
+    def _ingest_dsh_event(self, sid, event):
+        """Fold one dsh control-socket event (docs/dsh-session-lifecycle.md) into
+        this session's state. Only the `state` event is [D]'s: it becomes the
+        cached liveness `session_report` maps to paneBusy. The `interaction`
+        event (surfacing a dsh approval/question as a pending `question`) is [C]'s
+        (XERK-467), which hooks its own handling here; [D] leaves it untouched so
+        the two seams don't collide. Tolerant of a malformed event."""
+        if not isinstance(event, dict) or not sid:
+            return
+        evt = event.get("evt") or event.get("op")
+        if evt == "state":
+            snap = parse_dsh_state(event)
+            # Only a USABLE status (running|idle) updates the cache — a malformed
+            # state event must not clobber a known-good "running" with "unknown".
+            # Clearing to unknown is _set_dsh_status(sid, None)'s job (disconnect).
+            if snap and snap["status"] is not None:
+                self._set_dsh_status(sid, snap)
+
+    def refresh_dsh_status(self, sid):
+        """Off-beat one-shot refresh of a dsh session's cached liveness from its
+        control socket, for the launcher/poller to call OFF the heartbeat path.
+        Returns the snapshot (or None)."""
+        snap = dsh_query_state(dsh_sock_path(sid))
+        self._set_dsh_status(sid, snap)
+        return snap
 
     def _tmux_alive(self, tmux_name):
         """Whether the session's claude tmux is still up. The claude process is
@@ -18350,7 +18550,9 @@ class SessionManager:
                 st = self.sess_state.setdefault(sid, {})
                 signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"),
                                          session_id=sess.get("id"),
-                                         claude_sid=sess.get("claudeSessionId"))
+                                         claude_sid=sess.get("claudeSessionId"),
+                                         agent_type=sess.get("agentType"),
+                                         dsh_status=self.dsh_status.get(sid))
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]
