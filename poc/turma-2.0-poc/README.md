@@ -102,6 +102,54 @@ $ curl http://localhost:3000/api/agents
 [{"device":"dsh-test-host","sessions":[],"online":true}]
 ```
 
+### G1 vertical slice: the four operations against real dsh (XERK-463)
+
+Registration only proves the plugin *connects*. `--drive` proves hub→dsh
+**command routing**: it spawns a real dsh session, sends input, watches the
+transcript stream back, and kills it — no mock at any hop.
+
+```bash
+./test-real-dsh.sh --drive        # exits 0 on "=== FOUR-OPS PASS ==="
+```
+
+A driven session must reach a real model. dsh has no Claude-style failover
+(XERK-462 D5), so the `dsh-llm-pi-ai` selector is the whole story: the harness
+writes a **hand-declared, OpenAI-compatible** provider route into the profile's
+`cordis.patch.yml` and points it at a gateway. Defaults target this fleet's
+LiteLLM; override with `MODEL_PROVIDER` / `MODEL_ID` / `MODEL_BASE_URL` /
+`MODEL_API_KEY_ENV`. The credential rides `apiKeyEnv`, so no secret is written
+to disk.
+
+**What the go/no-go found — the mock hid a wrong API.** The plugin's
+`handleSpawn` / `handleInput` / `handleKill` were written against a *guessed*
+`ctx.agents` shape that the mock worker never checked. Real dsh (0.1.1-rc.2)
+differs on every one, so all three were corrected:
+
+| op | was (never ran on real dsh) | real dsh (`@deepseek-ai/dsh-agent`) |
+|----|------------------------------|--------------------------------------|
+| spawn | `ctx.agents.resume({cwd, prompt})` | `ctx.agents.create({sessionId, meta:{cwd}, agentOptions})` → `AgentHandle`; the id is minted caller-side, and `resume()` is for *persisted* sessions (requires `resumeSessionId`) — not how a fresh one is born |
+| input | `agent.inbox.append('next-turn', …)` | `agent.followup(msg)` — `inbox.append` enqueues **without waking the driver**, so the turn never runs |
+| kill | `agent.cancel()` (no arg) | `handle.dispose()` (stop loop + unregister + remove session); `cancel()` needs a `cause` and only aborts the active turn |
+
+Recorded run (`litellm` → `bedrock/…/claude-haiku-4-5`):
+
+```
+[drive] [1/4] spawn ...   spawned session b0d5d761-…
+[drive]   session present in heartbeat
+[drive] [2/4] input + [3/4] transcript ...
+[drive]   input recorded as a user/message event
+[drive]   assistant/message streamed back (16 session events total)
+[drive]   model said: "PONG"
+[drive] [4/4] kill ...    session gone from heartbeat
+session-event types observed: agent/inbox/spliced, assistant/chunk,
+  assistant/message, request/context, request/header, session/title,
+  session/title-llm-request, step/start, turn/start, user/message
+=== FOUR-OPS PASS ===
+```
+
+**Verdict: GO.** The epic's biggest evidence gap is closed — real dsh can be
+spawned, fed input, streamed from, and killed through the hub.
+
 ## Test Scenarios
 
 ### Scenario 1: Agent Registration
@@ -129,7 +177,8 @@ $ curl http://localhost:3000/api/agents
 ## Files
 
 ```
-test-real-dsh.sh    # end-to-end test against a real dsh instance
+test-real-dsh.sh    # end-to-end test against a real dsh instance (--drive = four ops)
+drive-four-ops.mjs  # dashboard client: spawn/input/transcript/kill driver (XERK-463)
 test-multi-host.ts  # multi-host federation test (mock workers)
 test-standalone.ts  # hub/protocol test (mock workers)
 
@@ -156,19 +205,22 @@ and conflating them was overclaiming.
 - [x] Multiple real dsh instances register with one hub
 - [x] The dashboard lists every registered host
 
+**Proven against real dsh** (`test-real-dsh.sh --drive`, XERK-463 G1):
+
+- [x] `spawn` — the plugin's `handleSpawn` calls a live `ctx.agents.create()`
+      and returns a real session id
+- [x] `input` — `handleInput` calls `agent.followup()` and the message is
+      logged as a `user/message` event
+- [x] transcript — the real model runs a turn and an `assistant/message`
+      streams back through the hub (alongside `turn/start`, `step/start`,
+      `assistant/chunk`, …)
+- [x] `kill` — `handleKill` disposes the agent handle and the session leaves
+      the heartbeat
+
 **Proven only against MOCK workers** (`test-multi-host.ts`, `test-standalone.ts`)
 — these exercise the hub and the wire protocol, not the plugin's dsh-side code:
 
-- [x] Can spawn a session on a specific host from the dashboard
-- [x] Can send input to any session from the dashboard
-- [x] Session events stream to the dashboard in real time
-
-**Not yet proven anywhere:**
-
-- [ ] `spawn` / `input` / `kill` driven end to end against a real dsh — the
-      plugin's `handleSpawn` / `handleInput` / `handleKill` have never executed
-      against a live `ctx.agents`. This is the biggest remaining gap in the
-      PoC's evidence.
+- [x] Multi-host federation and event fan-out under the same wire protocol
 
 ## Known limitations
 

@@ -5,6 +5,18 @@
  * Streams session events to the hub and handles commands (spawn, input, kill).
  */
 import { WebSocket } from 'ws';
+// Build a well-formed dsh UserMessage. dsh's own `createUserMessage` freezes
+// and mints a branded id, but the loose literal here carries the same fields
+// the inbox durably logs and the model request reads: a plain uuid id, the
+// `user` source kind, and one text block.
+function userMessage(text) {
+    return {
+        id: crypto.randomUUID(),
+        role: 'user',
+        source: { kind: 'user' },
+        content: [{ type: 'text', text }],
+    };
+}
 // Plugin metadata
 export const name = 'turma-fleet-agent';
 export const inject = ['sessions', 'agents'];
@@ -17,6 +29,11 @@ export function apply(ctx, config) {
     let reconnectTimer = null;
     let heartbeatTimer = null;
     const pendingCommands = new Map();
+    // Live agent handles keyed by session id. `ctx.agents.get()` returns a bare
+    // agent with no disposer, so a spawned session's handle is kept here to make
+    // `kill` a real teardown (stop loop + unregister + remove session) rather
+    // than a turn cancel.
+    const handles = new Map();
     function connect() {
         const url = `${config.hubUrl}?device=${encodeURIComponent(config.device)}`;
         ctx.logger.info(`[fleet] Connecting to hub: ${url}`);
@@ -100,12 +117,30 @@ export function apply(ctx, config) {
     async function handleSpawn(msg) {
         ctx.logger.info(`[fleet] Spawn request: ${msg.cmdId}`);
         try {
-            // Create or resume an agent
-            const result = await ctx.agents.resume({
-                cwd: msg.cwd,
-                prompt: msg.prompt,
+            // Mint the session id ourselves -- create() is identity-in, so the id is
+            // known before the agent exists (the same discipline the real hub uses to
+            // name a session's transcript before its first byte).
+            const sessionId = crypto.randomUUID();
+            const agentOptions = config.provider || config.model
+                ? { provider: config.provider, model: config.model }
+                : undefined;
+            // A dsh session's meta.cwd must be a validated absolute path; fall back
+            // to this process's cwd when the hub sends none (its `spawn` carries
+            // `repo`, not `cwd`), so create() always has a real working directory.
+            const cwd = msg.cwd || process.cwd();
+            const handle = await ctx.agents.create({
+                sessionId,
+                meta: { cwd },
+                agentOptions,
             });
-            sendCommandResult(msg.cmdId, { sessionId: result.agent.id });
+            handles.set(handle.agent.id, handle);
+            // An initial prompt is delivered like any other input: a follow-up turn
+            // that wakes the driver. create() alone leaves the agent idle.
+            if (msg.prompt)
+                handle.agent.followup(userMessage(msg.prompt));
+            sendCommandResult(msg.cmdId, { sessionId: handle.agent.id });
+            // Reflect the new session in the hub's state now, not on the next 15s beat.
+            sendHeartbeat();
         }
         catch (e) {
             ctx.logger.error(`[fleet] Spawn failed: ${e}`);
@@ -118,22 +153,28 @@ export function apply(ctx, config) {
             ctx.logger.warn(`[fleet] Session not found for input: ${msg.sessionId}`);
             return;
         }
-        // Queue user message to the agent's inbox
-        const userMessage = {
-            id: crypto.randomUUID(),
-            role: 'user',
-            source: { kind: 'fleet', clientId: config.device },
-            content: [{ type: 'text', text: msg.message }],
-        };
-        agent.inbox.append('next-turn', userMessage);
+        // followup queues the message as its own turn AND wakes the driver, so the
+        // model actually processes it. `inbox.append` would enqueue without waking.
+        agent.followup(userMessage(msg.message));
     }
     async function handleKill(msg) {
+        const handle = handles.get(msg.sessionId);
+        if (handle) {
+            // The capability disposer: stop the loop, unregister, remove the session.
+            handles.delete(msg.sessionId);
+            await handle.dispose();
+            // Reflect the teardown immediately rather than on the next 15s beat.
+            sendHeartbeat();
+            return;
+        }
+        // No handle (e.g. a session created outside this plugin): fall back to
+        // cancelling the active turn, the strongest teardown a bare agent allows.
         const agent = ctx.agents.get(msg.sessionId);
         if (!agent) {
             ctx.logger.warn(`[fleet] Session not found for kill: ${msg.sessionId}`);
             return;
         }
-        await agent.cancel();
+        agent.cancel({ kind: 'disposed' });
     }
     function sendCommandResult(cmdId, result, error) {
         if (!ws || ws.readyState !== WebSocket.OPEN)

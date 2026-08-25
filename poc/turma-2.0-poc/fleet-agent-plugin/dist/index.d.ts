@@ -59,34 +59,48 @@ interface SessionEvent {
 }
 interface AgentRegistry {
     get(id: string): Agent | undefined;
-    resume(options: ResumeOptions): Promise<{
-        agent: Agent;
-    }>;
+    create(options: CreateAgentOptions): Promise<AgentHandle>;
 }
-interface ResumeOptions {
-    resumeSessionId?: string;
-    cwd?: string;
-    prompt?: string;
+interface CreateAgentOptions {
+    sessionId: string;
+    meta?: {
+        cwd?: string;
+    };
     agentOptions?: AgentOptions;
 }
 interface AgentOptions {
-    instructions?: string;
+    provider?: string;
+    model?: string;
+    maxTokens?: number;
+}
+interface AgentHandle {
+    agent: Agent;
+    dispose(): Promise<void>;
 }
 interface Agent {
     id: string;
     session: Session;
     status: 'running' | 'idle';
-    inbox: {
-        append(target: 'next-turn' | 'next-step', message: UserMessage): void;
-    };
-    cancel(): Promise<void>;
+    followup(message: UserMessage): void;
+    cancel(cause: AgentCancelCause): void;
 }
+type AgentCancelCause = {
+    kind: 'user';
+} | {
+    kind: 'parent';
+} | {
+    kind: 'hook';
+    reason: string;
+} | {
+    kind: 'disposed';
+};
 interface UserMessage {
     id: string;
     role: 'user';
     source: {
         kind: string;
         clientId?: string;
+        plugin?: string;
     };
     content: Array<{
         type: 'text';
@@ -110,6 +124,16 @@ export interface Config {
      * exec time and cannot be adopted by an already-running one.
      */
     instanceId?: string;
+    /**
+     * Provider route and model a spawned session's agent uses, passed straight to
+     * `ctx.agents.create({ agentOptions })`. Omitted, dsh falls back to whatever
+     * `agent-default-model` the profile configures. dsh has no Claude-style
+     * failover (XERK-462 D5): this selector is the whole model story for the
+     * session, and the provider route must be registered (e.g. a `dsh-llm-pi-ai`
+     * profile pointing at DeepSeek or an OpenAI-compatible LiteLLM/Ollama gateway).
+     */
+    provider?: string;
+    model?: string;
 }
 export declare const name = "turma-fleet-agent";
 export declare const inject: string[];
