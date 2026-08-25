@@ -2032,6 +2032,56 @@ test("session card shows a dsh runtime badge, and none for claude (XERK-465)", (
   assert.equal(runtimeMarkHtml({}), "");
 });
 
+test("composer: the local model dropdown + context reach the spawn request (XERK-489)", () => {
+  const page = loadPage();
+  const now = Date.now();
+  const h = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
+    localModel: { available: true, defaultModel: "gpt-oss:120b",
+      models: [{ id: "gpt-oss:120b", contextTokens: 120000 }, { id: "qwen:32b", contextTokens: 32768 }] },
+  };
+  page.setCache({ now, agents: [h] });
+  page.render({ now, agents: [h] });
+  page.toggleComposer("hostA::repoX", "repoX");
+  const html = page.els.spawn.innerHTML;
+  // The dropdown lists the discovered models with windows, and the context field.
+  assert.match(html, /qwen:32b · 33k/);
+  assert.match(html, /Self-hosted model/);
+  // Choose local + a specific model + a shrunk context; all reach the spawn body.
+  page.els["cmp-source-hostA__repoX"] = { value: "local" };
+  page.els["cmp-lmodel-hostA__repoX"] = { value: "qwen:32b" };
+  page.els["cmp-lctx-hostA__repoX"] = { value: "16000" };
+  page.startSession("hostA", "repoX");
+  const post = page.posts.find((p) => p.url.endsWith("/sessions"));
+  assert.equal(post.body.modelSource, "local");
+  assert.equal(post.body.localModel, "qwen:32b");
+  assert.equal(post.body.localContext, 16000);
+});
+
+test("composer: a subscription spawn sends no local model fields (XERK-489)", () => {
+  const page = loadPage();
+  const now = Date.now();
+  const h = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
+    localModel: { available: true, defaultModel: "gpt-oss:120b",
+      models: [{ id: "gpt-oss:120b", contextTokens: 120000 }] },
+  };
+  page.setCache({ now, agents: [h] });
+  page.render({ now, agents: [h] });
+  page.toggleComposer("hostA::repoX", "repoX");
+  // The local fields are present in the DOM but source is subscription.
+  page.els["cmp-source-hostA__repoX"] = { value: "subscription" };
+  page.els["cmp-lmodel-hostA__repoX"] = { value: "gpt-oss:120b" };
+  page.els["cmp-lctx-hostA__repoX"] = { value: "16000" };
+  page.startSession("hostA", "repoX");
+  const post = page.posts.find((p) => p.url.endsWith("/sessions"));
+  assert.equal(post.body.modelSource, undefined);
+  assert.equal(post.body.localModel, undefined);
+  assert.equal(post.body.localContext, undefined);
+});
+
 // XERK-162: the sidebar's own prBadgeHtml copy labels a GitLab MR / ADO PR
 // with its platform's !n sigil, GitHub with #n. Guarded here because a QA
 // mutation pass flipped this copy's sigil back to "#" and every suite stayed

@@ -110,6 +110,18 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   typed on Android and `/api/agents` decodes atomically there, so one host's `available:"yes"` hid
   the whole fleet from the phone; see CLAUDE.md's heartbeat contract. Tests: the `model source:`
   cases in `chat.test.js`, `normalizeLocalModel` in `server.test.js`.
+- **A LOCAL session's model is a live DROPDOWN of the endpoint's DISCOVERED models** (XERK-489,
+  `localModelChipHtml`), not the old fixed `cc-model-fixed` label — each row is `id · 128k`, and
+  selecting one POSTs the endpoint id to `.../sessions/<id>/model` (the same route, which now
+  accepts an endpoint model for a local session). The menu also carries an **advanced context
+  override** (`ccLocalCtx`) that may only SHRINK the served window; selecting a model auto-applies
+  its window. With no discovered `models[]` (older agent / pre-discovery) it falls back to the fixed
+  label. The spawn composer (`sessions.html`) reveals the same model dropdown + context field under
+  "Run against: local". `normalizeSessions` now coerces the per-session `localModelName`/
+  `localModelContext` (typed on Android). Android has the dropdown (chat + composer); the context
+  override is web-only (`android/PARITY.md`). Tests: the `local model (XERK-489)` cases in
+  `chat.test.js`, the composer cases in `sessions.test.js`, `/model` context + `normalizeSessions`
+  in `server.test.js`.
 - The compose footer's agent-mode / model selectors are joined by a compact **PR status chip**
   (`prFooterChip`) when it has one, and a `jira-chip` when the session has a ticket.
 - The **model selector is accurate** (XERK-33) — never a hardcoded menu, and never rewriting the

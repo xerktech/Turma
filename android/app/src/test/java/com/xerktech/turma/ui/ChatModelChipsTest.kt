@@ -4,6 +4,7 @@ import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import org.junit.Rule
@@ -120,6 +121,25 @@ class ChatModelChipsTest {
         compose.onNodeWithText("model: qwen3-coder").assertIsDisplayed()
         // The picker's own label is what a forced-pickable mutation puts back.
         compose.onNodeWithText("model: default").assertDoesNotExist()
+    }
+
+    /**
+     * XERK-489: with a DISCOVERED model list the local session's model becomes a
+     * live dropdown (each "id · 128k") instead of the fixed label — the endpoint
+     * model is switchable per session. The chip carries the served window, which
+     * the old fixed label never did, and opening it reveals the other model.
+     */
+    @Test
+    fun `a local session with a discovered list offers a model dropdown`() {
+        openChat(
+            modelSource = "local",
+            localModel = """{"available":true,"model":"gpt-oss:120b","contextTokens":120000,
+                "defaultModel":"gpt-oss:120b",
+                "models":[{"id":"gpt-oss:120b","contextTokens":120000},{"id":"qwen:32b","contextTokens":32768}]}""",
+        )
+        compose.onNodeWithText("model: gpt-oss:120b · 120k").assertIsDisplayed()
+        compose.onNodeWithText("model: gpt-oss:120b · 120k").performClick()
+        compose.onNodeWithText("qwen:32b · 33k").assertIsDisplayed()
     }
 
     /** On the subscription the picker is exactly what should be there. */

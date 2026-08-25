@@ -4159,6 +4159,18 @@ function normalizeSessions(payload) {
     for (const k of ["modelSource", "modelSourceAt", "agentType"]) {
       if (k in s && typeof s[k] !== "string") s[k] = "";
     }
+    // XERK-489: the per-session self-hosted model name (String? on Android) and
+    // its context window (Int? on Android). Typing a field on SessionInfo and
+    // adding its hub-side coercion are the SAME change — a wrong-typed one from a
+    // rogue agent would otherwise fail the WHOLE /api/agents decode on the phone.
+    // A non-string name and a non-int-safe context degrade to the "can't tell"
+    // value every client already handles (null), never a plausible default.
+    if ("localModelName" in s && typeof s.localModelName !== "string") s.localModelName = null;
+    if ("localModelContext" in s) {
+      const c = s.localModelContext;
+      s.localModelContext = (typeof c === "number" && Number.isSafeInteger(c) &&
+        c > 0 && c <= 2_147_483_647) ? c : null;
+    }
   }
 }
 
@@ -8548,6 +8560,9 @@ const server = http.createServer(async (req, res) => {
                        "modelSource", "localModel", "agentType"]) {
         if (typeof body[f] === "string" && body[f].trim()) cmd[f] = body[f].trim();
       }
+      if (Number.isInteger(body.localContext) && body.localContext > 0) {
+        cmd.localContext = body.localContext;
+      }
       // Same enum as the switch route: a spawn is the OTHER way onto the local
       // model, so junk must 400 here rather than land as an errored session card.
       const spawnSourceErr = checkSpawnModelSource(cmd, hostname);
@@ -8592,6 +8607,12 @@ const server = http.createServer(async (req, res) => {
             }
             cmd[f] = body[f];
           }
+        }
+        // The context override is numeric (XERK-489); the agent clamps it to the
+        // served window, so the hub only keeps a positive int and drops anything
+        // else so the served figure applies.
+        if (Number.isInteger(body.localContext) && body.localContext > 0) {
+          cmd.localContext = body.localContext;
         }
         const spawnSourceErr = checkSpawnModelSource(cmd, key);
         if (spawnSourceErr) return json(res, spawnSourceErr.status, { error: spawnSourceErr.error });
@@ -8797,7 +8818,14 @@ const server = http.createServer(async (req, res) => {
             return json(res, 400, { error: "invalid model" });
           if (!localModelServes(agents[key], model))
             return json(res, 409, { error: "host does not serve that local model" });
-          const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
+          // Optional advanced context-window override (XERK-489). The agent
+          // clamps it to the served window (shrink-only); the hub only checks it
+          // is a positive int, else drops it so the served figure applies.
+          const cmd = { type: "setModel", sessionId, model };
+          if (Number.isInteger(body.context) && body.context > 0) {
+            cmd.localContext = body.context;
+          }
+          const cmdId = queueCommand(key, cmd);
           return json(res, 200, { ok: true, cmdId });
         }
         if (model.length > 60 || !/^[a-z0-9.[\]-]+$/i.test(model))

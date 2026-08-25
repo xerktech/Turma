@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1761,6 +1761,62 @@ test("model source: the menu names the host's actual model", () => {
   assert.deepEqual(modelSourceOpts().map((o) => o.value), ["subscription", "local"]);
   assert.equal(modelSourceOpts()[1].label, "gpt-oss:120b");
   assert.equal(modelSourceLabel(), "Subscription");
+});
+
+test("local model (XERK-489): the dropdown lists the discovered models with windows", () => {
+  __setLocalModelPending(null);
+  __setSess({ id: "s1", modelSource: "local", localModelName: "qwen:32b" });
+  __setAgent({ localModel: { available: true, defaultModel: "gpt-oss:120b",
+    models: [{ id: "gpt-oss:120b", contextTokens: 120000 }, { id: "qwen:32b", contextTokens: 32768 }] } });
+  // Options are "id · Nk".
+  assert.deepEqual(localModelOpts().map((o) => o.value), ["gpt-oss:120b", "qwen:32b"]);
+  assert.equal(localModelOpts()[0].label, "gpt-oss:120b · 120k");
+  assert.equal(localModelOpts()[1].label, "qwen:32b · 33k");
+  // The session's stored model wins over the host default.
+  assert.equal(currentLocalModel(), "qwen:32b");
+  // ...and its served window is the current context.
+  assert.equal(servedContextFor("qwen:32b"), 32768);
+  assert.equal(currentLocalContext(), 32768);
+  // The chip is a real dropdown (a button + menu), not the old fixed label.
+  const html = localModelChipHtml();
+  assert.match(html, /id="ccLocalModelBtn"/);
+  assert.match(html, /id="ccLocalModelMenu"/);
+  assert.match(html, /id="ccLocalCtx"/);           // the advanced override field
+  assert.doesNotMatch(html, /cc-model-fixed/);
+});
+
+test("local model (XERK-489): a stored context override wins, and shrinks the readout", () => {
+  __setLocalModelPending(null);
+  __setSess({ id: "s1", modelSource: "local", localModelName: "qwen:32b", localModelContext: 16000 });
+  __setAgent({ localModel: { available: true,
+    models: [{ id: "qwen:32b", contextTokens: 32768 }] } });
+  assert.equal(currentLocalContext(), 16000);
+  assert.match(localModelChipHtml(), /· 16k/);     // the chip shows the override
+});
+
+test("local model (XERK-489): falls back to a fixed label with no discovered list", () => {
+  // An older agent (or the discovery worker's first pass not yet landed) reports
+  // `available` but no `models` — keep the fixed label rather than an empty menu.
+  __setLocalModelPending(null);
+  __setSess({ id: "s1", modelSource: "local" });
+  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  assert.deepEqual(localModels(), []);
+  assert.equal(currentLocalModel(), "gpt-oss:120b");   // the back-compat single name
+  const html = localModelChipHtml();
+  assert.match(html, /cc-model-fixed/);
+  assert.doesNotMatch(html, /ccLocalModelBtn/);
+});
+
+test("local model (XERK-489): fmtCtx renders k, and a null window leaves no suffix", () => {
+  assert.equal(fmtCtx(128000), "128k");
+  assert.equal(fmtCtx(500), "500");
+  assert.equal(fmtCtx(0), "");
+  assert.equal(fmtCtx(null), "");
+  // A model the endpoint reports no window for (bare OpenAI) has no served figure.
+  __setSess({ id: "s1", modelSource: "local", localModelName: "llama3" });
+  __setAgent({ localModel: { available: true, models: [{ id: "llama3", contextTokens: null }] } });
+  assert.equal(servedContextFor("llama3"), null);
+  assert.equal(localModelOpts()[0].label, "llama3");   // no " · Nk"
 });
 
 test("model source: a pending switch never leaks onto another session", () => {

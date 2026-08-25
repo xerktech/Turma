@@ -62,7 +62,7 @@ fun SpawnDialog(
     localModel: LocalModelInfo? = null,
     dsh: DshInfo? = null,
     onDismiss: () -> Unit,
-    onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String, modelSource: String, agentType: String) -> Unit,
+    onSpawn: (prompt: String, label: String, baseRef: String, model: String, mode: String, modelSource: String, localModel: String, agentType: String) -> Unit,
 ) {
     var prompt by remember { mutableStateOf("") }
     var label by remember { mutableStateOf("") }
@@ -73,6 +73,14 @@ fun SpawnDialog(
     var agentType by remember { mutableStateOf(Runtime.CLAUDE) }
     val sourceOpts = remember(localModel) { ModelSource.options(localModel) }
     val runtimeOpts = remember { Runtime.options() }
+    // The chosen endpoint model for a LOCAL spawn (XERK-489), defaulting to the
+    // host default. The context override is web-only for now (see PARITY.md).
+    val localOpts = remember(localModel) { ModelSource.localOptions(localModel) }
+    var localModelId by remember(localModel) {
+        mutableStateOf(ModelSource.currentLocalModel(null, localModel).ifBlank {
+            localOpts.firstOrNull()?.first ?: ""
+        })
+    }
     // Never keep a choice the operator can no longer see. If the host stops
     // reporting a local model while the composer is open, the "Run against" row
     // disappears — and a `local` left behind in state would spawn into a
@@ -141,10 +149,23 @@ fun SpawnDialog(
                         optionLabel = { v -> sourceOpts.firstOrNull { it.first == v }?.second ?: v },
                     ) { modelSource = it }
                 }
+                // When "local" is chosen, reveal the endpoint's discovered models
+                // (XERK-489), mirroring the web composer's revealed dropdown.
+                if (modelSource == ModelSource.LOCAL && ModelSource.localModelPickable(localModel)) {
+                    DropdownField(
+                        label = "Self-hosted model",
+                        options = localOpts.map { it.first },
+                        selected = localModelId.ifBlank { localOpts.firstOrNull()?.first ?: "" },
+                        optionLabel = { v -> localOpts.firstOrNull { it.first == v }?.second ?: v },
+                    ) { localModelId = it }
+                }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onSpawn(prompt, label, baseRef, model, mode, modelSource, agentType) }) {
+            TextButton(onClick = {
+                onSpawn(prompt, label, baseRef, model, mode, modelSource,
+                    if (modelSource == ModelSource.LOCAL) localModelId else "", agentType)
+            }) {
                 Text("Spawn")
             }
         },

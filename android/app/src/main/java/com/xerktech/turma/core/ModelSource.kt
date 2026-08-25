@@ -202,4 +202,63 @@ object ModelSource {
      * move back to the subscription, and the web sends it either way.
      */
     fun modelPickable(source: String): Boolean = source != LOCAL
+
+    // ---- endpoint model dropdown (XERK-489) ---------------------------------
+    // A local session is no longer pinned to one model: it picks from the ids the
+    // endpoint SERVES (LocalModelInfo.models), switched live like the subscription
+    // model. Selecting one applies that model's served context window. Ports the
+    // web `chat.js` helpers localModels/currentLocalModel/servedContextFor/
+    // currentLocalContext/localModelOpts/fmtCtx.
+
+    /** The discovered models, or empty for an older agent / pre-discovery beat. */
+    fun localModels(local: LocalModelInfo?): List<com.xerktech.turma.model.LocalModelOption> =
+        local?.models ?: emptyList()
+
+    /**
+     * Is the LOCAL model itself pickable — i.e. is there a discovered list to
+     * choose from? When empty we keep the old fixed label (there is no menu to
+     * offer), mirroring the web's `cc-model-fixed` fallback.
+     */
+    fun localModelPickable(local: LocalModelInfo?): Boolean = localModels(local).isNotEmpty()
+
+    /** The endpoint model this session runs: its stored pick, else the host
+     *  default, else the single back-compat name. */
+    fun currentLocalModel(session: SessionInfo?, local: LocalModelInfo?): String =
+        session?.localModelName?.takeIf { it.isNotBlank() }
+            ?: local?.defaultModel?.takeIf { it.isNotBlank() }
+            ?: local?.model?.takeIf { it.isNotBlank() }
+            ?: ""
+
+    /** The endpoint's served window for a model id, or null when it reports none. */
+    fun servedContextFor(local: LocalModelInfo?, id: String): Int? =
+        localModels(local).firstOrNull { it.id == id }?.contextTokens
+
+    /** The window this session is actually running: its stored override, else the
+     *  served figure for its model. */
+    fun currentLocalContext(session: SessionInfo?, local: LocalModelInfo?): Int? {
+        val stored = session?.localModelContext
+        if (stored != null && stored > 0) return stored
+        return servedContextFor(local, currentLocalModel(session, local))
+    }
+
+    /** "128k" for a token count, "" for a null/non-positive one. */
+    fun fmtCtx(n: Int?): String = when {
+        n == null || n <= 0 -> ""
+        n >= 1000 -> "${Math.round(n / 1000.0)}k"
+        else -> n.toString()
+    }
+
+    /** Menu rows for the local dropdown as (id, "id · 128k") pairs. */
+    fun localOptions(local: LocalModelInfo?): List<Pair<String, String>> =
+        localModels(local).map { m ->
+            val k = fmtCtx(m.contextTokens)
+            m.id to (m.id + if (k.isNotEmpty()) " · $k" else "")
+        }
+
+    /** The chip label for a local session: its model + current window. */
+    fun localModelLabel(session: SessionInfo?, local: LocalModelInfo?): String {
+        val id = currentLocalModel(session, local).ifBlank { "local model" }
+        val k = fmtCtx(currentLocalContext(session, local))
+        return if (k.isNotEmpty()) "$id · $k" else id
+    }
 }
