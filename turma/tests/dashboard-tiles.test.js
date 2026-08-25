@@ -98,7 +98,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   g.window = g; g.globalThis = g;
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
-    "\n;return { render, fmtTokens, applyAgent, connectSSE," +
+    "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
   // Run every queued timer callback, as the browser would once they fire.
@@ -142,6 +142,23 @@ function tileOf(html, label) {
   const m = html.match(re);
   return m ? { value: m[1], hint: m[2] || "" } : null;
 }
+
+test("dashboard: the session card renders a context-fullness meter (XERK-489 Phase 4)", () => {
+  const D = loadDashboard();
+  // No numerator yet -> no meter.
+  assert.equal(D.contextMeterHtml({ contextWindowTokens: 200000 }), "");
+  // A local session is EXACT: the % and the fill width, no "~".
+  let html = D.contextMeterHtml({ modelSource: "local", lastTurnContextTokens: 16384, contextWindowTokens: 32768 });
+  assert.match(html, /width:50%/);
+  assert.match(html, />50% context</);
+  assert.doesNotMatch(html, /50% ~/);
+  assert.doesNotMatch(html, /\bwarn\b|\bdanger\b/);
+  // A subscription session is APPROXIMATE, marked "~".
+  assert.match(D.contextMeterHtml({ modelSource: "subscription", lastTurnContextTokens: 100000, contextWindowTokens: 200000 }), /50% ~/);
+  // Warn ~85-95%, danger near the ~95% auto-compact.
+  assert.match(D.contextMeterHtml({ modelSource: "local", lastTurnContextTokens: 88, contextWindowTokens: 100 }), /ctx-meter warn/);
+  assert.match(D.contextMeterHtml({ modelSource: "local", lastTurnContextTokens: 97, contextWindowTokens: 100 }), /ctx-meter danger/);
+});
 
 test("dashboard tiles: a removed host's spend still counts toward the fleet totals", () => {
   const D = loadDashboard();

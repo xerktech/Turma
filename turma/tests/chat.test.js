@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1817,6 +1817,32 @@ test("local model (XERK-489): fmtCtx renders k, and a null window leaves no suff
   __setAgent({ localModel: { available: true, models: [{ id: "llama3", contextTokens: null }] } });
   assert.equal(servedContextFor("llama3"), null);
   assert.equal(localModelOpts()[0].label, "llama3");   // no " · Nk"
+});
+
+test("context meter (XERK-489 Phase 4): pct, thresholds, and the approx mark", () => {
+  __setModelSourcePending(null);
+  __setAgent({});
+  // No numerator yet -> no meter.
+  __setSess({ id: "s1", contextWindowTokens: 200000 });
+  assert.equal(contextMeterChip(), "");
+  // A local session is EXACT (no "~"), and the fill width is num/den.
+  __setSess({ id: "s1", modelSource: "local", lastTurnContextTokens: 16384, contextWindowTokens: 32768 });
+  let html = contextMeterChip();
+  assert.match(html, /width:50%/);
+  assert.match(html, />50%<\/span>/);
+  assert.doesNotMatch(html, /50% ~/);           // exact, not approximate
+  assert.doesNotMatch(html, /ctx-warn|ctx-danger/);
+  // A subscription session is APPROXIMATE — marked "~".
+  __setSess({ id: "s1", modelSource: "subscription", lastTurnContextTokens: 100000, contextWindowTokens: 200000 });
+  assert.match(contextMeterChip(), /50% ~/);
+  // Warn ~85-95%, danger near the ~95% auto-compact.
+  __setSess({ id: "s1", modelSource: "local", lastTurnContextTokens: 88, contextWindowTokens: 100 });
+  assert.match(contextMeterChip(), /ctx-warn/);
+  __setSess({ id: "s1", modelSource: "local", lastTurnContextTokens: 97, contextWindowTokens: 100 });
+  assert.match(contextMeterChip(), /ctx-danger/);
+  // Never overflow past 100% even if a turn measured more than the window.
+  __setSess({ id: "s1", modelSource: "local", lastTurnContextTokens: 500, contextWindowTokens: 100 });
+  assert.match(contextMeterChip(), /width:100%/);
 });
 
 test("model source: a pending switch never leaks onto another session", () => {

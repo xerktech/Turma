@@ -1632,7 +1632,7 @@
         '🛡 <span class="cc-val">' + esc(optLabel(MODE_OPTS, mode)) + '</span><span class="cc-caret">▾</span></button>' +
         '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
         menuHtml(modeOpts, mode, "data-mode") + "</span></span>" +
-      '<span class="cc-right">' + ticketFooterChip(sess) + prFooterChip(sess) +
+      '<span class="cc-right">' + contextMeterChip() + ticketFooterChip(sess) + prFooterChip(sess) +
         (localModelOffered()
           ? '<span class="cc-opt cc-source' + (currentModelSource() === "local" ? " cc-source-local" : "") + '">' +
             '<button class="cc-btn" id="ccSourceBtn" title="' +
@@ -1661,6 +1661,28 @@
       (v) => setSessionLocalModel(v));
     wireLocalContext();
   }
+  // ---- context-fullness meter (XERK-489 Phase 4) ----------------------------
+  // How full the model's context window is right now, warning before the ~95%
+  // auto-compaction. EXACT for a local session (its selected model's window),
+  // and Claude Code's own 200k assumption ("~") for a subscription one. Both
+  // figures come off the heartbeat (agent transcript-sum), never a pane
+  // statusLine — that text needs a statusLine Turma refuses to wire because it
+  // breaks busy detection (XERK-130). Returns "" until a turn is measured.
+  function contextMeterChip() {
+    if (!sess) return "";
+    const num = sess.lastTurnContextTokens, den = sess.contextWindowTokens;
+    if (!(typeof num === "number" && num > 0 && typeof den === "number" && den > 0)) return "";
+    const pct = Math.min(100, Math.round((num / den) * 100));
+    const cls = pct >= 95 ? " ctx-danger" : pct >= 85 ? " ctx-warn" : "";
+    const approx = currentModelSource() !== "local";
+    const title = "Context " + fmtCtx(num) + " / " + fmtCtx(den) +
+      (approx ? " (subscription window assumed — 200k)" : " (exact)") +
+      " — the session auto-compacts near 95%";
+    return '<span class="cc-opt cc-ctx-meter' + cls + '" title="' + esc(title) + '">' +
+      '<span class="cc-ctx-track"><span class="cc-ctx-fill" style="width:' + pct + '%"></span></span>' +
+      '<span class="cc-ctx-cap">' + pct + "%" + (approx ? " ~" : "") + "</span></span>";
+  }
+
   // ---- local-model failover (XERK-246) --------------------------------------
   // Running out of Claude usage stops every session on a host at once. A session
   // can be moved onto that host's self-hosted model and carry on in the SAME
@@ -2590,6 +2612,7 @@
       // XERK-489 endpoint model dropdown + context override
       localModels, localModelOpts, currentLocalModel, currentLocalContext,
       servedContextFor, fmtCtx, localModelChipHtml, setSessionLocalModel,
+      contextMeterChip,   // Phase 4 context-fullness meter
       __setLocalModelPending: (p) => { localModelPending = p; },
       __setModelSourcePending: (p) => { modelSourcePending = p; },
       __setModeSwitchPending: (p) => { modeSwitchPending = p; },

@@ -253,6 +253,16 @@
   .usage .u-label { color: var(--muted); font-size: 11px; }
   .usage .u-value { font-family: var(--font-display); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .usage .u-sub { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  /* Context-fullness meter (XERK-489 Phase 4): how full the window is, warn ~85%,
+     danger near the ~95% auto-compact. */
+  .ctx-meter { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  .ctx-track { flex: 1; height: 5px; border-radius: 999px; background: var(--hairline); overflow: hidden; }
+  .ctx-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width .3s; }
+  .ctx-cap { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ctx-meter.warn .ctx-fill { background: var(--warn, #d98f2b); }
+  .ctx-meter.warn .ctx-cap { color: var(--warn, #d98f2b); }
+  .ctx-meter.danger .ctx-fill { background: var(--bad, #d9534f); }
+  .ctx-meter.danger .ctx-cap { color: var(--bad, #d9534f); font-weight: 600; }
 
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
@@ -1463,6 +1473,26 @@ function composer(a, repo, rk, spawning) {
   </div>`;
 }
 
+// Context-fullness meter (XERK-489 Phase 4): how full the model's context window
+// is right now, warning before the ~95% auto-compaction. EXACT for a local
+// session (its selected model's window); a subscription session uses Claude
+// Code's own 200k assumption, marked "~". Returns "" until a turn is measured.
+// Mirrored on the Sessions chat bar (chat.js) and Android's card.
+function contextMeterHtml(s) {
+  const num = s.lastTurnContextTokens, den = s.contextWindowTokens;
+  if (!(num > 0 && den > 0)) return "";
+  const pct = Math.min(100, Math.round((num / den) * 100));
+  const cls = pct >= 95 ? " danger" : pct >= 85 ? " warn" : "";
+  const approx = s.modelSource !== "local";
+  const title = `Context ${fmtTokens(num)} / ${fmtTokens(den)}`
+    + (approx ? " (subscription window assumed — 200k)" : " (exact)")
+    + " — the session auto-compacts near 95%";
+  return `<div class="ctx-meter${cls}" title="${esc(title)}">
+    <div class="ctx-track"><div class="ctx-fill" style="width:${pct}%"></div></div>
+    <div class="ctx-cap">${pct}%${approx ? " ~" : ""} context</div>
+  </div>`;
+}
+
 function sessCard(a, s, now) {
   const st = s.status || "stopped";
   const live = st === "running" ? liveState(s, a, now) : null;
@@ -1562,6 +1592,7 @@ function sessCard(a, s, now) {
       <div class="u-value" title="all tokens this session (input + output + cache), from the transcript — persists across kill/resume">${fmtTokens(totalTokens(u?.totals))}</div>
       <div class="u-sub">${fmtTokens(u?.totals?.output)} out</div>
     </div>
+    ${st === "running" ? contextMeterHtml(s) : ""}
     <div class="sess-actions">${actions}</div>
   </div>`;
 }

@@ -995,6 +995,11 @@ LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "").strip()
 # No self-hosted context we would plausibly serve is larger than this; beyond it
 # a typo is likelier than an intent.
 MAX_LOCAL_MODEL_CONTEXT = 2_000_000
+# The context-fullness meter's denominator for a SUBSCRIPTION session (XERK-489
+# Phase 4): there is no agent-side figure for the Claude login's window, so
+# Claude Code's own assumption (200k) is used and the client labels it
+# approximate. A LOCAL session uses its selected model's exact discovered window.
+SUBSCRIPTION_CONTEXT_ASSUMED = 200_000
 
 
 def _positive_int_env(name, default):
@@ -5280,9 +5285,56 @@ def _scan_model_entry(entry, report):
         report["modelActual"] = m.group(1).strip()
 
 
+def _context_tokens_from_usage(usage):
+    """How much of the context WINDOW an assistant turn consumed — the prompt fed
+    IN (input + cache read + cache creation), NOT the output (XERK-489 Phase 4).
+    This is the context meter's numerator: how full the window is right now. The
+    cumulative usage totals (_accumulate_usage) are the wrong quantity — they keep
+    climbing across compactions, where this is the CURRENT occupancy."""
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    seen = False
+    for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        if usage.get(k) is not None:
+            seen = True
+        total += _token_count(usage.get(k))
+    return total if seen else None
+
+
+def context_window_tokens(sess):
+    """The context meter's denominator (XERK-489 Phase 4): a LOCAL session's
+    selected-model window (EXACT — its discovered/stored figure), else Claude
+    Code's own 200k assumption for a subscription session, which the client
+    labels approximate (there is no agent-side figure for the login's window)."""
+    if sess.get("modelSource") == "local":
+        c = sess.get("localModelContext")
+        if isinstance(c, int) and c > 0:
+            return c
+    return SUBSCRIPTION_CONTEXT_ASSUMED
+
+
+def _scan_context_entry(entry, report):
+    """Fold an assistant turn's context occupancy into the per-beat report — the
+    meter's numerator (XERK-489 Phase 4). The scan feeds lines in order so the
+    LAST assistant turn wins, and a compact_boundary resets the floor to its
+    postTokens (the window just emptied) so the meter follows a compaction rather
+    than reading the stale pre-compaction figure until the next turn measures it."""
+    etype = entry.get("type")
+    if etype == "assistant":
+        ctx = _context_tokens_from_usage((entry.get("message") or {}).get("usage"))
+        if ctx is not None:
+            report["lastTurnContextTokens"] = ctx
+    elif etype == "system" and entry.get("subtype") == "compact_boundary":
+        meta = entry.get("compactMetadata")
+        post = meta.get("postTokens") if isinstance(meta, dict) else None
+        if isinstance(post, int) and post >= 0:
+            report["lastTurnContextTokens"] = post
+
+
 def _scan_entry_line(raw, state, report):
     """Fold one appended transcript line into every incremental per-beat scan
-    (PR attribution + actual model) with a single JSON parse."""
+    (PR attribution + actual model + context occupancy) with a single JSON parse."""
     try:
         entry = json.loads(raw)
     except ValueError:
@@ -5291,6 +5343,7 @@ def _scan_entry_line(raw, state, report):
         return
     _scan_pr_entry(entry, state, report)
     _scan_model_entry(entry, report)
+    _scan_context_entry(entry, report)
     _scan_agent_entry(entry, state)
 
 
@@ -7661,6 +7714,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         "questionSource": None,    # "transcript" | "hook" | None — which detector fired
         "prUrls": [],              # PR links newly appended since last beat
         "modelActual": None,       # newest actual-model signal appended this beat
+        # The context window the newest assistant turn occupied (input + cache),
+        # the context-fullness meter's numerator (XERK-489 Phase 4). None until an
+        # assistant turn is seen this beat; the record keeps the last known value.
+        "lastTurnContextTokens": None,
         "tail": [],                # recent transcript messages, for the glasses client
     }
 
@@ -17757,15 +17814,17 @@ class SessionManager:
         MODEL_ALIASES."""
         return tuple((self.models_info or {}).get("available") or ())
 
-    def _seed_model_actual(self, sess):
-        """One-shot: the newest actual-model signal already IN a session's
-        transcript, for a record that predates the field (the per-beat scan
-        primes to EOF, so history never replays through it). Bounded to the
-        transcript's last 64 KiB — an assistant turn sits within that in any
-        conversation that has one."""
+    def _seed_tail_signals(self, sess):
+        """One-shot: the newest actual-model signal AND context occupancy already
+        IN a session's transcript, for a record that predates either field (the
+        per-beat scan primes to EOF, so history never replays through it). ONE
+        64 KiB tail read feeds both — an assistant turn (which carries both) sits
+        within that in any conversation that has one. Returns
+        {modelActual, lastTurnContextTokens}."""
+        tmp = {"modelActual": None, "lastTurnContextTokens": None}
         path = _session_transcript_path(sess)
         if not path:
-            return None
+            return tmp
         try:
             with open(path, "rb") as f:
                 f.seek(0, os.SEEK_END)
@@ -17773,8 +17832,7 @@ class SessionManager:
                 f.seek(max(0, size - (64 << 10)))
                 raw = f.read()
         except OSError:
-            return None
-        tmp = {"modelActual": None}
+            return tmp
         # Skip the first fragment of a mid-entry start; fold the rest in order
         # so the newest signal wins, exactly like the live scan.
         lines = raw.split(b"\n")
@@ -17787,7 +17845,8 @@ class SessionManager:
                 continue
             if isinstance(entry, dict):
                 _scan_model_entry(entry, tmp)
-        return tmp["modelActual"]
+                _scan_context_entry(entry, tmp)
+        return tmp
 
     # --- prune merged branches + safe worktrees ----------------------------
 
@@ -18735,12 +18794,24 @@ class SessionManager:
                 # beats and restarts. The per-beat scan only sees new bytes, so
                 # a record predating the field seeds once from the tail.
                 actual = signals.pop("modelActual", None)
-                if (not actual and not sess.get("modelActual")
-                        and sid not in self._model_seeded):
-                    actual = self._seed_model_actual(sess)
+                # The context window the newest assistant turn occupied — the
+                # meter's numerator (XERK-489 Phase 4). Like modelActual, the
+                # per-beat scan only sees NEW bytes, so it persists on the record
+                # and a record predating the field seeds once from the tail.
+                ctx = signals.pop("lastTurnContextTokens", None)
+                if (sid not in self._model_seeded and
+                        ((not actual and not sess.get("modelActual")) or
+                         (ctx is None and sess.get("lastTurnContextTokens") is None))):
+                    seeded = self._seed_tail_signals(sess)   # ONE tail read, both signals
+                    actual = actual or seeded.get("modelActual")
+                    if ctx is None:
+                        ctx = seeded.get("lastTurnContextTokens")
                 self._model_seeded.add(sid)
                 if actual and actual != sess.get("modelActual"):
                     sess["modelActual"] = actual
+                    self.save()
+                if ctx is not None and ctx != sess.get("lastTurnContextTokens"):
+                    sess["lastTurnContextTokens"] = ctx
                     self.save()
                 # Reconcile the stored permission mode to the one the TUI's
                 # footer really shows (the operator can cycle by hand in the
@@ -18799,6 +18870,14 @@ class SessionManager:
             # off the served record to keep the choice across a move.
             "localModelName": sess.get("localModelName"),
             "localModelContext": sess.get("localModelContext"),
+            # Context-fullness meter (XERK-489 Phase 4): the newest assistant
+            # turn's window occupancy (numerator) and the window it runs in
+            # (denominator — EXACT for a local session, Claude Code's 200k
+            # assumption for a subscription one, which the client labels
+            # approximate off `modelSource`). Numerator is null until a turn is
+            # measured; the client hides the meter then.
+            "lastTurnContextTokens": sess.get("lastTurnContextTokens"),
+            "contextWindowTokens": context_window_tokens(sess),
             # When it last moved, so the UI's mark can say WHEN a session failed
             # over rather than only that it did. Absent on a session that never
             # switched.
