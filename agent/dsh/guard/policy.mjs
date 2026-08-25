@@ -72,6 +72,10 @@ export function classify(name, args) {
     const kind = EDITOR_READ_VERBS.has(verb) ? 'read' : 'write'
     return { kind, target: firstPath(args) }
   }
+  // Everything else (cordis_run, ralph, glob, grep, web_*, MCP tools) is
+  // UNGATED here — a code-exec tool's nested tool calls re-enter this pipeline
+  // and are re-gated, but its own direct fs/network is dsh's sandbox's job (the
+  // workspace-write / ask pins build_dsh_guard_config sets). See dsh-guard.md.
   return { kind: 'other' }
 }
 

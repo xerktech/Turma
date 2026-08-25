@@ -75,11 +75,21 @@ dsh gates tool calls **inside the agent process**, not with an external hook. Th
 
 ## Residual gaps (state them; do not paper over)
 
-- **`run_code` and unknown tools are UNGATED.** `classify` returns `other` for anything outside the
-  known shell/fs/editor surfaces. dsh's `run_code` executes arbitrary TS/Python in a worker — its
-  nested tool calls re-enter the pipeline and are re-gated, but direct fs/network from inside the
-  worker are dsh's sandbox's job, not this guard's. This is the dsh analogue of Claude's "Bash is
-  not covered by fileguard" caveat.
+- **Code-execution and search tools are UNGATED.** `classify` returns `other` for anything outside
+  the known shell/fs-write/fs-read/editor surfaces. Confirmed against real dsh 0.1.1-rc.2, the
+  ungated set includes **`cordis_run`** and **`ralph`** (arbitrary code / autonomous loops, from
+  `@deepseek-ai/dsh-tool-cordis` / `-tool-ralph`) plus `glob`/`grep`/`web_fetch`/`web_search`. A
+  code-exec tool's own nested tool calls re-enter the pipeline and ARE re-gated, but direct
+  fs/network from inside it is **dsh's sandbox's job, not this guard's** — which is why
+  `build_dsh_guard_config` pins `sandboxMode: workspace-write` + `approvalPolicy: ask`. This is the
+  dsh analogue of Claude's "Bash is not covered by fileguard" caveat, and it is the reason those
+  pins are load-bearing: **XERK-466's launcher MUST enforce them** (dsh enforces the sandbox; this
+  change only sets the value). Re-QA that seam when the launcher ships.
+- **`pwsh` routes to the bash-syntax classifier.** A PowerShell tool call goes to `guard.py` as a
+  `Bash` tool, but `guard.py` matches bash-oriented destructive patterns, so `Remove-Item -Recurse
+  -Force /` would likely not match. Low risk (Linux agent image; pwsh is niche) and still ahead of
+  Claude, which has no pwsh tool at all — but a PowerShell-aware destructive check is the honest fix
+  if a pwsh executor is ever composed.
 - **The peer-roster boundary (`ListAgents` deny) has no dsh analogue here** — dsh exposes no
   fleet-enumeration tool in scope, so the bare tool rule is dropped by `build_dsh_guard_config`.
 - **The uploads read-allow is fleet-wide (`~/.turma/uploads/**`), not per-`<sid>`** — parity with
