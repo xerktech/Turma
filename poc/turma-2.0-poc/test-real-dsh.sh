@@ -94,7 +94,7 @@ case "$MODEL_PROVIDER" in
     printf '      got: %q\n' "$MODEL_PROVIDER"; exit 1 ;;
 esac
 for _mv in MODEL_ID MODEL_BASE_URL MODEL_API_KEY_ENV; do
-  eval "_mval=\$$_mv"
+  _mval="${!_mv}"   # indirect expansion (bash); no eval, and ShellCheck sees the assignment
   case "$_mval" in
     ''|*[\'\\]*|*[$'\n\r\t']*)
       echo "FAIL: $_mv must be non-empty and free of quotes, backslashes, and control characters"
