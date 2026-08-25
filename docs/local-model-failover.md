@@ -204,3 +204,53 @@ settle it is an A/B — Claude alone versus Claude with the tool — comparing
 **subscription tokens per solved task**, using this bench for the tasks and the
 existing usage ledger for the counts. Until that shows a win, delegation stays
 out.
+
+## XERK-489 — discover the endpoint's models, switch live per session
+
+XERK-246 pinned one model by env (`LOCAL_MODEL_NAME`/`LOCAL_MODEL_CONTEXT`) and
+changing it meant editing DockerOps and restarting the container. XERK-489 points
+the agent at ONE endpoint and lets the UI pick between the endpoint's own models,
+live, with no agent restart. It EXTENDS the plumbing above — every hard constraint
+still holds (credential never in argv; `--model` never passed for a local session;
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` must match the served window).
+
+**The tricky part is context size.** A plain OpenAI `GET /v1/models` returns only
+ids. LiteLLM additionally serves `GET /model/info` (and `/v1/model/info`) with
+`max_input_tokens`/`max_tokens` per model, so context is AUTO-DISCOVERED for
+LiteLLM and falls back to `LOCAL_MODEL_CONTEXT` for a bare OpenAI-compatible
+endpoint. Context is a property of the model, applied on select; an advanced
+override may only SHRINK it (never grow past the served window). The same
+discovered window is what makes a local session's context meter exact (Phase 4).
+
+What changed:
+
+- **`LOCAL_MODEL_NAME`/`LOCAL_MODEL_CONTEXT` became optional defaults.** With only
+  `LOCAL_MODEL_BASE_URL` + `LOCAL_MODEL_API_KEY`, the model list is discovered and
+  the first discovered id is the default. `LOCAL_MODEL_NAME`'s env default is now
+  empty (was `gpt-oss:120b`), so a host relying on the implicit default should set
+  it explicitly or let discovery pick — `local_model_configured()` requires a
+  discovered list OR a configured default, so a base+key host simply stays hidden
+  (silently) until discovery lands.
+- **Discovery is a WORKER THREAD** (`start_local_model_discovery`), never the beat:
+  a blackholed endpoint must not render the host offline (XERK-395). Bounded
+  per-request timeout, `LOCAL_MODEL_DISCOVERY_EVERY_SEC` refresh; a failed pass
+  keeps the last good list.
+- **Heartbeat `localModel` gains `models:[{id, contextTokens|null}]` +
+  `defaultModel`**; `model`/`contextTokens` stay the current default for
+  back-compat. The hub's `normalizeLocalModel` bounds the list length and each
+  id/window — Android decodes `/api/agents` atomically, so a malformed list from
+  one host must not drop the fleet.
+- **A local session's model is per-session and live-switchable.** `set_model`
+  routes a local session to an env-rewrite + `--resume` relaunch
+  (`_switch_local_model`); the `/model` TUI picker stays refused for local (its
+  Claude rows all 403 the gateway). `setModelSource` takes an optional `model`
+  for a one-step subscription→local switch; spawn takes `localModel`. Membership
+  is validated against the discovered set (hub 409, agent re-check) on top of the
+  charset gate.
+- **The choice (`localModelName`/`localModelContext`) rides every rebuild** beside
+  `modelSource` — closed record, resume, resume-any, migration, boot — and a
+  migration re-validates against the TARGET's discovered set, falling back to its
+  default when it serves a different set.
+
+Phase 3 (the UI dropdown + context override + Android/glasses parity) and Phase 4
+(the context-fullness meter) build on this and ship as their own PRs.

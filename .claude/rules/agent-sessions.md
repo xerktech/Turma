@@ -211,3 +211,37 @@ process model and the command table.
 - **Automatic delegation to the local model is deliberately NOT shipped**; the token arithmetic
   doesn't obviously work (diagnosis dominates, and Claude must diagnose before it can delegate). See
   the doc before building it.
+
+### Endpoint model discovery + live per-session model (XERK-489)
+
+- **`LOCAL_MODEL_NAME`/`LOCAL_MODEL_CONTEXT` are OPTIONAL now** — the DEFAULT model and its fallback
+  window. With only base+key set, the endpoint's model list is DISCOVERED and the first discovered
+  id is the default. A configured `LOCAL_MODEL_NAME` still wins as the default. `local_model_default`
+  / `local_model_context` / `local_model_member` are the resolvers; `local_model_configured` now also
+  requires a usable model (a discovered list OR a configured default), so a base+key host stays
+  hidden until discovery lands (silent — that is "not ready", not an error).
+- **Discovery runs on a WORKER THREAD, never the beat** (`start_local_model_discovery`,
+  `_local_model_discovery_loop`) — a blackholed endpoint must not stall the heartbeat past
+  `OFFLINE_AFTER_MS`, the XERK-395 rule that moved archive-sync/prune off-beat. It polls
+  `{root}/v1/models` for ids and LiteLLM's `{root}/model/info` for per-model `max_input_tokens`
+  (a bare OpenAI endpoint has no such route → null window → the fallback applies). The beat only ever
+  reads the cache (`discovered_local_models`, lock-guarded whole-list rebind). A failed pass KEEPS
+  the last good list — never blank a working dropdown. Heartbeat `localModel` gains
+  `models:[{id, contextTokens|null}]` + `defaultModel`; `model`/`contextTokens` stay the current
+  default for back-compat.
+- **A local session's MODEL is per-session, live-switchable** (`localModelName`/`localModelContext` on
+  the record): the switch rewrites `local-model.env` (`ANTHROPIC_MODEL` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS`)
+  and relaunches via `--resume` — the setModelSource machinery, minus the source change
+  (`_switch_local_model`). `set_model` for a local session routes here instead of refusing; the
+  `/model` TUI picker stays refused (its Claude rows all 403 the gateway). `setModelSource` takes an
+  optional `model` for a one-step subscription→local switch onto a chosen model; spawn takes
+  `local_model`.
+- **Membership is validated before the gateway sees it** (`local_model_member`), on top of the
+  charset gate — a model the host doesn't serve errors the card rather than 403ing every turn. An
+  EMPTY discovered set can't DISPROVE membership (discovery not landed) so it accepts charset-valid;
+  the launch demotes cleanly if the endpoint truly lacks it. The window only ever SHRINKS to the
+  served figure (an overstated `CLAUDE_CODE_MAX_CONTEXT_TOKENS` compacts too late and truncates).
+- **The choice rides every rebuild** beside `modelSource` — closed record, resume, resume-any,
+  migration in, boot — and migration RE-VALIDATES against the target's own discovered set (falls back
+  to the target default). Tests: `TestLocalModelConfig` (discovery/resolvers), `TestLocalModelFailover`
+  (switch/spawn/persistence).

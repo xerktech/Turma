@@ -954,7 +954,13 @@ PERM_CYCLE_OPTIONAL = ["bypassPermissions", "auto"]  # canonical trailing order
 # the six-harness bake-off that settled this).
 LOCAL_MODEL_BASE_URL = os.environ.get("LOCAL_MODEL_BASE_URL", "").strip()
 LOCAL_MODEL_API_KEY = os.environ.get("LOCAL_MODEL_API_KEY", "").strip()
-LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "gpt-oss:120b").strip()
+# The DEFAULT model a new local session starts on, and the fallback when the
+# endpoint's own list can't be discovered (XERK-489). Optional now: with only
+# base+key set, the model list is discovered from the endpoint and the first
+# discovered id is the default — an operator configures one endpoint and picks
+# any of its models live, no agent restart. A configured name still wins as the
+# default when present.
+LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "").strip()
 # Claude Code assumes a 200k window for a model it does not recognise and would
 # compact far too late — the tail then silently truncates server-side instead of
 # compacting. Must match what the server ACTUALLY serves: DockerOps sizes
@@ -1010,6 +1016,83 @@ AGENT_TYPES = {"claude", "dsh"}
 # checked like every other launch input. Ollama-style tags carry a colon.
 LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
 
+# --- endpoint model discovery (XERK-489) ----------------------------------
+# The endpoint's own model list, discovered on a WORKER THREAD (never the beat).
+# A blackholed endpoint must not stall the heartbeat past OFFLINE_AFTER_MS (75s),
+# exactly the reason archive-sync and prune moved off the beat (XERK-395), so the
+# poll runs on its own daemon thread with a bounded per-request timeout and the
+# beat only ever reads the cache below.
+LOCAL_MODEL_DISCOVERY_TIMEOUT_SEC = int(
+    os.environ.get("LOCAL_MODEL_DISCOVERY_TIMEOUT_SEC") or "10")
+LOCAL_MODEL_DISCOVERY_EVERY_SEC = int(
+    os.environ.get("LOCAL_MODEL_DISCOVERY_EVERY_SEC") or "300")
+# Bound the discovered list — it rides the heartbeat and every client decodes
+# /api/agents atomically, so an endpoint answering thousands of ids must not
+# grow the beat without limit (the PEER_CELL_MAX / retiredUsage failure class).
+LOCAL_MODEL_MODELS_MAX = 200
+
+# Cache written by the worker, read by the beat. A plain lock guards a whole-list
+# rebind (never an in-place mutation), so a reader always sees a complete list.
+_local_model_lock = threading.Lock()
+_local_model_discovered = None            # None until the first poll completes
+_local_model_discovery_started = False
+
+
+def discovered_local_models():
+    """The endpoint's discovered models as [{id, contextTokens|null}], or [].
+
+    Thread-safe read of the worker's cache. [] means "not discovered yet" OR
+    "the endpoint served none" — both render the same (no models to pick), and
+    a configured default still makes the host usable in the meantime."""
+    with _local_model_lock:
+        return list(_local_model_discovered or ())
+
+
+def local_model_default():
+    """The model a NEW local session starts on when the operator picks none.
+
+    A configured LOCAL_MODEL_NAME wins (an operator naming one means it); else
+    the first discovered id (zero-config: point the agent at an endpoint and it
+    offers what that endpoint serves). None when neither exists yet."""
+    if LOCAL_MODEL_NAME and LOCAL_MODEL_NAME_RE.fullmatch(LOCAL_MODEL_NAME):
+        return LOCAL_MODEL_NAME
+    models = discovered_local_models()
+    return models[0]["id"] if models else None
+
+
+def local_model_context(model):
+    """The served context window for `model`.
+
+    The discovered figure when the endpoint reports one (LiteLLM /model/info),
+    else the configured LOCAL_MODEL_CONTEXT fallback (a bare OpenAI-style
+    endpoint exposes no per-model window). This is what makes the context meter
+    exact for a local session and CLAUDE_CODE_MAX_CONTEXT_TOKENS match the
+    served window — the constraint the whole feature turns on."""
+    for m in discovered_local_models():
+        if m.get("id") == model:
+            c = m.get("contextTokens")
+            if isinstance(c, int) and c > 0:
+                return c
+    return LOCAL_MODEL_CONTEXT
+
+
+def local_model_member(model):
+    """True when this host can actually serve `model`.
+
+    In the discovered set, or the configured default (which stands even before
+    discovery has landed). An EMPTY discovered set cannot DISPROVE membership —
+    the worker may simply not have polled yet — so it accepts a charset-valid
+    name rather than refusing every switch during the discovery gap; the launch
+    then demotes cleanly if the endpoint really lacks it."""
+    if not model or not LOCAL_MODEL_NAME_RE.fullmatch(model):
+        return False
+    if LOCAL_MODEL_NAME and model == LOCAL_MODEL_NAME:
+        return True
+    models = discovered_local_models()
+    if not models:
+        return True                        # can't refute; accept charset-valid
+    return any(m.get("id") == model for m in models)
+
 
 _local_model_complaints = set()
 
@@ -1017,11 +1100,16 @@ _local_model_complaints = set()
 def local_model_configured():
     """True when this host can run a session on the self-hosted model.
 
-    Both halves are required: an endpoint with no key (or the reverse) would
-    launch a session that dies on its first request, which is strictly worse
-    than not offering the switch at all.
+    Both halves of the endpoint are required: an endpoint with no key (or the
+    reverse) would launch a session that dies on its first request, which is
+    strictly worse than not offering the switch at all.
 
-    A PARTIAL configuration is the confusing case — the control simply never
+    A usable MODEL is also required (XERK-489) — a discovered list OR a
+    configured default. With only base+key set and discovery not yet landed the
+    control stays hidden rather than offering a switch that has no model to run
+    (that is not an error, just "not ready", so it is silent).
+
+    A PARTIAL endpoint configuration IS the confusing case — the control never
     appears and /model-source 409s — so it says why, once per distinct reason
     (this runs every heartbeat)."""
     if not LOCAL_MODEL_BASE_URL and not LOCAL_MODEL_API_KEY:
@@ -1031,14 +1119,136 @@ def local_model_configured():
         reason = "LOCAL_MODEL_API_KEY is set but LOCAL_MODEL_BASE_URL is not"
     elif not LOCAL_MODEL_API_KEY:
         reason = "LOCAL_MODEL_BASE_URL is set but LOCAL_MODEL_API_KEY is not"
-    elif not LOCAL_MODEL_NAME_RE.fullmatch(LOCAL_MODEL_NAME):
+    elif LOCAL_MODEL_NAME and not LOCAL_MODEL_NAME_RE.fullmatch(LOCAL_MODEL_NAME):
+        # A NAME that is set-but-garbage is an error worth naming; an UNSET one
+        # is the ordinary zero-config case and says nothing.
         reason = f"LOCAL_MODEL_NAME {LOCAL_MODEL_NAME!r} is not a usable model name"
     if reason:
         if reason not in _local_model_complaints:
             _local_model_complaints.add(reason)
             log(f"local model unavailable: {reason} — the failover is off on this host")
         return False
-    return True
+    # Endpoint is well-formed; a usable model is the last requirement.
+    return bool(local_model_default())
+
+
+def local_model_payload():
+    """The heartbeat `localModel` block — capability flag plus discovered set.
+
+    `model`/`contextTokens` stay the CURRENT DEFAULT for back-compat (older
+    hubs/clients read the single-model shape); `models`/`defaultModel` are the
+    XERK-489 additions the dropdown reads."""
+    if not local_model_configured():
+        return {"available": False, "model": None, "contextTokens": None,
+                "models": [], "defaultModel": None}
+    default = local_model_default()
+    return {
+        "available": True,
+        "model": default,
+        "contextTokens": local_model_context(default) if default else None,
+        "models": discovered_local_models(),
+        "defaultModel": default,
+    }
+
+
+def _discovery_root():
+    """The endpoint root the OpenAI-style discovery routes hang off — the base
+    with a trailing `/v1` trimmed, so `{root}/v1/models` is well-formed whether
+    the operator configured the base with or without the `/v1` suffix."""
+    return _messages_api_base(LOCAL_MODEL_BASE_URL)
+
+
+def _discovery_get_json(url):
+    """GET `url` with the gateway key, bounded timeout, parsed JSON or None.
+
+    Never raises — a discovery failure must leave the last good list in place,
+    not take down the worker (which would stop refreshes for the process life)."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {LOCAL_MODEL_API_KEY}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(
+                req, timeout=LOCAL_MODEL_DISCOVERY_TIMEOUT_SEC) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log(f"local model discovery: {url} failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _discovery_model_ids(root):
+    """The model ids from OpenAI-style GET {root}/v1/models (`data[].id`)."""
+    data = _discovery_get_json(f"{root}/v1/models")
+    ids = []
+    for item in ((data or {}).get("data") or []):
+        mid = (item or {}).get("id")
+        if isinstance(mid, str) and LOCAL_MODEL_NAME_RE.fullmatch(mid):
+            ids.append(mid)
+    return ids
+
+
+def _discovery_contexts(root):
+    """Per-model context windows from LiteLLM GET {root}/model/info, keyed by id.
+
+    LiteLLM returns `data[].model_info.max_input_tokens` (fall back to
+    `max_tokens`). A bare OpenAI-compatible endpoint has no such route, so a
+    failure here just leaves every window null and the fallback applies. Both
+    `/model/info` and `/v1/model/info` are tried (LiteLLM serves both)."""
+    data = (_discovery_get_json(f"{root}/model/info")
+            or _discovery_get_json(f"{root}/v1/model/info"))
+    ctx = {}
+    for item in ((data or {}).get("data") or []):
+        mid = (item or {}).get("model_name") or (item or {}).get("id")
+        info = (item or {}).get("model_info") or {}
+        win = info.get("max_input_tokens") or info.get("max_tokens")
+        if (isinstance(mid, str) and isinstance(win, int)
+                and 0 < win <= MAX_LOCAL_MODEL_CONTEXT):
+            ctx[mid] = win
+    return ctx
+
+
+def discover_local_models_once():
+    """One discovery pass: ids from /v1/models, windows from /model/info, merged
+    into [{id, contextTokens|null}] and stored. Bounded to LOCAL_MODEL_MODELS_MAX."""
+    global _local_model_discovered
+    root = _discovery_root()
+    ids = _discovery_model_ids(root)
+    contexts = _discovery_contexts(root) if ids else {}
+    out = [{"id": mid, "contextTokens": contexts.get(mid)}
+           for mid in ids[:LOCAL_MODEL_MODELS_MAX]]
+    # Only replace a good list on a good pass: a transient failure (ids == [])
+    # keeps whatever was discovered before rather than blanking the dropdown.
+    if not out and _local_model_discovered:
+        return
+    with _local_model_lock:
+        _local_model_discovered = out
+    log(f"local model discovery: {len(out)} model(s) from {root}")
+
+
+def _local_model_discovery_loop():
+    """Poll the endpoint forever on LOCAL_MODEL_DISCOVERY_EVERY_SEC. Daemon; a
+    single exception can never escape (discover_local_models_once swallows its
+    own), so the worker cannot die and freeze the list for the process life."""
+    while True:
+        try:
+            discover_local_models_once()
+        except Exception as e:
+            log(f"local model discovery loop: {type(e).__name__}: {e}")
+        time.sleep(LOCAL_MODEL_DISCOVERY_EVERY_SEC)
+
+
+def start_local_model_discovery():
+    """Start the discovery worker once, iff the endpoint is configured. Called
+    from run_forever (the main thread), never in unit tests — so no test spawns
+    a real HTTP-polling thread. Idempotent."""
+    global _local_model_discovery_started
+    if _local_model_discovery_started:
+        return
+    if not (LOCAL_MODEL_BASE_URL and LOCAL_MODEL_API_KEY):
+        return
+    _local_model_discovery_started = True
+    threading.Thread(target=_local_model_discovery_loop,
+                     name="local-model-discovery", daemon=True).start()
 
 
 def resolve_model_source(source):
@@ -1097,8 +1307,12 @@ def _messages_api_base(url):
     return base[:-3].rstrip("/") if base.endswith("/v1") else base
 
 
-def write_local_model_env(path):
+def write_local_model_env(path, model=None, context=None):
     """Write the self-hosted-model settings to a 0600 file and return its path.
+
+    `model`/`context` (XERK-489) pin the model and window this ONE session runs,
+    so a live switch is just a rewrite + `--resume` relaunch; both default to the
+    host default and its discovered window.
 
     The credential must not appear in ANY process's argv. A command-line prefix
     puts it in the tmux SERVER's argv, and `tmux -e VAR=VALUE` puts it in the
@@ -1120,7 +1334,7 @@ def write_local_model_env(path):
     tmp = f"{path}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
-        for pair in local_model_env_pairs():
+        for pair in local_model_env_pairs(model, context):
             key, _, value = pair.partition("=")
             fh.write(f"{key}={shlex.quote(value)}\n")
     os.chmod(tmp, 0o600)
@@ -1143,7 +1357,7 @@ def discard_local_model_env(path):
         log(f"could not remove {path}: {e}")
 
 
-def local_model_env_pairs():
+def local_model_env_pairs(model=None, context=None):
     """`KEY=VALUE` settings that repoint Claude Code at the self-hosted model.
 
     Written to a 0600 file by write_local_model_env and SOURCED by the launch
@@ -1152,14 +1366,16 @@ def local_model_env_pairs():
 
     Kept out of the shared guard settings file because the choice is PER
     SESSION: one session can fail over while its neighbours stay on the
-    subscription. Quoting is applied by the writer, since these end up in a
-    file a shell reads."""
+    subscription — and now WHICH model, too (XERK-489). Quoting is applied by
+    the writer, since these end up in a file a shell reads."""
+    model = model or local_model_default()
+    context = context or local_model_context(model)
     return [
         f"ANTHROPIC_BASE_URL={_messages_api_base(LOCAL_MODEL_BASE_URL)}",
         f"ANTHROPIC_AUTH_TOKEN={LOCAL_MODEL_API_KEY}",
-        f"ANTHROPIC_MODEL={LOCAL_MODEL_NAME}",
-        f"ANTHROPIC_SMALL_FAST_MODEL={LOCAL_MODEL_NAME}",
-        f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={LOCAL_MODEL_CONTEXT}",
+        f"ANTHROPIC_MODEL={model or ''}",
+        f"ANTHROPIC_SMALL_FAST_MODEL={model or ''}",
+        f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={context}",
         # An ambient API key outranks ANTHROPIC_AUTH_TOKEN and would quietly
         # bill the very account this failover exists to stop depending on.
         "ANTHROPIC_API_KEY=",
@@ -11821,9 +12037,36 @@ class SessionManager:
         on_local = sess.get("modelSource") == "local"
         local_env_file = None
         if on_local:
-            if local_model_configured():
+            # Which self-hosted model + window this session runs (XERK-489). A
+            # stored choice this host no longer serves — a migrated session, a
+            # model dropped from the endpoint — falls back to the host default.
+            lm_model = sess.get("localModelName")
+            if not local_model_member(lm_model):
+                lm_model = local_model_default()
+            # Gate on the ENDPOINT and a resolvable model, NOT on
+            # local_model_configured() (which also needs a DISCOVERED list). A
+            # local session resuming on boot, before the discovery worker's first
+            # pass, has an empty list — but its stored model is enough to launch,
+            # and demoting it there would silently return it to the subscription
+            # on every restart. Demote only when the endpoint is gone or there is
+            # no model at all to run.
+            endpoint_ok = bool(LOCAL_MODEL_BASE_URL and LOCAL_MODEL_API_KEY
+                               and (not LOCAL_MODEL_NAME
+                                    or LOCAL_MODEL_NAME_RE.fullmatch(LOCAL_MODEL_NAME)))
+            if endpoint_ok and lm_model:
+                # The window must MATCH what the server serves (an override only
+                # ever shrinks it — CLAUDE_CODE_MAX_CONTEXT_TOKENS overstated
+                # makes claude compact too late and the tail truncate).
+                served = local_model_context(lm_model)
+                lm_context = sess.get("localModelContext")
+                if not (isinstance(lm_context, int) and 0 < lm_context <= served):
+                    lm_context = served
                 local_env_file = write_local_model_env(
-                    os.path.join(REGISTRY_DIR, "local-model.env"))
+                    os.path.join(REGISTRY_DIR, "local-model.env"),
+                    lm_model, lm_context)
+                # Persist the resolved choice so the record reflects what runs.
+                sess["localModelName"] = lm_model
+                sess["localModelContext"] = lm_context
             else:
                 # Configuration was removed under a session that was already on
                 # local. Launching anyway would hit the subscription without
@@ -12060,7 +12303,7 @@ class SessionManager:
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
               model=None, permission_mode=None, ticket=None, ticket_detail=None,
               cmd_id=None, await_clone=None, await_clone_owner=None,
-              model_source=None, agent_type=None):
+              model_source=None, local_model=None, agent_type=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -12219,6 +12462,14 @@ class SessionManager:
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
             sess["modelSource"] = resolve_model_source(model_source)
             sess["agentType"] = resolve_agent_type(agent_type)
+            # Spawning straight onto a CHOSEN local model (XERK-489). Validated
+            # like the switch; the launch resolves its served window. Ignored
+            # unless this is actually a local spawn.
+            if sess["modelSource"] == "local" and local_model:
+                if not local_model_member(local_model):
+                    raise ValueError(
+                        f"local model {local_model!r} is not served by this host")
+                sess["localModelName"] = local_model
         except Exception as e:
             self._set_error(sess, e)
             return
@@ -12561,6 +12812,9 @@ class SessionManager:
             # Which runtime this session ran on (XERK-460), so a resume relaunches
             # the same one rather than silently reverting a dsh session to claude.
             "agentType",
+            # Which self-hosted model + window it was on (XERK-489), so a resume
+            # rejoins on the same one rather than the host default.
+            "localModelName", "localModelContext",
             # Which conversation this session WAS. Carried so a resume rejoins
             # its own rather than whatever now happens to be newest in a shared
             # project dir (root sessions share one) — see _launch_tmux.
@@ -12698,6 +12952,10 @@ class SessionManager:
             # against; usage has not come back just because it was killed.
             "modelSource": rec.get("modelSource") or "subscription",
             "agentType": rec.get("agentType") or "claude",
+            # ...and which self-hosted model it was on (XERK-489); the launch
+            # re-validates and falls back if the host no longer serves it.
+            "localModelName": rec.get("localModelName"),
+            "localModelContext": rec.get("localModelContext"),
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
             "stoppedAt": None,
@@ -12792,7 +13050,10 @@ class SessionManager:
                            and os.path.normpath(c["worktreePath"]) == os.path.normpath(cwd)),
                           None)
         extra = ({"modelSource": closed.get("modelSource"),
-                  "agentType": closed.get("agentType")} if closed else None)
+                  "agentType": closed.get("agentType"),
+                  "localModelName": closed.get("localModelName"),
+                  "localModelContext": closed.get("localModelContext")}
+                 if closed else None)
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
 
     def _refuse_start(self, reason, *, cmd_id=None, migration_id=None,
@@ -12918,6 +13179,11 @@ class SessionManager:
             "agentType": (resolve_agent_type(extra.get("agentType"))
                           if extra.get("agentType") in AGENT_TYPES
                           and dsh_configured() else "claude"),
+            # The self-hosted model it was on (XERK-489), carried raw; the launch
+            # re-validates against THIS host's discovered set and falls back to
+            # the host default when the target serves a different set.
+            "localModelName": extra.get("localModelName"),
+            "localModelContext": extra.get("localModelContext"),
             "baseRef": None,
             "status": "running",
             "createdAt": now_iso(),
@@ -13060,6 +13326,8 @@ class SessionManager:
             "permissionMode": cmd.get("permissionMode"),
             "modelSource": cmd.get("modelSource"),
             "agentType": cmd.get("agentType"),
+            "localModelName": cmd.get("localModelName"),
+            "localModelContext": cmd.get("localModelContext"),
             "migratedFrom": cmd.get("migratedFrom"),
         }
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
@@ -13272,9 +13540,57 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def set_model_source(self, sid, source):
+    def _switch_local_model(self, sess, model):
+        """Change which self-hosted model a RUNNING local session uses (XERK-489),
+        keeping its conversation.
+
+        Rewrite local-model.env with the new model + its served window and
+        relaunch via `--resume` — the exact machinery of a source switch, minus
+        the source change. Membership is validated before the gateway ever sees
+        it, on top of the charset gate; a model the host does not serve errors
+        the card rather than 403ing every turn silently. Reverts the record if
+        the relaunch throws, like set_model_source, so a stored model can never
+        outlive a launch that failed on it."""
+        if not sess or sess.get("status") != "running":
+            return
+        if not local_model_configured():
+            self._set_error(sess, ValueError(
+                "this host has no local model configured"))
+            return
+        if not local_model_member(model):
+            self._set_error(sess, ValueError(
+                f"local model {model!r} is not served by this host"))
+            return
+        if sess.get("localModelName") == model:
+            return                                  # already there; no relaunch
+        prev_model = sess.get("localModelName")
+        prev_ctx = sess.get("localModelContext")
+        sess["localModelName"] = model
+        sess["localModelContext"] = local_model_context(model)
+        sess.pop("pendingModel", None)
+        try:
+            self._kill_tmux(sess)
+            self._clear_question_files(sess["id"])
+            self._launch_tmux(sess, resume=True)
+            self._launch_ttyd(sess)
+            sess["errorMsg"] = None
+            sess["restartCount"] = sess.get("restartCount", 0) + 1
+            sess["modelSourceAt"] = now_iso()
+            log(f"session {sess['id']} switched local model -> {model}")
+        except Exception as e:
+            sess["localModelName"] = prev_model
+            sess["localModelContext"] = prev_ctx
+            self._set_error(sess, e)
+        self.save()
+
+    def set_model_source(self, sid, source, model=None):
         """Move a running session between the subscription and the self-hosted
         model, KEEPING its conversation (XERK-246).
+
+        `model` (XERK-489) lets a subscription→local switch land on a chosen
+        endpoint model in one step; None starts on the host default. Changing
+        the model of an ALREADY-local session goes through set_model instead
+        (this returns early when the source is unchanged).
 
         This is the failover: when Claude usage runs out every session on the
         host stops at once, and the work should continue rather than halt.
@@ -13309,10 +13625,20 @@ class SessionManager:
             return                                  # already there; no relaunch
         previous = sess.get("modelSource", "subscription")
         if source == "local":
-            # set_model refuses a local session, so a pick waiting for an idle
-            # pane would be silently discarded later. Drop it now rather than
-            # leave it heartbeat-visible and then unexplained.
+            # A stale deferred /model pick has no meaning on the self-hosted
+            # model — drop it now rather than leave it heartbeat-visible and
+            # then unexplained.
             sess.pop("pendingModel", None)
+            if model is not None:
+                # Switch onto a CHOSEN endpoint model (XERK-489). Validate
+                # membership before it reaches the gateway, then let the launch
+                # resolve the window from the served figure.
+                if not local_model_member(model):
+                    self._set_error(sess, ValueError(
+                        f"local model {model!r} is not served by this host"))
+                    return
+                sess["localModelName"] = model
+                sess["localModelContext"] = local_model_context(model)
         sess["modelSource"] = source
         try:
             self._kill_tmux(sess)      # ends claude; tmux/ttyd are re-made below
@@ -13918,14 +14244,14 @@ class SessionManager:
         into the pane, so it checks the pane NOW rather than trusting the
         beat-old paneBusy."""
         sess_early = self._find(sid)
-        # A session on the self-hosted model takes its model from ANTHROPIC_MODEL
-        # (XERK-246). The picker only lists the LOGIN's Claude aliases — none of
-        # which the gateway will serve — and "Default" resolves to the login
-        # default, so every row here breaks the session with a 403 on the next
-        # turn, nothing in errorMsg, and no row to switch back to.
+        # A session on the self-hosted model takes its model from ANTHROPIC_MODEL,
+        # not from the /model picker — the picker only lists the LOGIN's Claude
+        # aliases, none of which the gateway serves. So a model change for a local
+        # session is an ENDPOINT model pick (XERK-489): rewrite the env and
+        # relaunch via --resume rather than driving the TUI. The picker stays
+        # refused for local (there is no Claude row that would work).
         if sess_early and sess_early.get("modelSource") == "local":
-            log(f"set_model: session {sid} runs on the self-hosted model; "
-                f"its model is fixed by the host configuration")
+            self._switch_local_model(sess_early, model)
             return
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
@@ -17444,6 +17770,7 @@ class SessionManager:
                         model=cmd.get("model"),
                         permission_mode=cmd.get("permissionMode"),
                         model_source=cmd.get("modelSource"),
+                        local_model=cmd.get("localModel"),
                         agent_type=cmd.get("agentType"),
                         cmd_id=cid,
                     )
@@ -17481,7 +17808,8 @@ class SessionManager:
                     self.set_mode(cmd.get("sessionId"), cmd.get("permissionMode"))
                 elif ctype == "setModelSource":
                     self.set_model_source(
-                        cmd.get("sessionId"), cmd.get("modelSource"))
+                        cmd.get("sessionId"), cmd.get("modelSource"),
+                        model=cmd.get("localModel"))
                 elif ctype == "answerQuestion":
                     self.answer_question(
                         cmd.get("sessionId"),
@@ -18059,6 +18387,12 @@ class SessionManager:
             # Always present, defaulting claude, so a client (and an older agent's
             # absent field, coerced hub-side) reads the same "not dsh".
             "agentType": sess.get("agentType") or "claude",
+            # For a LOCAL session, which endpoint model + window it runs on
+            # (XERK-489) — the chip's label and the context meter's exact
+            # denominator. Null on a subscription session. Migration reads these
+            # off the served record to keep the choice across a move.
+            "localModelName": sess.get("localModelName"),
+            "localModelContext": sess.get("localModelContext"),
             # When it last moved, so the UI's mark can say WHEN a session failed
             # over rather than only that it did. Absent on a session that never
             # switched.
@@ -18148,6 +18482,7 @@ class SessionManager:
                 # Which runtime it ran on (XERK-460), so an ended dsh card can
                 # show its runtime the same way the live card does.
                 "agentType": c.get("agentType"),
+                "localModelName": c.get("localModelName"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
                 # The Jira ticket this session was spawned to work. _remember_closed
@@ -18419,11 +18754,7 @@ class SessionManager:
             # or one with no LOCAL_MODEL_* env — reports nothing, and the hub and
             # composers hide the control rather than queue a command that host
             # will silently ack and drop.
-            "localModel": {
-                "available": local_model_configured(),
-                "model": LOCAL_MODEL_NAME if local_model_configured() else None,
-                "contextTokens": LOCAL_MODEL_CONTEXT if local_model_configured() else None,
-            },
+            "localModel": local_model_payload(),
             # Whether this host offers the dsh runtime as a per-session choice
             # (XERK-460). Doubles as the capability flag, exactly like localModel:
             # an agent reporting available:false — every host today, since dsh is
@@ -18739,6 +19070,11 @@ class SessionManager:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
         self.resume_on_boot()
+        # Discover the local endpoint's model list on a WORKER THREAD (XERK-489),
+        # never inline on the beat — a blackholed endpoint must not stall the
+        # heartbeat past OFFLINE_AFTER_MS, the same reason archive-sync/prune
+        # moved off-beat (XERK-395). No-op unless base+key are configured.
+        start_local_model_discovery()
         beat = 0
         while True:
             # Clear before the beat so a poke that lands *during* it (a command
