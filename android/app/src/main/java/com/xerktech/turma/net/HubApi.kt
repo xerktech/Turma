@@ -408,6 +408,10 @@ data class SpawnRequest(
     // operator picked "dsh", so a bare spawn is unchanged; the hub 409s "dsh" at
     // a host that does not offer it.
     val agentType: String? = null,
+    // For a local spawn, which endpoint model (XERK-489). Omitted otherwise; the
+    // hub validates membership and the agent clamps its context to the served
+    // window. The context override itself is web-only for now (PARITY.md).
+    val localModel: String? = null,
 )
 
 @Serializable

@@ -10,6 +10,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.LocalModelInfo
+import com.xerktech.turma.model.LocalModelOption
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
@@ -42,6 +43,13 @@ class SpawnComposerTest {
     val compose = createComposeRule()
 
     private val local = LocalModelInfo(available = true, model = "qwen3-coder", contextTokens = 128_000)
+    private val discovered = LocalModelInfo(
+        available = true, model = "gpt-oss:120b", defaultModel = "gpt-oss:120b",
+        models = listOf(
+            LocalModelOption("gpt-oss:120b", 120_000),
+            LocalModelOption("qwen:32b", 32_768),
+        ),
+    )
 
     private fun show(
         localModel: LocalModelInfo?,
@@ -50,7 +58,7 @@ class SpawnComposerTest {
     ) = compose.setContent {
         SpawnDialog(
             host = "nas01", repo = "Turma", isRoot = false, localModel = localModel, dsh = dsh,
-            onDismiss = {}, onSpawn = { _, _, _, _, _, source, _ -> onSpawn(source) },
+            onDismiss = {}, onSpawn = { _, _, _, _, _, source, _, _ -> onSpawn(source) },
         )
     }
 
@@ -117,6 +125,34 @@ class SpawnComposerTest {
     }
 
     /**
+     * XERK-489: choosing "local" reveals the endpoint's discovered models as a
+     * dropdown (each "id · 128k"), the web composer's revealed field. Hidden
+     * until local is chosen; the whole spawn body (source + endpoint model) is
+     * driven end to end.
+     */
+    @Test
+    fun `choosing local reveals the endpoint model dropdown and carries the pick`() {
+        var source: String? = null
+        var model: String? = null
+        compose.setContent {
+            SpawnDialog(
+                host = "nas01", repo = "Turma", isRoot = false, localModel = discovered,
+                onDismiss = {}, onSpawn = { _, _, _, _, _, s, lm, _ -> source = s; model = lm },
+            )
+        }
+        compose.onNodeWithText("Self-hosted model").assertDoesNotExist()
+        // The "Run against" local option is labelled by the model name.
+        pickSource(current = "Claude subscription", option = "gpt-oss:120b")
+        compose.onNodeWithText("Self-hosted model").performScrollTo().assertIsDisplayed()
+        // The window suffix is unique to the self-hosted dropdown field.
+        compose.onNodeWithText("gpt-oss:120b · 120k").performScrollTo().performClick()
+        compose.onNodeWithText("qwen:32b · 33k").performClick()
+        compose.onNodeWithText("Spawn").performClick()
+        assertEquals("local", source)
+        assertEquals("qwen:32b", model)
+    }
+
+    /**
      * The reset `LaunchedEffect`: a host that stops reporting a local model
      * while the composer is open takes the row away, and a `local` left behind
      * in state would spawn into a guaranteed 409 with nothing on screen either
@@ -133,7 +169,7 @@ class SpawnComposerTest {
         compose.setContent {
             SpawnDialog(
                 host = "nas01", repo = "Turma", isRoot = false, localModel = offered,
-                onDismiss = {}, onSpawn = { _, _, _, _, _, source, _ -> got = source },
+                onDismiss = {}, onSpawn = { _, _, _, _, _, source, _, _ -> got = source },
             )
         }
         pickSource(current = "Claude subscription", option = "qwen3-coder")
@@ -152,7 +188,7 @@ class SpawnComposerTest {
     private fun showRuntime(dsh: DshInfo?, onType: (String) -> Unit = {}) = compose.setContent {
         SpawnDialog(
             host = "nas01", repo = "Turma", isRoot = false, dsh = dsh,
-            onDismiss = {}, onSpawn = { _, _, _, _, _, _, agentType -> onType(agentType) },
+            onDismiss = {}, onSpawn = { _, _, _, _, _, _, _, agentType -> onType(agentType) },
         )
     }
 
@@ -202,7 +238,7 @@ class SpawnComposerTest {
         compose.setContent {
             SpawnDialog(
                 host = "nas01", repo = "Turma", isRoot = false, dsh = offered,
-                onDismiss = {}, onSpawn = { _, _, _, _, _, _, agentType -> got = agentType },
+                onDismiss = {}, onSpawn = { _, _, _, _, _, _, _, agentType -> got = agentType },
             )
         }
         compose.onNodeWithText("Claude Code").performScrollTo().performClick()

@@ -259,6 +259,11 @@
   .composer details.opts > summary:hover { color: var(--ink-2); }
   .composer .opts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
   .composer .opts-grid .full { grid-column: 1 / -1; }
+  /* The self-hosted model + context override (XERK-489), revealed under "Run
+     against: local". Its own 2-col grid so it lines up inside the full-width row. */
+  .composer .lm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .composer .lm-wrap input[type="number"], .composer .lm-wrap select {
+    width: 100%; box-sizing: border-box; }
   .composer .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .composer .cmp-actions { display: flex; align-items: center; gap: 10px; }
   .composer .cmp-actions .spacer { flex: 1; }
@@ -792,6 +797,22 @@
   .cc-menu button.on { color: var(--accent); font-weight: 600; }
   .cc-menu button.on::after { content: "✓"; font-size: 11px; }
   .cc-hint { display: block; font-size: 10px; color: var(--muted); padding: 4px 10px 2px; }
+  /* The self-hosted model dropdown (XERK-489): a weaker model, so it wears the
+     same warn tint as the "run against" chip, and its wider menu holds a context
+     readout + advanced override. */
+  .cc-model-local .cc-menu { right: 0; min-width: 220px; }
+  .cc-model-local .cc-btn { border-color: var(--warn, #d98f2b); color: var(--warn, #d98f2b); }
+  .cc-model-local .cc-btn .cc-val { color: var(--warn, #d98f2b); }
+  .cc-btn .cc-ctx { font-weight: 400; opacity: .8; }
+  .cc-sep { display: block; height: 1px; background: var(--border); margin: 4px 6px; }
+  .cc-ctx-adv { padding: 4px 10px 6px; }
+  .cc-ctx-adv label { display: block; font-size: 10px; color: var(--muted); margin-bottom: 3px; }
+  .cc-ctx-in { display: flex; gap: 6px; }
+  .cc-ctx-in input { flex: 1; min-width: 0; font: inherit; font-size: 12px; padding: 3px 6px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--page); color: var(--ink); }
+  .cc-apply { font: inherit; font-size: 11.5px; padding: 3px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer; }
+  .cc-apply:hover { border-color: var(--accent); color: var(--accent); }
   .chat-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
   .term-bar .seg-toggle { font: inherit; font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm);
     border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer;
@@ -1261,6 +1282,15 @@ function onOptChange(rk, repo) {
   const o = loadOpts(repo);
   o.baseRef = v("base"); o.model = v("model"); o.permissionMode = v("perm");
   o.modelSource = v("source"); o.agentType = v("type");
+  // XERK-489: the chosen self-hosted model + context override (persisted so the
+  // repo's composer reopens on them). Only meaningful when source is local.
+  o.localModel = v("lmodel");
+  const lctx = parseInt(v("lctx"), 10);
+  o.localContext = lctx > 0 ? lctx : 0;
+  // Reveal / hide the local-model fields the instant "Run against" flips, rather
+  // than waiting for the next beat's repaint.
+  const wrap = document.getElementById(cid(rk, "lmwrap"));
+  if (wrap) wrap.style.display = o.modelSource === "local" ? "" : "none";
   saveOpts(repo, o);
 }
 // The "New session" composer panel: Task (autofocused, Cmd/Ctrl+Enter submits),
@@ -1292,6 +1322,17 @@ function composer(a, repo, rk, spawning) {
   // can't be made where it would only be acked and dropped.
   const dsh = (a.dsh && a.dsh.available) ? a.dsh : null;
   const selType = (dsh && o.agentType === "dsh") ? "dsh" : "claude";
+  // The endpoint's discovered models (XERK-489). When local is chosen the
+  // composer reveals a model dropdown + an optional context override — the same
+  // shape as the live chat footer. Empty when an older agent reports no list.
+  const lModels = (localModel && Array.isArray(localModel.models)) ? localModel.models : [];
+  const lDefault = (localModel && (localModel.defaultModel || localModel.model)) || "";
+  const selLModel = (o.localModel && lModels.some(m => m && m.id === o.localModel))
+    ? o.localModel : lDefault;
+  const servedCtx = (() => { const m = lModels.find(x => x && x.id === selLModel);
+    return m && typeof m.contextTokens === "number" ? m.contextTokens : null; })();
+  const selLCtx = (o.localContext && o.localContext > 0) ? o.localContext : (servedCtx || "");
+  const ctxK = n => (typeof n === "number" && n > 0) ? (n >= 1000 ? Math.round(n / 1000) + "k" : String(n)) : "";
   const optsExpanded = optionsOpen.has(rk);
   const opt = (val, label, sel) => `<option value="${esc(val)}"${val === sel ? " selected" : ""}>${esc(label)}</option>`;
   const submit = `startSession('${key}','${rn}')`;
@@ -1339,8 +1380,23 @@ function composer(a, repo, rk, spawning) {
         ${localModel ? `<div>
           <label>Run against</label>
           <select id="${cid(rk, "source")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
-            ${opt("subscription", "Claude subscription", selSource)}${opt("local", localModel.model || "Self-hosted model", selSource)}
+            ${opt("subscription", "Claude subscription", selSource)}${opt("local", localModel.defaultModel || localModel.model || "Self-hosted model", selSource)}
           </select>
+        </div>` : ""}
+        ${localModel && lModels.length ? `<div id="${cid(rk, "lmwrap")}" class="full lm-wrap"${selSource === "local" ? "" : ' style="display:none"'}>
+          <div class="lm-grid">
+            <div>
+              <label>Self-hosted model</label>
+              <select id="${cid(rk, "lmodel")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
+                ${lModels.map(m => opt(m.id, m.id + (ctxK(m.contextTokens) ? " · " + ctxK(m.contextTokens) : ""), selLModel)).join("")}
+              </select>
+            </div>
+            <div>
+              <label>Context ${servedCtx ? `<span class="hint">(max ${esc(ctxK(servedCtx))}; shrink only)</span>` : `<span class="hint">(tokens)</span>`}</label>
+              <input id="${cid(rk, "lctx")}" type="number" min="1" max="${servedCtx || 2000000}" step="1024"
+                value="${esc(String(selLCtx))}" oninput="onOptChange('${escJs(rk)}','${rn}')">
+            </div>
+          </div>
         </div>` : ""}
       </div>
     </details>
@@ -2167,6 +2223,8 @@ function startSession(key, repo) {
   const baseRef = v("base");
   const model = v("model"), perm = v("perm"), modelSource = v("source");
   const agentType = v("type");
+  const localModel = v("lmodel");
+  const localContext = parseInt(v("lctx"), 10);
   const body = { repo };
   if (prompt) body.prompt = prompt;
   if (label) body.label = label;
@@ -2177,11 +2235,20 @@ function startSession(key, repo) {
   if (perm && perm !== "auto") body.permissionMode = perm;
   // Only send a non-default source; a host with no local model renders no such
   // control, so this stays absent there.
-  if (modelSource === "local") body.modelSource = modelSource;
+  if (modelSource === "local") {
+    body.modelSource = modelSource;
+    // The chosen endpoint model + optional context override (XERK-489). The
+    // agent validates membership and clamps the window; both stay absent for a
+    // subscription spawn.
+    if (localModel) body.localModel = localModel;
+    if (localContext > 0) body.localContext = localContext;
+  }
   // Only send a non-default runtime; a host that doesn't offer dsh renders no
   // such control, so this stays absent (and defaults to claude) there.
   if (agentType === "dsh") body.agentType = agentType;
   saveOpts(repo, { baseRef, model, permissionMode: perm, modelSource, agentType,
+    localModel: modelSource === "local" ? localModel : "",
+    localContext: modelSource === "local" && localContext > 0 ? localContext : 0,
     optionsExpanded: optionsOpen.has(rk) });
   composerOpen.delete(rk);
   composerDraft.delete(rk);

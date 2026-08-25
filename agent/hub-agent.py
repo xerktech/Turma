@@ -12328,7 +12328,8 @@ class SessionManager:
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
               model=None, permission_mode=None, ticket=None, ticket_detail=None,
               cmd_id=None, await_clone=None, await_clone_owner=None,
-              model_source=None, local_model=None, agent_type=None):
+              model_source=None, local_model=None, local_context=None,
+              agent_type=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -12495,6 +12496,11 @@ class SessionManager:
                     raise ValueError(
                         f"local model {local_model!r} is not served by this host")
                 sess["localModelName"] = local_model
+                # Optional context override (XERK-489), clamped to the served
+                # window at launch (shrink-only). Only stored when it's a
+                # positive int; junk falls back to the served figure.
+                if isinstance(local_context, int) and local_context > 0:
+                    sess["localModelContext"] = local_context
         except Exception as e:
             self._set_error(sess, e)
             return
@@ -13565,17 +13571,24 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def _switch_local_model(self, sess, model):
-        """Change which self-hosted model a RUNNING local session uses (XERK-489),
-        keeping its conversation.
+    def _switch_local_model(self, sess, model, context=None):
+        """Change which self-hosted model (and optionally the context WINDOW) a
+        RUNNING local session uses (XERK-489), keeping its conversation.
 
-        Rewrite local-model.env with the new model + its served window and
-        relaunch via `--resume` — the exact machinery of a source switch, minus
-        the source change. Membership is validated before the gateway ever sees
-        it, on top of the charset gate; a model the host does not serve errors
-        the card rather than 403ing every turn silently. Reverts the record if
-        the relaunch throws, like set_model_source, so a stored model can never
-        outlive a launch that failed on it."""
+        Rewrite local-model.env with the new model + window and relaunch via
+        `--resume` — the exact machinery of a source switch, minus the source
+        change. Membership is validated before the gateway ever sees it, on top
+        of the charset gate; a model the host does not serve errors the card
+        rather than 403ing every turn silently. Reverts the record if the
+        relaunch throws, like set_model_source, so a stored model can never
+        outlive a launch that failed on it.
+
+        `context` is the operator's advanced override — it may only SHRINK the
+        served window (CLAUDE_CODE_MAX_CONTEXT_TOKENS overstated makes claude
+        compact too late and the tail truncate), so it is clamped to
+        local_model_context(model); a bad/absent value takes the served figure.
+        A context-only change (same model) still relaunches, because the window
+        is an env var read at launch."""
         if not sess or sess.get("status") != "running":
             return
         if not local_model_configured():
@@ -13586,12 +13599,16 @@ class SessionManager:
             self._set_error(sess, ValueError(
                 f"local model {model!r} is not served by this host"))
             return
-        if sess.get("localModelName") == model:
-            return                                  # already there; no relaunch
+        served = local_model_context(model)
+        new_ctx = (context if isinstance(context, int) and 0 < context <= served
+                   else served)
+        if (sess.get("localModelName") == model
+                and sess.get("localModelContext") == new_ctx):
+            return                                  # nothing changed; no relaunch
         prev_model = sess.get("localModelName")
         prev_ctx = sess.get("localModelContext")
         sess["localModelName"] = model
-        sess["localModelContext"] = local_model_context(model)
+        sess["localModelContext"] = new_ctx
         sess.pop("pendingModel", None)
         try:
             self._kill_tmux(sess)
@@ -13601,7 +13618,8 @@ class SessionManager:
             sess["errorMsg"] = None
             sess["restartCount"] = sess.get("restartCount", 0) + 1
             sess["modelSourceAt"] = now_iso()
-            log(f"session {sess['id']} switched local model -> {model}")
+            log(f"session {sess['id']} switched local model -> {model} "
+                f"(context {new_ctx})")
         except Exception as e:
             sess["localModelName"] = prev_model
             sess["localModelContext"] = prev_ctx
@@ -14243,10 +14261,14 @@ class SessionManager:
         log(f"renamed session {sid} -> {name!r}" if name
             else f"cleared name of session {sid}")
 
-    def set_model(self, sid, model):
+    def set_model(self, sid, model, context=None):
         """Switch a running session's model live — for THIS SESSION ONLY — by
         driving Claude Code's /model picker: open it, arrow to the chosen row,
         and press `s` ("use this session only").
+
+        `context` (XERK-489) is the advanced context-window override, honoured
+        ONLY for a local session (a subscription session's window is fixed by
+        Claude Code); it is passed through to _switch_local_model.
 
         It used to type `/model <name>`, which looks equivalent and isn't: the
         argument form ALSO saves the pick as the login-wide default for new
@@ -14276,7 +14298,7 @@ class SessionManager:
         # relaunch via --resume rather than driving the TUI. The picker stays
         # refused for local (there is no Claude row that would work).
         if sess_early and sess_early.get("modelSource") == "local":
-            self._switch_local_model(sess_early, model)
+            self._switch_local_model(sess_early, model, context)
             return
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
@@ -17801,6 +17823,7 @@ class SessionManager:
                         permission_mode=cmd.get("permissionMode"),
                         model_source=cmd.get("modelSource"),
                         local_model=cmd.get("localModel"),
+                        local_context=cmd.get("localContext"),
                         agent_type=cmd.get("agentType"),
                         cmd_id=cid,
                     )
@@ -17833,7 +17856,8 @@ class SessionManager:
                 elif ctype == "setSummary":
                     self.set_summary(cmd.get("sessionId"), cmd.get("summary"))
                 elif ctype == "setModel":
-                    self.set_model(cmd.get("sessionId"), cmd.get("model"))
+                    self.set_model(cmd.get("sessionId"), cmd.get("model"),
+                                   context=cmd.get("localContext"))
                 elif ctype == "setMode":
                     self.set_mode(cmd.get("sessionId"), cmd.get("permissionMode"))
                 elif ctype == "setModelSource":

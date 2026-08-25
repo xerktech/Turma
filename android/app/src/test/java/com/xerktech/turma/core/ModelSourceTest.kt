@@ -214,4 +214,55 @@ class ModelSourceTest {
         assertFalse(ModelSource.modelPickable(ModelSource.LOCAL))
         assertTrue(ModelSource.modelPickable(ModelSource.SUBSCRIPTION))
     }
+
+    // ---- endpoint model dropdown (XERK-489) ---------------------------------
+
+    private val discovered = LocalModelInfo(
+        available = true, model = "gpt-oss:120b", defaultModel = "gpt-oss:120b",
+        models = listOf(
+            com.xerktech.turma.model.LocalModelOption("gpt-oss:120b", 120000),
+            com.xerktech.turma.model.LocalModelOption("qwen:32b", 32768),
+        ),
+    )
+
+    @Test fun `the local model is pickable only with a discovered list`() {
+        assertTrue(ModelSource.localModelPickable(discovered))
+        assertFalse(ModelSource.localModelPickable(configured))   // no models[]
+        assertFalse(ModelSource.localModelPickable(null))
+    }
+
+    @Test fun `local options read as id and window`() {
+        val opts = ModelSource.localOptions(discovered)
+        assertEquals(listOf("gpt-oss:120b", "qwen:32b"), opts.map { it.first })
+        assertEquals("gpt-oss:120b · 120k", opts[0].second)
+        assertEquals("qwen:32b · 33k", opts[1].second)
+    }
+
+    @Test fun `the session's stored model and window win over the host default`() {
+        val sess = SessionInfo(id = "s1", modelSource = "local",
+            localModelName = "qwen:32b", localModelContext = 16000)
+        assertEquals("qwen:32b", ModelSource.currentLocalModel(sess, discovered))
+        assertEquals(16000, ModelSource.currentLocalContext(sess, discovered))   // override
+        assertEquals("qwen:32b · 16k", ModelSource.localModelLabel(sess, discovered))
+    }
+
+    @Test fun `with no stored pick the host default and its served window apply`() {
+        val sess = SessionInfo(id = "s1", modelSource = "local")
+        assertEquals("gpt-oss:120b", ModelSource.currentLocalModel(sess, discovered))
+        assertEquals(120000, ModelSource.currentLocalContext(sess, discovered))  // served
+    }
+
+    @Test fun `a bare OpenAI model reports no served window`() {
+        val bare = LocalModelInfo(available = true,
+            models = listOf(com.xerktech.turma.model.LocalModelOption("llama3", null)))
+        assertEquals(null, ModelSource.servedContextFor(bare, "llama3"))
+        assertEquals("llama3", ModelSource.localOptions(bare)[0].second)   // no suffix
+    }
+
+    @Test fun `fmtCtx renders k and drops a null window`() {
+        assertEquals("128k", ModelSource.fmtCtx(128000))
+        assertEquals("500", ModelSource.fmtCtx(500))
+        assertEquals("", ModelSource.fmtCtx(0))
+        assertEquals("", ModelSource.fmtCtx(null))
+    }
 }

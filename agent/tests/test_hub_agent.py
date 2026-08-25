@@ -5415,7 +5415,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
             model=None, permission_mode=None, model_source=None,
-            local_model=None, agent_type=None, cmd_id="c1",
+            local_model=None, local_context=None, agent_type=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -5463,7 +5463,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
             model="opus", permission_mode="plan", model_source=None,
-            local_model=None, agent_type="dsh", cmd_id="c9",
+            local_model=None, local_context=None, agent_type="dsh", cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -10472,6 +10472,57 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         self.assertIsNotNone(sess.get("errorMsg"))
         # No relaunch — the picker is never opened and no keys reach the pane.
         self.assertEqual([c for c in self.run_calls if "tmux" in c], [])
+
+    def test_local_model_context_override_clamps_to_served(self):
+        """The advanced override may not EXCEED the served window — an overstated
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS compacts too late and truncates the tail
+        (XERK-489). Asking for more than served clamps to served."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["localModelName"] = "qwen:32b"
+        sess["localModelContext"] = 16000          # currently shrunk
+        self._pin_transcript(sess)
+        with mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "qwen:32b", "contextTokens": 32768}]):
+            sm.set_model("abcde", "qwen:32b", context=999999)  # more than served
+            env = self._launch_env()
+        self.assertEqual(sess["localModelContext"], 32768)     # clamped to served
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768", env)
+
+    def test_launch_clamps_an_overstated_stored_context(self):
+        """The LAUNCH is the authoritative shrink-only clamp — every launch path
+        (resume, boot, migration, switch) goes through it, so it is pinned
+        INDEPENDENTLY of _switch_local_model's own clamp (XERK-489). An overstated
+        stored window (a bad restore, a migrated record) is shrunk to the served
+        figure and re-persisted, never launched as-is."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["localModelName"] = "qwen:32b"
+        sess["localModelContext"] = 999999          # stored overstatement
+        self._pin_transcript(sess)
+        with mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "qwen:32b", "contextTokens": 32768}]):
+            sm._launch_tmux(sess, resume=True)
+            env = self._launch_env()
+        self.assertEqual(sess["localModelContext"], 32768)   # re-persisted, clamped
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768", env)
+
+    def test_local_model_context_only_change_relaunches(self):
+        """A context-only shrink (same model) still relaunches — the window is an
+        env var read at launch, so it cannot change without one (XERK-489)."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["localModelName"] = "qwen:32b"
+        sess["localModelContext"] = 32768
+        self._pin_transcript(sess)
+        before = len(self._launches())
+        with mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "qwen:32b", "contextTokens": 32768}]):
+            sm.set_model("abcde", "qwen:32b", context=16000)
+            env = self._launch_env()
+        self.assertEqual(len(self._launches()), before + 1)    # relaunched
+        self.assertEqual(sess["localModelContext"], 16000)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=16000", env)
 
     def test_switch_keeps_the_conversation(self):
         """The whole value of failing over is not losing what the session has

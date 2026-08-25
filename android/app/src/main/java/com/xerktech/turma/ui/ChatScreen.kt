@@ -610,16 +610,28 @@ private fun ChatFooter(
         // shows (newest first — the freshest link leads), matching the web footer
         // chip (chat.js prFooterChip); FlowRow wraps them on a narrow phone.
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            // On the local model the Claude alias picker is not just useless but
-            // harmful — every alias it offers is one that endpoint refuses — so
-            // the chip states the fixed model instead (web: cc-model-fixed).
+            // On the local model the Claude alias picker is useless — every alias
+            // it offers is one that endpoint refuses. Instead a LOCAL session
+            // picks from the endpoint's DISCOVERED models (XERK-489), a live
+            // dropdown (each "id · 128k"); selecting one posts the id to /model,
+            // which the agent applies with that model's served window. With no
+            // discovered list yet (older agent / pre-discovery) it keeps the fixed
+            // label (web: cc-model-fixed).
             if (com.xerktech.turma.core.ModelSource.modelPickable(modelSource)) {
                 MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
+            } else if (com.xerktech.turma.core.ModelSource.localModelPickable(localModel)) {
+                val lopts = com.xerktech.turma.core.ModelSource.localOptions(localModel)
+                MenuChip(
+                    label = "model: " + com.xerktech.turma.core.ModelSource.localModelLabel(session, localModel),
+                    options = lopts.map { it.first },
+                    onSelect = onModel,
+                    optionLabel = { v -> lopts.firstOrNull { it.first == v }?.second ?: v },
+                    accent = true,
+                )
             } else {
                 StaticChip(
                     "model: ${com.xerktech.turma.core.ModelSource.label(modelSource, localModel)}",
-                    why = "Fixed by this host's self-hosted model configuration. "
-                        + "Switch \"run\" back to the subscription to choose a Claude model.",
+                    why = "This host's self-hosted model. Its model list has not been discovered yet.",
                 )
             }
             MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
