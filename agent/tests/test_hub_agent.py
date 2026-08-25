@@ -529,6 +529,36 @@ class TestSpawnOptionHelpers(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ha.resolve_permission_mode(bad)
 
+    def test_dsh_configured_is_off_by_default_and_env_gated(self):
+        # Opt-in, off by default, so every current host reads the capability as
+        # false and degrades — the whole degrade contract rests on this.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TURMA_DSH", None)
+            self.assertFalse(ha.dsh_configured())
+        for on in ("1", "true", "TRUE", "yes", "on", " On "):
+            with mock.patch.dict(os.environ, {"TURMA_DSH": on}):
+                self.assertTrue(ha.dsh_configured(), on)
+        for off in ("0", "", "no", "off", "maybe"):
+            with mock.patch.dict(os.environ, {"TURMA_DSH": off}):
+                self.assertFalse(ha.dsh_configured(), off)
+
+    def test_resolve_agent_type_enum_and_dsh_gate(self):
+        # Blank -> claude, what every session was before this existed.
+        with mock.patch.object(ha, "dsh_configured", lambda: False):
+            self.assertEqual(ha.resolve_agent_type(""), "claude")
+            self.assertEqual(ha.resolve_agent_type(None), "claude")
+            self.assertEqual(ha.resolve_agent_type("claude"), "claude")
+            # An unknown runtime is refused whether or not dsh is available.
+            with self.assertRaises(ValueError):
+                ha.resolve_agent_type("codex")
+            # dsh refused on a host that does not offer it — a clean spawn error
+            # beats a record naming a runtime this host cannot launch.
+            with self.assertRaises(ValueError):
+                ha.resolve_agent_type("dsh")
+        with mock.patch.object(ha, "dsh_configured", lambda: True):
+            self.assertEqual(ha.resolve_agent_type("dsh"), "dsh")
+            self.assertEqual(ha.resolve_agent_type("claude"), "claude")
+
     def test_perm_cycle_for(self):
         base = ["default", "acceptEdits", "plan"]
         # Base modes / blank / unknown launch -> base cycle only, no optionals.
@@ -5385,7 +5415,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
             model=None, permission_mode=None, model_source=None,
-            local_model=None, cmd_id="c1",
+            local_model=None, agent_type=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -5428,12 +5458,12 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{
             "cmdId": "c9", "type": "spawn", "repo": "Turma",
             "prompt": "fix the bug", "label": "Fix login", "baseRef": "main",
-            "model": "opus", "permissionMode": "plan",
+            "model": "opus", "permissionMode": "plan", "agentType": "dsh",
         }])
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
             model="opus", permission_mode="plan", model_source=None,
-            local_model=None, cmd_id="c9",
+            local_model=None, agent_type="dsh", cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -5635,6 +5665,53 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         wt = next(c for c in self.run_ok_calls if "worktree" in c and "add" in c)
         self.assertIn("--detach", wt)
         self.assertNotIn("-b", wt)
+
+    def test_spawn_defaults_agent_type_to_claude(self):
+        # The runtime field is always present and reads claude for a plain spawn,
+        # so a client (and an older record) never has to infer "not dsh".
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        self.assertEqual(sess["agentType"], "claude")
+        self.assertEqual(
+            sm._session_payload(sess, refresh=False)["agentType"], "claude")
+
+    def test_spawn_dsh_is_refused_when_the_host_does_not_offer_it(self):
+        # dsh off (the default) -> the runtime is validated like every spawn enum
+        # and the session lands as a clean error card, never a claude session
+        # mislabelled dsh.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.object(ha, "dsh_configured", lambda: False):
+            sm.spawn("Turma", agent_type="dsh")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("dsh", sess["errorMsg"])
+
+    def test_spawn_dsh_records_the_runtime_then_the_launcher_guard_fires(self):
+        # With the host opted in, the choice flows end-to-end onto the record and
+        # the payload — but until the dsh launcher lands (XERK-466) the launch
+        # choke point refuses rather than launch claude under a dsh label.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.object(ha, "dsh_configured", lambda: True):
+            sm.spawn("Turma", agent_type="dsh")
+        sess = sm.registry[0]
+        self.assertEqual(sess["agentType"], "dsh")
+        self.assertEqual(
+            sm._session_payload(sess, refresh=False)["agentType"], "dsh")
+        # No claude was launched for it — the guard set the error card instead.
+        self.assertEqual(sess["status"], "error")
+        self.assertIn("XERK-466", sess["errorMsg"])
+
+    def test_heartbeat_reports_the_dsh_capability_flag(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.object(ha, "dsh_configured", lambda: False):
+            self.assertEqual(sm.build_payload(1)["dsh"], {"available": False})
+        with mock.patch.object(ha, "dsh_configured", lambda: True):
+            self.assertEqual(sm.build_payload(1)["dsh"], {"available": True})
 
     def test_spawn_echoes_the_hub_command_id_onto_the_session(self):
         # The hub can't name the session it asked for — we mint the id here — so

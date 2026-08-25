@@ -8,6 +8,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import com.xerktech.turma.model.DshInfo
 import com.xerktech.turma.model.LocalModelInfo
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -44,11 +45,12 @@ class SpawnComposerTest {
 
     private fun show(
         localModel: LocalModelInfo?,
+        dsh: DshInfo? = null,
         onSpawn: (String) -> Unit = {},
     ) = compose.setContent {
         SpawnDialog(
-            host = "nas01", repo = "Turma", isRoot = false, localModel = localModel,
-            onDismiss = {}, onSpawn = { _, _, _, _, _, source -> onSpawn(source) },
+            host = "nas01", repo = "Turma", isRoot = false, localModel = localModel, dsh = dsh,
+            onDismiss = {}, onSpawn = { _, _, _, _, _, source, _ -> onSpawn(source) },
         )
     }
 
@@ -131,7 +133,7 @@ class SpawnComposerTest {
         compose.setContent {
             SpawnDialog(
                 host = "nas01", repo = "Turma", isRoot = false, localModel = offered,
-                onDismiss = {}, onSpawn = { _, _, _, _, _, source -> got = source },
+                onDismiss = {}, onSpawn = { _, _, _, _, _, source, _ -> got = source },
             )
         }
         pickSource(current = "Claude subscription", option = "qwen3-coder")
@@ -143,5 +145,74 @@ class SpawnComposerTest {
         compose.onNodeWithText("Run against").assertDoesNotExist()
         compose.onNodeWithText("Spawn").performClick()
         assertEquals("subscription", got)
+    }
+
+    // ---- Runtime row (XERK-465) — same gate/wiring rules as "Run against" -----
+
+    private fun showRuntime(dsh: DshInfo?, onType: (String) -> Unit = {}) = compose.setContent {
+        SpawnDialog(
+            host = "nas01", repo = "Turma", isRoot = false, dsh = dsh,
+            onDismiss = {}, onSpawn = { _, _, _, _, _, _, agentType -> onType(agentType) },
+        )
+    }
+
+    @Test
+    fun `no runtime row when the host does not offer dsh`() {
+        showRuntime(dsh = null)
+        compose.onNodeWithText("Permission mode").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Runtime").assertDoesNotExist()
+    }
+
+    @Test
+    fun `no runtime row when the host reports the dsh block unavailable`() {
+        showRuntime(dsh = DshInfo(available = false))
+        compose.onNodeWithText("Permission mode").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Runtime").assertDoesNotExist()
+    }
+
+    @Test
+    fun `runtime row appears when the host offers dsh, defaulting to Claude`() {
+        showRuntime(dsh = DshInfo(available = true))
+        compose.onNodeWithText("Runtime").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Claude Code").assertIsDisplayed()
+    }
+
+    @Test
+    fun `spawn carries claude when nothing is picked`() {
+        var got: String? = null
+        showRuntime(dsh = DshInfo(available = true)) { got = it }
+        compose.onNodeWithText("Spawn").performClick()
+        assertEquals("claude", got)
+    }
+
+    @Test
+    fun `picking dsh is what the spawn carries`() {
+        var got: String? = null
+        showRuntime(dsh = DshInfo(available = true)) { got = it }
+        compose.onNodeWithText("Claude Code").performScrollTo().performClick()
+        compose.onNodeWithText("dsh").performClick()
+        compose.onNodeWithText("Spawn").performClick()
+        assertEquals("dsh", got)
+    }
+
+    @Test
+    fun `losing the host's dsh capability resets a picked dsh back to claude`() {
+        var got: String? = null
+        var offered by mutableStateOf<DshInfo?>(DshInfo(available = true))
+        compose.setContent {
+            SpawnDialog(
+                host = "nas01", repo = "Turma", isRoot = false, dsh = offered,
+                onDismiss = {}, onSpawn = { _, _, _, _, _, _, agentType -> got = agentType },
+            )
+        }
+        compose.onNodeWithText("Claude Code").performScrollTo().performClick()
+        compose.onNodeWithText("dsh").performClick()
+
+        offered = DshInfo(available = false)
+        compose.waitForIdle()
+
+        compose.onNodeWithText("Runtime").assertDoesNotExist()
+        compose.onNodeWithText("Spawn").performClick()
+        assertEquals("claude", got)
     }
 }

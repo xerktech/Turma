@@ -1003,6 +1003,15 @@ LOCAL_MODEL_CONTEXT = _positive_int_env("LOCAL_MODEL_CONTEXT", 81920)
 # login (the default, and what every existing session is); "local" is the
 # self-hosted model above.
 MODEL_SOURCES = {"subscription", "local"}
+# Which runtime a session runs on (XERK-460, the dsh epic). "claude" is the
+# Claude Code launcher every session uses today and the default every existing
+# record reads back as; "dsh" is the DeepSeek Harness runtime, selectable per
+# session only where this host reports the dsh capability (see dsh_configured).
+# The value is presentational per-session state — it grants nothing and says
+# nothing about whether the dsh PROCESS is per-session or per-host (that is the
+# launcher's concern, XERK-466). Validated agent-side like every other spawn
+# enum.
+AGENT_TYPES = {"claude", "dsh"}
 # The model name is interpolated into a launch command line, so it is charset
 # checked like every other launch input. Ollama-style tags carry a colon.
 LOCAL_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,60}$")
@@ -1253,6 +1262,37 @@ def resolve_model_source(source):
     if source == "local" and not local_model_configured():
         raise ValueError("local model not configured on this host")
     return source
+
+
+def dsh_configured():
+    """True when this host offers the dsh runtime as a per-session choice.
+
+    Doubles as the heartbeat capability flag (like local_model_configured):
+    an agent reporting this False — every host today, since it is opt-in and
+    off by default — makes the hub and composers HIDE the runtime selector
+    rather than queue a spawn the host would ack and then fail to launch.
+
+    Gated on TURMA_DSH so the capability can be turned on per host once the dsh
+    launcher (XERK-466) and the image's dsh toolchain land. [A] establishes the
+    field, the flag and the whole wire path; until the launcher exists, an
+    agentType="dsh" spawn is refused at launch (see _launch_tmux), so leaving
+    this off keeps every current host on Claude Code with nothing changed."""
+    return (os.environ.get("TURMA_DSH", "").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+def resolve_agent_type(agent_type):
+    """Validate a runtime choice against a fixed enum. Blank -> claude (what
+    every session was before this existed). "dsh" is refused on a host that
+    does not offer it, mirroring resolve_model_source's local gate."""
+    agent_type = (agent_type or "").strip()
+    if not agent_type:
+        return "claude"
+    if agent_type not in AGENT_TYPES:
+        raise ValueError(f"unknown agent type {agent_type!r}")
+    if agent_type == "dsh" and not dsh_configured():
+        raise ValueError("dsh runtime not available on this host")
+    return agent_type
 
 
 def _messages_api_base(url):
@@ -11899,6 +11939,20 @@ class SessionManager:
         self._guard_settings_path = path
         return path
 
+    def _launch_dsh(self, sess):
+        """Launch a session on the dsh runtime (XERK-460).
+
+        [A] is the runtime SELECTION plumbing — the field, the capability flag,
+        the composer choice and the wire path. The dsh session LAUNCHER (a
+        per-session headless dsh child in its own tmux + worktree, D1) is
+        XERK-466, which replaces this body. Until then a dsh session — only
+        reachable where the operator opted the host in via TURMA_DSH — is refused
+        rather than silently launched as claude, which would mislabel the runtime
+        on every surface. Refusing here keeps the choke point (and the guard's
+        one-line dispatch above) exactly where XERK-466 plugs the real launcher
+        in."""
+        self._set_error(sess, "dsh runtime launcher not yet available (XERK-466)")
+
     def _launch_tmux(self, sess, resume=False, prompt=None, resume_id=None):
         """(Re)launch claude for a session inside its own tmux, detached.
 
@@ -11916,6 +11970,15 @@ class SessionManager:
         that happens to start with '-' can't be read as a flag. The per-session
         model (#12) and permission mode (#12) come from the validated fields on
         the session record; both fall back to today's behavior when unset."""
+        # Runtime dispatch (XERK-460). _launch_tmux is the ONE launch choke point
+        # every path goes through (spawn provision, resume, restart, resume-any,
+        # resume-on-boot), so the claude-vs-dsh branch lives here rather than at
+        # each caller. [A] establishes the field, the flag and the whole wire
+        # path; the dsh LAUNCHER is XERK-466, which fills in _launch_dsh — the
+        # swap is that method's body alone, this dispatch line stays.
+        if sess.get("agentType") == "dsh":
+            self._launch_dsh(sess)
+            return
         self._drop_bridge_pointer(sess["worktreePath"])
         # Claude in this worktree. IS_SANDBOX=1 (compose) lets
         # bypassPermissions run under root; --remote-control bridges the session
@@ -12240,7 +12303,7 @@ class SessionManager:
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
               model=None, permission_mode=None, ticket=None, ticket_detail=None,
               cmd_id=None, await_clone=None, await_clone_owner=None,
-              model_source=None, local_model=None):
+              model_source=None, local_model=None, agent_type=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -12369,6 +12432,10 @@ class SessionManager:
             # session over: when usage runs out you cannot start NEW work
             # either, which is the halt this ticket is about.
             "modelSource": "subscription",
+            # Which runtime this session runs on (XERK-460). Defaults to claude
+            # — the launcher every session has always used — and reads back as
+            # claude for every record that predates this field.
+            "agentType": "claude",
             "baseRef": None,                # base branch the worktree forked from
             # A queued record has no worktree/tmux/ttyd yet — _provision_session
             # (via _drain_queue) makes it real when it's allowed to run.
@@ -12394,6 +12461,7 @@ class SessionManager:
             sess["model"] = resolve_model(model, self.models_available())
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
             sess["modelSource"] = resolve_model_source(model_source)
+            sess["agentType"] = resolve_agent_type(agent_type)
             # Spawning straight onto a CHOSEN local model (XERK-489). Validated
             # like the switch; the launch resolves its served window. Ignored
             # unless this is actually a local spawn.
@@ -12741,6 +12809,9 @@ class SessionManager:
             # exhausted subscription — and restores its --model alias, which the
             # gateway refuses — with no mark and no error.
             "modelSource",
+            # Which runtime this session ran on (XERK-460), so a resume relaunches
+            # the same one rather than silently reverting a dsh session to claude.
+            "agentType",
             # Which self-hosted model + window it was on (XERK-489), so a resume
             # rejoins on the same one rather than the host default.
             "localModelName", "localModelContext",
@@ -12880,6 +12951,7 @@ class SessionManager:
             # Resuming an ended session keeps whichever model it was running
             # against; usage has not come back just because it was killed.
             "modelSource": rec.get("modelSource") or "subscription",
+            "agentType": rec.get("agentType") or "claude",
             # ...and which self-hosted model it was on (XERK-489); the launch
             # re-validates and falls back if the host no longer serves it.
             "localModelName": rec.get("localModelName"),
@@ -12978,6 +13050,7 @@ class SessionManager:
                            and os.path.normpath(c["worktreePath"]) == os.path.normpath(cwd)),
                           None)
         extra = ({"modelSource": closed.get("modelSource"),
+                  "agentType": closed.get("agentType"),
                   "localModelName": closed.get("localModelName"),
                   "localModelContext": closed.get("localModelContext")}
                  if closed else None)
@@ -13100,6 +13173,12 @@ class SessionManager:
             "modelSource": (resolve_model_source(extra.get("modelSource"))
                             if extra.get("modelSource") in MODEL_SOURCES
                             and local_model_configured() else "subscription"),
+            # Same story for the runtime (XERK-460): a dsh session migrated onto a
+            # host that does not offer dsh falls back to claude rather than being
+            # recorded as a runtime this host cannot launch.
+            "agentType": (resolve_agent_type(extra.get("agentType"))
+                          if extra.get("agentType") in AGENT_TYPES
+                          and dsh_configured() else "claude"),
             # The self-hosted model it was on (XERK-489), carried raw; the launch
             # re-validates against THIS host's discovered set and falls back to
             # the host default when the target serves a different set.
@@ -13246,6 +13325,7 @@ class SessionManager:
             "model": cmd.get("model"),
             "permissionMode": cmd.get("permissionMode"),
             "modelSource": cmd.get("modelSource"),
+            "agentType": cmd.get("agentType"),
             "localModelName": cmd.get("localModelName"),
             "localModelContext": cmd.get("localModelContext"),
             "migratedFrom": cmd.get("migratedFrom"),
@@ -17691,6 +17771,7 @@ class SessionManager:
                         permission_mode=cmd.get("permissionMode"),
                         model_source=cmd.get("modelSource"),
                         local_model=cmd.get("localModel"),
+                        agent_type=cmd.get("agentType"),
                         cmd_id=cid,
                     )
                 elif ctype == "spawnTicket":
@@ -18302,6 +18383,10 @@ class SessionManager:
             # self-hosted model it failed over to). Always present, so a client
             # never has to infer "not local" from an absent field.
             "modelSource": sess.get("modelSource") or "subscription",
+            # Which runtime this session runs on (XERK-460): "claude" or "dsh".
+            # Always present, defaulting claude, so a client (and an older agent's
+            # absent field, coerced hub-side) reads the same "not dsh".
+            "agentType": sess.get("agentType") or "claude",
             # For a LOCAL session, which endpoint model + window it runs on
             # (XERK-489) — the chip's label and the context meter's exact
             # denominator. Null on a subscription session. Migration reads these
@@ -18394,6 +18479,9 @@ class SessionManager:
                 # ended session's transcript is exactly when "which model wrote
                 # this" matters, and the Ended card's mark reads this field.
                 "modelSource": c.get("modelSource"),
+                # Which runtime it ran on (XERK-460), so an ended dsh card can
+                # show its runtime the same way the live card does.
+                "agentType": c.get("agentType"),
                 "localModelName": c.get("localModelName"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
@@ -18667,6 +18755,16 @@ class SessionManager:
             # composers hide the control rather than queue a command that host
             # will silently ack and drop.
             "localModel": local_model_payload(),
+            # Whether this host offers the dsh runtime as a per-session choice
+            # (XERK-460). Doubles as the capability flag, exactly like localModel:
+            # an agent reporting available:false — every host today, since dsh is
+            # opt-in and off by default — makes the hub and composers HIDE the
+            # runtime selector rather than queue a spawn the host would ack and
+            # then refuse to launch. Absent (a pre-dsh agent) reads the same as
+            # false, coerced hub-side.
+            "dsh": {
+                "available": dsh_configured(),
+            },
             # The largest file this agent will take as a message attachment
             # (XERK-234). Doubles as the capability flag, exactly like
             # inputMaxChars above: an agent predating attachments reports nothing

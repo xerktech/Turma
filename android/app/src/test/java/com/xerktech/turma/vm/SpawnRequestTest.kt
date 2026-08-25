@@ -1,6 +1,7 @@
 package com.xerktech.turma.vm
 
 import com.xerktech.turma.core.ModelSource
+import com.xerktech.turma.core.Runtime
 import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.vm.FleetViewModel.Companion.spawnRequest
 import kotlinx.serialization.encodeToString
@@ -74,6 +75,20 @@ class SpawnRequestTest {
             .single { it.name == "setModelSource" }
         assertEquals("api/agents/{host}/sessions/{id}/model-source",
             m.getAnnotation(retrofit2.http.POST::class.java)!!.value)
+    }
+
+    @Test fun `a claude spawn sends no agentType (XERK-465)`() {
+        // "claude" is what a spawn already meant; sending it would change the
+        // body every existing host receives for no behavioural gain.
+        assertEquals("""{"repo":"Turma"}""",
+            json(spawnRequest("Turma", agentType = Runtime.CLAUDE)))
+    }
+
+    @Test fun `a dsh spawn carries the runtime (XERK-465)`() {
+        // The hub 409s "dsh" at a host that doesn't offer it, so only a real dsh
+        // choice reaches the wire.
+        assertEquals("""{"repo":"Turma","agentType":"dsh"}""",
+            json(spawnRequest("Turma", agentType = Runtime.DSH)))
     }
 
     @Test fun `the full composer body keeps its field order and content`() {
