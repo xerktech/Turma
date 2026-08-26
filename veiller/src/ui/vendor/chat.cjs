@@ -1708,14 +1708,17 @@
     if (mine && Date.now() - modelSourcePending.at < 60000) return modelSourcePending.value;
     return (sess && sess.modelSource) || "subscription";
   }
+  // The source selector is subscription vs the host's OWN endpoint. It does NOT
+  // name the model — the adjacent model dropdown (localModelChipHtml) does, and
+  // the raw discovered id (e.g. "bedrock/us.anthropic.claude-opus-4-5-…") is
+  // noise here — so the local source reads a plain "Other".
   function modelSourceLabel() {
-    return currentModelSource() === "local" ? (localModelInfo().model || "local model") : "Subscription";
+    return currentModelSource() === "local" ? "Other" : "Subscription";
   }
   function modelSourceOpts() {
-    const local = localModelInfo();
     return [
       { value: "subscription", label: "Claude subscription" },
-      { value: "local", label: local.model || "Self-hosted model" },
+      { value: "local", label: "Other" },
     ];
   }
   async function setSessionModelSource(value) {

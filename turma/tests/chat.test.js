@@ -1747,19 +1747,19 @@ test("model source: an in-flight switch paints the target, not the stale beat", 
   __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
   __setModelSourcePending({ value: "local", at: Date.now(), sessionId: "s1" });
   assert.equal(currentModelSource(), "local");
-  assert.equal(modelSourceLabel(), "gpt-oss:120b");
+  assert.equal(modelSourceLabel(), "Other");   // the model is named in its own dropdown, not here
   // A stale memo must not pin the chip forever if the switch never lands.
   __setModelSourcePending({ value: "local", at: Date.now() - 120000, sessionId: "s1" });
   assert.equal(currentModelSource(), "subscription");
   __setModelSourcePending(null);
 });
 
-test("model source: the menu names the host's actual model", () => {
+test("model source: the local option reads 'Other', not the raw model id", () => {
   __setModelSourcePending(null);
   __setSess({ id: "s1", modelSource: "subscription" });
-  __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
+  __setAgent({ localModel: { available: true, model: "bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0" } });
   assert.deepEqual(modelSourceOpts().map((o) => o.value), ["subscription", "local"]);
-  assert.equal(modelSourceOpts()[1].label, "gpt-oss:120b");
+  assert.deepEqual(modelSourceOpts().map((o) => o.label), ["Claude subscription", "Other"]);
   assert.equal(modelSourceLabel(), "Subscription");
 });
 
