@@ -4,7 +4,7 @@
 import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
 import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
-import { filterAgents, glyph, liveState, sessionName } from "./sessions.ts";
+import { filterAgents, glyph, isDsh, liveState, sessionName } from "./sessions.ts";
 import { measureDefault, measureGeneration, wrapText } from "./text-wrap.ts";
 import type { AgentInfo, SessionInfo } from "./types.ts";
 
@@ -203,6 +203,12 @@ export function buildHomeRows(state: AppState): HomeRow[] {
       const g = glyph(display);
       const labelOrRepo = session.label || session.repo;
       const name = sessionName(session);
+      // A dsh (DeepSeek Harness) session is tagged so a glance tells it apart
+      // from the Claude default (XERK-460) — the monochrome analogue of the web
+      // card's "⚙ dsh" chip. Only dsh rows carry it, so the common row is
+      // unchanged. Suffixed rather than prefixed so it never displaces the state
+      // glyph, which is what the wearer scans first.
+      const rt = isDsh(session) ? " ·dsh" : "";
       // The host is already the header above these rows, so the row itself is
       // just <repo>-<generated name> (e.g. "Turma-Adding Compose Flag"),
       // falling back to <repo>-<short id> when the session is unnamed.
@@ -211,7 +217,7 @@ export function buildHomeRows(state: AppState): HomeRow[] {
         hostKey: agent.key,
         sessionId: session.id,
         selectable: true,
-        text: `${g} ${labelOrRepo}-${name}`,
+        text: `${g} ${labelOrRepo}-${name}${rt}`,
       });
     }
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { flattenSessions, glyph, liveState } from "./sessions.ts";
+import { flattenSessions, glyph, isDsh, liveState } from "./sessions.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -147,6 +147,23 @@ describe("glyph", () => {
     ["pending", "…"],
   ] as const)("maps %s -> %s", (state, expected) => {
     expect(glyph(state)).toBe(expected);
+  });
+});
+
+describe("isDsh", () => {
+  // XERK-460: "dsh" is the only truthy runtime; the default and every pre-dsh
+  // session (claude / "" / absent) must read false so it shows no marker.
+  it("is true only for agentType === 'dsh'", () => {
+    expect(isDsh(session({ agentType: "dsh" }))).toBe(true);
+  });
+  it.each([
+    ["claude", { agentType: "claude" }],
+    ["empty string (pre-dsh agent)", { agentType: "" }],
+    ["absent", {}],
+    ["null", { agentType: null }],
+    ["unknown value", { agentType: "something-else" }],
+  ] as const)("is false for %s", (_label, overrides) => {
+    expect(isDsh(session(overrides))).toBe(false);
   });
 });
 

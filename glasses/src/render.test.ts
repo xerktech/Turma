@@ -111,6 +111,23 @@ describe("render: home", () => {
     expect(lines.some((l) => l.includes("repoB-abcdef"))).toBe(true);
   });
 
+  it("tags a dsh session row, and only a dsh one (XERK-460)", () => {
+    const agents: AgentInfo[] = [
+      agent({
+        key: "alpha",
+        device: "alpha",
+        sessions: [
+          session({ id: "s-dsh", repo: "repoA", summary: "dsh one", agentType: "dsh" }),
+          session({ id: "s-cc", repo: "repoB", summary: "claude one", agentType: "claude" }),
+        ],
+      }),
+    ];
+    const lines = asLines(render(base({ agents, home: { cursor: 0 } })));
+    // The dsh row carries the compact suffix; the Claude default row carries none.
+    expect(lines.some((l) => l.includes("repoA-dsh one ·dsh"))).toBe(true);
+    expect(lines.some((l) => l.includes("repoB-claude one") && !l.includes("·dsh"))).toBe(true);
+  });
+
   it("marks a cursor'd session row with '>' and renders its glyph as pending overlay", () => {
     const agents: AgentInfo[] = [
       agent({ sessions: [session({ id: "s1", session: signals({ transcriptAgeSec: 1 }) })] }),

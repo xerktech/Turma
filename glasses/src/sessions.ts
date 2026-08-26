@@ -119,6 +119,18 @@ export function sessionName(s: SessionInfo): string {
   return summary || s.id.slice(0, 6);
 }
 
+// Does this session run on the dsh (DeepSeek Harness) runtime rather than Claude
+// Code (XERK-460)? `agentType` is "dsh" only for a dsh session; "claude", ""
+// (a pre-dsh agent) and absent all read as the default Claude runtime, so no
+// current session shows a runtime marker. Mirrors the web's `s.agentType ===
+// "dsh"` check (turma/public/sessions.html) and Android's `Runtime.isDsh`
+// (core/Runtime.kt). Purely presentational — busy/ready/summary state for a dsh
+// session rides the same `paneBusy`/transcript signals as any other (XERK-468),
+// so nothing else here branches on the runtime.
+export function isDsh(s: SessionInfo): boolean {
+  return s.agentType === "dsh";
+}
+
 // The tracker org a host belongs to — a host with no tracker creds reports no
 // jira block and belongs to no org (empty key). Mirrors the web dashboard's
 // org.js `siteKeyOf`, the pure half of the phone-side org filter (XERK-171).

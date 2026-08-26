@@ -113,6 +113,28 @@ describe("phone render", () => {
     expect(html).toContain("killed one");
   });
 
+  it("marks a dsh session with the runtime chip, on active and ended cards (XERK-460)", () => {
+    const st = state({
+      agents: [agent({ sessions: [
+        session({ id: "sd", summary: "dsh one", agentType: "dsh" }),
+        session({ id: "sc", summary: "claude one", agentType: "claude" }),
+        session({ id: "se", summary: "ended dsh", status: "stopped", agentType: "dsh" }),
+      ] })],
+    });
+    const html = sessionsBodyHtml(st);
+    // Both the active and the ended dsh card carry the chip...
+    expect((html.match(/ph-runtime/g) ?? []).length).toBe(2);
+    expect(html).toContain("⚙ dsh");
+    // ...and the claude (default) card carries none, so the common card is unchanged.
+    const claudeCard = html.slice(html.indexOf("claude one"));
+    expect(claudeCard.slice(0, claudeCard.indexOf("</button>"))).not.toContain("ph-runtime");
+  });
+
+  it("shows no runtime chip when agentType is absent (a pre-dsh agent)", () => {
+    const st = state({ agents: [agent({ sessions: [session({ id: "sp", summary: "plain" })] })] });
+    expect(sessionsBodyHtml(st)).not.toContain("ph-runtime");
+  });
+
   it("a session card carries its enter hooks and status", () => {
     const st = state({ agents: [agent({ sessions: [session({ id: "sX", summary: "do a thing", session: signals({ paneBusy: true }) })] })] });
     const html = sessionsBodyHtml(st);
