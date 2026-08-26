@@ -152,6 +152,27 @@ class AgentDecodeTest {
         assertEquals("", resp.agents[2].sessions[0].agentType)
     }
 
+    // XERK-477 [M]: an ENDED dsh session's runtime rides _closed_payload's
+    // agentType too, so its ended card carries the same badge as the live one.
+    // A record from an agent predating the field omits it and defaults to "".
+    @Test fun `a closed session carries its agentType`() {
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "closedSessions": [
+                { "id": "d", "repo": "r", "agentType": "dsh" },
+                { "id": "c", "repo": "r", "agentType": "claude" },
+                { "id": "o", "repo": "r" }
+              ]
+            } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val closed = resp.agents[0].closedSessions
+        assertEquals("dsh", closed[0].agentType)
+        assertEquals("claude", closed[1].agentType)
+        assertEquals("", closed[2].agentType)
+    }
+
     // XERK-489: the discovered model list + defaultModel on the block, and the
     // per-session localModelName/localModelContext. Both are typed now, so the
     // hub coerces them (normalizeLocalModel / normalizeSessions) and this decode

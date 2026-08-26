@@ -259,6 +259,40 @@ class SessionsFlattenTest {
         assertEquals(1, lists.ended.count { it.transcriptId == "tid-kill" })
     }
 
+    // XERK-477 [M]: the ended card's dsh badge reads EndedSession.agentType,
+    // which the stopped and closed channels carry through from their records;
+    // the resumable channel (a bare transcript scan) records no runtime, so it
+    // is always "" (web resumableSession omits it too), reading as Claude Code.
+    @Test fun `collectSessions carries agentType from stopped and closed, blank for resumable`() {
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            sessions = listOf(
+                SessionInfo(id = "stop1", status = "stopped", stoppedAt = "2026-07-22T08:00:00Z",
+                    transcriptId = "tid-stop", agentType = "dsh"),
+            ),
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "kill1", transcriptId = "tid-kill", closedAt = "2026-07-22T10:00:00Z",
+                    summary = "killed one", agentType = "dsh",
+                ),
+            ),
+            repos = listOf(
+                RepoInfo(
+                    name = "r",
+                    resumable = listOf(
+                        com.xerktech.turma.model.ResumableInfo(
+                            transcriptId = "tid-old", endedTs = "2026-07-22T09:00:00Z", summary = "old work",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val byId = collectSessions(listOf(a), "").ended.associateBy { it.id }
+        assertEquals("dsh", byId["stop1"]?.agentType)     // stopped channel
+        assertEquals("dsh", byId["kill1"]?.agentType)     // closed channel
+        assertEquals("", byId["t:tid-old"]?.agentType)    // resumable: no runtime recorded
+    }
+
     @Test fun `an undated ended record sorts oldest, not NaN-somewhere`() {
         val a = AgentInfo(
             key = "h1", device = "BOX", online = true,

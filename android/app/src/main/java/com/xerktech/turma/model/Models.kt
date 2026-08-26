@@ -275,6 +275,12 @@ data class ClosedSessionInfo(
     // over the branch), and must not change just because the session was killed.
     val summaryManual: Boolean = false,
     val label: String = "",
+    // Which runtime this session ran on (XERK-460 / [M] XERK-477), so an ended
+    // dsh card shows its runtime the same way a live one does. "claude" (the
+    // default) and "" (a record from an agent predating the field) both read as
+    // Claude Code and carry no badge — the same coercion the live SessionInfo
+    // field gets. Served on the closed payload (hub _closed_payload).
+    val agentType: String = "",
     val createdAt: String = "",
     val closedAt: String = "",
     // The Jira ticket this session worked, snapshotted onto the closed record
