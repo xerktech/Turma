@@ -1,0 +1,11 @@
+# Bundle patch for @turma/dsh-session-driver.
+#
+# The per-session configuration (session id, control-socket path, cwd, provider,
+# model, native event-log path, system-prompt file) is read from the process
+# ENVIRONMENT, never from here: dsh hot-reloads config and every dsh sharing a
+# DSH_HOME reads the same file, so config-borne identity would let an abandoned
+# instance adopt another session's id. Environment is fixed per process at exec.
+- insert:
+    - id: turma-dsh-session-driver
+      name: '@turma/dsh-session-driver'
+      config: {}

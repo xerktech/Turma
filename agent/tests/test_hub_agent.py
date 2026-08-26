@@ -3607,6 +3607,168 @@ class ManagerMixin:
         return ha.SessionManager()
 
 
+class _FakeDshControl:
+    """Stand-in for dsh_session.DshControl: records the frames the routing built
+    instead of talking to a real socket. The socket protocol itself is covered by
+    test_dsh_session.py; these tests cover hub-agent's dsh input/interaction arms."""
+
+    def __init__(self):
+        self.inputs = []       # (text, kind)
+        self.answers = []      # (request_id, option_index, option_indices, text)
+        self.killed = False
+        self.closed = False
+
+    def input(self, text, kind="user", client_id=None, plugin=None):
+        self.inputs.append((text, kind))
+        return True
+
+    def answer(self, request_id, option_index=None, option_indices=None, text=None):
+        self.answers.append((request_id, option_index, option_indices, text))
+        return True
+
+    def state(self):
+        return {"status": "idle"}
+
+    def kill(self):
+        self.killed = True
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+class TestDshRouting(ManagerMixin, unittest.TestCase):
+    """XERK-467 [C]: the dsh arms of send_input / notify_session /
+    answer_question, and the dsh-interaction rendezvous. A dsh session is driven
+    over its control socket, not a pane, so these never touch _type_into_pane or
+    the pendingInputs outbox."""
+
+    def _dsh_session(self, sid="dsh1", **extra):
+        sm = self.make_manager()
+        sess = {"id": sid, "status": "running", "agentType": "dsh",
+                "worktreePath": os.path.join(self.tmp, "wt"),
+                # named already, so the input path doesn't start a summary thread
+                "summary": "named", "summaryAttempts": 1}
+        sess.update(extra)
+        sm.registry = [sess]
+        ctl = _FakeDshControl()
+        sm.dsh_controls[sid] = ctl
+        return sm, sess, ctl
+
+    def test_send_input_delivers_a_user_sourced_followup(self):
+        sm, sess, ctl = self._dsh_session()
+        sm.send_input("dsh1", "hello dsh")
+        self.assertEqual(ctl.inputs, [("hello dsh", "user")])
+        # A dsh session keeps NO pendingInputs outbox — the event log is
+        # append-only, so there is no pane compaction to guard against.
+        self.assertNotIn("pendingInputs", sess)
+        # And nothing was typed into a pane.
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_send_input_refuses_past_input_max_chars(self):
+        sm, sess, ctl = self._dsh_session()
+        sm.send_input("dsh1", "x" * (ha.INPUT_MAX_CHARS + 1))
+        self.assertEqual(ctl.inputs, [])
+
+    def test_notify_delivers_machine_sourced_with_inbox_prefix(self):
+        sm, sess, ctl = self._dsh_session()
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            self.assertTrue(sm.notify_session("dsh1", "PR review activity"))
+        self.assertEqual(len(ctl.inputs), 1)
+        text, kind = ctl.inputs[0]
+        self.assertEqual(kind, "machine")
+        self.assertTrue(text.startswith(ha.INBOX_PREFIX))
+        self.assertIn("PR review activity", text)
+
+    def test_notify_opt_out_falls_back_operator_framed(self):
+        sm, sess, ctl = self._dsh_session()
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: True):
+            # Peer messages refused -> delivered operator-framed, returns False
+            # (it did NOT go to the peer/inbox channel), and carries no prefix.
+            self.assertFalse(sm.notify_session("dsh1", "conflict nudge"))
+        self.assertEqual(len(ctl.inputs), 1)
+        text, kind = ctl.inputs[0]
+        self.assertEqual(kind, "user")
+        self.assertFalse(text.startswith(ha.INBOX_PREFIX))
+
+    def test_interaction_renders_a_question_file_and_answers_it(self):
+        sm, sess, ctl = self._dsh_session()
+        sm._on_dsh_interaction("dsh1", {
+            "evt": "interaction", "requestId": "req-9", "kind": "question",
+            "prompt": "Which approach?",
+            "options": [{"number": 1, "label": "A"}, {"number": 2, "label": "B"}]})
+        req_path, _ = sm._question_paths("dsh1")
+        with open(req_path) as f:
+            req = json.load(f)
+        self.assertEqual(req["question"], "Which approach?")
+        self.assertEqual([o["label"] for o in req["options"]], ["A", "B"])
+        self.assertEqual(req["_dshRequestId"], "req-9")
+        # _hook_question renders it like any AskUserQuestion (no client change).
+        hq = ha._hook_question("dsh1")
+        self.assertIsNotNone(hq)
+        self.assertEqual(hq["question"], "Which approach?")
+        # Answering sends the answer frame over the socket and clears the file.
+        sm.answer_question("dsh1", 1, None)
+        self.assertEqual(ctl.answers, [("req-9", 1, None, None)])
+        self.assertFalse(os.path.exists(req_path))
+
+    def test_approval_interaction_gets_default_options(self):
+        sm, sess, ctl = self._dsh_session()
+        sm._on_dsh_interaction("dsh1", {
+            "evt": "interaction", "requestId": "ap-1", "kind": "approval",
+            "prompt": "", "detail": "Bash"})
+        req_path, _ = sm._question_paths("dsh1")
+        with open(req_path) as f:
+            req = json.load(f)
+        self.assertEqual([o["label"] for o in req["options"]], ["Approve", "Reject"])
+        self.assertTrue(req["question"])           # a non-empty synthesized prompt
+        self.assertEqual(req["header"], "Bash")
+
+    def test_interaction_end_clears_matching_request(self):
+        sm, sess, ctl = self._dsh_session()
+        sm._on_dsh_interaction("dsh1", {
+            "evt": "interaction", "requestId": "req-9", "kind": "question",
+            "prompt": "Q", "options": []})
+        req_path, _ = sm._question_paths("dsh1")
+        self.assertTrue(os.path.exists(req_path))
+        # A stale end for a DIFFERENT request must not clear the live one.
+        sm._on_dsh_interaction_end("dsh1", {"requestId": "other"})
+        self.assertTrue(os.path.exists(req_path))
+        # The matching end clears it.
+        sm._on_dsh_interaction_end("dsh1", {"requestId": "req-9"})
+        self.assertFalse(os.path.exists(req_path))
+
+    def test_teardown_kills_control_and_tail(self):
+        sm, sess, ctl = self._dsh_session()
+        class _FakeTail:
+            def __init__(self): self.stopped = False
+            def stop(self): self.stopped = True
+        tail = _FakeTail()
+        sm.dsh_tails["dsh1"] = tail
+        # Teardown must also unlink the per-session socket and the 0600 env file
+        # (which holds the model API key) so they don't accumulate per session.
+        dsh_dir = os.path.join(self.tmp, "dshsock")
+        os.makedirs(dsh_dir, exist_ok=True)
+        sock_f = os.path.join(dsh_dir, "dsh1.sock")
+        env_f = os.path.join(dsh_dir, "dsh1.env")
+        open(sock_f, "w").close()
+        open(env_f, "w").close()
+        with mock.patch.object(ha, "DSH_SOCKET_DIR", dsh_dir):
+            sm._teardown_dsh("dsh1", kill=True)
+        self.assertTrue(ctl.killed)
+        self.assertTrue(ctl.closed)
+        self.assertTrue(tail.stopped)
+        self.assertFalse(os.path.exists(sock_f))
+        self.assertFalse(os.path.exists(env_f))
+        self.assertNotIn("dsh1", sm.dsh_controls)
+        self.assertNotIn("dsh1", sm.dsh_tails)
+
+    def test_dsh_state_records_working_signal(self):
+        sm, sess, ctl = self._dsh_session()
+        sm._on_dsh_state("dsh1", {"evt": "state", "status": "running"})
+        self.assertEqual(sm.dsh_status["dsh1"], "running")
+
+
 class TestStartedAt(ManagerMixin, unittest.TestCase):
     """The heartbeat's startedAt: docker's StartedAt where it answers, else the
     manager's own start — never empty. The hub's restart-loop alert keys on this
@@ -5929,8 +6091,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
 
     def test_spawn_dsh_records_the_runtime_then_the_launcher_guard_fires(self):
         # With the host opted in, the choice flows end-to-end onto the record and
-        # the payload — but until the dsh launcher lands (XERK-466) the launch
-        # choke point refuses rather than launch claude under a dsh label.
+        # the payload. The dsh launcher (XERK-467) then refuses to launch when the
+        # dsh profile isn't prepared — no model route / unbuilt plugin / not yet
+        # primed — rather than launch claude under a dsh label. Here nothing
+        # primed self._dsh_profile_ready, so the readiness guard fires.
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         with mock.patch.object(ha, "dsh_configured", lambda: True):
@@ -5941,7 +6105,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             sm._session_payload(sess, refresh=False)["agentType"], "dsh")
         # No claude was launched for it — the guard set the error card instead.
         self.assertEqual(sess["status"], "error")
-        self.assertIn("XERK-466", sess["errorMsg"])
+        self.assertIn("not ready", sess["errorMsg"])
 
     def test_heartbeat_reports_the_dsh_capability_flag(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
