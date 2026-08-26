@@ -520,10 +520,12 @@ function paintDetail() {
   const site = lastSites.find(x => x.siteKey === s.siteKey);
   const agentPin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
   const modelPin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
-  // What the Agent/Model rows are showing, so refreshOpenTicket can repaint only
-  // when a pin actually moved (same story as the repoGuess `shown` fingerprint).
+  const runtimePin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
+  // What the Agent/Model/Runtime rows are showing, so refreshOpenTicket can
+  // repaint only when a pin actually moved (same story as the repoGuess `shown`).
   s.agentPinShown = agentPin ? agentPin.host : "";
   s.modelPinShown = modelPin ? modelPin.model : "";
+  s.runtimePinShown = runtimePin ? runtimePin.runtime : "";
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
@@ -546,6 +548,12 @@ function paintDetail() {
     modelEditing: s.modelEditing,
     modelError: s.modelError,
     models: (site && site.models) || null,
+    // The runtime pin is hub-owned too (XERK-473); "dsh" is offerable only when
+    // the org has a dsh-capable host (site.dshAvailable, off the merged block).
+    runtimePin,
+    runtimeEditing: s.runtimeEditing,
+    runtimeError: s.runtimeError,
+    dshAvailable: !!(site && site.dshAvailable),
     // The status change writes back to Jira/Azure via the heartbeat command
     // path, so — like the Repo override, unlike the hub-owned agent/model pins —
     // it needs an online host AND the fetched detail (its statusOptions) to be
@@ -566,6 +574,10 @@ function paintDetail() {
   }
   if (s.modelEditing) {
     const sel = $panel.querySelector("[data-model-select]");
+    if (sel) sel.focus();
+  }
+  if (s.runtimeEditing) {
+    const sel = $panel.querySelector("[data-runtime-select]");
     if (sel) sel.focus();
   }
   if (s.statusEditing) {
@@ -616,13 +628,15 @@ function refreshOpenTicket() {
   // last drew rather than against the rebuilt ticket.
   const pin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
   const mpin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
+  const rpin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
   const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
     (pin ? pin.host : "") !== (s.agentPinShown || "") ||
-    (mpin ? mpin.model : "") !== (s.modelPinShown || "");
+    (mpin ? mpin.model : "") !== (s.modelPinShown || "") ||
+    (rpin ? rpin.runtime : "") !== (s.runtimePinShown || "");
   s.ticket = fresh;
   // No picker may be swapped out from under an operator mid-edit.
   if (changed && !s.editing && !s.agentEditing && !s.modelEditing &&
-      !s.statusEditing) paintDetail();
+      !s.runtimeEditing && !s.statusEditing) paintDetail();
 }
 
 // The operator's own answer to which HOST the ticket's sessions spawn on
@@ -695,6 +709,41 @@ async function saveModel(value) {
     else tm[k] = { model: body.model, at: Date.now() };
   } else if (openTicketState === s) {
     s.modelError = err;
+  }
+  if (openTicketState === s) paintDetail();
+}
+
+// The operator's own answer to which RUNTIME the ticket's session runs on
+// (XERK-473). Same posture as saveModel: hub-owned, POST is authoritative, the
+// SSE broadcast keeps other boards in step. "claude" releases the pin.
+async function saveRuntime(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = { runtime: value };
+  s.runtimeEditing = false;
+  s.runtimeError = "";
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/runtime`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const tr = cache.ticketRuntimes || (cache.ticketRuntimes = {});
+    const k = `${s.siteKey}/${s.key}`;
+    if (value === "claude") delete tr[k];
+    else tr[k] = { runtime: value, at: Date.now() };
+  } else if (openTicketState === s) {
+    s.runtimeError = err;
   }
   if (openTicketState === s) paintDetail();
 }
@@ -971,6 +1020,15 @@ $panel.addEventListener("click", (e) => {
     openTicketState.modelEditing = false;
     return paintDetail();
   }
+  if (e.target.closest("[data-runtime-edit]")) {
+    openTicketState.runtimeEditing = true;
+    openTicketState.runtimeError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-runtime-cancel]")) {
+    openTicketState.runtimeEditing = false;
+    return paintDetail();
+  }
   if (e.target.closest("[data-status-edit]")) {
     openTicketState.statusEditing = true;
     openTicketState.statusError = "";   // a new attempt clears the old complaint
@@ -1016,6 +1074,17 @@ $panel.addEventListener("change", (e) => {
       return paintDetail();
     }
     return void saveModel(msel.value);
+  }
+  // The runtime picker follows the same contract (XERK-473).
+  const rsel = e.target.closest("[data-runtime-select]");
+  if (rsel) {
+    const pin = B.runtimePinOf(cache && cache.ticketRuntimes,
+      openTicketState.siteKey, openTicketState.key);
+    if (rsel.value === B.runtimePickerValue(pin)) {
+      openTicketState.runtimeEditing = false;
+      return paintDetail();
+    }
+    return void saveRuntime(rsel.value);
   }
   // The status picker follows the same contract; its "keep current" first
   // option is the no-op (XERK-138).
@@ -1163,6 +1232,14 @@ function connectSSE() {
     try { tm = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketModels = tm;
+    scheduleRender();
+  });
+  // A ticket->runtime pin changed (XERK-473) — same tiny-whole-map pattern.
+  es.addEventListener("ticketRuntimes", (e) => {
+    let tr;
+    try { tr = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketRuntimes = tr;
     scheduleRender();
   });
   // The hub's ticket queue changed (XERK-296) — a ticket queued, dispatched or

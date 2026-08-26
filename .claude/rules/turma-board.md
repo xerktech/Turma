@@ -241,10 +241,10 @@ Waiting work is a queued TICKET on the hub, and its host is chosen at dispatch. 
   so a doomed fetch isn't re-queued. The fetched copy wins field-by-field; its text is plain, so the
   panel escapes before linkifying.
 
-#### The row pickers — one pattern, four rows
+#### The row pickers — one pattern, five rows
 
-The Repo / Agent / Model / Status rows each swap in place for a `<select>` on **"Change"**. All four
-share the rules below; each row's subsection carries only its deltas.
+The Repo / Agent / Model / Runtime / Status rows each swap in place for a `<select>` on **"Change"**.
+All five share the rules below; each row's subsection carries only its deltas.
 
 - **Choosing an option IS the save** — every option is a complete answer, so picking one commits and
   closes; **Cancel** is the way out. No Save button: with one, closing the panel discarded the
@@ -304,6 +304,21 @@ the Start button AND the auto-start sweep.
   omits `model`. The picker offers the curated menu (`modelChoices`/`prettyModel`); an un-probed org
   falls back to the static aliases, never an empty menu.
 - Tests: `server.test.js`; `modelPinOf`/`modelPickerHtml`/`modelChoices` in `board.test.js`.
+
+##### Runtime row (XERK-473)
+
+- **Which RUNTIME the session runs on** — "Claude Code" (default) or "dsh" (XERK-460). Hub-owned
+  durable like the Model row (`ticketRuntimes` → the `spawnTicket` command's **`agentType`**), so it
+  needs no online host to edit. `{runtime:"dsh"}` pins; `{runtime:"claude"}` or `{auto:true}` release
+  (only the non-default is stored). The full picture — the pin, the `orgOffersDsh` gate, and the
+  `findTicketHost` runtime-capability filter that routes a dsh ticket only to a dsh-capable host — is
+  in `.claude/rules/dsh.md`'s **[I] (XERK-473)** section.
+- **"dsh" is offered only when the org offers it** (`site.dshAvailable`, from any reporting host's
+  `dsh.available` via `mergeSites`), so the picker can't name a runtime the hub would refuse — but an
+  existing dsh pin is always carried back so it can be released even after the last dsh host leaves.
+- **Deferred on Android** to XERK-477 (an `android/PARITY.md` line), the way the dsh card badge was.
+- Tests: `server.test.js` (the `/runtime` route + the dsh `findTicketHost` cases);
+  `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml` in `board.test.js`.
 
 ##### Status row (XERK-138) — the one detail control that writes BACK to the tracker
 

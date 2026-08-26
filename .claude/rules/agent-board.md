@@ -216,7 +216,13 @@ lives in `hub-agent.py`; the hub/UI half is `.claude/rules/turma-board.md`.
   the answer. Tests: `TestTicketLedger`.
 - A ticket-backed session is **named from its ticket** instead of paying a `claude -p`. A failed
   fetch raises to `handle_commands`, which logs and acks.
-- Tests: `TestSpawnTicket`, `TestBuildTicketPrompt`.
+- **A ticket can run on the dsh RUNTIME** (XERK-473): the hub's per-ticket runtime pin rides the
+  command as `agentType`, which `spawn_ticket` forwards to `spawn()` (validated by
+  `resolve_agent_type`, `dsh`-refused where dsh is not configured). The launch choke point already
+  dispatches on `agentType`, and `_launch_dsh` already appends the ticket-branch directive and
+  delivers the built ticket prompt + attachments — so a dsh ticket session needs NO new launch code.
+  The hub only routes a dsh ticket to a `dsh.available` host (`.claude/rules/dsh.md` [I]).
+- Tests: `TestSpawnTicket` (incl. the runtime-pin cases), `TestBuildTicketPrompt`.
 
 ### Ticket branch naming
 

@@ -13521,7 +13521,7 @@ class SessionManager:
             return None
         return branch
 
-    def spawn_ticket(self, issue_key, cmd_id=None, model=None):
+    def spawn_ticket(self, issue_key, cmd_id=None, model=None, agent_type=None):
         """Spawn a session to work a ticket (Jira or Azure DevOps) — the board's
         per-card start button.
 
@@ -13531,6 +13531,17 @@ class SessionManager:
         with the login's default model, exactly as before. It is validated the
         same way a composer spawn's model is — resolve_model in spawn() — so a
         model this host can't run fails as an error card rather than silently.
+
+        `agent_type` is the operator's per-ticket runtime pin (XERK-473), carried
+        on the command for the same reason: "dsh" (XERK-460) or None/"claude".
+        The hub's dispatch (findTicketHost) has already routed this ticket only
+        to a host that offers the requested runtime, but it is re-validated here
+        like model — resolve_agent_type in spawn() — and a dsh spawn on a host
+        where dsh is not ready fails as an error card (_launch_dsh raises). The
+        ticket's branch, prompt and attachments reach _launch_dsh unchanged: the
+        launch choke point dispatches on agentType and the dsh launcher already
+        appends the ticket-branch directive (told its branch, cuts it itself,
+        worktree stays detached).
 
         Everything is re-derived from LOCAL state rather than trusted from the
         command: the hub only chooses which host (an online one reporting the org,
@@ -13621,7 +13632,8 @@ class SessionManager:
         # names the attachments this ticket's session downloads for itself, and
         # those land under the session id spawn() is about to mint (XERK-242).
         self.spawn(repo_name, ticket_detail=detail, ticket=ticket,
-                   model=model, cmd_id=cmd_id, await_clone=await_clone,
+                   model=model, agent_type=agent_type, cmd_id=cmd_id,
+                   await_clone=await_clone,
                    await_clone_owner=(entry.get("nameWithOwner") if await_clone
                                       else None))
 
@@ -18932,7 +18944,8 @@ class SessionManager:
                     )
                 elif ctype == "spawnTicket":
                     self.spawn_ticket(cmd.get("issueKey"), cmd_id=cid,
-                                      model=cmd.get("model"))
+                                      model=cmd.get("model"),
+                                      agent_type=cmd.get("agentType"))
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
                 elif ctype == "start":

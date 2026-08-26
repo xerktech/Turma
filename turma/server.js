@@ -118,6 +118,15 @@ const TICKET_AGENTS_MAX = 500;
 // resolves at spawn, never a raw model id.
 const TICKET_MODELS_FILE = process.env.TICKET_MODELS_FILE || "/data/ticket-models.json";
 const TICKET_MODELS_MAX = 500;
+// Ticket -> runtime pins (XERK-473): which RUNTIME a ticket's session runs on —
+// "claude" (the default) or "dsh" (XERK-460). Like the model pin this is
+// hub-owned durable state on /data: the runtime is carried on the spawnTicket
+// command as `agentType`, so the hub must remember it across a restart, and it
+// also decides WHICH hosts the dispatch may route to — only a host that offers
+// the dsh runtime can run a dsh-pinned ticket (findTicketHost). Only a non-default
+// ("dsh") choice is stored; clearing (or "claude") releases back to the default.
+const TICKET_RUNTIMES_FILE = process.env.TICKET_RUNTIMES_FILE || "/data/ticket-runtimes.json";
+const TICKET_RUNTIMES_MAX = 500;
 // Per-org auto opt-in (XERK-41): which Jira orgs let the board drive their whole
 // session lifecycle — auto-START a session for every To Do ticket that has a repo
 // (XERK-41), and auto-STOP a session when its ticket moves to Done (XERK-45; see
@@ -1223,6 +1232,69 @@ function setTicketModel(siteKey, issueKey, model) {
   sseBroadcast("ticketModels", ticketModels);
 }
 
+// ---- ticket -> runtime pins (XERK-473) -------------------------------------
+// The operator's answer to which RUNTIME a ticket's session runs on — "claude"
+// (the default) or "dsh" (XERK-460). Keyed "<siteKey>/<issueKey>" like the model
+// pin; each entry {runtime, at}. Hub-owned and durable for the same reason: the
+// runtime is delivered on the spawnTicket command the hub routes (as `agentType`),
+// so the hub must remember the choice across a restart. Only a NON-default ("dsh")
+// choice is stored — "claude" and clearing both release the pin — so a ticket with
+// no runtime choice rides exactly the command it always did.
+let ticketRuntimes = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TICKET_RUNTIMES_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketRuntimes = parsed;
+} catch {
+  /* first boot or no volume mounted */
+}
+let trSaveTimer = null;
+function scheduleTicketRuntimesSave() {
+  if (trSaveTimer) return;
+  trSaveTimer = setTimeout(() => {
+    trSaveTimer = null;
+    fs.mkdir(path.dirname(TICKET_RUNTIMES_FILE), { recursive: true }, () => {
+      fs.writeFile(TICKET_RUNTIMES_FILE, JSON.stringify(ticketRuntimes), (err) => {
+        if (err) console.error(`ticket-runtimes save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  trSaveTimer.unref();
+}
+function ticketRuntimePin(siteKey, issueKey) {
+  const p = ticketRuntimes[`${siteKey}/${issueKey}`];
+  return p && typeof p.runtime === "string" && p.runtime ? p : null;
+}
+// Set or clear a ticket's pinned runtime. `runtime` null or "claude" clears it
+// (claude is the default — nothing to store). The caller has already validated
+// the value against {claude, dsh} and, for dsh, that the org offers it; this
+// owns the map's bookkeeping and eviction.
+function setTicketRuntime(siteKey, issueKey, runtime) {
+  const k = `${siteKey}/${issueKey}`;
+  if (!runtime || runtime === "claude") delete ticketRuntimes[k];
+  else {
+    ticketRuntimes[k] = { runtime, at: Date.now() };
+    const keys = Object.keys(ticketRuntimes);
+    if (keys.length > TICKET_RUNTIMES_MAX) {
+      keys.sort((a, b) => (ticketRuntimes[a].at || 0) - (ticketRuntimes[b].at || 0));
+      for (const old of keys.slice(0, keys.length - TICKET_RUNTIMES_MAX)) {
+        delete ticketRuntimes[old];
+      }
+    }
+  }
+  scheduleTicketRuntimesSave();
+  invalidateAgentsCache();
+  sseBroadcast("ticketRuntimes", ticketRuntimes);
+}
+// Whether any host reporting `siteKey` offers the dsh runtime — the org-level
+// capability the runtime pin's dsh option is gated on, both here (rejecting a
+// dsh pin no host could honour) and on the board (hiding the option). Unioned
+// across the org's hosts online or not, mirroring orgModelAliases: a host that
+// offers dsh while briefly offline still means the org can run it.
+function orgOffersDsh(siteKey) {
+  return Object.values(agents).some(
+    (a) => a && a.jira && a.jira.siteKey === siteKey && dshAvailable(a));
+}
+
 // The set of model aliases a ticket may be pinned to for an org: the aliases the
 // org's hosts actually probed available, unioned across every reporting host,
 // dropped to the non-bracketed ones (a bracketed "[1m]" alias is a live-switch
@@ -1718,7 +1790,7 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, autoStartOrgs, orgColors,
+    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, autoStartOrgs, orgColors,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -3517,15 +3589,28 @@ function hostTriagedTicket(a, issueKey, repo) {
 function findTicketHost(siteKey, repo, issueKey, opts) {
   const requireFree = !!(opts && opts.requireFree);
   const now = Date.now();
+  // Which runtime this ticket is pinned to run on (XERK-473). "dsh" restricts
+  // the pool to hosts that offer the dsh runtime — a host without it can no more
+  // run a dsh ticket than one that triaged a different repo, so this filters
+  // beside the triage check and yields its own distinct refusal below.
+  const runtimePin = issueKey ? ticketRuntimePin(siteKey, issueKey) : null;
+  const wantDsh = !!(runtimePin && runtimePin.runtime === "dsh");
   let anyOrg = false, anyOnline = false;
-  // Vacuously satisfied when there is no ticket to have triaged.
+  // Vacuously satisfied when there is no ticket to have triaged / no dsh need.
   let anyTriaged = !issueKey;
+  let anyRuntimeCapable = !wantDsh;
   const cloned = [], uncloned = [];
   for (const [key, a] of Object.entries(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
     anyOrg = true;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     anyOnline = true;
+    // A host that cannot run the requested runtime is out of the running
+    // entirely — checked ahead of triage and capacity so `anyRuntimeCapable`
+    // counts hosts that COULD run it, separating "no host offers dsh" (blocked,
+    // a freed slot would not help) from the triage and full refusals.
+    if (wantDsh && !dshAvailable(a)) continue;
+    anyRuntimeCapable = true;
     // Ahead of the capacity filter so `anyTriaged` counts hosts that could run
     // this ticket if they had room, which is what separates the two refusals
     // below: "nothing can run it" (blocked — a freed slot would not help) from
@@ -3557,6 +3642,13 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
       return { status: 503, full: true, error:
         `this ticket is pinned to agent "${pin.host}", which has no free session slot` };
     }
+    // The pinned host cannot run the requested runtime — reported, not routed
+    // around, exactly like the triage refusal just below it. Blocked, never
+    // full: a slot freeing on that host does not give it dsh.
+    if (wantDsh && !dshAvailable(a)) {
+      return { status: 503, error:
+        `this ticket is pinned to agent "${pin.host}", which does not offer the dsh runtime` };
+    }
     // The pin says WHICH host, never that the host can run it — reported rather
     // than routed around, exactly like every other pin refusal.
     //
@@ -3579,6 +3671,13 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
   }
   if (!anyOnline) {
     return { status: 503, error: "every host reporting that Jira org is offline" };
+  }
+  // Not `full`: a slot freeing does not give a host the dsh runtime, so this
+  // holds as `blocked` and ages out rather than waiting for capacity that would
+  // not help — the same shape as the untriaged refusal below.
+  if (!anyRuntimeCapable) {
+    return { status: 503, error:
+      "no online host reporting that Jira org offers the dsh runtime" };
   }
   // Not `full`: a slot coming free does not give a host a triage decision, so
   // this holds on the queue as `blocked` and ages out rather than waiting for a
@@ -6270,6 +6369,11 @@ function drainTicketQueue() {
     // from the Start button — read at DISPATCH so a pin changed while the ticket
     // waited is the one that takes effect.
     const mpin = ticketModelPin(e.siteKey, e.issueKey);
+    // The runtime pin (XERK-473) rides the command as `agentType`, read at
+    // DISPATCH like the model pin so a pin changed while the ticket waited takes
+    // effect. findTicketHost has already restricted the pool to a host that
+    // offers it, so this only carries the choice; omitted (claude) by default.
+    const rpin = ticketRuntimePin(e.siteKey, e.issueKey);
     // `ticketSource`/`ticketSite` ride the command as hub-only bookkeeping
     // (stripped by publicCommands): the entry leaves the queue here, so they are
     // the only record of what KIND of work this was and WHOSE org it was
@@ -6277,7 +6381,8 @@ function drainTicketQueue() {
     // before taking it (XERK-303).
     queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ticketSource: e.source, ticketSite: e.siteKey,
-      ...(mpin ? { model: mpin.model } : {}) });
+      ...(mpin ? { model: mpin.model } : {}),
+      ...(rpin ? { agentType: rpin.runtime } : {}) });
     rememberDispatch(e.siteKey, e.issueKey);
     const wait = Math.round((now - e.at) / 1000);
     console.log(`ticket queue: dispatched ${logName(e.issueKey)} to ${logName(host)}`
@@ -9391,10 +9496,14 @@ const server = http.createServer(async (req, res) => {
       // Omitted when unpinned, so a ticket with no model choice spawns exactly as
       // it always did (the agent's default model).
       const mpin = ticketModelPin(siteKey, issueKey);
+      // The runtime pin (XERK-473) rides as `agentType`; findTicketHost above
+      // already ensured `host` offers it. Omitted (claude) when unpinned.
+      const rpin = ticketRuntimePin(siteKey, issueKey);
       const cmdId = pending ? pending.cmdId
         : queueCommand(host, { type: "spawnTicket", issueKey,
             ticketSource: "manual", ticketSite: siteKey,
-            ...(mpin ? { model: mpin.model } : {}) });
+            ...(mpin ? { model: mpin.model } : {}),
+            ...(rpin ? { agentType: rpin.runtime } : {}) });
       // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
       // a board that hadn't seen the queue yet clicked Start). Its session is
       // starting now, so its place in line is spent — leaving it there would
@@ -9573,6 +9682,44 @@ const server = http.createServer(async (req, res) => {
       }
       setTicketModel(siteKey, issueKey, auto ? null : raw);
       return json(res, 200, { ok: true, model: auto ? null : raw });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/runtime — pin which RUNTIME this
+    // ticket's session runs on (XERK-473). Body: {runtime:"claude"|"dsh"}, where
+    // "claude" (or {auto:true}) releases back to the default. Hub-owned durable
+    // state exactly like the /model pin — the runtime rides the spawnTicket
+    // command as `agentType`, so this is authoritative the moment it returns
+    // (a 200). A "dsh" pin is refused unless the org actually offers dsh, so it
+    // can't name a runtime no session could run; the agent still re-validates
+    // (resolve_agent_type) and the dispatch (findTicketHost) routes it only to a
+    // host that offers it.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "runtime") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (body.runtime != null && typeof body.runtime !== "string") {
+        return json(res, 400, { error: "body needs {runtime} or {auto:true}" });
+      }
+      const raw = typeof body.runtime === "string" ? body.runtime.trim().toLowerCase() : "";
+      // "claude" is the default, so pinning to it is a release — same landing as
+      // {auto:true} or an empty value, rather than storing a "claude" pin.
+      const auto = body.auto === true || raw === "claude" || raw === "";
+      if (!auto && raw !== "dsh") {
+        return json(res, 400, { error: "runtime must be claude or dsh" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      if (!auto && !orgOffersDsh(siteKey)) {
+        return json(res, 400, { error: "no host reporting this org offers the dsh runtime" });
+      }
+      setTicketRuntime(siteKey, issueKey, auto ? null : raw);
+      return json(res, 200, { ok: true, runtime: auto ? "claude" : raw });
     }
 
     // POST /api/jira/<siteKey>/autostart — flip an org's auto-start opt-in
@@ -10200,6 +10347,10 @@ if (process.env.TURMA_TEST) {
     ticketModelPin,
     setTicketModel,
     orgModelAliases,
+    ticketRuntimes,
+    ticketRuntimePin,
+    setTicketRuntime,
+    orgOffersDsh,
     findTicketHost,
     hostHasFreeSlot,
     // The hub-side ticket queue (XERK-296) — the array itself, so a test can see
