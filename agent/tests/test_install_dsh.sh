@@ -15,7 +15,7 @@ INSTALL="$(dirname "$HERE")/native/install.sh"
 WORK="$(mktemp -d)"
 FAILED=0
 
-# shellcheck disable=SC2317  # invoked indirectly, via the EXIT trap below.
+# shellcheck disable=SC2317,SC2329  # invoked indirectly, via the EXIT trap below.
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
