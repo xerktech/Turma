@@ -4,27 +4,28 @@ Written for the next QA agent. Everything here was learned the hard way during
 XERK-235 (the first full-app QA pass). If you find a new trap, add it — the point
 of this file is that nobody pays the same hour twice.
 
-Read this **before** `.claude/skills/verify/SKILL.md`. That skill assumes the
-**agent container**; this file covers the TrueNAS-native host most sessions
-actually run on, where several of its recipes do not apply as written.
+Read this **before** `.claude/skills/verify/SKILL.md`. The agent runs NATIVELY on
+every host now (the container image was removed); this file covers the
+TrueNAS-native host most sessions actually run on, where several of that skill's
+recipes do not apply as written.
 
 ---
 
 ## 0. Know which box you are on
 
-Turma runs its fleet two ways, and they are not interchangeable:
+The fleet runs the agent natively; the two hosts you QA on differ in toolchain:
 
-| | agent container | TrueNAS native | WSL workstation (`MaxAI`) |
-|---|---|---|---|
-| `npm` / `npx` | on PATH | **not on PATH** — see below | on PATH |
-| `java`, `gradle`, Android SDK | bundled | **absent** | **installed** — see §2.5 |
-| emulator / `adb` | only the `:emulator` tag | absent | **a running AVD** |
-| `apt`, writable `/usr` | yes | **no** — read-only, no sudo | yes, with sudo |
-| `ps` / `pkill` | absent | present | present |
-| `~/.claude`, `~/.turma` | bind mounts | the operator's real ones | the operator's real ones |
+| | TrueNAS native | WSL workstation (`MaxAI`) |
+|---|---|---|
+| `npm` / `npx` | **not on PATH** — see below | on PATH |
+| `java`, `gradle`, Android SDK | **absent** | **installed** — see §2.4 |
+| emulator / `adb` | absent | **a running AVD** |
+| `apt`, writable `/usr` | **no** — read-only, no sudo | yes, with sudo |
+| `ps` / `pkill` | present | present |
+| `~/.claude`, `~/.turma` | the operator's real ones | the operator's real ones |
 
-Check with `which java gradle npm adb` before you plan anything. Assuming the
-container's toolchain on a native host is the single most common way to waste
+Check with `which java gradle npm adb` before you plan anything. Assuming a full
+toolchain on the TrueNAS host is the single most common way to waste
 a QA session — and assuming the TrueNAS host's *absences* on the WSL
 workstation is the second, because it sends you into a docker pull and an
 emulator download you don't need.
@@ -45,8 +46,7 @@ emulator download you don't need.
   "npm-managed?" takes the `claude update` path on this host.
 - **npm's cache must be redirected** — `/root/.npm` is root-owned and npm dies
   with EACCES: `npm ci --cache /tmp/claude-0/npm-cache`.
-- **`bun` is available** at `/root/.local/bin/bun` — this is what `veiller/`
-  builds and tests with.
+- **`bun` is available** at `/root/.local/bin/bun`, if a component needs it.
 - **No `java`/`gradle`/`adb`.** Android work must happen inside the agent image
   (see §2.5).
 - **`/tmp` is `noexec`.** Write scratch files there freely, but anything that
@@ -54,16 +54,15 @@ emulator download you don't need.
   `/root/.local`.
 - **`/etc` is mounted read-only** (`boot-pool/ROOT/<ver>/etc`, `ro`), hardened
   after the incident in §1.
-- Those two together **fail six of the agent's shell suites for environmental
-  reasons only** — `test_bootstrap`, `test_entrypoint`, `test_install_sudo`,
+- Those two together **fail five of the agent's shell suites for environmental
+  reasons only** — `test_bootstrap`, `test_install_sudo`,
   `test_turma_agent`, `test_turma_agent_update`, `test_turma_agentctl`. They
   install into a temp prefix and `exec` what they installed, so `noexec /tmp`
-  makes them die with `setsid: Permission denied`, and `test_entrypoint` also
-  tries to `cp` a `tmux.conf` into the read-only `/etc`. **Do not file these as
-  regressions.** Point `TMPDIR` at an exec-capable filesystem and all six pass:
+  makes them die with `setsid: Permission denied`. **Do not file these as
+  regressions.** Point `TMPDIR` at an exec-capable filesystem and all five pass:
   ```bash
   mkdir -p /mnt/data/tmp-qa && export TMPDIR=/mnt/data/tmp-qa
-  cd agent && for t in tests/test_*.sh; do bash "$t"; done   # all 6 OK
+  cd agent && for t in tests/test_*.sh; do bash "$t"; done   # all 5 OK
   ```
   CI runs them on `ubuntu-latest`, where neither constraint exists.
 - `docker` works and can pull from ghcr.
@@ -183,7 +182,7 @@ cd agent
 python3 -m unittest tests.test_hub_agent                       # 1138 pass, ~14s
 python3 -m unittest tests.test_guard tests.test_guard_settings tests.test_ask   # 108 pass
 node --test tests/tunnel-agent.test.js                         # 95 pass
-for t in tests/test_*.sh; do bash "$t"; done                   # native/entrypoint suites
+for t in tests/test_*.sh; do bash "$t"; done                   # native install/launcher suites
 ```
 
 **There is no pytest.** `python3 -m unittest` is the only runner.
@@ -224,36 +223,33 @@ npm run build                                                  # glasses-ci gate
 
 `src/vendor/vendor.test.ts` asserts `chat.cjs`/`board.cjs` are **byte-identical**
 to their `turma/public/` sources. Editing `turma/public/chat.js` without
-re-copying both vendored files fails here and in `veiller-ci` — verified by
+re-copying the vendored files fails here in `glasses-ci` — verified by
 mutating one byte.
 
-### 2.4 Veiller (`veiller/`) — bun
+### 2.4 Android (`android/`) — inside a JDK/Android toolchain container, and it does work
 
-```bash
-cd veiller && bun install && bun test                          # baseline: 344 pass
-bun run typecheck                                              # needs devDeps installed first
-bun run build                                                  # veiller-ci gates on this too
-```
+> **NOTE (agent image removed):** the `ghcr.io/xerktech/turma-agent` image this
+> section used to build Android in is **no longer built** — the agent is
+> native-only now. On a host with a JDK the WSL-native path below is the reliable
+> route, and `.github/workflows/android-ci.yml` is the authoritative spec. To
+> build inside a container on TrueNAS, use a **public JDK 17 + Android SDK image**
+> that carries Gradle 8.11.1, `platforms/android-35` and `build-tools/35.0.0`; the
+> mechanics below still apply, minus the agent image's own-entrypoint trap.
+> Revisiting this section for the native-only model is tracked separately.
 
-`bun run typecheck` calls bare `tsc`, so it fails with `command not found`
-until `bun install` has run.
-
-### 2.5 Android (`android/`) — inside the agent image, and it does work
-
-There is no JDK on this host, but the **whole `android-ci` gate runs locally** in
-`ghcr.io/xerktech/turma-agent:latest` in ~3.5 min. Do not report Android as
-unbuildable — that is only true of the *UI*, below. The image already carries
-JDK 17.0.20, Gradle **8.11.1** at `/opt/gradle` (the same version android-ci
-pins) and `/opt/android-sdk` with `platforms/android-35` + `build-tools/35.0.0`,
+The **whole `android-ci` gate runs locally** in a JDK 17 + Android SDK container
+in ~3.5 min. Do not report Android as unbuildable — that is only true of the
+*UI*, below. The toolchain it needs: JDK 17.0.20, Gradle **8.11.1** (the version
+android-ci pins) and an SDK with `platforms/android-35` + `build-tools/35.0.0`,
 so nothing needs downloading in-job:
 
 ```bash
 mkdir -p /mnt/data/tmp-qa/andhome /mnt/data/tmp-qa/gradlehome
-docker run --rm --entrypoint bash \
+docker run --rm \
   -v <checkout>/android:/work \
   -v /mnt/data/tmp-qa/andhome:/andhome -v /mnt/data/tmp-qa/gradlehome:/gradlehome \
   -e ANDROID_USER_HOME=/andhome -e GRADLE_USER_HOME=/gradlehome \
-  ghcr.io/xerktech/turma-agent:latest -c \
+  <jdk17-android-sdk-image> bash -c \
   'cd /work && gradle :app:testDebugUnitTest --no-daemon && gradle :app:assembleDebug --no-daemon'
 ```
 
@@ -263,8 +259,6 @@ Baseline: **281 JVM unit tests** (was 278 before XERK-252), 0 failures, and a ~2
 
 Traps:
 
-- **`--entrypoint bash` is required.** The image's own entrypoint resolves a
-  run-as identity and `setpriv`s; a plain `docker run … bash -lc '…'` just hangs.
 - `assembleDebug` needs `ANDROID_USER_HOME` somewhere writable, or
   `validateSigningDebug` fails creating a debug keystore in `/root/.android`.
   Mount `GRADLE_USER_HOME` too, or every run re-resolves dependencies.
@@ -286,15 +280,14 @@ Traps:
   know the tests really ran against the tree in front of you, add
   `--rerun-tasks` (~46s).
 
-`:latest` is the `android-build` tier — no emulator and no system image **in the
-image** — but you do NOT need the `:emulator` tag (which is not pullable without
-GHCR auth) to drive the app. `/dev/kvm` exists on this host, so add the emulator
-to a throwaway container of `:latest` and boot an AVD (~4 min, mostly download):
+A base JDK+SDK image carries no emulator or system image, but `/dev/kvm` exists
+on this host, so add the emulator to a throwaway container and boot an AVD
+(~4 min, mostly download):
 
 ```bash
 docker run -d --name qa-emu --device /dev/kvm --network host -v /mnt/data/tmp-qa:/gh \
   -e PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/emulator:/usr/bin:/bin \
-  --entrypoint sh ghcr.io/xerktech/turma-agent:latest -c 'sleep 100000'
+  <jdk17-android-sdk-image> sleep 100000
 docker exec qa-emu sh -c 'ANDROID_USER_HOME=/gh/andhome HOME=/gh/emuhome \
   yes | sdkmanager --sdk_root=/opt/android-sdk "emulator" "system-images;android-35;google_apis;x86_64" &&
   ANDROID_USER_HOME=/gh/andhome avdmanager create avd -n qa35 -k "system-images;android-35;google_apis;x86_64" -d pixel_5 --force'
@@ -521,11 +514,10 @@ Three more that each cost a run:
   leaked `/live/<host>/<id>` connection the DOM says nothing about.
 
 How Chrome-in-Docker reaches your hub depends on the box, and the wrong answer
-looks like "CDP is down": **agent container** → `--network container:$CID` (the
-verify skill's recipe); **TrueNAS native host** → `--network host`; **WSL /
-desktop (Docker Desktop)** → neither works (that engine is its own VM, so nothing
-binds on your 127.0.0.1) — publish the port, add a gateway alias, load the hub
-through the alias:
+looks like "CDP is down": **TrueNAS native host** → `--network host`; **WSL /
+desktop (Docker Desktop)** → that doesn't work (that engine is its own VM, so
+nothing binds on your 127.0.0.1) — publish the port, add a gateway alias, load
+the hub through the alias:
 
 ```bash
 docker run -d --name qa-chrome-<ticket> -p 127.0.0.1:9344:9344 \
@@ -693,8 +685,8 @@ all. A green suite proves nothing here; measure it in a browser.
 
 ## 4. Running QA agents in parallel
 
-XERK-235 ran five `qa` subagents at once (hub backend, web UI, python agent,
-glasses+veiller, android). That works, and it is much faster than serial, but
+XERK-235 ran multiple `qa` subagents at once (hub backend, web UI, python agent,
+glasses, android). That works, and it is much faster than serial, but
 give each one:
 
 - **Its own port lane**, stated in the prompt. They all boot hubs.
@@ -880,13 +872,11 @@ Mutation-testing mechanics, since a broken harness reads as a passing one:
 
 Say these are unverified rather than implying otherwise:
 
-- **The Android UI.** `ghcr.io/xerktech/turma-agent:latest` has no emulator or
-  system image. Build, unit tests, lint and APK inspection are reachable;
-  installing and driving the app is not, without the `:emulator` tag or a real
-  device over `adb connect`.
-- **Real G2 glasses / the Even phone app / the Mentra simulator.** The Veiller
-  checkout on this host has no `sdk/miniapp-simulator`, so `sim/walkthrough.ts`
-  and `sim/phone-tour.ts` both exit 1.
+- **The Android UI.** A base JDK+SDK image has no emulator or system image.
+  Build, unit tests, lint and APK inspection are reachable; installing and
+  driving the app is not, without adding an emulator + system image (see §2.4)
+  or a real device over `adb connect`.
+- **Real G2 glasses / the Even phone app.** No hardware or Even Hub on this host.
 - **Real FCM delivery** (needs a device + a service account) and **real Whisper
   STT** (needs `LITELLM_URL`).
 - **The ttyd terminal proxy and the OSC 52 clipboard bridge** — needs a real
@@ -1024,9 +1014,9 @@ EOF
 
 - `jira.source` is `jira` or `azure` — which tracker that host polls, and hence
   whether its PRs are GitHub/GitLab/ADO.
-- `reposRoot` distinguishes a container (`/repos` per DockerOps compose) from a
-  native install (a real host path). **Every agent in this fleet is native** —
-  Portainer shows no `turma-agent` container on any node, only the hub.
+- `reposRoot` is the git root the agent scans — a real host path, since **every
+  agent in this fleet is native**. Portainer shows no `turma-agent` container on
+  any node, only the hub.
 - `github.available:false` means `gh` is absent there, so nothing GitHub-shaped
   can be assumed of it.
 - Ticket URLs in `jira.tickets[].url` reveal the ADO base's **scheme and case**,

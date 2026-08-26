@@ -6,11 +6,9 @@ const M = require("../manifest.js");
 
 const ALL_CHANGED = {
   turma: true,
-  "agent-image": true,
   "agent-native": true,
   glasses: true,
   android: true,
-  veiller: true,
 };
 
 function firstRelease() {
@@ -30,7 +28,6 @@ test("first release: every component fresh and built", () => {
   const m = firstRelease();
   assert.equal(m.schema, 1);
   assert.equal(m.components.turma.ref, "ghcr.io/xerktech/turma:0.3.0");
-  assert.equal(m.components["agent-image"].ref, "ghcr.io/xerktech/turma-agent:0.3.0");
   assert.equal(m.components["agent-native"].asset, "turma-agent-native-v0.3.0.tar.gz");
   assert.equal(m.components["agent-native"].sha256_asset, "turma-agent-native-v0.3.0.tar.gz.sha256");
   assert.equal(m.components.glasses.kind, "evenhub");
@@ -38,9 +35,6 @@ test("first release: every component fresh and built", () => {
   assert.equal(m.components.glasses.asset, undefined); // the portal is the channel, not a release asset
   assert.equal(m.components.android.asset, "turma-android-v0.3.0.apk");
   assert.equal(m.components.android.version_code, 30000);
-  assert.equal(m.components.veiller.kind, "asset");
-  assert.equal(m.components.veiller.asset, "turma-veiller-v0.3.0.zip");
-  assert.equal(m.components.veiller.release_tag, "v0.3.0");
   for (const c of Object.values(m.components)) assert.equal(c.built, true);
 });
 
@@ -56,15 +50,14 @@ test("carried image keeps its OLDER version and ref; never retagged to the new v
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": false, "agent-native": false, glasses: false, android: false, veiller: false },
+    changed: { turma: false, "agent-native": false, glasses: false, android: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
-  assert.equal(m.components.turma.version, "0.3.1"); // rebuilt
-  assert.equal(m.components.turma.built, true);
-  assert.equal(m.components["agent-image"].version, "0.3.0"); // carried, older
-  assert.equal(m.components["agent-image"].ref, "ghcr.io/xerktech/turma-agent:0.3.0");
-  assert.equal(m.components["agent-image"].built, false);
+  assert.equal(m.components.android.built, true); // rebuilt
+  assert.equal(m.components.turma.version, "0.3.0"); // carried, older
+  assert.equal(m.components.turma.ref, "ghcr.io/xerktech/turma:0.3.0");
+  assert.equal(m.components.turma.built, false);
 });
 
 test("carried asset keeps its name/version but re-points release_tag to the new release", () => {
@@ -74,7 +67,7 @@ test("carried asset keeps its name/version but re-points release_tag to the new 
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: true, android: false, veiller: true },
+    changed: { turma: true, "agent-native": true, glasses: true, android: false },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -92,7 +85,7 @@ test("carried glasses keeps its older version on the portal; nothing to copy", (
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true, veiller: true },
+    changed: { turma: true, "agent-native": true, glasses: false, android: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -120,7 +113,7 @@ test("carried glasses from a pre-portal (asset-kind) manifest is normalized to e
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true, veiller: true },
+    changed: { turma: true, "agent-native": true, glasses: false, android: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -138,7 +131,7 @@ test("unchanged component absent from prev manifest throws (never emit a hole)",
       tag: "v0.3.1",
       commit: "bbb",
       releasedAt: "2026-07-17T00:00:00Z",
-      changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true, veiller: true },
+      changed: { turma: true, "agent-native": true, glasses: false, android: true },
       prevManifest: prev,
       androidVersionCode: 30001,
     }),
@@ -152,16 +145,15 @@ test("carryPlan emits copy-asset only for carried assets, not images or built on
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": false, "agent-native": false, glasses: false, android: false, veiller: false },
+    changed: { turma: true, "agent-native": false, glasses: false, android: false },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
   const plan = M.carryPlan(m, prev);
   const components = plan.map((a) => a.component).sort();
-  // agent-image carried but it's an image, glasses lives on the Even Hub portal
-  // -> no copy action for either. native/android/veiller are the carried
-  // release assets.
-  assert.deepEqual(components, ["agent-native", "android", "veiller"]);
+  // turma carried but it's an image, glasses lives on the Even Hub portal
+  // -> no copy action for either. native/android are the carried release assets.
+  assert.deepEqual(components, ["agent-native", "android"]);
   const androidAction = plan.find((a) => a.component === "android");
   assert.deepEqual(androidAction, {
     component: "android",
@@ -172,8 +164,6 @@ test("carryPlan emits copy-asset only for carried assets, not images or built on
   });
   const nativeAction = plan.find((a) => a.component === "agent-native");
   assert.equal(nativeAction.sha256_asset, "turma-agent-native-v0.3.0.tar.gz.sha256");
-  const veillerAction = plan.find((a) => a.component === "veiller");
-  assert.equal(veillerAction.asset, "turma-veiller-v0.3.0.zip");
 });
 
 test("carryPlan is empty when everything was rebuilt", () => {

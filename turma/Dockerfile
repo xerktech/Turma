@@ -1,7 +1,12 @@
 FROM node:24-alpine
 
-# Dashboard + command hub for the Claude Code containers. stdlib-only Node —
-# no app-dependency install layer. Agents (agent image) heartbeat to :8300.
+# Dashboard + command hub for the Claude Code fleet. stdlib-only Node —
+# no app-dependency install layer. Native agents heartbeat to :8300.
+
+# Pull the patched Alpine packages ahead of the base tag's next rebuild — the
+# image scan gates HIGH/CRITICAL, and openssl (libcrypto3/libssl3) lags the
+# node:24-alpine tag between rebuilds (CVE-2026-14456, fixed 3.5.8-r0).
+RUN apk --no-cache upgrade
 
 # npm — pinned ahead of the base image's bundled npm to pull in patched
 # transitive deps (e.g. undici). The hub never runs npm, but the image scan

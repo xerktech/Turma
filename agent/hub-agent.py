@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Session manager + heartbeat agent for the turma dashboard.
 
-ONE of these runs per physical host (started by entrypoint.sh, in the
-FOREGROUND — it is the container's long-lived process). It replaces the old
+ONE of these runs per physical host (started by the native launcher
+agent/native/turma-agent, in the FOREGROUND — it is the agent's long-lived
+process). It replaces the old
 "one container = one repo = one Claude session" model with a host-level
 multiplexer:
 
@@ -101,7 +102,7 @@ INTERVAL = int(os.environ.get("TURMA_INTERVAL", "20"))
 # follow-up, so budget two of these per cycle.
 HEARTBEAT_TIMEOUT_SEC = 10
 
-# Host-multiplexer configuration (see CONTRACT / entrypoint.sh comments).
+# Host-multiplexer configuration (see CONTRACT / agent/native/turma-agent).
 REPOS_ROOT = os.environ.get("REPOS_ROOT", "/mnt/data/Docker/git")
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "6"))
 TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
@@ -2803,8 +2804,8 @@ def smb_host_name():
 def device_name():
     # The physical host name the hub keys this agent by. A container doesn't know
     # its host's name on its own, so we discover it — no env var / compose config
-    # required. entrypoint.sh resolves this once and exports DEVICE_NAME so the
-    # manager and the reverse tunnel share one identity. Resolution order:
+    # required. The native launcher resolves this once and exports DEVICE_NAME so
+    # the manager and the reverse tunnel share one identity. Resolution order:
     #   1. DEVICE_NAME / COMPUTERNAME env — the entrypoint-resolved value (or an
     #      explicit operator override); checked first so the one-time resolution
     #      short-circuits both processes and auto-detection isn't re-run.
@@ -8154,9 +8155,9 @@ def log_tail(container_id):
 
     on its host card, which reads as a broken agent during whatever the operator
     happened to be doing at the time — a clone, in the report that found this.
-    Nothing is broken; there is simply nothing to tail. `.claude/rules/
-    agent-image.md` calls this degradation cosmetic, and it only IS cosmetic
-    once the error stops being presented as content.
+    Nothing is broken; there is simply nothing to tail. This degradation is
+    cosmetic, and it only IS cosmetic once the error stops being presented as
+    content.
     """
     try:
         out = subprocess.run(
@@ -13664,8 +13665,8 @@ class SessionManager:
                     elif sess.get("awaitCloneOwner") and os.path.exists(
                             sess["repoPath"]):
                         # No job of ours, but a directory: the clone was lost with
-                        # the manager that launched it (`entrypoint.sh` execs
-                        # hub-agent.py as the container's foreground process, so
+                        # the manager that launched it (the native launcher runs
+                        # hub-agent.py as its managed foreground process, so
                         # nothing of ours survives a restart). `clone()` refuses a
                         # dest that exists, so nothing here can retry — say so in
                         # one beat rather than spin the card out to the deadline.
@@ -17475,7 +17476,7 @@ class SessionManager:
             }
         # NOTHING here may raise onto the beat loop. This runs OUTSIDE a try in
         # run_forever, where the inline passes it replaced ran inside one, and
-        # the beat loop is the container's main process (entrypoint.sh `exec`s
+        # the beat loop is the agent's main process (the native launcher runs
         # it with no retry) — so an exception here is not a skipped sync, it is
         # the host and every session on it going down. `Thread.start()` raising
         # RuntimeError at the pids_limit is the realistic way that happens. A
@@ -20843,16 +20844,17 @@ def main():
 
 
 if __name__ == "__main__":
-    # entrypoint.sh calls this to resolve the host name once and export it. The
-    # "DEVICE_NAME=" prefix lets the caller sed it out cleanly, ignoring the
+    # The native launcher calls this to resolve the host name once and export it.
+    # The "DEVICE_NAME=" prefix lets the caller sed it out cleanly, ignoring the
     # module-level boot logs that also land on stdout.
     if "--print-device" in sys.argv:
         print("DEVICE_NAME=" + device_name())
         sys.exit(0)
     if "--wire-azure-git" in sys.argv:
-        # entrypoint.sh calls this once at boot (as root, before the privilege
-        # drop, since it writes --system git config) so plain git can push to a
-        # non-GitHub Azure DevOps org using the PAT the board already has.
+        # Writes --system git config so plain git can push to a non-GitHub Azure
+        # DevOps org using the PAT the board already has. This was invoked at boot
+        # by the old container entrypoint (as root, before the privilege drop);
+        # the native agent does not wire it (no `az`), so it is currently unused.
         # Non-fatal and secret-safe: it logs the host, never the token, and any
         # failure just leaves git unwired.
         cfg = azure_git_auth_config()

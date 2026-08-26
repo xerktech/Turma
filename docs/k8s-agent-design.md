@@ -1,5 +1,10 @@
 # Running Turma agents on Kubernetes — design (XERK-369)
 
+> **SUPERSEDED.** This design was written around the agent **container image**, which the repo no
+> longer builds — the agent is native-only now, and `k8x` runs a native (Ubuntu) agent. References
+> below to `agent/Dockerfile`, `agent/entrypoint.sh`, `.claude/rules/agent-image.md` and a
+> `turma-agent` StatefulSet describe that removed container path; kept for design history only.
+
 **A design, not an implementation.** The ticket asks for a k8s agent for Turma: an operator that
 starts a container per session, persistent repo storage that does not re-clone and is reachable from
 every node, and whether one persistent agent per node would be better even though that "feels more

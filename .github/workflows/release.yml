@@ -1,10 +1,9 @@
 name: release
 
 # The unified release pipeline: ONE v<MAJOR>.<MINOR>.<PATCH> tag per release,
-# carrying ALL six components (turma image, agent image, glasses .ehpk, android
-# .apk, native agent tarball, veiller miniapp .zip) + a changelog. Replaces the
-# per-component release/build workflows. See RELEASING.md and
-# .github/scripts/README.md.
+# carrying ALL four components (turma image, native agent tarball, glasses .ehpk,
+# android .apk) + a changelog. Replaces the per-component release/build
+# workflows. See RELEASING.md and .github/scripts/README.md.
 #
 # Model:
 #   - PATCH is derived from the existing v* tags (max+1), never committed — so
@@ -22,7 +21,7 @@ name: release
 # release / commit is created. It's the break-glass diagnostic — keep it.
 #
 # Triggers:
-#   - push: main   — the auto patch release. Path-filtered to the five component
+#   - push: main   — the auto patch release. Path-filtered to the four component
 #     source dirs, because a release whose every component is CARRIED publishes
 #     nothing new: a docs-only or .github-only merge would still mint a tag and
 #     re-attach the previous release's assets verbatim. Changing the release
@@ -38,7 +37,6 @@ on:
       - "agent/**"
       - "glasses/**"
       - "android/**"
-      - "veiller/**"
   workflow_dispatch:
     inputs:
       release_type:
@@ -70,7 +68,6 @@ permissions:
 
 env:
   TURMA_IMAGE: ghcr.io/${{ github.repository_owner }}/turma
-  AGENT_IMAGE: ghcr.io/${{ github.repository_owner }}/turma-agent
 
 jobs:
   # ------------------------------------------------------------------ plan ----
@@ -89,11 +86,9 @@ jobs:
       base_minor: ${{ steps.plan.outputs.base_minor }}
       release_type: ${{ steps.plan.outputs.release_type }}
       build_turma: ${{ steps.plan.outputs.build_turma }}
-      build_agent_image: ${{ steps.plan.outputs.build_agent_image }}
       build_agent_native: ${{ steps.plan.outputs.build_agent_native }}
       build_glasses: ${{ steps.plan.outputs.build_glasses }}
       build_android: ${{ steps.plan.outputs.build_android }}
-      build_veiller: ${{ steps.plan.outputs.build_veiller }}
       dry_run: ${{ steps.flags.outputs.dry_run }}
       sha: ${{ github.sha }}
     steps:
@@ -266,8 +261,7 @@ jobs:
           git clone --quiet "git@github.com:${GITOPS_REPO}.git" "$RUNNER_TEMP/gitops"
           cd "$RUNNER_TEMP/gitops"
           # Only the hub's own line: the pattern is anchored on the exact
-          # repository, so `turma-agent` in the same repo cannot match it. The
-          # old pin may carry a tag, a @digest, or neither.
+          # repository image. The old pin may carry a tag, a @digest, or neither.
           sed -i -E "s#^([[:space:]]*image: )${IMAGE}([:@][^[:space:]]*)?[[:space:]]*\$#\1${IMAGE}:${VERSION}#" "$MANIFEST"
           # A sed that matched nothing is silent, and a cluster that quietly
           # never updates is the failure this step exists to prevent.
@@ -283,69 +277,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --quiet -m "Turma hub ${VERSION} (${TAG})" -- "$MANIFEST"
           git push --quiet origin HEAD:main
-  # --------------------------------------------------------- build: agent -----
-  # Hosted. This is the biggest build in the repo; its layer cache is `type=gha`
-  # (GitHub-side, so it follows the job) and its disk is handled by the reclaim
-  # step below, which frees more than the box ever had spare.
-  build-agent-image:
-    needs: [plan, bump]
-    if: >-
-      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
-      && needs.plan.outputs.build_agent_image == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
-      # ~25 GB of preinstalled toolchains this job never uses, against ~14 GB
-      # free — and it builds ~2 GB of image (plus buildkit snapshots and the
-      # cache export) entirely inside the Dockerfile. Safe to delete the runner's
-      # own Android SDK precisely because the build is hermetic: the image
-      # downloads its own. Never fails the job.
-      - name: Free up disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
-          df -h /
-      # The bundled Claude Code release is pinned into the build (contents can't
-      # drift), resolved via a throwaway node container (no npm on the runner).
-      # NOT part of the version.
-      - name: Resolve Claude Code version
-        id: cc
-        run: |
-          set -euo pipefail
-          CC_VERSION="$(docker run --rm node:24-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
-          echo "version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v4
-      - name: Build and push (:latest — android-build tier)
-        uses: docker/build-push-action@v7
-        with:
-          context: ./agent
-          push: ${{ needs.plan.outputs.dry_run != 'true' }}
-          build-args: |
-            AGENT_BASE=android-build
-            CLAUDE_CODE_VERSION=${{ steps.cc.outputs.version }}
-            TURMA_AGENT_VERSION=${{ needs.plan.outputs.version }}
-          tags: |
-            ${{ env.AGENT_IMAGE }}:latest
-            ${{ env.AGENT_IMAGE }}:${{ needs.plan.outputs.version }}
-            ${{ env.AGENT_IMAGE }}:sha-${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
-          cache-from: type=gha,scope=turma-agent
-          cache-to: type=gha,mode=max,scope=turma-agent
-          labels: |
-            org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
-            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
 
   # ------------------------------------------------------- build: glasses -----
   # GitHub-hosted: an npm build + pack, no docker cache to keep warm.
@@ -518,60 +449,20 @@ jobs:
             turma-agent-native-v${{ needs.plan.outputs.version }}.tar.gz.sha256
           if-no-files-found: error
 
-  # ------------------------------------------------------ build: veiller -----
-  # GitHub-hosted: a bun install/build + a stdlib pack script, nothing to cache.
-  # Builds the Veiller bundled-miniapp port of the glasses client and uploads
-  # the flat miniapp zip as a release asset (the Veiller repo bundles it into
-  # its mobile app's assets).
-  build-veiller:
-    needs: [plan, bump]
-    if: >-
-      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
-      && needs.plan.outputs.build_veiller == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.2.22"
-      # Stamp the unified version into miniapp.json before packing — mirroring
-      # the glasses app.json stamp: only the manifest is touched (pack reads the
-      # version there; package.json stays at its committed 0.0.0).
-      - name: Stamp version, install, build, pack
-        working-directory: veiller
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("miniapp.json"));j.version=process.env.VERSION;fs.writeFileSync("miniapp.json",JSON.stringify(j,null,2)+"\n")'
-          bun install --frozen-lockfile
-          bun run build
-          node scripts/pack.mjs --out "$GITHUB_WORKSPACE/turma-veiller-v${VERSION}.zip"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: asset-veiller
-          path: turma-veiller-v${{ needs.plan.outputs.version }}.zip
-          if-no-files-found: error
-
   # --------------------------------------------------------------- publish ----
   # Runs last. Assembles manifest.json + release notes, carries unchanged assets
   # forward, and (unless dry_run) creates the tag + release. Runs unless a build
   # that was SUPPOSED to run failed (a skipped/carried component is fine).
   publish:
     needs:
-      [plan, bump, build-turma-image, build-agent-image, build-glasses, build-android, build-agent-native, build-veiller]
+      [plan, bump, build-turma-image, build-glasses, build-android, build-agent-native]
     if: >-
       !cancelled() && needs.plan.result == 'success'
       && needs.bump.result != 'failure'
       && needs.build-turma-image.result != 'failure'
-      && needs.build-agent-image.result != 'failure'
       && needs.build-glasses.result != 'failure'
       && needs.build-android.result != 'failure'
       && needs.build-agent-native.result != 'failure'
-      && needs.build-veiller.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -586,12 +477,12 @@ jobs:
         with:
           node-version: "24"
       # Collect the built release assets into dist/ (flattened). The Android
-      # .apk, native tarball, and veiller zip are the only asset-* producers
-      # now (the .ehpk ships to the Even Hub portal from build-glasses), so only
-      # download when one of them actually built — a zero-match pattern must not
-      # be able to fail a hub/agent-image/glasses-only release.
+      # .apk and native tarball are the only asset-* producers now (the .ehpk
+      # ships to the Even Hub portal from build-glasses), so only download when
+      # one of them actually built — a zero-match pattern must not be able to
+      # fail a hub/glasses-only release.
       - uses: actions/download-artifact@v4
-        if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true' || needs.plan.outputs.build_veiller == 'true'
+        if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true'
         with:
           pattern: asset-*
           path: dist

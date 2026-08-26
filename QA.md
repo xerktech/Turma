@@ -30,21 +30,19 @@
 
 ## glasses/
 
-- `glasses/src/vendor/chat.cjs`+`board.cjs` AND `veiller/src/ui/vendor/chat.cjs`+`board.cjs`
-  are COMMITTED byte-for-byte copies of `turma/public/chat.js`/`board.js`, each enforced by
-  its own `vendor.test.ts`. TRAP: a PR editing chat.js/board.js without re-copying BOTH
-  merges green when the path filters don't fire and breaks the NEXT glasses/veiller PR.
-  Sweep with `find . -name chat.cjs` + `cmp` against the source.
-- `glasses/src/phone/render.ts` AND `veiller/src/ui/phone/render.ts` each carry a
-  hand-ported `prBadgeHtml` — chip renderers beside web ×3 + android; check both whenever
-  the chip changes.
+- `glasses/src/vendor/chat.cjs`+`board.cjs` are COMMITTED byte-for-byte copies of
+  `turma/public/chat.js`/`board.js`, enforced by `vendor.test.ts`. TRAP: a PR editing
+  chat.js/board.js without re-copying them merges green when the path filters don't fire and
+  breaks the NEXT glasses PR. Sweep with `find . -name chat.cjs` + `cmp` against the source.
+- `glasses/src/phone/render.ts` carries a hand-ported `prBadgeHtml` — a chip renderer beside
+  web ×3 + android; check it whenever the chip changes.
 - Vitest needs npm install; not runnable on the TrueNAS host — rely on glasses-ci.yml.
 
 ## android/
 
 - JVM unit tests need Gradle + JDK17 + Android SDK — NOT runnable on the TrueNAS host
   (no apt, ro /usr). Rely on `android-ci.yml` (`gh pr checks <n>`), or a container host
-  with the `turma-agent:latest` image (it bundles the toolchain).
+  with a public JDK17 + Android SDK image (Gradle 8.11.1, android-35, build-tools 35.0.0).
 
 ## This TrueNAS host (where QA sessions usually run)
 

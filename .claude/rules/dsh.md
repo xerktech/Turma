@@ -63,27 +63,24 @@ invariants a later child must not undo:
   cases (`server.test.js`), the Runtime cases in `sessions.test.js`, `RuntimeTest`/`SpawnRequestTest`/
   `SpawnComposerTest`/`AgentDecodeTest` (android).
 
-## D1 — Where dsh runs: inside the existing agent container
+## D1 — Where dsh runs: inside the existing agent
 
-- **Decision: dsh runs as an additional per-session LAUNCHER inside the existing agent container,
-  not in its own container.** A dsh session is launched the way a `claude --remote-control` session
+- **Decision: dsh runs as an additional per-session LAUNCHER inside the existing agent,
+  not as a separate agent.** A dsh session is launched the way a `claude --remote-control` session
   is — its own tmux, its own worktree, counting against `MAX_SESSIONS` — dispatched on a validated
   `agentType` spawn option (`{'claude','dsh'}`, allowlisted agent-side like every other spawn enum).
-- **Why not its own container.** The fleet's whole model is one-container-per-host, and a host's
+- **Why not a separate agent.** The fleet's whole model is one-agent-per-host, and a host's
   identity is singular: one XERK-268 credential, one heartbeat, one org binding, one peer roster,
-  one worktree pool under `.turma/worktrees`. A second container would be a second "host" to the
+  one worktree pool under `.turma/worktrees`. A second agent would be a second "host" to the
   hub — doubling the online count, the credential, and the roster for one physical machine, and
-  forcing every cross-cutting contract to learn a split identity. Keeping dsh in-container means the
-  runtime choice is per-session and invisible to the hub's host model.
-- **Cost this accepts, and the follow-up it needs.** The image already carries a large toolchain;
-  adding dsh (node + its npm tree — the PoC's `test-real-dsh.sh` installs ~460 packages) grows it
-  further, and a live dsh session (node runtime + a model client) is not free on `mem_limit` /
-  `pids_limit`, which DockerOps sizes against `MAX_SESSIONS`. Whether those ceilings need raising
-  before dsh sessions run beside Claude sessions is a **DockerOps sizing follow-up** (child of this
-  epic), not a code change here — flagged to Malcolm below (Q1).
-- **`k8x` is the exception, as always.** Its agent is a StatefulSet in xerktech/ArgoCD
-  (`ai/turma-agent/`), image pinned by tag with no Watchtower — so a dsh-carrying image reaches it
-  only when someone deletes the pod. Image CONTENT edits still land in this repo.
+  forcing every cross-cutting contract to learn a split identity. Keeping dsh in the same agent means
+  the runtime choice is per-session and invisible to the hub's host model.
+- **Cost this accepts, and the follow-up it needs.** dsh (node + its npm tree — the PoC's
+  `test-real-dsh.sh` installs ~460 packages) adds a native prerequisite, and a live dsh session
+  (node runtime + a model client) is not free on a host's memory/process budget, sized per host
+  against `MAX_SESSIONS`. Whether those ceilings need raising before dsh sessions run beside Claude
+  sessions is a **host sizing follow-up** (child of this epic), not a code change here — flagged to
+  Malcolm below (Q1).
 
 ## D2 — Coordinator: reuse the existing Turma hub; the PoC Fleet Hub is redundant for this epic
 
@@ -120,10 +117,10 @@ invariants a later child must not undo:
   per-turn tokens, tool success rates, step timings, error rates — and flattening it into Claude
   JSONL turns would throw it away. So the native log is what we KEEP; the JSONL is what we DERIVE.
 - **Why derive the JSONL at all (the projection).** Turma's read side is a web of parity contracts
-  that already cost N-way edits: `readyForReview` (five mirrors), "Working" = paneBusy OR live agents
-  (six mirrors), the board column rule (`categoryOf`, five mirrors), and the whole `hub-agent.py` ↔
-  `tunnel-agent.js` py/js parity set. Teaching the archive and every client (hub, android, glasses,
-  veiller) a SECOND transcript shape multiplies each of those (N → 2N). A single agent-side
+  that already cost N-way edits: `readyForReview` (four mirrors), "Working" = paneBusy OR live agents
+  (five mirrors), the board column rule (`categoryOf`, four mirrors), and the whole `hub-agent.py` ↔
+  `tunnel-agent.js` py/js parity set. Teaching the archive and every client (hub, android, glasses)
+  a SECOND transcript shape multiplies each of those (N → 2N). A single agent-side
   projection into the shape they already read keeps the mirrors at N — the exact reason the ticket
   names — WITHOUT making that projection the record. Display reads the projection; metrics read the
   native log. Neither impersonates the other.
@@ -378,7 +375,7 @@ the same spawn path — no new session model.
   orthogonal to a ticket's column.
 - **Web ⇄ Android parity**: the board Runtime row shipped on Android too (XERK-477 —
   `RuntimeSection` in `BoardScreen.kt`, `ticketRuntimes`/`dshAvailable` typed). The vendored
-  `board.cjs` copies (glasses/veiller) stay byte-identical to `board.js`.
+  `board.cjs` copy (glasses) stays byte-identical to `board.js`.
 - Tests: `TestSpawnTicket` (`test_a_runtime_pin_lands_on_the_session_record`,
   `test_handle_commands_carries_the_runtime_pin`) agent-side; the `/runtime` route + the dsh
   `findTicketHost` cases in `server.test.js`; the `runtime*` cases in `board.test.js`.
@@ -446,11 +443,11 @@ so the Claude-inbox protocol and the crossSessionInbound policy stay in ONE Pyth
 
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
-1. **Image + resource + retention sizing.** Is growing the agent image with dsh's node/npm tree
-   acceptable, and do `mem_limit` / `pids_limit` need raising in DockerOps before dsh sessions run
+1. **Resource + retention sizing.** Is adding dsh's node/npm tree to the native install
+   acceptable, and does a host's memory/process budget need raising before dsh sessions run
    beside Claude sessions? Also: does the archive raw-layer ceiling
    (`ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES`) fit real dsh session sizes so the canonical native log we
-   keep for metrics (D3) is not silently truncated? A DockerOps / archive sizing follow-up, not code
+   keep for metrics (D3) is not silently truncated? A host / archive sizing follow-up, not code
    here.
 2. **Attribution granularity.** Should PR/commit attribution visibly distinguish dsh-authored from
    Claude-authored work, or is host-level attribution enough? Not needed for correctness.

@@ -1,10 +1,10 @@
 name: code-scan
 
 # Code security + quality gate on PRs to main. Runs four independent checks
-# over the sources that go into the two images:
-#   - Semgrep  : SAST over the JS/Python code, Dockerfiles, and secret patterns
-#   - hadolint : Dockerfile best-practice/quality lint (both Dockerfiles)
-#   - ShellCheck: shell correctness for entrypoint.sh
+# over the repo's sources:
+#   - Semgrep  : SAST over the JS/Python code, the hub Dockerfile, and secret patterns
+#   - hadolint : Dockerfile best-practice/quality lint (turma/Dockerfile)
+#   - ShellCheck: shell correctness for the repo's shell scripts (native launcher/updater/installer)
 #   - tests    : behavioral unit tests for agent/hub-agent.py (stdlib unittest),
 #                turma/server.js (built-in node:test), and the release scripts
 #                (.github/scripts) — see agent/tests/, turma/tests/, and
@@ -21,8 +21,8 @@ name: code-scan
 # preinstalled, and can authenticate to ghcr.io.
 #
 # This was the first workflow moved; every workflow in the repo now runs hosted,
-# image builds included (their layer cache is `type=gha`, which is GitHub-side
-# and moves with the job — see turma-agent-image-scan.yml for the disk story).
+# the hub image build included (its layer cache is `type=gha`, which is GitHub-side
+# and moves with the job).
 on:
   pull_request:
     branches: [main]
@@ -102,17 +102,12 @@ jobs:
       #     SHA (this repo's convention across all workflows).
       #   - using-http-server: the hub serves plain HTTP on purpose — TLS is
       #     terminated at the Cloudflare tunnel, behind HTTP Basic auth.
-      #   - missing-user-entrypoint: the images deliberately carry no USER
-      #     directive. The agent resolves its run-as identity at RUNTIME instead
-      #     (entrypoint.sh: PUID/PGID, else the owner of REPOS_ROOT) and setprivs
-      #     down to it, because the right uid is the host's — a property of the
-      #     mounted git root, unknowable at build time. A baked USER couldn't
-      #     express that, and the entrypoint needs root briefly anyway (create
-      #     the user, join the docker-sock group, reclaim root-owned leftovers).
-      #     Semgrep only sees the Dockerfile, so it can't see the drop; the
-      #     identity block is covered by agent/tests/test_entrypoint.sh instead.
+      #   - missing-user-entrypoint: the hub image carries no USER directive. It
+      #     runs a single node server in its own container with no host bind
+      #     mounts, behind TLS + Basic auth at the Cloudflare tunnel; there is no
+      #     uid-parity requirement a baked USER would satisfy.
       #   - dynamic-urllib-use-detected: the URL is TURMA_URL from the trusted
-      #     compose env, not attacker-controlled input.
+      #     agent env, not attacker-controlled input.
       # Everything else stays blocking, so new injection/secret/unsafe-eval
       # style issues still fail the PR.
       - name: Semgrep scan
@@ -151,7 +146,7 @@ jobs:
       # Blocks only on error-level issues; warnings (e.g. unpinned apt) are
       # surfaced without failing. Tighten to `warning` to gate harder.
       - name: Run hadolint
-        run: hadolint --failure-threshold error agent/Dockerfile turma/Dockerfile
+        run: hadolint --failure-threshold error turma/Dockerfile
 
   shellcheck:
     name: ShellCheck
@@ -160,7 +155,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Finds every shell script in the repo and lints per its shebang
-      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding.
+      # (the native launcher/updater/installer). Fails the job on any finding.
       - uses: ludeeus/action-shellcheck@2.0.0
         with:
           ignore_paths: poc
@@ -228,14 +223,6 @@ jobs:
         # fileguard.py). drive-real-dsh.mjs needs a real dsh install and is a
         # host proof, not a CI test — the *.test.mjs glob excludes it.
         run: node --test agent/dsh/guard/test/*.test.mjs
-      # entrypoint.sh is PID 1 and decides which uid every session runs as —
-      # i.e. whether files land in the mounted git root owned by the host user
-      # or by root. ShellCheck only covers its syntax, so this builds the real
-      # entrypoint onto the real base image and asserts the resolved identity
-      # across root-owned / user-owned / PUID-override roots. Drives docker
-      # directly, which a hosted runner provides.
-      - name: Entrypoint identity tests (agent/entrypoint.sh)
-        run: ./agent/tests/test_entrypoint.sh
       # The native updater is the only runtime consumer of the release tag
       # scheme and runs on deployed hosts; ShellCheck covers its syntax, this
       # covers its decision (component-version vs tag comparison, carried-release

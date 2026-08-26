@@ -149,9 +149,9 @@ export interface HubClientOptions {
 // on stale content with no "hub unreachable" flash at all, where every other
 // failure mode recovers within one poll.
 //
-// Veiller already fixed exactly this for its background JSContext (XERK-215,
-// veiller/src/background/net.ts); this is the same guard for the lens, applied
-// where every request funnels through instead of at one call site.
+// The same class of bug was fixed once for a background JSContext (XERK-215);
+// this is the same guard for the lens, applied where every request funnels
+// through instead of at one call site.
 export const HUB_FETCH_TIMEOUT_MS = 30_000;
 
 /** Race `base` against a timer so a never-settling fetch becomes a normal error. */

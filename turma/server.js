@@ -6852,7 +6852,7 @@ function sendPage(req, res, page) {
 // Unicode + icon coverage regardless of what fonts the viewer's machine has.
 const TERM_FONT = fs.readFileSync(path.join(__dirname, "public", "jbm-nerd-mono.woff2"));
 // <style> injected into ttyd's HTML document defining that font as 'JBMNerd' —
-// the family name the agent points ttyd's fontFamily at (see agent/entrypoint.sh).
+// the family name the agent points ttyd's fontFamily at.
 const TERM_FONT_STYLE =
   "<style>@font-face{font-family:'JBMNerd';" +
   "src:url('/term-font.woff2') format('woff2');font-display:swap;}</style>";

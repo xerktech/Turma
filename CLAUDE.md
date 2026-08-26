@@ -21,7 +21,6 @@ that component's files.
 | `.claude/rules/agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line` attribution, GitLab/ADO dispatch, comment + conflict replies |
 | `.claude/rules/agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `.claude/rules/agent-hooks.md` | `agent/hooks/**`, `agent/hub-agent.py` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
-| `.claude/rules/agent-image.md` | `agent/entrypoint.sh`, `agent/Dockerfile` | run-as identity, container boot, start-time Claude Code check, bundled toolchains |
 | `.claude/rules/agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `.claude/rules/turma.md` | `turma/**` | chrome, org filter, dashboard, notifications, auth |
 | `.claude/rules/turma-archive.md` | `turma/archive.js` + its tests | the durable archive: layers, the two size ceilings, how the total is measured |
@@ -33,7 +32,7 @@ that component's files.
 | `.claude/rules/turma-sessions.md` | `turma/public/sessions.html`, `chat.js` + their tests | the Sessions page, chat engine, live tail, composer, terminal |
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
-| `.claude/rules/release.md` | `.github/**`, `VERSION`, Dockerfiles | releases, PR gates, image tiers |
+| `.claude/rules/release.md` | `.github/**`, `VERSION`, `turma/Dockerfile` | releases, PR gates, the hub image |
 | `.claude/rules/routing-eval.md` | `bench/archive/**`, the routing docs | archive-sourced replay eval: the requestId turn unit, curation gates, why routing is per-session |
 | `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh ADR + per-child mechanics (XERK-460) |
 | `.claude/rules/dsh-input.md` | `agent/dsh_session.py` | driving a dsh session (XERK-467 [C]): socket, driver, input |
@@ -71,17 +70,18 @@ that component's files.
 ## What This Repo Is
 
 Turma is the source and CI for the Claude Code agent fleet used with the TrueNAS-based home lab: a
-**one-container-per-host** agent image that scans a git root and multiplexes many worktree-backed
+**one-native-agent-per-host** process that scans a git root and multiplexes many worktree-backed
 Claude Code Remote Control sessions, plus a central dashboard ("turma") that lists each host's
 repos, spawns/kills those sessions, and monitors them.
 
-It builds two images and pushes them to GHCR. The per-host agents run from the sibling **DockerOps**
-repo (`compose/turma-truenas.yaml`, via Portainer GitOps); the hub runs on `k8x` from
-**xerktech/ArgoCD** (`ai/turma/`), which a release updates itself — see Deployment below.
+The agent runs **natively** on each host (systemd + a shipped tarball, see `.claude/rules/agent-native.md`);
+the repo no longer builds an agent container. It builds ONE image — the hub — and pushes it to GHCR;
+the hub runs on `k8x` from **xerktech/ArgoCD** (`ai/turma/`), which a release updates itself — see
+Deployment below.
 
 ## Session Model
 
-One agent container per host, multiplexing sessions across every repo it scans. What follows is the
+One native agent per host, multiplexing sessions across every repo it scans. What follows is the
 part that spans components; the agent-side runtime behind it — launch flags, repos-root sessions,
 the session queue, kill/resume/delete — is in `.claude/rules/agent-sessions.md`.
 
@@ -272,7 +272,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - **It is a strong soft boundary, not an airtight one.** `crossSessionInbound` has no per-sender
     filter (accept/hold/refuse only), so an off-org session sharing the Claude login can still
     DELIVER into a session — it just can't discover one. **One Claude login per org is the only
-    hard boundary**, and it is a DockerOps decision. Don't describe this contract as sealing it.
+    hard boundary**, and it is a per-host deployment decision. Don't describe this contract as sealing it.
   - Mechanics in `.claude/rules/agent-sessions.md` and `.claude/rules/agent-hooks.md`.
 - **Nothing on the agent's BEAT LOOP may have a worst case at or above the hub's `OFFLINE_AFTER_MS`**
   (XERK-395). The hub calls a host offline after 75s of silence (`turma/server.js`); what sets the
@@ -292,11 +292,11 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     ≈ 300s), `refresh_jira` (measured at a 20s beat gap against a blackholed site), `refresh_github`
     — all three in `build_payload` — and `_migration_upload` under `handle_commands` (~96s).
     XERK-397 carries them. A fix there extends `TestBeatLoopBudget` rather than adding its own pin.
-- **`readyForReview` has FIVE mirrors that must agree**: `turma/public/sessions.html`,
-  `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`, and veiller's fork of
-  it. Changing the rule means changing all five.
+- **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
+  `turma/server.js`, `android/…/core/Sessions.kt`, and `glasses/src/sessions.ts`. Changing the rule
+  means changing all four.
 - **"Working" is `paneBusy` OR live background agents** (XERK-245), in every mirror of the read
-  (those five plus `turma/public/index.html`). A session that delegates work ENDS ITS OWN TURN: the
+  (those four plus `turma/public/index.html`). A session that delegates work ENDS ITS OWN TURN: the
   pane drops the interrupt hint, so `paneBusy` says False while an agent it launched keeps going —
   which read idle everywhere AND qualified as ready-for-review, buzzing the operator mid-run. The
   session's `agents[]` is the second input; it sits BEHIND the offline and no-transcript gates,
@@ -304,14 +304,12 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   **It comes from the TRANSCRIPT** (`_scan_agent_entry`: `agentId:` on launch, `<task-notification>`
   on stop), never from the TUI's footer rows — those are forgeable pane content and linger ~24s past
   completion, so they cannot answer "is one running right now".
-- **`turma/public/board.js` has FIVE mirrors of its column rule** (`categoryOf` /
-  `REVIEW_STATUS_RE`), and changing it means changing all five: the source, its **two
-  byte-identical vendored copies** (`glasses/src/vendor/board.cjs`, `veiller/src/ui/vendor/
-  board.cjs` — each asserted by that client's own `vendor.test.ts`, and `veiller-ci` is
-  path-filtered on the SOURCE so a one-sided edit fails there, not here), and the two ports,
-  `_board_column` in `hub-agent.py` and `categoryOf` in android's `core/Board.kt`. The agent
-  resolves a dropped column against its OWN read, so a drift silently refuses valid drops. Tests:
-  `TestBoardColumn`, `board.test.js`, `BoardTest.kt`.
+- **`turma/public/board.js` has FOUR mirrors of its column rule** (`categoryOf` /
+  `REVIEW_STATUS_RE`), and changing it means changing all four: the source, its **byte-identical
+  vendored copy** (`glasses/src/vendor/board.cjs`, asserted by `glasses`'s own `vendor.test.ts`),
+  and the two ports, `_board_column` in `hub-agent.py` and `categoryOf` in android's `core/Board.kt`.
+  The agent resolves a dropped column against its OWN read, so a drift silently refuses valid drops.
+  Tests: `TestBoardColumn`, `board.test.js`, `BoardTest.kt`.
 - **`hub-agent.py` ↔ `tunnel-agent.js` are a parity contract** for everything both parse:
   `_entry_blocks`/`entryBlocks`, `_entry_text`, `transcript_tail`, `_busy_from_capture`/
   `paneShowsBusy`, `_fold_queue_op`/`foldQueueOp`, `_send_user_file_detail`/`sendUserFileDetail`.
@@ -319,7 +317,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - **`device_name`/`deviceName` + `_usable_hostname`/`usableHostname` are on that list too.** They
     must resolve the SAME name: `openChannel` keys `controlChannels` by it, so a tunnel and a
     manager under different names is a host whose commands work while its terminal, live tail and
-    heartbeat poke are dead — and a ghost card `DELETE` cannot reach. `entrypoint.sh` exports an
+    heartbeat poke are dead — and a ghost card `DELETE` cannot reach. The native launcher exports an
     operator-set `DEVICE_NAME` to both processes unvalidated, so an env-path divergence is the one
     that bites. Tests: `TestDeviceName`, `usableHostname`/`deviceName` in `tunnel-agent.test.js`.
 - **The heartbeat is the wire contract** between `hub-agent.py` and `turma/server.js` (and through
@@ -352,7 +350,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     `FleetViewModel.run`/`ChatViewModel.report` word the snackbar from it and drop the optimistic
     pending row. `/history` refusals are `HistoryResult.Failed`, never `Pending` — polling can't fix
     a refusal, and folding them together burned 60s and then said nothing.
-  - Glasses + veiller's fork (XERK-270): `hub-client.ts`'s `refusal()` reads the body BEFORE it
+  - Glasses (XERK-270): `hub-client.ts`'s `refusal()` reads the body BEFORE it
     throws, so the `HttpError` carries the hub's words — and `app.ts`'s `failureFlash` is what puts
     them on the display. Both halves or neither: the client throwing good text is invisible while
     every `.catch` flashes a flat "hub unreachable", which is also wrong (the hub answered, it said
@@ -383,7 +381,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   refuse anything before the OOM killer fires — which is how a flat 128 MiB upload ceiling and an
   unbounded socket count each killed the fleet's whole control plane, `restart: unless-stopped`
   looping the outage. `containerMemoryLimit()` reads the cgroup; everything derives from it and is
-  logged at boot. Raising `mem_limit` in DockerOps widens them with no code change. The mechanics
+  logged at boot. Raising the hub's `mem_limit` in its ArgoCD deployment widens them with no code change. The mechanics
   are in `.claude/rules/turma-limits.md`; what spans components is here:
   - **413 and 503 mean opposite things and must not be collapsed**: 413 is "your body is too big,
     send less", 503 is "the hub is momentarily full, send it again". Every `readRawBody` caller has
@@ -406,37 +404,32 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 
 ### Credentials
 
-- All credentials are inline in environment variables (no Docker secrets mechanism), set in
-  DockerOps' `compose/turma-truenas.yaml`, never here.
+- All credentials are inline in environment variables (no Docker secrets mechanism): the agent's in
+  its per-host `agent/native/turma-agent.env`, the hub's in its ArgoCD deployment — never here.
 
 ### Agent-side conventions, elsewhere
 
-- **Run-as identity** (host permission parity, `PUID`/`PGID`, the boot heal) —
-  `.claude/rules/agent-image.md`.
+- **Native install, run-as identity and the updater** — `.claude/rules/agent-native.md`.
 - **How a session runs**, the **new-work branching directive** and **local-model failover** —
   `.claude/rules/agent-sessions.md`.
 - **The safety guard** — what it denies and why, and the `--settings` file every launch passes —
   `.claude/rules/agent-hooks.md`.
 
-## Deployment (DockerOps, not here)
+## Deployment (mostly not here)
 
-- `compose/turma-truenas.yaml` defines the `turma` service and a single per-host `agent-host`
-  container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, that host's OWN
-  `TURMA_TOKEN` (`node turma/server.js --agent-token <device>` against the hub's master
-  `TURMA_AGENT_TOKEN`; `TURMA_AGENT_STRICT` on the hub once every host has one — see XERK-268 in the
-  contracts above), the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
-  basic-auth. Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost
-  env — usage is counted in tokens per model, so there is no rate table.
-- **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`), and a release DEPLOYS it** (XERK-425):
-  the last step of `build-turma-image` rewrites that manifest's image tag to the build it just
-  pushed, and the Application is `automated`, so merging hub code to main is what puts it in
-  production. It needs the `ARGOCD_DEPLOY_KEY` secret (a write deploy key on that repo, not a
-  PAT) and fails loudly without it; detail in `.claude/rules/release.md`.
-- Changing how it's RUN (or adding a host) is a DockerOps compose edit — **except `k8x`, whose
-  agent is a StatefulSet in xerktech/ArgoCD (`ai/turma-agent/`, XERK-369)**: one agent for the whole
-  cluster, its kubeconfig its own ServiceAccount, and its image pinned there by tag with no
-  Watchtower, so a release does not reach it until someone deletes the pod. Image content edits land
-  here.
+- **The agent runs NATIVELY on each host** — a shipped tarball + systemd unit, installed and
+  self-updated by `agent/native/` (`install.sh`, `turma-agent`, `turma-agent-update`). Per-host
+  config lives in `agent/native/turma-agent.env`: `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`,
+  that host's OWN `TURMA_TOKEN` (`node turma/server.js --agent-token <device>` against the hub's
+  master `TURMA_AGENT_TOKEN`; `TURMA_AGENT_STRICT` on the hub once every host has one — see XERK-268
+  in the contracts above), and the push service-account. No pricing/cost env — usage is counted in
+  tokens per model, so there is no rate table. Mechanics in `.claude/rules/agent-native.md`.
+- **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`) as the `turma` image, and a release
+  DEPLOYS it** (XERK-425): the last step of `build-turma-image` rewrites that manifest's image tag to
+  the build it just pushed, and the Application is `automated`, so merging hub code to main is what
+  puts it in production. It needs the `ARGOCD_DEPLOY_KEY` secret (a write deploy key on that repo,
+  not a PAT) and fails loudly without it; detail in `.claude/rules/release.md`.
+- Adding a host is a native install on that host; the hub is the only container this repo ships.
 - The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
   persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
   - The archive holds **two layers**: the rendered entries every Turma surface reads, and a
@@ -452,25 +445,24 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     ceiling counts `index.db`, which lives on the same volume and is unbounded across fill/wipe
     cycles (XERK-332) — size the volume for that too.
 - Local-model failover is per host: `LOCAL_MODEL_BASE_URL` / `LOCAL_MODEL_API_KEY` /
-  `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` on the `agent-host` service. Unset = feature off, and
-  the agent reports `localModel.available:false` so clients hide the control.
-- The `turma` service also takes the LiteLLM env for **Whisper STT** (`LITELLM_URL` = that
+  `LOCAL_MODEL_NAME` / `LOCAL_MODEL_CONTEXT` in the agent's `turma-agent.env`. Unset = feature off,
+  and the agent reports `localModel.available:false` so clients hide the control.
+- The hub also takes the LiteLLM env for **Whisper STT** (`LITELLM_URL` = that
   instance's `/v1` base, optional `LITELLM_API_KEY`; legacy `WHISPER_URL`/`WHISPER_API_KEY`
   override), and `NODE_NO_WARNINGS=1` to silence `node:sqlite`'s experimental warning.
-- Watchtower keeps `:latest` current; the DockerOps compose references
-  `ghcr.io/xerktech/turma-agent:latest` — keep that ref in sync if renamed here.
 
 ## Releases and CI, in one line each
 
 Full detail in `.claude/rules/release.md`.
 
-- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all five components + a changelog**, cut by
+- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all four components + a changelog**, cut by
   `.github/workflows/release.yml`. Never split back into per-component workflows.
+- The four components: `turma` image, native agent tarball, glasses `.ehpk`, android `.apk`.
 - The root **`VERSION`** file holds `MAJOR.MINOR` only; **the patch is derived from existing `v*`
   tags and never committed**. Bump `VERSION` only for a minor/major.
 - Only **changed** components build; unchanged ones are **carried** at their prior version. Every
-  release publishes all five.
+  release publishes all four.
 - PR gates that block a merge: `code-scan.yml` (Semgrep, hadolint, ShellCheck, unit tests, the
-  instruction-file size limits), the two image scans, `glasses-ci.yml`, `android-ci.yml`.
+  instruction-file size limits), `turma-image-scan.yml`, `glasses-ci.yml`, `android-ci.yml`.
 - **Every workflow runs on GitHub-hosted `ubuntu-latest`.** The self-hosted-box workarounds were
   deleted, not disabled — reintroducing any is a regression.

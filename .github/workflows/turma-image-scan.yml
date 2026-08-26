@@ -5,8 +5,8 @@ name: scan-turma-image
 # Trivy. Pre-merge counterpart to build-turma-image.yml (push only on main).
 #
 # Runs on GitHub-hosted `ubuntu-latest`; Trivy installed from its release
-# tarball, no SARIF upload (no GHAS) — see turma-agent-image-scan.yml for the full
-# rationale.
+# tarball, no SARIF upload (no GHAS — findings live in the job log and
+# --exit-code is the gate).
 on:
   pull_request:
     branches: [main]
@@ -75,8 +75,7 @@ jobs:
       # export. On the self-hosted box this kept it off the runner container's
       # small /tmp; on a hosted runner /tmp and runner.temp share the one root
       # volume, so it's now belt-and-braces rather than load-bearing — kept
-      # because it costs nothing and keeps this job's flags reading the same as
-      # turma-agent-image-scan.yml's, where the scratch size is a real constraint.
+      # because it costs nothing.
       - name: Trivy image scan
         env:
           TMPDIR: ${{ runner.temp }}

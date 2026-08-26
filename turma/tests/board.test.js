@@ -2095,7 +2095,7 @@ const APP_CSS = fs.readFileSync(path.join(__dirname, "../public/app.css"), "utf8
 
 // EVERY rule whose selector names the strip or a column, in source order — not
 // just the first. A guard that reads one rule is beaten by a later unscoped
-// override, which is the exact idiom the glasses/veiller vendored board.css
+// override, which is the exact idiom the glasses vendored board.css
 // already uses, so it is one copy-paste away from re-stacking the columns.
 function allRules() {
   return [...APP_CSS.matchAll(/([^{}]*)\{([^{}]*)\}/g)]

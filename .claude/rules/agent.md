@@ -263,7 +263,7 @@ into a session. All of it lives in `hub-agent.py`.
   surfaces **only while the host is silent**; the dashboard renders it as a distinct amber state
   (`agentState`/`hostCard`).
 - The native updater leaves `~/.turma/updating.json` (`UPDATING_FLAG_PATH`) which the handler reads
-  to enrich the announcement (`reason:"update"`); a container update leaves no file and announces
+  to enrich the announcement (`reason:"update"`); a plain restart leaves no file and announces
   `reason:"restart"`. Next boot clears a stale flag. Tests: `TestUpdatingAnnounce`.
 
 ## Usage aggregates, ledger and subscription limits
@@ -340,15 +340,14 @@ triage and ticket-backed sessions. All of it lives in `hub-agent.py`.
   `store --file=/root/.git-credentials`. gh serves github.com; every other host falls through to
   `store`, reading an **optional** bind mount. **gh is first** so github.com always gets a fresh
   token; an unmounted file is a no-op. The guard denies writing `~/.git-credentials`. **Native
-  inherits the host's git config untouched.** Tests: `test_entrypoint.sh`,
+  inherits the host's git config untouched.** Tests:
   `test_denies_non_github_git_credential_writes`.
-- **Azure DevOps git auth (XERK-54, XERK-226)** — reuses the board PAT. At boot `entrypoint.sh` runs
-  `hub-agent.py --wire-azure-git`, setting a URL-scoped `http.<azure_base>.extraHeader`
-  (`azure_git_auth_config()`) — **`extraHeader`, not a credential helper / `http.proactiveAuth`**:
-  self-hosted TFS/Server often issues no Basic challenge a helper can act on, and the image's git
-  (2.39) predates `proactiveAuth` (2.46). Written `--system` as root before the privilege drop;
-  **exports `AZURE_DEVOPS_EXT_PAT`** so `az repos` authenticates too. Non-fatal; logs the host never
-  the token. Container-only. Tests: `TestAzureGitAuthConfig`, `test_entrypoint.sh`.
+- **Azure DevOps git auth (XERK-54, XERK-226)** — reuses the board PAT. The `--wire-azure-git` CLI
+  (`azure_git_auth_config()`) sets a URL-scoped `http.<azure_base>.extraHeader` — **`extraHeader`,
+  not a credential helper / `http.proactiveAuth`**: self-hosted TFS/Server often issues no Basic
+  challenge a helper can act on. It also exports `AZURE_DEVOPS_EXT_PAT` so `az repos` authenticates.
+  It was wired at boot by the old container entrypoint; the native agent does not wire it (no `az`
+  installed), so this is currently dormant. Tests: `TestAzureGitAuthConfig`.
 
 ## `tunnel-agent.js`
 
@@ -417,12 +416,7 @@ See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_se
 `~/.turma/guard-settings.json`, passed to every launch as `--settings`, wiring both hooks plus the
 `permissions.deny` credential-store rules. Policy is in that same file.
 
-## `entrypoint.sh` and the bundled toolchains
-
-See `.claude/rules/agent-image.md` (scoped to `agent/entrypoint.sh` + `agent/Dockerfile`) — the boot
-sequence, the start-time Claude Code check, and the cloud/Android toolchains the image bundles.
-
-## `native/` — non-Docker install
+## `native/` — the install
 
 See `.claude/rules/agent-native.md` (scoped to `agent/native/**`). **Nothing under `native/` edits
 the shared runtime files**; the one enabling change is `resume_on_boot`'s adopt path.
