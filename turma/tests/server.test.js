@@ -5593,6 +5593,96 @@ test("http: an unpinned ticket spawns with no model on the command (unchanged)",
   ]);
 });
 
+// POST /api/jira/<siteKey>/<issueKey>/runtime — the operator's per-ticket
+// runtime pin (XERK-473). Hub-owned durable like the /model pin; the runtime
+// rides the spawnTicket command as `agentType`, and the dispatch routes a dsh
+// ticket only to a host that offers dsh.
+
+const setRuntime = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/runtime`, { body, headers: userHeaders });
+
+// A ticket host that ALSO offers the dsh runtime.
+const dshTicketBeat = (device, site, { key = "ENG-5", repo = "Turma" } = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: [{ name: repo, path: `/git/${repo}` }],
+      dsh: { available: true },
+      jira: {
+        available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+        fetchedAt: "2026-07-14T12:00:00Z",
+        tickets: [{ key, summary: "Fix it", repoGuess: { repo, cloned: true } }],
+      },
+    },
+    headers: agentHeaders,
+  });
+
+test("http: pinning a ticket to dsh needs an org host offering it; claude releases", async () => {
+  await jiraBeat("trNo", "trNo.atlassian.net");
+  // No host of this org offers dsh, so a dsh pin is refused (nothing could run it).
+  assert.equal((await setRuntime("trNo.atlassian.net", "ENG-1", { runtime: "dsh" })).status, 400);
+  assert.ok(!("trNo.atlassian.net/ENG-1" in hub.ticketRuntimes));
+
+  // A host that offers dsh makes the pin acceptable.
+  await dshTicketBeat("trYes", "trYes.atlassian.net");
+  const ok = await setRuntime("trYes.atlassian.net", "ENG-5", { runtime: "dsh" });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.runtime, "dsh");
+  assert.equal(hub.ticketRuntimes["trYes.atlassian.net/ENG-5"].runtime, "dsh");
+
+  // "claude" (the default) releases the pin — nothing to store.
+  const rel = await setRuntime("trYes.atlassian.net", "ENG-5", { runtime: "claude" });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.runtime, "claude");
+  assert.ok(!("trYes.atlassian.net/ENG-5" in hub.ticketRuntimes));
+
+  // Bad runtime and an org nobody reports.
+  assert.equal((await setRuntime("trYes.atlassian.net", "ENG-5", { runtime: "gpt" })).status, 400);
+  assert.equal((await setRuntime("nobody.atlassian.net", "ENG-1", { runtime: "dsh" })).status, 404);
+});
+
+test("http: the runtime pin rides the /api/agents payload + requires the user login", async () => {
+  await dshTicketBeat("trPay", "trPay.atlassian.net");
+  await setRuntime("trPay.atlassian.net", "ENG-5", { runtime: "dsh" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(res.body.ticketRuntimes["trPay.atlassian.net/ENG-5"].runtime, "dsh");
+  // No user login → refused, pin untouched.
+  const anon = await request("POST", "/api/jira/trPay.atlassian.net/ENG-6/runtime",
+    { body: { runtime: "dsh" } });
+  assert.equal(anon.status, 401);
+});
+
+test("http: a dsh-pinned ticket carries agentType on its spawnTicket command", async () => {
+  await dshTicketBeat("trSpawn", "trSpawn.atlassian.net");
+  await setRuntime("trSpawn.atlassian.net", "ENG-5", { runtime: "dsh" });
+  const res = await request("POST", "/api/jira/trSpawn.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(agents.trSpawn.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+      ticketSite: "trSpawn.atlassian.net", agentType: "dsh", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("findTicketHost routes a dsh ticket only to a host that offers dsh", async () => {
+  // A dsh pin plus one org host that does NOT offer dsh: blocked, not full — a
+  // freed slot would not give it the runtime.
+  await ticketBeat("trPlain", "trRoute.atlassian.net", { key: "ENG-9" });
+  hub.setTicketRuntime("trRoute.atlassian.net", "ENG-9", "dsh");
+  const blocked = hub.findTicketHost("trRoute.atlassian.net", "Turma", "ENG-9",
+    { requireFree: true });
+  assert.equal(blocked.host, undefined);
+  assert.ok(!blocked.full);                     // blocked, ages out — not a capacity wait
+  assert.match(blocked.error, /dsh runtime/);
+
+  // A dsh-capable host in the same org is chosen.
+  await dshTicketBeat("trCap", "trRoute.atlassian.net", { key: "ENG-9" });
+  const ok = hub.findTicketHost("trRoute.atlassian.net", "Turma", "ENG-9",
+    { requireFree: true });
+  assert.equal(ok.host, "trCap");
+  hub.setTicketRuntime("trRoute.atlassian.net", "ENG-9", null);   // cleanup
+});
+
 test("ticket-model pins survive a hub restart (read back from their own file)", () => {
   const file = path.join(os.tmpdir(), `turma-test-tm-persist-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({

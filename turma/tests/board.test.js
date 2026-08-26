@@ -15,6 +15,7 @@ const {
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
   modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+  runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
@@ -1148,6 +1149,62 @@ test("modelPickerHtml: default preselected without a pin, the pinned alias with 
   const pinned = modelPickerHtml({ model: "opus" }, models);
   assert.ok(/<option value="opus" selected>/.test(pinned));
   assert.ok(!/<option value="__default__" selected>/.test(pinned));
+});
+
+// ---- ticket -> runtime pin (XERK-473): the detail panel's Runtime row -------
+
+test("mergeSites: dshAvailable is set when any reporting host offers dsh", () => {
+  assert.equal(mergeSites([agent("h1", block())])[0].dshAvailable, false);
+  assert.equal(mergeSites([agent("h1", block(), { dsh: { available: true } })])[0].dshAvailable, true);
+  // Any host in the org is enough, online or not.
+  assert.equal(mergeSites([
+    agent("h1", block(), { online: false, dsh: { available: true } }),
+    agent("h2", block()),
+  ])[0].dshAvailable, true);
+});
+
+test("runtimePinOf: reads the map; only a non-default runtime is a pin", () => {
+  const tr = { "myorg.atlassian.net/X-1": { runtime: "dsh", at: 1 } };
+  assert.equal(runtimePinOf(tr, "myorg.atlassian.net", "X-1").runtime, "dsh");
+  assert.equal(runtimePinOf(tr, "myorg.atlassian.net", "X-2"), null);
+  assert.equal(runtimePinOf(null, "myorg.atlassian.net", "X-1"), null);
+  // A stored "claude" (the default) is not a pin.
+  assert.equal(runtimePinOf({ "s/X-1": { runtime: "claude" } }, "s", "X-1"), null);
+});
+
+test("prettyRuntime: dsh names the harness, everything else is Claude Code", () => {
+  assert.equal(prettyRuntime("dsh"), "dsh (DeepSeek Harness)");
+  assert.equal(prettyRuntime("claude"), "Claude Code");
+  assert.equal(prettyRuntime(""), "Claude Code");
+});
+
+test("runtimeFieldHtml: default vs pinned, editable only with dsh or a pin", () => {
+  const def = runtimeFieldHtml(null, { editable: true });
+  assert.ok(def.includes("Claude Code"));
+  assert.ok(def.includes("data-runtime-edit"));
+  const pinned = runtimeFieldHtml({ runtime: "dsh" }, { editable: true });
+  assert.ok(pinned.includes("dsh (DeepSeek Harness)"));
+  assert.ok(pinned.includes("set by you"));
+  // A failed save is reported inline, like the model row.
+  const err = runtimeFieldHtml(null, { editable: true, error: "no host offers dsh" });
+  assert.ok(err.includes("Couldn't save"));
+  assert.ok(err.includes("no host offers dsh"));
+});
+
+test("runtimePickerHtml: dsh offered only when the org offers it or a pin exists", () => {
+  // No dsh in the org and no pin: only the Claude option (nothing pinnable).
+  const none = runtimePickerHtml(null, { dshAvailable: false });
+  assert.ok(!none.includes('value="dsh"'));
+  assert.ok(/<option value="claude" selected>/.test(none));
+  assert.ok(none.includes("data-runtime-cancel"));   // a pick IS the save
+  // The org offers dsh: the option appears.
+  const offered = runtimePickerHtml(null, { dshAvailable: true });
+  assert.ok(offered.includes('value="dsh"'));
+  // An existing dsh pin is always carried so it can be released, even with dsh gone.
+  const pinned = runtimePickerHtml({ runtime: "dsh" }, { dshAvailable: false });
+  assert.ok(/<option value="dsh" selected>/.test(pinned));
+  assert.equal(runtimePickerValue({ runtime: "dsh" }), "dsh");
+  assert.equal(runtimePickerValue(null), "claude");
 });
 
 test("modelPickerHtml: a pinned alias off the probed list stays selected", () => {
