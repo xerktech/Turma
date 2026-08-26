@@ -11549,12 +11549,50 @@ class TestContextMeter(unittest.TestCase):
         # A local session's exact selected-model window.
         self.assertEqual(ha.context_window_tokens(
             {"modelSource": "local", "localModelContext": 32768}), 32768)
-        # A subscription session has no agent-side figure -> the 200k assumption.
+        # A subscription session that has not named a model yet -> the assumption.
         self.assertEqual(ha.context_window_tokens({"modelSource": "subscription"}),
                          ha.SUBSCRIPTION_CONTEXT_ASSUMED)
         # A local session before its window is resolved falls back to the same.
         self.assertEqual(ha.context_window_tokens({"modelSource": "local"}),
                          ha.SUBSCRIPTION_CONTEXT_ASSUMED)
+
+    def test_subscription_denominator_is_the_model_window_not_a_flat_200k(self):
+        # The window is KNOWN from the model, so the current 1M families report
+        # 1M — the flat 200k assumption over-warned 5x (XERK-489 follow-up).
+        # message.model is the bare family id even on the 1M variant.
+        self.assertEqual(ha.context_window_tokens(
+            {"modelSource": "subscription", "modelActual": "claude-opus-4-8"}),
+            1_000_000)
+        # `modelActual` (what the turns ran on) wins over the requested `model`.
+        self.assertEqual(ha.context_window_tokens(
+            {"modelSource": "subscription", "modelActual": "claude-opus-4-8",
+             "model": "claude-haiku-4-5"}), 1_000_000)
+        # A 200k family maps to 200k; an explicit `[1m]` alias is a definite 1M.
+        self.assertEqual(ha.context_window_tokens(
+            {"modelSource": "subscription", "modelActual": "claude-haiku-4-5"}),
+            200_000)
+        self.assertEqual(ha.context_window_tokens(
+            {"modelSource": "subscription", "model": "claude-haiku-4-5[1m]"}),
+            1_000_000)
+        # A dated snapshot resolves via its family prefix.
+        self.assertEqual(ha.context_window_tokens(
+            {"modelSource": "subscription",
+             "modelActual": "claude-sonnet-4-6-20260101"}), 1_000_000)
+        # An unrecognised model falls back to the assumption (under-warns, safe).
+        self.assertEqual(ha.context_window_tokens(
+            {"modelSource": "subscription", "modelActual": "some-future-model"}),
+            ha.SUBSCRIPTION_CONTEXT_ASSUMED)
+
+    def test_subscription_context_window_normalises_the_id(self):
+        self.assertEqual(ha._subscription_context_window("claude-opus-4-8[1m]"),
+                         1_000_000)
+        self.assertEqual(ha._subscription_context_window("Claude-Opus-4-8"),
+                         1_000_000)
+        self.assertEqual(ha._subscription_context_window("claude-haiku-4-5"),
+                         200_000)
+        self.assertIsNone(ha._subscription_context_window(""))
+        self.assertIsNone(ha._subscription_context_window(None))
+        self.assertIsNone(ha._subscription_context_window("gpt-4o"))
 
 
 class TestSeedModelActual(ManagerMixin, unittest.TestCase):

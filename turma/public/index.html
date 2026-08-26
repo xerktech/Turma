@@ -1475,9 +1475,9 @@ function composer(a, repo, rk, spawning) {
 
 // Context-fullness meter (XERK-489 Phase 4): how full the model's context window
 // is right now, warning before the ~95% auto-compaction. EXACT for a local
-// session (its selected model's window); a subscription session uses Claude
-// Code's own 200k assumption, marked "~". Returns "" until a turn is measured.
-// Mirrored on the Sessions chat bar (chat.js) and Android's card.
+// session (its selected model's window); a subscription session's window is
+// derived from the model it runs (agent-side), marked "~". Returns "" until a
+// turn is measured. Mirrored on the Sessions chat bar (chat.js) and Android's card.
 function contextMeterHtml(s) {
   const num = s.lastTurnContextTokens, den = s.contextWindowTokens;
   if (!(num > 0 && den > 0)) return "";
@@ -1485,7 +1485,7 @@ function contextMeterHtml(s) {
   const cls = pct >= 95 ? " danger" : pct >= 85 ? " warn" : "";
   const approx = s.modelSource !== "local";
   const title = `Context ${fmtTokens(num)} / ${fmtTokens(den)}`
-    + (approx ? " (subscription window assumed — 200k)" : " (exact)")
+    + (approx ? " (subscription — window from model)" : " (exact)")
     + " — the session auto-compacts near 95%";
   return `<div class="ctx-meter${cls}" title="${esc(title)}">
     <div class="ctx-track"><div class="ctx-fill" style="width:${pct}%"></div></div>
