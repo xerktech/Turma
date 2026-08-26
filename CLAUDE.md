@@ -35,9 +35,10 @@ that component's files.
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
 | `.claude/rules/release.md` | `.github/**`, `VERSION`, Dockerfiles | releases, PR gates, image tiers |
 | `.claude/rules/routing-eval.md` | `bench/archive/**`, the routing docs | archive-sourced replay eval: the requestId turn unit, curation gates, why routing is per-session |
-| `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh integration ADR (XERK-460 G0): the five architecture decisions |
-| `.claude/rules/dsh-input.md` | `agent/dsh_session.py`, `agent/dsh-session-driver/**`, `agent/hub-agent.py` | driving a dsh session (XERK-467 [C]): control socket, driver plugin, `_launch_dsh`, input/interaction |
-| `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**`, `agent/hub-agent.py` | dsh safety guard (XERK-470 [F]): the deny policy mapped onto dsh's tool pipeline |
+| `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh ADR + per-child mechanics (XERK-460) |
+| `.claude/rules/dsh-input.md` | `agent/dsh_session.py` | driving a dsh session (XERK-467 [C]): socket, driver, input |
+| `.claude/rules/dsh-delegation.md` | `agent/dsh_transcript.py` | dsh delegation (XERK-474 [J]): bg-agent/workflow rows + `subagentHistory` |
+| `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**` | dsh safety guard (XERK-470 [F]): deny policy on dsh's pipeline |
 
 ### Editing these files
 
