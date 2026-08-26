@@ -629,8 +629,11 @@ private fun ChatFooter(
                     accent = true,
                 )
             } else {
+                // No discovered list yet — name the configured model (web: the
+                // fixed cc-model label `cur || "local model"`), NOT the source
+                // label, which now reads "Other".
                 StaticChip(
-                    "model: ${com.xerktech.turma.core.ModelSource.label(modelSource, localModel)}",
+                    "model: ${com.xerktech.turma.core.ModelSource.currentLocalModel(session, localModel).ifBlank { "local model" }}",
                     why = "This host's self-hosted model. Its model list has not been discovered yet.",
                 )
             }

@@ -1390,7 +1390,7 @@ function composer(a, repo, rk, spawning) {
         ${localModel ? `<div>
           <label>Run against</label>
           <select id="${cid(rk, "source")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
-            ${opt("subscription", "Claude subscription", selSource)}${opt("local", localModel.defaultModel || localModel.model || "Self-hosted model", selSource)}
+            ${opt("subscription", "Claude subscription", selSource)}${opt("local", "Other", selSource)}
           </select>
         </div>` : ""}
         ${localModel && lModels.length ? `<div id="${cid(rk, "lmwrap")}" class="full lm-wrap"${selSource === "local" ? "" : ' style="display:none"'}>

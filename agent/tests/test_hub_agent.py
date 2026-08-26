@@ -22498,7 +22498,8 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.spawn_ticket = mock.Mock()
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "cmdId": "c9"}])
-        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model=None)
+        sm.spawn_ticket.assert_called_once_with(
+            "PROJ-7", cmd_id="c9", model=None, agent_type=None)
 
     def test_handle_commands_carries_the_model_pin(self):
         # The hub's per-ticket model pin (XERK-123) rides the command; the agent
@@ -22507,7 +22508,19 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.spawn_ticket = mock.Mock()
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "model": "opus", "cmdId": "c9"}])
-        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model="opus")
+        sm.spawn_ticket.assert_called_once_with(
+            "PROJ-7", cmd_id="c9", model="opus", agent_type=None)
+
+    def test_handle_commands_carries_the_runtime_pin(self):
+        # The hub's per-ticket runtime pin (XERK-473) rides the command as
+        # agentType; the agent forwards it to spawn_ticket, which validates it
+        # like any spawn agent_type (resolve_agent_type in spawn()).
+        sm = self.make_ticket_manager()
+        sm.spawn_ticket = mock.Mock()
+        sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                             "agentType": "dsh", "cmdId": "c9"}])
+        sm.spawn_ticket.assert_called_once_with(
+            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh")
 
     def test_a_model_pin_lands_on_the_session_and_command_line(self):
         sm = self.make_ticket_manager()
@@ -22517,6 +22530,28 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["model"], "opus")     # resolve_model(opus) -> opus
         cmd = self._launches()[-1][-1]
         self.assertIn("--model opus", cmd)
+
+    def test_a_runtime_pin_lands_on_the_session_record(self):
+        # The hub's per-ticket runtime pin (XERK-473) reaches spawn_ticket as
+        # agent_type and is validated + stamped on the record like any spawn
+        # runtime (resolve_agent_type in spawn()). The launch itself dispatches
+        # on agentType — stubbed here so the record's field is what's asserted,
+        # not a live dsh process (which the launch choke point routes to).
+        sm = self.make_ticket_manager()
+        launched = []
+        sm._launch_dsh = lambda sess, **kw: launched.append(sess)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()), \
+                mock.patch.object(ha, "dsh_configured", lambda: True):
+            sm.spawn_ticket("PROJ-7", agent_type="dsh")
+        sess = sm.registry[0]
+        self.assertEqual(sess["agentType"], "dsh")
+        self.assertEqual(len(launched), 1)          # dispatched to the dsh launcher
+
+    def test_no_runtime_pin_spawns_on_claude(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry[0]["agentType"], "claude")
 
     def test_no_model_pin_spawns_with_the_default_model(self):
         sm = self.make_ticket_manager()

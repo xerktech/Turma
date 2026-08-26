@@ -328,6 +328,42 @@ reader, so the whole PR web reads a dsh transcript unchanged.
   create`), proving attribution, the live per-beat scan, `_seed_prs`, `refresh_pr_status` +
   GitLab/ADO dispatch, and socket-delivered comment/conflict nudges — the G1 lesson (no mock).
 
+## [I] (XERK-473) shipped: board integration — a ticket can run on dsh
+
+A ticket is DISPATCHED to a runtime, and the board's collectors/triage/tracker-writes are
+runtime-agnostic. Like [A]'s composer selector, the runtime choice is presentational plumbing over
+the same spawn path — no new session model.
+
+- **The ticket runtime is a per-ticket PIN, mirroring the model pin (XERK-123), not a spawn-time
+  flag.** Hub-owned durable state (`ticketRuntimes` on `/data`, keyed `<siteKey>/<issueKey>`), it
+  rides the `spawnTicket` command as `agentType` and so must survive a hub restart and feed both the
+  Start button and the auto-start sweep. Only a NON-default ("dsh") choice is stored — "claude" and
+  clearing both release — so an unpinned ticket rides byte-for-byte the command it always did.
+  `POST /api/jira/<siteKey>/<issueKey>/runtime` is the board's Runtime row (a fifth tap-to-change
+  picker beside Status/Repo/Agent/Model), authoritative on a 200 like the model pin.
+- **The DISPATCH filters the pool by runtime capability, not just triage** (XERK-296). `findTicketHost`
+  restricts a dsh-pinned ticket to hosts reporting `dsh.available` — the same shape as the triage
+  filter, checked ahead of capacity so "no host offers dsh" reads as **blocked** (a freed slot would
+  not add the runtime, so it ages out) rather than **full** (clears itself). A pinned host that lacks
+  dsh is reported, never routed around. `orgOffersDsh` gates the pin server-side and `dshAvailable`
+  hides the board option, so a dsh pin can only name a runtime the org can actually run — the agent
+  still re-validates (`resolve_agent_type`).
+- **The agent side is one forwarded argument.** `spawn_ticket(agent_type=…)` passes it to `spawn()`,
+  validated by `resolve_agent_type` like every other spawn enum; the launch choke point (`_launch_tmux`)
+  already dispatches on `agentType`, and `_launch_dsh` already appends the ticket-branch directive and
+  delivers the built ticket prompt + attachments. So a dsh ticket session is "told its branch, cuts
+  it itself, worktree stays detached" with NO new launch code — the whole point of the [A]/[B] shape.
+- **Collectors and the two tracker writes are runtime-agnostic and untouched** — they gather tickets
+  and write status/create, never spawn a session, so the runtime never reaches them. **The
+  `_board_column` mirrors are untouched too** (the ticket's explicit ask): the runtime pin is
+  orthogonal to a ticket's column.
+- **Web ⇄ Android parity**: the board Runtime row is deferred to XERK-477 (the Android dsh-parity
+  ticket) with an `android/PARITY.md` line; the hub side is live, so the row works fully on web.
+  The vendored `board.cjs` copies (glasses/veiller) stay byte-identical to `board.js`.
+- Tests: `TestSpawnTicket` (`test_a_runtime_pin_lands_on_the_session_record`,
+  `test_handle_commands_carries_the_runtime_pin`) agent-side; the `/runtime` route + the dsh
+  `findTicketHost` cases in `server.test.js`; the `runtime*` cases in `board.test.js`.
+
 ## [L] (XERK-476) shipped: peer roster + cross-session messaging for dsh
 
 XERK-348 matched for dsh. The ROSTER was already runtime-independent (`_peer_rows`/
