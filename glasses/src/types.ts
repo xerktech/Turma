@@ -78,6 +78,11 @@ export interface SessionInfo {
   // spawns that had no prompt, or until the summary lands.
   summary?: string | null;
   status: SessionStatus;
+  // Which runtime this session runs on (XERK-460): "dsh" for a DeepSeek Harness
+  // session, "claude"/""/absent for the default Claude Code one. Coerced hub-side
+  // (server.js `normalizeSessions`) so a bad value can't break the decode; read
+  // only through `isDsh` (sessions.ts) for the presentational runtime marker.
+  agentType?: string | null;
   model?: string | null;
   permissionMode?: string | null;
   createdAt?: string | null;
@@ -142,6 +147,11 @@ export interface AgentInfo {
   // (XERK-171), matching the web dashboard's org.js `siteKeyOf`. The real block
   // carries far more (tickets, status, …), ignored via the index signature.
   jira?: { siteKey?: string | null; orgName?: string | null; [key: string]: unknown } | null;
+  // dsh runtime capability (XERK-460): present with `available:true` only on a
+  // host that can launch dsh sessions, mirroring `localModel`. Read by nothing
+  // here today (glasses/veiller don't spawn), but typed so the field is decoded
+  // and available for a future runtime picker; coerced hub-side (`normalizeDsh`).
+  dsh?: { available?: boolean; [key: string]: unknown } | null;
   [key: string]: unknown; // startedAt, memory, logTail, reposRoot, ...
 }
 
