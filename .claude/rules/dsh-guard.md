@@ -50,12 +50,12 @@ dsh gates tool calls **inside the agent process**, not with an external hook. Th
 
 - `build_dsh_guard_config()` is that equivalent — it returns the plugin config + the two profile
   pins, NOT a settings dict claude reads. `_dsh_guard_config()` memoizes it on the manager like
-  `_ensure_guard_settings`, and `_launch_dsh` builds it **at the launch choke point** so the seam is
-  wired and exercised even while the process launcher (XERK-466 [B]) is a stub.
-- **XERK-466's launcher MUST consume it**: compose `@turma/dsh-guard` from `cfg["pluginPath"]` with
-  `cfg["plugin"]` (adding the per-session `sessionId`/`cwd`), and pin the profile from
-  `cfg["sandboxMode"]`/`cfg["approvalPolicy"]`. A dsh launch that skips this ships a runtime with no
-  guard — the "not shippable" state this ticket gates against.
+  `_ensure_guard_settings`, and `_launch_dsh` builds it **at the launch choke point** (XERK-466 [B])
+  so the guard seam is wired before the dsh process runs.
+- **The launcher consumes it**: `_launch_dsh` composes `@turma/dsh-guard` from `cfg["pluginPath"]`
+  with `cfg["plugin"]` (adding the per-session `sessionId`/`cwd`), and pins the profile from
+  `cfg["sandboxMode"]`/`cfg["approvalPolicy"]`. A dsh launch that skipped this would ship a runtime
+  with no guard — the "not shippable" state XERK-460 gates against.
 
 ## Invariants a change must not undo
 
@@ -83,8 +83,8 @@ dsh gates tool calls **inside the agent process**, not with an external hook. Th
   fs/network from inside it is **dsh's sandbox's job, not this guard's** — which is why
   `build_dsh_guard_config` pins `sandboxMode: workspace-write` + `approvalPolicy: ask`. This is the
   dsh analogue of Claude's "Bash is not covered by fileguard" caveat, and it is the reason those
-  pins are load-bearing: **XERK-466's launcher MUST enforce them** (dsh enforces the sandbox; this
-  change only sets the value). Re-QA that seam when the launcher ships.
+  pins are load-bearing: **`_launch_dsh` MUST set them on every launch** (dsh enforces the sandbox;
+  the launcher only supplies the value) — a standing invariant, exercised by XERK-479's real-dsh QA.
 - **`pwsh` routes to the bash-syntax classifier.** A PowerShell tool call goes to `guard.py` as a
   `Bash` tool, but `guard.py` matches bash-oriented destructive patterns, so `Remove-Item -Recurse
   -Force /` would likely not match. Low risk (Linux agent image; pwsh is niche) and still ahead of

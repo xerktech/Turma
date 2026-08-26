@@ -21,9 +21,9 @@ files as each child ships, and this file's `paths:` widens then.
   **incremental** path: dsh added as a selectable per-session runtime under the EXISTING agent and
   the EXISTING hub. **XERK-460's title says "alongside Claude Code" — so the epic is the incremental
   path, and these decisions choose it over the rewrite wherever the two conflict.**
-- **No production code touches dsh yet.** Every `agentType`/`agent_type` in `hub-agent.py` and
-  `server.js` is about Task-tool SUBAGENTS, unrelated to dsh. dsh lives only in `poc/` and `docs/`.
-  These decisions are greenfield, not a description of scaffolding.
+- **`agentType`/`agent_type` in `hub-agent.py`/`server.js` ALSO names Task-tool SUBAGENTS** — an
+  older, unrelated concept. The dsh runtime is the per-session `agentType` field ([A]) plus the
+  `agent/dsh_*` modules; do not conflate the two.
 - **G1 (XERK-463) is done: go/no-go = GO.** All four operations are proven end-to-end against real
   dsh 0.1.1-rc.2, no mock, via `poc/turma-2.0-poc/test-real-dsh.sh --drive`. The go/no-go corrected
   the PoC plugin, which had spawn/input/kill written against a *guessed* `ctx.agents` API the mock
@@ -51,9 +51,8 @@ invariants a later child must not undo:
   at a host with no capability (`checkSpawnAgentType`), and the agent re-validates
   (`resolve_agent_type`).
 - **`_launch_tmux` is the single launch choke point, and its FIRST action is the runtime dispatch**:
-  `if sess.agentType == "dsh": self._launch_dsh(sess); return`. `_launch_dsh` is [A]'s stub — it
-  refuses via `_set_error("dsh runtime launcher not yet available (XERK-466)")`. **XERK-466 replaces
-  that method's BODY with the real per-session dsh launch**; the dispatch line and choke point stay.
+  `if sess.agentType == "dsh": self._launch_dsh(sess); return`. `_launch_dsh` performs the real
+  per-session dsh launch (XERK-466 [B]); the dispatch line and choke point stay.
   Do not hoist the dispatch to the ~6 callers — they all funnel through `_launch_tmux`.
 - **Composer + card**: `sessions.html` gates a "Runtime" `<select>` on `a.dsh.available` and sends
   `agentType` only when "dsh" (a bare spawn is unchanged); `runtimeMarkHtml` badges a dsh card.
