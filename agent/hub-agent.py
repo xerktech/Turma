@@ -20538,8 +20538,9 @@ class SessionManager:
                              name="dsh-profile", daemon=True).start()
         # The dsh peer-message delivery worker (XERK-476): delivers staged
         # cross-session traffic off the beat (see _dsh_peer_worker_loop). Started
-        # unconditionally — it is idle until a dsh session stages a message — so a
-        # backlog resumed on boot drains without waiting for the next stage.
+        # once here rather than lazily so the first staged message is delivered
+        # by an already-running worker; the queue is in-memory, so it parks on an
+        # empty queue at boot until a session stages something.
         self._start_dsh_peer_worker()
         beat = 0
         while True:
