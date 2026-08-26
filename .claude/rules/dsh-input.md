@@ -104,6 +104,20 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
 
 ## Pitfalls (each cost real time; do not re-learn)
 
+- **A BOUND control socket is not proof the session is alive** (XERK-492). The driver binds the
+  socket a moment before a load-time crash (a bad plugin, a missing dynamic import, a bad model
+  route) can abort the dsh process, so `ctl.start()` succeeding can race ahead of a dead process —
+  the old code then recorded a live-looking zombie (empty pane, `ctl.state()` → None, no events, no
+  transcript). `_launch_dsh` now calls `_confirm_dsh_launch` after `start()`: a bounded wait for the
+  driver's **`agentUp`** state field (set once `agents.create`/`resume` RESOLVES — distinct from
+  `status`, which reads `idle` both while creating AND when creation has failed), failing fast if the
+  tmux process is gone (dsh is that tmux session's only command, so a vanished session means it
+  exited) or the window elapses. A failed confirmation tears down and RAISES, so the start routes
+  through the caller's `_set_error` / `_refuse_start` (the XERK-265 channel) with a reason instead of
+  a zombie. A driver too old to report `agentUp` falls back to "a usable state reply == up", so it is
+  never false-failed. **The driver EXITS(1) on agent-create failure** rather than lingering agentless,
+  turning the bad-model-route / failed-setup zombie into the same detectable tmux-death. Tests:
+  `TestConfirmDshLaunch`.
 - **The control socket path must stay short (< ~108 bytes, `sun_path`).** `~/.turma/dsh/<uuid>.sock`
   (~58) is fine; a long base path silently truncates bind/connect and the driver "cannot connect"
   while the socket file exists. Never move the socket under a deep path.
