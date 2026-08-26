@@ -820,10 +820,18 @@ export function apply(ctx, config) {
                     workflowChildIds.add(d.childId);
             }
             if (event.type === 'turn/start' || event.type === 'turn/end') {
-                const agent = ctx.agents.get(sessionId);
+                // Derive the liveness status from the turn EDGE, not from
+                // ctx.agents.get(sessionId).status at emit time: at turn/end the agent
+                // has NOT yet settled to idle, so reading .status there pushes a final
+                // `running` and no idle edge ever follows. The hub cannot recover from
+                // that — dsh_pane_busy is deliberately not age-expired (a long silent
+                // tool call must stay `running`) — so a finished dsh session reads
+                // "working" forever and never becomes ready-for-review (XERK-479 D3).
+                // A turn/start IS the turn beginning (running); a turn/end IS it
+                // ending (idle).
                 emit({
                     evt: 'state',
-                    status: agent ? agent.status : 'idle',
+                    status: event.type === 'turn/start' ? 'running' : 'idle',
                     eventCount: session.events.length,
                 });
             }

@@ -259,6 +259,15 @@ not undo:
   minutes) — the exact bug paneBusy's "esc to interrupt" solves for Claude. Liveness-of-the-SIGNAL is
   the producer's job: it clears to unknown on socket disconnect, and the host-offline gate zeroes it
   when the host dies.
+- **The driver derives its `state` status from the TURN EDGE, never `agent.status` at emit time**
+  (XERK-479 D3). Because the hub cannot age-expire a stale "running" (above), the PRODUCER must
+  deliver the idle edge: `dsh-session-driver` emits `running` on `turn/start` and `idle` on
+  `turn/end`. Reading `ctx.agents.get(sid).status` inside the `turn/end` handler returns `running`
+  (the agent has not settled yet), so no idle edge ever fires and a finished dsh session reads
+  "working" forever — never becoming ready-for-review. Keep the committed `dist/` in sync with `src/`.
+- **`_on_dsh_state` stores the PARSED snapshot dict, via `_ingest_dsh_event`** — the reader's canonical
+  fold. `dsh_pane_busy` is dict-only; storing the bare status STRING made paneBusy read None for every
+  dsh session (XERK-479 D1). The reader callback and `_ingest_dsh_event` are one path, not two.
 - **The beat only ever READS an in-memory cache (`self.dsh_status`), never the socket** — so a wedged
   plugin cannot stall the heartbeat past `OFFLINE_AFTER_MS` (XERK-395). The PRODUCER that fills the
   cache — the persistent per-session socket reader — is the LAUNCHER's ([B] impl phase), off the beat.
