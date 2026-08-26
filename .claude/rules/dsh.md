@@ -213,6 +213,11 @@ to; `project_log()` is the batch form. Invariants a change here must not undo:
   transcript equivalent; a dsh session's "working" signal is an in-flight turn (`turn/start` with no
   `turn/end`, i.e. `agent.status === 'running'`), reported as a heartbeat field by [D] and read from
   dsh directly. Injecting a turn marker into the JSONL would force `entryBlocks` to grow a case.
+- **The chat's live streaming also reads the native log, never the projection** (`tunnel-agent.js`
+  `pollDshTurn`/`foldDshView`). A dsh session streams its `assistant/chunk` deltas into the same
+  `/live` `turn` frames a claude pane scrape produces, so the chat page grows the response as it
+  generates. It tails `events.jsonl` directly for the DISPLAY; it does not project chunks into JSONL
+  and adds no new reader to `_entry_blocks`/`entryBlocks`.
 - **usage + model ride the assistant entry** (D4): dsh `TokenUsage` maps 1:1 to Claude's disjoint
   `input/output/cache_read/cache_creation` counts, and `message.model` comes from the event's
   `message.source.model`. A step with no usage projects no `usage` key (never a fabricated zero,

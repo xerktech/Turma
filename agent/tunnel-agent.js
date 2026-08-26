@@ -69,6 +69,25 @@ const MAX_WATCHERS = 16; // safety cap on concurrent live tails
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 
+// dsh (DeepSeek Harness) sessions (XERK-460) have no Claude TUI pane to scrape
+// for the live in-progress turn, but their native event log carries the raw LLM
+// stream as `assistant/chunk` deltas. Tunnel-agent folds those deltas into the
+// same `turn` frame a Claude pane scrape produces, so the chat page streams a
+// dsh response as it generates instead of only when the whole `assistant/message`
+// commits. The events file nests at <slug>/<transcriptId>/<dsh>/events.jsonl —
+// the same <tid>/dsh/ nest hub-agent.py's _launch_dsh writes and the raw archive
+// walk retains (dsh.md [E]). The path is mirrored here, not shared, because the
+// hub-agent.py and this JS tail are separate processes; keep it in lockstep with
+// _launch_dsh. A claude session never writes this nest, so its presence is what
+// tells the watcher a session is dsh (no protocol/hub change needed).
+const DSH_STORE_DIRNAME = "dsh";
+const DSH_EVENTS_FILE = "events.jsonl";
+// Cap the accumulated live stream text so a long generated message can't build
+// an unbounded chat frame. The committed `assistant/message` (which the dsh
+// projection writes in full to the transcript) supersedes it the moment the turn
+// ends, so a live cap clips neither history nor the final rendering.
+const DSH_LIVE_TEXT_CHARS = Number(process.env.DSH_LIVE_TEXT_CHARS) || 16000;
+
 // Rich-block caps for the live tail — mirror hub-agent.py BLOCK_CAPS, which is
 // the SAME set the on-demand `history` read uses (XERK-347): the live path used
 // to clip to a quarter of what history returned, and the chat put a "Show more…"
@@ -1227,6 +1246,126 @@ function resolveLiveText(generating, captured, held, entries) {
   return t;
 }
 
+// The dsh native event-log path for a watched session, or null when it is not a
+// dsh session (no events file at the derived nest). Mirrors _launch_dsh's
+// `store_dir` `<slug>/<tid>/<dsh>/events.jsonl`, so a claude session — which
+// never writes that nest — keeps the pane-scrape live path below. The
+// transcriptId is the pinned claude_sid for dsh, exactly as sessionTranscript
+// reads it. Path-traversal-safe: transcriptId is validated to a plain word and
+// projectSlug rewrites every non-alphanumeric char to '-', so both only name a
+// child of PROJECTS_ROOT.
+function dshEventsPath(worktreePath, transcriptId) {
+  if (!transcriptId || !/^[A-Za-z0-9-]+$/.test(transcriptId)) return null;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const p = path.join(PROJECTS_ROOT, projectSlug(worktreePath), transcriptId,
+    DSH_STORE_DIRNAME, DSH_EVENTS_FILE);
+  return fs.existsSync(p) ? p : null;
+}
+
+// Fold one dsh native event into the live streaming view {text, generating}.
+// This is the dsh analogue of the pane-scrape classifier (XERK-19/251) — it
+// turns the raw LLM stream into a monotonic bubble for the chat page:
+//  - `assistant/chunk` with a `text-delta` grows `text` (streaming), capped at
+//    DSH_LIVE_TEXT_CHARS so no frame is unbounded;
+//  - the committed `assistant/message` CLEARS `text` — the projection just wrote
+//    it in full, so the committed transcript tail owns that bubble (never keep
+//    streaming it);
+//  - only `turn/end` (and a fresh `user/message`, which opens a new turn) ends
+//    the generating read, mirroring the driver's own turn/start->running /
+//    turn/end->idle liveness edge (XERK-479 D3) so the working bar never blinks
+//    between a multi-step turn's steps.
+// Pure so it's unit-testable against captured events; `view` may be mutated in
+// place (the caller owns it per-session).
+function foldDshView(view, event) {
+  const e = (event && typeof event === "object") ? event : null;
+  if (!e) return view;
+  const t = e.type;
+  if (t === "turn/start" || t === "user/message") {
+    // A turn opened; any held stream text from a prior turn is stale.
+    return { text: "", generating: true };
+  }
+  if (t === "assistant/chunk") {
+    const chunk = (e.data && typeof e.data === "object") ? e.data.chunk : null;
+    if (chunk && chunk.type === "text-delta" && typeof chunk.text === "string" && chunk.text) {
+      return { text: (String(view.text === undefined ? "" : view.text) + chunk.text)
+        .slice(0, DSH_LIVE_TEXT_CHARS), generating: true };
+    }
+    return { text: view.text, generating: true };
+  }
+  if (t === "assistant/message") {
+    // The full message committed to the projection; the transcript tail owns it.
+    return { text: "", generating: view.generating };
+  }
+  if (t === "turn/end") {
+    return { text: "", generating: false };
+  }
+  return view;
+}
+
+// Tail a watched dsh session's native event log and push `turn` frames carrying
+// the streaming assistant text (the dsh counterpart of the pane scrape in
+// pollWatcher's claude branch). Reads only the bytes appended since the last
+// poll, folds each complete event via foldDshView, and sends on a text or
+// generating change — a blank text + null status clears the bubble and the
+// working bar, exactly like a finished claude turn. Best-effort: a missing or
+// transiently unreadable events file is skipped, never fatal to the tail.
+function pollDshTurn(w, sessionId) {
+  let fd;
+  try { fd = fs.openSync(w.dshEvents, "r"); } catch { return; }
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size < w.dshOffset) {
+      // The log was truncated/rewritten (a fresh launch / clear-context) — start
+      // over, like DshProjectionTail's defensive reset.
+      w.dshOffset = 0; w.dshPartial = ""; w.dshView = { text: "", generating: false };
+    }
+    const len = size - w.dshOffset;
+    let buf = "";
+    if (len > 0) {
+      const b = Buffer.alloc(len);
+      fs.readSync(fd, b, 0, len, w.dshOffset);
+      w.dshOffset = size;
+      buf = b.toString("utf8");
+    }
+    w.dshPartial += buf;
+    const lines = [];
+    let idx;
+    while ((idx = w.dshPartial.indexOf("\n")) !== -1) {
+      const line = w.dshPartial.slice(0, idx).trim();
+      w.dshPartial = w.dshPartial.slice(idx + 1);
+      if (line) lines.push(line);
+    }
+    let changed = false;
+    for (const raw of lines) {
+      let event;
+      try { event = JSON.parse(raw); } catch { continue; }
+      const before = { text: w.dshView.text, generating: w.dshView.generating };
+      w.dshView = foldDshView(w.dshView, event);
+      if (w.dshView.text !== before.text || w.dshView.generating !== before.generating) changed = true;
+    }
+    if (!changed) return;
+    // dsh carries NO working status here: the Stop button and the working-status
+    // bar are driven by `frame.status`, and Stop for a dsh session would send
+    // Escape into its (non-Claude) tmux pane — a no-op, so surfacing it would
+    // present a Stop that does nothing. dsh's working read stays on the
+    // heartbeat's `paneBusy` (dsh_pane_busy, [D]), as today. The streaming text
+    // alone is this frame's job.
+    const status = null;
+    // NUL separator: a byte that cannot occur in stream text (same escape as the
+    // claude branch — a literal NUL makes grep treat this file as binary).
+    const key = String(w.dshView.text || "") + "\u0000" + (status ? JSON.stringify(status) : "");
+    if (key !== w.lastTurn) {
+      w.lastTurn = key;
+      sendControl({ turn: sessionId, text: String(w.dshView.text || ""), status,
+        agents: liveAgentsReport(w.agentState) });
+    }
+  } catch {
+    /* transient read error — keep the old view; never let this kill the tail */
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
 function pollWatcher(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
@@ -1257,12 +1396,18 @@ function pollWatcher(sessionId) {
       log(`live tail: could not serialize ${sessionId}'s tail (${e && e.message}); skipping this frame`);
     }
   }
-  // 2. Live in-progress assistant turn scraped from the TUI (real-time). Sent
-  //    as its own `turn` delta carrying the streamed text AND the parsed
-  //    working-status (verb + token counters) for the hub's pinned status bar;
-  //    an empty text + null status clears both (generation ended, so the
-  //    committed tail now owns that message). Dedup on text+status together so a
-  //    status-only change (the token counter ticking) still pushes an update.
+  // 2. Live in-progress assistant turn, streamed (real-time). Sent as its own
+  //    `turn` delta carrying the streamed text AND the working-status for the
+  //    hub's pinned status bar; an empty text + null status clears both
+  //    (generation ended, so the committed tail now owns that message). Dedup
+  //    on text+status together so a status-only change still pushes an update.
+  //    Two sources, one frame shape (the chat page can't tell them apart):
+  //    a claude session is scraped from the TUI pane (below); a dsh session
+  //    folds its native event log's `assistant/chunk` deltas (pollDshTurn).
+  if (w.dshEvents) {
+    pollDshTurn(w, sessionId);
+    return;
+  }
   captureLiveTurn(sessionId, (live) => {
     if (!watchers.has(sessionId)) return; // stopped mid-capture
     const d = liveTurnDecision(w.liveGen === true, w.livePending === true, live.generating);
@@ -1307,6 +1452,10 @@ function startWatch(sessionId, worktreePath, transcriptId) {
     // take the newer answer rather than keeping the one we started with.
     existing.worktreePath = worktreePath;
     existing.transcriptId = transcriptId || null;
+    // A restart-clear-context may also have recreated the dsh events log (fresh
+    // launch truncates it), so re-detect the runtime; the offset reset in
+    // pollDshTurn handles a rewritten file.
+    existing.dshEvents = dshEventsPath(worktreePath, transcriptId || null);
     return; // already tailing
   }
   if (watchers.size >= MAX_WATCHERS) {
@@ -1317,10 +1466,21 @@ function startWatch(sessionId, worktreePath, transcriptId) {
     lastJson: null, lastTurn: "", timer: null,
     liveGen: false, livePending: false, // busy->idle blip hold; see liveTurnDecision
     heldText: "", // uncommitted prose held across paint gaps; see resolveLiveText
+    // dsh live stream state (null dshEvents = a claude session): the native
+    // event-log path plus the incremental-read cursor and the current folded
+    // streaming view. See pollDshTurn / foldDshView. The cursor is seeded to the
+    // file's CURRENT size so a chat opened on a session mid-way only streams
+    // events appended after the watch armed — never re-folds the finished
+    // history (which could echo a completed turn's stale text into the bubble).
+    dshEvents: dshEventsPath(worktreePath, transcriptId || null),
+    dshOffset: 0, dshPartial: "", dshView: { text: "", generating: false },
     // Live background agents, accumulated from the transcript across polls
     // (scanAgentEntry). Not derived from the pane — see that function.
     agentState: { live: new Map(), tasks: new Map() },
     tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
+  if (w.dshEvents) {
+    try { w.dshOffset = fs.statSync(w.dshEvents).size; } catch { /* missing */ }
+  }
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
   pollWatcher(sessionId); // emit an immediate snapshot, don't wait a full interval
@@ -1601,7 +1761,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport,
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
     usableHostname, deviceName };
 }
