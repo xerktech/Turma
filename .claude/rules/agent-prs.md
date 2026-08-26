@@ -93,3 +93,28 @@ state is polled across GitHub/GitLab/Azure DevOps, and what gets typed back in b
   a new PR clears it) so the hub can tell "merged and done" from "merged, then handed new work". It
   and `newWorkSincePrs` are **transcript timestamps** — the conversation's clock, not the mtime a
   synced `~/.claude` inflates. Tests: `TestPrsLanded`.
+
+## dsh sessions get the same PR chips with NO dsh-specific PR code (XERK-472 [H])
+
+- **Everything above reads and writes a dsh session UNCHANGED — do not add an `agentType` branch to
+  the PR path.** `_scan_pr_line`, `_seed_prs`, `refresh_pr_status`, the GitLab/ADO dispatch and the
+  comment/conflict pollers all key on `session_pr_urls` (session id) and the transcript, never on the
+  runtime. A dsh session's transcript is the S1 projection of dsh's own event log, so the SAME scan
+  attributes the SAME `gh pr create`. This is D4's "PR chips work with no new code", proven end to
+  end by `TestDshPrAttribution` over the real projector + real corpus (which carries a `gh pr create`).
+- **The one load-bearing dependency is the projector's `bash`→`Bash` name map**
+  (`_TOOL_NAME_MAP` in `dsh_transcript.py`). `_scan_pr_entry` attributes only a `tool_use` whose
+  `name` is `"Bash"`; dsh's shell tool registers as `bash`, so without that map a dsh `gh pr create`
+  projects to an unattributed tool call and the PR is chipless. Same narrowness as Claude: a PR
+  opened another way — dsh's `cordis_run`/`ralph`, or the raw GitLab API — gets no chip, exactly as a
+  Claude PR opened via MCP/subagent does. **Widen only by teaching `_scan_pr_line` another creation
+  event, never by loosening the Bash-name gate.**
+- **Comment/conflict delivery routes through `notify_session` → `_dsh_notify`** (the control socket,
+  XERK-467 [C]), peer-framed (`machine` source + `INBOX_PREFIX`), with the operator-framed fallback
+  on `crossSessionInbound` opt-out — the dsh analogue of the pane fallback. No pane, no `pendingInputs`
+  outbox. The socket send is bounded by `DSH_ACK_TIMEOUT_SEC` and never raises, so a dsh session on
+  the PR pollers adds no new beat-loop budget over Claude's inbox post; `refresh_pr_status` stays the
+  same inline offender for both runtimes (XERK-397's scope, not widened here).
+- **Chips survive a dsh resume/migration** because `_seed_prs` reads the PROJECTED `<tid>.jsonl`,
+  which migration already packs as the top-level transcript — independent of [K]'s native-log
+  `tar.add(<tid>/dsh)`, still out of scope. Tests: `TestDshPrAttribution`.
