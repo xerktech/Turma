@@ -1005,10 +1005,60 @@ LOCAL_MODEL_NAME = os.environ.get("LOCAL_MODEL_NAME", "").strip()
 # a typo is likelier than an intent.
 MAX_LOCAL_MODEL_CONTEXT = 2_000_000
 # The context-fullness meter's denominator for a SUBSCRIPTION session (XERK-489
-# Phase 4): there is no agent-side figure for the Claude login's window, so
-# Claude Code's own assumption (200k) is used and the client labels it
-# approximate. A LOCAL session uses its selected model's exact discovered window.
+# Phase 4). The window is KNOWN from the model the session runs, so map the model
+# family to its real window rather than assuming 200k for everything: the current
+# Opus/Sonnet/Fable families all serve a 1M window (measured on this fleet — an
+# Opus 4.8 session reached 999,891 context tokens and compacted at ~1,002,846),
+# so the flat 200k assumption over-warned 5x, screaming "about to compact" at a
+# fifth full. SUBSCRIPTION_CONTEXT_ASSUMED stays the fallback for a model this
+# does not recognise (Claude Code's own default for an unknown model) and until a
+# turn names the model. A LOCAL session uses its selected model's exact discovered
+# window; this map covers only subscription models.
 SUBSCRIPTION_CONTEXT_ASSUMED = 200_000
+
+# Longest-prefix match on the NORMALISED model id (lowercased, any `[...]`/date
+# suffix dropped). The transcript's `message.model` is the BARE family id —
+# measured `claude-opus-4-8` even on the 1M `[1m]` variant — so this keys on the
+# family. Order does not matter (prefixes are disjoint); a `[1m]` alias is handled
+# as an explicit 1M override BEFORE this map is consulted. Windows are the API
+# models' documented context windows (see the claude-api reference). Keep this in
+# sync as new families ship; an unlisted model falls back to the assumption above,
+# which UNDER-warns (safe) rather than crying wolf.
+_MODEL_CONTEXT_WINDOWS = (
+    ("claude-opus-4-6", 1_000_000),
+    ("claude-opus-4-7", 1_000_000),
+    ("claude-opus-4-8", 1_000_000),
+    ("claude-opus-5", 1_000_000),
+    ("claude-sonnet-4-6", 1_000_000),
+    ("claude-sonnet-5", 1_000_000),
+    ("claude-fable-5", 1_000_000),
+    ("claude-mythos-5", 1_000_000),
+    ("claude-opus-4-5", 200_000),
+    ("claude-sonnet-4-5", 200_000),
+    ("claude-haiku-4-5", 200_000),
+)
+
+
+def _subscription_context_window(model):
+    """The context window Claude Code runs a SUBSCRIPTION model in, for the meter's
+    denominator (XERK-489 Phase 4) — or None when the model is unknown/absent, so
+    the caller applies SUBSCRIPTION_CONTEXT_ASSUMED. An explicit `[1m]` alias is a
+    definite 1M window; otherwise the family maps via _MODEL_CONTEXT_WINDOWS. The
+    id is normalised to a lowercase family (any `[...]` bracket and date/`@`
+    suffix dropped) so `claude-opus-4-8`, `claude-opus-4-8[1m]` and a dated
+    snapshot all resolve together."""
+    if not isinstance(model, str):
+        return None
+    m = model.strip().lower()
+    if not m:
+        return None
+    if "[1m]" in m:
+        return 1_000_000
+    base = m.split("[", 1)[0]
+    for prefix, window in _MODEL_CONTEXT_WINDOWS:
+        if base.startswith(prefix):
+            return window
+    return None
 
 
 def _positive_int_env(name, default):
@@ -5400,14 +5450,24 @@ def _context_tokens_from_usage(usage):
 
 
 def context_window_tokens(sess):
-    """The context meter's denominator (XERK-489 Phase 4): a LOCAL session's
-    selected-model window (EXACT — its discovered/stored figure), else Claude
-    Code's own 200k assumption for a subscription session, which the client
-    labels approximate (there is no agent-side figure for the login's window)."""
+    """The context meter's denominator (XERK-489 Phase 4). A LOCAL session's
+    selected-model window (EXACT — its discovered/stored figure); a SUBSCRIPTION
+    session's window derived from the model it runs (`modelActual`, the model the
+    turns actually ran on, then the requested `model`) — the current families
+    serve a 1M window, so a flat 200k assumption over-warned 5x. Falls back to
+    SUBSCRIPTION_CONTEXT_ASSUMED for a model this cannot place and until a turn
+    names one; the client still labels a subscription figure approximate off
+    `modelSource`, since the `[1m]`/200k variant of one family is indistinguishable
+    in the transcript."""
     if sess.get("modelSource") == "local":
         c = sess.get("localModelContext")
         if isinstance(c, int) and c > 0:
             return c
+    else:
+        for key in ("modelActual", "model"):
+            w = _subscription_context_window(sess.get(key))
+            if w:
+                return w
     return SUBSCRIPTION_CONTEXT_ASSUMED
 
 
@@ -19506,10 +19566,10 @@ class SessionManager:
             "localModelContext": sess.get("localModelContext"),
             # Context-fullness meter (XERK-489 Phase 4): the newest assistant
             # turn's window occupancy (numerator) and the window it runs in
-            # (denominator — EXACT for a local session, Claude Code's 200k
-            # assumption for a subscription one, which the client labels
-            # approximate off `modelSource`). Numerator is null until a turn is
-            # measured; the client hides the meter then.
+            # (denominator — EXACT for a local session, derived from the model for
+            # a subscription one, which the client labels approximate off
+            # `modelSource`). Numerator is null until a turn is measured; the
+            # client hides the meter then.
             "lastTurnContextTokens": sess.get("lastTurnContextTokens"),
             "contextWindowTokens": context_window_tokens(sess),
             # When it last moved, so the UI's mark can say WHEN a session failed

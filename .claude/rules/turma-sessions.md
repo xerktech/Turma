@@ -128,9 +128,14 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   the dashboard session card (`contextMeterHtml` in `index.html`), warning before the ~95%
   auto-compaction (warn ~85%, danger ~95%). Numerator = the newest assistant turn's window
   occupancy (input + cache), agent-computed per-session as `lastTurnContextTokens` — NOT the
-  cumulative usage totals, which keep climbing across compactions. Denominator = `contextWindowTokens`:
-  EXACT for a local session (its selected model's window), Claude Code's 200k assumption for a
-  subscription one (marked "~", derived off `modelSource`). Both figures come off the HEARTBEAT
+  cumulative usage totals, which keep climbing across compactions. Denominator = `contextWindowTokens`,
+  agent-computed in `context_window_tokens`: EXACT for a local session (its selected model's window);
+  for a subscription one, derived from the MODEL it runs (`_subscription_context_window` maps the
+  `modelActual`/`model` family — the current Opus/Sonnet/Fable families serve 1M, so a flat 200k
+  `SUBSCRIPTION_CONTEXT_ASSUMED` over-warned 5x and is now only the fallback for an unrecognised model
+  or a session that has not named one). Still marked "~" (derived off `modelSource`): `message.model`
+  is the bare family id, so the transcript can't tell a family's `[1m]` 1M variant from its 200k one,
+  and the map errs toward 1M (under-warn) over the old cry-wolf. Both figures come off the HEARTBEAT
   transcript-sum, never a pane statusLine — that text needs a statusLine Turma refuses to wire
   because it breaks busy detection (XERK-130). Android mirrors it (`core/ContextMeter.kt` +
   `ContextMeterBar` on the card and chat bar). Tests: the `context meter` cases in `chat.test.js`,

@@ -8,11 +8,12 @@ import com.xerktech.turma.model.SessionInfo
  *
  * How full the model's context window is right now, so an operator sees a session
  * about to auto-compact (~95%) before it does. EXACT for a local session (its
- * selected model's discovered window); a subscription session has no agent-side
- * figure, so Claude Code's own 200k assumption is used and the reading is marked
- * approximate. Both figures come off the heartbeat (agent transcript-sum), never a
- * pane statusLine — the "% context left" text needs a statusLine Turma refuses to
- * wire because it breaks busy detection (XERK-130).
+ * selected model's discovered window); a subscription session's window is derived
+ * agent-side from the model it runs and the reading is marked approximate (the
+ * transcript can't tell a family's 1M variant from its 200k one). Both figures come
+ * off the heartbeat (agent transcript-sum), never a pane statusLine — the "% context
+ * left" text needs a statusLine Turma refuses to wire because it breaks busy
+ * detection (XERK-130).
  */
 object ContextMeter {
 

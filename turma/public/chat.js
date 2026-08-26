@@ -1663,11 +1663,12 @@
   }
   // ---- context-fullness meter (XERK-489 Phase 4) ----------------------------
   // How full the model's context window is right now, warning before the ~95%
-  // auto-compaction. EXACT for a local session (its selected model's window),
-  // and Claude Code's own 200k assumption ("~") for a subscription one. Both
-  // figures come off the heartbeat (agent transcript-sum), never a pane
-  // statusLine — that text needs a statusLine Turma refuses to wire because it
-  // breaks busy detection (XERK-130). Returns "" until a turn is measured.
+  // auto-compaction. EXACT for a local session (its selected model's window); a
+  // subscription session's window is derived from the model it runs (agent-side)
+  // and marked "~" — the transcript can't tell a family's 1M variant from its
+  // 200k one. Both figures come off the heartbeat (agent transcript-sum), never a
+  // pane statusLine — that text needs a statusLine Turma refuses to wire because
+  // it breaks busy detection (XERK-130). Returns "" until a turn is measured.
   function contextMeterChip() {
     if (!sess) return "";
     const num = sess.lastTurnContextTokens, den = sess.contextWindowTokens;
@@ -1676,7 +1677,7 @@
     const cls = pct >= 95 ? " ctx-danger" : pct >= 85 ? " ctx-warn" : "";
     const approx = currentModelSource() !== "local";
     const title = "Context " + fmtCtx(num) + " / " + fmtCtx(den) +
-      (approx ? " (subscription window assumed — 200k)" : " (exact)") +
+      (approx ? " (subscription — window from model)" : " (exact)") +
       " — the session auto-compacts near 95%";
     return '<span class="cc-opt cc-ctx-meter' + cls + '" title="' + esc(title) + '">' +
       '<span class="cc-ctx-track"><span class="cc-ctx-fill" style="width:' + pct + '%"></span></span>' +
