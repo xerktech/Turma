@@ -28,17 +28,24 @@ assert_eq() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$4"; fi; }
 
 # --- Build a valid native tarball + sha256 sidecar for a given version -------
 # The payload must satisfy install_payload's completeness check (hub-agent.py +
-# tunnel-agent.js + hooks/).
-make_tarball() {  # <version> <outdir> [nohooks]
+# tunnel-agent.js + hooks/ + the dsh_*.py siblings).
+make_tarball() {  # <version> <outdir> [nohooks|nodsh]
   local version="$1" out="$2" staged
   staged="$(mktemp -d)"
   mkdir -p "$staged/hooks"
   echo "# hub-agent $version" >"$staged/hub-agent.py"
   echo "// tunnel $version" >"$staged/tunnel-agent.js"
   echo "# guard" >"$staged/hooks/guard.py"
+  # The dsh runtime siblings hub-agent.py imports — kept in lockstep with it, so
+  # install_payload refuses a payload missing them (a skew crash-looped the host).
+  echo "# dsh_session $version" >"$staged/dsh_session.py"
+  echo "# dsh_transcript $version" >"$staged/dsh_transcript.py"
   # A payload missing hooks/ — the swap DELETES the installed hooks before it
   # moves the staged ones in, so this must be refused outright.
   [ "${3:-}" = nohooks ] && rm -rf "$staged/hooks"
+  # A payload that swapped hub-agent.py but not the dsh siblings — the exact skew
+  # that crash-looped every dsh host — must be refused for the same reason.
+  [ "${3:-}" = nodsh ] && rm -f "$staged/dsh_session.py" "$staged/dsh_transcript.py"
   echo "$version" >"$staged/VERSION"
   local tgz="$out/turma-agent-native-v${version}.tar.gz"
   tar czf "$tgz" -C "$staged" .
@@ -1094,6 +1101,81 @@ else
   pass "no restart for a refused payload"
 fi
 unset TURMA_TEST_RESTART_LOG
+rm -rf "$root" "$d"
+
+# --- A payload missing the dsh siblings is refused; a complete one installs them
+# The skew that crash-looped every dsh host: hub-agent.py swapped, dsh_session.py
+# left stale. install_payload must refuse a payload that omits them, and a
+# complete payload must land them beside hub-agent.py.
+d="$(mktemp -d)"; mkdir -p "$d/manifests"
+cat > "$d/tags" <<'EOF'
+v0.4.0
+EOF
+cat > "$d/manifests/v0.4.0.json" <<'EOF'
+{ "version":"0.4.0",
+  "components": { "agent-native": {
+      "version":"0.4.0", "kind":"asset",
+      "asset":"turma-agent-native-v0.4.0.tar.gz",
+      "sha256_asset":"turma-agent-native-v0.4.0.tar.gz.sha256",
+      "release_tag":"v0.4.0", "built":true } } }
+EOF
+mkdir -p "$d/assets/v0.4.0"
+cp "$d/manifests/v0.4.0.json" "$d/assets/v0.4.0/manifest.json"
+make_tarball "0.4.0" "$d/assets/v0.4.0" nodsh >/dev/null
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+echo "# dsh_session old" >"$prefix/dsh_session.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+export TURMA_TEST_RESTART_LOG="$root/restart.log"; : > "$TURMA_TEST_RESTART_LOG"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
+got="$(tr -d '[:space:]' < "$prefix/VERSION")"
+assert_eq "0.3.0" "$got" "a payload without the dsh siblings is refused (stayed $got)" \
+  "installed a dsh-less payload, VERSION now $got"
+if grep -q old "$prefix/dsh_session.py"; then
+  pass "the stale dsh_session.py is left untouched by a refused payload"
+else
+  fail "a refused payload still swapped dsh_session.py"
+fi
+unset TURMA_TEST_RESTART_LOG
+rm -rf "$root" "$d"
+
+# A COMPLETE payload lands the dsh siblings beside hub-agent.py (in lockstep).
+d="$(mktemp -d)"; mkdir -p "$d/manifests"
+cat > "$d/tags" <<'EOF'
+v0.4.0
+EOF
+cat > "$d/manifests/v0.4.0.json" <<'EOF'
+{ "version":"0.4.0",
+  "components": { "agent-native": {
+      "version":"0.4.0", "kind":"asset",
+      "asset":"turma-agent-native-v0.4.0.tar.gz",
+      "sha256_asset":"turma-agent-native-v0.4.0.tar.gz.sha256",
+      "release_tag":"v0.4.0", "built":true } } }
+EOF
+mkdir -p "$d/assets/v0.4.0"
+cp "$d/manifests/v0.4.0.json" "$d/assets/v0.4.0/manifest.json"
+make_tarball "0.4.0" "$d/assets/v0.4.0" >/dev/null
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+echo "# dsh_session old" >"$prefix/dsh_session.py"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_fake_gh "$bin"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
+got="$(tr -d '[:space:]' < "$prefix/VERSION")"
+assert_eq "0.4.0" "$got" "a complete payload installs (VERSION now $got)" \
+  "a complete payload did not install, VERSION $got"
+if grep -q "0.4.0" "$prefix/dsh_session.py" && [ -f "$prefix/dsh_transcript.py" ]; then
+  pass "the dsh siblings are swapped in lockstep with hub-agent.py"
+else
+  fail "hub-agent.py updated but the dsh siblings did not — the crash-loop skew"
+fi
 rm -rf "$root" "$d"
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi

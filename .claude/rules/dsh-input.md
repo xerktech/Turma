@@ -172,6 +172,30 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
   world-readable) — the local-model-credential discipline. Same-uid sessions can already read the
   manager's `/proc/<pid>/environ`, so this adds no exposure; a `[F]` guard read-deny on
   `~/.turma/dsh/*.env` would be defence-in-depth.
+- **An ADOPTED dsh session must be REATTACHED, not just re-ttyd'd.** `resume_on_boot`'s adopt path
+  (the tmux survived a manager-only restart — the in-place-update case) leaves the live dsh PROCESS
+  alone, but its control socket + projection tail live IN the manager and died with it. Without
+  `_reattach_dsh(sess)` (reconnect the still-bound `~/.turma/dsh/<sid>.sock`, restart the tail at
+  the event log's **current EOF** — `resume=True`, since the history was projected pre-restart and
+  re-reading from 0 would double the transcript) an adopted dsh session runs DARK: input dropped
+  ("no control socket"), transcript frozen. Best-effort by contract — it never raises (adopt would
+  else `_set_error` a live session) and never kills the adopted process. Bounded cost: an event
+  written during the seconds-long restart window is not re-projected (the native log keeps it).
+  A claude session needs none of this (its tmux + transcript are self-sufficient). Tests:
+  `test_adopts_dsh_reattaches_control_and_tail`, `test_reattach_dsh_*` in `TestResumeOnBootAdopt`.
+- **The dsh runtime files must ship + update in LOCKSTEP with `hub-agent.py`.** `dsh_session.py` and
+  `dsh_transcript.py` are siblings `hub-agent.py` imports; `dsh-session-driver/` and `dsh/guard/` are
+  the plugin trees `_ensure_dsh_profile` composes. All four were missing from `release.yml`'s tarball
+  staging, `install.sh`'s `install_files`, AND the updater's `install_payload`, so an update advanced
+  `hub-agent.py` while freezing `dsh_session.py` — and a new `hub-agent.py` call into the old sibling
+  (`tail.title()`, absent pre-4ff323b) raised `AttributeError` on the BEAT, which is the agent's main
+  process: it crash-looped every dsh host (~15s), and the repeated `agents.resume` on each restart
+  corrupted dsh's own store (a `session/end-seed` reseed re-using seq numbers → "seq gap in committed
+  region"). All three lists now carry them and the updater REFUSES a payload missing the `.py`
+  siblings (like `hooks/`). Belt-and-suspenders: `_seed_summaries` guards the `tail.title()` call so a
+  sibling skew degrades to "unnamed this beat" instead of crashing the fleet (the XERK-395/402
+  beat-loop contract). Tests: `test_seed_summaries_survives_a_dsh_tail_without_title`, the
+  dsh-payload cases in `test_turma_agent_update.sh`.
 
 ## Tests
 

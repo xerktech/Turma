@@ -12900,6 +12900,71 @@ class SessionManager:
             ctl.input(prompt, kind="user")
             tail.poke()
 
+    def _reattach_dsh(self, sess):
+        """Re-establish the manager-side control socket + projection tail for a
+        dsh session whose dsh PROCESS survived a manager restart (resume_on_boot's
+        ADOPT path). Unlike _launch_dsh this starts NO dsh process and mints no id:
+        the live driver still holds ~/.turma/dsh/<sid>.sock and keeps appending to
+        the native event log. Both the control socket and the projection tail live
+        IN this process and died with it, so an adopted dsh session runs DARK —
+        input dropped ("no control socket"), transcript frozen — until they are
+        reconnected here.
+
+        Best-effort by contract: it must NEVER raise (resume_on_boot would else
+        _set_error a perfectly live session) and must NEVER kill the adopted
+        process (a failed reconnect is no worse than not reattaching). The tail
+        resumes at the event log's CURRENT EOF, exactly like a dsh host-local
+        resume: its history was already projected by the pre-restart tail, so
+        re-reading from 0 would double the transcript. The bounded cost is that an
+        event written during the (seconds-long) restart window is not projected —
+        the native log still retains it. XERK-467 [C]."""
+        try:
+            import dsh_session
+            sid = sess["id"]
+            claude_sid = sess.get("claudeSessionId")
+            worktree = sess.get("worktreePath")
+            # An agent predating the session-id pin, or a half-built record, can't
+            # be reattached — leave it (it keeps the old dark behaviour, no worse).
+            if not claude_sid or not worktree:
+                return
+            if sid in self.dsh_controls or sid in self.dsh_tails:
+                return  # already attached (idempotent)
+            slug = _project_slug(worktree)
+            store_dir = os.path.join(PROJECTS_ROOT, slug, claude_sid,
+                                     DSH_STORE_DIRNAME)
+            events_path = os.path.join(store_dir, "events.jsonl")
+            transcript_path = os.path.join(PROJECTS_ROOT, slug,
+                                           f"{claude_sid}.jsonl")
+            sock_path = os.path.join(DSH_SOCKET_DIR, f"{sid}.sock")
+            ctl = dsh_session.DshControl(
+                sock_path,
+                on_interaction=lambda p: self._on_dsh_interaction(sid, p),
+                on_state=lambda p: self._on_dsh_state(sid, p),
+                on_interaction_end=lambda p: self._on_dsh_interaction_end(sid, p),
+                on_peer_send=lambda p: self._on_dsh_peer_send(sid, p),
+                on_peer_inbound=lambda p: self._on_dsh_peer_inbound(sid, p),
+                log=log)
+            if not ctl.start():
+                log(f"dsh reattach: control socket for {sid} did not answer; "
+                    "session runs unmanaged until its next full relaunch")
+                return
+            self.dsh_controls[sid] = ctl
+            tail = dsh_session.DshProjectionTail(
+                events_path, transcript_path, claude_sid, cwd=worktree, log=log,
+                resume=True)
+            tail.start()
+            self.dsh_tails[sid] = tail
+            # Seed the liveness cache off a one-shot query socket (NOT the
+            # persistent reader — a callback may not call state()). Without it a
+            # session that was mid-turn through the restart reads paneBusy=None
+            # (transcript-freshness fallback) until the next turn edge arrives —
+            # the exact false-idle the socket signal exists to avoid for a long
+            # silent tool call ([D]/XERK-479). Best-effort; off the beat (boot).
+            self.refresh_dsh_status(sid)
+            log(f"dsh reattach: control + projection tail restored for {sid}")
+        except Exception as e:  # never let a reattach hiccup fail the adopt
+            log(f"dsh reattach: {sess.get('id')} failed: {e}")
+
     def _confirm_dsh_launch(self, sess, ctl):
         """Confirm a just-launched dsh session actually came up before it is
         recorded running (XERK-492).
@@ -18745,7 +18810,19 @@ class SessionManager:
             # next beat (no attempt spent, no `claude -p`).
             if sess.get("agentType") == "dsh":
                 tail = self.dsh_tails.get(sess["id"])
-                title = tail.title() if tail else None
+                # Guarded because this runs on the beat, which is the agent's MAIN
+                # process: an uncaught exception here does not skip a cycle, it
+                # takes the host and every session on it down (the XERK-395/402
+                # beat-loop contract). A packaging skew that shipped a NEW
+                # hub-agent.py beside an OLD dsh_session.py — one with no title()
+                # — did exactly that, crash-looping every dsh host on an
+                # AttributeError. A sibling-module mismatch must degrade to
+                # "unnamed this beat", never crash the fleet.
+                try:
+                    title = tail.title() if tail else None
+                except Exception as e:
+                    log(f"dsh title lookup failed for {sess['id']}: {e}")
+                    title = None
                 if not title or sess.get("summary"):
                     continue
                 sess["summary"] = title
@@ -19425,6 +19502,12 @@ class SessionManager:
                     # a surviving one by port, else relaunches). No launch stagger
                     # — nothing contends on the shared login, we started no claude.
                     self._launch_ttyd(sess)
+                    # A dsh session's control socket + projection tail live in THIS
+                    # manager and died with it, while the dsh PROCESS in tmux did
+                    # not — so without a reattach an adopted dsh session runs dark
+                    # (input dropped, transcript frozen) until its next relaunch.
+                    if sess.get("agentType") == "dsh":
+                        self._reattach_dsh(sess)
                     log(f"adopted live session {sess['id']} on :{sess['ttydPort']}")
                     continue
                 self._launch_tmux(sess, resume=True)

@@ -233,6 +233,15 @@ install_files() {
   cp "$SRC_DIR/tunnel-agent.js"  "$PREFIX/tunnel-agent.js"
   cp "$SRC_DIR/tmux.conf"        "$PREFIX/tmux.conf"
   cp "$SRC_DIR"/hooks/*.py       "$PREFIX/hooks/"        # sibling to hub-agent.py (load-bearing)
+  # dsh runtime: the two sibling modules hub-agent.py imports (kept in lockstep
+  # with it — a skew crash-loops every dsh host) plus the driver + guard plugin
+  # trees _ensure_dsh_profile composes. Best-effort dirs (feature-gated on
+  # TURMA_DSH), but the .py siblings must land whenever hub-agent.py does.
+  cp "$SRC_DIR/dsh_session.py"    "$PREFIX/dsh_session.py"
+  cp "$SRC_DIR/dsh_transcript.py" "$PREFIX/dsh_transcript.py"
+  rm -rf "$PREFIX/dsh-session-driver" "$PREFIX/dsh"
+  [ -d "$SRC_DIR/dsh-session-driver" ] && cp -r "$SRC_DIR/dsh-session-driver" "$PREFIX/dsh-session-driver"
+  [ -d "$SRC_DIR/dsh" ] && cp -r "$SRC_DIR/dsh" "$PREFIX/dsh"
   cp "$SELF_DIR/turma-agent"        "$PREFIX/bin/turma-agent"
   cp "$SELF_DIR/turma-agentctl"     "$PREFIX/bin/turma-agentctl"
   cp "$SELF_DIR/turma-agent-update" "$PREFIX/bin/turma-agent-update"
@@ -389,6 +398,7 @@ do_verify() {
   echo "prefix: $PREFIX (version $( [ -f "$PREFIX/VERSION" ] && cat "$PREFIX/VERSION" || echo MISSING))"
   for f in hub-agent.py tunnel-agent.js hooks/guard.py hooks/fileguard.py \
            hooks/ask.py hooks/statusline.py \
+           dsh_session.py dsh_transcript.py \
            bin/turma-agent bin/turma-agentctl bin/turma-agent-update; do
     if [ -e "$PREFIX/$f" ]; then echo "  file $f: ok"; else echo "  file $f: MISSING"; ok=1; fi
   done

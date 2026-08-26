@@ -437,6 +437,12 @@ jobs:
              agent/native/README.md "$STAGE/"
           cp agent/hub-agent.py agent/tunnel-agent.js agent/tmux.conf "$STAGE/"
           cp agent/hooks/*.py "$STAGE/hooks/"
+          # The dsh runtime siblings hub-agent.py imports + the driver/guard
+          # plugin trees it composes into the dsh profile. Omitting them froze
+          # dsh_session.py while hub-agent.py advanced, crash-looping every dsh
+          # host on an AttributeError (a new hub-agent call into an old sibling).
+          cp agent/dsh_session.py agent/dsh_transcript.py "$STAGE/"
+          cp -r agent/dsh-session-driver agent/dsh "$STAGE/"
           echo "$VERSION" > "$STAGE/VERSION"
           ASSET="turma-agent-native-v${VERSION}.tar.gz"
           tar czf "$GITHUB_WORKSPACE/$ASSET" -C "$STAGE" .

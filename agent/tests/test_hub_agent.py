@@ -3858,6 +3858,21 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
         self.assertNotIn("dsh1", sm.dsh_controls)
         self.assertNotIn("dsh1", sm.dsh_tails)
 
+    def test_seed_summaries_survives_a_dsh_tail_without_title(self):
+        # The packaging skew: a NEW hub-agent.py beside an OLD dsh_session.py whose
+        # tail has no title(). _seed_summaries runs on the beat (the agent's MAIN
+        # process), so the AttributeError it raised crash-looped every dsh host.
+        # It must degrade to "unnamed this beat", never take the host down.
+        sm = self.make_manager()
+        sess = {"id": "dsh1", "status": "running", "agentType": "dsh",
+                "worktreePath": os.path.join(self.tmp, "wt")}  # UNNAMED
+        sm.registry = [sess]
+        class _OldTail:  # a stale dsh_session.py — no title() method
+            pass
+        sm.dsh_tails["dsh1"] = _OldTail()
+        sm._seed_summaries()  # must not raise
+        self.assertNotIn("summary", sess)  # stays unnamed, retried next beat
+
     def test_dsh_state_records_working_signal(self):
         sm, sess, ctl = self._dsh_session()
         sm._on_dsh_state("dsh1", {"evt": "state", "status": "running",
@@ -6556,6 +6571,59 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         # ...but the ttyd bridge is re-ensured, and the session stays running.
         sm._launch_ttyd.assert_called_once()
         self.assertEqual(sm.registry[0]["status"], "running")
+
+    def test_adopts_dsh_reattaches_control_and_tail(self):
+        # A dsh session's control socket + projection tail live in the manager
+        # and die with it, while the dsh PROCESS in tmux survives. Adopting one
+        # must reconnect them (else it runs dark), and a claude session must not.
+        sm = self.make_manager()
+        dsh = dict(self._running_sess(), id="dsh1", agentType="dsh",
+                   tmuxName="agent-dsh1")
+        claude = self._running_sess()
+        sm.registry = [dsh, claude]
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sm._reattach_dsh = mock.Mock()
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            sm.resume_on_boot()
+        sm._launch_tmux.assert_not_called()          # both adopted, not relaunched
+        sm._reattach_dsh.assert_called_once_with(dsh)  # dsh only
+
+    def test_reattach_dsh_wires_control_and_tail(self):
+        sm = self.make_manager()
+        sess = dict(self._running_sess(), id="dsh1", agentType="dsh",
+                    claudeSessionId="11111111-1111-4111-8111-111111111111")
+        ctl = mock.Mock()
+        ctl.start.return_value = True
+        sm.refresh_dsh_status = mock.Mock()
+        with mock.patch("dsh_session.DshControl", return_value=ctl) as DC, \
+             mock.patch("dsh_session.DshProjectionTail") as DT:
+            sm._reattach_dsh(sess)
+        # Reconnected to the live driver's socket, tail resumed at the log's EOF
+        # (history already projected pre-restart — resume=True avoids a double).
+        self.assertIs(sm.dsh_controls["dsh1"], ctl)
+        ctl.start.assert_called_once()
+        self.assertTrue(DT.call_args.kwargs.get("resume"))
+        DT.return_value.start.assert_called_once()
+        self.assertIn("dsh1", sm.dsh_tails)
+        # Liveness cache seeded so a mid-turn session doesn't read false-idle
+        # until the next turn edge ([D]/XERK-479).
+        sm.refresh_dsh_status.assert_called_once_with("dsh1")
+
+    def test_reattach_dsh_is_best_effort_on_dead_socket(self):
+        # A socket that never answers must not wire a half-attached session and
+        # must never raise (resume_on_boot would else _set_error a live session).
+        sm = self.make_manager()
+        sess = dict(self._running_sess(), id="dsh1", agentType="dsh",
+                    claudeSessionId="11111111-1111-4111-8111-111111111111")
+        ctl = mock.Mock()
+        ctl.start.return_value = False
+        with mock.patch("dsh_session.DshControl", return_value=ctl), \
+             mock.patch("dsh_session.DshProjectionTail") as DT:
+            sm._reattach_dsh(sess)  # no raise
+        self.assertNotIn("dsh1", sm.dsh_controls)
+        self.assertNotIn("dsh1", sm.dsh_tails)
+        DT.assert_not_called()
 
     def test_relaunches_when_tmux_gone(self):
         sm = self.make_manager()

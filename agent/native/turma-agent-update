@@ -533,8 +533,14 @@ install_payload() {  # <tgz> <version>
   # would leave the host with no guard hook at all, and a missing hook command
   # is a non-blocking hook — the safety guard would fail OPEN while VERSION,
   # the restart and the log all reported a clean update.
+  # dsh_session.py / dsh_transcript.py are siblings hub-agent.py imports and must
+  # stay in lockstep with it: a payload that swapped hub-agent.py but not these
+  # left the old modules in place, and a new hub-agent call into an old sibling
+  # crash-looped the manager (an AttributeError on the beat takes the host down).
+  # Refuse an incomplete payload rather than install a skew, same as hooks/.
   if [ ! -f "$src/hub-agent.py" ] || [ ! -f "$src/tunnel-agent.js" ] \
-     || [ ! -d "$src/hooks" ]; then
+     || [ ! -d "$src/hooks" ] \
+     || [ ! -f "$src/dsh_session.py" ] || [ ! -f "$src/dsh_transcript.py" ]; then
     logmsg "staged payload incomplete; refusing to install"; return 1
   fi
 
@@ -545,6 +551,12 @@ install_payload() {  # <tgz> <version>
   rm -rf "$PREFIX/hooks"; mv -f "$src/hooks" "$PREFIX/hooks"
   mv -f "$src/tunnel-agent.js" "$PREFIX/tunnel-agent.js"
   [ -f "$src/tmux.conf" ] && mv -f "$src/tmux.conf" "$PREFIX/tmux.conf"
+  # dsh runtime siblings (checked complete above) + the driver/guard plugin
+  # trees, moved together with hub-agent.py so they can never drift from it.
+  mv -f "$src/dsh_session.py" "$PREFIX/dsh_session.py"
+  mv -f "$src/dsh_transcript.py" "$PREFIX/dsh_transcript.py"
+  [ -d "$src/dsh-session-driver" ] && { rm -rf "$PREFIX/dsh-session-driver"; mv -f "$src/dsh-session-driver" "$PREFIX/dsh-session-driver"; }
+  [ -d "$src/dsh" ] && { rm -rf "$PREFIX/dsh"; mv -f "$src/dsh" "$PREFIX/dsh"; }
   local b
   for b in turma-agent turma-agentctl turma-agent-update; do
     [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }
