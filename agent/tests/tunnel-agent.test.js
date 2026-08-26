@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -1627,6 +1627,179 @@ test("watch -> transcript -> frame: the turn frame carries the live agents", asy
     assert.deepEqual(after.agents, [], "the finished agent is gone");
   } finally {
     mod.stopWatch("sess-wire");
+    mod.__setControlSink(null);
+  }
+});
+
+// --- dsh live streaming (XERK: fold the native event log's assistant/chunk ----
+// dsh sessions have no Claude TUI pane, so the live `turn` frame is folded from
+// the driver's native event log (`assistant/chunk` deltas) instead of a pane
+// scrape. foldDshView is the pure fold (unit-tested below); dshEventsPath is the
+// runtime detection; pollDshTurn is the watcher tail that turns it into frames.
+
+test("foldDshView: assistant/chunk deltas stream text; commit and turn/end clear", () => {
+  const f = foldDshView;
+  let v = { text: "", generating: false };
+  // A turn starts: text clears, generating becomes true (dsh has no pane, so the
+  // working bar rides this flag like a claude turn's status).
+  v = f(v, { type: "turn/start" });
+  assert.deepEqual(v, { text: "", generating: true });
+  // Raw stream deltas grow the text.
+  v = f(v, { type: "assistant/chunk", data: { chunk: { type: "text-delta", index: 0, text: "Hello" } } });
+  v = f(v, { type: "assistant/chunk", data: { chunk: { type: "text-delta", index: 1, text: ", world" } } });
+  assert.deepEqual(v, { text: "Hello, world", generating: true });
+  // Reasoning deltas and non-text chunks are NOT the visible prose — ignored.
+  v = f(v, { type: "assistant/chunk", data: { chunk: { type: "reasoning-delta", index: 0, text: "think…" } } });
+  assert.equal(v.text, "Hello, world");
+  v = f(v, { type: "assistant/chunk", data: { chunk: { type: "block-start", index: 0, blockType: "text" } } });
+  assert.equal(v.text, "Hello, world");
+  // The committed assistant/message clears text — the projection wrote it in full
+  // and the committed transcript tail owns that bubble — but a multi-step turn is
+  // still generating (no turn/end yet).
+  v = f(v, { type: "assistant/message", data: { message: { content: [{ type: "text", text: "Hello, world" }] } } });
+  assert.deepEqual(v, { text: "", generating: true });
+  // Next step streams again.
+  v = f(v, { type: "assistant/chunk", data: { chunk: { type: "text-delta", text: "Next" } } });
+  assert.equal(v.text, "Next");
+  // turn/end is the only thing that ends generating.
+  v = f(v, { type: "turn/end" });
+  assert.deepEqual(v, { text: "", generating: false });
+});
+
+test("foldDshView: a fresh user/message opens the turn; malformed events are inert", () => {
+  const f = foldDshView;
+  let v = { text: "stale", generating: true };
+  // A user message resets to a fresh, generating turn (clearing prior stream).
+  v = f(v, { type: "user/message", data: { content: "ask" } });
+  assert.deepEqual(v, { text: "", generating: true });
+  // Unknown / malformed events pass the current view through unchanged.
+  const before = { text: "abc", generating: true };
+  assert.equal(f(before, null), before);
+  assert.equal(f(before, { type: "todo/write" }), before);
+  assert.equal(f(before, "not-an-event"), before);
+  assert.equal(f(before, { type: "assistant/chunk", data: { chunk: { type: "text-delta" } } }).text, "abc");
+});
+
+test("foldDshView: a long generated message is capped so no chat frame is unbounded", () => {
+  const f = foldDshView;
+  let v = { text: "", generating: true };
+  for (let i = 0; i < 5000; i++) {
+    v = f(v, { type: "assistant/chunk", data: { chunk: { type: "text-delta", text: "x" } } });
+  }
+  assert.ok(v.text.length > 0 && v.text.length <= 16000,
+    `capped at DSH_LIVE_TEXT_CHARS, got ${v.text.length}`);
+});
+
+test("dshEventsPath: resolves the native events nest only for a dsh session", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dshpath-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const slug = projectSlug(work);
+  const tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const dshDir = path.join(PROJECTS_ROOT, slug, tid, "dsh");
+  fs.mkdirSync(dshDir, { recursive: true });
+  // No events file yet -> not (yet) a dsh session (claude sessions never have one).
+  assert.equal(dshEventsPath(work, tid), null);
+  const events = path.join(dshDir, "events.jsonl");
+  fs.writeFileSync(events, "");
+  // A dsh session resolves to its events path.
+  assert.equal(dshEventsPath(work, tid), events);
+  // A malformed / absent transcriptId gets the claude treatment (null), never a path.
+  assert.equal(dshEventsPath(work, null), null);
+  assert.equal(dshEventsPath(work, "../etc"), null);
+});
+
+test("pollDshTurn: a watch armed mid-session does not replay completed history", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dshseed-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const slug = mod.projectSlug(work);
+  const tid = "aaaaaaaa-1111-2222-3333-444444444444";
+  const dshDir = path.join(PROJECTS_ROOT, slug, tid, "dsh");
+  fs.mkdirSync(dshDir, { recursive: true });
+  const events = path.join(dshDir, "events.jsonl");
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  try {
+    // A session that finished a turn BEFORE the chat opened: the file already
+    // holds the completed turn when the watch arms.
+    const done = [
+      { type: "user/message", time: 1, data: { content: "hi" } },
+      { type: "turn/start", time: 2, data: {} },
+      { type: "assistant/chunk", time: 3, data: { chunk: { type: "text-delta", text: "done answer" } } },
+      { type: "assistant/message", time: 4, data: { message: { content: [{ type: "text", text: "done answer" }] } } },
+      { type: "turn/end", time: 5, data: {} },
+    ];
+    fs.writeFileSync(events, done.map((o) => JSON.stringify(o)).join("\n") + "\n");
+    mod.startWatch("sess-seed", work, tid);
+    mod.pollWatcher("sess-seed");
+    // No NEW events since the watch armed, so no stream frame is emitted — the
+    // completed turn is not echoed into the live bubble as stale streaming.
+    assert.equal(frames.filter((f) => f.turn === "sess-seed").length, 0,
+      "a completed dsh turn before the watch must not produce a turn frame");
+  } finally {
+    mod.stopWatch("sess-seed");
+    mod.__setControlSink(null);
+  }
+});
+
+test("pollDshTurn: streams dsh assistant text as turn frames and clears on commit", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dshlive-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const slug = mod.projectSlug(work);
+  const tid = "dddddddd-eeee-ffff-0000-111111111111";
+  const dshDir = path.join(PROJECTS_ROOT, slug, tid, "dsh");
+  fs.mkdirSync(dshDir, { recursive: true });
+  const events = path.join(dshDir, "events.jsonl");
+  const ev = (...objs) => fs.appendFileSync(events, objs.map((o) => JSON.stringify(o)).join("\n") + "\n");
+
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  try {
+    // The events file must exist before the watch is armed so the watcher detects
+    // the session as dsh (dshEventsPath checks existence at startWatch). The watch
+    // seeds its cursor to the file's CURRENT size, so only events appended AFTER
+    // it arms are streamed — write them next, then poll.
+    fs.writeFileSync(events, "");
+    mod.startWatch("sess-dsh", work, tid);
+    ev(
+      { type: "user/message", time: 1, data: { content: "write a haiku" } },
+      { type: "turn/start", time: 2, data: {} },
+      { type: "assistant/chunk", time: 3, data: { chunk: { type: "text-delta", index: 0, text: "Gentle" } } },
+      { type: "assistant/chunk", time: 4, data: { chunk: { type: "text-delta", index: 0, text: " rain falls" } } },
+    );
+    mod.pollWatcher("sess-dsh");
+    let turn = frames.find((f) => f.turn === "sess-dsh");
+    assert.ok(turn, "a dsh turn frame was emitted");
+    assert.equal(turn.text, "Gentle rain falls", "streamed deltas are folded into the frame text");
+    // dsh turn frames carry no working status (Stop would send Escape into a
+    // non-Claude pane), so the frame is text-only — see pollDshTurn.
+    assert.equal(turn.status, null, "no working status on a dsh turn frame");
+
+    // Appending a chunk grows the next frame's text.
+    frames.length = 0;
+    ev({ type: "assistant/chunk", time: 5, data: { chunk: { type: "text-delta", index: 0, text: " on the pond" } } });
+    mod.pollWatcher("sess-dsh");
+    turn = frames.find((f) => f.turn === "sess-dsh");
+    assert.ok(turn, "a growth frame was emitted");
+    assert.equal(turn.text, "Gentle rain falls on the pond");
+
+    // The committed assistant/message clears (homework); turn/end ends generating.
+    frames.length = 0;
+    ev(
+      { type: "assistant/message", time: 6, data: { message: { content: [{ type: "text", text: "Gentle rain falls on the pond — a haiku." }] } } },
+      { type: "turn/end", time: 7, data: {} },
+    );
+    mod.pollWatcher("sess-dsh");
+    turn = frames.find((f) => f.turn === "sess-dsh");
+    assert.ok(turn, "a clear frame was emitted");
+    assert.equal(turn.text, "", "the stream clears once the message is committed");
+    assert.equal(turn.status, null, "idle once the turn ends");
+  } finally {
+    mod.stopWatch("sess-dsh");
     mod.__setControlSink(null);
   }
 });

@@ -60,6 +60,16 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   - **No text ever types in** (XERK-251): a capture is painted whole the frame it arrives, in this
     and every other client. The typewriter was animation over an already-~1s-delayed pane scrape —
     it delayed the text further and bought nothing. Don't reintroduce one.
+  - **dsh sessions genuinely stream** (unlike claude's pane scrape): `tunnel-agent.js` folds the
+    dsh native event log's `assistant/chunk` deltas into the SAME `turn` frames a claude pane
+    scrape produces (`pollDshTurn`/`foldDshView`), so a dsh response grows in the live bubble as it
+    generates instead of appearing whole when `assistant/message` commits. It is a real-time stream
+    over the existing `/live` socket, NOT a reintroduced typewriter — the committed
+    `assistant/message` clears the bubble and the projected transcript tail owns it. dsh turn frames
+    carry NO `status` (Stop for dsh would send Escape into a non-Claude pane — a no-op — so the
+    working bar/Stop stay on the heartbeat `paneBusy` as today). This reads the native events file
+    directly; the S1 projection is untouched, per the ADR. Tests: the `pollDshTurn`/`foldDshView`/
+    `dshEventsPath` cases in `tunnel-agent.test.js`.
   - The live turn is the tmux **pane scrape's "last ● bullet"**, NOT monotonic (XERK-19): it SWAPS
     blocks mid-turn, so every `turn` frame is CLASSIFIED by `applyTurn` before it reaches the bubble
     — an empty frame or a tool-use bullet (`isToolBullet`, biased toward matching since a miss
