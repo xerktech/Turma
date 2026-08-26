@@ -77,6 +77,12 @@ export function apply(ctx, config) {
     const provider = env.TURMA_DSH_PROVIDER || config.provider;
     const model = env.TURMA_DSH_MODEL || config.model;
     const sysPromptFile = env.TURMA_DSH_SYSTEM_PROMPT_FILE || '';
+    // Resume vs fresh (XERK-475). The launcher sets this when relaunching a
+    // session that already has a persisted dsh store (start / resume-on-boot /
+    // migration import). `agents.create` on an already-persisted id THROWS
+    // ("already has a persisted log on disk; load/resume it instead"), so a
+    // resume MUST take the resume() path to reload the model's context.
+    const resume = env.TURMA_DSH_RESUME === '1';
     // Peer messaging (XERK-476): this session's roster NAME (what a peer addresses
     // and what the forged Claude-inbox record is registered under) and Claude
     // Code's session-registry dir (where that record goes). Absent -> peer
@@ -239,8 +245,27 @@ export function apply(ctx, config) {
     (async () => {
         try {
             const agentOptions = (provider || model) ? { provider, model } : undefined;
-            handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions, setup });
-            ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} created (cwd ${cwd})`);
+            if (resume) {
+                // Reload the persisted session — the model's full context (XERK-475).
+                // No `meta`: the cwd is read from the store's header, not supplied. If
+                // the store is somehow absent, resume() rejects; fall back to a fresh
+                // create so the session at least comes up (loudly logged) rather than
+                // leaving the process dead — the create then also succeeds only if no
+                // store exists, so it can never mask a present-but-unreadable store.
+                try {
+                    handle = await ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, setup });
+                    ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} resumed (cwd ${cwd})`);
+                }
+                catch (re) {
+                    ctx.logger.error(`[turma-dsh] agent resume failed (${re}); creating fresh`);
+                    handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions, setup });
+                    ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} created fresh after resume failure (cwd ${cwd})`);
+                }
+            }
+            else {
+                handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions, setup });
+                ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} created (cwd ${cwd})`);
+            }
             await pinGuardPolicy(handle.agent);
         }
         catch (e) {
@@ -400,7 +425,16 @@ export function apply(ctx, config) {
         ctx.logger.info(`[turma-dsh] control socket bound at ${socketPath}`);
     });
     (async () => {
-        if (!ctx.tools || typeof ctx.tools.register !== 'function')
+        // Resolve the tools service via ctx.get, NOT `ctx.tools`: cordis THROWS on a
+        // property access for a service not named in `inject` ("cannot get property
+        // tools without inject"), which fires before any `!ctx.tools` guard and
+        // aborts the whole plugin load — DOA on the real `web` profile. `ctx.get`
+        // returns undefined for an absent/uninjected service instead (the same
+        // tolerated-optional pattern the preset mount uses), so a deployment without
+        // dsh-tools simply skips the peer send_message tool. (Fixes an XERK-476 [L]
+        // crash surfaced while QAing XERK-475.)
+        const tools = ctx.get('tools');
+        if (!tools || typeof tools.register !== 'function')
             return;
         let defineTool;
         try {
@@ -417,7 +451,7 @@ export function apply(ctx, config) {
             return;
         }
         try {
-            ctx.tools.register(defineTool({
+            tools.register(defineTool({
                 name: 'send_message',
                 description: 'Send a short message to another session in your organisation, '
                     + 'addressed by its `name` exactly as it appears in ~/.turma/peers.tsv. '

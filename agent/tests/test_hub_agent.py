@@ -5860,6 +5860,170 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.session_pr_urls[sess["id"]], [url])
         self.assertEqual(sm.pr_ledger["transP"]["urls"], [url])
 
+    # --- dsh session migration: the durable native store (XERK-475) ---------
+    #
+    # A dsh session cannot resume from the projection transcript — dsh reloads
+    # its OWN store ($DSH_HOME/sessions/<key>/<sid>/session.jsonl). So migration
+    # must carry that store (not the `<tid>/dsh/` projection feed), re-key its
+    # header cwd onto the target's worktree, and place it at the target's key.
+
+    def _fake_dsh_store(self, sid, cwd):
+        """A plaintext dsh store as `_dsh_cordis_patch`'s override writes it:
+        a JSON header line carrying `cwd`, then a couple of event rows."""
+        d = ha._dsh_store_dir(cwd, sid)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "session.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "session", "version": 1, "id": sid,
+                                "createdAt": 0, "cwd": cwd,
+                                "delegationDepth": 0}) + "\n")
+            f.write(json.dumps({"type": "user/message", "seq": 1}) + "\n")
+        return d
+
+    def test_a_dsh_bundle_carries_the_native_store_under_its_own_prefix(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "dshmig")
+        path = self._write_transcript(wt, "transD")
+        sm = self._manager()
+        with mock.patch.object(ha, "DSH_SESSIONS_ROOT",
+                               os.path.join(self.tmp, "dsh-home", "sessions")):
+            store = self._fake_dsh_store("transD", wt)
+            blob = sm._pack_transcript(path, dsh_store=store)
+            # Same-mount target: unpack the store back at the SAME key.
+            dest = os.path.join(self.tmp, "dest-d")
+            store_dest = ha._dsh_store_dir(wt, "transD")
+            os.makedirs(dest)
+            os.makedirs(store_dest, exist_ok=True)
+            sm._unpack_transcript(blob, dest, dsh_store_dest=store_dest)
+        # The transcript still rides the slug tree; the store rides `.dsh-store/`.
+        self.assertTrue(os.path.isfile(os.path.join(dest, "transD.jsonl")))
+        self.assertFalse(os.path.isdir(os.path.join(dest, ha.DSH_STORE_ARCNAME)))
+        self.assertTrue(os.path.isfile(os.path.join(store_dest, "session.jsonl")))
+
+    def test_a_claude_import_drops_a_stray_dsh_store(self):
+        # No dsh_store_dest -> `.dsh-store/` members are skipped, never written
+        # into the slug tree (they have no resume to feed).
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "dshstray")
+        path = self._write_transcript(wt, "transS")
+        sm = self._manager()
+        with mock.patch.object(ha, "DSH_SESSIONS_ROOT",
+                               os.path.join(self.tmp, "dsh-home", "sessions")):
+            store = self._fake_dsh_store("transS", wt)
+            blob = sm._pack_transcript(path, dsh_store=store)
+        dest = os.path.join(self.tmp, "dest-s")
+        os.makedirs(dest)
+        sm._unpack_transcript(blob, dest, dsh_store_dest=None)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "transS.jsonl")))
+        self.assertFalse(os.path.exists(os.path.join(dest, ha.DSH_STORE_ARCNAME)))
+        # Nothing escaped into the slug tree under the reserved name either.
+        self.assertEqual(sorted(os.listdir(dest)), ["transS.jsonl"])
+
+    def test_import_places_and_rekeys_the_dsh_store_cross_mount(self):
+        """The end-to-end target half for a dsh session: the store lands at the
+        LOCALIZED cwd's key, and its header cwd is rewritten to match — without
+        which dsh refuses the store as corrupt (path vs header-cwd mismatch)."""
+        foreign = "/home/otheruser/src/.turma/worktrees/Turma/dshx"
+        local = os.path.join(ha.WORKTREES_ROOT, "Turma", "dshx")
+        sessions_root = os.path.join(self.tmp, "dsh-home", "sessions")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        with mock.patch.object(ha, "DSH_SESSIONS_ROOT", sessions_root), \
+                mock.patch.object(ha, "dsh_configured", lambda: True):
+            # Build the bundle on the "source": store header carries the FOREIGN
+            # cwd (the source's own worktree path).
+            src_path = self._write_transcript(local, "transX")
+            store = self._fake_dsh_store("transX", foreign)
+            blob = sm._pack_transcript(src_path, dsh_store=store)
+            shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(local)))
+            # The source store lives on the OTHER host; clear it so only the
+            # import's own placement remains under this shared sessions root.
+            shutil.rmtree(sessions_root)
+            sm._migration_download = lambda mid: blob
+            cmd = {"type": "importSession", "cmdId": "cX", "migrationId": "migX",
+                   "transcriptId": "transX", "cwd": foreign, "repo": "Turma",
+                   "agentType": "dsh"}
+            with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+                sm.import_session(cmd)
+            # The store landed at the LOCAL cwd's key (not the foreign one)...
+            placed = os.path.join(ha._dsh_store_dir(local, "transX"),
+                                  "session.jsonl")
+            self.assertTrue(os.path.isfile(placed))
+            self.assertFalse(os.path.isdir(ha._dsh_store_dir(foreign, "transX")))
+            # ...and its header cwd was re-pointed to the local worktree, so the
+            # path dsh derives from the header matches where the file sits.
+            with open(placed) as f:
+                header = json.loads(f.readline())
+            self.assertEqual(header["cwd"], local)
+            self.assertEqual(header["id"], "transX")     # every other field kept
+        self.assertEqual(sm.registry[0]["agentType"], "dsh")
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transX")
+
+    def test_import_drops_the_dsh_store_when_target_lacks_dsh(self):
+        # agentType=dsh but the target does not offer dsh -> the session falls
+        # back to claude (existing rule), so the store has no resume to feed and
+        # is not placed under DSH_SESSIONS_ROOT.
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "dshno")
+        sessions_root = os.path.join(self.tmp, "dsh-home", "sessions")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        with mock.patch.object(ha, "DSH_SESSIONS_ROOT", sessions_root), \
+                mock.patch.object(ha, "dsh_configured", lambda: False):
+            src_path = self._write_transcript(wt, "transN")
+            store = self._fake_dsh_store("transN", wt)
+            blob = sm._pack_transcript(src_path, dsh_store=store)
+            shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt)))
+            # Clear the source store; a correct import (no dsh) never recreates it.
+            shutil.rmtree(sessions_root)
+            sm._migration_download = lambda mid: blob
+            cmd = {"type": "importSession", "cmdId": "cN", "migrationId": "migN",
+                   "transcriptId": "transN", "cwd": wt, "repo": "Turma",
+                   "agentType": "dsh"}
+            with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+                sm.import_session(cmd)
+            self.assertFalse(os.path.exists(sessions_root))
+        self.assertEqual(sm.registry[0]["agentType"], "claude")
+
+
+class TestDshProjectKey(unittest.TestCase):
+    """`_dsh_project_key` ports dsh's `projectKey(cwd)` byte-for-byte — the store
+    dir name migration must reproduce so a re-keyed store passes dsh's
+    header-cwd-vs-path corruption guard (XERK-475)."""
+
+    def test_matches_a_real_dsh_store_dir_name(self):
+        # The exact dir name real dsh 0.1.1-rc.2 wrote for this cwd on disk.
+        self.assertEqual(
+            ha._dsh_project_key(
+                "/home/mhabeeb/git/.turma/worktrees/Turma/8199c/poc/turma-2.0-poc"),
+            "--home-mhabeeb-git-.turma-worktrees-Turma-8199c-poc-turma-2.0-poc--")
+
+    def test_separators_collapse_and_unsafe_chars_escape(self):
+        # `/ \ :` runs collapse to one `-`; a space is escaped `~0020` (upper
+        # hex, 4-wide); `. _ -` stay literal; `~` itself is escaped.
+        self.assertEqual(ha._dsh_project_key("/a b/c"), "--a~0020b-c--")
+        self.assertEqual(ha._dsh_project_key("a~b"), "--a~007Eb--")
+        self.assertEqual(ha._dsh_project_key("a.b_c-d"), "--a.b_c-d--")
+
+    def test_empty_body_defaults_to_root_and_empty_cwd_raises(self):
+        self.assertEqual(ha._dsh_project_key("/"), "--root--")
+        with self.assertRaises(ValueError):
+            ha._dsh_project_key("")
+
+
+class TestDshCordisPatchPersistence(unittest.TestCase):
+    """The profile patch overrides dsh's session-persistence to PLAINTEXT
+    (XERK-475) so a migrated store's header cwd can be re-keyed without a zstd
+    round-trip (Python has no stdlib zstd)."""
+
+    def test_override_pins_plaintext_and_restates_the_root(self):
+        patch = ha._dsh_cordis_patch("prov", "model", "http://x/v1",
+                                     "KEY_ENV", 200000)
+        # A patch entry REPLACES config, so `root` must be re-stated — as the
+        # absolute DSH_SESSIONS_ROOT, not the base's `!!js dshHomePath(...)`.
+        self.assertIn("- id: session-persistence-jsonl", patch)
+        self.assertIn("compression: none", patch)
+        self.assertIn(json.dumps(ha.DSH_SESSIONS_ROOT), patch)
+        # It leads the composed patch (the base entry it modifies loads first).
+        self.assertLess(patch.index("session-persistence-jsonl"),
+                        patch.index("turma-dsh-session-driver"))
+
 
 class TestSpawnFailures(ManagerMixin, unittest.TestCase):
     """A refused session-creating command is REPORTED, not just logged

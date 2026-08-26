@@ -128,19 +128,25 @@ dsh call is made.
 - **restart (clear context):** `_kill_tmux`, drop caches, relaunch dsh with a **fresh** agent (new
   dsh session → new projection transcript id, moved onto the record like Claude's `claudeSessionId`).
   Reuses `restart()`.
-- **resume / start:** relaunch dsh, and the plugin uses **`ctx.agents.resume({ resumeSessionId })`**
-  (not `create`) to reload the persisted dsh session from its retained `<sid>/dsh/` log — this is the one
-  place dsh's `resume` vs `create` distinction matters (G1). The pinned transcript id (hence the
-  projection) is preserved, so PR chips / usage / ticket links re-derive with no new code. Reuses
-  `start()` / `resume()` / `_resume_at_cwd`.
+- **resume / start:** relaunch dsh (`TURMA_DSH_RESUME=1`), and the driver uses
+  **`ctx.agents.resume({ resumeSessionId })`** (not `create`) to reload the persisted dsh session —
+  from dsh's OWN store under `DSH_SESSIONS_ROOT` (`$DSH_HOME/sessions/<key>/<sid>/`), **NOT** the
+  `<sid>/dsh/` log (that is the driver's projection feed; the earlier claim it was resumable was
+  wrong — XERK-475 [K]). `create` on an already-persisted id throws, so resume MUST take this path;
+  it is the one place dsh's `resume` vs `create` distinction matters (G1). The pinned transcript id
+  (hence the projection) is preserved, so PR chips / usage / ticket links re-derive with no new
+  code. Reuses `start()` / `resume()` / `_resume_at_cwd`.
 - **delete:** `_kill_tmux` + `_worktree_remove`; drop record + closed + uploads. Reuses `delete()`.
   The native `<sid>/dsh/` store lives under the project-slug session dir (XERK-469), so — like the
   projection transcript — it is durable and survives the worktree removal (and by then has been
   archived), rather than being destroyed with the worktree.
-- **migration (XERK-101):** out of scope for [B] v1 — `_pack_bytes` packs `<tid>.jsonl` +
-  `subagents/` + `workflows/`, not the whole `<tid>/` tree, so a dsh session's resumable native
-  `<sid>/dsh/` store is not yet carried. [K] adds one `tar.add(<tid>/dsh)` — a one-liner because
-  XERK-469 [E] put the store in exactly that subtree (see `.claude/rules/dsh.md` [E]).
+- **migration (XERK-101):** shipped by [K] (XERK-475). It carries dsh's DURABLE store
+  (`_dsh_store_dir` under `DSH_SESSIONS_ROOT`) in the bundle under `.dsh-store/`, re-keys its header
+  cwd to the target's worktree (`_reconcile_dsh_store_cwd` — dsh refuses a store whose path
+  disagrees with its header), and the driver resumes from it. It does NOT carry `<sid>/dsh/` (the
+  projection feed): the target rebuilds it from new events, and the tail starts at the kept log's
+  EOF on resume so it never doubles the transcript. The store is plaintext (`_dsh_cordis_patch`
+  pins `compression: none`) so the header edit needs no zstd. See `.claude/rules/dsh.md` [K].
 
 ## Consequences to fold into the cross-cutting contracts (when the code ships)
 

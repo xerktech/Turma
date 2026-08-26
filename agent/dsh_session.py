@@ -346,7 +346,7 @@ class DshProjectionTail:
     """
 
     def __init__(self, events_path, transcript_path, session_id,
-                 cwd=None, git_branch=None, log=None):
+                 cwd=None, git_branch=None, log=None, resume=False):
         self.events_path = events_path
         self.transcript_path = transcript_path
         self._log = log or _noop_log
@@ -355,7 +355,21 @@ class DshProjectionTail:
         self._git_branch = git_branch
         self._proj = (DshProjector(session_id, cwd=cwd, git_branch=git_branch)
                       if DshProjector else None)
+        # On RESUME (XERK-475), the kept event log's history is ALREADY projected
+        # into the transcript — by the pre-restart tail (host-local resume) or on
+        # the source (a migrated session's transcript rides the bundle). dsh does
+        # NOT re-emit seeded events on resume (verified: "constructor seeds do not
+        # emit" on the session/event firehose), so the driver appends only NEW
+        # events past this point. Starting at the log's current EOF projects only
+        # those, avoiding a re-projection that would DOUBLE the transcript (the
+        # deterministic-uuid de-dup keeps display/usage exact, but the file still
+        # grows). A fresh launch truncates the log, so 0 is correct there.
         self._offset = 0
+        if resume:
+            try:
+                self._offset = os.path.getsize(events_path)
+            except OSError:
+                self._offset = 0  # not written yet (a migration target) -> new
         self._partial = b""
         self._stop = threading.Event()
         self._thread = None
