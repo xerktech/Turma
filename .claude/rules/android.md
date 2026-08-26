@@ -133,6 +133,14 @@ When you touch one of these web files, check its Android counterpart:
 - **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** —
   the state copy is a mirror the VM rebuilds, so a mirror assertion passes on a change that dropped
   the real thing.
+- **The in-app updater is silenced in tests (XERK-281).** `TurmaApplication.onCreate` fires a
+  fire-and-forget `Updater.check()`, and Robolectric rebuilds the Application per test METHOD so the
+  ~15-min throttle never applies — every test hit live `api.github.com` (~33 anonymous calls/suite,
+  from shared-IP CI runners). `Updater.check()` no-ops when the `turma.updater.disabled` system
+  property is `true` (checked BEFORE the throttle/force branch, so even a forced "check now" stays
+  quiet); `build.gradle.kts`'s `testOptions.unitTests.all { systemProperty(…) }` sets it JVM-wide.
+  Nothing in production sets it. Don't re-introduce startup egress into the harness. Tests:
+  `net/UpdaterTestSeamTest`.
 - Tests: `vm/ChatModelSourceTest`, `vm/FleetOutcomeTest`, `ui/SpawnComposerTest`,
   `ui/ChatModelChipsTest`, `ui/SessionsPaneSpawnTest`, `ui/FleetSpawnLocalModelTest`.
 

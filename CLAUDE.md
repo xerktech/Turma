@@ -34,10 +34,11 @@ that component's files.
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
 | `.claude/rules/release.md` | `.github/**`, `VERSION`, Dockerfiles | releases, PR gates, image tiers |
-| `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh integration ADR + per-child mechanics index (XERK-460) |
-| `.claude/rules/dsh-input.md` | `agent/dsh_session.py`, `agent/dsh-session-driver/**` | driving a dsh session (XERK-467 [C]): control socket, driver, `_launch_dsh`, input |
-| `.claude/rules/dsh-delegation.md` | `agent/dsh_transcript.py`, `agent/dsh_session.py` | dsh delegation (XERK-474 [J]): bg-agent/workflow rows + `subagentHistory` |
-| `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**`, `agent/hub-agent.py` | dsh safety guard (XERK-470 [F]): deny policy on dsh's tool pipeline |
+| `.claude/rules/routing-eval.md` | `bench/archive/**`, the routing docs | archive-sourced replay eval: the requestId turn unit, curation gates, why routing is per-session |
+| `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh ADR + per-child mechanics (XERK-460) |
+| `.claude/rules/dsh-input.md` | `agent/dsh_session.py` | driving a dsh session (XERK-467 [C]): socket, driver, input |
+| `.claude/rules/dsh-delegation.md` | `agent/dsh_transcript.py` | dsh delegation (XERK-474 [J]): bg-agent/workflow rows + `subagentHistory` |
+| `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**` | dsh safety guard (XERK-470 [F]): deny policy on dsh's pipeline |
 
 ### Editing these files
 

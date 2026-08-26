@@ -118,6 +118,13 @@ android {
                 // in gradle.properties so it applies to the test JVM only, and
                 // not to the compiler daemon that shares that file.
                 it.maxHeapSize = "2g"
+                // Silence the in-app updater in tests (XERK-281). Robolectric
+                // builds a fresh Application per test METHOD, so the updater's
+                // ~15-min throttle never applies and TurmaApplication.onCreate's
+                // fire-and-forget GitHub check runs ~33× per suite against live
+                // api.github.com from a shared-IP CI runner. Updater.check()
+                // no-ops when this is set; nothing in production sets it.
+                it.systemProperty("turma.updater.disabled", "true")
             }
         }
     }
