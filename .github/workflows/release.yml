@@ -437,6 +437,15 @@ jobs:
              agent/native/README.md "$STAGE/"
           cp agent/hub-agent.py agent/tunnel-agent.js agent/tmux.conf "$STAGE/"
           cp agent/hooks/*.py "$STAGE/hooks/"
+          # dsh toolchain (XERK-496): the Python siblings land beside hub-agent.py
+          # and the driver/guard dirs at the paths hub-agent.py resolves from ITS
+          # own dir (DSH_PLUGIN_DIR = <dir>/dsh-session-driver, guard at
+          # <dir>/dsh/guard). Shipped unconditionally — install.sh --with-dsh
+          # decides whether to lay them into the prefix, and turma-agent-update
+          # keeps them in step on a host that has.
+          cp agent/dsh_session.py agent/dsh_transcript.py "$STAGE/"
+          cp -a agent/dsh-session-driver "$STAGE/dsh-session-driver"
+          mkdir -p "$STAGE/dsh"; cp -a agent/dsh/guard "$STAGE/dsh/guard"
           echo "$VERSION" > "$STAGE/VERSION"
           ASSET="turma-agent-native-v${VERSION}.tar.gz"
           tar czf "$GITHUB_WORKSPACE/$ASSET" -C "$STAGE" .

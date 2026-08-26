@@ -240,13 +240,18 @@ report_creds
 #     that died on a missing binary is not. It is a no-op (two version reads)
 #     unless something newer is actually published.
 #
+#   * dsh, AWAITED, the same shape and for the same reason (XERK-496): a dsh
+#     CLI update briefly removes `dsh` from PATH, so on a dsh host it must run
+#     before the manager exists too. Gated on $PREFIX/.dsh so a non-dsh host
+#     pays nothing.
+#
 #   * The agent self-update, DETACHED. It does network I/O against GitHub (a
 #     start must not wait on that), and a successful update restarts this very
 #     unit — so it has to be outside the process tree that restart tears down.
 #     setsid + KillMode=process is what lets it survive to finish its own swap.
 #
-# Both rate-limit themselves (see throttled()) so a crash-looping unit can't turn
-# Restart=always into an update check every five seconds.
+# All three rate-limit themselves (see throttled()) so a crash-looping unit can't
+# turn Restart=always into an update check every five seconds.
 #
 # Placed BEFORE the credential gate below on purpose: a host idling for want of
 # a Claude login is exactly a host that should still be picking up new builds,
@@ -299,6 +304,35 @@ if [ "${TURMA_BOOT_UPDATE:-1}" != "0" ] && [ -x "$SELF_DIR/turma-agent-update" ]
   else
     "$SELF_DIR/turma-agent-update" --claude-only \
       || echo "[turma-agent] claude update check failed; carrying on"
+  fi
+  # dsh, AWAITED, same shape and for the same reason (XERK-496): a dsh CLI
+  # update removes `dsh` from PATH briefly, so it must run before the manager
+  # exists (nothing can be launching then) — never on the timer/loop. Gated on
+  # $PREFIX/.dsh (install.sh --with-dsh wrote it): a host that never opted into
+  # dsh pays nothing. $PREFIX/.dsh is compared via -f so no `set -u` trap on a
+  # host with no --with-dsh.
+  if [ -f "$PREFIX/.dsh" ]; then
+    echo "[turma-agent] checking dsh (before any dsh session can launch)"
+    if command -v timeout >/dev/null 2>&1; then
+      dsh_deadline="$(_num "${TURMA_DSH_UPDATE_TIMEOUT:-1800}" 1800)"
+      # The same floor as claude: the deadline must not land inside an install,
+      # so hold it 2.5x clear of the (shared) npm install budget.
+      dsh_min=$(( $(_num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300) * 5 / 2 ))
+      if [ "$dsh_deadline" -lt "$dsh_min" ]; then
+        echo "[turma-agent] TURMA_DSH_UPDATE_TIMEOUT=${dsh_deadline}s could fire while an" \
+          "install is running; using ${dsh_min}s"
+        dsh_deadline="$dsh_min"
+      fi
+      echo "[turma-agent] dsh check bounded at ${dsh_deadline}s"
+      timeout "$dsh_deadline" \
+        "$SELF_DIR/turma-agent-update" --dsh-only \
+        || echo "[turma-agent] dsh update check did not finish in ${dsh_deadline}s; carrying on." \
+                "If it was mid-install, that install can still be replacing dsh — a dsh session" \
+                "started in the next few minutes may fail to launch."
+    else
+      "$SELF_DIR/turma-agent-update" --dsh-only \
+        || echo "[turma-agent] dsh update check failed; carrying on"
+    fi
   fi
   echo "[turma-agent] checking for a newer agent build (detached)"
   setsid "$SELF_DIR/turma-agent-update" --boot >/dev/null 2>&1 &

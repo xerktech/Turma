@@ -229,6 +229,12 @@ jobs:
       # no-op, checksum refusal, legacy fallback). Pure shell + a gh stub.
       - name: Native updater tests (agent/native/turma-agent-update)
         run: ./agent/tests/test_turma_agent_update.sh
+      # The native installer ships the dsh toolchain (XERK-496): --with-dsh /
+      # TURMA_DSH=1 gate the lay-down, the file placement must match hub-agent.py's
+      # path resolution, and the marker + config seeding keep install.sh and the
+      # updater in step. Pure shell, extracted real funcs + throwaway prefix.
+      - name: Native installer dsh tests (agent/native/install.sh)
+        run: ./agent/tests/test_install_dsh.sh
       # bootstrap.sh is the README's curl|bash front door, so it runs off main
       # on hosts with no checkout — a bug there has no deployed copy to fix.
       # Covers its resolution decision (carried assets, newest build) and its
