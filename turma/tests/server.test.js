@@ -10922,6 +10922,22 @@ test("normalizeSessions coerces the per-session local model fields (XERK-489)", 
   ]);
 });
 
+test("normalizeSessions coerces the context-meter fields (XERK-489 Phase 4)", () => {
+  // lastTurnContextTokens + contextWindowTokens are Int? on Android; a rogue
+  // figure must degrade to null (the client hides the meter), never fail the
+  // whole /api/agents decode nor divide by junk.
+  const p = { device: "h", sessions: [
+    { id: "a", lastTurnContextTokens: 21500, contextWindowTokens: 200000 },   // good
+    { id: "b", lastTurnContextTokens: 1.5, contextWindowTokens: "lots" },      // bad
+    { id: "c", lastTurnContextTokens: 9999999999, contextWindowTokens: -1 },   // out of range
+  ] };
+  hub.normalizeRecord(p);
+  assert.deepEqual(
+    p.sessions.map((s) => [s.lastTurnContextTokens, s.contextWindowTokens]),
+    [[21500, 200000], [null, null], [null, null]],
+  );
+});
+
 test("heartbeat: localModel is a known key, not an unknown-field remnant", async () => {
   // It is the capability flag the hub and every composer gate on. Dropping it
   // from HEARTBEAT_KNOWN_KEYS would make the control vanish fleet-wide.

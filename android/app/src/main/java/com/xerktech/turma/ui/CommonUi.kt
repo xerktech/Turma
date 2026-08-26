@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -21,6 +22,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -47,10 +49,12 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.xerktech.turma.core.ContextMeter
 import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.core.hasLiveAgents
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
+import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.ui.theme.TurmaColors
 
 // ---- surfaces / structure --------------------------------------------------
@@ -369,4 +373,38 @@ fun Pill(
         fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
         color = fg,
     )
+}
+
+/**
+ * The context-fullness meter (XERK-489 Phase 4) — a thin bar + "N% context",
+ * warn ~85%, danger near the ~95% auto-compaction. Shared by the session card
+ * (FleetScreen) and the chat bar (ChatScreen), mirroring the web's card + compose
+ * footer. Renders nothing until a turn is measured. A subscription session's
+ * window is Claude Code's 200k assumption, marked "~".
+ */
+@Composable
+fun ContextMeterBar(session: SessionInfo, modifier: Modifier = Modifier) {
+    val m = ContextMeter.read(session) ?: return
+    val color = when (m.level) {
+        ContextMeter.Level.DANGER -> TurmaColors.critical
+        ContextMeter.Level.WARN -> TurmaColors.warning
+        ContextMeter.Level.OK -> MaterialTheme.colorScheme.primary
+    }
+    Row(
+        modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        LinearProgressIndicator(
+            progress = { m.fraction },
+            color = color,
+            trackColor = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.weight(1f).height(4.dp),
+        )
+        Text(
+            "${m.pct}%${if (m.approx) " ~" else ""} context",
+            style = MaterialTheme.typography.bodySmall,
+            color = if (m.level == ContextMeter.Level.OK) MaterialTheme.colorScheme.onSurfaceVariant else color,
+        )
+    }
 }

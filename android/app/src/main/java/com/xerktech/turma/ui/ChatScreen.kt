@@ -654,6 +654,10 @@ private fun ChatFooter(
             }
             session?.prs?.asReversed()?.forEach { PrBadge(it) }
         }
+        // Context-fullness meter (XERK-489 Phase 4), below the chips and above the
+        // box — the chat counterpart of the web compose footer's meter. Renders
+        // nothing until a turn is measured.
+        session?.let { ContextMeterBar(it, Modifier.fillMaxWidth()) }
         // Files staged for the next message, above the box so adding one doesn't
         // shove the text field around (web: the .compose-attach strip).
         if (attachments.isNotEmpty()) {

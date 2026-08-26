@@ -550,6 +550,12 @@ private fun SessionCard(
                         }
                     }
                 }
+                // Context-fullness meter (XERK-489 Phase 4): how full the window
+                // is right now, warning before the ~95% auto-compaction. Running
+                // sessions only; renders nothing until a turn is measured.
+                if (session.status == "running") {
+                    ContextMeterBar(session, Modifier.fillMaxWidth().padding(top = 4.dp))
+                }
                 if (session.prs.isNotEmpty()) {
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),

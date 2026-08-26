@@ -11513,6 +11513,50 @@ class TestModelsProbe(ManagerMixin, unittest.TestCase):
         self.assertIs(sm.models_probe, job)
 
 
+class TestContextMeter(unittest.TestCase):
+    """The context-fullness meter's numerator + denominator (XERK-489 Phase 4)."""
+
+    def test_context_tokens_are_the_prompt_not_the_output(self):
+        # Occupancy is what was fed IN (input + cache read + cache creation), not
+        # the response — output keeps climbing the cumulative totals but is not
+        # part of the window's current fill.
+        usage = {"input_tokens": 1000, "cache_read_input_tokens": 20000,
+                 "cache_creation_input_tokens": 500, "output_tokens": 9999}
+        self.assertEqual(ha._context_tokens_from_usage(usage), 21500)
+        # No usage block, or none of the three fields -> None (nothing to show).
+        self.assertIsNone(ha._context_tokens_from_usage(None))
+        self.assertIsNone(ha._context_tokens_from_usage({"output_tokens": 5}))
+        # A present-but-zero field still counts as measured (0), not "unknown".
+        self.assertEqual(ha._context_tokens_from_usage({"input_tokens": 0}), 0)
+
+    def test_scan_folds_the_last_assistant_turn(self):
+        report = {}
+        ha._scan_context_entry(
+            {"type": "assistant", "message": {"usage": {"input_tokens": 100}}}, report)
+        ha._scan_context_entry(
+            {"type": "assistant", "message": {"usage": {"input_tokens": 500,
+             "cache_read_input_tokens": 300}}}, report)
+        self.assertEqual(report["lastTurnContextTokens"], 800)   # newest wins
+
+    def test_a_compaction_resets_the_floor_to_post_tokens(self):
+        report = {"lastTurnContextTokens": 190000}
+        ha._scan_context_entry(
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"preTokens": 190000, "postTokens": 40000}}, report)
+        self.assertEqual(report["lastTurnContextTokens"], 40000)  # window emptied
+
+    def test_denominator_is_local_window_or_the_200k_assumption(self):
+        # A local session's exact selected-model window.
+        self.assertEqual(ha.context_window_tokens(
+            {"modelSource": "local", "localModelContext": 32768}), 32768)
+        # A subscription session has no agent-side figure -> the 200k assumption.
+        self.assertEqual(ha.context_window_tokens({"modelSource": "subscription"}),
+                         ha.SUBSCRIPTION_CONTEXT_ASSUMED)
+        # A local session before its window is resolved falls back to the same.
+        self.assertEqual(ha.context_window_tokens({"modelSource": "local"}),
+                         ha.SUBSCRIPTION_CONTEXT_ASSUMED)
+
+
 class TestSeedModelActual(ManagerMixin, unittest.TestCase):
     SID = "11111111-1111-4111-8111-111111111111"
 
@@ -11525,19 +11569,28 @@ class TestSeedModelActual(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         wt = os.path.join(self.tmp, "wt")
         self._transcript(wt, [
-            {"type": "assistant", "message": {"model": "claude-sonnet-5"}},
+            # The assistant turn carries BOTH signals the seed folds in one read
+            # (XERK-489 Phase 4): its model AND its context occupancy (input +
+            # cache). The usage here pins the numerator SEED path — without it,
+            # dropping _scan_context_entry from _seed_tail_signals goes unnoticed.
+            {"type": "assistant", "message": {"model": "claude-sonnet-5",
+             "usage": {"input_tokens": 50000, "cache_read_input_tokens": 30000}}},
             {"type": "user", "message": {"content":
              "<local-command-stdout>Set model to Haiku 4.5 for this session "
              "only</local-command-stdout>"}},
         ])
         sess = {"id": "s1", "worktreePath": wt, "claudeSessionId": self.SID}
-        self.assertEqual(sm._seed_model_actual(sess), "Haiku 4.5")
+        seeded = sm._seed_tail_signals(sess)
+        self.assertEqual(seeded["modelActual"], "Haiku 4.5")
+        self.assertEqual(seeded["lastTurnContextTokens"], 80000)   # numerator seed
 
     def test_no_transcript_seeds_nothing(self):
         sm = self.make_manager()
         sess = {"id": "s1", "worktreePath": os.path.join(self.tmp, "none"),
                 "claudeSessionId": self.SID}
-        self.assertIsNone(sm._seed_model_actual(sess))
+        seeded = sm._seed_tail_signals(sess)
+        self.assertIsNone(seeded["modelActual"])
+        self.assertIsNone(seeded["lastTurnContextTokens"])
 
 
 class TestInternalToolSlugModelProbe(ManagerMixin, unittest.TestCase):

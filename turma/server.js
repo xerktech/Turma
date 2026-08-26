@@ -4166,10 +4166,17 @@ function normalizeSessions(payload) {
     // A non-string name and a non-int-safe context degrade to the "can't tell"
     // value every client already handles (null), never a plausible default.
     if ("localModelName" in s && typeof s.localModelName !== "string") s.localModelName = null;
-    if ("localModelContext" in s) {
-      const c = s.localModelContext;
-      s.localModelContext = (typeof c === "number" && Number.isSafeInteger(c) &&
-        c > 0 && c <= 2_147_483_647) ? c : null;
+    // XERK-489 Phase 4: the context-fullness meter's numerator + denominator, both
+    // Int? on Android — same coercion, same reason (a rogue figure must degrade to
+    // null, not fail the whole fleet decode). The numerator is genuinely null until
+    // a turn is measured; a non-int-safe denominator degrades to null and the client
+    // hides the meter rather than dividing by junk.
+    for (const k of ["localModelContext", "lastTurnContextTokens", "contextWindowTokens"]) {
+      if (k in s) {
+        const c = s[k];
+        s[k] = (typeof c === "number" && Number.isSafeInteger(c) &&
+          c > 0 && c <= 2_147_483_647) ? c : null;
+      }
     }
   }
 }

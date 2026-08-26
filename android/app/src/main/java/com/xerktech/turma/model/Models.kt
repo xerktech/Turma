@@ -650,6 +650,15 @@ data class SessionInfo(
      */
     val localModelName: String? = null,
     val localModelContext: Int? = null,
+    /**
+     * Context-fullness meter (XERK-489 Phase 4): [lastTurnContextTokens] is how
+     * much of the window the newest assistant turn occupied (the numerator, null
+     * until a turn is measured), [contextWindowTokens] the window it runs in (the
+     * denominator — EXACT for a local session, Claude Code's 200k assumption for a
+     * subscription one). Both are coerced hub-side (`normalizeSessions`).
+     */
+    val lastTurnContextTokens: Int? = null,
+    val contextWindowTokens: Int? = null,
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
     /**

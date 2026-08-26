@@ -369,6 +369,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     window (the common LiteLLM case) but has no shrink field yet. The wire + agent plumbing already
     carries it (`/model {context}`, spawn `localContext`), so this is a UI-only follow-up; a phone
     rarely needs to hand-tune a context window.
+  - **XERK-489 Phase 4 — the context-fullness meter is ported.** A thin bar + "N% context"
+    (`ContextMeterBar` in `CommonUi.kt`, pure `core/ContextMeter.kt`) rides the session card
+    (`FleetScreen`) and the chat bar (`ChatScreen`), matching the web's card (`index.html`) + compose
+    footer (`chat.js`): warn ~85%, danger near the ~95% auto-compaction. `SessionInfo` gains
+    `lastTurnContextTokens` (numerator) + `contextWindowTokens` (denominator — EXACT for a local
+    session, Claude Code's 200k assumption "~" for a subscription one), both coerced hub-side.
+    Tests: `ContextMeterTest.kt`, the meter case in `AgentDecodeTest.kt`.
 - The memo lives in `AppContainer.modelSwitches`, not the chat ViewModel, for the same reason
   `drafts` does — the VM is scoped to the chat's nav entry, so a memo kept there died the moment
   you walked back to the session list, mid-switch, which is when it is doing its job.

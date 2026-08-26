@@ -124,6 +124,17 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   in `server.test.js`.
 - The compose footer's agent-mode / model selectors are joined by a compact **PR status chip**
   (`prFooterChip`) when it has one, and a `jira-chip` when the session has a ticket.
+- **A context-fullness meter** (XERK-489 Phase 4, `contextMeterChip`) rides the compose footer and
+  the dashboard session card (`contextMeterHtml` in `index.html`), warning before the ~95%
+  auto-compaction (warn ~85%, danger ~95%). Numerator = the newest assistant turn's window
+  occupancy (input + cache), agent-computed per-session as `lastTurnContextTokens` — NOT the
+  cumulative usage totals, which keep climbing across compactions. Denominator = `contextWindowTokens`:
+  EXACT for a local session (its selected model's window), Claude Code's 200k assumption for a
+  subscription one (marked "~", derived off `modelSource`). Both figures come off the HEARTBEAT
+  transcript-sum, never a pane statusLine — that text needs a statusLine Turma refuses to wire
+  because it breaks busy detection (XERK-130). Android mirrors it (`core/ContextMeter.kt` +
+  `ContextMeterBar` on the card and chat bar). Tests: the `context meter` cases in `chat.test.js`,
+  `dashboard-tiles.test.js`, `TestContextMeter` in `test_hub_agent.py`, `ContextMeterTest.kt`.
 - The **model selector is accurate** (XERK-33) — never a hardcoded menu, and never rewriting the
   shared login's default:
   - the chip leads with the session's heartbeated `modelActual`, humanized by `prettyModel`

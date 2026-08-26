@@ -188,6 +188,27 @@ class AgentDecodeTest {
         assertNull(old.sessions[0].localModelContext)
     }
 
+    // XERK-489 Phase 4: the context-fullness meter's numerator + denominator. Both
+    // are typed Int? now, so the hub coerces them and this decode must accept the
+    // figures and the absent (older-agent) shape.
+    @Test fun `the context-meter fields decode`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "h", "device": "h", "online": true,
+                "sessions": [ { "id": "s1", "modelSource": "subscription",
+                                "lastTurnContextTokens": 21500, "contextWindowTokens": 200000 },
+                              { "id": "s2", "modelSource": "local" } ] }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val s = resp.agents[0].sessions
+        assertEquals(21500, s[0].lastTurnContextTokens)
+        assertEquals(200000, s[0].contextWindowTokens)
+        // A session with no measurement / an older agent: both null, never a throw.
+        assertNull(s[1].lastTurnContextTokens)
+        assertNull(s[1].contextWindowTokens)
+    }
+
     // What hub-agent actually emits for a session that never moved:
     // `_session_payload` sends `modelSourceAt: sess.get("modelSourceAt")`, i.e.
     // a JSON null, on EVERY such session. A non-nullable field would throw and
