@@ -10851,6 +10851,77 @@ test("http: /model on a local session picks an ENDPOINT model, validated by memb
   assert.equal(sub.status, 200);
 });
 
+test("http: /model on a local session carries the context override (XERK-489)", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "lm8",
+      localModel: { available: true, model: "qwen:32b", defaultModel: "qwen:32b",
+        models: [{ id: "qwen:32b", contextTokens: 32768 }] },
+      sessions: [{ id: "loc", repo: "R", status: "running", modelSource: "local" }],
+    },
+    headers: agentHeaders,
+  });
+  // A positive-int context rides the setModel command as localContext.
+  await request("POST", "/api/agents/lm8/sessions/loc/model", {
+    body: { model: "qwen:32b", context: 16000 }, headers: userHeaders,
+  });
+  let cmd = agents.lm8.commands.filter((c) => c.type === "setModel").pop();
+  assert.equal(cmd.model, "qwen:32b");
+  assert.equal(cmd.localContext, 16000);
+  // A non-int / non-positive context is dropped, so the served figure applies.
+  await request("POST", "/api/agents/lm8/sessions/loc/model", {
+    body: { model: "qwen:32b", context: "big" }, headers: userHeaders,
+  });
+  cmd = agents.lm8.commands.filter((c) => c.type === "setModel").pop();
+  assert.equal("localContext" in cmd, false);
+});
+
+test("http: spawn onto local carries localModel + localContext (XERK-489)", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "lm9",
+      localModel: { available: true, model: "qwen:32b", defaultModel: "qwen:32b",
+        models: [{ id: "qwen:32b", contextTokens: 32768 }] },
+    },
+    headers: agentHeaders,
+  });
+  const ok = await request("POST", "/api/agents/lm9/sessions", {
+    body: { repo: "Turma", modelSource: "local", localModel: "qwen:32b", localContext: 20000 },
+    headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+  const cmd = agents.lm9.commands.filter((c) => c.type === "spawn").pop();
+  assert.equal(cmd.localModel, "qwen:32b");
+  assert.equal(cmd.localContext, 20000);
+  // A non-int context is dropped (the agent clamps a real one to the served window).
+  const ok2 = await request("POST", "/api/agents/lm9/sessions", {
+    body: { repo: "Turma", modelSource: "local", localModel: "qwen:32b", localContext: -5 },
+    headers: userHeaders,
+  });
+  assert.equal(ok2.status, 200);
+  const cmd2 = agents.lm9.commands.filter((c) => c.type === "spawn").pop();
+  assert.equal("localContext" in cmd2, false);
+});
+
+test("normalizeSessions coerces the per-session local model fields (XERK-489)", () => {
+  // localModelName is String? and localModelContext is Int? on Android, which
+  // decodes /api/agents atomically — a wrong-typed one from a rogue agent must
+  // degrade to null, never fail the whole fleet decode.
+  const p = { device: "h", sessions: [
+    { id: "a", localModelName: "qwen:32b", localModelContext: 32768 },   // good
+    { id: "b", localModelName: 123, localModelContext: 1.5 },            // bad types
+    { id: "c", localModelName: "m", localModelContext: 9999999999 },     // out of Int
+    { id: "d", localModelName: "m", localModelContext: -5 },             // non-positive
+  ] };
+  hub.normalizeRecord(p);
+  assert.deepEqual(p.sessions.map((s) => [s.localModelName, s.localModelContext]), [
+    ["qwen:32b", 32768],
+    [null, null],
+    ["m", null],
+    ["m", null],
+  ]);
+});
+
 test("heartbeat: localModel is a known key, not an unknown-field remnant", async () => {
   // It is the capability flag the hub and every composer gate on. Dropping it
   // from HEARTBEAT_KNOWN_KEYS would make the control vanish fleet-wide.

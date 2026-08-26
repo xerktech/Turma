@@ -222,11 +222,27 @@ data class DshInfo(
  * A host's self-hosted-model configuration (hub-agent's `localModel` block).
  * [model] and [contextTokens] are null exactly when [available] is false, so
  * nothing may read them as a fallback for an unconfigured host.
+ *
+ * [models] + [defaultModel] are the XERK-489 additions: the endpoint's DISCOVERED
+ * models (each with its context window) and which one a new local session starts
+ * on. [model]/[contextTokens] stay the current default for back-compat, so an
+ * older hub that sends only those still works. The hub bounds the list length and
+ * per-element (`normalizeLocalModel`), so this decode is safe against a rogue host.
  */
 @Serializable
 data class LocalModelInfo(
     val available: Boolean = false,
     val model: String? = null,
+    val contextTokens: Int? = null,
+    val models: List<LocalModelOption> = emptyList(),
+    val defaultModel: String? = null,
+)
+
+/** One model the endpoint serves; [contextTokens] is null for a bare OpenAI
+ *  endpoint that reports no per-model window (XERK-489). */
+@Serializable
+data class LocalModelOption(
+    val id: String = "",
     val contextTokens: Int? = null,
 )
 
@@ -626,6 +642,14 @@ data class SessionInfo(
      * claude — the runtime every session had before this existed. Presentational.
      */
     val agentType: String = "",
+    /**
+     * For a LOCAL session, which endpoint model + context window it runs on
+     * (XERK-489). Null on a subscription session (and on an older agent). The hub
+     * coerces both at ingest (`normalizeSessions`), so a wrong-typed one from a
+     * rogue host degrades to null rather than failing the whole /api/agents decode.
+     */
+    val localModelName: String? = null,
+    val localModelContext: Int? = null,
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
     /**

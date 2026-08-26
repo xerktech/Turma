@@ -222,6 +222,18 @@ paths:
   - A source file SHORTER than the hub's cursor means the transcript was rewritten under us: it is
     logged and left alone. **Never truncate the archive to match** — the longer copy is the one with
     the history in it.
+  - **A dsh session's native event log rides this layer at `<tid>/dsh/`** (`DSH_STORE_DIRNAME`,
+    XERK-469). It is placed UNDER the project-slug session dir, not in the worktree, precisely so the
+    raw walk carries it with no special case — the launcher (XERK-466) writes it there. The worktree
+    is the wrong home: the raw layer excludes it on purpose (its contents are what prune/delete key
+    on), so a native log there is D3's canonical record retained by NOTHING. This reconciles the
+    `docs/dsh-session-lifecycle.md` design, which had proposed the worktree.
+  - **Only APPEND-ONLY bytes belong under `<tid>/dsh/`.** The per-file cursor ships bytes past an
+    offset — correct for dsh's event-sourced JSONL log, wrong for a page-mutating SQLite (an in-place
+    rewrite leaves the archived early bytes stale). dsh's SQLite is a derived index it rebuilds from
+    the log, so it is not archived. Migration ([K]) is the other consumer and is NOT free yet:
+    `_pack_bytes` names `subagents/`+`workflows/`, not the whole `<tid>/` tree, so [K] adds one
+    `tar.add(<tid>/dsh)`. Tests: `TestDshArchiveSync`.
   - The raw pass runs in its **own try/except** off the same reply: a raw failure must never cost the
     rendered transcript, which is what every other surface reads. Its read window must stay at or
     under the hub's `ARCHIVE_RAW_CHUNK_MAX`, which bounds its gunzip — a larger window is refused on

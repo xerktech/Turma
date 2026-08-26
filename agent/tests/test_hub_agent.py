@@ -1977,6 +1977,244 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         self.assertIsNone(rep["panePrompt"])
 
 
+class TestDshState(unittest.TestCase):
+    """parse_dsh_state / dsh_pane_busy — the pure mapping from a dsh
+    control-socket `state` object to the paneBusy tri-state (XERK-468 [D])."""
+
+    def test_parse_normalizes_status_and_counts(self):
+        self.assertEqual(
+            ha.parse_dsh_state({"status": "running", "eventCount": 7,
+                                "pendingInteraction": False}),
+            {"status": "running", "eventCount": 7, "pendingInteraction": False})
+        # The ack shape (an inline snapshot on {"ok":true,...}) parses the same.
+        self.assertEqual(
+            ha.parse_dsh_state({"ok": True, "status": "idle"}),
+            {"status": "idle", "eventCount": None, "pendingInteraction": False})
+
+    def test_parse_rejects_junk_without_raising(self):
+        self.assertIsNone(ha.parse_dsh_state("running"))
+        self.assertIsNone(ha.parse_dsh_state(None))
+        # Unknown status -> None status (not an error), eventCount coerced.
+        self.assertEqual(ha.parse_dsh_state({"status": "weird"})["status"], None)
+        # A bool is not an eventCount (True is an int in Python — the guard is
+        # load-bearing), and a negative one is dropped.
+        self.assertIsNone(ha.parse_dsh_state({"eventCount": True})["eventCount"])
+        self.assertIsNone(ha.parse_dsh_state({"eventCount": -3})["eventCount"])
+        self.assertIsNone(ha.parse_dsh_state({"eventCount": 1.5})["eventCount"])
+
+    def test_pane_busy_tri_state(self):
+        run = {"status": "running", "eventCount": 1, "pendingInteraction": False}
+        idle = {"status": "idle", "eventCount": 1, "pendingInteraction": False}
+        self.assertIs(ha.dsh_pane_busy(run), True)
+        self.assertIs(ha.dsh_pane_busy(idle), False)
+        # Missing / unknown status -> None ("can't tell", falls back to
+        # transcript freshness downstream, like an uncapturable Claude pane).
+        self.assertIsNone(ha.dsh_pane_busy(None))
+        self.assertIsNone(ha.dsh_pane_busy({"status": None}))
+
+    def test_pending_interaction_reads_not_working(self):
+        # Blocked on a human is NOT its own turn — like a Claude panePrompt that
+        # suppresses the busy hint. False even if dsh still calls itself running.
+        self.assertIs(ha.dsh_pane_busy(
+            {"status": "running", "pendingInteraction": True}), False)
+
+
+class TestDshQueryState(unittest.TestCase):
+    """dsh_query_state speaks the control-socket contract
+    (docs/dsh-session-lifecycle.md) against a real fake UNIX-socket server."""
+
+    def _serve(self, reply_bytes, *, accept=True):
+        """Bind a fake driver-plugin socket that answers one `state` request
+        with `reply_bytes`. Returns its path; torn down at test end."""
+        d = tempfile.mkdtemp(prefix="dsh-sock-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "s.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def run():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                if not accept:
+                    return
+                conn.recv(4096)          # the {"op":"state"} request
+                conn.sendall(reply_bytes)
+        threading.Thread(target=run, daemon=True).start()
+        return path
+
+    def test_reads_a_running_snapshot(self):
+        path = self._serve(
+            b'{"ok":true,"status":"running","eventCount":3,'
+            b'"pendingInteraction":false}\n')
+        self.assertEqual(
+            ha.dsh_query_state(path, timeout=5),
+            {"status": "running", "eventCount": 3, "pendingInteraction": False})
+
+    def test_no_socket_returns_none(self):
+        self.assertIsNone(ha.dsh_query_state("/no/such/dsh.sock", timeout=1))
+
+    def test_malformed_reply_returns_none(self):
+        path = self._serve(b'not json at all\n')
+        self.assertIsNone(ha.dsh_query_state(path, timeout=5))
+
+    def test_a_flood_without_newline_is_bounded(self):
+        # A hostile/broken plugin streaming one unterminated line must not become
+        # an unbounded read on the agent. The server here NEVER sends a newline
+        # and NEVER closes — it streams past DSH_SOCK_LINE_MAX continuously — so
+        # only the byte bound can end the read. (A finite blob that then closes
+        # would return None on the recv->empty path whether or not the bound
+        # existed, which is a vacuous test: with the bound deleted it still
+        # passes. Here, deleting the bound makes the read run to the timeout, so
+        # the FAST return is the proof the bound fired.)
+        d = tempfile.mkdtemp(prefix="dsh-flood-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "s.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def run():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                conn.recv(4096)                 # the {"op":"state"} request
+                chunk = b"x" * 65536
+                while not stop.is_set():
+                    try:
+                        conn.sendall(chunk)     # no newline, ever
+                    except OSError:
+                        return                  # client hung up (the bound fired)
+        threading.Thread(target=run, daemon=True).start()
+
+        start = time.monotonic()
+        # Generous timeout: WITH the bound this returns in milliseconds; WITHOUT
+        # it the read runs until the 30s timeout — so a fast None is the guard,
+        # a slow one is the timeout masking a removed bound.
+        self.assertIsNone(ha.dsh_query_state(path, timeout=30))
+        self.assertLess(time.monotonic() - start, 5)
+
+
+class TestDshLivenessInReport(ProjectDirMixin, unittest.TestCase):
+    """A dsh session sources paneBusy from its cached control-socket status
+    instead of a pane scrape, reusing the same wire field so every working/ready
+    mirror is unchanged (XERK-468 [D]). Everything else in the report still
+    comes from the (projected) transcript."""
+
+    def _txn(self, role, text, tool_use=False):
+        content = [{"type": "text", "text": text}]
+        if tool_use:
+            content.append({"type": "tool_use", "name": "Bash",
+                            "input": {"command": "ls"}})
+        return {"type": role, "message": {"role": role, "content": content}}
+
+    def test_dsh_busy_from_status_never_scrapes_the_pane(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "done")])
+        status = {"status": "running", "eventCount": 2,
+                  "pendingInteraction": False}
+        # A tmux_name is passed, but a dsh session has no Claude pane — assert
+        # _pane_status is never consulted, so a stray capture can't fake a read.
+        with mock.patch.object(ha, "_pane_status",
+                               side_effect=AssertionError("pane scraped")):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-dsh",
+                                    agent_type="dsh", dsh_status=status)
+        self.assertIs(rep["paneBusy"], True)
+        self.assertIsNone(rep["modeActual"])
+        self.assertIsNone(rep["panePrompt"])
+        # Transcript-derived ready inputs still populate for a dsh session — this
+        # is what makes readyForReview's finished-turn branch work unchanged.
+        self.assertEqual(rep["lastRole"], "assistant")
+        self.assertIs(rep["lastHasToolUse"], False)
+        self.assertIsNotNone(rep["transcriptAgeSec"])
+
+    def test_dsh_idle_and_unknown(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "hi")])
+        with mock.patch.object(ha, "_pane_status",
+                               side_effect=AssertionError("pane scraped")):
+            idle = ha.session_report(self.WORKDIR, {}, "agent-dsh",
+                                     agent_type="dsh",
+                                     dsh_status={"status": "idle"})
+            # No cached status yet (launcher's reader hasn't reported) -> None,
+            # which falls back to transcript freshness downstream.
+            unknown = ha.session_report(self.WORKDIR, {}, "agent-dsh",
+                                        agent_type="dsh", dsh_status=None)
+        self.assertIs(idle["paneBusy"], False)
+        self.assertIsNone(unknown["paneBusy"])
+
+    def test_a_claude_session_still_scrapes_the_pane(self):
+        # The dsh branch must not touch the Claude path.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self._txn("assistant", "hi")])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "plan", None)) as ps:
+            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.assertIs(rep["paneBusy"], True)
+        self.assertEqual(rep["modeActual"], "plan")
+        ps.assert_called_once()
+
+
+class TestDshLivenessSeam(unittest.TestCase):
+    """The manager-side seam the launcher's socket reader feeds (XERK-468 [D])."""
+
+    def test_ingest_state_event_updates_cache(self):
+        sm = ha.SessionManager()
+        sm._ingest_dsh_event("s1", {"evt": "state", "status": "running",
+                                    "eventCount": 4})
+        self.assertEqual(sm.dsh_status["s1"],
+                         {"status": "running", "eventCount": 4,
+                          "pendingInteraction": False})
+
+    def test_ingest_interaction_is_left_to_C(self):
+        # [D] owns the `state` event; the `interaction` event is [C]'s, so [D]
+        # touches neither the cache nor anything else for it.
+        sm = ha.SessionManager()
+        sm._ingest_dsh_event("s1", {"evt": "interaction", "requestId": "r1",
+                                    "prompt": "pick"})
+        self.assertNotIn("s1", sm.dsh_status)
+
+    def test_ingest_tolerates_junk(self):
+        sm = ha.SessionManager()
+        sm._ingest_dsh_event("s1", "nope")
+        sm._ingest_dsh_event("", {"evt": "state", "status": "running"})
+        sm._ingest_dsh_event("s1", {"evt": "state", "status": "bogus"})
+        self.assertEqual(sm.dsh_status, {})
+
+    def test_set_none_clears_a_disconnected_session(self):
+        sm = ha.SessionManager()
+        sm._set_dsh_status("s1", {"status": "running"})
+        sm._set_dsh_status("s1", None)          # what the reader does on disconnect
+        self.assertNotIn("s1", sm.dsh_status)
+
+    def test_forget_caches_drops_dsh_status(self):
+        sm = ha.SessionManager()
+        sm.dsh_status["s1"] = {"status": "running"}
+        sm._forget_session_caches("s1")
+        self.assertNotIn("s1", sm.dsh_status)
+
+    def test_refresh_reads_the_socket_off_beat(self):
+        sm = ha.SessionManager()
+        snap = {"status": "running", "eventCount": 1, "pendingInteraction": False}
+        with mock.patch.object(ha, "dsh_query_state", return_value=snap) as q:
+            self.assertEqual(sm.refresh_dsh_status("s1"), snap)
+        self.assertEqual(sm.dsh_status["s1"], snap)
+        self.assertEqual(q.call_args[0][0], ha.dsh_sock_path("s1"))
+        # A failed query clears the cache rather than freezing a stale read.
+        with mock.patch.object(ha, "dsh_query_state", return_value=None):
+            self.assertIsNone(sm.refresh_dsh_status("s1"))
+        self.assertNotIn("s1", sm.dsh_status)
+
+
 class TestStablePaneBusy(unittest.TestCase):
     """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
     capture would otherwise cause: a busy read is instant, an idle read is
@@ -5577,7 +5815,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
             model=None, permission_mode=None, model_source=None,
-            local_model=None, agent_type=None, cmd_id="c1",
+            local_model=None, local_context=None, agent_type=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -5625,7 +5863,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
             model="opus", permission_mode="plan", model_source=None,
-            local_model=None, agent_type="dsh", cmd_id="c9",
+            local_model=None, local_context=None, agent_type="dsh", cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -10636,6 +10874,57 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         self.assertIsNotNone(sess.get("errorMsg"))
         # No relaunch — the picker is never opened and no keys reach the pane.
         self.assertEqual([c for c in self.run_calls if "tmux" in c], [])
+
+    def test_local_model_context_override_clamps_to_served(self):
+        """The advanced override may not EXCEED the served window — an overstated
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS compacts too late and truncates the tail
+        (XERK-489). Asking for more than served clamps to served."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["localModelName"] = "qwen:32b"
+        sess["localModelContext"] = 16000          # currently shrunk
+        self._pin_transcript(sess)
+        with mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "qwen:32b", "contextTokens": 32768}]):
+            sm.set_model("abcde", "qwen:32b", context=999999)  # more than served
+            env = self._launch_env()
+        self.assertEqual(sess["localModelContext"], 32768)     # clamped to served
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768", env)
+
+    def test_launch_clamps_an_overstated_stored_context(self):
+        """The LAUNCH is the authoritative shrink-only clamp — every launch path
+        (resume, boot, migration, switch) goes through it, so it is pinned
+        INDEPENDENTLY of _switch_local_model's own clamp (XERK-489). An overstated
+        stored window (a bad restore, a migrated record) is shrunk to the served
+        figure and re-persisted, never launched as-is."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["localModelName"] = "qwen:32b"
+        sess["localModelContext"] = 999999          # stored overstatement
+        self._pin_transcript(sess)
+        with mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "qwen:32b", "contextTokens": 32768}]):
+            sm._launch_tmux(sess, resume=True)
+            env = self._launch_env()
+        self.assertEqual(sess["localModelContext"], 32768)   # re-persisted, clamped
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768", env)
+
+    def test_local_model_context_only_change_relaunches(self):
+        """A context-only shrink (same model) still relaunches — the window is an
+        env var read at launch, so it cannot change without one (XERK-489)."""
+        sm = self.make_manager()
+        sess = self._session(sm, source="local")
+        sess["localModelName"] = "qwen:32b"
+        sess["localModelContext"] = 32768
+        self._pin_transcript(sess)
+        before = len(self._launches())
+        with mock.patch.object(ha, "_local_model_discovered",
+                               [{"id": "qwen:32b", "contextTokens": 32768}]):
+            sm.set_model("abcde", "qwen:32b", context=16000)
+            env = self._launch_env()
+        self.assertEqual(len(self._launches()), before + 1)    # relaunched
+        self.assertEqual(sess["localModelContext"], 16000)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=16000", env)
 
     def test_switch_keeps_the_conversation(self):
         """The whole value of failing over is not losing what the session has
@@ -16242,6 +16531,182 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         with mock.patch.object(sm, "_post_archive_chunk", stuck_post):
             sm._archive_deltas({})
         self.assertEqual(len(calls), 1)  # one attempt, then it bails (no loop)
+
+
+class TestDshArchiveSync(TestArchiveSync):
+    """A dsh session archives with BOTH layers and no new archive code (XERK-469,
+    [dsh][E]).
+
+    The whole point of the S1/D3 architecture is symmetry: the dsh->Claude-JSONL
+    projection needs no new READER because it is named `<slug>/<sid>.jsonl` like
+    any transcript, and the native event log needs no new WRITER in the archive
+    because it is placed under `<slug>/<sid>/dsh/` like any raw sidecar. These
+    tests pin that a dsh-SHAPED session on disk — projection at the top level,
+    native event log under `<sid>/dsh/` — flows through the existing manifest and
+    both delta pushes unchanged. There is no live dsh launcher yet (XERK-466 is a
+    stub), so the session is built the way S1's tests build one: from real dsh
+    events (`dsh_corpus.json`) run through the real projector.
+    """
+
+    def _dt(self):
+        """Load the real dsh projector (agent/dsh_transcript.py), as S1's own
+        test does — the projection under test is genuine dsh output, not a
+        hand-rolled JSONL fixture that could drift from the real shape."""
+        path = os.path.join(AGENT_DIR, "dsh_transcript.py")
+        spec = importlib.util.spec_from_file_location("dsh_transcript", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _dsh_events(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "dsh_corpus.json")) as f:
+            return json.load(f)
+
+    def _build_dsh_session(self, sm, wt="/w/.turma/worktrees/Turma/dsh1", sid="d1"):
+        """Lay a dsh session on disk the way the launcher (XERK-466) will:
+
+          <slug>/<sid>.jsonl        the S1 projection (rendered layer reads this)
+          <slug>/<sid>/dsh/events.jsonl   the native, append-only event log (raw)
+
+        Returns (slug, native_rel, native_bytes)."""
+        dt = self._dt()
+        events = self._dsh_events()
+        # The projection — exactly what the launcher appends incrementally.
+        entries = dt.project_log(events, sid, cwd=wt)
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, sid + ".jsonl"),
+                    [json.dumps(e, ensure_ascii=False) for e in entries])
+        # The native event log — dsh's canonical record, retained in full (D3).
+        # Its bytes are the append-only event stream, which is what the raw
+        # layer's per-file cursor is built for.
+        native = b"".join(
+            (json.dumps(e, ensure_ascii=False) + "\n").encode() for e in events)
+        native_rel = os.path.join(sid, ha.DSH_STORE_DIRNAME, "events.jsonl")
+        self._nested(slug, sid, os.path.join(ha.DSH_STORE_DIRNAME, "events.jsonl"),
+                     native)
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm.closed = [{"id": "s", "worktreePath": wt, "summary": "dsh task",
+                      "createdAt": "2026-07-01T00:00:00Z"}]
+        return slug, native_rel, native
+
+    def test_the_store_dir_is_a_fixed_named_contract(self):
+        # The launcher (XERK-466) and this layer must agree on ONE dir name, so a
+        # rename can't strand the native log outside the archive silently.
+        self.assertEqual(ha.DSH_STORE_DIRNAME, "dsh")
+
+    def test_a_dsh_session_appears_in_the_manifest_with_both_layers(self):
+        sm = self.make_manager()
+        slug, native_rel, _ = self._build_dsh_session(sm)
+        manifest = sm._archive_manifest()
+        self.assertEqual(len(manifest), 1)
+        m = manifest[0]
+        # RENDERED: the projection is the transcript the manifest enumerates.
+        self.assertEqual(m["transcriptId"], "d1")
+        self.assertEqual(m["repo"], "Turma")
+        self.assertGreater(m["size"], 0)
+        # RAW: the native event log rides as a sidecar, no special case.
+        rels = [rel for rel, _s in (m["rawFiles"] or [])]
+        self.assertIn("d1.jsonl", rels)
+        self.assertIn(native_rel, rels)
+
+    def test_session_files_lists_the_native_dsh_log(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_dsh_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        sizes = dict(sm._session_files(proj, "d1"))
+        self.assertIn(native_rel, sizes)
+        self.assertEqual(sizes[native_rel], len(native))
+        # Everything the raw layer offers is under the project-slug SESSION tree
+        # (`<sid>.jsonl` or `<sid>/...`) — never the worktree. That subtree is
+        # exactly what a migration ([K]) will pack, so archive and migration
+        # coverage cannot diverge on where the store lives.
+        for rel in sizes:
+            self.assertTrue(rel == "d1.jsonl" or rel.startswith("d1" + os.sep),
+                            rel)
+
+    def test_the_rendered_layer_ships_the_projection(self):
+        sm = self.make_manager()
+        self._build_dsh_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+
+        def fake_chunk(tid, body):
+            # The rendered push carries pre-parsed entries; enough here is that
+            # the projection transcript is what ships and the cursor advances.
+            pushed.append((tid, body.get("startOffset"), body.get("endOffset")))
+            return {"bytesStored": body.get("endOffset")}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fake_chunk):
+            sm._archive_deltas({})
+        self.assertTrue(pushed, "the dsh projection ships through the rendered layer")
+        self.assertEqual({t for t, _s, _e in pushed}, {"d1"})
+
+    def test_the_raw_layer_ships_the_native_log_byte_for_byte(self):
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_dsh_session(sm)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((tid, rel, start, raw))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        got = {rel: b"".join(r for _t, rl, _s, r in pushed if rl == rel)
+               for _t, rel, _s, _r in pushed}
+        # The native event log went up byte-for-byte, not a rendering of it —
+        # this is D3's canonical record, kept in full for metrics/resume.
+        self.assertIn(native_rel, got)
+        self.assertEqual(got[native_rel], native)
+
+    def test_a_resumed_dsh_log_ships_only_the_appended_bytes(self):
+        # dsh resume (XERK-466) reloads the persisted native log and appends new
+        # events to the SAME file; the raw layer's per-file cursor ships only the
+        # tail, exactly as it does for a resumed Claude transcript — and this is
+        # what a MIGRATION relies on too (same id, byte-identical prefix).
+        sm = self.make_manager()
+        slug, native_rel, native = self._build_dsh_session(sm)
+        proj = os.path.join(ha.PROJECTS_ROOT, slug)
+        path = os.path.join(proj, native_rel)
+        first = os.path.getsize(path)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        stored = {}
+        pushed = []
+
+        def fake_post(tid, rel, start, raw):
+            pushed.append((rel, start, len(raw)))
+            if start != stored.get(rel, 0):
+                return {"stored": stored.get(rel, 0)}
+            stored[rel] = start + len(raw)
+            return {"stored": stored[rel]}
+
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({})
+        self.assertEqual(stored[native_rel], first)
+
+        # Resume: append one more event line, re-manifest, sync with the hub's
+        # cursor at `first`. Only the appended bytes go up.
+        with open(path, "ab") as f:
+            f.write(json.dumps({"type": "user/message", "seq": 99, "time": 1,
+                                "data": {"message": {"role": "user",
+                                "content": "again"}}}).encode() + b"\n")
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed.clear()
+        with mock.patch.object(sm, "_post_archive_raw", fake_post):
+            sm._archive_raw_deltas({"d1": {native_rel: first}})
+        tail = [p for p in pushed if p[0] == native_rel]
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0][1], first)  # started at the old EOF, not 0
+        self.assertEqual(stored[native_rel], os.path.getsize(path))
 
 
 class TestArchivePayloadBudget(ManagerMixin, unittest.TestCase):

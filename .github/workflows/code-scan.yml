@@ -211,6 +211,11 @@ jobs:
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
       - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
         run: node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
+      - name: Node unit tests (dsh safety guard)
+        # The dsh guard's deny-policy proof (shells out to the real guard.py /
+        # fileguard.py). drive-real-dsh.mjs needs a real dsh install and is a
+        # host proof, not a CI test — the *.test.mjs glob excludes it.
+        run: node --test agent/dsh/guard/test/*.test.mjs
       # entrypoint.sh is PID 1 and decides which uid every session runs as —
       # i.e. whether files land in the mounted git root owned by the host user
       # or by root. ShellCheck only covers its syntax, so this builds the real

@@ -36,6 +36,7 @@ that component's files.
 | `.claude/rules/release.md` | `.github/**`, `VERSION`, Dockerfiles | releases, PR gates, image tiers |
 | `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh integration ADR (XERK-460 G0): the five architecture decisions |
 | `.claude/rules/dsh-input.md` | `agent/dsh_session.py`, `agent/dsh-session-driver/**`, `agent/hub-agent.py` | driving a dsh session (XERK-467 [C]): control socket, driver plugin, `_launch_dsh`, input/interaction |
+| `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**`, `agent/hub-agent.py` | dsh safety guard (XERK-470 [F]): the deny policy mapped onto dsh's tool pipeline |
 
 ### Editing these files
 

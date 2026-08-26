@@ -129,11 +129,43 @@ export function apply(ctx, config) {
                 + `presets the agent has NO TOOLS`);
         }
     };
+    // Pin the per-session approval policy + sandbox mode from the guard config
+    // (XERK-470 [F]): approvals must ASK so [C]'s answerer over the socket is
+    // called (a 'never' default would auto-reject every escalation without ever
+    // asking); writes are confined to the worktree. These are per-session runtime
+    // settings, so they are set here rather than in the shared profile. The guard
+    // plugin's monotonic deny is the load-bearing protection regardless; these are
+    // additional confinement, so a failure is warned, not fatal.
+    const pinGuardPolicy = async (agent) => {
+        const policy = env.TURMA_DSH_APPROVAL_POLICY;
+        if (policy && ctx.approval && typeof ctx.approval.setPolicy === 'function') {
+            try {
+                ctx.approval.setPolicy(agent, policy);
+            }
+            catch (e) {
+                ctx.logger.warn(`[turma-dsh] could not set approval policy: ${e}`);
+            }
+        }
+        const mode = env.TURMA_DSH_SANDBOX_MODE;
+        if (mode) {
+            try {
+                const pkg = '@deepseek-ai/dsh-sandbox-policy';
+                const mod = await import(pkg);
+                if (mod && typeof mod.setSandboxMode === 'function') {
+                    mod.setSandboxMode(agent.session, mode);
+                }
+            }
+            catch (e) {
+                ctx.logger.warn(`[turma-dsh] could not set sandbox mode: ${e}`);
+            }
+        }
+    };
     (async () => {
         try {
             const agentOptions = (provider || model) ? { provider, model } : undefined;
             handle = await ctx.agents.create({ sessionId, meta: { cwd }, agentOptions, setup });
             ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} created (cwd ${cwd})`);
+            await pinGuardPolicy(handle.agent);
         }
         catch (e) {
             ctx.logger.error(`[turma-dsh] agent create failed: ${e}`);

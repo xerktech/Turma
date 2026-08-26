@@ -744,8 +744,8 @@ fun SessionsListPane(
             localModel = com.xerktech.turma.core.ModelSource.hostLocalModel(fleet.agents, host),
             dsh = com.xerktech.turma.core.Runtime.hostDsh(fleet.agents, host),
             onDismiss = { spawnFor = null },
-            onSpawn = { prompt, label, baseRef, model, mode, source, agentType ->
-                vm.spawn(host, repo, prompt, label, baseRef, model, mode, source, agentType); spawnFor = null
+            onSpawn = { prompt, label, baseRef, model, mode, source, localModel, agentType ->
+                vm.spawn(host, repo, prompt, label, baseRef, model, mode, source, localModel, agentType); spawnFor = null
             },
         )
     }

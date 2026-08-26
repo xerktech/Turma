@@ -230,6 +230,84 @@ to; `project_log()` is the batch form. Invariants a change here must not undo:
   `tunnel-agent.test.js` both assert against — pinning both readers to one expected result.
 - Tests: `test_dsh_transcript.py`, the `dsh projection` case in `tunnel-agent.test.js`.
 
+## [D] (XERK-468) — busy / ready / summary semantics, implemented (`hub-agent.py`)
+
+The read-side of a dsh session's state. A dsh session runs HEADLESS
+(`docs/dsh-session-lifecycle.md`, [B]): no Claude TUI pane, so `paneBusy` — the "is its own turn
+running" signal every working/ready mirror keys on — cannot come from `_pane_status`. It comes from
+the dsh driver plugin's control-socket `state` (status running|idle). Invariants a change here must
+not undo:
+
+- **It REUSES the `paneBusy` wire field, agent-side — it does NOT add a dsh signal to the mirrors.**
+  `session_report(agent_type="dsh", dsh_status=…)` sources `paneBusy` from the cached dsh status
+  (`dsh_pane_busy`) instead of scraping the pane, and reports it in the same `paneBusy`. So
+  `sessionWorking`, `liveState`, the FIVE `readyForReview` mirrors, the ready-for-review alert and
+  summaries are **UNCHANGED and cannot drift** — the projection philosophy applied to liveness
+  (keep the mirrors at N). The CLAUDE.md "Working = paneBusy OR live agents" contract holds verbatim;
+  the [B] design note's "all mirrors branch on agentType" was the rejected alternative — do not
+  restore it (it multiplies the very mirror edits S1 exists to avoid).
+- **Everything OTHER than liveness stays transcript-derived**, from the S1 projection: `lastRole`,
+  `lastHasToolUse`, `transcriptAgeSec`, the PR scan and the summary seed all read the projected
+  `<claudeSessionId>.jsonl` with no change. This is what makes `readyForReview`'s finished-turn branch
+  and summaries work identically for a dsh session — the only signal that is not transcript-derived is
+  liveness, exactly as S1's "liveness is deliberately NOT in the projection" note carves out.
+- **`dsh_pane_busy` is a tri-state and deliberately NOT time-expired.** running→True, idle→False,
+  unknown/missing→None ("can't tell", so downstream falls back to transcript freshness exactly like an
+  uncapturable Claude pane). A pending interaction reads False (blocked on a human, not its own turn —
+  like a Claude `panePrompt`). Expiring a stale "running" by AGE would reintroduce the transcript-
+  freshness false-idle the socket signal exists to avoid (a long dsh tool call emits no status edge for
+  minutes) — the exact bug paneBusy's "esc to interrupt" solves for Claude. Liveness-of-the-SIGNAL is
+  the producer's job: it clears to unknown on socket disconnect, and the host-offline gate zeroes it
+  when the host dies.
+- **The beat only ever READS an in-memory cache (`self.dsh_status`), never the socket** — so a wedged
+  plugin cannot stall the heartbeat past `OFFLINE_AFTER_MS` (XERK-395). The PRODUCER that fills the
+  cache — the persistent per-session socket reader — is the LAUNCHER's ([B] impl phase), off the beat.
+  [D] owns the CONSUMER seam: `_ingest_dsh_event(sid, event)` (the launcher's reader forwards each
+  streamed `state` line here), `_set_dsh_status(sid, None)` (what it calls on disconnect), and
+  `refresh_dsh_status` / `dsh_query_state` (the off-beat one-shot a poller can use instead). The cache
+  is dropped on kill/delete (`_forget_session_caches`) and restart (a fresh dsh agent).
+- **`_ingest_dsh_event` handles the `state` event ONLY; the `interaction` event is [C]'s** (XERK-467) —
+  surfacing a dsh approval/question as a pending `question` through the AskUserQuestion bridge is what
+  leads a blocked dsh session into Ready-for-review's "waiting" lead. [D] leaves `interaction`
+  untouched so the two seams don't collide, and only a USABLE status (running|idle) updates the cache
+  (a malformed state event must not clobber a known-good "running").
+- **Verified by unit test, not against real dsh** — no launcher exists yet, so no dsh session runs to
+  drive end to end. `dsh_query_state` is tested against a real fake UNIX-socket server speaking the
+  contract; the cache/mapping/seam are tested directly. When the launcher lands it wires its reader to
+  `_ingest_dsh_event` and this lights up. Tests: `TestDshState`, `TestDshQueryState`,
+  `TestDshLivenessInReport`, `TestDshLivenessSeam` in `test_hub_agent.py`.
+
+## [E] (XERK-469) shipped: archive sync (rendered + raw) for dsh sessions
+
+D3's retention obligation made concrete — a dsh session archives with BOTH layers and no new archive
+code, which is the same symmetry S1 buys the read side: the projection needs no new READER, the
+native log needs no new WRITER.
+
+- **The projection (`<slug>/<sid>.jsonl`) rides the RENDERED layer unchanged** — `_archive_manifest`
+  enumerates every ledger slug's top-level `*.jsonl`, and a dsh session is in the usage ledger like
+  any other. The native log (`<slug>/<sid>/dsh/...`) is nested, so it is NOT mistaken for a rendered
+  transcript.
+- **The native event log rides the RAW layer unchanged** because it is placed under the project-slug
+  session dir at **`<slug>/<sid>/dsh/`** (`DSH_STORE_DIRNAME`), which `_session_files` already walks.
+  This RECONCILES the [B] design-of-record (`docs/dsh-session-lifecycle.md`), which proposed the
+  worktree's `.dsh/` — a location the raw layer reaches into for nothing (it excludes the worktree on
+  purpose; those bytes are what prune/delete key on). The launcher (XERK-466) MUST write the store
+  here, not in the worktree, or D3's canonical record is retained by nothing.
+- **dsh's "raw" bytes are its append-only event log, not its SQLite.** The raw cursor ships bytes
+  past an offset — right for an event-sourced JSONL stream, wrong for a page-mutating DB. The SQLite
+  is a derived index dsh rebuilds from the log, so it is not the archived artifact and must not land
+  under `<sid>/dsh/`.
+- **Resume/migration de-dup is free**: a resumed dsh session appends to the same native log under the
+  same pinned id, so the per-file cursor ships only the tail — the same property a resumed Claude
+  transcript has, and what a migration relies on (same id, byte-identical prefix).
+- **Migration ([K]) is the one thing NOT free yet.** `_pack_bytes` packs `<tid>.jsonl` +
+  `<tid>/subagents/` + `<tid>/workflows/` by name, not the whole `<tid>/` subtree, so [K] adds a
+  single `tar.add(<tid>/dsh)` in that same convention — a one-liner precisely because the store lives
+  in this subtree. Flagged out of scope for [B] v1 already.
+- **No beat-loop budget regression**: archive sync stays on the sync worker (XERK-395); [E] adds no
+  code to the beat or the archive functions, only the store-dir contract. Tests: `TestDshArchiveSync`
+  (agent), and the existing `TestArchiveSyncWorker` / `TestBeatLoopBudget`.
+
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
 1. **Image + resource + retention sizing.** Is growing the agent image with dsh's node/npm tree

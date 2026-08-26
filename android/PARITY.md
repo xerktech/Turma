@@ -353,6 +353,22 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   it whatever the source): the agent drops `--model` for a local session itself, and the alias is
   what that session goes back to if it is later switched to the subscription, so discarding it
   would give an Android-spawned session a different model from a web-spawned one.
+- **XERK-489 — the endpoint's DISCOVERED models are a live dropdown, per session.** Where the host
+  reports a `localModel.models` list, the chat bar's fixed local-model chip becomes a menu (each
+  "id · 128k") posting the chosen endpoint id to `.../sessions/<id>/model`, and the spawn composer
+  reveals a "Self-hosted model" dropdown under "Run against: local" carrying `localModel` on the
+  spawn. With no discovered list (an older agent, or the discovery worker's first pass not yet
+  landed) it falls back to the fixed label. `core/ModelSource.kt` gains
+  `localModels`/`localOptions`/`currentLocalModel`/`servedContextFor`/`currentLocalContext`/`fmtCtx`/
+  `localModelLabel` (`ModelSourceTest.kt`); `LocalModelInfo` gains `models`/`defaultModel` and
+  `SessionInfo` gains `localModelName`/`localModelContext` (`AgentDecodeTest.kt`); the chip and
+  composer are pinned in `ChatModelChipsTest.kt` / `SpawnComposerTest.kt`.
+  - **Deferred (web-only for now): the ADVANCED context-window override.** The web chat footer and
+    spawn composer let an operator SHRINK a local session's `CLAUDE_CODE_MAX_CONTEXT_TOKENS` below
+    the served window (a number field, clamped agent-side). Android auto-applies the model's served
+    window (the common LiteLLM case) but has no shrink field yet. The wire + agent plumbing already
+    carries it (`/model {context}`, spawn `localContext`), so this is a UI-only follow-up; a phone
+    rarely needs to hand-tune a context window.
 - The memo lives in `AppContainer.modelSwitches`, not the chat ViewModel, for the same reason
   `drafts` does — the VM is scoped to the chat's nav entry, so a memo kept there died the moment
   you walked back to the session list, mid-switch, which is when it is doing its job.

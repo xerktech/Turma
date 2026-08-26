@@ -414,6 +414,31 @@ ARCHIVE_RAW_COMPONENT_MAX = 255
 ARCHIVE_RAW_REL_DEPTH_MAX = 10
 ARCHIVE_RAW_REL_LEN_MAX = 400
 
+# Where a dsh session's canonical native event log lives on disk (XERK-469,
+# [dsh][E]). It sits UNDER the project-slug session directory
+# (`<slug>/<sessionId>/dsh/`), NOT in the worktree, precisely so it rides the
+# raw archive layer with no new code: `_session_files` walks `<tid>/**`, the same
+# way it carries subagents/, workflows/ and tool-results/. D3's retention
+# obligation (`.claude/rules/dsh.md`) is that the native, event-sourced log is
+# kept in full for metrics/resume/migration; that is only true if it is archived,
+# and the raw layer archives the project-slug tree, never the worktree (worktree
+# contents are what prune/delete key on and the raw layer excludes on purpose).
+# This RECONCILES the [B] design-of-record (docs/dsh-session-lifecycle.md), which
+# proposed the worktree — a location the raw archive reaches into for nothing.
+#
+# Migration ([K], a separate follow-up already flagged out of scope for [B] v1)
+# is the OTHER consumer of these bytes and is NOT free yet: `_pack_bytes` packs
+# `<tid>.jsonl` + `<tid>/subagents/` + `<tid>/workflows/` by name, not the whole
+# `<tid>/` subtree, so [K] adds one `tar.add(<tid>/dsh)` in the same convention.
+# Placing the store here is what makes that a one-liner rather than a new path.
+#
+# Only APPEND-ONLY files belong here. The raw layer's per-file cursor ships new
+# bytes past a byte offset, which is correct for an event-sourced JSONL log and
+# WRONG for a page-mutating SQLite index (an in-place rewrite leaves the archived
+# early bytes stale). dsh's SQLite is a derived index it rebuilds from the log,
+# so it is not the archived artifact and must not be written into this dir.
+DSH_STORE_DIRNAME = "dsh"
+
 
 def _archivable_rel(rel):
     """Whether the hub's allowlist can name this session-relative path."""
@@ -1062,14 +1087,30 @@ DSH_BIN = os.environ.get("DSH_BIN", "dsh")
 DSH_IDENT_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
 
 
-def _dsh_cordis_patch(provider, model, base_url, api_key_env, context):
+def _dsh_cordis_patch(provider, model, base_url, api_key_env, context,
+                      guard_config=None):
     """The profile's cordis.patch.yml: the driver-plugin entry, a hand-declared
     pi-ai provider route (dsh has no Claude failover — this route is the whole
-    model story, D5), and an agent-default-model fallback. `base_url` and
-    `api_key_env` place NO secret on disk — the credential rides the named env
-    var. `provider`/`model` are charset-validated by the caller before reaching
-    here. Mirrors poc/turma-2.0-poc/test-real-dsh.sh's proven patch."""
-    return (
+    model story, D5), an agent-default-model fallback, and — when `guard_config`
+    is given — the `@turma/dsh-guard` safety guard (XERK-470 [F]), the dsh
+    equivalent of the Claude `--settings` guard the launcher MUST compose.
+    `base_url`/`api_key_env` place NO secret on disk — the credential rides the
+    named env var. `provider`/`model` are charset-validated by the caller.
+    Mirrors poc/turma-2.0-poc/test-real-dsh.sh's proven patch."""
+    guard = ""
+    if guard_config is not None:
+        # The safety guard (XERK-470 [F]) is INSERTed via the patch, not a bundle:
+        # its package declares no `dsh.bundle`, so it cannot go in
+        # dsh.profile.bundles (a `- id:` alone is a MODIFY and warns "entry not
+        # found"). Config is host-fixed; emit as JSON (valid YAML) so nested
+        # arrays need no hand-formatting.
+        guard = (
+            "- insert:\n"
+            "    - id: turma-dsh-guard\n"
+            "      name: '@turma/dsh-guard'\n"
+            f"      config: {json.dumps(guard_config)}\n"
+        )
+    return guard + (
         "# Written by hub-agent.py (_ensure_dsh_profile) — loads the Turma driver\n"
         "# plugin and points dsh's model selector at an OpenAI-compatible gateway.\n"
         "- id: turma-dsh-session-driver\n"
@@ -1374,6 +1415,141 @@ def resolve_agent_type(agent_type):
     if agent_type == "dsh" and not dsh_configured():
         raise ValueError("dsh runtime not available on this host")
     return agent_type
+
+
+# ---- dsh session liveness / control socket (XERK-468 [D]) -------------------
+#
+# A dsh session runs HEADLESS (docs/dsh-session-lifecycle.md, XERK-466 [B]):
+# there is no Claude-style TUI pane to scrape, so `paneBusy` — the "is its own
+# turn running" signal every working/ready mirror keys on — cannot come from
+# `_pane_status`. It comes instead from the dsh driver plugin's control socket,
+# whose `state` event/ack reports status running|idle. (The S1 projection
+# carries the DISPLAY stream; the socket carries control + liveness only, and
+# liveness is deliberately NOT in the projection — a long dsh tool call emits no
+# transcript entry for minutes, so transcript-freshness would read it idle,
+# exactly the false-idle paneBusy's "esc to interrupt" was invented to avoid.)
+#
+# [D] reuses the EXISTING `paneBusy` wire field rather than adding a dsh-only
+# one, so every downstream mirror (sessionWorking, liveState, the five
+# readyForReview mirrors, the ready-for-review alert, summaries) is UNCHANGED
+# and cannot drift — the same reason S1 projects into the one transcript shape
+# instead of teaching every client a second one. So the whole dsh liveness
+# change lives HERE, agent-side: `session_report` sources paneBusy from the
+# cached dsh status for a dsh session, and nothing on the wire or in any client
+# learns a new field.
+#
+# The PRODUCER of that status — the persistent per-session socket connection
+# that streams `state`/`interaction` events — is the launcher's (XERK-466
+# implementation phase, gated on standing up real dsh in the image). [D] owns
+# the CONSUMER: the one-shot protocol helper (`dsh_query_state`), the ingest
+# seam (`_ingest_dsh_event`) the launcher's reader forwards each event to, the
+# in-memory cache `session_report` reads OFF the beat, and the paneBusy mapping.
+# Reading the socket is off-beat by construction (the beat only ever reads the
+# cache), so a wedged plugin can never stall the heartbeat past OFFLINE_AFTER_MS
+# (the XERK-395 rule).
+
+DSH_SOCK_DIR = os.path.join(REGISTRY_DIR, "dsh")
+# The one-shot `state` query's socket timeout. Off the beat (the launcher/poller
+# calls it, never `session_report`), so this bounds the POLLER, not the
+# heartbeat — kept short so an off-beat refresh across many sessions can't add
+# up, and so a wedged plugin costs at most this per query.
+DSH_STATE_QUERY_TIMEOUT_SEC = 2.0
+# A control-socket line is a small status object; this bounds a malformed or
+# hostile plugin flooding one unterminated line into an unbounded read.
+DSH_SOCK_LINE_MAX = 64 * 1024
+
+
+def dsh_sock_path(sid):
+    """The per-session control socket path (docs/dsh-session-lifecycle.md).
+    Under the agent-owned ~/.turma the guard already governs — NEVER a worktree,
+    where prune/delete key on the uncommitted work a socket would look like."""
+    return os.path.join(DSH_SOCK_DIR, f"{sid}.sock")
+
+
+def parse_dsh_state(obj):
+    """Normalize a dsh control-socket `state` ack/event into
+    {"status": "running"|"idle"|None, "eventCount": int|None,
+     "pendingInteraction": bool}, or None when it carries no usable status.
+
+    Tolerant of a malformed object: the peer is an in-container plugin, but a
+    liveness read must never crash a caller (it runs behind the beat), so an
+    unknown status is None, a non-int/negative eventCount is None, and
+    pendingInteraction defaults False. A bool is not an int here (True/False
+    are ints in Python, so the explicit guard is load-bearing)."""
+    if not isinstance(obj, dict):
+        return None
+    status = obj.get("status")
+    status = status if status in ("running", "idle") else None
+    ec = obj.get("eventCount")
+    if isinstance(ec, bool) or not isinstance(ec, int) or ec < 0:
+        ec = None
+    return {
+        "status": status,
+        "eventCount": ec,
+        "pendingInteraction": obj.get("pendingInteraction") is True,
+    }
+
+
+def dsh_query_state(sock_path, timeout=DSH_STATE_QUERY_TIMEOUT_SEC):
+    """One-shot liveness snapshot over the control socket: connect, send
+    {"op":"state"}, read one line-delimited JSON reply, return `parse_dsh_state`
+    of it (or None on ANY failure — no socket, refused, timeout, malformed).
+
+    This is the OFF-BEAT primitive the launcher's reader/poller uses to seed the
+    cache `session_report` reads; it does socket I/O and so must never be called
+    on the heartbeat path (XERK-395). The `state` op is acked with the snapshot
+    inline, so either the ack shape ({"ok":true,"status":...}) or a bare state
+    object parses the same way."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(sock_path)
+            s.sendall(b'{"op":"state"}\n')
+            buf = bytearray()
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > DSH_SOCK_LINE_MAX:
+                    return None
+    except (OSError, socket.timeout):
+        return None
+    line = bytes(buf).split(b"\n", 1)[0]
+    try:
+        obj = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return parse_dsh_state(obj)
+
+
+def dsh_pane_busy(status):
+    """Map a cached dsh status snapshot onto the paneBusy tri-state every
+    working/ready mirror reads: running -> True, idle -> False, and
+    unknown/missing -> None ("can't tell", so the mirrors fall back exactly as
+    they do for a Claude session whose pane could not be captured).
+
+    A pending interaction reads as NOT working (False), like a Claude
+    `panePrompt` that suppresses the busy hint: the session is blocked on a
+    human, not running its own turn — and the interaction itself surfaces as a
+    `question` through the AskUserQuestion bridge (that half is [C], XERK-467),
+    which is what leads it into Ready-for-review.
+
+    Deliberately NOT time-expired: a long dsh tool call emits no status edge for
+    minutes, so expiring a stale "running" by age would reintroduce the very
+    transcript-freshness false-idle the socket signal exists to avoid. The
+    producer clears the status to unknown on socket disconnect, and the
+    host-offline gate zeroes it when the host dies; neither is this map's job."""
+    if not isinstance(status, dict):
+        return None
+    if status.get("pendingInteraction"):
+        return False
+    st = status.get("status")
+    if st == "running":
+        return True
+    if st == "idle":
+        return False
+    return None
 
 
 def _messages_api_base(url):
@@ -2144,6 +2320,134 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
         # wants no peer messages can still say `refuse` in its own project
         # settings, which outranks this.
         "crossSessionInbound": "accept",
+    }
+
+
+# --- dsh safety guard (the "--settings equivalent" for the dsh runtime) -------
+#
+# dsh (XERK-460) is a SECOND agent runtime. It has no `--settings` file and no
+# external PreToolUse hook process: it gates tool calls INSIDE the agent process
+# through `ctx.tools` (see `agent/dsh/guard/` and `.claude/rules/dsh-guard.md`).
+# So the dsh equivalent of `build_guard_settings()` is not a settings dict claude
+# reads — it is the config the `@turma/dsh-guard` cordis plugin receives when the
+# dsh session driver (XERK-466 [B]) composes it, PLUS the two profile pins
+# (sandbox mode + approval policy) the guard composes on top of.
+#
+# The deny POLICY is NOT re-derived here. `build_dsh_guard_config()` reads the
+# SAME rule set `build_guard_settings()` produces and hands the guard the two
+# hook SCRIPT paths, so both runtimes deny by one policy that lives in one place.
+
+# dsh's file sandbox mode pinned for every Turma dsh session: writes are confined
+# to the session workspace (the worktree), the dsh analogue of a Claude session
+# running in its worktree. `danger-full-access` would remove that confinement;
+# `read-only` would stop ordinary dev work.
+DSH_SANDBOX_MODE = "workspace-write"
+
+# dsh's approval policy pinned for every Turma dsh session: `ask` delegates an
+# escalation to the composed answerer (the control-socket bridge, [C] XERK-467)
+# and FAILS CLOSED to a denial when none is composed — never a silent allow.
+# `never` would auto-reject every escalation without ever reaching the operator.
+DSH_APPROVAL_POLICY = "ask"
+
+# Per-call budget for the guard.py/fileguard.py subprocess the dsh guard shells
+# out to, mirrored into the plugin config as `hookTimeoutMs`.
+DSH_GUARD_HOOK_TIMEOUT_MS = 5000
+
+
+def dsh_guard_plugin_path():
+    """Absolute path to the `@turma/dsh-guard` cordis plugin, resolved both in
+    the repo (``agent/dsh/guard``) and in the image, since the guard sits in a
+    ``dsh/guard/`` dir next to this file in both layouts (like the hooks)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsh", "guard")
+
+
+def _parse_perm_rule(rule):
+    """Turn one Claude ``Read(P)``/``Edit(P)`` permission rule into
+    ``('read'|'write', <absolute path glob>)`` for the dsh guard, or ``None`` for
+    a bare tool rule (e.g. ``ListAgents``) that names no path.
+
+    Two quirks of ``build_guard_settings()``'s Claude-specific formatting are
+    undone so the glob reads as an ordinary absolute path the dsh guard resolves
+    itself: `runtime_code_deny_rules` emits a DOUBLED leading slash (Claude reads
+    a single `/` relative to the settings-file dir) and glob-escapes metacharacters
+    with a backslash (`_glob_literal`). The dsh guard does its own matching against
+    a realpath'd target, so both are reversed here."""
+    m = re.match(r"^(Read|Edit)\((.*)\)$", rule.strip())
+    if not m:
+        return None
+    op = "read" if m.group(1) == "Read" else "write"
+    p = m.group(2)
+    p = re.sub(r"\\(.)", r"\1", p)          # undo _glob_literal's backslash escapes
+    if p.startswith("~"):
+        p = os.path.expanduser(p)
+    p = re.sub(r"^/{2,}", "/", p)           # collapse the Claude-relative // anchor
+    return (op, p)
+
+
+def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None,
+                           local_settings_path=None):
+    """Build the config a Turma dsh session launches with — the dsh analogue of
+    ``build_guard_settings()``. Returns::
+
+        {
+          "plugin": { ... },        # passed to @turma/dsh-guard's apply(ctx, cfg)
+          "pluginPath": "...",      # where the driver composes it from
+          "sandboxMode": "workspace-write",
+          "approvalPolicy": "ask",
+        }
+
+    The `plugin` block carries the two hook script paths (guard.py / fileguard.py
+    — the shared deny policy) and the credential/roster path globs, DERIVED FROM
+    the same ``build_guard_settings()`` rule set so there is one policy, not two.
+    `sessionId` and `cwd` are filled in per-launch by the driver plugin, since
+    they are per-session.
+
+    The `sandboxMode`/`approvalPolicy` pins are what the driver writes into the
+    dsh profile so the guard composes over a fail-closed base: workspace-confined
+    writes + an approval seam that denies an unanswered escalation.
+    """
+    python_exe = python_exe or sys.executable or "python3"
+    guard_path = guard_path or guard_script_path()
+    fileguard_path = fileguard_path or fileguard_script_path()
+    settings = build_guard_settings(python_exe=python_exe, guard_path=guard_path,
+                                    local_settings_path=local_settings_path,
+                                    fileguard_path=fileguard_path)
+    perms = settings.get("permissions", {})
+    deny_write, deny_read, allow_read = [], [], []
+    for rule in perms.get("deny", []):
+        parsed = _parse_perm_rule(rule)
+        if parsed is None:
+            continue                        # bare tool rule (ListAgents) — dsh has no such tool
+        op, path_glob = parsed
+        (deny_write if op == "write" else deny_read).append(path_glob)
+    for rule in perms.get("allow", []):
+        parsed = _parse_perm_rule(rule)
+        if parsed is None:
+            continue
+        op, path_glob = parsed
+        if op == "read":
+            allow_read.append(path_glob)    # a write-allow can't override a deny (deny wins), so it is a no-op
+
+    plugin = {
+        "pythonExe": python_exe,
+        "guardScript": guard_path,
+        "fileguardScript": fileguard_path if os.path.exists(fileguard_path) else None,
+        "denyWrite": deny_write,
+        "denyRead": deny_read,
+        # `~/.turma/uploads/**` is already in here from _GUARD_ALLOW_PATH_RULES, so
+        # a staged attachment under uploads/<sessionId>/ is readable with no
+        # approval prompt — the cross-child contract [C] (XERK-467) depends on.
+        "allowRead": allow_read,
+        "hookTimeoutMs": DSH_GUARD_HOOK_TIMEOUT_MS,
+    }
+    if plugin["fileguardScript"] is None:
+        log(f"dsh guard: fileguard hook missing at {fileguard_path}; ~/.claude "
+            f"is protected by write-deny globs only (see .claude/rules/dsh-guard.md)")
+    return {
+        "plugin": plugin,
+        "pluginPath": dsh_guard_plugin_path(),
+        "sandboxMode": DSH_SANDBOX_MODE,
+        "approvalPolicy": DSH_APPROVAL_POLICY,
     }
 
 
@@ -7382,7 +7686,7 @@ def _post_to_inbox(sock_path, pid, claude_sid, text):
 
 
 def session_report(workdir, state, tmux_name=None, session_id=None,
-                   claude_sid=None):
+                   claude_sid=None, agent_type=None, dsh_status=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
     state carries per-file byte offsets between beats so the PR-URL scan only
@@ -7399,7 +7703,18 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
-    pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
+    if agent_type == "dsh":
+        # A dsh session is HEADLESS — no Claude pane to scrape (XERK-468 [D]).
+        # paneBusy comes from the dsh control socket's cached `state`, reused as
+        # the same wire field so every working/ready mirror is unchanged; there
+        # is no mode footer or blocking-dialog pane to read either (mode is the
+        # spawn value, and an interaction surfaces via the question bridge, [C]).
+        # `dsh_status` is the off-beat cache the launcher's socket reader fills;
+        # None ("can't tell") falls back to transcript freshness downstream,
+        # exactly as an uncapturable Claude pane does.
+        pane_busy, mode_actual, pane_prompt = dsh_pane_busy(dsh_status), None, None
+    else:
+        pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
@@ -10829,6 +11144,12 @@ class SessionManager:
         # control socket, the dsh session's "working" signal for [D] (XERK-468).
         self.dsh_status = {}
         self.sess_state = {}                     # id -> session_report offsets
+        # id -> latest dsh control-socket liveness snapshot (XERK-468 [D]),
+        # {status, eventCount, pendingInteraction}. Filled off the beat by the
+        # launcher's per-session socket reader via _ingest_dsh_event; read on the
+        # beat by session_report to source a dsh session's paneBusy. Empty until
+        # the dsh launcher (XERK-466 impl) exists, so no current host is touched.
+        self.dsh_status = {}
         self.usage_cache = {}                    # id -> usage_report result
         self.slug_usage = {}                     # project slug -> {acc, offsets}
                                                  # persistent incremental usage fold,
@@ -12071,33 +12392,50 @@ class SessionManager:
                 log(f"dsh: could not scaffold profile under {DSH_HOME} "
                     f"(is dsh installed?): {(r.stderr or '').strip()[:200]}")
                 return None
-            # 2. Install the built driver plugin into the profile as a bundle.
+            # 2. Install the built driver plugin AND the safety guard (XERK-470
+            # [F]) into the profile as bundles. A dsh runtime without the guard
+            # is the not-shippable state [F] gates against, so the launcher MUST
+            # compose it — this is where.
+            guard_cfg = self._dsh_guard_config()
+            # Install BOTH local packages in ONE npm command: a second sequential
+            # `npm install <localdir>` drops the first's dependency entry, so the
+            # first bundle then fails to resolve ("cannot resolve profile bundle").
             r = subprocess.run(
-                ["npm", "install", "--no-audit", "--no-fund", DSH_PLUGIN_DIR],
-                cwd=profile_dir, env=env, capture_output=True, text=True, timeout=300)
+                ["npm", "install", "--no-audit", "--no-fund",
+                 DSH_PLUGIN_DIR, guard_cfg["pluginPath"]],
+                cwd=profile_dir, env=env, capture_output=True, text=True,
+                timeout=300)
             if r.returncode != 0:
-                log(f"dsh: installing the driver plugin failed: "
+                log(f"dsh: installing the driver + guard plugins failed: "
                     f"{(r.stderr or '').strip()[:200]}")
                 return None
-            # 3. Register it in dsh.profile.bundles (idempotent).
+            # 3. Register both in dsh.profile.bundles (idempotent).
             pkg_path = os.path.join(profile_dir, "package.json")
             with open(pkg_path, encoding="utf-8") as f:
                 pkg = json.load(f)
             bundles = (pkg.setdefault("dsh", {}).setdefault("profile", {})
                        .setdefault("bundles", []))
+            # The driver is a bundle (it declares dsh.bundle); the guard is NOT —
+            # it is INSERTed via cordis.patch.yml (see _dsh_cordis_patch), so only
+            # the driver goes in dsh.profile.bundles.
+            changed = False
             if "@turma/dsh-session-driver" not in bundles:
                 bundles.append("@turma/dsh-session-driver")
+                changed = True
+            if changed:
                 with open(pkg_path, "w", encoding="utf-8") as f:
                     json.dump(pkg, f, indent=2)
                     f.write("\n")
-            # 4. Write the profile patch (driver entry + pi-ai route + default).
+            # 4. Write the profile patch (driver entry + pi-ai route + default +
+            # the guard, configured with the host-fixed deny/allow policy).
             base_url = DSH_MODEL_BASE_URL.rstrip("/")
             if not base_url.endswith("/v1"):
                 base_url += "/v1"
             with open(os.path.join(profile_dir, "cordis.patch.yml"), "w",
                       encoding="utf-8") as f:
                 f.write(_dsh_cordis_patch(DSH_PROVIDER, DSH_MODEL, base_url,
-                                          DSH_MODEL_API_KEY_ENV, DSH_MODEL_CONTEXT))
+                                          DSH_MODEL_API_KEY_ENV, DSH_MODEL_CONTEXT,
+                                          guard_config=guard_cfg["plugin"]))
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             log(f"dsh: profile preparation failed: {e}")
             return None
@@ -12151,16 +12489,21 @@ class SessionManager:
             claude_sid = str(uuid.uuid4())
         sess["claudeSessionId"] = claude_sid
         self._remember_ticket(sess)
-        # 2. Paths. The native event log + dsh persistence live under the
-        # worktree's .dsh/ (so they go with the worktree on delete and ride the
-        # raw archive, D3); the control socket + its env file under ~/.turma.
-        dsh_dir = os.path.join(worktree, ".dsh")
-        events_path = os.path.join(dsh_dir, "events.jsonl")
-        sysprompt_path = os.path.join(dsh_dir, "system-prompt.txt")
+        # 2. Paths. The native event log (D3's canonical record) lives UNDER the
+        # project-slug session dir at <tid>/dsh/ (DSH_STORE_DIRNAME), NOT the
+        # worktree: the raw archive layer (XERK-469 [E]) EXCLUDES the worktree, so
+        # a log there would be retained by nothing — placed here it rides the raw
+        # walk as a sidecar like subagents/. tid == the pinned claude_sid.
+        # Transient per-session files (read once, or carrying the key) live under
+        # the agent-owned ~/.turma, never the worktree; the control socket too.
+        store_dir = os.path.join(PROJECTS_ROOT, _project_slug(worktree),
+                                 claude_sid, DSH_STORE_DIRNAME)
+        events_path = os.path.join(store_dir, "events.jsonl")
+        sysprompt_path = os.path.join(DSH_SOCKET_DIR, f"{sid}-prompt.txt")
         sock_path = os.path.join(DSH_SOCKET_DIR, f"{sid}.sock")
         env_file = os.path.join(DSH_SOCKET_DIR, f"{sid}.env")
         try:
-            os.makedirs(dsh_dir, exist_ok=True)
+            os.makedirs(store_dir, exist_ok=True)
             os.makedirs(DSH_SOCKET_DIR, exist_ok=True)
         except OSError as e:
             raise RuntimeError(f"dsh session dirs: {e}")
@@ -12197,6 +12540,7 @@ class SessionManager:
         # discipline as the local-model credential (/proc/<pid>/cmdline is
         # world-readable). The model API key referenced by DSH_MODEL_API_KEY_ENV
         # must reach dsh's env; only ids and file paths ever hit a command line.
+        guard_cfg = self._dsh_guard_config()
         env_map = {
             "DSH_HOME": DSH_HOME,
             "TURMA_DSH_SESSION_ID": claude_sid,
@@ -12205,6 +12549,12 @@ class SessionManager:
             "TURMA_DSH_EVENTS": events_path,
             "TURMA_DSH_PROVIDER": DSH_PROVIDER,
             "TURMA_DSH_MODEL": sess.get("model") or DSH_MODEL,
+            # The per-session guard pins (XERK-470 [F]) the driver applies at
+            # agent creation — approvals must ASK (so [C]'s answerer is called)
+            # and writes confine to the worktree. The composed @turma/dsh-guard
+            # plugin carries the monotonic denies; these are additional.
+            "TURMA_DSH_APPROVAL_POLICY": guard_cfg["approvalPolicy"],
+            "TURMA_DSH_SANDBOX_MODE": guard_cfg["sandboxMode"],
         }
         if sysprompt_path:
             env_map["TURMA_DSH_SYSTEM_PROMPT_FILE"] = sysprompt_path
@@ -12259,6 +12609,21 @@ class SessionManager:
         if prompt and not resume:
             ctl.input(prompt, kind="user")
             tail.poke()
+
+    def _dsh_guard_config(self):
+        """The dsh safety-guard config for this host (XERK-470), memoized on the
+        manager like ``_ensure_guard_settings`` — the dsh analogue of the Claude
+        ``--settings`` file, minus the per-session `sessionId`/`cwd` the driver
+        fills in at launch. Content is host-fixed (hook paths, interpreter, the
+        credential globs, the operator's snapshotted local perms), so it is built
+        once and reused. See ``build_dsh_guard_config`` / ``.claude/rules/dsh-guard.md``.
+        Consumed by _ensure_dsh_profile (composes @turma/dsh-guard into the profile
+        + pins sandbox/approval) — the guard seam XERK-470 requires the launcher to wire."""
+        cached = getattr(self, "_dsh_guard_config_cache", None)
+        if cached is None:
+            cached = build_dsh_guard_config()
+            self._dsh_guard_config_cache = cached
+        return cached
 
     def _launch_tmux(self, sess, resume=False, prompt=None, resume_id=None):
         """(Re)launch claude for a session inside its own tmux, detached.
@@ -12609,7 +12974,8 @@ class SessionManager:
         # per session id. The plugin unlinks the socket on a clean exit, but a hard
         # _kill_tmux may leave it — remove both here. Best-effort.
         for p in (os.path.join(DSH_SOCKET_DIR, f"{sid}.sock"),
-                  os.path.join(DSH_SOCKET_DIR, f"{sid}.env")):
+                  os.path.join(DSH_SOCKET_DIR, f"{sid}.env"),
+                  os.path.join(DSH_SOCKET_DIR, f"{sid}-prompt.txt")):
             try:
                 os.remove(p)
             except OSError:
@@ -12621,6 +12987,7 @@ class SessionManager:
         # there). Never sends the socket kill — that is the explicit callers' job.
         self._teardown_dsh(sid)
         self.sess_state.pop(sid, None)
+        self.dsh_status.pop(sid, None)  # dsh liveness dies with the session (XERK-468)
         self.usage_cache.pop(sid, None)
         # Not slug_usage: the transcript survives kill/delete and still counts
         # toward the persistent per-repo/host usage. It's keyed by slug (not
@@ -12643,7 +13010,8 @@ class SessionManager:
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
               model=None, permission_mode=None, ticket=None, ticket_detail=None,
               cmd_id=None, await_clone=None, await_clone_owner=None,
-              model_source=None, local_model=None, agent_type=None):
+              model_source=None, local_model=None, local_context=None,
+              agent_type=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -12810,6 +13178,11 @@ class SessionManager:
                     raise ValueError(
                         f"local model {local_model!r} is not served by this host")
                 sess["localModelName"] = local_model
+                # Optional context override (XERK-489), clamped to the served
+                # window at launch (shrink-only). Only stored when it's a
+                # positive int; junk falls back to the served figure.
+                if isinstance(local_context, int) and local_context > 0:
+                    sess["localModelContext"] = local_context
         except Exception as e:
             self._set_error(sess, e)
             return
@@ -13869,6 +14242,7 @@ class SessionManager:
             self._teardown_dsh(sid, kill=True)  # dsh: dispose the old agent + drop its socket/tail
             self._kill_tmux(sess)          # ends the current claude
             self.sess_state.pop(sid, None)  # fresh freshness/PR tracking
+            self.dsh_status.pop(sid, None)  # restart-clear-context = a fresh dsh agent (XERK-468)
             self._clear_question_files(sid)  # drop any question the old claude was blocked on
             # A message queued for the pre-restart conversation is contextually
             # gone with it — never re-inject it into the fresh one (XERK-47).
@@ -13885,17 +14259,24 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def _switch_local_model(self, sess, model):
-        """Change which self-hosted model a RUNNING local session uses (XERK-489),
-        keeping its conversation.
+    def _switch_local_model(self, sess, model, context=None):
+        """Change which self-hosted model (and optionally the context WINDOW) a
+        RUNNING local session uses (XERK-489), keeping its conversation.
 
-        Rewrite local-model.env with the new model + its served window and
-        relaunch via `--resume` — the exact machinery of a source switch, minus
-        the source change. Membership is validated before the gateway ever sees
-        it, on top of the charset gate; a model the host does not serve errors
-        the card rather than 403ing every turn silently. Reverts the record if
-        the relaunch throws, like set_model_source, so a stored model can never
-        outlive a launch that failed on it."""
+        Rewrite local-model.env with the new model + window and relaunch via
+        `--resume` — the exact machinery of a source switch, minus the source
+        change. Membership is validated before the gateway ever sees it, on top
+        of the charset gate; a model the host does not serve errors the card
+        rather than 403ing every turn silently. Reverts the record if the
+        relaunch throws, like set_model_source, so a stored model can never
+        outlive a launch that failed on it.
+
+        `context` is the operator's advanced override — it may only SHRINK the
+        served window (CLAUDE_CODE_MAX_CONTEXT_TOKENS overstated makes claude
+        compact too late and the tail truncate), so it is clamped to
+        local_model_context(model); a bad/absent value takes the served figure.
+        A context-only change (same model) still relaunches, because the window
+        is an env var read at launch."""
         if not sess or sess.get("status") != "running":
             return
         if not local_model_configured():
@@ -13906,12 +14287,16 @@ class SessionManager:
             self._set_error(sess, ValueError(
                 f"local model {model!r} is not served by this host"))
             return
-        if sess.get("localModelName") == model:
-            return                                  # already there; no relaunch
+        served = local_model_context(model)
+        new_ctx = (context if isinstance(context, int) and 0 < context <= served
+                   else served)
+        if (sess.get("localModelName") == model
+                and sess.get("localModelContext") == new_ctx):
+            return                                  # nothing changed; no relaunch
         prev_model = sess.get("localModelName")
         prev_ctx = sess.get("localModelContext")
         sess["localModelName"] = model
-        sess["localModelContext"] = local_model_context(model)
+        sess["localModelContext"] = new_ctx
         sess.pop("pendingModel", None)
         try:
             self._kill_tmux(sess)
@@ -13921,7 +14306,8 @@ class SessionManager:
             sess["errorMsg"] = None
             sess["restartCount"] = sess.get("restartCount", 0) + 1
             sess["modelSourceAt"] = now_iso()
-            log(f"session {sess['id']} switched local model -> {model}")
+            log(f"session {sess['id']} switched local model -> {model} "
+                f"(context {new_ctx})")
         except Exception as e:
             sess["localModelName"] = prev_model
             sess["localModelContext"] = prev_ctx
@@ -14577,10 +14963,14 @@ class SessionManager:
         log(f"renamed session {sid} -> {name!r}" if name
             else f"cleared name of session {sid}")
 
-    def set_model(self, sid, model):
+    def set_model(self, sid, model, context=None):
         """Switch a running session's model live — for THIS SESSION ONLY — by
         driving Claude Code's /model picker: open it, arrow to the chosen row,
         and press `s` ("use this session only").
+
+        `context` (XERK-489) is the advanced context-window override, honoured
+        ONLY for a local session (a subscription session's window is fixed by
+        Claude Code); it is passed through to _switch_local_model.
 
         It used to type `/model <name>`, which looks equivalent and isn't: the
         argument form ALSO saves the pick as the login-wide default for new
@@ -14610,7 +15000,7 @@ class SessionManager:
         # relaunch via --resume rather than driving the TUI. The picker stays
         # refused for local (there is no Claude row that would work).
         if sess_early and sess_early.get("modelSource") == "local":
-            self._switch_local_model(sess_early, model)
+            self._switch_local_model(sess_early, model, context)
             return
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
@@ -14842,6 +15232,52 @@ class SessionManager:
                 os.remove(path)
             except OSError:
                 pass
+
+    # ---- dsh liveness seam (XERK-468 [D]) -----------------------------------
+    #
+    # The launcher's per-session control-socket reader (XERK-466 impl, off the
+    # beat) forwards each streamed `state`/`interaction` line to
+    # `_ingest_dsh_event`, and clears the cache with `_set_dsh_status(sid, None)`
+    # when the socket disconnects (so a dropped connection reads as "can't tell",
+    # not a frozen "running"). `refresh_dsh_status` is the off-beat one-shot a
+    # poller can use instead. `session_report` only ever READS the cache these
+    # fill, so the heartbeat never does socket I/O (XERK-395).
+
+    def _set_dsh_status(self, sid, snap):
+        """Store a session's latest dsh liveness snapshot (or None to mark it
+        unknown)."""
+        if not sid:
+            return
+        if snap is None:
+            self.dsh_status.pop(sid, None)
+        else:
+            self.dsh_status[sid] = snap
+
+    def _ingest_dsh_event(self, sid, event):
+        """Fold one dsh control-socket event (docs/dsh-session-lifecycle.md) into
+        this session's state. Only the `state` event is [D]'s: it becomes the
+        cached liveness `session_report` maps to paneBusy. The `interaction`
+        event (surfacing a dsh approval/question as a pending `question`) is [C]'s
+        (XERK-467), which hooks its own handling here; [D] leaves it untouched so
+        the two seams don't collide. Tolerant of a malformed event."""
+        if not isinstance(event, dict) or not sid:
+            return
+        evt = event.get("evt") or event.get("op")
+        if evt == "state":
+            snap = parse_dsh_state(event)
+            # Only a USABLE status (running|idle) updates the cache — a malformed
+            # state event must not clobber a known-good "running" with "unknown".
+            # Clearing to unknown is _set_dsh_status(sid, None)'s job (disconnect).
+            if snap and snap["status"] is not None:
+                self._set_dsh_status(sid, snap)
+
+    def refresh_dsh_status(self, sid):
+        """Off-beat one-shot refresh of a dsh session's cached liveness from its
+        control socket, for the launcher/poller to call OFF the heartbeat path.
+        Returns the snapshot (or None)."""
+        snap = dsh_query_state(dsh_sock_path(sid))
+        self._set_dsh_status(sid, snap)
+        return snap
 
     def _tmux_alive(self, tmux_name):
         """Whether the session's claude tmux is still up. The claude process is
@@ -16279,7 +16715,12 @@ class SessionManager:
           <tid>/subagents/agent-x.jsonl      each delegated agent (+ its .meta.json)
           <tid>/workflows/wf_<run>.json      the workflow run records (XERK-304)
           <tid>/tool-results/<id>.txt        overflowed tool output
+          <tid>/dsh/...                      a dsh session's native event log (XERK-469)
           <tid>/...                          whatever Claude Code adds next
+
+        A dsh session's canonical native log (D3, `.claude/rules/dsh.md`) is
+        written under `<tid>/dsh/` for exactly this reason — placed here it is a
+        raw sidecar like any other and needs no special case (DSH_STORE_DIRNAME).
 
         Deliberately NOT filtered to `*.jsonl`: the point of the raw layer is that
         nobody has to have predicted what would be worth keeping, and the files
@@ -18366,6 +18807,7 @@ class SessionManager:
                         permission_mode=cmd.get("permissionMode"),
                         model_source=cmd.get("modelSource"),
                         local_model=cmd.get("localModel"),
+                        local_context=cmd.get("localContext"),
                         agent_type=cmd.get("agentType"),
                         cmd_id=cid,
                     )
@@ -18398,7 +18840,8 @@ class SessionManager:
                 elif ctype == "setSummary":
                     self.set_summary(cmd.get("sessionId"), cmd.get("summary"))
                 elif ctype == "setModel":
-                    self.set_model(cmd.get("sessionId"), cmd.get("model"))
+                    self.set_model(cmd.get("sessionId"), cmd.get("model"),
+                                   context=cmd.get("localContext"))
                 elif ctype == "setMode":
                     self.set_mode(cmd.get("sessionId"), cmd.get("permissionMode"))
                 elif ctype == "setModelSource":
@@ -18891,7 +19334,9 @@ class SessionManager:
                 st = self.sess_state.setdefault(sid, {})
                 signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"),
                                          session_id=sess.get("id"),
-                                         claude_sid=sess.get("claudeSessionId"))
+                                         claude_sid=sess.get("claudeSessionId"),
+                                         agent_type=sess.get("agentType"),
+                                         dsh_status=self.dsh_status.get(sid))
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]

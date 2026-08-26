@@ -1644,16 +1644,10 @@
             menuHtml(modelSourceOpts(), currentModelSource(), "data-source") + "</span></span>"
           : "") +
         (currentModelSource() === "local"
-          // A local session's model is fixed by the host's configuration. Every
-          // row the picker could offer is a Claude alias the gateway refuses —
-          // "Default" included, since it resolves to the login default — so the
-          // chip states the model instead of offering a menu that only breaks it.
-          ? '<span class="cc-opt cc-model cc-model-fixed">' +
-            '<span class="cc-btn" title="' +
-            esc("Fixed by this host's self-hosted model configuration. " +
-                "Switch back to the subscription to choose a Claude model.") + '">' +
-            '<span class="cc-val">' + esc(localModelInfo().model || "local model") +
-            "</span> 🧠</span></span>"
+          // A local session's model is one of the ENDPOINT's discovered models
+          // (XERK-489): a live dropdown, not a fixed label. Selecting one applies
+          // its served context window; an advanced field can only shrink it.
+          ? localModelChipHtml()
           : '<span class="cc-opt cc-model">' +
             '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
             '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
@@ -1663,6 +1657,9 @@
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
     wireComposeMenu("ccSourceBtn", "ccSourceMenu", "data-source", setSessionModelSource);
+    wireComposeMenu("ccLocalModelBtn", "ccLocalModelMenu", "data-lmodel",
+      (v) => setSessionLocalModel(v));
+    wireLocalContext();
   }
   // ---- local-model failover (XERK-246) --------------------------------------
   // Running out of Claude usage stops every session on a host at once. A session
@@ -1716,10 +1713,126 @@
     } catch { modelSourcePending = null; renderComposeOpts(); }
   }
 
+  // ---- endpoint model dropdown + context override (XERK-489) ---------------
+  // A local session is no longer pinned to one model: it picks from the ids the
+  // endpoint SERVES (localModel.models), switched live like the subscription
+  // model. Selecting one applies that model's served context window; an advanced
+  // field can only SHRINK it (an overstated CLAUDE_CODE_MAX_CONTEXT_TOKENS makes
+  // claude compact too late and the tail truncate).
+  const MAX_LOCAL_MODEL_CONTEXT = 2000000;   // mirrors the agent's cap
+  function localModels() {
+    const l = localModelInfo();
+    return Array.isArray(l.models) ? l.models : [];
+  }
+  function fmtCtx(n) {
+    if (!(typeof n === "number" && n > 0)) return "";
+    return n >= 1000 ? Math.round(n / 1000) + "k" : String(n);
+  }
+  // A just-picked local-model switch, held across the relaunch like the source
+  // memo — cleared once the heartbeat's localModelName agrees or it times out.
+  let localModelPending = null; // {value, at, sessionId}
+  const LOCAL_MODEL_SETTLE_MS = 60000;
+  function localModelMemoActive() {
+    return localModelPending && localModelPending.sessionId === sessionId &&
+      Date.now() - localModelPending.at < LOCAL_MODEL_SETTLE_MS;
+  }
+  function currentLocalModel() {
+    if (localModelMemoActive()) return localModelPending.value;
+    const l = localModelInfo();
+    return (sess && sess.localModelName) || l.defaultModel || l.model || "";
+  }
+  // The endpoint's served window for a model id, or null when it reports none
+  // (a bare OpenAI-compatible endpoint — the override field is then free-form).
+  function servedContextFor(id) {
+    const m = localModels().find((x) => x && x.id === id);
+    return m && typeof m.contextTokens === "number" ? m.contextTokens : null;
+  }
+  function currentLocalContext() {
+    const stored = sess && sess.localModelContext;
+    if (typeof stored === "number" && stored > 0) return stored;
+    return servedContextFor(currentLocalModel());
+  }
+  function localModelOpts() {
+    return localModels().map((m) => {
+      const k = fmtCtx(m && m.contextTokens);
+      return { value: m.id, label: (m && m.id) + (k ? " · " + k : "") };
+    });
+  }
+  // The whole local-model chip: a dropdown of the discovered models (each
+  // "id · 128k") plus an advanced context override. Degrades to a fixed label
+  // when the host reports local but no discovered list (an older agent, or the
+  // discovery worker's first pass not yet landed).
+  function localModelChipHtml() {
+    const models = localModels();
+    const cur = currentLocalModel();
+    if (!models.length) {
+      return '<span class="cc-opt cc-model cc-model-fixed">' +
+        '<span class="cc-btn" title="' +
+        esc("This host's self-hosted model. Its list has not been discovered yet.") + '">' +
+        '<span class="cc-val">' + esc(cur || "local model") + "</span> 🧠</span></span>";
+    }
+    const ctx = currentLocalContext();
+    const served = servedContextFor(cur);
+    const kLabel = fmtCtx(ctx);
+    const val = esc(cur || "local model") +
+      (kLabel ? ' <span class="cc-ctx">· ' + esc(kLabel) + "</span>" : "") +
+      (localModelMemoActive() ? "…" : "");
+    const cap = served || MAX_LOCAL_MODEL_CONTEXT;
+    const ctxRow =
+      '<div class="cc-ctx-adv"><label for="ccLocalCtx">Context ' +
+      (served ? "(max " + esc(fmtCtx(served)) + ")" : "(tokens)") + "</label>" +
+      '<span class="cc-ctx-in"><input type="number" id="ccLocalCtx" min="1" max="' + cap +
+      '" step="1024" value="' + (typeof ctx === "number" && ctx > 0 ? ctx : "") + '">' +
+      '<button id="ccLocalCtxApply" class="cc-apply">Apply</button></span></div>';
+    return '<span class="cc-opt cc-model cc-model-local">' +
+      '<button class="cc-btn" id="ccLocalModelBtn" title="' +
+      esc("Self-hosted model for this session — switched live, session-only. " +
+          "Selecting a model applies its context window; Advanced can shrink it.") + '">' +
+      '<span class="cc-val">' + val + '</span><span class="cc-caret">▾</span> 🧠</button>' +
+      '<span class="cc-menu" id="ccLocalModelMenu"><span class="cc-hint">Self-hosted model</span>' +
+      menuHtml(localModelOpts(), cur, "data-lmodel") +
+      '<span class="cc-sep"></span>' + ctxRow + "</span></span>";
+  }
+  // The context input lives INSIDE the menu popover, so its own clicks/keys must
+  // not bubble to the document listener that closes every menu.
+  function wireLocalContext() {
+    const input = $("ccLocalCtx"), apply = $("ccLocalCtxApply");
+    if (!input || !apply) return;
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") { e.preventDefault(); apply.click(); }
+    });
+    apply.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const v = parseInt(input.value, 10);
+      closeComposeMenus();
+      if (v > 0) setSessionLocalModel(currentLocalModel(), v);
+    });
+  }
+  async function setSessionLocalModel(value, context) {
+    if (!hostKey || !sessionId || !sess) return;
+    const sameModel = value === currentLocalModel();
+    const sameCtx = context == null || context === currentLocalContext();
+    if (sameModel && sameCtx) return;         // re-picking the showing value
+    localModelPending = { value, at: Date.now(), sessionId };
+    renderComposeOpts();
+    const body = { model: value };
+    if (typeof context === "number" && context > 0) body.context = context;
+    try {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      // A refusal (an unserved model, an agent too old) takes the memo back —
+      // left up, the chip names a model the session is NOT running (XERK-264).
+      if (!r.ok) { await hubRefused("Model switch", r); localModelPending = null; renderComposeOpts(); return; }
+      if (typeof fastPoll === "function") fastPoll();
+    } catch { localModelPending = null; renderComposeOpts(); }
+  }
+
   async function setSessionModel(value) {
     if (!hostKey || !sessionId || !sess || value === currentModelValue()) return;
-    // The agent refuses this for a local session (its model comes from the host
-    // configuration); don't send a request that only ever gets logged and dropped.
+    // The subscription-model picker path only; a LOCAL session uses the endpoint
+    // dropdown above (setSessionLocalModel), which posts an endpoint model id.
     if (currentModelSource() === "local") return;
     const prevModel = sess.model;
     modelSwitchPending = { value, prevActual: sess.modelActual || null, at: Date.now() };
@@ -2347,9 +2460,13 @@
     // pending source (🏠 on a subscription session) and its own switch click is
     // swallowed by the `value === currentModelSource()` early-return.
     if (!modelSourcePending || modelSourcePending.sessionId !== id) modelSourcePending = null;
+    // Same for the endpoint-model memo (XERK-489): drop a foreign session's, and
+    // retire ours once the heartbeat's localModelName agrees.
+    if (!localModelPending || localModelPending.sessionId !== id) localModelPending = null;
     hostKey = hk; sessionId = id; sess = s; agent = a;
     // The switch has landed once the host reports the source we asked for.
     if (modelSourcePending && s && s.modelSource === modelSourcePending.value) modelSourcePending = null;
+    if (localModelPending && s && s.localModelName === localModelPending.value) localModelPending = null;
     historyChain = false;   // a chain from the PREVIOUS session must not block this one
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; liveAgents = [];
     backoffIdx = 0;
@@ -2470,6 +2587,10 @@
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
       localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,
       setSessionModelSource,
+      // XERK-489 endpoint model dropdown + context override
+      localModels, localModelOpts, currentLocalModel, currentLocalContext,
+      servedContextFor, fmtCtx, localModelChipHtml, setSessionLocalModel,
+      __setLocalModelPending: (p) => { localModelPending = p; },
       __setModelSourcePending: (p) => { modelSourcePending = p; },
       __setModeSwitchPending: (p) => { modeSwitchPending = p; },
       __setQuestionActive: (v) => { questionActive = v; },

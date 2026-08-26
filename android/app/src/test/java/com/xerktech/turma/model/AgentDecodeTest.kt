@@ -152,6 +152,42 @@ class AgentDecodeTest {
         assertEquals("", resp.agents[2].sessions[0].agentType)
     }
 
+    // XERK-489: the discovered model list + defaultModel on the block, and the
+    // per-session localModelName/localModelContext. Both are typed now, so the
+    // hub coerces them (normalizeLocalModel / normalizeSessions) and this decode
+    // must accept the well-formed shape and the absent one.
+    @Test fun `the discovered local models and per-session pick decode`() {
+        val body = """
+            { "now": 1, "agents": [
+              { "key": "h", "device": "h", "online": true,
+                "localModel": { "available": true, "model": "gpt-oss:120b",
+                  "contextTokens": 120000, "defaultModel": "gpt-oss:120b",
+                  "models": [ { "id": "gpt-oss:120b", "contextTokens": 120000 },
+                              { "id": "qwen:32b", "contextTokens": null } ] },
+                "sessions": [ { "id": "s1", "modelSource": "local",
+                                "localModelName": "qwen:32b", "localModelContext": 16000 } ] },
+              { "key": "old", "device": "old", "online": true,
+                "localModel": { "available": true, "model": "m" },
+                "sessions": [ { "id": "s2", "modelSource": "local" } ] }
+            ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val h = resp.agents[0]
+        assertEquals("gpt-oss:120b", h.localModel?.defaultModel)
+        assertEquals(2, h.localModel?.models?.size)
+        assertEquals("qwen:32b", h.localModel?.models?.get(1)?.id)
+        assertNull(h.localModel?.models?.get(1)?.contextTokens)   // bare OpenAI
+        assertEquals("qwen:32b", h.sessions[0].localModelName)
+        assertEquals(16000, h.sessions[0].localModelContext)
+        // An older hub sends neither the list nor the per-session fields: they
+        // default (empty list / null), never throw.
+        val old = resp.agents[1]
+        assertEquals(emptyList<Any>(), old.localModel?.models)
+        assertNull(old.localModel?.defaultModel)
+        assertNull(old.sessions[0].localModelName)
+        assertNull(old.sessions[0].localModelContext)
+    }
+
     // What hub-agent actually emits for a session that never moved:
     // `_session_payload` sends `modelSourceAt: sess.get("modelSourceAt")`, i.e.
     // a JSON null, on EVERY such session. A non-nullable field would throw and

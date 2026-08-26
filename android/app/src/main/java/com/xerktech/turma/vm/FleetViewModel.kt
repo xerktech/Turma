@@ -113,11 +113,11 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun spawn(
         host: String, repo: String, prompt: String? = null, label: String? = null,
         baseRef: String? = null, model: String? = null, permissionMode: String? = null,
-        modelSource: String? = null, agentType: String? = null,
+        modelSource: String? = null, localModel: String? = null, agentType: String? = null,
     ) = run("session queued") {
         container.client.api.spawnSession(
             host,
-            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource, agentType),
+            spawnRequest(repo, prompt, label, baseRef, model, permissionMode, modelSource, localModel, agentType),
         )
     }
 
@@ -195,7 +195,7 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         fun spawnRequest(
             repo: String, prompt: String? = null, label: String? = null,
             baseRef: String? = null, model: String? = null, permissionMode: String? = null,
-            modelSource: String? = null, agentType: String? = null,
+            modelSource: String? = null, localModel: String? = null, agentType: String? = null,
         ) = SpawnRequest(
             repo = repo,
             prompt = prompt?.ifBlank { null },
@@ -207,6 +207,10 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             // Sent ONLY for dsh (XERK-460); "claude" is what a spawn already
             // meant, so a bare spawn stays byte-identical.
             agentType = Runtime.spawnValue(agentType),
+            // Only meaningful for a local spawn (XERK-489); blank -> null so a
+            // subscription spawn stays byte-identical to before.
+            localModel = if (ModelSource.spawnValue(modelSource) == ModelSource.LOCAL)
+                localModel?.ifBlank { null } else null,
         )
 
         /** The in-flight action kind for a session, or null (web sessPending). */

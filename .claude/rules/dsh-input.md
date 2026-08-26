@@ -78,6 +78,18 @@ the PLUGIN maps them to dsh's native answer — a question option LABEL, or an a
   rosterless deployment (tools live in the global host layer); in the `web` profile the mount is what
   delivers the tools. Because the async setup adds latency, the `input` op waits for the agent to be
   registered before `followup`, or the initial prompt races ahead and is dropped.
+- **The native event log lives under `<tid>/dsh/`, NOT the worktree** (XERK-469 [E]): the raw
+  archive layer excludes the worktree, so a log there is D3's canonical record retained by nothing.
+  `_launch_dsh` writes `TURMA_DSH_EVENTS` to `<PROJECTS_ROOT>/<slug>/<claude_sid>/dsh/events.jsonl`;
+  transient per-session files (env with the key, system-prompt) live under `~/.turma/dsh/`.
+- **Composing the guard: `- insert:`, not a bundle, and install BOTH plugins in ONE npm command**
+  (XERK-470 [F]). The guard package declares no `dsh.bundle`, so it CANNOT go in
+  `dsh.profile.bundles` (a bare `- id:` there fails "cannot resolve profile bundle"; in the patch a
+  bare `- id:` is a MODIFY and warns "entry not found") — it is `- insert:`ed via cordis.patch.yml,
+  installed in node_modules so the name resolves. A second sequential `npm install <localdir>` drops
+  the first's dependency, so the driver + guard install in one `npm install A B`. The launcher pins
+  `approval/policy: ask` + `sandbox/mode: workspace-write` per session via the DRIVER (they are
+  per-session runtime settings, set at agent creation from env), over the guard's monotonic deny.
 - **A DshControl callback must never call a send method.** `on_interaction`/`on_state`/
   `on_interaction_end` run on the reader thread; `input`/`answer`/`state`/`kill` block on an ack that
   the reader delivers, so calling one from a callback deadlocks. In hub-agent the answer is sent from
