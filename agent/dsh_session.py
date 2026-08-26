@@ -38,15 +38,25 @@ OFFLINE_AFTER_MS):
 
 import json
 import os
+import re
 import socket
 import threading
 import time
 
 try:
     # Imported as a sibling module by hub-agent.py (same dir on sys.path).
-    from dsh_transcript import DshProjector
+    from dsh_transcript import DshProjector, DshWorkflowRuns, workflow_run_id
 except ImportError:  # pragma: no cover - only when run outside the agent dir
     DshProjector = None
+    DshWorkflowRuns = None
+    workflow_run_id = None
+
+# A child (subagent / workflow-agent) native log filename validates as this — it
+# is the child's dsh SessionId, and it names both the file the DRIVER wrote under
+# `<store>/subagents/` and the projected `agent-<id>.jsonl` the pickers open. Kept
+# in step with hub-agent's VALID_WORKFLOW_AGENT_ID_RE (which validates the same id
+# arriving from a clicked row) so a child the tail files is one the reader accepts.
+_CHILD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # How long a single op waits for its ack before giving up. Short on purpose: a
@@ -67,6 +77,10 @@ DSH_LINE_MAX_BYTES = int(os.environ.get("DSH_LINE_MAX_BYTES", str(4 << 20)))
 # How often the projection tail wakes to look for new native events, when it is
 # not being poked. Cheap: it only reads bytes appended since its last offset.
 DSH_PROJECTION_POLL_SEC = float(os.environ.get("DSH_PROJECTION_POLL_SEC", "0.5"))
+# Cap on the childIds a tail remembers for the workflow-child reclaim (XERK-474
+# [J]): an ordinary subagent's id is never reclaimed, so the set is bounded here
+# rather than growing one entry per subagent over a long session.
+EMITTED_LAUNCHES_MAX = 256
 
 
 def _noop_log(_msg):
@@ -319,6 +333,9 @@ class DshProjectionTail:
         self.events_path = events_path
         self.transcript_path = transcript_path
         self._log = log or _noop_log
+        self._session_id = session_id
+        self._cwd = cwd
+        self._git_branch = git_branch
         self._proj = (DshProjector(session_id, cwd=cwd, git_branch=git_branch)
                       if DshProjector else None)
         self._offset = 0
@@ -326,6 +343,30 @@ class DshProjectionTail:
         self._stop = threading.Event()
         self._thread = None
         self._wake = threading.Event()
+        # --- delegation projection (XERK-474 [J]) ---------------------------
+        # The workflow accumulator folds the parent log's `tool-workflow/*` events
+        # into the per-run record/journal + the childId->run mapping; per-child
+        # native logs (written by the driver beside the parent log) are projected
+        # into the Claude-Code subagents/ layout hub-agent's pickers read.
+        self._wf = DshWorkflowRuns() if DshWorkflowRuns else None
+        # The driver writes each descendant session's raw events to
+        # `<store>/subagents/<childId>.jsonl`, a sibling of the parent's
+        # events.jsonl.
+        store_dir = os.path.dirname(events_path)
+        self._child_events_dir = os.path.join(store_dir, "subagents")
+        # Where the PROJECTED transcripts + run records land — the exact paths
+        # `_subagents_dir` / `_workflow_runs_dir` / `_workflow_run_record` derive
+        # from the main transcript, so what the tail writes is what the reader opens.
+        stem = (transcript_path[:-len(".jsonl")]
+                if transcript_path.endswith(".jsonl") else transcript_path)
+        self._subagents_dir = os.path.join(stem, "subagents")
+        self._wf_agents_dir = os.path.join(self._subagents_dir, "workflows")
+        self._wf_records_dir = os.path.join(stem, "workflows")
+        # Per-child tail state: childId -> {"proj","offset","partial","dest"}.
+        self._children = {}
+        # childIds we projected a top-level Agent launch for, so one later claimed
+        # by a workflow run can be retired (see _reclaim_if_workflow_child).
+        self._emitted_launches = set()
 
     def start(self):
         if self._proj is None:
@@ -393,15 +434,255 @@ class DshProjectionTail:
                 event = json.loads(line.decode("utf-8", "replace"))
             except ValueError:
                 continue
-            for entry in self._proj.feed(event):
-                entries.append(entry)
+            # Fold the workflow accumulator FIRST, so the childId->run mapping is
+            # up to date before a child log below is filed to its destination.
+            if self._wf is not None:
+                self._wf.feed(event)
+                # A child we ALREADY launched as a top-level Agent row has just
+                # been claimed by a workflow run (its `tool-workflow/agent-start`
+                # arrived AFTER its `turma/subagent-start` — the reversed order the
+                # driver's setImmediate makes unlikely but cannot rule out). Retire
+                # the phantom NOW: its own `turma/subagent-end` would be suppressed
+                # below as a workflow edge, so without this it would linger forever.
+                # This is what makes the tail an INDEPENDENT net, not merely a
+                # restatement of the file-order assumption.
+                entries.extend(self._reclaim_if_workflow_child(event))
+            # An ORDINARY subagent's end retires it, so it can never become a phantom
+            # to reclaim — drop it from the tracking set. THIS bounds the set to
+            # in-flight launches, so the count cap below only ever backstops a
+            # subagent whose end was LOST (a crash / dropped edge), never the normal
+            # flow. (A workflow child was already dropped at its reclaim; this discard
+            # is then a harmless no-op.)
+            if isinstance(event, dict) and event.get("type") == "turma/subagent-end":
+                ended = (event.get("data") or {}).get("childId") \
+                    or (event.get("data") or {}).get("id")
+                if ended:
+                    self._emitted_launches.discard(str(ended))
+            # A workflow AGENT reaches us through the same subagent seam as an
+            # ordinary subagent, so the driver forwards a `turma/subagent-*` for it
+            # too. It belongs to the run PICKER, not a top-level `Agent` row — so
+            # its launch/stop is dropped here. The driver writes the forward a tick
+            # late (setImmediate) so the run's `tool-workflow/agent-start` lands
+            # first and the accumulator already knows the child; the reclaim above
+            # covers the case it does not.
+            if self._is_workflow_child_edge(event):
+                continue
+            projected = self._proj.feed(event)
+            # Remember which children we projected a top-level launch for, so the
+            # reclaim above can retire one later found to be a workflow agent.
+            if (isinstance(event, dict)
+                    and event.get("type") == "turma/subagent-start" and projected):
+                child = (event.get("data") or {}).get("childId") \
+                    or (event.get("data") or {}).get("id")
+                if child:
+                    self._emitted_launches.add(str(child))
+                    # Backstop only (the set is bounded by drop-on-end above): a
+                    # subagent whose end was LOST would otherwise linger for the life
+                    # of the session. Evicting the oldest such entry cannot re-open the
+                    # workflow-child phantom in any realistic run — a workflow claims
+                    # its child at an agent-start that lands within the run, so a child
+                    # still tracked after EMITTED_LAUNCHES_MAX *other* launches is an
+                    # ordinary subagent, not an about-to-be-reclaimed workflow member.
+                    while len(self._emitted_launches) > EMITTED_LAUNCHES_MAX:
+                        self._emitted_launches.pop()
+            entries.extend(projected)
         if entries:
-            self._append(entries)
-
-    def _append(self, entries):
+            self._append(self.transcript_path, entries)
+        # Delegation side-effects run every pump (a workflow record advances even
+        # when the parent transcript gained no entry, and child logs stream on
+        # their own). Each is contained: a delegation failure must never cost the
+        # main transcript, which is what every other surface reads.
+        if self._wf is not None:
+            try:
+                self._sync_workflow_records()
+            except Exception as e:      # never let it kill the tail
+                self._log(f"dsh workflow record sync error: {e}")
         try:
-            with open(self.transcript_path, "a", encoding="utf-8") as fh:
+            self._sync_children()
+        except Exception as e:
+            self._log(f"dsh child projection error: {e}")
+
+    def _reclaim_if_workflow_child(self, event):
+        """If `event` is a `tool-workflow/agent-start` whose child we already
+        launched top-level, return a `<task-notification>` retiring that phantom
+        row (and forget it). Empty otherwise."""
+        if (self._wf is None or not isinstance(event, dict)
+                or event.get("type") != "tool-workflow/agent-start"):
+            return []
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        child = str(data.get("childId") or "").strip()
+        if not child or child not in self._emitted_launches:
+            return []
+        self._emitted_launches.discard(child)
+        # Fed straight to the projector (NOT through the workflow-edge filter,
+        # which would now suppress it): the entry is a plain retirement turn.
+        return self._proj.feed({"type": "turma/subagent-end",
+                                "seq": "reclaim-%s" % child,
+                                "time": event.get("time"),
+                                "data": {"childId": child, "stopReason": "completed"}})
+
+    def _is_workflow_child_edge(self, event):
+        """True iff `event` is a `turma/subagent-*` edge for a child the workflow
+        accumulator already knows is a workflow agent — those are represented by
+        the run, not a top-level Agent row."""
+        if self._wf is None or not isinstance(event, dict):
+            return False
+        if event.get("type") not in ("turma/subagent-start", "turma/subagent-end"):
+            return False
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        child = data.get("childId") or data.get("id")
+        return bool(child) and self._wf.run_of_child(child) is not None
+
+    def _append(self, path, entries):
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
                 for e in entries:
                     fh.write(json.dumps(e, ensure_ascii=False) + "\n")
         except OSError as e:
             self._log(f"dsh projection append failed: {e}")
+
+    # ---- workflow run records (XERK-474 [J]) -------------------------------
+
+    def _sync_workflow_records(self):
+        """Write/refresh `<stem>/workflows/<runId>.json` and the run's
+        `journal.jsonl` for every run that changed this pump. The record is what
+        makes the workflow picker usable — it carries the script's own per-agent
+        labels + live states, which nothing else on disk has. Written as the run
+        PROGRESSES (dsh appends the events live), unlike Claude Code which writes
+        its record only at the end."""
+        for run_id in self._wf.take_dirty():
+            record = self._wf.record(run_id)
+            if record is None:
+                continue
+            try:
+                os.makedirs(self._wf_records_dir, exist_ok=True)
+                tmp = os.path.join(self._wf_records_dir, run_id + ".json")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(record, fh, ensure_ascii=False)
+            except OSError as e:
+                self._log(f"dsh workflow record write failed ({run_id}): {e}")
+            # The journal is the fallback `_workflow_finished_agents` reads when
+            # the record does not cover an agent; rewritten whole each change (a
+            # few dozen one-line records — cheap and idempotent).
+            run_dir = os.path.join(self._wf_agents_dir, run_id)
+            try:
+                os.makedirs(run_dir, exist_ok=True)
+                lines = self._wf.finished(run_id)
+                with open(os.path.join(run_dir, "journal.jsonl"), "w",
+                          encoding="utf-8") as fh:
+                    for ln in lines:
+                        fh.write(json.dumps(ln, ensure_ascii=False) + "\n")
+            except OSError as e:
+                self._log(f"dsh workflow journal write failed ({run_id}): {e}")
+
+    # ---- per-child transcripts (XERK-474 [J]) ------------------------------
+
+    def _child_dest(self, child_id):
+        """Where child `child_id`'s PROJECTED transcript belongs:
+        `subagents/workflows/<runId>/agent-<id>.jsonl` for a workflow agent, else
+        the flat `subagents/agent-<id>.jsonl` — the two layouts `_workflow_agent_path`
+        and `_resolve_subagent` respectively resolve. The run assignment can only
+        arrive AFTER the child log starts (the parent `agent-start` event races the
+        child's first bytes), so a flat->run move is handled in `_sync_children`."""
+        run_id = self._wf.run_of_child(child_id) if self._wf else None
+        if run_id:
+            return os.path.join(self._wf_agents_dir, run_id, "agent-%s.jsonl" % child_id)
+        return os.path.join(self._subagents_dir, "agent-%s.jsonl" % child_id)
+
+    def _sync_children(self):
+        """Discover and project every descendant session's native log the driver
+        has written, appending to its Claude-Code destination transcript."""
+        try:
+            names = os.listdir(self._child_events_dir)
+        except OSError:
+            return  # no children yet
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            child_id = name[:-len(".jsonl")]
+            if not _CHILD_ID_RE.match(child_id):
+                continue
+            src = os.path.join(self._child_events_dir, name)
+            try:
+                if os.path.islink(src) or not os.path.isfile(src):
+                    continue      # never follow a planted link into another tree
+            except OSError:
+                continue
+            self._pump_child(child_id, src)
+
+    def _pump_child(self, child_id, src):
+        st = self._children.get(child_id)
+        if st is None:
+            if DshProjector is None:
+                return
+            st = {"proj": DshProjector(child_id, cwd=self._cwd,
+                                       git_branch=self._git_branch),
+                  "offset": 0, "partial": b"", "dest": self._child_dest(child_id)}
+            self._children[child_id] = st
+            self._ensure_child_file(st["dest"])
+        else:
+            # A workflow agent's run assignment may only now have arrived (its
+            # `tool-workflow/agent-start` was folded this pump), moving its home
+            # from the flat subagents/ dir into the run dir. Move the file we have
+            # and repoint — the projector's offset is unchanged (same bytes).
+            desired = self._child_dest(child_id)
+            if desired != st["dest"]:
+                self._move_child_file(st["dest"], desired)
+                st["dest"] = desired
+        try:
+            size = os.path.getsize(src)
+        except OSError:
+            return
+        if size < st["offset"]:      # rewritten under us — re-project from 0
+            st["offset"] = 0
+            st["partial"] = b""
+            st["proj"] = DshProjector(child_id, cwd=self._cwd,
+                                      git_branch=self._git_branch)
+            try:
+                open(st["dest"], "w").close()   # start the destination over too
+            except OSError:
+                pass
+        try:
+            with open(src, "rb") as fh:
+                fh.seek(st["offset"])
+                data = fh.read()
+        except OSError:
+            return
+        if not data:
+            return
+        st["offset"] += len(data)
+        st["partial"] += data
+        entries = []
+        while b"\n" in st["partial"]:
+            line, st["partial"] = st["partial"].split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            entries.extend(st["proj"].feed(event))
+        if entries:
+            self._append(st["dest"], entries)
+
+    def _ensure_child_file(self, dest):
+        """Create the destination transcript (empty) so a picker resolving the
+        child mid-run finds a file — an empty one reads as an empty conversation,
+        the same guarantee the main transcript gets at launch."""
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if not os.path.exists(dest):
+                open(dest, "a", encoding="utf-8").close()
+        except OSError as e:
+            self._log(f"dsh child transcript create failed: {e}")
+
+    def _move_child_file(self, old, new):
+        try:
+            os.makedirs(os.path.dirname(new), exist_ok=True)
+            if os.path.exists(old):
+                os.replace(old, new)
+            elif not os.path.exists(new):
+                open(new, "a", encoding="utf-8").close()
+        except OSError as e:
+            self._log(f"dsh child transcript move failed: {e}")

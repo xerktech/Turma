@@ -32,6 +32,7 @@ def _load(name, filename):
 
 
 ds = _load("dsh_session", "dsh_session.py")
+ha = _load("hub_agent", "hub-agent.py")
 
 
 class FakePlugin:
@@ -255,6 +256,211 @@ class DshProjectionTailTest(unittest.TestCase):
                             "time": 1_700_000_000_000, "data": {}})
         time.sleep(0.4)
         self.assertEqual(self._read_transcript(), [])
+
+
+class DshDelegationTailTest(unittest.TestCase):
+    """XERK-474 [J]: the tail turns a dsh session's delegation events + captured
+    child logs into the Claude-Code subagents/ + workflows/ layout hub-agent's
+    pickers resolve. Drives `_pump()` synchronously for determinism."""
+
+    SID = "sess-11112222"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        slug = os.path.join(self.tmp, "projects", "-repos-x")
+        self.store = os.path.join(slug, self.SID, "dsh")
+        self.child_dir = os.path.join(self.store, "subagents")
+        os.makedirs(self.child_dir, exist_ok=True)
+        self.events_path = os.path.join(self.store, "events.jsonl")
+        open(self.events_path, "w").close()
+        self.transcript = os.path.join(slug, self.SID + ".jsonl")
+        os.makedirs(slug, exist_ok=True)
+        open(self.transcript, "a").close()
+        self.tail = ds.DshProjectionTail(
+            self.events_path, self.transcript, self.SID,
+            cwd="/repos/x", log=lambda m: None)
+
+    def _parent(self, events):
+        with open(self.events_path, "w") as f:
+            for e in events:
+                f.write(json.dumps(e) + "\n")
+
+    def _child(self, child_id, prompt="do it", answer="done"):
+        with open(os.path.join(self.child_dir, child_id + ".jsonl"), "w") as f:
+            f.write(json.dumps({"type": "subagent/descriptor", "seq": 1, "time": 1,
+                    "data": {"version": 2, "mode": "one-shot", "label": "L"}}) + "\n")
+            f.write(json.dumps({"type": "user/message", "seq": 2, "time": 2, "data": {
+                "role": "user", "source": {"kind": "user"},
+                "content": [{"type": "text", "text": prompt}]}}) + "\n")
+            f.write(json.dumps({"type": "assistant/message", "seq": 3, "time": 3, "data": {
+                "message": {"id": "c", "role": "assistant", "source": {"model": "m"},
+                            "content": [{"type": "text", "text": answer}]},
+                "usage": {"inputTokens": 10, "outputTokens": 5}}}) + "\n")
+
+    def _read(self, path):
+        try:
+            with open(path) as f:
+                return [json.loads(x) for x in f if x.strip()]
+        except OSError:
+            return []
+
+    def test_ordinary_subagent_transcript_resolves(self):
+        child = "a1b2c3d4-9999"
+        self._parent([
+            {"type": "turma/subagent-start", "seq": "sa-start-r", "time": 1000,
+             "data": {"runId": "r", "childId": child, "label": "Investigate"}},
+            {"type": "turma/subagent-end", "seq": "sa-end-r", "time": 9000,
+             "data": {"runId": "r", "childId": child, "stopReason": "completed"}},
+        ])
+        self._child(child)
+        self.tail._pump()
+        # the flat transcript exists and resolves
+        path = ha._resolve_subagent(self.transcript, "subagent", "Investigate")
+        self.assertTrue(path and os.path.basename(path) == "agent-%s.jsonl" % child)
+        self.assertGreaterEqual(len(self._read(path)), 2)
+
+    def test_workflow_run_picker_and_agent_transcripts(self):
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        c1, c2 = "wfchild-a", "wfchild-b"
+        self._parent([
+            {"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+             "data": {"runId": run, "name": "review"}},
+            {"type": "tool-workflow/agent-start", "seq": 3, "time": 1100,
+             "data": {"runId": run, "seq": 1, "label": "review:bugs", "childId": c1}},
+            {"type": "tool-workflow/agent-start", "seq": 4, "time": 1200,
+             "data": {"runId": run, "seq": 2, "label": "review:perf", "childId": c2}},
+            {"type": "tool-workflow/agent-end", "seq": 5, "time": 2000,
+             "data": {"runId": run, "seq": 1, "outcome": "completed"}},
+            {"type": "tool-workflow/run-end", "seq": 6, "time": 3000,
+             "data": {"runId": run, "stopReason": "completed"}},
+        ])
+        self._child(c1, answer="found bugs")
+        self._child(c2, answer="perf ok")
+        self.tail._pump()
+        claude_run = ds.workflow_run_id(run)
+        run_dir = ha._resolve_workflow_run(self.transcript, "review")
+        self.assertTrue(run_dir and os.path.basename(run_dir) == claude_run)
+        record = ha._workflow_run_record(self.transcript, claude_run)
+        agents, _ = ha._workflow_agents(run_dir, record)
+        self.assertEqual({a["label"] for a in agents}, {"review:bugs", "review:perf"})
+        by_id = {a["id"]: a for a in agents}
+        self.assertEqual(by_id[c1]["status"], "done")
+        self.assertEqual(by_id[c2]["status"], "running")
+        # drill into one agent's transcript
+        p = ha._workflow_agent_path(run_dir, c1)
+        self.assertTrue(p and os.path.isfile(p))
+        self.assertGreaterEqual(len(self._read(p)), 2)
+
+    def test_workflow_agent_is_not_a_top_level_subagent_row(self):
+        # A workflow agent reaches the tail through the subagent seam too, so the
+        # driver forwards a `turma/subagent-*` for it — but it belongs to the run,
+        # so the tail drops that edge from the parent transcript. The parent log
+        # here has the agent-start FIRST (the driver's setImmediate ordering).
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        child = "wfchild-a"
+        self._parent([
+            {"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+             "data": {"runId": run, "name": "review"}},
+            {"type": "tool-workflow/agent-start", "seq": 3, "time": 1100,
+             "data": {"runId": run, "seq": 1, "label": "review:bugs", "childId": child}},
+            {"type": "turma/subagent-start", "seq": "sa-start-x", "time": 1150,
+             "data": {"runId": "x", "childId": child, "label": "review:bugs"}},
+        ])
+        self.tail._pump()
+        state = {}
+        for e in self._read(self.transcript):
+            ha._scan_agent_entry(e, state)
+        # only the WORKFLOW row is live — no separate `subagent`-typed row for the
+        # workflow agent
+        live = state.get("liveAgents", {})
+        self.assertIn(ds.workflow_run_id(run), live)
+        self.assertNotIn(child, live)
+        self.assertTrue(all(v["type"] != "subagent" for v in live.values()), live)
+
+    def test_workflow_child_launched_before_its_run_is_reclaimed(self):
+        # The reversed order the driver's setImmediate makes unlikely: the child's
+        # `turma/subagent-start` lands BEFORE its `tool-workflow/agent-start`. The
+        # tail cannot suppress the launch (it does not yet know the child is a
+        # workflow agent), so a top-level row appears — but the moment the run
+        # claims the child, it is RETIRED, so no permanent phantom lingers (its own
+        # `subagent-end` would be suppressed as a workflow edge). Independent of
+        # file order — the defect QA (F1) flagged.
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        child = "wfchild-a"
+        self._parent([
+            {"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+             "data": {"runId": run, "name": "review"}},
+            {"type": "turma/subagent-start", "seq": "sa-start-x", "time": 1100,
+             "data": {"runId": "x", "childId": child, "label": "review:bugs"}},
+            {"type": "tool-workflow/agent-start", "seq": 3, "time": 1200,
+             "data": {"runId": run, "seq": 1, "label": "review:bugs", "childId": child}},
+            {"type": "turma/subagent-end", "seq": "sa-end-x", "time": 1300,
+             "data": {"runId": "x", "childId": child, "stopReason": "completed"}},
+        ])
+        self.tail._pump()
+        state = {}
+        for e in self._read(self.transcript):
+            ha._scan_agent_entry(e, state)
+        live = state.get("liveAgents", {})
+        self.assertNotIn(child, live, "the phantom workflow-child row must be retired")
+        self.assertIn(ds.workflow_run_id(run), live)
+
+    def test_flat_child_is_moved_when_its_run_arrives_late(self):
+        # The child log starts before the parent `tool-workflow/agent-start` is
+        # seen (a real race): first pump files it flat, the second — after the
+        # agent-start — moves it under the run dir.
+        run = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        child = "wfchild-late"
+        self._parent([{"type": "tool-workflow/run-start", "seq": 2, "time": 1000,
+                       "data": {"runId": run, "name": "review"}}])
+        self._child(child, answer="early work")
+        self.tail._pump()
+        flat = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                            "agent-%s.jsonl" % child)
+        self.assertTrue(os.path.isfile(flat), "filed flat before its run is known")
+        # now the agent-start arrives
+        with open(self.events_path, "a") as f:
+            f.write(json.dumps({"type": "tool-workflow/agent-start", "seq": 3,
+                    "time": 1100, "data": {"runId": run, "seq": 1,
+                    "label": "review:bugs", "childId": child}}) + "\n")
+        self.tail._pump()
+        moved = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                             "workflows", ds.workflow_run_id(run),
+                             "agent-%s.jsonl" % child)
+        self.assertTrue(os.path.isfile(moved), "moved under the run dir")
+        self.assertFalse(os.path.isfile(flat), "flat copy removed")
+
+    def test_emitted_launches_is_bounded_by_ended_subagents(self):
+        # An ordinary subagent's end retires it and drops it from the reclaim
+        # tracking set, so the set tracks only IN-FLIGHT launches — it does not
+        # grow one entry per subagent for the life of the session.
+        events = []
+        for i in range(50):
+            cid = "sub-%08d" % i
+            events.append({"type": "turma/subagent-start", "seq": "s%d" % i,
+                           "time": 1000 + i, "data": {"childId": cid, "label": "l"}})
+            events.append({"type": "turma/subagent-end", "seq": "e%d" % i,
+                           "time": 2000 + i, "data": {"childId": cid, "stopReason": "completed"}})
+        self._parent(events)
+        self.tail._pump()
+        self.assertEqual(self.tail._emitted_launches, set(),
+                         "every launched-then-ended subagent should be dropped")
+
+    def test_symlinked_child_log_is_refused(self):
+        # A child "log" that is a symlink would drag whatever it points at into a
+        # session's transcript tree — refused, like every other transcript walk.
+        victim = os.path.join(self.tmp, "victim.jsonl")
+        with open(victim, "w") as f:
+            f.write(json.dumps({"type": "user/message", "seq": 1, "time": 1, "data": {
+                "content": [{"type": "text", "text": "secret"}]}}) + "\n")
+        link = os.path.join(self.child_dir, "b0b0b0b0.jsonl")
+        os.symlink(victim, link)
+        self._parent([{"type": "user/message", "seq": 1, "time": 1000,
+                       "data": {"content": [{"type": "text", "text": "hi"}]}}])
+        self.tail._pump()
+        dest = os.path.join(self.transcript[:-len(".jsonl")], "subagents",
+                            "agent-b0b0b0b0.jsonl")
+        self.assertFalse(os.path.exists(dest))
 
 
 if __name__ == "__main__":
