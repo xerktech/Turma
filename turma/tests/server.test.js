@@ -69,6 +69,10 @@ process.env.TICKET_MODELS_FILE = path.join(
   os.tmpdir(),
   `turma-test-ticket-models-${process.pid}.json`
 );
+process.env.TICKET_RUNTIMES_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-ticket-runtimes-${process.pid}.json`
+);
 process.env.ORG_COLORS_FILE = path.join(
   os.tmpdir(),
   `turma-test-org-colors-${process.pid}.json`
