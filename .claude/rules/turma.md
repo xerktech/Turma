@@ -326,9 +326,8 @@ layers, the size ceilings, and the rules about how the total is measured.
   connected and `terminalOnline` stayed true — so the symptom reads as a Turma bug and is not one.
 - **Only the base path is rewritten.** Assets and the WS below it never end in a slash, and
   appending one there would 404 them.
-- Every client (`sessions.html`, android `TerminalScreen`, `glasses/src/hub-client.ts`,
-  `veiller/src/core/hub-client.ts`) asks for the slash form, so this is belt-and-braces for the
-  wire, not a client contract.
+- Every client (`sessions.html`, android `TerminalScreen`, `glasses/src/hub-client.ts`) asks for the
+  slash form, so this is belt-and-braces for the wire, not a client contract.
 - The slash is **inserted into the original request target**, not rebuilt from the parsed URL, and
   only for origin-form requests — so the query reaches ttyd byte-for-byte and an absolute-form or
   backslash target still 404s there rather than newly resolving to a terminal.
@@ -432,7 +431,7 @@ layers, the size ceilings, and the rules about how the total is measured.
   4 MiB and a share is 512 KiB, so a record drifts past its share — and starts being refused — with
   that warning still eight times away. This is what makes the eighth-of-the-container default safe;
   a record grows over weeks, which is ample notice provided somebody is told. If real records ever
-  approach the share, raise `AGENTS_TOTAL_MAX` in the DockerOps compose beside `mem_limit` rather
+  approach the share, raise `AGENTS_TOTAL_MAX` in the hub's ArgoCD deployment beside `mem_limit` rather
   than moving the derived default for every deployment at once.
 - Byte accounting is a side map (`recordBytes`), never a field on the record — anything on a record
   is served to every client — and `registryBytes()` re-measures unknown keys and forgets dead ones,

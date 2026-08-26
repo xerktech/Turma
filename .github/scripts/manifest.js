@@ -34,8 +34,6 @@ function freshComponent(component, version, tag, opts) {
   switch (component) {
     case "turma":
       return { version, kind: "image", ref: `ghcr.io/${owner}/turma:${version}`, built: true };
-    case "agent-image":
-      return { version, kind: "image", ref: `ghcr.io/${owner}/turma-agent:${version}`, built: true };
     case "agent-native": {
       const asset = `turma-agent-native-v${version}.tar.gz`;
       return { version, kind: "asset", asset, sha256_asset: `${asset}.sha256`, release_tag: tag, built: true };
@@ -56,8 +54,6 @@ function freshComponent(component, version, tag, opts) {
         release_tag: tag,
         built: true,
       };
-    case "veiller":
-      return { version, kind: "asset", asset: `turma-veiller-v${version}.zip`, release_tag: tag, built: true };
     default:
       throw new Error(`unknown component ${component}`);
   }

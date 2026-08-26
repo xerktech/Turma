@@ -30,43 +30,44 @@ and nothing inbound exposed.
 
 | | What it is | Where it runs |
 |---|---|---|
-| **`agent/`** | One container per host, mounted at a git root. Scans it for repos and multiplexes many worktree-backed Claude Code sessions, each in its own tmux + loopback ttyd. Heartbeats state; carries terminals and live transcripts back over one outbound tunnel. Also has a **[native install](agent/native/README.md)** for a host that would rather not run Docker. | Every machine with repos |
+| **`agent/`** | One [native install](agent/native/README.md) per host (systemd + a shipped tarball), mounted at a git root. Scans it for repos and multiplexes many worktree-backed Claude Code sessions, each in its own tmux + loopback ttyd. Heartbeats state; carries terminals and live transcripts back over one outbound tunnel. | Every machine with repos |
 | **`turma/`** | The hub: dashboard, terminal gateway, and durable searchable archive of every ended session. Node **stdlib only** — zero npm dependencies. | Once, anywhere reachable |
 | **`glasses/`** | An [Even Realities G2](https://www.evenrealities.com/) smart-glasses client (Vite + TypeScript). Sessions, transcripts, question answering, and mic dictation. | Even Hub plugin |
 | **`android/`** | Native Android client (Kotlin + Compose). Everything the web dashboard does, plus push notifications and voice. | Phone |
-| **`veiller/`** | The glasses client as a [Mentra miniapp](veiller/README.md) for the Veiller app (Bun + TypeScript). Same G2 experience, bundled into the Veiller mobile app instead of Even Hub. | Veiller app |
 
 Full architecture, the session model, and the design rationale behind each piece
 live in [`CLAUDE.md`](CLAUDE.md).
 
 ## Quick start
 
-The fastest path: **hub + one agent on one machine.**
+The fastest path: **the hub on one machine, plus one native agent on it.** The
+hub runs as a container; the agent runs **natively** on each host it manages.
 
-**Prerequisites.** Docker with the Compose plugin, a directory of git repos, and
-a logged-in Claude Code on the host:
+**Prerequisites.** Docker with the Compose plugin (for the hub), a directory of
+git repos, and — on each agent host — git, node, python, and a logged-in Claude
+Code:
 
 ```sh
 claude /login    # required — a subscription OAuth login, not a setup token
 gh auth login    # optional; needed for private repos and `gh pr create`
 ```
 
-The agent **reuses that host login** through a bind mount and never logs in
-itself — no API key, and nothing is baked into the image. Without it the
-container boots and idles, waiting.
+The agent **reuses that host login** and never logs in itself — no API key.
+Without it the agent runs and idles, waiting.
+
+**1. Start the hub.**
 
 ```sh
 git clone https://github.com/xerktech/turma.git
 cd turma/examples/compose
 cp .env.example .env
-$EDITOR .env     # set HOST_REPOS_ROOT and the two secrets
+$EDITOR .env     # set the two secrets (TURMA_PASSWORD, TURMA_AGENT_TOKEN)
 
-docker compose -f all-in-one.yaml up -d
+docker compose -f hub.yaml up -d
 ```
 
-Open <http://localhost:8300>, log in with the `TURMA_USER` / `TURMA_PASSWORD`
-you set, and your host appears with its repos under it. Pick one, hit **+ New
-session**, and you land in the session.
+Open <http://localhost:8300> and log in with the `TURMA_USER` / `TURMA_PASSWORD`
+you set.
 
 > **Heads up:** `ghcr.io/xerktech/turma` is not yet published for anonymous
 > pulls, so the hub image may fail with `unauthorized`. Until it is, build it
@@ -75,26 +76,43 @@ session**, and you land in the session.
 > docker build -t ghcr.io/xerktech/turma:latest ../../turma
 > ```
 
+**2. Install the agent natively** on the host with your repos. It fetches the
+latest native release, verifies its checksum, and installs a systemd user
+service — no checkout needed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xerktech/turma/main/agent/native/bootstrap.sh | bash
+```
+
+Then edit `~/.config/turma-agent/turma-agent.env` — set `TURMA_URL` to the hub,
+`REPOS_ROOT` to your git root, and `TURMA_TOKEN` to this host's own agent token
+(`node turma/server.js --agent-token <device-name>`, run on the hub). Options
+pass through after `-s --`:
+
+```sh
+curl -fsSL .../bootstrap.sh | bash -s -- --autostart
+curl -fsSL .../bootstrap.sh | bash -s -- --verify     # files, tools, config, service, login
+```
+
+From a checkout, `cd agent/native && ./install.sh` does the same thing. Full
+detail is in [`agent/native/README.md`](agent/native/README.md).
+
+Your host then appears in the dashboard with its repos under it. Pick one, hit
+**+ New session**, and you land in the session.
+
 ### Going wider
 
-Three compose files, all in [`examples/compose/`](examples/compose/), sharing
-one [`.env.example`](examples/compose/.env.example):
-
-| File | Use it for |
-|---|---|
-| [`all-in-one.yaml`](examples/compose/all-in-one.yaml) | Hub + agent on one machine. Start here. |
-| [`hub.yaml`](examples/compose/hub.yaml) | The hub on its own. Run once per fleet. |
-| [`agent.yaml`](examples/compose/agent.yaml) | An agent on its own. Run on each extra machine. |
-
-To add a machine, copy `agent.yaml` + `.env` to it, point `HUB_URL` at the hub's
-public URL, give it a distinct `AGENT_DEVICE_NAME`, and give it **its own**
-agent token — `node turma/server.js --agent-token <that device name>`, run on
-the hub, prints it. Because agents dial out, that machine needs no inbound
-exposure — only the hub does. Put the hub behind TLS (a reverse proxy or a
-Cloudflare tunnel) before exposing it: the login is single-user HTTP Basic and
+To add a machine, install the agent natively on it (step 2 above), point
+`TURMA_URL` at the hub's public URL, give it a distinct `DEVICE_NAME`, and give
+it **its own** agent token — `node turma/server.js --agent-token <that device
+name>`, run on the hub, prints it. Because agents dial out, that machine needs no
+inbound exposure — only the hub does. Put the hub behind TLS (a reverse proxy or
+a Cloudflare tunnel) before exposing it: the login is single-user HTTP Basic and
 should not cross the internet in the clear.
 
-The compose files are commented in full; the three things worth knowing up front:
+The one compose file, [`hub.yaml`](examples/compose/hub.yaml), and its
+[`.env.example`](examples/compose/.env.example), are commented in full; the three
+things worth knowing up front:
 
 - **Every hub auth check fails *open* when its variable is unset**, warning at
   boot rather than refusing to start. `TURMA_PASSWORD` unset means an
@@ -111,33 +129,6 @@ The compose files are commented in full; the three things worth knowing up front
   transcript history of every ended session, plus a byte-for-byte copy of each
   session's own files beside it. The search index inside it is disposable and
   rebuilds from the files; the files are not.
-- **The `.env` inputs are named apart from the variables they set** — `HUB_URL`
-  sets the container's `TURMA_URL`, `HOST_REPOS_ROOT` sets the `REPOS_ROOT`
-  mount. That is deliberate: compose lets the calling shell override `.env`, and
-  an agent container exports `TURMA_URL`/`REPOS_ROOT`/`DEVICE_NAME` itself, so
-  same-named inputs would be silently ignored when running compose from inside a
-  Turma session. Keep the two namespaces separate when editing.
-
-### Beyond Docker
-
-An agent can also be installed **natively** on a Linux/WSL host that already has
-git, node, python, and a logged-in Claude — same session model, no image. This
-needs no checkout: it fetches the latest native release, verifies its checksum,
-and installs it.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/xerktech/turma/main/agent/native/bootstrap.sh | bash
-```
-
-Then edit `~/.config/turma-agent/turma-agent.env` (hub URL + token). Options
-pass through after `-s --`, so the same line does the installer's other modes:
-
-```sh
-curl -fsSL .../bootstrap.sh | bash -s -- --autostart
-curl -fsSL .../bootstrap.sh | bash -s -- --verify     # files, tools, config, service, login
-```
-
-From a checkout, `cd agent/native && ./install.sh` does the same thing.
 
 It self-updates from the release stream afterwards without stopping running
 sessions. See [`agent/native/README.md`](agent/native/README.md).
@@ -228,7 +219,6 @@ Safety guard section of [`CLAUDE.md`](CLAUDE.md).
 node --test turma/tests/*.test.js agent/tests/*.test.js    # hub + agent (Node 24)
 cd glasses && npm test                                     # glasses (vitest)
 cd android && ./gradlew testDebugUnitTest                   # android (JVM)
-cd veiller && bun test                                    # veiller miniapp (bun)
 ```
 
 The hub has no build step and no dependencies — `node turma/server.js` runs it,

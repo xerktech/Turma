@@ -6,22 +6,17 @@
 
 "use strict";
 
-// The six release components. `agent/**` fans out to BOTH agent-image and
-// agent-native on purpose: the image build context is ./agent with no
-// .dockerignore, so agent/native/** genuinely IS in the image context and a
-// native-only change really does change the image. Over-building a native-only
-// change wastes runner time; under-building ships a manifest that lies. We take
-// the former.
-const COMPONENTS = ["turma", "agent-image", "agent-native", "glasses", "android", "veiller"];
+// The four release components. `agent/**` maps only to agent-native — the agent
+// no longer ships a container image; native is the sole agent distribution.
+const COMPONENTS = ["turma", "agent-native", "glasses", "android"];
 
 // Ordered longest-prefix-first isn't needed here since the prefixes are
 // disjoint top-level dirs, but keep the mapping explicit rather than derived.
 const PREFIX_MAP = [
   { prefix: "turma/", components: ["turma"] },
-  { prefix: "agent/", components: ["agent-image", "agent-native"] },
+  { prefix: "agent/", components: ["agent-native"] },
   { prefix: "glasses/", components: ["glasses"] },
   { prefix: "android/", components: ["android"] },
-  { prefix: "veiller/", components: ["veiller"] },
 ];
 
 // Which components a single changed path touches. Anything matching no prefix

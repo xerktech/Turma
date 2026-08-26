@@ -12,10 +12,10 @@ paths:
 - `src/` is the reference implementation the Android `core/` reducers are ported from
   (`live.ts`/`transcript.ts` → `Transcript`/`ChatItems`). A change to the transcript-merge semantics
   here is a change to those.
-- **`src/sessions.ts` is one of the FIVE `readyForReview` mirrors** that must agree — see
-  `CLAUDE.md`'s cross-cutting contracts. Veiller carries a FORK of this file; it counts as a mirror.
-- **Every body read in `hub-client.ts` goes through `readJson`, never a bare `res.json()`** — in
-  veiller's fork too. `timeoutFetch` bounds the RESPONSE and cannot reach the body after it, so an
+- **`src/sessions.ts` is one of the FOUR `readyForReview` mirrors** that must agree — see
+  `CLAUDE.md`'s cross-cutting contracts.
+- **Every body read in `hub-client.ts` goes through `readJson`, never a bare `res.json()`**.
+  `timeoutFetch` bounds the RESPONSE and cannot reach the body after it, so an
   unwrapped read is an unbounded await on a live socket; since `App.poll()` re-arms only in its
   `finally`, one hub that sends headers then stalls freezes the display on stale content forever.
   A new endpoint added with a bare `res.json()` silently reopens that hole on its own route.

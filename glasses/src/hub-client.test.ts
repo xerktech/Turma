@@ -18,8 +18,8 @@ describe("HubClient request timeout (XERK-235)", () => {
   // `finally`. A hub that accepts the connection and never answers therefore
   // left the promise unsettled and killed the poll loop PERMANENTLY — the
   // glasses froze on stale content with no "hub unreachable" flash, where
-  // every other failure mode recovers within one poll. Veiller already fixed
-  // this for its background context (XERK-215); this is the lens's guard.
+  // every other failure mode recovers within one poll. The same class of bug
+  // was fixed once for a background context (XERK-215); this is the lens's guard.
   it("rejects a never-settling request instead of hanging forever", async () => {
     vi.useFakeTimers();
     try {

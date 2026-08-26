@@ -16,7 +16,7 @@ test("buildEntries matches merge-commit and squash oids to PRs; orphans synthesi
     { number: 201, title: "Remove sibling refs", url: "http://x/201", author: "malc", mergeCommitOid: "m1" },
     { number: 202, title: "Add board chip", url: "http://x/202", author: "malc", mergeCommitOid: "s1" },
   ];
-  const componentsByOid = { m1: [], s1: ["turma"], d1: ["agent-image", "agent-native"] };
+  const componentsByOid = { m1: [], s1: ["turma"], d1: ["agent-native"] };
   const entries = CL.buildEntries({ commits, prs, componentsByOid });
   assert.equal(entries[0].number, 201);
   assert.equal(entries[0].title, "Remove sibling refs");
@@ -25,31 +25,23 @@ test("buildEntries matches merge-commit and squash oids to PRs; orphans synthesi
   // orphan: kept, synthesized from the commit subject, no PR metadata
   assert.equal(entries[2].number, null);
   assert.equal(entries[2].title, "direct hotfix to main");
-  assert.deepEqual(entries[2].components, ["agent-image", "agent-native"]);
+  assert.deepEqual(entries[2].components, ["agent-native"]);
 });
 
-test("groupByComponent folds agent components into one Agent heading, [] into Other", () => {
+test("groupByComponent maps agent-native to the Agent heading, [] into Other", () => {
   const groups = CL.groupByComponent([
     entry({ title: "hub thing", components: ["turma"] }),
-    entry({ title: "agent thing", components: ["agent-image", "agent-native"] }),
+    entry({ title: "agent thing", components: ["agent-native"] }),
     entry({ title: "chore", components: [] }),
   ]);
   assert.deepEqual(Object.keys(groups), ["Hub", "Agent", "Other"]);
-  assert.equal(groups.Agent.length, 1); // not double-counted across the two agent components
+  assert.equal(groups.Agent.length, 1);
 });
 
 test("a multi-component entry appears under each heading it touches", () => {
   const groups = CL.groupByComponent([entry({ title: "shared", components: ["turma", "glasses"] })]);
   assert.equal(groups.Hub.length, 1);
   assert.equal(groups.Glasses.length, 1);
-});
-
-test("a veiller entry lands under the Veiller heading, before Other", () => {
-  const groups = CL.groupByComponent([
-    entry({ title: "miniapp thing", components: ["veiller"] }),
-    entry({ title: "chore", components: [] }),
-  ]);
-  assert.deepEqual(Object.keys(groups), ["Veiller", "Other"]);
 });
 
 test("an entry matching no component is never dropped (lands in Other)", () => {
@@ -75,20 +67,17 @@ test("sanitizeTitle collapses newlines/whitespace so a title can't break markdow
 test("renderComponentTable reads rebuilt/carried status straight from the manifest", () => {
   const manifest = {
     components: {
-      turma: { version: "0.3.1", kind: "image", ref: "ghcr.io/x/turma:0.3.1", built: true },
-      "agent-image": { version: "0.3.0", kind: "image", ref: "ghcr.io/x/turma-agent:0.3.0", built: false },
+      turma: { version: "0.3.0", kind: "image", ref: "ghcr.io/x/turma:0.3.0", built: false },
       "agent-native": { version: "0.3.1", kind: "asset", asset: "n.tar.gz", built: true },
       glasses: { version: "0.3.0", kind: "evenhub", package_id: "com.xerktech.turma", built: false },
       android: { version: "0.3.1", kind: "asset", asset: "a.apk", version_code: 30001, built: true },
-      veiller: { version: "0.3.1", kind: "asset", asset: "turma-veiller-v0.3.1.zip", built: true },
     },
   };
   const table = CL.renderComponentTable(manifest);
-  assert.match(table, /Hub \(image\) \| 0\.3\.1 \| rebuilt/);
-  assert.match(table, /Agent \(image\) \| 0\.3\.0 \| carried/);
+  assert.match(table, /Hub \(image\) \| 0\.3\.0 \| carried/);
+  assert.match(table, /Agent \(native\) \| 0\.3\.1 \| rebuilt/);
   assert.match(table, /Glasses \(Even Hub\) \| 0\.3\.0 \| carried \| `com\.xerktech\.turma` \(Even Hub portal\)/);
   assert.match(table, /code 30001/);
-  assert.match(table, /Veiller \(miniapp \.zip\) \| 0\.3\.1 \| rebuilt \| `turma-veiller-v0\.3\.1\.zip`/);
 });
 
 test("renderReleaseNotes handles an empty range", () => {
@@ -103,7 +92,7 @@ test("insertSection prepends under the marker and is idempotent for the same ver
   const once = CL.insertSection(base, secA);
   assert.match(once, /## 0\.3\.0 — 2026-07-16/);
 
-  const secB = CL.renderChangelogSection({ version: "0.4.0", date: "2026-08-01", groups: { Agent: [entry({ title: "b", components: ["agent-image"] })] } });
+  const secB = CL.renderChangelogSection({ version: "0.4.0", date: "2026-08-01", groups: { Agent: [entry({ title: "b", components: ["agent-native"] })] } });
   const two = CL.insertSection(once, secB);
   // newest first: 0.4.0 above 0.3.0
   assert.ok(two.indexOf("## 0.4.0") < two.indexOf("## 0.3.0"));

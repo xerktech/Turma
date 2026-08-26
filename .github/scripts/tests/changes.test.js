@@ -6,14 +6,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 const C = require("../changes.js");
 
-test("componentsForPath maps top-level dirs; agent/** fans out to both agent components", () => {
+test("componentsForPath maps top-level dirs; agent/** maps to agent-native", () => {
   assert.deepEqual(C.componentsForPath("turma/server.js"), ["turma"]);
-  assert.deepEqual(C.componentsForPath("agent/hub-agent.py"), ["agent-image", "agent-native"]);
-  // a native-only change still fans to the image: ./agent is the build context, no .dockerignore
-  assert.deepEqual(C.componentsForPath("agent/native/install.sh"), ["agent-image", "agent-native"]);
+  assert.deepEqual(C.componentsForPath("agent/hub-agent.py"), ["agent-native"]);
+  assert.deepEqual(C.componentsForPath("agent/native/install.sh"), ["agent-native"]);
   assert.deepEqual(C.componentsForPath("glasses/src/app.ts"), ["glasses"]);
   assert.deepEqual(C.componentsForPath("android/app/build.gradle.kts"), ["android"]);
-  assert.deepEqual(C.componentsForPath("veiller/src/background/index.ts"), ["veiller"]);
 });
 
 test("componentsForPath returns [] for non-component paths (-> Other, never a build)", () => {
@@ -28,11 +26,9 @@ test("detectChanges unions components across the diff", () => {
   const changed = C.detectChanges(["turma/server.js", "android/x.kt", "CLAUDE.md"], {});
   assert.deepEqual(changed, {
     turma: true,
-    "agent-image": false,
     "agent-native": false,
     glasses: false,
     android: true,
-    veiller: false,
   });
 });
 

@@ -26,8 +26,8 @@ paths:
     only then sets it, so clearing afterwards drops a job staged mid-pass.
   - `self._archive_pending` is beat-written and worker-read with no lock, which is safe ONLY because
     the beat REBINDS it and never mutates it in place; each pass snapshots it once.
-  - **`queue_archive_sync` may not raise.** The beat loop is the container's MAIN PROCESS
-    (`entrypoint.sh` `exec`s it, with no retry loop of its own), so an exception on it is not a
+  - **`queue_archive_sync` may not raise.** The beat loop is the agent's MAIN PROCESS
+    (the native launcher runs it, with no retry loop of its own), so an exception on it is not a
     skipped cycle — it is the host and every session on it going down, and this is called outside
     any try. Work moved OFF the beat must not leave a raise where the try/except it replaced stood:
     `Thread.start()` at the `pids_limit` is the realistic one. `_start_limits_probe` still has that
@@ -70,7 +70,7 @@ paths:
     held, including downwards — a reset or evicted archive answers smaller, and a high-water mark
     would leave that transcript looking complete here and missing there for good.
     - **It may not raise**, because `queue_archive_sync` runs on the beat loop, which is the
-      container's main process. `int(float("inf"))` raises OverflowError — neither of the two
+      agent's main process. `int(float("inf"))` raises OverflowError — neither of the two
       obvious exceptions — and a bare `1e400` is plain RFC-8259 JSON, so it is reachable from
       anything broken or hostile answering `TURMA_URL`. Keys are length-capped as well as counted:
       bounding ENTRIES bounds no bytes when one key may be a megabyte.

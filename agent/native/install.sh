@@ -18,8 +18,8 @@ PREFIX="${PREFIX:-$HOME/.local/share/turma-agent}"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent"
 CFG="$CFG_DIR/turma-agent.env"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-TTYD_VERSION="1.7.7"          # matches agent/Dockerfile
-GLAB_VERSION="1.111.0"        # matches agent/Dockerfile
+TTYD_VERSION="1.7.7"          # pinned static ttyd binary
+GLAB_VERSION="1.111.0"        # pinned static glab binary
 NODE_MAJOR_MIN=24            # standardized on Node 24 (tunnel-agent.js needs the global WebSocket, Node 22+)
 
 DO=install
@@ -168,7 +168,7 @@ ensure_node() {
 
 ensure_ttyd() {
   have ttyd && { info "ttyd present"; return 0; }
-  # Prefer apt; fall back to the pinned static binary (like the Dockerfile).
+  # Prefer apt; fall back to the pinned static binary.
   if have apt-get && { have_sudo || [ "$(id -u)" = 0 ]; } && $SUDO apt-get install -y ttyd 2>/dev/null; then
     info "ttyd installed via apt"; return 0
   fi
@@ -205,9 +205,9 @@ ensure_gh() {
 ensure_glab() {
   # glab is how a session opens a GitLab MR that Turma can attribute — the MR
   # counterpart of `gh pr create`. Without it a session improvises with the raw
-  # GitLab API and the MR never gets a chip (the container image bundles glab
-  # for the same reason). Static binary from GitLab's own releases, pinned to
-  # match the Dockerfile; best-effort like gh — a GitHub-only host loses nothing.
+  # GitLab API and the MR never gets a chip. Static binary from GitLab's own
+  # releases, pinned to GLAB_VERSION; best-effort like gh — a GitHub-only host
+  # loses nothing.
   have glab && { info "glab present"; return 0; }
   local arch; arch="$(uname -m)"
   case "$arch" in

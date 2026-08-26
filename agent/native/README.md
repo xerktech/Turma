@@ -1,24 +1,22 @@
 # Native Turma agent (WSL / Linux, no Docker)
 
 Runs the Turma per-host agent **directly on the host**, reusing its built-in
-tooling, instead of the `ghcr.io/xerktech/turma-agent` container. Good for a WSL
-box (or any Linux desktop) that already has git, node, python, and a logged-in
-Claude — you skip the 2–7 GB image and everything lands owned by your own user.
+tooling. This is the only way the agent runs — the repo no longer builds a
+container image. Good for a WSL box (or any Linux desktop) that already has git,
+node, python, and a logged-in Claude — everything lands owned by your own user.
 
-It runs the exact same `hub-agent.py` + `tunnel-agent.js` + hooks as the image;
-this directory only adds the launcher, installer, service, and self-updater. The
-agent connects **purely outbound** to the hub, so it works from any network with
-no inbound exposure.
+This directory holds the launcher, installer, service, and self-updater around
+the shared `hub-agent.py` + `tunnel-agent.js` + hooks. The agent connects
+**purely outbound** to the hub, so it works from any network with no inbound
+exposure.
 
 ## What it is / isn't
 
-- **Same** session model, heartbeat, worktrees, Jira/PR/usage features as the
-  container.
-- **Not** installed: the cloud CLIs (aws/az/terraform), PowerShell, the docker
-  CLI, and the Android toolchain (JDK/Gradle/SDK) the image bundles — a session
-  that needs those should use the Docker image, or the host must provide them
-  itself. `gh` is installed (needed for auto-update on a private repo and for
-  private git/PR).
+- The full session model, heartbeat, worktrees, Jira/PR/usage features.
+- **Not** installed by default: the cloud CLIs (aws/az/terraform), PowerShell,
+  the docker CLI, and the Android toolchain (JDK/Gradle/SDK) — a session that
+  needs those requires the host to provide them itself. `gh` is installed
+  (needed for auto-update on a private repo and for private git/PR).
 
 ## Prerequisites (auto-installed)
 
@@ -194,13 +192,12 @@ curl -fsSL .../bootstrap.sh | bash -s -- --verify
 ## Known limitations (graceful degradation)
 
 - **No container self-inspect** — the heartbeat's container-log tail is empty
-  (`docker logs` isn't there). Sessions and per-session restart are unaffected.
-  `startedAt` falls back to the manager's own start time when `docker inspect`
-  can't answer, so the host card's Uptime reads as MANAGER uptime here (an
-  update restart resets it) and the hub's restart-loop alert still catches a
-  crash-looping native manager.
-- **`DEVICE_NAME` is explicit** — the container's docker/SMB auto-detection is
-  gone; the launcher defaults it to `$(hostname)`.
+  (there is no docker container to `docker logs`). Sessions and per-session
+  restart are unaffected. `startedAt` falls back to the manager's own start time,
+  so the host card's Uptime reads as MANAGER uptime here (an update restart resets
+  it) and the hub's restart-loop alert still catches a crash-looping manager.
+- **`DEVICE_NAME` is explicit** — with no container, the docker/SMB
+  auto-detection isn't available; the launcher defaults it to `$(hostname)`.
 - **Lifetime** — the agent lives only while the WSL distro is running. Windows
   may idle-stop the distro after the last shell exits despite lingering; there's
   no Docker-daemon-under-a-Windows-service to keep it up.
@@ -213,6 +210,6 @@ curl -fsSL .../bootstrap.sh | bash -s -- --verify
   `$PREFIX/tmux.conf`, or colors flatten and every copy made in the terminal is
   silently dropped. The agent's sessions also share the user's own tmux server
   on a native host, so a personal tmux config applies to them.
-- **Manual `stop` leaves sessions running** — like the container's "kill keeps
-  the worktree", stopping the service orphans the tmux/ttyd (a later `start`
-  re-adopts). `--uninstall` prints how to sweep them.
+- **Manual `stop` leaves sessions running** — as with "kill keeps the worktree",
+  stopping the service orphans the tmux/ttyd (a later `start` re-adopts).
+  `--uninstall` prints how to sweep them.

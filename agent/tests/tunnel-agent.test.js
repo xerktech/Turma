@@ -1669,7 +1669,7 @@ test("deviceName refuses a dot-segment DEVICE_NAME override", () => {
       process.env.DEVICE_NAME = bad;
       const got = deviceName();
       // Whatever source it falls through to, it must not be the dot segment —
-      // entrypoint.sh exports an operator-set DEVICE_NAME to both processes
+      // the native launcher exports an operator-set DEVICE_NAME to both processes
       // unvalidated, so this is the path that would split the identity.
       assert.notEqual(got, bad, `fell through instead of returning ${bad}`);
       assert.ok(got && got.length, "resolved to some usable name");
@@ -1714,7 +1714,7 @@ test("BLOCK_CAPS matches hub-agent.py's, value for value", () => {
 // V8's ~512 MB string ceiling (previews come off DISK, so no transcript window
 // bounds them — XERK-355). This runs in a setInterval with no uncaughtException
 // handler in this file, so the throw took the whole tunnel process down and
-// entrypoint.sh restarted it in a loop for as long as the session was watched —
+// the native launcher restarted it in a loop for as long as the session was watched —
 // every terminal, live tail and heartbeat poke on the host with it.
 test("pollWatcher survives a tail JSON.stringify cannot produce", async () => {
   const mod = require("../tunnel-agent.js");

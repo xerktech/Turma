@@ -1,8 +1,8 @@
 # Releasing Turma
 
-One release publishes **all six components** under a single `v<MAJOR>.<MINOR>.<PATCH>`
-tag: the `turma` image, the `agent` image, the glasses app, the android
-`.apk`, the native-agent tarball, and the veiller miniapp `.zip`. Driven by
+One release publishes **all four components** under a single `v<MAJOR>.<MINOR>.<PATCH>`
+tag: the `turma` (hub) image, the native-agent tarball, the glasses app, and the
+android `.apk`. Driven by
 `.github/workflows/release.yml`;
 the logic lives in `.github/scripts/` (see its README). The glasses build is
 **not a release asset**: its distribution channel is the Even Hub developer
@@ -20,7 +20,7 @@ dev-portal publish").
 ## Patch releases (automatic)
 
 Every merge to `main` that touches a component's source (`turma/`, `agent/`,
-`glasses/`, `android/`, `veiller/`) cuts a patch release — a merge that touches only docs or
+`glasses/`, `android/`) cuts a patch release — a merge that touches only docs or
 the release machinery does not, since every component would be carried and the
 release would publish nothing new. `plan` diffs the merge against the previous
 release tag and decides, per component, **build or carry**:
@@ -31,7 +31,7 @@ release tag and decides, per component, **build or carry**:
   portal-publishes the new glasses app and copies the previous
   `turma-android-v*.apk` / native tarball onto the release unchanged.
 
-So a release always contains all six components; carried ones simply read their
+So a release always contains all four components; carried ones simply read their
 older version. The release notes render a **rebuilt vs carried** table from the
 attached `manifest.json`, which is the machine-readable source of truth.
 
@@ -39,7 +39,7 @@ Carried **images** are referenced in the manifest at their prior `:version` tag
 (we do not retag an unchanged image to the new version — `:0.3.9` pointing at
 `0.3.4` bits would be as misleading as renaming a carried asset). `:latest` is
 already correct on a carried image, so Watchtower needs nothing. Carried
-**assets** (the `.apk`, native tarball, and veiller `.zip`) are copied forward
+**assets** (the `.apk` and native tarball) are copied forward
 under their **original filename**, because Android and the native updater version
 an install by the version baked *inside* the file — the name must describe the
 bits. A
@@ -137,12 +137,11 @@ this repo, a classic PAT would carry a whole account into CI, and a fine-grained
 one expires — which fails as a deploy that silently stops happening. Revoke by
 deleting the deploy key.
 
-Two things it deliberately does not do. It does not fire for a **carried**
-(unchanged) hub, because the job it lives in doesn't run then; but "built" is
-not "changed" — `changes.js` maps the whole `turma/` prefix, so a test-only
-merge still rebuilds and redeploys a runtime-identical hub (XERK-426). And the
-cluster-side Turma **agent** (`ai/turma-agent`) is still bumped by hand, since
-restarting it kills every session that host is running.
+One thing it deliberately does not do: fire for a **carried** (unchanged) hub,
+because the job it lives in doesn't run then; but "built" is not "changed" —
+`changes.js` maps the whole `turma/` prefix, so a test-only merge still rebuilds
+and redeploys a runtime-identical hub (XERK-426). The `k8x` agent runs natively
+(not as an image this release publishes), so nothing here deploys it.
 
 ## Known wrinkles
 

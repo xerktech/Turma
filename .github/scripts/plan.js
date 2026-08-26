@@ -52,11 +52,9 @@ function main() {
     changed: JSON.stringify(changed),
     force_all: forceAll,
     build_turma: changed.turma,
-    build_agent_image: changed["agent-image"],
     build_agent_native: changed["agent-native"],
     build_glasses: changed.glasses,
     build_android: changed.android,
-    build_veiller: changed.veiller,
   });
 
   // Human-readable summary for the Actions run log / step summary.

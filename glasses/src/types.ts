@@ -149,7 +149,7 @@ export interface AgentInfo {
   jira?: { siteKey?: string | null; orgName?: string | null; [key: string]: unknown } | null;
   // dsh runtime capability (XERK-460): present with `available:true` only on a
   // host that can launch dsh sessions, mirroring `localModel`. Read by nothing
-  // here today (glasses/veiller don't spawn), but typed so the field is decoded
+  // here today (glasses doesn't spawn), but typed so the field is decoded
   // and available for a future runtime picker; coerced hub-side (`normalizeDsh`).
   dsh?: { available?: boolean; [key: string]: unknown } | null;
   [key: string]: unknown; // startedAt, memory, logTail, reposRoot, ...

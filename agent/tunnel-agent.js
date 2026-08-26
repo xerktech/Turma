@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Reverse-tunnel client for the turma terminal gateway (compose/claude-code.yaml).
 //
-// Runs in the background of every Turma container (started by
-// entrypoint.sh) alongside hub-agent.py — ONE control channel per host, keyed
+// Runs in the background of every Turma agent (started by the native launcher
+// agent/native/turma-agent) alongside hub-agent.py — ONE control channel per host, keyed
 // by the host name. It keeps a persistent OUTBOUND WebSocket to the hub's
 // control endpoint. When a browser opens a session's terminal in the Turma,
 // the hub sends {"open":<ch>,"port":<ttydPort>} on that control channel; we then
@@ -1244,8 +1244,8 @@ function pollWatcher(sessionId) {
     // ~512 MB string ceiling — previews are read from disk, so no transcript
     // window bounds them (XERK-355) — and this runs in a setInterval with no
     // uncaughtException handler in this file: the RangeError killed the whole
-    // tunnel process, which entrypoint.sh then restarted in a loop for as long
-    // as that session was watched. Skipping one frame is a stale tail; dying is
+    // tunnel process, which the native launcher then restarted in a loop for as
+    // long as that session was watched. Skipping one frame is a stale tail; dying is
     // every session's terminal, live tail and heartbeat poke on this host.
     try {
       const json = JSON.stringify(tail);
@@ -1345,14 +1345,12 @@ function stopAllWatches() {
 // to a whole TURMA_INTERVAL later. The manager installs a SIGUSR1 handler that
 // cuts its interval sleep short.
 //
-// Which pid that is depends on how the agent was launched, so the launcher
-// names it: turma-agent exports TURMA_MANAGER_PID (its own $$, which `exec`
-// makes the manager's). PID 1 is the fallback for the container, where
-// entrypoint.sh `exec`s hub-agent.py as PID 1 — but ONLY there. On a native
-// install PID 1 is systemd, and signalling it raised EPERM on every poke, so
-// every hub command silently waited out a full beat instead of landing in
-// about a round-trip. Still best-effort: a failed signal costs latency, never
-// correctness, since the scheduled beat delivers the command anyway.
+// The launcher names the manager's pid: turma-agent exports TURMA_MANAGER_PID
+// (its own $$, which `exec` makes the manager's). The bare `|| 1` fallback is a
+// last resort only — under systemd PID 1 is init, and signalling it raised EPERM
+// on every poke, so every hub command silently waited out a full beat instead of
+// landing in about a round-trip. Still best-effort: a failed signal costs
+// latency, never correctness, since the scheduled beat delivers the command anyway.
 function pokeHeartbeat() {
   const pid = Number(process.env.TURMA_MANAGER_PID) || 1;
   try {
@@ -1376,8 +1374,8 @@ function log(msg) {
   console.log(`[tunnel-agent] ${msg}`);
 }
 
-// The physical host name the hub keys agents by. entrypoint.sh resolves it once
-// (via `hub-agent.py --print-device`, which includes the SMB probe of the
+// The physical host name the hub keys agents by. The native launcher resolves it
+// once (via `hub-agent.py --print-device`, which includes the SMB probe of the
 // Windows host on Docker Desktop) and exports DEVICE_NAME, so here we read that
 // env FIRST — that's how the tunnel and the heartbeat register under one
 // identity and /term/<name> lines up. The remaining sources mirror
@@ -1431,7 +1429,7 @@ function dockerHostName() {
 function deviceName() {
   // The env override outranks the placeholder rules (an operator naming a host
   // "localhost" means it), but a dot segment is unaddressable no matter who
-  // chose it — and entrypoint.sh exports an operator-set DEVICE_NAME to BOTH
+  // chose it — and the native launcher exports an operator-set DEVICE_NAME to BOTH
   // processes unvalidated, so this is the path that would split the identity.
   for (const env of ["DEVICE_NAME", "COMPUTERNAME"]) {
     const v = (process.env[env] || "").trim();

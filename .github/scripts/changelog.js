@@ -12,28 +12,24 @@
 
 "use strict";
 
-// Component -> display heading. agent-image and agent-native both fold into one
-// "Agent" heading; an unmatched change (empty components) lands in "Other".
+// Component -> display heading. An unmatched change (empty components) lands in
+// "Other".
 const COMPONENT_HEADING = {
   turma: "Hub",
-  "agent-image": "Agent",
   "agent-native": "Agent",
   glasses: "Glasses",
   android: "Android",
-  veiller: "Veiller",
 };
-const HEADING_ORDER = ["Hub", "Agent", "Glasses", "Android", "Veiller", "Other"];
+const HEADING_ORDER = ["Hub", "Agent", "Glasses", "Android", "Other"];
 
 // Component -> row label for the release-notes summary table.
 const COMPONENT_LABEL = {
   turma: "Hub (image)",
-  "agent-image": "Agent (image)",
   "agent-native": "Agent (native)",
   glasses: "Glasses (Even Hub)",
   android: "Android",
-  veiller: "Veiller (miniapp .zip)",
 };
-const TABLE_ORDER = ["turma", "agent-image", "agent-native", "glasses", "android", "veiller"];
+const TABLE_ORDER = ["turma", "agent-native", "glasses", "android"];
 
 // First line, trimmed, internal whitespace collapsed — a PR title or commit
 // subject that somehow carries a newline can't break a markdown bullet/table.
@@ -132,14 +128,12 @@ function renderComponentTable(manifest) {
 const INSTALL_DETAILS = [
   "<details><summary>Install / deploy</summary>",
   "",
-  "- **Images** (`Hub`, `Agent`): deployed on the home lab by Watchtower from `:latest`.",
+  "- **Hub** (image): deployed on the home lab by Watchtower from `:latest`.",
   "  Pin a specific build with the `ghcr.io/...` ref in the table above.",
   "- **Agent (native)**: WSL/Linux hosts self-update from this stream; see `agent/native/README.md`.",
   "- **Glasses**: published to the Even Hub developer portal (no release asset);",
   "  promote the build there, then update the app from the Even phone app.",
   "- **Android** (`.apk`): download below and install (enable \"install unknown apps\"). Debug-signed.",
-  "- **Veiller** (`.zip`): the Turma miniapp for the Veiller app — bundled into the",
-  "  Veiller app's `mobile/assets/miniapps/` in the Veiller repo.",
   "",
   "Carried components are unchanged since the version shown; their artifact name reflects the",
   "build it actually is. `manifest.json` (attached) is the machine-readable source of truth.",

@@ -24,13 +24,12 @@ check whether anything validates the *scheme*.
 
 A test exists, is green, and is wired to nothing.
 
-- `glasses`/`veiller` vendor `turma/public/{chat,board}.js` verbatim and assert
-  byte-identity — but their CI only triggered on their own directories. A PR
-  editing the source of truth never ran the guard, and three vendored copies
-  drifted before anyone noticed.
-- `veiller`'s copy of that test compared the vendored file against a hash baked
-  in from **that same file**. It could only catch someone editing the copy,
-  never the upstream moving. Green the whole time it was wrong.
+- `glasses` vendors `turma/public/{chat,board}.js` verbatim and asserts
+  byte-identity — but its CI only triggered on its own directory. A PR
+  editing the source of truth never ran the guard, and vendored copies
+  drifted before anyone noticed. (A vendor test that compares the copy against a
+  hash baked in from that same file is worse than useless — it can only catch
+  someone editing the copy, never the upstream moving, and stays green while wrong.)
 - `code-scan.yml` omitted `android/**`, so an Android-only PR ran zero SAST —
   while two Android files carried `nosemgrep` annotations written on the
   assumption that it runs.
@@ -125,10 +124,10 @@ exercised code in the tree.
   caller omitted them; only the new unit test exercised it. **Check the call
   sites, not just the function** — a fix behind an optional argument is a fix
   only for whoever passes it.
-- **A doc that undercounts.** CLAUDE.md said "four mirrors must agree" for
-  `readyForReview`; there are five, and the fifth (`veiller/src/core/sessions.ts`,
-  a fork rather than an import) was missed for exactly that reason. When a rule
-  names its own copies, grep for a sixth before believing the list.
+- **A doc that undercounts.** CLAUDE.md once undercounted the `readyForReview`
+  mirrors, and the missed one was a fork rather than an import — easy to overlook
+  for exactly that reason. When a rule names its own copies, grep for one more
+  before believing the list.
 - **A test that asserts presence rather than meaning.** The Android backup-rules
   test checked that both prefs filenames appeared in the XML. Flipping `<exclude>`
   to `<include>` keeps both names present and INVERTS the rule — those two files
@@ -180,7 +179,7 @@ in shell that runs at boot.
 
 ### 5.9 Techniques that found what reading the source did not (XERK-254)
 
-For `agent/native/` and `agent/entrypoint.sh`; each of these surfaced a defect that
+For `agent/native/`; each of these surfaced a defect that
 review, shellcheck and a green suite had all passed.
 
 - **Measure as the identity the code runs as.** `[ "$(id -u)" = 0 ]` guards a whole branch of the
@@ -203,7 +202,7 @@ review, shellcheck and a green suite had all passed.
   timesyncd on a host with no battery-backed RTC), which is exactly when this code runs, and
   `$(( now - started ))` is then negative.
 - **Time the recovery, don't just assert it happened.** "Never blocked" and "rescued by a watchdog
-  after N seconds" both end with a booted container; only the elapsed time tells them apart.
+  after N seconds" both end with a booted agent; only the elapsed time tells them apart.
 - **Sample fast when measuring a swap window.** `npm install -g` unlinks the bin before extracting,
   so `claude` is absent from PATH for ~1.5-2s; a single probe misses it, a 50ms loop doesn't.
 
@@ -225,11 +224,6 @@ Staging and driving them, which every case above needed:
 - The **real** npm registry is cheap and safe if you sandbox it: `export
   npm_config_prefix=$SCRATCH/pfx npm_config_cache=$SCRATCH/cache`. The install is ~250 MB and ~3s;
   `npm view @anthropic-ai/claude-code version` answers in <0.5s.
-- The container half is drivable end to end with a REAL claude: `node:24-bookworm-slim` + `npm i -g
-  @anthropic-ai/claude-code@<older>` + the real `entrypoint.sh` + stub
-  `python3`/`hub-agent.py`/`tunnel-agent.js`. Keep the stub manager alive (`sleep`) or the container
-  exits first. `test_entrypoint.sh` stubs claude+npm, so it observes the DECISION only — never file
-  ownership, writes under `/root`, or timing.
 - A **running** claude survives the package swap (one static ELF, the kernel keeps the inode); only
   a new exec in the window fails.
 

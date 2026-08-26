@@ -5,7 +5,6 @@ paths:
   - "turma/public/board.js"
   - "turma/public/board.html"
   - "glasses/src/vendor/board.cjs"
-  - "veiller/src/ui/vendor/board.cjs"
   - "android/app/src/main/java/com/xerktech/turma/core/Board.kt"
   - "turma/tests/server.test.js"
   - "turma/tests/board.test.js"

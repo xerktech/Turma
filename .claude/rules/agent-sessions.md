@@ -13,15 +13,15 @@ process model and the command table.
 
 ## How a session runs
 
-- Each session runs as the entrypoint's resolved run-as identity
-  (`.claude/rules/agent-image.md`) as an interactive `claude --remote-control`, defaulting to
+- Each session runs as the native agent's run-as identity
+  (`.claude/rules/agent-native.md`) as an interactive `claude --remote-control`, defaulting to
   `--permission-mode auto`; the composer can pick
   `bypassPermissions`/`acceptEdits`/`plan`/`default`. `bypassPermissions` is refused **under root**
-  unless `IS_SANDBOX` is set (in the compose env).
+  unless `IS_SANDBOX` is set (in `turma-agent.env`).
 - Deliberately the interactive form, **not** `claude remote-control` server mode, whose terminal is
   a QR/status lobby with no conversation.
-- Sessions are independent processes inside the one container, so a session ending doesn't restart
-  the container — the manager marks it stopped. "Restart (clear context)" relaunches a single
+- Sessions are independent processes under the one agent manager, so a session ending doesn't restart
+  the manager — it marks the session stopped. "Restart (clear context)" relaunches a single
   session's Claude in place.
 - All of a host's sessions share the one mounted `~/.claude` login; distinct worktree paths give
   each its own project slug and Remote Control bridge pointer. `MAX_SESSIONS` caps concurrency; the
@@ -85,8 +85,8 @@ process model and the command table.
     job is live (`_poll_clones` bounds that one). `clone()` files a refusal under `slugify(spec)`,
     so a 3-segment GitLab/ADO spec lands under a key the job lookup can't see — behind an `elif`
     that retried every beat and `awaitCloneSince` never bounded anything.
-  - **A clone does NOT outlive its manager**: `entrypoint.sh` execs `hub-agent.py` as the
-    container's foreground process, so a manager restart takes the `git clone` child with it. A
+  - **A clone does NOT outlive its manager**: the native launcher runs `hub-agent.py` as the
+    managed foreground process, so a manager restart takes the `git clone` child with it. A
     restart mid-clone leaves a directory that `clone()` refuses as an existing dest — nothing can
     retry it — so that session errors in ONE beat naming the dir, rather than spinning out the
     deadline. Removing it is the operator's call; don't have the agent take it. The re-clone is for
@@ -117,8 +117,8 @@ process model and the command table.
   `CLOSED_PER_REPO` per repo. **Anything that must survive belongs on the durable side** — the
   transcripts under `~/.claude` (which `_resumable_report()` re-derives from), the hub's archive,
   and `~/.turma`.
-- **`~/.turma`'s durability is the HOST's to provide, and no code here may assume it.** A container
-  must bind-mount it or it is the image's writable layer, recreated on update; every ledger still
+- **`~/.turma`'s durability is the HOST's to provide, and no code here may assume it.** It lives in
+  the agent user's home on the host, so a reinstall/update must preserve it; every ledger still
   reconciles from disk rather than trusting itself.
 - Resuming relaunches `claude --resume <transcript id>` **cwd'd at that transcript's origin path**,
   re-creating a deleted/pruned worktree there first: Claude scopes id lookup to a repo's live
@@ -205,7 +205,7 @@ process model and the command table.
   exhausted subscription.
 - `LOCAL_MODEL_CONTEXT` must match what the server really serves: Claude Code assumes 200k for a
   model it doesn't recognise and would compact far too late, truncating server-side instead. The
-  default tracks the cue LLM's per-slot window, which DockerOps sizes — when that moves, this moves.
+  default tracks the cue LLM's per-slot window, sized per host in `turma-agent.env` — when that moves, this moves.
 - **It is a fallback, not a peer** — the local model solved 4/8 of the bench Claude would be expected
   to clear. The UI marks a `local` session so nobody has to wonder which model wrote a turn.
 - **Automatic delegation to the local model is deliberately NOT shipped**; the token arithmetic

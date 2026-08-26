@@ -178,7 +178,7 @@ class TestDeviceName(unittest.TestCase):
                 "truenas", bad)
 
     def test_env_wins_first(self):
-        # entrypoint.sh exports DEVICE_NAME after resolving once; it (or an
+        # The native launcher exports DEVICE_NAME after resolving once; it (or an
         # explicit operator override) is checked before any auto-detection.
         self.assertEqual(
             self._run(env={"DEVICE_NAME": "MAXAI"}, host_file="truenas\n",
@@ -13669,8 +13669,8 @@ class TestSpawnDuringAnUnfinishedClone(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._worktree_adds()[-1][-1], "origin/main")
 
     def test_an_interrupted_clone_says_so_at_once(self):
-        # A clone does NOT outlive its manager — entrypoint.sh execs
-        # hub-agent.py as the container's foreground process — and `clone()`
+        # A clone does NOT outlive its manager — the native launcher runs
+        # hub-agent.py as its managed foreground process — and `clone()`
         # refuses a dest that exists, so nothing here can retry. One beat, not
         # the deadline, and the message names the partial checkout.
         sm = self._manager(cloning=False)

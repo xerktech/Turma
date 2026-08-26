@@ -2307,8 +2307,8 @@
   // on the page raises — and the button keeps its short wording. Returns the
   // parsed body so the caller can read `limit`/`error` for that wording.
   //
-  // Guarded on TurmaNav: the vendored copies of this engine (glasses, veiller)
-  // render transcripts with none of the site chrome loaded.
+  // Guarded on TurmaNav: the vendored copy of this engine (glasses)
+  // renders transcripts with none of the site chrome loaded.
   async function hubRefused(what, res) {
     const body = await res.json().catch(() => null);
     const nav = typeof window !== "undefined" && window.TurmaNav;

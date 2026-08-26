@@ -9,10 +9,9 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
 **Nothing under `native/` edits the shared runtime files**; the one enabling change is
 `resume_on_boot`'s adopt path.
 
-- `turma-agent` — the launcher: the runtime half of `entrypoint.sh` minus every container/privilege
-  bit. Defaults `CLAUDE_PROJECTS_ROOT=$HOME/.claude/projects` (the one env decoupling from the
-  container's hardcoded `/root`) and `DEVICE_NAME=$(hostname)`, idles on missing claude creds,
-  supervises the tunnel, execs the manager.
+- `turma-agent` — the launcher: resolves the runtime env, idles on missing claude creds, supervises
+  the tunnel, execs the manager. Defaults `CLAUDE_PROJECTS_ROOT=$HOME/.claude/projects` (rooted at
+  the agent user's real `$HOME`, not a hardcoded `/root`) and `DEVICE_NAME=$(hostname)`.
 - It puts **`$HOME/.local/bin` on PATH itself** (XERK-94): a systemd `--user` unit doesn't inherit
   the login shell's PATH, so claude at the prefix `install.sh` blesses is otherwise unreachable and
   every session dies on exec. A missing claude is a **loud, log-only** warning at start —
@@ -34,8 +33,7 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     tunnel (else the old loop respawns the just-killed tunnel), and `turma-agentctl stop` reaps it
     too. Tests: `test_turma_agent.sh`.
 - The launcher exports **`TURMA_MANAGER_PID=$$`**, which `exec` makes the manager's own pid, so the
-  tunnel's `pokeHeartbeat` signals the right process. Its PID-1 fallback is right only in the
-  container.
+  tunnel's `pokeHeartbeat` signals the right process.
 - `install.sh` — idempotent (`--verify`/`--uninstall`): installs prereqs (apt + npm + pinned static
   ttyd + pinned static glab — the MR counterpart of `gh`, without which a session's MR never gets a
   chip; best-effort, absence doesn't fail `--verify`), lays files into a prefix **keeping
@@ -155,15 +153,15 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   PATH the launcher does** (XERK-94): its unit sets no PATH, so a `gh` installed there is invisible
   to the timer.
 - Not installed natively: cloud CLIs, PowerShell, docker CLI, the Android toolchain.
-- **Container ⇄ native parity (XERK-34)**: the same runtime files run in both, so session model,
-  heartbeat, board/PR/usage/archive features are identical. Known deltas:
-  - **Azure DevOps git/CLI enablement is container-only**: `--wire-azure-git` and
-    `AZURE_DEVOPS_EXT_PAT` are wired by `entrypoint.sh`, and `az` isn't installed natively at all, so
-    a native ADO host authenticates git and opens PRs with its own tooling. PR chips still work —
-    attribution is the creating COMMAND (`TURMA_PR_CREATE_CMDS`, see
-    `.claude/rules/agent-prs.md`), not the CLI — but nothing here provides that tooling.
+- **The native install is the ONLY runtime** (XERK-34): session model, heartbeat, board/PR/usage/
+  archive features all run from these shared files. Capabilities the removed container image used to
+  add, and that a native host therefore does NOT have:
+  - **Azure DevOps git/CLI enablement**: the `--wire-azure-git` path and `AZURE_DEVOPS_EXT_PAT` were
+    wired by the old container entrypoint, and `az` isn't installed natively at all, so a native ADO
+    host authenticates git and opens PRs with its own tooling. PR chips still work — attribution is
+    the creating COMMAND (`TURMA_PR_CREATE_CMDS`, see `.claude/rules/agent-prs.md`), not the CLI.
   - `startedAt` is docker's StartedAt where docker can answer, else the manager's OWN start time —
     **never empty** (`TestStartedAt`), keeping the restart-loop alert (keyed on `startedAt`
-    CHANGING) and card Uptime working natively. The log tail stays container-only.
+    CHANGING) and card Uptime working. The container-log tail is not available natively.
   - The bundled `tmux.conf` only takes effect at `/etc/tmux.conf`/`~/.tmux.conf`; a host with its
     own conf loses truecolor and the OSC 52 copy chain (hub-agent launches bare `tmux`).
