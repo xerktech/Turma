@@ -1980,13 +1980,17 @@ that is not in it is not yours to contact.
 PEER_CELL_MAX_CHARS = 120
 
 
-# dsh cross-session peer messaging (XERK-476). The reader thread stages traffic
-# and the beat delivers it, so both bounds guard the heartbeat: MAX caps the
-# backlog one session can build, PER_BEAT caps how many local socket writes one
-# beat does. Both generous against any real peer-message rate (a message costs
-# the receiver a turn, so the directive weights hard toward restraint).
+# dsh cross-session peer messaging (XERK-476). The reader thread STAGES traffic
+# and a WORKER thread DELIVERS it — never the beat: each delivery is a blocking
+# local socket write bounded by a 5s ack/inbox timeout, and a batch of them on
+# the heartbeat could approach OFFLINE_AFTER_MS if targets are wedged (the
+# XERK-395 rule that moved prune/archive-sync off the beat). MAX caps the backlog
+# one session can build; DELIVER_BATCH caps how many the worker pops per drain
+# pass (it loops until the queue is empty, so this only bounds one pass's memory
+# footprint, not throughput). Both generous against any real peer-message rate (a
+# message costs the receiver a turn, so the directive weights hard to restraint).
 DSH_PEER_TRAFFIC_MAX = 200
-DSH_PEER_TRAFFIC_PER_BEAT = 20
+DSH_PEER_DELIVER_BATCH = 20
 
 
 def _dsh_peer_frame(name, text):
@@ -11311,12 +11315,16 @@ class SessionManager:
         # cross-session traffic here for the BEAT to deliver — a dsh SEND
         # (`peer_send`: the session's send_message tool wants to reach a roster
         # name) and a native RECEIVE (`peer_inbound`: a Claude peer's SendMessage
-        # arrived at the driver's forged Claude-inbox socket). Both are drained by
-        # `_drain_dsh_peer_traffic` so the actual delivery (a socket write to
-        # ANOTHER session, and the crossSessionInbound policy read) runs on the
-        # beat like notify_session, never on a callback (the DshControl invariant).
+        # arrived at the driver's forged Claude-inbox socket). Delivery — a
+        # blocking socket write to ANOTHER session plus the crossSessionInbound
+        # policy read — runs on a WORKER thread (_dsh_peer_worker_loop), never a
+        # callback (the DshControl invariant) and never the beat (XERK-395: a
+        # batch of 5s-bounded writes could approach OFFLINE_AFTER_MS). The reader
+        # only appends + wakes the worker.
         self.dsh_peer_traffic = []               # [(src_sid, kind, arg, text)]
         self._dsh_peer_lock = threading.Lock()
+        self._dsh_peer_wake = threading.Event()
+        self._dsh_peer_worker = None
         self.usage_cache = {}                    # id -> usage_report result
         self.slug_usage = {}                     # project slug -> {acc, offsets}
                                                  # persistent incremental usage fold,
@@ -15821,21 +15829,55 @@ class SessionManager:
         with self._dsh_peer_lock:
             # Bound the queue: a session emitting peer_sends in a loop must not
             # grow it without limit. Oldest-dropped — a lost peer message is the
-            # accepted failure (Claude's own is best-effort too), a stalled beat
-            # is not. The cap is generous against any real burst.
+            # accepted failure (Claude's own is best-effort too). The cap is
+            # generous against any real burst.
             self.dsh_peer_traffic.append((sid, kind, arg, text))
             del self.dsh_peer_traffic[:-DSH_PEER_TRAFFIC_MAX]
+        # Wake the delivery worker (started once in run_forever). Only setting the
+        # event here — never starting a thread — keeps staging side-effect-free
+        # for the unit tests, which drive _drain_dsh_peer_traffic directly and
+        # would otherwise race a background worker draining the same queue.
+        self._dsh_peer_wake.set()
+
+    def _start_dsh_peer_worker(self):
+        """Start the peer-delivery worker once (from run_forever). Idempotent and
+        restart-safe: a relaunched loop that finds a live worker is a no-op."""
+        with self._dsh_peer_lock:
+            w = self._dsh_peer_worker
+            if w is not None and w.is_alive():
+                return
+            self._dsh_peer_worker = threading.Thread(
+                target=self._dsh_peer_worker_loop, name="dsh-peer", daemon=True)
+            self._dsh_peer_worker.start()
+
+    def _dsh_peer_worker_loop(self):
+        """Deliver staged dsh peer traffic off the beat (XERK-395): each delivery
+        is a blocking local socket write bounded by a 5s ack/inbox timeout, and a
+        batch of them on the heartbeat could approach OFFLINE_AFTER_MS. Waits on
+        the wake event, then drains the queue to empty in DSH_PEER_DELIVER_BATCH
+        passes. Never raises — a dead worker would silently stop peer delivery."""
+        while True:
+            self._dsh_peer_wake.wait()
+            self._dsh_peer_wake.clear()
+            try:
+                while True:
+                    with self._dsh_peer_lock:
+                        if not self.dsh_peer_traffic:
+                            break
+                    self._drain_dsh_peer_traffic()
+            except Exception as e:
+                log(f"dsh peer worker error: {type(e).__name__}: {e}")
 
     def _drain_dsh_peer_traffic(self):
-        """Deliver staged dsh peer traffic — SENDS and native RECEIVES — on the
-        beat. Bounded per beat so a backlog cannot stall the heartbeat past
-        OFFLINE_AFTER_MS (each delivery is a local socket write with its own short
-        timeout; DSH_PEER_TRAFFIC_PER_BEAT of them stays well inside INTERVAL)."""
+        """Deliver one batch of staged dsh peer traffic — SENDS and native
+        RECEIVES. Runs on the peer WORKER thread (or directly in tests). Pops
+        under the lock, then delivers OUTSIDE it (a per-item try/except keeps one
+        wedged target from starving the rest, and no exception escapes)."""
         with self._dsh_peer_lock:
             if not self.dsh_peer_traffic:
                 return
-            batch = self.dsh_peer_traffic[:DSH_PEER_TRAFFIC_PER_BEAT]
-            del self.dsh_peer_traffic[:DSH_PEER_TRAFFIC_PER_BEAT]
+            batch = self.dsh_peer_traffic[:DSH_PEER_DELIVER_BATCH]
+            del self.dsh_peer_traffic[:DSH_PEER_DELIVER_BATCH]
         for src_sid, kind, arg, text in batch:
             try:
                 if kind == "send":
@@ -20093,10 +20135,10 @@ class SessionManager:
         # stale-dropped by _hook_question — a dsh interaction has no ask.py
         # self-timeout (XERK-467 [C]).
         self._refresh_dsh_questions()
-        # Deliver staged dsh cross-session peer traffic (XERK-476) — sends the
-        # session's send_message tool queued, and native peer messages that
-        # arrived at its forged inbox socket — off the reader thread, on the beat.
-        self._drain_dsh_peer_traffic()
+        # dsh cross-session peer traffic (XERK-476) is delivered by its own WORKER
+        # thread (_dsh_peer_worker_loop, started in run_forever), NOT here: each
+        # delivery is a blocking socket write and a batch of them could approach
+        # OFFLINE_AFTER_MS (XERK-395). The beat only stages via the reader thread.
         # Seed names for bare-spawned sessions from their transcript's first
         # prompt (channel-agnostic; the live terminal bypasses send_input), then
         # reap any finished naming subprocess.
@@ -20494,6 +20536,11 @@ class SessionManager:
         if dsh_configured():
             threading.Thread(target=self._ensure_dsh_profile,
                              name="dsh-profile", daemon=True).start()
+        # The dsh peer-message delivery worker (XERK-476): delivers staged
+        # cross-session traffic off the beat (see _dsh_peer_worker_loop). Started
+        # unconditionally — it is idle until a dsh session stages a message — so a
+        # backlog resumed on boot drains without waiting for the next stage.
+        self._start_dsh_peer_worker()
         beat = 0
         while True:
             # Clear before the beat so a poke that lands *during* it (a command

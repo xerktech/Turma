@@ -3828,6 +3828,32 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
             sm._drain_dsh_peer_traffic()
         self.assertEqual(tgt_ctl.inputs, [])
 
+    def test_peer_send_to_own_name_is_not_echoed(self):
+        # A session addressing its OWN rcName must not deliver to itself — the
+        # `id != src_sid` guard drops it (rcNames are unique per _unique_rc_name,
+        # so this is defence, not the common case).
+        sm, src_ctl, _ = self._peer_pair("dsh")
+        src = sm._find("src")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._on_dsh_peer_send("src", {"name": src["rcName"], "text": "to myself"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(src_ctl.inputs, [])
+
+    def test_peer_send_ambiguous_name_is_dropped(self):
+        # Two running sessions sharing an rcName make the name unaddressable
+        # (SendMessage refuses an ambiguous name too) — drop rather than guess.
+        sm, src_ctl, tgt_ctl = self._peer_pair("dsh")
+        dup = {"id": "tgt2", "status": "running", "agentType": "dsh",
+               "rcName": "host-Repo-TGT", "summary": "named", "summaryAttempts": 1,
+               "worktreePath": os.path.join(self.tmp, "tgt2")}
+        sm.registry.append(dup)
+        dup_ctl = _FakeDshControl(); sm.dsh_controls["tgt2"] = dup_ctl
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._on_dsh_peer_send("src", {"name": "host-Repo-TGT", "text": "which one?"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(tgt_ctl.inputs, [])
+        self.assertEqual(dup_ctl.inputs, [])
+
     def test_peer_send_to_opted_out_target_is_dropped(self):
         sm, src_ctl, tgt_ctl = self._peer_pair("dsh")
         with mock.patch.object(ha, "_inbox_opted_out", lambda wt: True):
