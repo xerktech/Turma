@@ -95,7 +95,8 @@ class ChatModelChipsTest {
     @Test
     fun `the run chip stays for a local session whose host stopped reporting one`() {
         openChat(modelSource = "local", localModel = null)
-        compose.onNodeWithText("🏠 run: local model").assertIsDisplayed()
+        // The source chip reads "Other" (the model is named in the model chip).
+        compose.onNodeWithText("🏠 run: Other").assertIsDisplayed()
     }
 
     /** No capability, no session on it — no chip. */

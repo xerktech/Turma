@@ -1945,7 +1945,10 @@ test("composer: 'Run against' appears only when the host reports a local model",
     localModel: { available: true, model: "gpt-oss:120b" },
   });
   assert.match(withLocal, /Run against/);
-  assert.match(withLocal, /gpt-oss:120b/, "names the host's actual model");
+  // The source selector reads "Other", not the raw model id — the model is named
+  // in its own revealed dropdown (covered by the discovered-models test below).
+  assert.match(withLocal, />Other</, "the local source reads 'Other'");
+  assert.doesNotMatch(withLocal, /gpt-oss:120b/, "the raw model id is not in the source selector");
 
   const without = open({
     key: "hostA", device: "hostA", online: true, terminalOnline: true,

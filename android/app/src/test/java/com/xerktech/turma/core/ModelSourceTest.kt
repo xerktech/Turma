@@ -193,15 +193,15 @@ class ModelSourceTest {
         assertEquals("☁", ModelSource.glyph(ModelSource.SUBSCRIPTION))
     }
 
-    @Test fun `a local session reads as the model name, not the word local`() {
-        // It is a weaker model than Claude; nobody should have to wonder which
-        // one wrote a turn.
-        assertEquals("gpt-oss:120b", ModelSource.label(ModelSource.LOCAL, configured))
+    @Test fun `the local source reads 'Other', not the raw model id`() {
+        // The selector is subscription vs the host's own endpoint; the model is
+        // named in the adjacent model dropdown, so the raw discovered id is noise
+        // here. Independent of whether a model name is reported.
+        assertEquals("Other", ModelSource.label(ModelSource.LOCAL, configured))
         assertEquals("Subscription", ModelSource.label(ModelSource.SUBSCRIPTION, configured))
-        // A host that stopped reporting a name still labels the row honestly.
-        assertEquals("local model", ModelSource.label(ModelSource.LOCAL, null))
-        assertEquals("Self-hosted model", ModelSource.options(null)[1].second)
-        assertEquals("gpt-oss:120b", ModelSource.options(configured)[1].second)
+        assertEquals("Other", ModelSource.label(ModelSource.LOCAL, null))
+        assertEquals("Other", ModelSource.options(null)[1].second)
+        assertEquals("Other", ModelSource.options(configured)[1].second)
         assertEquals(
             listOf(ModelSource.SUBSCRIPTION, ModelSource.LOCAL),
             ModelSource.options(configured).map { it.first },
