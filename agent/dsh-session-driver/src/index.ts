@@ -526,7 +526,16 @@ export function apply(ctx: Context, config: Config) {
   // like SendMessage); the hub logs an undeliverable name. `defineTool` is
   // dynamic-imported (the sandbox-policy pattern) so the plugin stays standalone.
   ;(async () => {
-    if (!ctx.tools || typeof ctx.tools.register !== 'function') return
+    // Resolve the tools service via ctx.get, NOT `ctx.tools`: cordis THROWS on a
+    // property access for a service not named in `inject` ("cannot get property
+    // tools without inject"), which fires before any `!ctx.tools` guard and
+    // aborts the whole plugin load — DOA on the real `web` profile. `ctx.get`
+    // returns undefined for an absent/uninjected service instead (the same
+    // tolerated-optional pattern the preset mount uses), so a deployment without
+    // dsh-tools simply skips the peer send_message tool. (Fixes an XERK-476 [L]
+    // crash surfaced while QAing XERK-475.)
+    const tools = ctx.get('tools') as { register(d: unknown): () => void } | undefined
+    if (!tools || typeof tools.register !== 'function') return
     let defineTool: (o: unknown) => unknown
     try {
       // Indirect specifier (the sandbox-policy pattern): resolved at runtime from
@@ -540,7 +549,7 @@ export function apply(ctx: Context, config: Config) {
       return
     }
     try {
-      ctx.tools.register(defineTool({
+      tools.register(defineTool({
         name: 'send_message',
         description: 'Send a short message to another session in your organisation, '
           + 'addressed by its `name` exactly as it appears in ~/.turma/peers.tsv. '
