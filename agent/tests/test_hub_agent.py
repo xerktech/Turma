@@ -3769,6 +3769,246 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.dsh_status["dsh1"], "running")
 
 
+class TestDshPrAttribution(ManagerMixin, unittest.TestCase):
+    """XERK-472 [dsh][H]: a dsh session that opens a PR gets the SAME chips,
+    ledgers, attribution and comment/conflict delivery as a Claude Code one —
+    with no dsh-specific PR code, exactly as D4 predicted.
+
+    That prediction is load-bearing and this class is what proves it. PR
+    attribution keys on a `gh pr create` landing as a real Bash tool_use /
+    tool_result pair in the transcript (`_scan_pr_line`); a dsh session's
+    transcript is the S1 projection of dsh's own event log, and the projector
+    maps dsh's `bash` tool onto the `Bash` name the scan keys on
+    (`_TOOL_NAME_MAP`, dsh_transcript.py). So the whole PR web — the per-beat
+    scan, `_seed_prs`, `refresh_pr_status`, the GitLab/ADO dispatch, and the
+    comment/conflict nudges typed back in — reads and writes a dsh session with
+    no branch on `agentType`. These tests drive the REAL projector over the REAL
+    dsh corpus (which carries a `gh pr create` flow), never a hand-rolled JSONL
+    fixture that could drift from real dsh output — the G1 lesson.
+
+    A change that breaks any of this — the projector's name map, the scan's
+    Bash-name gate, or the dsh delivery arm of notify_session — fails here rather
+    than silently leaving dsh PRs chipless.
+    """
+
+    # The PR the corpus's `gh pr create` opens (see agent/tests/dsh_corpus.json).
+    PR_URL = "https://github.com/xerktech/Turma/pull/999"
+
+    def _dt(self):
+        """The real dsh projector, loaded by path like TestDshArchiveSync — the
+        projection under test is genuine dsh output, not a fixture."""
+        path = os.path.join(AGENT_DIR, "dsh_transcript.py")
+        spec = importlib.util.spec_from_file_location("dsh_transcript", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _corpus(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "dsh_corpus.json")) as f:
+            return json.load(f)
+
+    def _projected(self, sid, wt):
+        """The projected Claude-JSONL entries for the corpus, as the launcher
+        would append them to the pinned <sid>.jsonl."""
+        return self._dt().project_log(self._corpus(), sid, cwd=wt)
+
+    def _write_transcript(self, wt, sid, entries):
+        slug = ha._project_slug(wt)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        return path
+
+    def _dsh_session(self, sm, sid="dsh1", wt=None, ctl=True):
+        wt = wt or os.path.join(self.tmp, "worktrees", "Turma", sid)
+        cid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        sess = {"id": sid, "status": "running", "agentType": "dsh",
+                "worktreePath": wt, "claudeSessionId": cid,
+                "summary": "dsh task", "summaryAttempts": 1}
+        sm.registry = [sess]
+        if ctl:
+            fake = _FakeDshControl()
+            sm.dsh_controls[sid] = fake
+            return sess, cid, wt, fake
+        return sess, cid, wt, None
+
+    # --- the core claim: the projected transcript attributes the PR ----------
+
+    def test_projected_gh_pr_create_is_attributed(self):
+        """The corpus's `gh pr create` — run through dsh's `bash` tool, projected
+        to a `Bash` tool_use/tool_result pair — is attributed by the same scan a
+        Claude session uses, with zero dsh-specific code."""
+        entries = self._projected("sid", "/repos/Turma")
+        report = {"prUrls": []}
+        state = {}
+        for e in entries:
+            ha._scan_pr_line(json.dumps(e).encode(), state, report)
+        self.assertEqual(report["prUrls"], [self.PR_URL])
+
+    def test_a_non_bash_projection_would_not_be_attributed(self):
+        """The narrowness is the same as Claude's: attribution needs the projected
+        name to be `Bash`. This pins that the win above comes from the projector's
+        `bash`->`Bash` map, not from loose text matching — drop the map and the
+        chip is gone (a PR opened via cordis_run/ralph or the raw GitLab API gets
+        none, matching a Claude PR opened via MCP/subagent)."""
+        entries = self._projected("sid", "/repos/Turma")
+        renamed = 0
+        for e in entries:
+            for b in (((e.get("message") or {}).get("content")) or []):
+                if isinstance(b, dict) and b.get("name") == "Bash":
+                    b["name"] = "shell"   # as if the projector left dsh's own name
+                    renamed += 1
+        self.assertTrue(renamed, "the corpus must carry a Bash tool_use to rename")
+        report = {"prUrls": []}
+        state = {}
+        for e in entries:
+            ha._scan_pr_line(json.dumps(e).encode(), state, report)
+        self.assertEqual(report["prUrls"], [])
+
+    # --- the live per-beat scan reads a dsh session's projection -------------
+
+    def test_live_beat_scan_derives_the_chip_for_a_dsh_session(self):
+        """session_report(agent_type="dsh") runs the SAME incremental PR scan over
+        the pinned projection transcript. The first beat primes offsets to EOF
+        (so a restart never replays old links); the PR that the session opens
+        DURING its life is seen as freshly appended bytes on a later beat."""
+        sess, cid, wt, _ = self._dsh_session(self.make_manager())
+        entries = self._projected(cid, wt)
+        # Prime: only the opening user turn exists when the first beat lands.
+        self._write_transcript(wt, cid, entries[:1])
+        state = {}
+        first = ha.session_report(wt, state, session_id=sess["id"],
+                                  claude_sid=cid, agent_type="dsh",
+                                  dsh_status="running")
+        self.assertEqual(first["prUrls"], [])
+        # The session now runs `gh pr create` — the rest of the conversation is
+        # appended, and the next beat's scan picks the PR link out of it.
+        self._write_transcript(wt, cid, entries)
+        second = ha.session_report(wt, state, session_id=sess["id"],
+                                   claude_sid=cid, agent_type="dsh",
+                                   dsh_status="running")
+        self.assertEqual(second["prUrls"], [self.PR_URL])
+
+    # --- _seed_prs re-derives chips for a resumed/migrated dsh session -------
+
+    def test_seed_prs_rederives_chips_for_a_resumed_dsh_session(self):
+        """A resumed or migrated dsh session already has the `gh pr create` in its
+        transcript at launch (past the EOF the live scan primes to), so `_seed_prs`
+        re-derives its chips — keyed on the PRESERVED transcript id, so a migrated
+        session lands the same URLs the source reported. The dispatch to _launch_dsh
+        lives inside _launch_tmux, so _resume_at_cwd's _seed_prs call covers dsh."""
+        sm = self.make_manager()
+        sess, cid, wt, _ = self._dsh_session(sm)
+        self._write_transcript(wt, cid, self._projected(cid, wt))
+        sm._seed_prs(sess)
+        self.assertEqual(sm.session_pr_urls[sess["id"]], [self.PR_URL])
+        self.assertEqual(sess["prUrls"], [self.PR_URL])
+        # It seeds the durable transcript-keyed ledger too, so the chip survives
+        # into the session's ENDED life exactly as a Claude session's does.
+        ledgered = set()
+        for entry in sm.pr_ledger.values():
+            ledgered.update((entry or {}).get("urls") or [])
+        self.assertIn(self.PR_URL, ledgered)
+
+    def test_seed_prs_is_a_noop_for_a_dsh_session_that_opened_no_pr(self):
+        sm = self.make_manager()
+        sess, cid, wt, _ = self._dsh_session(sm)
+        # A transcript with a plain user turn and nothing else.
+        self._write_transcript(wt, cid, [
+            {"type": "user", "uuid": "u1", "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"role": "user", "content": [{"type": "text",
+                                                       "text": "hi"}]}}])
+        sm._seed_prs(sess)
+        self.assertNotIn(sess["id"], sm.session_pr_urls)
+        self.assertNotIn("prUrls", sess)
+
+    # --- refresh_pr_status + GitLab/ADO dispatch reach a dsh session's PR ----
+
+    def test_refresh_pr_status_polls_a_dsh_sessions_pr(self):
+        """A dsh session's PR is re-polled like any other — refresh_pr_status keys
+        on session_pr_urls (session id), never agentType."""
+        sm = self.make_manager()
+        sess, cid, wt, _ = self._dsh_session(sm)
+        sm.session_pr_urls[sess["id"]] = [self.PR_URL]
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status",
+                               return_value={"url": self.PR_URL,
+                                             "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(self.PR_URL)
+        self.assertEqual(sm.pr_status_cache[self.PR_URL]["state"], "OPEN")
+
+    def test_a_dsh_sessions_gitlab_mr_dispatches_the_same_way(self):
+        """The URL-keyed source dispatch (_pr_source_ok) is agent-agnostic, so a
+        dsh session that opens a GitLab MR refreshes through the configured
+        GitLab exactly as a Claude session's would."""
+        mr = "https://gitlab.example.com/grp/app/-/merge_requests/5"
+        sm = self.make_manager()
+        sess, cid, wt, _ = self._dsh_session(sm)
+        sm.session_pr_urls[sess["id"]] = [mr]
+        sm.github = {"available": False}
+        with mock.patch.multiple(ha, GITLAB_URL="https://gitlab.example.com",
+                                 GITLAB_TOKEN="tok"), \
+                mock.patch.object(ha, "pr_status",
+                                  return_value={"url": mr,
+                                                "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(mr)
+
+    # --- comment + conflict delivery reach a dsh session over its socket ------
+
+    def test_conflict_nudge_reaches_a_dsh_session_over_its_socket(self):
+        """A CONFLICTING PR nudges the session that opened it — for a dsh session
+        that goes through _dsh_notify (the control socket), not a pane. The nudge
+        is peer-framed (machine kind + INBOX_PREFIX) and carries the MERGE
+        instruction _pr_conflict_message builds."""
+        sm = self.make_manager()
+        sess, cid, wt, ctl = self._dsh_session(sm)
+        os.makedirs(wt, exist_ok=True)
+        sm.session_pr_urls[sess["id"]] = [self.PR_URL]
+        sm.pr_status_cache[self.PR_URL] = {
+            "url": self.PR_URL, "state": "OPEN",
+            "mergeable": "CONFLICTING", "base": "main"}
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._poll_pr_conflicts()
+        self.assertEqual(len(ctl.inputs), 1)
+        text, kind = ctl.inputs[0]
+        self.assertEqual(kind, "machine")
+        self.assertTrue(text.startswith(ha.INBOX_PREFIX))
+        self.assertIn("origin/main", text)
+        # The episode is recorded on the record so it isn't re-nudged every beat.
+        self.assertIn(self.PR_URL, sess["prConflicts"])
+
+    def test_comment_activity_reaches_a_dsh_session_over_its_socket(self):
+        """New, not-self PR review activity is delivered into the dsh session that
+        opened the PR — through _dsh_notify, peer-framed. The first sighting only
+        baselines (no delivery); a later new comment is what reaches the session."""
+        sm = self.make_manager()
+        sess, cid, wt, ctl = self._dsh_session(sm)
+        os.makedirs(wt, exist_ok=True)
+        sm.session_pr_urls[sess["id"]] = [self.PR_URL]
+        sm.github = {"available": True, "login": "me"}
+
+        events = [{"key": "c1", "is_self": False, "author": "reviewer",
+                   "body": "please fix the naming", "kind": "comment"}]
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
+                mock.patch.object(ha, "_pr_comment_events", return_value=events):
+            sm._poll_pr_comments()   # first sighting: baseline, no delivery
+            self.assertEqual(ctl.inputs, [])
+            events.append({"key": "c2", "is_self": False, "author": "reviewer",
+                           "body": "and rename the flag", "kind": "comment"})
+            sm._poll_pr_comments()   # the new comment reaches the session
+        self.assertEqual(len(ctl.inputs), 1)
+        text, kind = ctl.inputs[0]
+        self.assertEqual(kind, "machine")
+        self.assertTrue(text.startswith(ha.INBOX_PREFIX))
+        self.assertIn("rename the flag", text)
+
+
 class TestStartedAt(ManagerMixin, unittest.TestCase):
     """The heartbeat's startedAt: docker's StartedAt where it answers, else the
     manager's own start — never empty. The hub's restart-loop alert keys on this
@@ -22140,7 +22380,8 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.spawn_ticket = mock.Mock()
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "cmdId": "c9"}])
-        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model=None)
+        sm.spawn_ticket.assert_called_once_with(
+            "PROJ-7", cmd_id="c9", model=None, agent_type=None)
 
     def test_handle_commands_carries_the_model_pin(self):
         # The hub's per-ticket model pin (XERK-123) rides the command; the agent
@@ -22149,7 +22390,19 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.spawn_ticket = mock.Mock()
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "model": "opus", "cmdId": "c9"}])
-        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model="opus")
+        sm.spawn_ticket.assert_called_once_with(
+            "PROJ-7", cmd_id="c9", model="opus", agent_type=None)
+
+    def test_handle_commands_carries_the_runtime_pin(self):
+        # The hub's per-ticket runtime pin (XERK-473) rides the command as
+        # agentType; the agent forwards it to spawn_ticket, which validates it
+        # like any spawn agent_type (resolve_agent_type in spawn()).
+        sm = self.make_ticket_manager()
+        sm.spawn_ticket = mock.Mock()
+        sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                             "agentType": "dsh", "cmdId": "c9"}])
+        sm.spawn_ticket.assert_called_once_with(
+            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh")
 
     def test_a_model_pin_lands_on_the_session_and_command_line(self):
         sm = self.make_ticket_manager()
@@ -22159,6 +22412,28 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["model"], "opus")     # resolve_model(opus) -> opus
         cmd = self._launches()[-1][-1]
         self.assertIn("--model opus", cmd)
+
+    def test_a_runtime_pin_lands_on_the_session_record(self):
+        # The hub's per-ticket runtime pin (XERK-473) reaches spawn_ticket as
+        # agent_type and is validated + stamped on the record like any spawn
+        # runtime (resolve_agent_type in spawn()). The launch itself dispatches
+        # on agentType — stubbed here so the record's field is what's asserted,
+        # not a live dsh process (which the launch choke point routes to).
+        sm = self.make_ticket_manager()
+        launched = []
+        sm._launch_dsh = lambda sess, **kw: launched.append(sess)
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()), \
+                mock.patch.object(ha, "dsh_configured", lambda: True):
+            sm.spawn_ticket("PROJ-7", agent_type="dsh")
+        sess = sm.registry[0]
+        self.assertEqual(sess["agentType"], "dsh")
+        self.assertEqual(len(launched), 1)          # dispatched to the dsh launcher
+
+    def test_no_runtime_pin_spawns_on_claude(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry[0]["agentType"], "claude")
 
     def test_no_model_pin_spawns_with_the_default_model(self):
         sm = self.make_ticket_manager()

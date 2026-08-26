@@ -167,13 +167,12 @@ object ModelSource {
         agents.firstOrNull { it.key == host }?.localModel
 
     /**
-     * Human label for a source. A local session reads as the MODEL NAME, not the
-     * word "local": it is a weaker model than Claude, and nobody should have to
-     * wonder which one wrote a turn.
+     * Human label for a source. The selector is subscription vs the host's own
+     * endpoint; it does NOT name the model (the adjacent model dropdown does, and
+     * the raw discovered id is noise here), so a local source reads "Other".
      */
     fun label(source: String, local: LocalModelInfo?): String =
-        if (source == LOCAL) local?.model?.takeIf { it.isNotBlank() } ?: "local model"
-        else "Subscription"
+        if (source == LOCAL) "Other" else "Subscription"
 
     /**
      * The chip's leading glyph, matching the web's ☁ / 🏠 (`chat.js`). It is the
@@ -186,7 +185,7 @@ object ModelSource {
     fun options(local: LocalModelInfo?): List<Pair<String, String>> =
         listOf(
             SUBSCRIPTION to "Claude subscription",
-            LOCAL to (local?.model?.takeIf { it.isNotBlank() } ?: "Self-hosted model"),
+            LOCAL to "Other",
         )
 
     /**

@@ -466,6 +466,14 @@ those are marked `[MODEL]`.
   `SessionInfo`.
 - ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Done (XERK-477, see Done below):
   the web's `⚙ dsh` chip on live and ended session cards, so a glance says which sessions run on dsh.
+- **P2 board ticket "Runtime" row (XERK-473 → XERK-477).** The web board's ticket detail panel gained
+  a fifth tap-to-change row beside Status/Repo/Agent/Model — "Runtime" — pinning which runtime a
+  ticket's session spawns on (`ticketRuntimes` map on `/api/agents` + its SSE event; `POST
+  /api/jira/<siteKey>/<issueKey>/runtime`). "dsh" is offered only when the org has a dsh-capable host
+  (`BoardSite.dshAvailable`, off `AgentInfo.dsh.available` which already decodes). Port
+  `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml` into `core/Board.kt` and add the
+  `SelectableValue` row in `BoardScreen.kt`, mirroring the Model row exactly. Deferred to the Android
+  dsh-parity ticket (XERK-477); the hub side is live so the row is fully functional on web now.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
 - ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
   see Done above; the read-only review itself was XERK-70).

@@ -129,10 +129,15 @@
       if (!rep) {
         reporters.set(site, rep = {
           hosts: new Set(), online: false, repos: new Map(), hostOpts: new Map(),
-          modelAvail: new Set(), modelAt: "", modelDefaultLabel: "" });
+          modelAvail: new Set(), modelAt: "", modelDefaultLabel: "",
+          dshAvailable: false });
       }
       rep.hosts.add(a.device || a.key || "?");
       if (a.online) rep.online = true;
+      // Whether the org can run the dsh runtime (XERK-473): any reporting host
+      // offering it, online or not — matching orgOffersDsh hub-side, so the
+      // Runtime picker offers "dsh" exactly when a dsh pin would be accepted.
+      if (a.dsh && a.dsh.available) rep.dshAvailable = true;
       // The per-ticket model picker's choices (XERK-123): the aliases this org's
       // hosts probed available, unioned over EVERY reporting host (same reason as
       // the repo/host options — the freshest-block winners loop below sees only
@@ -243,6 +248,9 @@
             available: [...rep.modelAvail].sort(),
             defaultLabel: rep.modelDefaultLabel || "",
           },
+          // Whether the org offers the dsh runtime (XERK-473) — the Runtime
+          // picker's "dsh" option is gated on this, as orgOffersDsh gates the pin.
+          dshAvailable: !!rep.dshAvailable,
           _byKey: new Map(),
         });
       }
@@ -1037,6 +1045,59 @@
     </div>`;
   }
 
+  // ---- ticket runtime pin (XERK-473) ----------------------------------------
+  // Which RUNTIME a ticket's session runs on — "claude" (the default) or "dsh"
+  // (XERK-460). Panel-only like the Agent/Model rows; hub-owned durable state
+  // (the ticketRuntimes map), delivered on the spawnTicket command as agentType.
+
+  // The ticket's pinned runtime out of the hub's ticketRuntimes map; null when
+  // it runs the default (claude).
+  function runtimePinOf(ticketRuntimes, siteKey, issueKey) {
+    const p = (ticketRuntimes || {})[`${siteKey}/${issueKey}`];
+    return p && p.runtime && p.runtime !== "claude" ? p : null;
+  }
+  function prettyRuntime(v) {
+    return v === "dsh" ? "dsh (DeepSeek Harness)" : "Claude Code";
+  }
+  // The Runtime row. Editable only when the org offers dsh OR a pin already
+  // exists (so an existing dsh pin can always be released even if the last
+  // dsh-capable host went away) — mirroring how the hub still lets a pin clear.
+  function runtimeFieldHtml(pin, opts) {
+    const o = opts || {};
+    const bits = [];
+    if (!pin) {
+      bits.push(`<span class="td-dim">Claude Code — the default runtime</span>`);
+    } else {
+      bits.push(`<span class="kc-repo">${esc(prettyRuntime(pin.runtime))}</span>`);
+      bits.push(`<span class="td-dim">— set by you</span>`);
+    }
+    if (o.editable) {
+      bits.push(`<button type="button" class="td-edit" data-runtime-edit="1">Change</button>`);
+    }
+    if (o.error) bits.push(`<span class="td-err-inline">Couldn't save — ${esc(o.error)}</span>`);
+    return bits.join(" ");
+  }
+  // The picker's current answer — the change handler compares a pick against
+  // this, so it must derive the way runtimePickerHtml preselects.
+  function runtimePickerValue(pin) {
+    return pin ? pin.runtime : "claude";
+  }
+  // The runtime picker. "Claude Code" is the release (drops the pin); "dsh" pins
+  // it, offered only when the org offers dsh (else a pin the hub would refuse).
+  // An existing dsh pin is always carried so it can be released.
+  function runtimePickerHtml(pin, opts) {
+    const o = opts || {};
+    const cur = pin ? pin.runtime : "claude";
+    const dshOffered = !!o.dshAvailable || cur === "dsh";
+    const sel = `<select class="td-repo-select" data-runtime-select="1">
+      <option value="claude"${cur === "claude" ? " selected" : ""}>Claude Code (default)</option>
+      ${dshOffered ? `<option value="dsh"${cur === "dsh" ? " selected" : ""}>dsh (DeepSeek Harness)</option>` : ""}
+    </select>`;
+    return `<div class="td-repo-edit">${sel}
+      <button type="button" class="td-edit" data-runtime-cancel="1">Cancel</button>
+    </div>`;
+  }
+
   // ---- ticket status change (XERK-138) --------------------------------------
   // The board's one write-back: the operator picks a status the ticket can move
   // to and it's pushed to Jira/Azure. The changeable statuses are the fetched
@@ -1150,6 +1211,16 @@
         : modelFieldHtml(o.modelPin, o.models, {
             editable: true,
             error: o.modelError,
+          })),
+      // Which RUNTIME this ticket's session runs on (XERK-473). Hub-owned like
+      // the agent/model pins (o.runtimePin, from ticketRuntimes), so it needs no
+      // online host to edit — but "dsh" is offered only when the org offers it
+      // (o.dshAvailable), with an existing dsh pin always releasable.
+      fieldRow("Runtime", o.runtimeEditing
+        ? runtimePickerHtml(o.runtimePin, { dshAvailable: o.dshAvailable })
+        : runtimeFieldHtml(o.runtimePin, {
+            editable: !!(o.runtimePin || o.dshAvailable),
+            error: o.runtimeError,
           })),
       fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),
       fieldRow("Reporter", d.reporter ? esc(d.reporter) : ""),
@@ -1493,6 +1564,7 @@
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
     modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+    runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
     statusFieldHtml, statusPickerHtml, statusPickerValue,
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
