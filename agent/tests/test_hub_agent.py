@@ -3637,6 +3637,101 @@ class _FakeDshControl:
         self.closed = True
 
 
+class _ConfirmDshControl:
+    """Stand-in for DshControl exposing only what _confirm_dsh_launch reads:
+    a scripted sequence of `state()` replies (the last is repeated) and a
+    `close()` flag."""
+
+    def __init__(self, replies):
+        self._replies = list(replies)
+        self.state_calls = 0
+        self.closed = False
+
+    def state(self):
+        self.state_calls += 1
+        if not self._replies:
+            return None
+        if len(self._replies) > 1:
+            return self._replies.pop(0)
+        return self._replies[0]
+
+    def close(self):
+        self.closed = True
+
+
+class TestConfirmDshLaunch(ManagerMixin, unittest.TestCase):
+    """XERK-492: _launch_dsh must confirm the dsh agent actually came up before
+    it records the session running — a bound control socket races ahead of a
+    load-time crash, so ctl.start() alone is not proof of life."""
+
+    def setUp(self):
+        super().setUp()
+        # Never really sleep — the loop's poll cadence is irrelevant to the logic.
+        p = mock.patch.object(ha.time, "sleep", lambda *_: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _sess(self):
+        return {"id": "dsh1", "tmuxName": "agent-dsh1"}
+
+    def test_agent_up_confirms_alive(self):
+        sm = self.make_manager()
+        ctl = _ConfirmDshControl([{"ok": True, "agentUp": True}])
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            self.assertTrue(sm._confirm_dsh_launch(self._sess(), ctl))
+
+    def test_still_creating_then_up(self):
+        # A healthy launch whose agent is still being created reads agentUp False
+        # for a poll or two, then True — it must WAIT, not fail.
+        sm = self.make_manager()
+        ctl = _ConfirmDshControl([
+            {"ok": True, "agentUp": False},
+            {"ok": True, "agentUp": False},
+            {"ok": True, "agentUp": True},
+        ])
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            self.assertTrue(sm._confirm_dsh_launch(self._sess(), ctl))
+        self.assertEqual(ctl.state_calls, 3)
+
+    def test_dead_process_is_refused_fast(self):
+        # The crash-on-load signal: dsh is the tmux session's only command, so a
+        # vanished session means the process exited. Refused on the first poll,
+        # without waiting out the window.
+        sm = self.make_manager()
+        ctl = _ConfirmDshControl([{"ok": True, "agentUp": True}])
+        with mock.patch.object(sm, "_tmux_alive", return_value=False):
+            self.assertFalse(sm._confirm_dsh_launch(self._sess(), ctl))
+        # tmux-death is checked before state(), so the socket is never queried.
+        self.assertEqual(ctl.state_calls, 0)
+
+    def test_alive_but_agent_never_up_times_out(self):
+        # A wedged-but-alive plugin (bound socket, agent never registers): the
+        # window elapses and the launch is refused rather than reported running.
+        sm = self.make_manager()
+        ctl = _ConfirmDshControl([{"ok": True, "agentUp": False}])
+        with mock.patch.object(ha, "DSH_LAUNCH_CONFIRM_SEC", 0.05), \
+             mock.patch.object(sm, "_tmux_alive", return_value=True):
+            self.assertFalse(sm._confirm_dsh_launch(self._sess(), ctl))
+
+    def test_old_driver_without_agentUp_key_is_trusted(self):
+        # A driver too old to report readiness: a usable state reply is the best
+        # liveness signal it offers, so a responsive one confirms alive rather
+        # than false-failing a healthy older plugin.
+        sm = self.make_manager()
+        ctl = _ConfirmDshControl([{"ok": True, "status": "idle"}])
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            self.assertTrue(sm._confirm_dsh_launch(self._sess(), ctl))
+
+    def test_no_reply_keeps_waiting_then_times_out(self):
+        # ctl.state() -> None (socket dropped, mid-reconnect) is not "up": while
+        # the process still looks alive it keeps polling, then times out.
+        sm = self.make_manager()
+        ctl = _ConfirmDshControl([None])
+        with mock.patch.object(ha, "DSH_LAUNCH_CONFIRM_SEC", 0.05), \
+             mock.patch.object(sm, "_tmux_alive", return_value=True):
+            self.assertFalse(sm._confirm_dsh_launch(self._sess(), ctl))
+
+
 class TestDshRouting(ManagerMixin, unittest.TestCase):
     """XERK-467 [C]: the dsh arms of send_input / notify_session /
     answer_question, and the dsh-interaction rendezvous. A dsh session is driven

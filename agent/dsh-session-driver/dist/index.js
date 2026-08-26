@@ -95,6 +95,12 @@ export function apply(ctx, config) {
         return;
     }
     let handle = null;
+    // Whether agents.create/resume has RESOLVED (XERK-492). The control socket
+    // binds before this, so `agentUp` is what the hub's launch confirmation waits
+    // on to tell "socket up, agent still creating" (normal) from "socket up,
+    // process already dead / agent failed to start" (a zombie). Reported on the
+    // `state` reply.
+    let agentUp = false;
     const clients = new Set();
     // requestId -> resolve fn for a pending interaction (an approval or a question)
     const pending = new Map();
@@ -267,9 +273,26 @@ export function apply(ctx, config) {
                 ctx.logger.info(`[turma-dsh] agent ${handle.agent.id} created (cwd ${cwd})`);
             }
             await pinGuardPolicy(handle.agent);
+            agentUp = true;
         }
         catch (e) {
-            ctx.logger.error(`[turma-dsh] agent create failed: ${e}`);
+            // The agent is the whole reason this process exists; without it the
+            // session is a zombie — socket bound, pane empty, no events ever (a bad
+            // model route, a missing dynamic import in setup, an unreadable store).
+            // EXIT rather than linger, so the hub's launch confirmation (XERK-492)
+            // sees the tmux process die and refuses the launch with a reason, instead
+            // of recording a session that is dead on arrival.
+            ctx.logger.error(`[turma-dsh] agent create failed: ${e} — exiting`);
+            // Drop the bound control socket so the launcher's stale-socket check and
+            // the next launch are clean; exiting closes the listener regardless. The
+            // forged peer-inbox record (if any) is left to the hub's cc-socks sweep,
+            // which reaps it once this pid is dead (a hard-killed dsh session leaves
+            // the same, and it is undeliverable meanwhile — harmless).
+            try {
+                fs.unlinkSync(socketPath);
+            }
+            catch { /* */ }
+            process.exit(1);
         }
     })();
     // ---- system-prompt section from the policy file --------------------------
@@ -344,6 +367,10 @@ export function apply(ctx, config) {
                         status: agent ? agent.status : 'idle',
                         eventCount: agent ? agent.session.events.length : 0,
                         pendingInteraction: pending.size > 0,
+                        // Launch-liveness signal (XERK-492): true once agents.create/resume
+                        // has resolved. Distinct from `status`, which reads 'idle' both while
+                        // the agent is still being created and when it has failed to.
+                        agentUp,
                     }) + '\n');
                 }
                 catch { /* */ }

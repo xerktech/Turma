@@ -1591,6 +1591,17 @@ DSH_STATE_QUERY_TIMEOUT_SEC = 2.0
 # A control-socket line is a small status object; this bounds a malformed or
 # hostile plugin flooding one unterminated line into an unbounded read.
 DSH_SOCK_LINE_MAX = 64 * 1024
+# After the control socket binds, how long _launch_dsh waits for the dsh agent to
+# actually come UP before it reports the session running (XERK-492). The plugin
+# binds the socket a moment before a load crash can abort the dsh process, so a
+# bound socket alone is a live-looking zombie; this bounds the confirmation. It
+# runs on the beat (provision/resume do), so it is kept modest — a healthy launch
+# resolves on the first poll once the driver reports `agentUp`, and a crash is
+# caught the instant the tmux process is seen gone, so only a wedged-but-alive
+# plugin pays the whole window.
+DSH_LAUNCH_CONFIRM_SEC = float(os.environ.get("DSH_LAUNCH_CONFIRM_SEC", "12"))
+DSH_LAUNCH_CONFIRM_POLL_SEC = float(
+    os.environ.get("DSH_LAUNCH_CONFIRM_POLL_SEC", "0.4"))
 
 
 def dsh_sock_path(sid):
@@ -12862,6 +12873,19 @@ class SessionManager:
             self._kill_tmux(sess)
             raise RuntimeError("dsh control socket did not come up "
                                "(the dsh process failed to start or bind)")
+        # A bound socket is NOT proof the session is alive (XERK-492): the plugin
+        # binds it a moment before a load crash can abort the dsh process, so
+        # ctl.start() succeeding can race ahead of a dead process — an empty pane,
+        # ctl.state() -> None, no events, no transcript. Confirm the agent came up
+        # before recording the session running; a dead/wedged launch tears down
+        # and raises, routing through the caller's _set_error / _refuse_start (the
+        # XERK-265 channel) so the Start wait ends with a reason, not a zombie.
+        if not self._confirm_dsh_launch(sess, ctl):
+            ctl.close()
+            self._kill_tmux(sess)
+            raise RuntimeError(
+                "the dsh process bound its control socket but the agent never "
+                "came up (it crashed on load, or its agent failed to start)")
         self.dsh_controls[sid] = ctl
         tail = dsh_session.DshProjectionTail(
             events_path, transcript_path, claude_sid, cwd=worktree, log=log,
@@ -12874,6 +12898,48 @@ class SessionManager:
         if prompt and not resume:
             ctl.input(prompt, kind="user")
             tail.poke()
+
+    def _confirm_dsh_launch(self, sess, ctl):
+        """Confirm a just-launched dsh session actually came up before it is
+        recorded running (XERK-492).
+
+        ctl.start() only proves the control socket BOUND. The driver binds it a
+        moment before a load-time crash can abort the dsh process (a bad plugin,
+        a missing dynamic import, a bad model route), so a bound socket can race
+        ahead of a dead process, leaving a live-looking zombie. Wait a bounded
+        window for one of two verdicts:
+
+        - the tmux process is GONE — dsh is that tmux session's only command, so
+          a vanished session means the process exited (the crash-on-load signal);
+          fail fast, cheapest and most reliable.
+        - the driver reports its agent registered (`agentUp` on the state reply,
+          set once agents.create/resume resolves) — the session is genuinely up.
+
+        Returns True once confirmed alive, False on a dead or wedged launch. A
+        driver too old to report `agentUp` (the key absent) falls back to "a
+        usable state reply == responsive == up", so this never false-fails an
+        older plugin; a new driver's explicit readiness is authoritative and also
+        exits the process on create failure, so that case reads as a dead tmux."""
+        tmux = sess.get("tmuxName")
+        sid = sess.get("id")
+        deadline = time.time() + DSH_LAUNCH_CONFIRM_SEC
+        while time.time() < deadline:
+            if not self._tmux_alive(tmux):
+                log(f"dsh session {sid}: process exited during startup "
+                    "(crashed on load) — refusing the launch")
+                return False
+            ack = ctl.state()
+            if isinstance(ack, dict):
+                if ack.get("agentUp"):
+                    return True
+                if "agentUp" not in ack:
+                    # An older driver that does not report readiness: a usable
+                    # state reply is the strongest liveness signal it offers.
+                    return True
+            time.sleep(DSH_LAUNCH_CONFIRM_POLL_SEC)
+        log(f"dsh session {sid}: control socket bound but the agent never came "
+            f"up within {DSH_LAUNCH_CONFIRM_SEC:g}s — refusing the launch")
+        return False
 
     def _dsh_guard_config(self):
         """The dsh safety-guard config for this host (XERK-470), memoized on the
