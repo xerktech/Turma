@@ -2,8 +2,11 @@
 paths:
   - "agent/hub-agent.py"
   - "agent/hooks/statusline.py"
+  - "agent/dsh_transcript.py"
+  - "agent/dsh_session.py"
   - "agent/tests/test_hub_agent.py"
   - "agent/tests/test_statusline.py"
+  - "agent/tests/test_dsh_transcript.py"
 ---
 
 # Usage aggregates, the attribution ledger and subscription limits
@@ -177,3 +180,41 @@ in `hub-agent.py` plus `hooks/statusline.py`; the hub/UI half is `.claude/rules/
 - Cached on the file's `(mtime, size)`, per path — it is ~120 KiB of caches, so re-parsing it every
   beat would be pure waste, while a re-login still wins.
 - Tests: `TestSubscriptionIdentity`.
+
+## dsh sessions ride this half unchanged (XERK-471 [dsh][G])
+
+The dsh runtime (XERK-460) spends tokens through a different model client, but its usage reaches
+every surface here through the SAME code with no dsh branch — because [S1]'s projection
+(`dsh_transcript.py`) writes dsh spend into the exact `message.usage`/`message.model` shape this file
+already reads. The reconciliation, and the two things a change must not undo:
+
+- **Token aggregates + the attribution ledger cost dsh NO new code, and adding an `agentType` branch
+  to the aggregation is the regression to avoid.** A dsh session is an ordinary session here:
+  `_remember_usage` records its worktree→repo at spawn like any other, and its spend is the
+  PROJECTION transcript `<slug>/<claudeSessionId>.jsonl`, whose assistant entries carry
+  `message.usage` (dsh `TokenUsage` mapped 1:1 by `_map_usage`) and a real `message.model` (D4). So
+  `_accumulate_usage` / `_token_count` / `repo_usage_report` fold it, `retiredUsage` (XERK-338)
+  carries it after the host is gone, and the per-model breakdown attributes it — all by construction.
+  The wire needs nothing new either: usage is `agentType`-agnostic, so no heartbeat field is added
+  for [G] (the capability plumbing was [A]).
+- **Local / DeepSeek model ids just APPEAR in the per-model breakdown and may DOMINATE a host's
+  turns** ([G0] D5). They are not `<synthetic>` (no `<...>` name), so `_accumulate_usage`'s guard
+  leaves them in — correctly. The one dsh-specific care is at the projection: `_map_usage` drops an
+  all-zero usage block to `None`, so a local OpenAI-compatible endpoint that returns no counts does
+  NOT plant a phantom zero-token model row in "Tokens by model" (the defect the `<synthetic>` guard
+  removes for Claude). Tests: `TestDshProjectionAccounting`, `TestDshUsageReportEndToEnd`,
+  `test_all_zero_usage_projects_no_usage_key` in `test_dsh_transcript.py`.
+- **The native event log is NEVER counted; the projection is the single copy.** dsh's canonical log
+  at `<slug>/<claudeSessionId>/dsh/` (XERK-469 [E]) is neither a top-level `*.jsonl` nor under
+  `subagents/`, so `_project_transcripts` skips it — counting both would double a dsh session's
+  spend. Do not teach the walk to read `<sid>/dsh/`.
+- **Subscription limits and the probe are CLAUDE-SUBSCRIPTION only, and dsh does not feed them.** A
+  dsh session has no 5h/7d window — its model is a local/DeepSeek route with no pool shared with
+  claude.ai (D5) — so nothing dsh spends touches the `limits` block, and there is deliberately no dsh
+  limits path to build ("where applicable" = not applicable). The probe already runs against the
+  mounted subscription login and sources nothing from the dsh model route, so it is unchanged. Never
+  wire dsh spend into `limits`.
+- **The subscription CARD still applies to the host, and a dsh session never moves it.** A host
+  running dsh is still logged into Claude (the mounted login powers summaries/triage/the probe), so
+  `subscription_identity` — per-host, off the Claude config — reports the same account whether or not
+  a dsh session is running. A dsh-only-active host groups on its Claude account like any other.
