@@ -308,6 +308,18 @@ native log needs no new WRITER.
   code to the beat or the archive functions, only the store-dir contract. Tests: `TestDshArchiveSync`
   (agent), and the existing `TestArchiveSyncWorker` / `TestBeatLoopBudget`.
 
+## [G] (XERK-471) shipped: usage aggregates, attribution ledger, subscription limits
+
+D4's usage obligation made concrete — a dsh session's spend charts on the Usage page and the
+dashboard token tiles IDENTICALLY to a Claude session, with no schema change and no `agentType`
+branch in the aggregation, because [S1]'s projection already writes `message.usage`/`message.model`
+in the shape the ledger reads. The full contract (why token aggregates + the attribution ledger cost
+dsh nothing, why local/DeepSeek ids appear in the per-model breakdown and may dominate, why the
+native log is never double-counted, and why the subscription `limits`/probe stay Claude-only) lives
+in **`.claude/rules/agent-usage.md`** ("dsh sessions ride this half unchanged"), whose `paths:` now
+loads for the dsh modules. The one code change was hardening `_map_usage` to drop an all-zero block.
+Tests: `TestDshUsageReportEndToEnd`, `TestDshProjectionAccounting` in `test_dsh_transcript.py`.
+
 ## [H] (XERK-472) shipped: PR/MR chips, ledgers & attribution for dsh sessions
 
 D4's "PR chips work with no new code" made concrete and LOCKED — a dsh session that opens a PR gets

@@ -187,6 +187,15 @@ def _map_usage(usage):
         "cache_read_input_tokens": _int(usage.get("cacheReadTokens")),
         "cache_creation_input_tokens": _int(usage.get("cacheWriteTokens")),
     }
+    # An all-zero block counts for nothing but the model id, so folding it would
+    # plant a phantom zero-token row in the usage page's "Tokens by model" table
+    # (the same defect the `<synthetic>` guard removes for Claude). It is a real
+    # dsh case, not a hypothetical: a local OpenAI-compatible endpoint that
+    # returns no usage yields `{}`->all-zero here, and under [G0] (XERK-460 D5)
+    # local models may DOMINATE a dsh host's turns. Project no `usage` key then,
+    # exactly as a usage-less step does — the totals lose nothing (they were 0).
+    if not any(out.values()):
+        return None
     return out
 
 
