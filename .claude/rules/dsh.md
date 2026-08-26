@@ -57,8 +57,9 @@ invariants a later child must not undo:
   Do not hoist the dispatch to the ~6 callers — they all funnel through `_launch_tmux`.
 - **Composer + card**: `sessions.html` gates a "Runtime" `<select>` on `a.dsh.available` and sends
   `agentType` only when "dsh" (a bare spawn is unchanged); `runtimeMarkHtml` badges a dsh card.
-  Android mirrors the composer (`core/Runtime.kt`, `SpawnDialog`'s Runtime row); the dsh card badge
-  is deferred in `android/PARITY.md` alongside the local-model card mark.
+  Android mirrors the composer (`core/Runtime.kt`, `SpawnDialog`'s Runtime row) AND the dsh card
+  badge (`RuntimeBadge` on live + ended session cards, XERK-477 — the local-model card mark is the
+  one still deferred in `android/PARITY.md`).
 - Tests: `TestSpawnOptionHelpers`/`TestSessionLifecycle` (agent), `normalizeDsh`/spawn-route/restore
   cases (`server.test.js`), the Runtime cases in `sessions.test.js`, `RuntimeTest`/`SpawnRequestTest`/
   `SpawnComposerTest`/`AgentDecodeTest` (android).
@@ -367,9 +368,9 @@ the same spawn path — no new session model.
   and write status/create, never spawn a session, so the runtime never reaches them. **The
   `_board_column` mirrors are untouched too** (the ticket's explicit ask): the runtime pin is
   orthogonal to a ticket's column.
-- **Web ⇄ Android parity**: the board Runtime row is deferred to XERK-477 (the Android dsh-parity
-  ticket) with an `android/PARITY.md` line; the hub side is live, so the row works fully on web.
-  The vendored `board.cjs` copies (glasses/veiller) stay byte-identical to `board.js`.
+- **Web ⇄ Android parity**: the board Runtime row shipped on Android too (XERK-477 —
+  `RuntimeSection` in `BoardScreen.kt`, `ticketRuntimes`/`dshAvailable` typed). The vendored
+  `board.cjs` copies (glasses/veiller) stay byte-identical to `board.js`.
 - Tests: `TestSpawnTicket` (`test_a_runtime_pin_lands_on_the_session_record`,
   `test_handle_commands_carries_the_runtime_pin`) agent-side; the `/runtime` route + the dsh
   `findTicketHost` cases in `server.test.js`; the `runtime*` cases in `board.test.js`.
