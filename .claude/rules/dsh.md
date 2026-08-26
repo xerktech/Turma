@@ -308,6 +308,26 @@ native log needs no new WRITER.
   code to the beat or the archive functions, only the store-dir contract. Tests: `TestDshArchiveSync`
   (agent), and the existing `TestArchiveSyncWorker` / `TestBeatLoopBudget`.
 
+## [H] (XERK-472) shipped: PR/MR chips, ledgers & attribution for dsh sessions
+
+D4's "PR chips work with no new code" made concrete and LOCKED — a dsh session that opens a PR gets
+the same chips, ledgers, attribution and comment/conflict delivery as a Claude one, with no
+`agentType` branch on the PR path. The symmetry is the same one S1/E buy: the projection needs no new
+reader, so the whole PR web reads a dsh transcript unchanged.
+
+- **The load-bearing dependency is S1's `bash`→`Bash` name map**: `_scan_pr_line` attributes only a
+  `Bash` tool_use, and dsh's shell tool is `bash`, so the map is what makes `gh pr create` chip. Same
+  narrowness as Claude (a PR opened via `cordis_run`/`ralph` or the raw GitLab API gets none).
+- **No new PR code, and no beat-loop regression**: comment/conflict nudges route through
+  `notify_session` → `_dsh_notify` (control socket, [C]), bounded by `DSH_ACK_TIMEOUT_SEC` and never
+  raising. `refresh_pr_status` remains the same inline offender for BOTH runtimes — XERK-397's scope,
+  not widened here. Chips survive a dsh resume/migration via `_seed_prs` over the projected
+  `<tid>.jsonl` (independent of [K]'s native-log pack).
+- The mechanics live in `.claude/rules/agent-prs.md` ("dsh sessions" section). Tests:
+  `TestDshPrAttribution` drives the REAL projector over the REAL corpus (which carries a `gh pr
+  create`), proving attribution, the live per-beat scan, `_seed_prs`, `refresh_pr_status` +
+  GitLab/ADO dispatch, and socket-delivered comment/conflict nudges — the G1 lesson (no mock).
+
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
 1. **Image + resource + retention sizing.** Is growing the agent image with dsh's node/npm tree
