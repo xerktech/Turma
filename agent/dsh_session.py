@@ -393,6 +393,12 @@ class DshProjectionTail:
         self._subagents_dir = os.path.join(stem, "subagents")
         self._wf_agents_dir = os.path.join(self._subagents_dir, "workflows")
         self._wf_records_dir = os.path.join(stem, "workflows")
+        # The latest automatically-derived session title dsh wrote to the log
+        # (`session/title` event data.title), or None until one arrives. Read on
+        # the beat by hub-agent's _seed_summaries so a dsh session is named from
+        # dsh's OWN title rather than a `claude -p` call (a title is NOT a
+        # transcript entry, so it is captured here in the tail, never projected).
+        self._title = None
         # Per-child tail state: childId -> {"proj","offset","partial","dest"}.
         self._children = {}
         # childIds we projected a top-level Agent launch for, so one later claimed
@@ -410,6 +416,12 @@ class DshProjectionTail:
     def poke(self):
         """Optional nudge to project immediately (e.g. right after an input)."""
         self._wake.set()
+
+    def title(self):
+        """dsh's latest auto-generated session title (`session/title` event), or
+        None until the driver has written one. Read on the beat by _seed_summaries
+        so a dsh session is named from dsh's own title instead of a claude -p."""
+        return self._title
 
     def stop(self):
         self._stop.set()
@@ -498,6 +510,16 @@ class DshProjectionTail:
             # covers the case it does not.
             if self._is_workflow_child_edge(event):
                 continue
+            # Capture dsh's auto-generated session title (the `session/title`
+            # event carries `data.title`, written by dsh once the first user
+            # turn lets it derive one). It is log-only for the TRANSCRIPT — kept
+            # here so _seed_summaries can name the session from dsh's own title.
+            if (isinstance(event, dict) and event.get("type") == "session/title"):
+                data = event.get("data")
+                if isinstance(data, dict):
+                    title = data.get("title")
+                    if isinstance(title, str) and title.strip():
+                        self._title = title.strip()
             projected = self._proj.feed(event)
             # Remember which children we projected a top-level launch for, so the
             # reclaim above can retire one later found to be a workflow agent.

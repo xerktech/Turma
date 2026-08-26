@@ -15567,6 +15567,63 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
             sm._seed_summaries()
         start.assert_not_called()
 
+    # -- dsh sessions ------------------------------------------------------
+    # A dsh session is named from dsh's OWN auto-generated title (the
+    # `session/title` event the projection tail captures), never claude -p.
+
+    class _Tail:
+        def __init__(self, title):
+            self._t = title
+
+        def title(self):
+            return self._t
+
+    def test_dsh_session_named_from_dsh_title_not_claude(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(agentType="dsh")]
+        sm.dsh_tails = {"abcde": self._Tail("Adding Compose Flag")}
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()  # never a claude -p for a dsh session
+        self.assertEqual(sm.registry[0]["summary"], "Adding Compose Flag")
+
+    def test_dsh_session_without_title_yet_waits(self):
+        # No `session/title` event has landed yet (dsh derives it from the first
+        # user turn): the session stays unnamed and NO attempt is spent / no
+        # claude -p runs — it is looked at again next beat.
+        sm = self.make_manager()
+        sm.registry = [self._session(agentType="dsh")]
+        sm.dsh_tails = {"abcde": self._Tail(None)}
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()
+        self.assertIsNone(sm.registry[0]["summary"])
+        # dsh spends no claude summary attempts, so it keeps its full retry budget
+        # until dsh's own title actually arrives.
+        self.assertEqual(sm.registry[0].get("summaryAttempts", 0), 0)
+
+    def test_dsh_session_title_does_not_override_manual_name(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(agentType="dsh", summary="Operator Name")]
+        sm.dsh_tails = {"abcde": self._Tail("Adding Compose Flag")}
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()
+        self.assertEqual(sm.registry[0]["summary"], "Operator Name")
+
+    def test_start_summary_refuses_a_dsh_session(self):
+        # The spawn + dsh-input paths call _start_summary directly; it must be a
+        # no-op (and spend no attempt) for a dsh session, which is named by its
+        # own title instead.
+        sm = self.make_manager()
+        sess = self._session(agentType="dsh")
+        sm.registry = [sess]
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._start_summary(sess, "add a flag please")
+        popen.assert_not_called()  # no claude -p launched
+        self.assertEqual(sm.summaries, {})
+        self.assertEqual(sess.get("summaryAttempts", 0), 0)
+
 
 class TestProjectSlug(unittest.TestCase):
     def test_every_non_alphanumeric_becomes_dash(self):

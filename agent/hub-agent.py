@@ -18614,6 +18614,13 @@ class SessionManager:
         prompt = (prompt or "").strip()
         if not prompt:
             return
+        # A dsh session is named from dsh's OWN auto-generated title (the
+        # `session/title` event, seeded by _seed_summaries), never claude -p — a
+        # dsh session has no Claude summarizer to lean on, and spending a turn to
+        # re-derive what dsh already wrote would be pure waste. Guards the
+        # spawn/dsh-input/summaries call sites in one place.
+        if sess.get("agentType") == "dsh":
+            return
         sid = sess["id"]
         out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
         outf = None
@@ -18710,6 +18717,10 @@ class SessionManager:
         transcript catches the first prompt no matter how it was entered (terminal,
         glasses/compose-bar input, or a resumed session).
 
+        A DSH session skips `claude -p` entirely (it has no Claude summarizer to
+        lean on): it is named from dsh's own `session/title` event, captured by the
+        projection tail, the moment that title is available.
+
         This is also where a failed naming attempt gets retried, for a session
         spawned WITH an initial prompt just as much as a bare one: the transcript
         holds that same first prompt, so re-reading it is all a retry needs. Gated
@@ -18724,6 +18735,23 @@ class SessionManager:
             if not _summary_due(sess, now):
                 continue
             if sess["id"] in self.summaries:
+                continue
+            # A dsh session is named from dsh's OWN auto-generated title — the
+            # `session/title` event the projection tail captured — never claude -p
+            # (_start_summary also refuses a dsh session, but the title seeding
+            # lives HERE, on the beat, where session-record mutation is safe).
+            # dsh writes the title once it can derive one from the first user
+            # turn; until it lands the session stays unnamed and we look again
+            # next beat (no attempt spent, no `claude -p`).
+            if sess.get("agentType") == "dsh":
+                tail = self.dsh_tails.get(sess["id"])
+                title = tail.title() if tail else None
+                if not title or sess.get("summary"):
+                    continue
+                sess["summary"] = title
+                sess.pop("summaryRetryAt", None)
+                self.save()
+                log(f"named dsh session {sess['id']}: {title!r}")
                 continue
             path = _session_transcript_path(sess)
             if not path:
