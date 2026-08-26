@@ -119,7 +119,7 @@ class SpawnComposerTest {
     fun `picking the self-hosted model is what the spawn carries`() {
         var got: String? = null
         show(localModel = local) { got = it }
-        pickSource(current = "Claude subscription", option = "qwen3-coder")
+        pickSource(current = "Claude subscription", option = "Other")
         compose.onNodeWithText("Spawn").performClick()
         assertEquals("local", got)
     }
@@ -141,8 +141,9 @@ class SpawnComposerTest {
             )
         }
         compose.onNodeWithText("Self-hosted model").assertDoesNotExist()
-        // The "Run against" local option is labelled by the model name.
-        pickSource(current = "Claude subscription", option = "gpt-oss:120b")
+        // The "Run against" local option reads "Other" — the model is named in its
+        // own revealed dropdown ("Self-hosted model"), not the source selector.
+        pickSource(current = "Claude subscription", option = "Other")
         compose.onNodeWithText("Self-hosted model").performScrollTo().assertIsDisplayed()
         // The window suffix is unique to the self-hosted dropdown field.
         compose.onNodeWithText("gpt-oss:120b · 120k").performScrollTo().performClick()
@@ -172,7 +173,7 @@ class SpawnComposerTest {
                 onDismiss = {}, onSpawn = { _, _, _, _, _, source, _, _ -> got = source },
             )
         }
-        pickSource(current = "Claude subscription", option = "qwen3-coder")
+        pickSource(current = "Claude subscription", option = "Other")
 
         // The host's next heartbeat no longer carries the block.
         offered = LocalModelInfo(available = false)

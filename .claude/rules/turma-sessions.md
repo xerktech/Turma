@@ -104,7 +104,10 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   the switch would queue a command it silently drops. It is **also shown when the session is already
   `local`**, so one whose host later lost its configuration still has a visible way back. A `local`
   session is marked (🏠, warn colour) — it is a weaker model, and nobody should have to wonder which
-  one wrote a turn. Like the mode switch it paints from a MEMO, never an optimistic write onto
+  one wrote a turn. **Its two rows read "Claude subscription" / "Other"** (`modelSourceOpts`,
+  `modelSourceLabel`) — the selector is subscription vs the host's own endpoint and does NOT name the
+  model (the adjacent DROPDOWN below does), so the raw discovered id — e.g.
+  `bedrock/us.anthropic.claude-opus-4-5-…` — stays out of it. Like the mode switch it paints from a MEMO, never an optimistic write onto
   `sess`, so a stale beat can't flash the old value back; the memo ages out so a switch that never
   lands doesn't pin the chip. **`normalizeLocalModel` coerces the block at ingest** — the block is
   typed on Android and `/api/agents` decodes atomically there, so one host's `available:"yes"` hid
