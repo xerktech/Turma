@@ -42,6 +42,16 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - **`have_sudo` asks** when it must, rather than probing `sudo -n` only (which makes a
     password-sudo host look sudo-less and skips every apt prereq under `curl … | bash`). Gated on `[
     -t 2 ]`; cached.
+  - **`--with-dsh` (or `TURMA_DSH=1`) ships the dsh toolchain (XERK-496)**: lays
+    `dsh_session.py`/`dsh_transcript.py` beside `hub-agent.py` and the `dsh-session-driver/`
+    (built `dist/`) + `dsh/guard/` dirs at the paths `hub-agent.py` resolves from ITS own dir
+    (`DSH_PLUGIN_DIR`, `dsh_guard_plugin_path()`), installs the LATEST `@deepseek-ai/dsh` CLI into
+    `~/.local` with npm's native-build scripts allowed (`--allow-scripts=koffi,node-pty,…` — npm 11 +
+    blocks them by default and dsh's subprocess layer silently stays broken), writes a **`$PREFIX/.dsh`
+    marker** (the "wants dsh" signal the updater keys on), and seeds `TURMA_DSH=1` into a FRESH config
+    (the runtime gate). The CLI is then updated at every agent restart LIKE CLAUDE CODE, never on the
+    timer (`--dsh-only`, see the launcher/updater bullets). A built `dist/` is non-negotiable:
+    `_ensure_dsh_profile` refuses every dsh spawn without it. Tests: `test_install_dsh.sh`.
   - **It must never become `curl … | sudo bash`**: the install belongs to the invoking user, only
     prereqs need root. Tests: `test_install_sudo.sh`.
 - `bootstrap.sh` — the `curl … | bash` front door: resolve the newest native tarball, verify its
@@ -66,6 +76,16 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - `install_payload` requires `hooks/` in the payload before it swaps: the swap DELETES the
     installed hooks first, and a missing hook command is a non-blocking hook — the safety guard
     would fail open while VERSION, the restart and the log all reported a clean update.
+  - **A dsh host's toolchain swaps with the payload (XERK-496).** The dsh bits sit OUTSIDE the
+    shared files, so unreferenced here they silently froze on the last `install.sh` run. Gated on the
+    `$PREFIX/.dsh` marker: when present, refresh the plugins from the staged payload (and drop them +
+    the marker if a payload stops shipping them — never leave a stale copy that no longer matches
+    what's installed); when absent, don't introduce dsh unilaterally. The CLI is NOT pinned — it is
+    updated at LATEST on every agent restart, exactly like Claude Code, via a dedicated `--dsh-only`
+    check (mirrors `--claude-only`: fired AWAITED by the launcher before the manager exists, its own
+    rate-limit stamp, held under the update lock) — never on the hourly timer/`--loop`, because a
+    session launched into a replaced `dsh` dies on exec. Tests: the dsh payload cases and the
+    `--dsh-only` cases in `test_turma_agent_update.sh`.
   - It also updates **Claude Code** (XERK-254, `--claude-only`), which the agent otherwise installs
     once and never touches again.
     - **Only ever at agent start**, never on the timer or in `--loop`. Replacing the package leaves
