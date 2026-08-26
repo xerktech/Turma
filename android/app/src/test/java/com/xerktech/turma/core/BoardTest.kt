@@ -461,6 +461,46 @@ class BoardTest {
         assertEquals(listOf("sonnet"), modelChoices(BoardModels(available = listOf("opus[1m]", "sonnet"))))
     }
 
+    // ---- ticket -> runtime pin (XERK-473): parity with board.js
+    // runtimePinOf/prettyRuntime + mergeSites dshAvailable ----------------------
+
+    @Test fun `mergeSites marks dshAvailable when ANY reporting host offers dsh`() {
+        val noDsh = agent("hostA", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+        val withDsh = agent("hostB", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T02:00:00Z"))
+            .copy(dsh = com.xerktech.turma.model.DshInfo(available = true))
+        // One host offering dsh makes the whole org offer it (an OR).
+        assertTrue(mergeSites(listOf(noDsh, withDsh)).single().dshAvailable)
+        // No host offering it (absent or available:false) leaves the org without.
+        val off = agent("hostC", true, JiraBlock(siteKey = "org2", user = "u"))
+            .copy(dsh = com.xerktech.turma.model.DshInfo(available = false))
+        assertFalse(mergeSites(listOf(noDsh.copy(jira = JiraBlock(siteKey = "org2", user = "u")), off)).single().dshAvailable)
+    }
+
+    @Test fun `runtimePinOf reads the map, treating claude and blank as no pin`() {
+        val tr = mapOf(
+            "org.atlassian.net/X-1" to com.xerktech.turma.model.TicketRuntimePin(runtime = "dsh", at = 1),
+            "org.atlassian.net/X-2" to com.xerktech.turma.model.TicketRuntimePin(runtime = "claude", at = 1),
+        )
+        assertEquals("dsh", runtimePinOf(tr, "org.atlassian.net", "X-1")?.runtime)
+        // "claude" is the default, so it reads as no pin — same as the web.
+        assertEquals(null, runtimePinOf(tr, "org.atlassian.net", "X-2"))
+        // A key nothing pinned, and a blank runtime, both read as no pin.
+        assertEquals(null, runtimePinOf(tr, "org.atlassian.net", "X-9"))
+        assertEquals(null, runtimePinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketRuntimePin()), "s", "X-1"))
+    }
+
+    @Test fun `prettyRuntime and runtimeEditable mirror the web`() {
+        assertEquals("dsh (DeepSeek Harness)", prettyRuntime("dsh"))
+        assertEquals("Claude Code", prettyRuntime("claude"))
+        assertEquals("Claude Code", prettyRuntime(""))
+        val pin = com.xerktech.turma.model.TicketRuntimePin(runtime = "dsh", at = 1)
+        // Editable when the org offers dsh OR a pin already exists (so it can be
+        // released even after the last dsh host leaves).
+        assertTrue(runtimeEditable(dshAvailable = true, pin = null))
+        assertTrue(runtimeEditable(dshAvailable = false, pin = pin))
+        assertFalse(runtimeEditable(dshAvailable = false, pin = null))
+    }
+
     @Test fun `prettyModel capitalizes aliases and parses claude ids`() {
         assertEquals("Opus", prettyModel("opus"))
         assertEquals("Opus 4.8", prettyModel("claude-opus-4-8"))

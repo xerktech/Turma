@@ -40,6 +40,9 @@ data class FleetState(
     // Ticket -> pinned model (XERK-123), from the same payload; the board's Model
     // row reads it. Refreshed by the poll and the "ticketModels" SSE event.
     val ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap(),
+    // Ticket -> pinned runtime (XERK-473), from the same payload; the board's
+    // Runtime row reads it. Refreshed by the poll and the "ticketRuntimes" SSE event.
+    val ticketRuntimes: Map<String, com.xerktech.turma.model.TicketRuntimePin> = emptyMap(),
     // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
     // 1..8; every screen's org tint reads it. Refreshed by the poll and the
     // "orgColors" SSE event.
@@ -106,6 +109,7 @@ class FleetRepository(
             ticketAgents = resp.ticketAgents
             autoStartOrgs = resp.autoStartOrgs
             ticketModels = resp.ticketModels
+            ticketRuntimes = resp.ticketRuntimes
             orgColors = resp.orgColors
             ticketQueue = resp.ticketQueue
             retiredUsage = resp.retiredUsage
@@ -126,6 +130,9 @@ class FleetRepository(
     private var ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap()
 
     @Volatile
+    private var ticketRuntimes: Map<String, com.xerktech.turma.model.TicketRuntimePin> = emptyMap()
+
+    @Volatile
     private var orgColors: Map<String, Int> = emptyMap()
 
     @Volatile
@@ -144,6 +151,7 @@ class FleetRepository(
             ticketAgents = ticketAgents,
             autoStartOrgs = autoStartOrgs,
             ticketModels = ticketModels,
+            ticketRuntimes = ticketRuntimes,
             orgColors = orgColors,
             ticketQueue = ticketQueue,
             retiredUsage = retiredUsage,
@@ -184,6 +192,10 @@ class FleetRepository(
                     "ticketModels" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketModelPin>>(data)
                     }.getOrNull()?.let { ticketModels = it; emit(_state.value.now, null) }
+                    // A ticket->runtime pin changed (XERK-473); whole tiny map.
+                    "ticketRuntimes" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketRuntimePin>>(data)
+                    }.getOrNull()?.let { ticketRuntimes = it; emit(_state.value.now, null) }
                     // An org's color pin changed (XERK-145); whole tiny map.
                     "orgColors" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, Int>>(data)

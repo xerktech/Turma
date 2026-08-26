@@ -27,6 +27,11 @@ data class AgentsResponse(
     // a ticket's session runs, when the operator overrode the login's default.
     // Hub-owned and durable like ticketAgents; absent on older hubs.
     val ticketModels: Map<String, TicketModelPin> = emptyMap(),
+    // Ticket -> pinned RUNTIME (XERK-473 / [I]), keyed "<siteKey>/<issueKey>":
+    // which runtime ("claude"|"dsh") a ticket's session spawns on, delivered on
+    // the spawnTicket command as `agentType`. Only a non-default ("dsh") pin is
+    // stored. Hub-owned and durable like ticketModels; absent on older hubs.
+    val ticketRuntimes: Map<String, TicketRuntimePin> = emptyMap(),
     // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
     // 1..8 (presence = pinned). Hub-owned and durable; absent on older hubs.
     val orgColors: Map<String, Int> = emptyMap(),
@@ -56,6 +61,10 @@ data class TicketAgentPin(val host: String = "", val at: Long = 0)
 /** One ticket->model pin (the web board's Model row; hub ticket-models store). */
 @Serializable
 data class TicketModelPin(val model: String = "", val at: Long = 0)
+
+/** One ticket->runtime pin (the web board's Runtime row; hub ticket-runtimes store). */
+@Serializable
+data class TicketRuntimePin(val runtime: String = "", val at: Long = 0)
 
 /**
  * One ticket waiting in the hub's queue for a free session slot (XERK-296).
@@ -275,6 +284,12 @@ data class ClosedSessionInfo(
     // over the branch), and must not change just because the session was killed.
     val summaryManual: Boolean = false,
     val label: String = "",
+    // Which runtime this session ran on (XERK-460 / [M] XERK-477), so an ended
+    // dsh card shows its runtime the same way a live one does. "claude" (the
+    // default) and "" (a record from an agent predating the field) both read as
+    // Claude Code and carry no badge — the same coercion the live SessionInfo
+    // field gets. Served on the closed payload (hub _closed_payload).
+    val agentType: String = "",
     val createdAt: String = "",
     val closedAt: String = "",
     // The Jira ticket this session worked, snapshotted onto the closed record

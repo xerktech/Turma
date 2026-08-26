@@ -401,8 +401,38 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   (`LaunchedEffect`), the same reset the local-model row has.
 - Pure half in `core/Runtime.kt` (`RuntimeTest.kt`); the composer call site in
   `ui/SpawnComposerTest.kt`; the wire body in `vm/SpawnRequestTest.kt`.
-- **Still open:** the dsh runtime BADGE on live/ended session CARDS (see below) — the field decodes,
-  so it is a pure render add, in the same boat as the local-model card mark below.
+- **The dsh runtime BADGE on live/ended session CARDS** — done (XERK-477, see Done below).
+
+## Done (XERK-477 — dsh runtime badge on session cards)
+
+- **The `⚙ dsh` runtime badge** (web `runtimeMarkHtml` / `.runtime-mark` in `sessions.html`) now
+  shows on both the live session cards (`SessionListCard`) and the ended rows (`EndedSessionRow`) in
+  `ui/SessionsScreen.kt`, so a glance at the Sessions list says which sessions run on dsh. A Claude
+  session — the default, and every session predating the field — carries none, exactly as the web
+  gates on `s.agentType === "dsh"`. `RuntimeBadge` (`ui/CommonUi.kt`) is the shared render; the card
+  gates it on `Runtime.isDsh(agentType)` and shows the badge even on a card with no PR.
+- **Deliberately Sessions-page only**, matching the web: `runtimeMarkHtml` lives only in
+  `sessions.html`, so the Dashboard's (`index.html`) session cards carry no badge and neither does
+  `FleetScreen`'s.
+- **The ended card reads the runtime from the record it came on.** `EndedSession` now carries
+  `agentType`, sourced from the stopped channel (`SessionInfo.agentType`) and the closed channel
+  (`ClosedSessionInfo.agentType`, newly typed — the hub already serves it on `_closed_payload`). The
+  resumable channel is a bare transcript scan that records no runtime, so it stays `""` and reads as
+  Claude Code — the same omission the web's `resumableSession` makes.
+- Tests: the closed-`agentType` decode in `model/AgentDecodeTest.kt`, the projection carry-through in
+  `ui/SessionsFlattenTest.kt`, and the existing `Runtime.isDsh` cases in `core/RuntimeTest.kt`.
+- **The board ticket "Runtime" row** (web `board.js` `runtimePinOf`/`runtimeFieldHtml`/
+  `runtimePickerHtml`, XERK-473) — the fifth tap-to-change row in the ticket detail sheet
+  (`RuntimeSection` in `ui/BoardScreen.kt`), beside Status/Repo/Agent/Model, pinning which runtime a
+  ticket's session spawns on. Hub-owned durable state: it reads the `ticketRuntimes` map off the
+  fleet payload (typed as `AgentsResponse.ticketRuntimes` → `FleetState.ticketRuntimes`, refreshed by
+  the poll and the `ticketRuntimes` SSE event) and writes with `POST
+  /api/jira/<siteKey>/<issueKey>/runtime` (`vm.setTicketRuntime`), authoritative on a 200 like the
+  Model pin. "dsh" is offered only when the org has a dsh-capable host (`BoardSite.dshAvailable`,
+  OR'd over every host's `dsh.available` in `mergeSites`), with an existing dsh pin always releasable
+  (`Runtime` row `runtimeEditable`). Pure ports (`runtimePinOf`/`prettyRuntime`/`runtimeEditable`) in
+  `core/Board.kt`, tested in `core/BoardTest.kt`; the `ticketRuntimes` decode in
+  `model/AgentDecodeTest.kt`.
 
 ## Open (subsequent installments), by screen and priority
 
@@ -446,19 +476,10 @@ those are marked `[MODEL]`.
   glance at the list says which sessions are on the weaker model without opening each one. Read
   `session.modelSource == "local"`, titled with `modelSourceAt`. Both fields already decode onto
   `SessionInfo`.
-- **P2 dsh runtime badge on session CARDS (XERK-465 remainder).** The composer selector and the
-  `agentType`/`dsh` typing are done (see Done above); what's left is the web's `⚙ dsh` chip on live
-  and ended session cards (`.runtime-mark` in `sessions.html`), so a glance says which sessions run
-  on dsh. Read `Runtime.isDsh(session.agentType)`; claude sessions (the default) carry none. The
-  field already decodes onto `SessionInfo`.
-- **P2 board ticket "Runtime" row (XERK-473 → XERK-477).** The web board's ticket detail panel gained
-  a fifth tap-to-change row beside Status/Repo/Agent/Model — "Runtime" — pinning which runtime a
-  ticket's session spawns on (`ticketRuntimes` map on `/api/agents` + its SSE event; `POST
-  /api/jira/<siteKey>/<issueKey>/runtime`). "dsh" is offered only when the org has a dsh-capable host
-  (`BoardSite.dshAvailable`, off `AgentInfo.dsh.available` which already decodes). Port
-  `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml` into `core/Board.kt` and add the
-  `SelectableValue` row in `BoardScreen.kt`, mirroring the Model row exactly. Deferred to the Android
-  dsh-parity ticket (XERK-477); the hub side is live so the row is fully functional on web now.
+- ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Done (XERK-477, see Done below):
+  the web's `⚙ dsh` chip on live and ended session cards, so a glance says which sessions run on dsh.
+- ~~P2 board ticket "Runtime" row (XERK-473 → XERK-477).~~ Done (XERK-477, see Done below): the board
+  ticket detail sheet's fifth tap-to-change row, pinning which runtime a ticket's session spawns on.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
 - ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
   see Done above; the read-only review itself was XERK-70).
