@@ -316,7 +316,8 @@ the Start button AND the auto-start sweep.
 - **"dsh" is offered only when the org offers it** (`site.dshAvailable`, from any reporting host's
   `dsh.available` via `mergeSites`), so the picker can't name a runtime the hub would refuse — but an
   existing dsh pin is always carried back so it can be released even after the last dsh host leaves.
-- **Deferred on Android** to XERK-477 (an `android/PARITY.md` line), the way the dsh card badge was.
+- **Shipped on Android** in XERK-477 (`RuntimeSection` in `BoardScreen.kt`), the way the dsh card
+  badge was.
 - Tests: `server.test.js` (the `/runtime` route + the dsh `findTicketHost` cases);
   `runtimePinOf`/`runtimeFieldHtml`/`runtimePickerHtml` in `board.test.js`.
 
