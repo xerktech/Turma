@@ -16,6 +16,7 @@ are passed to each harness the way that harness expects.
 
 import argparse
 import concurrent.futures
+import glob
 import json
 import os
 import re
@@ -26,7 +27,11 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIGS = os.path.join(HERE, "configs")
-MODEL = "gpt-oss:120b"
+# The model every harness is pointed at. Overridable so one task set can be run
+# across a whole model matrix -- which is the point of XERK-445 Phase 3: the
+# harness is held fixed and the MODEL is the variable, the inverse of the
+# bake-off this directory was built for.
+MODEL = os.environ.get("TURMA_LOCAL_MODEL", "gpt-oss:120b")
 
 # Appended verbatim to every task prompt, for every harness. Kept out of
 # tasks.json so a harness can never be measured against different wording.
@@ -57,7 +62,13 @@ AIDER = _bin("/root/.local/bin/aider", "/usr/local/bin/aider")
 
 def base_env():
     env = os.environ.copy()
-    env.setdefault("TMPDIR", "/root/tmp")
+    # Not /root/tmp: this used to run as root and the hardcoded path is simply
+    # unwritable for anyone else, which surfaces as every task "abandoning" in
+    # ~7s with EACCES rather than as a setup error.
+    tmp = os.environ.get("TMPDIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "turma-bench-tmp")
+    os.makedirs(tmp, exist_ok=True)
+    env["TMPDIR"] = tmp
     # Keep every harness from picking up an ambient cloud login: the bench is
     # explicitly about the SELF-HOSTED model, and a stray key would silently
     # benchmark someone else's frontier model instead.
@@ -154,7 +165,12 @@ def harness_claude_local(prompt, env):
     env["CLAUDE_CONFIG_DIR"] = env.get(
         "BENCH_CLAUDE_CONFIG_DIR",
         os.path.join(os.path.expanduser("~"), ".turma-bench-claude"))
-    return ["claude", "-p", "--permission-mode", "bypassPermissions", prompt], env
+    cmd = ["claude", "-p", "--permission-mode", "bypassPermissions"]
+    effort = os.environ.get("TURMA_LOCAL_EFFORT")
+    if effort:
+        cmd += ["--effort", effort]
+    cmd.append(prompt)
+    return cmd, env
 
 
 HARNESSES = {
@@ -243,13 +259,48 @@ def score(task, dest, baseline):
     }
 
 
+def _extract_usage(dest, env, started=0):
+    """Sum token usage from the Claude Code transcript for a completed run.
+
+    Multiple models may share a workroot (and therefore a project slug dir),
+    so ``started`` limits to JSONL files created during THIS run.
+    """
+    config_dir = env.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+    slug = dest.replace("/", "-")
+    proj_dir = os.path.join(config_dir, "projects", slug)
+    totals = {"input_tokens": 0, "output_tokens": 0,
+              "cache_creation_tokens": 0, "cache_read_tokens": 0}
+    if not os.path.isdir(proj_dir):
+        return totals
+    for jf in glob.glob(os.path.join(proj_dir, "*.jsonl")):
+        if started and os.path.getmtime(jf) < started:
+            continue
+        try:
+            with open(jf) as f:
+                for line in f:
+                    e = json.loads(line)
+                    u = (e.get("message") or {}).get("usage")
+                    if not u:
+                        continue
+                    totals["input_tokens"] += u.get("input_tokens", 0)
+                    totals["output_tokens"] += u.get("output_tokens", 0)
+                    totals["cache_creation_tokens"] += u.get(
+                        "cache_creation_input_tokens", 0)
+                    totals["cache_read_tokens"] += u.get(
+                        "cache_read_input_tokens", 0)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return totals
+
+
 # A run that never reached the model tells us nothing about the harness. These
 # are the gateway/transport failures seen in practice (Bun's fetch wording, plus
 # the usual proxy codes); a run whose transcript is only these, with no tool
 # activity, is retried rather than scored as a capability failure.
 INFRA_ERROR_RE = re.compile(
     r"Unable to connect|Cannot connect to API|ECONNRESET|ECONNREFUSED|ETIMEDOUT|"
-    r"socket hang up|502 Bad Gateway|503 Service|504 Gateway|Connection error",
+    r"socket hang up|502 Bad Gateway|503 Service|504 Gateway|Connection error|"
+    r"Request rejected \(429\)|Too many tokens|rate.limited",
     re.I)
 # Evidence the harness actually got a model turn back and acted on it. Kept to
 # capitalised tool NAMES and unambiguous markers: bare words like "shell" appear
@@ -307,6 +358,11 @@ def one_run(repo, task, hname, attempt, args, workroot, infra_try=1):
         rec["abandoned"] = rec["seconds"] < 25 and not rec["committed"] and not rec["solved"]
         rec["infra_failure"] = not rec["solved"] and looks_like_infra_failure(out)
         rec["infra_try"] = infra_try
+        usage = _extract_usage(dest, env, started)
+        rec.update(usage)
+        secs = rec["seconds"]
+        if secs > 0 and usage["output_tokens"] > 0:
+            rec["tps"] = round(usage["output_tokens"] / secs, 1)
         os.makedirs(args.runs, exist_ok=True)
         with open(os.path.join(args.runs, f"{hname}-{task['id']}-{attempt}.log"), "w") as fh:
             fh.write(" ".join(cmd[:4]) + "\n\n" + out)

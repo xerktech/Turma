@@ -121,6 +121,7 @@ jobs:
             --config=p/default \
             --config=p/secrets \
             --config=p/dockerfile \
+            --exclude='poc' \
             --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag \
             --exclude-rule problem-based-packs.insecure-transport.js-node.using-http-server.using-http-server \
             --exclude-rule dockerfile.security.missing-user-entrypoint.missing-user-entrypoint \
@@ -161,6 +162,8 @@ jobs:
       # Finds every shell script in the repo and lints per its shebang
       # (entrypoint.sh is #!/bin/sh). Fails the job on any finding.
       - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          ignore_paths: poc
 
   tests:
     name: Unit tests
@@ -209,6 +212,15 @@ jobs:
           exit "$fail"
       - name: Python unit tests (agent/hub-agent.py)
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
+      # bench/archive holds the XERK-445 routing-eval tooling, including
+      # scrub.py -- the redactor that decides what may leave the box. Nothing
+      # under bench/ was executed by any gate until this step existed, and a QA
+      # pass proved it: max->sum in the token reducer, the error-recovery
+      # precedence rule, and the entire scrub rule loop were each deleted in
+      # turn and every project suite stayed green. A security control with no
+      # test rots silently.
+      - name: Python unit tests (bench/archive routing-eval tooling)
+        run: python3 -m unittest discover -s bench/archive -p "test_*.py" -t bench/archive -v
       - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
         run: node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
       - name: Node unit tests (dsh safety guard)

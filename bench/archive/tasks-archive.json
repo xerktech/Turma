@@ -1,0 +1,1628 @@
+{
+ "_comment": [
+  "Replay tasks mined from the Turma hub's archived session history",
+  "(XERK-445 Phase 0). The prompt is the session's FIRST user message,",
+  "scrubbed -- the real ask, before any work happened. Nothing from the",
+  "body of the transcript is included, so a replay cannot read the answer",
+  "out of the task. Grading is mechanical and comes from git, not from the",
+  "transcript: check out `commit`, revert `revert_paths` to the parent, and",
+  "the repo's own tests must go red-then-green.",
+  "sensitivity=local-only tasks must never be sent to a cloud endpoint.",
+  "Every task still has to pass bench/validate_tasks.py before it is used."
+ ],
+ "tasks": [
+  {
+   "id": "tenir-xerk-102",
+   "commit": "7387a87705b4e8018d300bcb335643ea909b1b12",
+   "kind": "feature",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-102",
+    "repo": "tenir",
+    "transcript": "4c8543dd-5299-4bbd-ad69-e32ec60aa461.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/cue/__init__.py",
+    "api/src/api/cue/base.py",
+    "api/src/api/cue/openai.py",
+    "api/src/api/cue/stub.py",
+    "api/src/api/session.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_cue_backends",
+    "api.tests.test_cue_session"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-102. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-102: Cue Queue\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-102\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nWhen a new Cue is triggered when there is already an active Cue, it should be Queued and popup immediately after the current Cue is released and disappears. This Queue may end up several Cues deep, that needs to be expected / handled\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-105",
+   "commit": "539bd86ea367de1aeb8a56863d70dfd0abee441c",
+   "kind": "change",
+   "lang": "tsx",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-105",
+    "repo": "tenir",
+    "transcript": "2303f250-06c6-4fc9-954c-c50d70112ef3.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/screens/History.tsx",
+    "mobile/src/ui/cue.tsx",
+    "web/src/panels/History.tsx",
+    "web/src/styles.css"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/cue.test.ts",
+    "mobile/tests/selectableText.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-105. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-105: Tenir cue popup\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-105\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nInstead of making the cues in the conversation history a pop-up let's make them a drop down in line. But they default to minimized.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-107",
+   "commit": "de9d3121741089b92b41a6a612650df5fa79408d",
+   "kind": "change",
+   "lang": "tsx",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-107",
+    "repo": "tenir",
+    "transcript": "5327fdf4-15fd-4b76-b39e-15092150839e.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/screens/Live.tsx",
+    "mobile/src/ui/cue.tsx",
+    "mobile/src/ui/theme.ts",
+    "packages/client-core/src/captureSession.ts",
+    "packages/client-core/src/scroll.ts",
+    "web/src/panels/Live.tsx",
+    "web/src/styles.css"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/cue.test.ts",
+    "mobile/tests/selectableText.test.ts",
+    "mobile/tests/theme.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-107. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-107: Cues Position\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-107\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nIn the web Ui, it\u2019s disorienting when the cues appear and disappear because it pushed the transcript window down, and then it goes back up as the Cue disappears. suggest some solutions for this.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-110",
+   "commit": "bff2e9c4e119dd7a5095e03b8e59772915043b1d",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-110",
+    "repo": "tenir",
+    "transcript": "68d41b49-a43a-4c51-a99e-cbf972fb41ee.jsonl"
+   },
+   "revert_paths": [
+    "even/index.html",
+    "even/src/lens/controller.ts",
+    "even/src/lens/layout.ts",
+    "even/src/phone/session.ts",
+    "mobile/src/ui/cue.tsx",
+    "packages/client-core/src/captureSession.ts",
+    "web/src/panels/Live.tsx",
+    "web/src/styles.css"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/controller.test.ts",
+    "even/tests/layout.test.ts",
+    "even/tests/session.test.ts",
+    "mobile/tests/cue.test.ts",
+    "packages/client-core/tests/captureSession.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-110. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-110: Cue Count down timer\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-110\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nA Cue window should have a countdown timer in the top right corner, across from the title. The countdown time is how many seconds until it disappears.\nThis should be across all components.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-115",
+   "commit": "0be1270cf6c3577d3ce4c8bb0a7177c6887361c9",
+   "kind": "infra",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-115",
+    "repo": "tenir",
+    "transcript": "a3bb7d13-99b7-4247-bc13-c88a534ea4b9.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/config.py",
+    "api/src/api/stt/__init__.py",
+    "api/src/api/stt/engine.py",
+    "api/src/api/stt/streaming.py",
+    "api/src/api/stt/voxtral.py",
+    "docker-compose.yml",
+    "parakeet-stt/server.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_streaming_stt",
+    "api.tests.test_stt_backends",
+    "parakeet-stt.tests.test_server"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-115. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-115: STT model selection\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-115\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nI'm comparing this app against the built in Even G2 Conversate app. The STT model in that app is faster and more accurate than what we've got in our app. Research their app and research alternative models we can use to reduce latency and improve accuracy. If there are app changes or model settings that can be set for parakeet to improve our current model, research that as well.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-116",
+   "commit": "53582d68eb0d1abbbc158eacf2f94e4f14e82df7",
+   "kind": "bugfix",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-116",
+    "repo": "tenir",
+    "transcript": "4e56c18c-24a7-4fa9-b515-c5fc25628865.jsonl"
+   },
+   "revert_paths": [
+    "even/index.html",
+    "even/src/lens/controller.ts",
+    "even/src/phone/session.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/controller.test.ts",
+    "even/tests/session.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-116. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-116: Even phone app stop button\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-116\n- Status: To Do\n- Type: Epic\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nin the phone companion for the glasses app we should have stop and start buttons so it doesn't only have to started and stopped from the glasses.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-120",
+   "commit": "e7a728069d52f61eb1a43efe78d0ff43836ee4e0",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-120",
+    "repo": "tenir",
+    "transcript": "db1a9214-f474-46ae-af92-e122f88e9eb9.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/cue/openai.py",
+    "api/src/api/cue/tuning.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_cue_backends"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-120. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-120: Cue RAG\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-120\n- Status: To Do\n- Type: Epic\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nwe need to build out a comprehensive system for the cue model to be able to search the Internet to gather and confirm information that is used to provide factual and accurate Cues. This should include a vector db where rss feeds of reliable news sources can be automatically collected and stored as context for the cue model to increase its knowledge and understanding of recent events. it's critical that we keep the cue system as accurate as possible but also as fast as possible so that the Cue context is on time in the conversation for when it makes sense. research and plan this all out thoroughly before starting. (only do the rss feed and vector db components if they are actually helpful to the goal of generating up to date and factual data quickly.)\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-124",
+   "commit": "42b749ebd34e67d6b1aa626cb4f4316c7ccffa8e",
+   "kind": "bugfix",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-124",
+    "repo": "tenir",
+    "transcript": "f177f4af-1e91-4182-8105-38f5b82fe150.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/cue/retrieval/live.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_cue_retrieval"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-124. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-124: No cues are appearing\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-124\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nIve gone through a couple sessions and no cues are appearing. If you can, review the recent session on disk (the container is deployed on this server) and determine if that's design or error.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-129",
+   "commit": "59052c1cd129dd031c9ff0889272d425b7f0bdc0",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-129",
+    "repo": "tenir",
+    "transcript": "46b43a74-0443-48c8-8881-c2d7014aba0d.jsonl"
+   },
+   "revert_paths": [
+    "even/src/lens/controller.ts",
+    "even/src/lens/layout.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/controller.test.ts",
+    "even/tests/layout.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-129. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-129: Cue interaction\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-129\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nin the glasses ui when a cue appears If I tap or scroll it should reset the cue countdown timer. And if a cue body is more than 3 lines and scrollable, there should be a scroll bar in the cue container to signify that it's scrollable.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-134",
+   "commit": "861b2e06298e63da8d910fb44751ee124a11b88f",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-134",
+    "repo": "tenir",
+    "transcript": "b199c000-b586-45d3-bd63-f7634d49e88a.jsonl"
+   },
+   "revert_paths": [
+    "even/index.html",
+    "even/src/lens/layout.ts",
+    "even/src/phone/session.ts",
+    "mobile/src/ui/cue.tsx",
+    "web/src/styles.css"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/layout.test.ts",
+    "mobile/tests/cue.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-134. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-134: No caps headers\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-134\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nCurrently cue titles are all caps across all UIs. I am want them capitalized normally, I don't like them all caps.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-160",
+   "commit": "a9f77fe3604f40592c6c9fbd6a4b524503070f2f",
+   "kind": "feature",
+   "lang": "tsx",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-160",
+    "repo": "tenir",
+    "transcript": "agent-a174fa0346cb1f1a8.jsonl"
+   },
+   "revert_paths": [
+    "even/index.html",
+    "even/src/lens/controller.ts",
+    "even/src/phone/history.ts",
+    "even/src/phone/session.ts",
+    "mobile/src/screens/History.tsx",
+    "mobile/src/screens/Live.tsx",
+    "mobile/src/ui/components.tsx",
+    "web/src/panels/History.tsx",
+    "web/src/panels/Live.tsx",
+    "web/src/ui/TranslationLine.tsx",
+    "web/src/ui/index.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/controller.test.ts",
+    "even/tests/history.test.ts",
+    "even/tests/session.test.ts",
+    "mobile/tests/translation.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Explore the repo at <INTERNAL_PATH> (a product called Tenir: smart-glasses live transcription + AI \"cues\"). Be thorough. I need to understand the client/front-end side to add a \"live translation\" feature (showing English translations of non-English speech). Report on:\n\n1. even/ \u2014 the Even Realities glasses phone app component: what platform/language it is, how it receives transcripts and cues, and specifically how a Cue is rendered on the glasses (box location/size, the 10-second display timer, dismiss logic).\n2. mobile/ \u2014 the Android app: framework (React Native? Kotlin?), how it displays the live transcript and cues, key components/files.\n3. web/ \u2014 the web UI: framework, how it displays live transcript and cues, key components/files.\n4. packages/ \u2014 shared TS packages: what's shared between web/mobile/even (types, websocket client, state).\n5. How transcript segments are rendered in each UI (component names, file paths) \u2014 I will need to show translation either side-by-side with the original or turn-by-turn.\n6. Any existing settings UI in web and mobile where a \"translation\" toggle would go.\n\nGive file paths with line numbers for key integration points. Return raw findings, organized by topic."
+  },
+  {
+   "id": "tenir-xerk-167",
+   "commit": "815a93318b3fecc8c315df072cfdba03ac86107e",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-167",
+    "repo": "tenir",
+    "transcript": "1fff8edb-a663-44d0-89c3-2f7a86a66f52.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/App.tsx",
+    "mobile/src/lib/updater.ts",
+    "mobile/src/lib/useUpdater.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/updater.test.ts",
+    "mobile/tests/useUpdater.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-167. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-167: Tenir android updates\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-167\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: tenir\n\n## Description\n\ndoes the Tenir android app check for updates regularly or only on app start? it seems like it only checks at app start, which means I have to close the app and re open to check for updates, and I don't like that\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-168",
+   "commit": "e04e16ce6be014bcf98003ee26b697aee78d90a3",
+   "kind": "infra",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-168",
+    "repo": "tenir",
+    "transcript": "e8e14d3d-2d1e-4245-b42c-0e4415380167.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/auth/tokens.py",
+    "api/src/api/config.py",
+    "api/src/api/main.py",
+    "docker-compose.yml",
+    "packages/client-core/src/api.ts"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_auth"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-168. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-168: cache user creds\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-168\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nuser creds reset every couple days or so it seems. they should be persistent on device so I'm not asked to log in again unless I manually log out\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-175",
+   "commit": "5b833f3b89e0288fef2a3f7cc7c6041267fa7adb",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-175",
+    "repo": "tenir",
+    "transcript": "e20549bb-d724-4586-82db-33e776d1a6a0.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/config.py",
+    "api/src/api/stt/streaming.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_stt_backends",
+    "scripts.stt_eval.tests.test_stt_eval"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-175. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-175: Shorten turn time\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-175\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nDoes it make sense / as it possible to shorten howong a turn is? Long turns seem to make translations come in slower, and maybe also increase how long it takes to get a cue. Review, evaluate and test this with recent session data.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-180",
+   "commit": "e1de3bc959126954f83ac5011d84671c69b57b78",
+   "kind": "infra",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-180",
+    "repo": "tenir",
+    "transcript": "5db8051d-92ab-4bdf-9139-83ccb042286b.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/config.py",
+    "api/src/api/translate/__init__.py",
+    "api/src/api/translate/openai.py",
+    "docker-compose.yml",
+    "litellm/config.yaml"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_translation_backends"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-180. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-180: Seperate translation model\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-180\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nInvestigate and evaluate if we would benefit from having a dedicated translation model instead of using the cue model. Looking for optimal translation speed and accuracy\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-182",
+   "commit": "5c4498a39f019f608c84573167c2b86dac5f9216",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-182",
+    "repo": "tenir",
+    "transcript": "54648f33-f94b-4154-b18d-757128895c6c.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/stt/streaming.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_streaming_stt"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-182. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-182: Accuracy loss fix\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-182\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nBetween pr 111, and pr 110, I feel like we had a huge fall off the cliff with quality and accuracy. Review the audio recordings, transcriptions, cues and translations. Run them and monitor them in real time for yourself so you can see and understand the issues. Theorize how to increase accuracy and run tests to prove and improve your theories until we get this accuracy improved and locked in.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-187",
+   "commit": "4c288596f230fe16ea1052f1b957403fac552681",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-187",
+    "repo": "tenir",
+    "transcript": "d2dc7302-16cc-40e4-a141-e68d58fca6d5.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/config.py",
+    "api/src/api/music/__init__.py",
+    "api/src/api/music/base.py",
+    "api/src/api/music/shazam.py",
+    "api/src/api/session.py",
+    "scripts/music_eval/replay.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_music_backends",
+    "api.tests.test_music_session"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-187. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-187: Music ID verification\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-187\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nThe music ID feature has been built. Test and verify it's functionality, accuracy, and speed using the last 7 hours of sessions that are hosted on this server. Every one of the sessions should have songs. Make any changes and improvements and then evaluate test, and verify again until you have the feature working exactly as intended.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-189",
+   "commit": "29d5364c87383e116e8c17af7a28fb776eed925e",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-189",
+    "repo": "tenir",
+    "transcript": "431092aa-a41c-4a8b-9fb9-d7ed3a2d4f8f.jsonl"
+   },
+   "revert_paths": [
+    "even/src/lens/controller.ts",
+    "even/src/lens/layout.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/controller.test.ts",
+    "even/tests/layout.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-189. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-189: Even lyric line\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-189\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nin the web ui the current lyric line is the 2nd from the top and it's bolded. I like that. In the glasses UI we can't bold a line, so let's put an > at the current lyric line and also have it be the 2nd line from the top still\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-191",
+   "commit": "187170165c97c4283d804b34d4b2668ddcec8d5e",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-191",
+    "repo": "tenir",
+    "transcript": "e6c87694-fa28-49e2-a15f-e9a958ca932b.jsonl"
+   },
+   "revert_paths": [
+    "even/src/lens/layout.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/layout.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-191. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-191: Lyrics scroll bar\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-191\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nSometimes when the lyrics are on screen in the glasses there is a line of the song whose text is longer than 1 line in the glasses, and so that causes a scroll bar in the lyrics box. That scroll bar should never appear for lyrics. It auto corrects after the long line passes, but I don't want it there.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-216",
+   "commit": "f24bd63d6a519d064160df2c89775064ffc6dd92",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-216",
+    "repo": "tenir",
+    "transcript": "agent-a0b501ff636569f61.jsonl"
+   },
+   "revert_paths": [
+    "veiller/src/background/controllers/TenirController.ts",
+    "veiller/src/background/hud.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "veiller/src/background/controllers/TenirController.test.ts",
+    "veiller/src/background/hud.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "You are auditing feature parity between two apps in the repo at <INTERNAL_PATH>\n\nUPSTREAM (reference): the Even G2 glasses app's phone pages:\n- <INTERNAL_PATH> nav.ts, session.ts, history.ts\n- <INTERNAL_PATH> (how phone pages are wired)\n- <INTERNAL_PATH> (the phone UI markup + CSS, sections #login/#app/#page-session/#page-history etc.)\n- <INTERNAL_PATH> (user settings surface)\n\nPORT (to audit): the foverlay miniapp's phone WebView:\n- <INTERNAL_PATH> lib.ts, index.html, index.css\n- <INTERNAL_PATH> (what state the UI receives)\n\nRead ALL of these files completely. Produce an exhaustive, specific gap list: every feature, UI element, behavior, or detail present in the upstream phone pages but missing, stubbed, or behaviorally different in the foverlay UI. For each gap give: (1) short name, (2) upstream file:line evidence of the behavior, (3) what foverlay currently does instead (file:line), (4) severity (user-visible feature missing vs cosmetic). Pay special attention to: the session page's live view (song banner, lyrics display, cue rendering/review flow, text sizing), history page (cue toggle, song rows, lyrics, audio, search, delete), settings (mic source, language, text size), and anything in even/index.html's phone sections with no foverlay equivalent. Note where foverlay's header comment in ui/main.ts already declares intentional omissions (audio playback, cue-detail modal) \u2014 list those separately as 'declared exceptions'. Return the full gap list as structured text; be precise with file:line references."
+  },
+  {
+   "id": "tenir-xerk-67",
+   "commit": "89b839b1b0dc35091f37f67bb836248493470a77",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-67",
+    "repo": "tenir",
+    "transcript": "ce0dd4d0-4d08-4683-80dc-e9b38c2f2885.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/lib/audioPlayer.ts",
+    "mobile/src/lib/useAudioPlayer.ts",
+    "mobile/src/ui/AudioPlayer.tsx"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/audioPlayer.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-67. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-67: Tenir audio playback\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-67\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nIn the web ui and in the android app we should be able to click on the audio recording and have native playback with a scroll bar\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-79",
+   "commit": "8bb0e59968c32e02cc91acc67e19f7b91e09b974",
+   "kind": "feature",
+   "lang": "tsx",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-79",
+    "repo": "tenir",
+    "transcript": "agent-a39e41223270e4dae.jsonl"
+   },
+   "revert_paths": [
+    "mobile/android/app/src/main/res/values/colors.xml",
+    "mobile/src/App.tsx",
+    "mobile/src/lib/notify.tsx",
+    "mobile/src/screens/Disclosure.tsx",
+    "mobile/src/screens/History.tsx",
+    "mobile/src/screens/Live.tsx",
+    "mobile/src/screens/Settings.tsx",
+    "mobile/src/screens/Setup.tsx",
+    "mobile/src/screens/Status.tsx",
+    "mobile/src/storage.ts",
+    "mobile/src/ui/AudioPlayer.tsx",
+    "mobile/src/ui/UpdateBanner.tsx",
+    "mobile/src/ui/components.tsx",
+    "mobile/src/ui/icons.tsx",
+    "mobile/src/ui/theme.ts",
+    "package-lock.json",
+    "web/src/App.tsx",
+    "web/src/panels/History.tsx",
+    "web/src/panels/Users.tsx",
+    "web/src/styles.css",
+    "web/src/ui/NavIcon.tsx",
+    "web/src/ui/index.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/confirm.test.ts",
+    "mobile/tests/storage.test.ts",
+    "mobile/tests/tabBar.test.ts",
+    "mobile/tests/theme.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Explore the repo at <INTERNAL_PATH> \u2014 specifically its two UIs: the web dashboard in `turma/` and the Android app in `android/`. This is READ-ONLY exploration of a REFERENCE app whose design language another product must match.\n\nProduce a detailed DESIGN-LANGUAGE SPEC covering, for EACH of the two UIs (web and Android):\n\n1. **Layout & structure**: page/screen structure, headers, navigation model, list/tree patterns, card layouts, how detail views work.\n2. **Typography**: font families, sizes, weights, letter-spacing, text-transform conventions (e.g. uppercase labels), monospace usage.\n3. **Spacing & shape**: paddings, margins, border radii, borders, dividers, elevation/shadows.\n4. **Components**: buttons (variants, shapes, sizes), badges/pills, status indicators/dots, inputs, dialogs/modals, toasts, empty states, loading states \u2014 with concrete CSS values / Compose or XML attributes.\n5. **Iconography**: icon set used, style (outline/filled), sizes.\n6. **Color SYSTEM STRUCTURE ONLY** (not the actual hues \u2014 the other product keeps its own palette): how colors are organized \u2014 e.g. background layers, surface levels, accent usage, status colors, dark/light theme handling, CSS variable naming.\n7. **Interaction patterns**: hover states, transitions/animations, press feedback.\n8. **Android specifics**: is it Compose or Views? theme setup, Material version, component styling, nav patterns (bottom nav? drawer? toolbar?), and how closely the Android app mirrors the web dashboard.\n\nCite file:line for every concrete claim (e.g. `turma/public/style.css:120`). Include exact CSS snippets/values for the signature elements (the things that make Turma look like Turma): e.g. its header, cards, buttons, badges, status dots, font stacks, radii scale.\n\nBe very thorough \u2014 read the actual stylesheet(s) and main markup/component files fully. Your report is the only thing I'll see; make it self-contained."
+  },
+  {
+   "id": "tenir-xerk-80",
+   "commit": "26f8324ceafbc7978ef78b2dead393d5adf970fb",
+   "kind": "change",
+   "lang": "tsx",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-80",
+    "repo": "tenir",
+    "transcript": "f69b35a5-3b95-4c19-8c6a-1ae7e1a4eceb.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/App.tsx",
+    "mobile/src/bootstrap.ts",
+    "mobile/src/storage.ts",
+    "web/src/App.tsx"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/storage.test.ts",
+    "mobile/tests/tabBar.test.ts",
+    "web/tests/route.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-80. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-80: Tenir page refresh issues\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-80\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nIn the Tenir web ui if ai refresh the page it takes me back to the live page. I should be able to refresh any page and stay on the same page\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-82",
+   "commit": "7d653f279a53c6ab107f3665d62ee7813afa4bfe",
+   "kind": "bugfix",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-82",
+    "repo": "tenir",
+    "transcript": "b61490d4-3d93-4e87-ad7e-9f93a00eb4e0.jsonl"
+   },
+   "revert_paths": [
+    "even/index.html",
+    "even/src/lens/layout.ts",
+    "even/src/main.ts",
+    "even/src/phone/login.ts",
+    "even/src/state/persist.ts",
+    "even/src/state/storage.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/layout.test.ts",
+    "even/tests/login.test.ts",
+    "even/tests/storage.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-82. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-82: Glasses app fixes\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-82\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nThe glasses app doesn't really work at all. The url and creds should cache so they don't need to be entered every time. The login page style should match the web ui, and the phone companion for the glasses app should just be the Tenir web ui.\n\nReference the Turma repo for clues about what we're going for\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-85",
+   "commit": "f4ee1eb3004d9718b7fba080eba8a3176144934a",
+   "kind": "feature",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-85",
+    "repo": "tenir",
+    "transcript": "8d193838-5184-4c5f-92c8-5c1b54318958.jsonl"
+   },
+   "revert_paths": [
+    "even/src/lens/controller.ts",
+    "even/src/lens/layout.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/layout.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-85. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-85: Glasses ui\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-85\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nWe need to make some tweaks to the glasses UI. From the UI we need to be able to start a new session, and stop the current session by. When we are in a session we should have the current time in the top right with a 'listening...'  in the top left. The three dots should move in some way to signify activity.\n\nWhen we are recording a session I should not be able to scroll up and down. All new text starts at the bottom like it already does, if old text no longer fits in the screen you just don't see it anymore.\n\nI need to be able to see the live transcript on the even phone app In real time\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-91",
+   "commit": "74bac533b0f56144d2b0126d89add35527559560",
+   "kind": "change",
+   "lang": "tsx",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-91",
+    "repo": "tenir",
+    "transcript": "55a99c17-4d1e-47df-a104-aad24a41e1e8.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/App.tsx",
+    "mobile/src/ui/UpdateBanner.tsx"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/updateBanner.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-91. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-91: Android upgrade bar\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-91\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nThe upgrade bar is at the top of the android app and not very pretty. Inspect how Turma s android update bar works and reflect that. Below the header, stylized. Slides in from the side.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-93",
+   "commit": "62ccb7c6216c35dc4e779ee2e91e513ea51afe99",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-93",
+    "repo": "tenir",
+    "transcript": "d81da359-9032-45ea-a29f-1b08e2fcbd0d.jsonl"
+   },
+   "revert_paths": [
+    "even/index.html",
+    "even/src/lens/controller.ts",
+    "even/src/main.ts",
+    "even/src/phone/login.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "even/tests/controller.test.ts",
+    "even/tests/history.test.ts",
+    "even/tests/login.test.ts",
+    "even/tests/nav.test.ts",
+    "even/tests/session.test.ts",
+    "even/tests/transcript.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-93. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-93: Glasses Phone App Redesign\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-93\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nWe need to revisit the phone portion of the glasses app. Just using the web page isn\u2019t good enough. As the transcript comes through and squishes the page it looks really bad. We need a dedicated session page where we can see the current live transcripts and a dedicated history page where we can review previous sessions. It should be in the exact same style and theme as the web ui\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-96",
+   "commit": "3dd8fc3de674c92996baa86a66a801910bb2323e",
+   "kind": "change",
+   "lang": "tsx",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-96",
+    "repo": "tenir",
+    "transcript": "58e66b52-9a5d-497a-a143-cee5a014728e.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/App.tsx",
+    "mobile/src/ui/icons.tsx"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/tests/tabBar.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-96. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-96: Remove the privacy tab from the android app\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-96\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\n_No description._\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "tenir-xerk-97",
+   "commit": "1bc0ae00b7fde5ece602949ec5a11e30ce37130b",
+   "kind": "feature",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-97",
+    "repo": "tenir",
+    "transcript": "e7f50d1d-e74e-4b57-bfb5-414037da45b1.jsonl"
+   },
+   "revert_paths": [
+    "api/src/api/config.py",
+    "api/src/api/status.py",
+    "docker-compose.yml"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "api.tests.test_status"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-97. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-97: Update the Tenir status page\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-97\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Tenir\n\n## Description\n\nUpdate the status page to remove the outdated voxtral reference and add a cue status\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-101",
+   "commit": "d570690b2a06c78aaed2b83e003957d3d1e425db",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-101",
+    "repo": "turma",
+    "transcript": "9ca396ab-2f83-47f1-b434-a51daa224e34.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "agent.tests.test_hub_agent"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-101. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-101: Migrate session\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-101\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nIs it possible to build a feature that could move a ssession from one agent to another in the same org?\n\nSometimes I need to pull logs from a container running on a specific agent so I want to be able to move the entire session to that agent so Claude can get access to those logs.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-122",
+   "commit": "7c09458466509add21f3ef54f8faf864986bd032",
+   "kind": "change",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-122",
+    "repo": "turma",
+    "transcript": "28392be2-a1d8-4ff4-9b87-f63a66c7bf8d.jsonl"
+   },
+   "revert_paths": [
+    "android/app/src/main/java/com/xerktech/turma/AppContainer.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/TerminalScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/vm/ChatViewModel.kt",
+    "turma/public/sessions.html"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/sessions.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-122. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-122: Text box parity\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-122\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nIn the web ui and the android app if I type text into the session text box and change between the terminal view and the chat view the text should stay in the text box for me to continue typing.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-130",
+   "commit": "d527207a771c0f517faaa8027733b932a777470d",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-130",
+    "repo": "turma",
+    "transcript": "f0648ba5-21aa-4d26-946a-d901be274666.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "agent.tests.test_hub_agent"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-130. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-130: Active session indicator\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-130\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nWeve made a couple upgrades over time to how the agent / hub determine if a session is active, but it's still not super accurate. If you can, review live sessions to try and determine how we can improve the accuracy. More often then not active sessions are marked as idle\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-145",
+   "commit": "ea20ec807f15479c1b0c5b321c71bc6274e47cf8",
+   "kind": "change",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-145",
+    "repo": "turma",
+    "transcript": "35df238a-5ba1-4d04-9cc6-c24e72bec46c.jsonl"
+   },
+   "revert_paths": [
+    "android/app/src/main/java/com/xerktech/turma/core/Board.kt",
+    "android/app/src/main/java/com/xerktech/turma/model/Models.kt",
+    "android/app/src/main/java/com/xerktech/turma/net/FleetRepository.kt",
+    "android/app/src/main/java/com/xerktech/turma/net/HubApi.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/BoardScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/FleetScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/OrgControl.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/SessionsScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/vm/OrgViewModel.kt",
+    "turma/public/app.css",
+    "turma/public/board.html",
+    "turma/public/board.js",
+    "turma/public/index.html",
+    "turma/public/org.js",
+    "turma/public/sessions.html",
+    "turma/public/usage.html",
+    "turma/server.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/board.test.js",
+    "turma/tests/org.test.js",
+    "turma/tests/server.test.js",
+    "turma/tests/sessions.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-145. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-145: Org Color Manual Selection\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-145\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nWe need to be able to manually select the org color. This selection should be persistent across any reboot and web and android. Where would be a good place to change that color?\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-147",
+   "commit": "21fc00455b8c71b98effbffda8216817e7068e44",
+   "kind": "change",
+   "lang": "unknown",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-147",
+    "repo": "turma",
+    "transcript": "ea92b238-1964-4b4b-8e64-5413ac22e1b2.jsonl"
+   },
+   "revert_paths": [
+    ".trivyignore",
+    "agent/Dockerfile",
+    "agent/hub-agent.py",
+    "android/app/src/main/java/com/xerktech/turma/ui/UsageScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/vm/UsageViewModel.kt",
+    "turma/public/usage.html"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "agent.tests.test_hub_agent"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-147. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-147: Cleanup Usage Repo List\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-147\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nOn the usage page in the repo list *-scratchpad and tmp* and 'repo' and 'repos' are listed here. But there aren't repos. All token usage data should be associated to a repo or to the 'root', or to the turma app itself.\n\nroot should be displayed as Root not '(root)'\n\nIf usage can't be associated to a repo, then just associate it with root.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-151",
+   "commit": "03422a750a964e2fb1ea31b1669be1e2f155cbee",
+   "kind": "feature",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-151",
+    "repo": "turma",
+    "transcript": "29d1c433-7403-448e-b7e7-c3ff00249afe.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "agent.tests.test_hub_agent"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-151. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-151: ADO New ticket Creation\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-151\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nNew Ticket Creation for ADO isn't working. The 'project' never loads.\n\nCouldn't load projects \u2014 the host didn't answer in time\n\nIs there a custom setting that needs to be set on the agent to use a ADO board?\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-153",
+   "commit": "a0c9109489ff968e0c6b3f6530fd6a71d12aaeee",
+   "kind": "change",
+   "lang": "js",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-153",
+    "repo": "turma",
+    "transcript": "38b3f191-6215-4172-90c3-e39dbc3e747c.jsonl"
+   },
+   "revert_paths": [
+    "turma/server.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/server.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-153. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-153: pr notifications\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-153\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\ncan we make it so PR notifications don't trigger until all the CI has completed successfully? (if there is no CI, then trigger on pr creation)\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-155",
+   "commit": "9ba88ed3dee1d8bca9318d552aae6e3ff6fdb11e",
+   "kind": "feature",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-155",
+    "repo": "turma",
+    "transcript": "0d225136-b351-406f-8540-9c0397e2ada0.jsonl"
+   },
+   "revert_paths": [
+    "android/app/src/main/java/com/xerktech/turma/core/Clone.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/FleetDialogs.kt",
+    "turma/public/index.html"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/clone.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-155. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-155: Multiple Git Source Support\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-155\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nCurrently in the dashboard we can trigger a git clone from github sources only.\n\nWe also have an ADO org, and a gitlab org (git clone via ssh)\n\nWe need to be able to view repos that are available to clone, and be able to clone them for these orgs also.\n\nAnywhere in the app that shoes non-cloned repos should be supported and updated by this.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-162",
+   "commit": "be96f6b373fbac1d76d0eefb5a8d7a06387e6114",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-162",
+    "repo": "turma",
+    "transcript": "af796d40-8ddb-4e53-95c6-ca7284cb1390.jsonl"
+   },
+   "revert_paths": [
+    "agent/hooks/guard.py",
+    "agent/hub-agent.py",
+    "agent/native/install.sh",
+    "android/app/src/main/java/com/xerktech/turma/ui/CommonUi.kt",
+    "glasses/src/phone/render.ts",
+    "glasses/src/vendor/chat.cjs",
+    "turma/public/chat.js",
+    "turma/public/index.html",
+    "turma/public/sessions.html",
+    "veiller/src/ui/phone/render.ts",
+    "veiller/src/ui/vendor/chat.cjs"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/chat.test.js",
+    "turma/tests/dashboard-livestate.test.js",
+    "turma/tests/sessions.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-162. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-162: Merge Request Handling\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-162\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\n'Merge Requests' from gitlab orgs should be handled exactly the same as pull requests are in every other org. They should be chips in the session card and the session footer, and anywhere else.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-186",
+   "commit": "0595166bbf2a9c6a57c0c4194f740c657ab6aeeb",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-186",
+    "repo": "turma",
+    "transcript": "95cbdcff-f446-460a-8bcc-2dccb1fd5020.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "agent.tests.test_hub_agent"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-186. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-186: Chat session user text\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-186\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nIn the chat session page in all interfaces the user input boxes often dissapear completely from the page. Often times the only blue text user input will be the starting prompt. I need to be able to reliably see every message that I sent.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-215",
+   "commit": "3cdddefb49efa2af833ade9aca3f1da480bdcf28",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-215",
+    "repo": "turma",
+    "transcript": "58be3099-a4b6-45ca-b4d2-9f786ed79f8c.jsonl"
+   },
+   "revert_paths": [
+    "foverlay/src/background/index.ts",
+    "foverlay/src/shared/channels.ts",
+    "foverlay/src/shared/phone-state.ts",
+    "foverlay/src/ui/main.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "foverlay/src/shared/phone-state.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-215. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-215: Turma Foverlay App\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-215\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nWhile I'm trying to enter the url and creds in the mini app (Phone component) the fields all keep resetting while I'm trying to complete the form.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-218",
+   "commit": "d056f7d738ccd587984b51f06bee80901ae8145c",
+   "kind": "feature",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-218",
+    "repo": "turma",
+    "transcript": "c7ac24fc-0334-4321-960b-b4bad62b5b54.jsonl"
+   },
+   "revert_paths": [
+    "android/app/src/main/java/com/xerktech/turma/core/Board.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/BoardScreen.kt",
+    "foverlay/src/background/net.ts",
+    "turma/public/app.css",
+    "turma/public/board.js",
+    "turma/public/newticket.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/board.test.js",
+    "turma/tests/newticket.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-218. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-218: New ticket cancel confirmation\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-218\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nIn the android app on the new ticket creation page if I accidentally slide down and close the ticket I have to make a new one and retype everything out again. There should be some confirmation button before closing a ticket that hasnt been created yet.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-222",
+   "commit": "0d41745a5dd753950802918a1e27492adb006363",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-222",
+    "repo": "turma",
+    "transcript": "3fdf1dae-08f3-4f21-8983-95ec4a03e659.jsonl"
+   },
+   "revert_paths": [
+    "agent/Dockerfile",
+    "agent/entrypoint.sh",
+    "agent/hooks/guard.py",
+    "agent/hub-agent.py",
+    "android/app/src/main/java/com/xerktech/turma/ui/CommonUi.kt",
+    "glasses/src/vendor/chat.cjs",
+    "turma/public/chat.js",
+    "turma/public/index.html",
+    "turma/public/sessions.html"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/chat.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-222. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-222: Multi Org Selector\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-222\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nInstead of just selecting 1 org at a time, I should be able to select as many or as few as I want. Any that I select it in the drop down it should stay highlighted, and then un highlight when I un select them\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-223",
+   "commit": "07cc27c6e4c818266be82a9ad69073eccb3f423b",
+   "kind": "change",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-223",
+    "repo": "turma",
+    "transcript": "f6f31357-b025-48d3-974f-b4c5f9a612a2.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py",
+    "android/app/build.gradle.kts",
+    "android/app/src/main/java/com/xerktech/turma/TurmaApplication.kt",
+    "android/app/src/main/java/com/xerktech/turma/core/ChatItems.kt",
+    "android/app/src/main/java/com/xerktech/turma/model/Models.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/TranscriptView.kt",
+    "turma/server.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/server.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-223. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-223: Merge Conflict Auto Resolution.\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-223\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nI shouldn't have to tell an agent in a session to fix merge conflicts. the UI reveals when a PR has conflicts, the agent should go and fix those automatically. Along that same vein, I shouldn't get a notification that a PR is ready and mergeable, when there are still merge conflicts that have to be resolved.\n\nIf local / global claude md changes are needed for this to work across all repos, let me know.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-226",
+   "commit": "be68edb5a94d54c4487489d5e0c8b8eaecd8e74d",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-226",
+    "repo": "turma",
+    "transcript": "fbe0915f-52f9-43b1-8335-cdab3174b146.jsonl"
+   },
+   "revert_paths": [
+    "agent/hooks/guard.py",
+    "agent/hub-agent.py",
+    "agent/native/turma-agent.env"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "agent.tests.test_guard",
+    "agent.tests.test_hub_agent"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-226. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-226: ADO PR Chips\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-226\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nADO agent sessions should also have PR chips with all of the same functionality as github chips\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-227",
+   "commit": "7f59e0bfb984396df2d206a0e99a6e0d7ee00f52",
+   "kind": "bugfix",
+   "lang": "js",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-227",
+    "repo": "turma",
+    "transcript": "2475d121-116e-421e-8963-4ff84806112f.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py",
+    "glasses/src/vendor/chat.cjs",
+    "turma/public/chat.js",
+    "turma/public/sessions.html",
+    "turma/server.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/chat.test.js",
+    "turma/tests/server.test.js",
+    "turma/tests/sessions.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-227. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-227: Input Text box Limit\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-227\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nIn the session chat page input text box there is a character count limit that doesn't exist on the terminal size. Sometimes I need to be able to paste in long messages, but I can't.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-233",
+   "commit": "c8347a942bf7252afeb8a0e9768f854a48874467",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-233",
+    "repo": "turma",
+    "transcript": "f003a71b-2c91-4dee-86e9-27eb1dc1a2d7.jsonl"
+   },
+   "revert_paths": [
+    "veiller/src/core/app.ts",
+    "veiller/src/core/input-box.ts",
+    "veiller/src/core/render.ts",
+    "veiller/src/core/transcript.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "veiller/src/core/app.test.ts",
+    "veiller/src/core/input-box.test.ts",
+    "veiller/src/core/render.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-233. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-233: Turma Veiller fixes\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-233\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nUse the Vellier simulator / emulator to step through each and every expected feature and behaviour of the Turma veiller mini app to test and verify functionality. Fix any issues you encounter.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-235",
+   "commit": "ad682b2d8b8a0a8f98089ab31e30b8c93bb6bd46",
+   "kind": "bugfix",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-235",
+    "repo": "turma",
+    "transcript": "5902549a-0b58-4659-8217-62f914441e77.jsonl"
+   },
+   "revert_paths": [
+    "agent/hooks/guard.py",
+    "agent/hub-agent.py",
+    "android/app/build.gradle.kts",
+    "android/app/src/main/AndroidManifest.xml",
+    "android/app/src/main/java/com/xerktech/turma/core/Board.kt",
+    "android/app/src/main/java/com/xerktech/turma/core/ChatItems.kt",
+    "android/app/src/main/java/com/xerktech/turma/core/Sessions.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/TerminalScreen.kt",
+    "glasses/src/hub-client.ts",
+    "glasses/src/phone/phone.css",
+    "glasses/src/phone/phone.ts",
+    "glasses/src/phone/render.ts",
+    "glasses/src/render.ts",
+    "glasses/src/sessions.ts",
+    "glasses/src/vendor/board.cjs",
+    "glasses/src/vendor/chat.cjs",
+    "turma/archive.js",
+    "turma/public/app.css",
+    "turma/public/board.js",
+    "turma/public/chat.js",
+    "turma/public/index.html",
+    "turma/public/sessions.html",
+    "turma/server.js",
+    "veiller/src/core/render.ts",
+    "veiller/src/core/sessions.ts",
+    "veiller/src/ui/phone/phone.css",
+    "veiller/src/ui/phone/phone.ts",
+    "veiller/src/ui/phone/render.ts",
+    "veiller/src/ui/vendor/board.cjs",
+    "veiller/src/ui/vendor/chat.cjs",
+    "veiller/src/ui/vendor/chat.css",
+    "veiller/src/ui/vendor/engines.ts"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/archive.test.js",
+    "turma/tests/escjs.test.js",
+    "turma/tests/server.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-235. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-235: Turma 1st QA\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-235\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nExercise the new QA agent to validate our entire app front to back, as well as each component. Address and resolve all issues that it finds. Go back and forth until all found bugs are resolved. Notate anything in a qa.md file that helps make the process easier for future QA agents.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-241",
+   "commit": "60933271c1bcf230a0c12fac8b6bfe2f66a7ad18",
+   "kind": "bugfix",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-241",
+    "repo": "turma",
+    "transcript": "0a15bd18-3efd-4589-8c44-7862731c6db3.jsonl"
+   },
+   "revert_paths": [
+    "agent/hooks/guard.py",
+    "agent/native/turma-agent",
+    "turma/server.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/server.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-241. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-241: Multi agent Ticket creation\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-241\n- Status: To Do\n- Type: Bug\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nFor my xerktech org one of the hosts was down, but the other wasn't. When I went to make a new ticket I'd get an error saying that it couldn't be created, so I retried a couple times. And then it ended up there were 4 tickets created. I'm assuming it's an issue around multi agent orgs, and which agent the ticket creation is routed through. This should auto load balance to reduce issues.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-246",
+   "commit": "104cebf21138a5a3ea6cbbd9bedde74f7111dfe8",
+   "kind": "feature",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-246",
+    "repo": "turma",
+    "transcript": "cb67719d-1c80-4eaa-9fcd-d38a17d52542.jsonl"
+   },
+   "revert_paths": [
+    "VERSION",
+    "android/app/build.gradle.kts",
+    "android/app/src/main/java/com/xerktech/turma/AppContainer.kt",
+    "android/app/src/main/java/com/xerktech/turma/model/Models.kt",
+    "android/app/src/main/java/com/xerktech/turma/net/HubApi.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/ChatScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/FleetDialogs.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/FleetScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/SessionsScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/vm/ChatViewModel.kt",
+    "android/app/src/main/java/com/xerktech/turma/vm/FleetViewModel.kt",
+    "turma/server.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/server.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-246. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-246: Open Code\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-246\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nWe need to include and ship OpenCode along side our agent. It needs to connect to and utilize our gpt oss 120b model that's deployed via Tenir and docker compose. You need to test, iterate, and optimize the best config to get the most optimal results for coding tasks. Test with actual Turma sessions history data. We need Claude to trigger open code for appropriate tasks automatically in order to save Claude token usage. NOT AT THE SAKE OF QUALITY.  But also if the Claude usage runs out we need to be able to convert an open Claude session to work with OpenCode / our local models.\n\nI'm not tied to open code specifically, I just need to best agentic coding tool for self hosted models. Test and confirm alternatives if you know of them.\n\nThe problem were addressing - running out of Claude usage completely halts all work, and that's unacceptable.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-250",
+   "commit": "5c78834f48105b1d886211cd6d4d0f2fbba70e7e",
+   "kind": "feature",
+   "lang": "cjs",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-250",
+    "repo": "turma",
+    "transcript": "99152168-6108-497c-878e-11bb353ed8ed.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py",
+    "android/app/src/main/java/com/xerktech/turma/core/Board.kt",
+    "glasses/src/vendor/board.cjs",
+    "turma/public/board.js",
+    "veiller/src/ui/vendor/board.cjs"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/board.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-250. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-250: ADO Status Sync\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-250\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nADO Board / ticket items status don't properly sync.\n\nADO Board uses different status names, active, new, closed, removed, resolved. The don't quite line up with the jira statuses on our internal board. \n\nNew - To Do\n\nActive - In Progress\n\nResolved - In Review\n\nClosed / Removed - Done\n\nUpdate our app to reflect thee changes.\n\nAnd then look in to and resolve what would cause problems / stop users being able to change / update ticket status for ado tasks from our internal turma board\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-251",
+   "commit": "de0a3e799d4cc75803c871786c340990d416a7a4",
+   "kind": "change",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-251",
+    "repo": "turma",
+    "transcript": "5132b30c-46cb-4381-b957-483c8005797d.jsonl"
+   },
+   "revert_paths": [
+    "android/app/src/main/java/com/xerktech/turma/core/ChatItems.kt",
+    "android/app/src/main/java/com/xerktech/turma/core/Prose.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/ChatScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/SessionsScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/TranscriptView.kt",
+    "android/app/src/main/java/com/xerktech/turma/vm/ChatViewModel.kt",
+    "glasses/src/app.ts",
+    "glasses/src/live.ts",
+    "glasses/src/render.ts",
+    "glasses/src/transcript.ts",
+    "glasses/src/vendor/chat.cjs",
+    "turma/public/chat.js",
+    "veiller/src/background/index.ts",
+    "veiller/src/core/app.ts",
+    "veiller/src/core/live.ts",
+    "veiller/src/core/render.ts",
+    "veiller/src/core/transcript.ts",
+    "veiller/src/shared/phone-state.ts",
+    "veiller/src/ui/vendor/chat.cjs"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/chat-selection.test.js",
+    "turma/tests/chat.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-251. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-251: Remove Text Streaming\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-251\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nThere is no need for text streaming in the chat sessions page. It can just appear, or auto update, or whatever would be natural. Text streaming is contributing nothing.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-254",
+   "commit": "f982aedc1eca16a1bf716b9012decb9fb2bff5c4",
+   "kind": "change",
+   "lang": "sh",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-254",
+    "repo": "turma",
+    "transcript": "05fb2a88-216a-4dc6-9c8f-2c38d7c17311.jsonl"
+   },
+   "revert_paths": [
+    "agent/entrypoint.sh",
+    "agent/hooks/guard.py",
+    "agent/hub-agent.py",
+    "agent/native/install.sh",
+    "agent/native/turma-agent",
+    "agent/native/turma-agent-update",
+    "agent/native/turma-agent.env",
+    "android/app/src/main/java/com/xerktech/turma/ui/CommonUi.kt",
+    "glasses/src/phone/render.ts",
+    "glasses/src/vendor/chat.cjs",
+    "turma/public/chat.js",
+    "turma/public/index.html",
+    "turma/public/sessions.html",
+    "veiller/src/ui/phone/render.ts",
+    "veiller/src/ui/vendor/chat.cjs"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/chat.test.js",
+    "turma/tests/dashboard-livestate.test.js",
+    "turma/tests/sessions.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-254. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-254: Turma Agent Update\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-254\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nEverytime an agent restarts, for any reason, it should check for and update itself (turma agent) and claude code and install it\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-296",
+   "commit": "0cebe8192a37b5850cbbfbeae90c414e96838e6a",
+   "kind": "change",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-296",
+    "repo": "turma",
+    "transcript": "f6cef3f1-78c9-455f-9919-87199fdb8197.jsonl"
+   },
+   "revert_paths": [
+    "android/app/src/main/java/com/xerktech/turma/core/Board.kt",
+    "android/app/src/main/java/com/xerktech/turma/model/Models.kt",
+    "android/app/src/main/java/com/xerktech/turma/net/FleetRepository.kt",
+    "android/app/src/main/java/com/xerktech/turma/net/HubApi.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/BoardScreen.kt",
+    "android/app/src/main/java/com/xerktech/turma/vm/BoardViewModel.kt",
+    "glasses/src/vendor/board.cjs",
+    "turma/public/app.css",
+    "turma/public/board.html",
+    "turma/public/board.js",
+    "turma/server.js",
+    "veiller/src/ui/vendor/board.cjs"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/board.test.js",
+    "turma/tests/server.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-296. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-296: Ticket Queue Changes\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-296\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n\n## Description\n\nWhen all of the session slots for an org are filled a queue builds up while it waits for sessions to be closed.  a queued session already has a session id, a claimed host. it\u2019s a real live session, just without activity yet. I don\u2019t like this. it should be a queued ticket that\u2019s waiting for an available host, not an already created session that\u2019s only waiting for permission to start.\n\nFor orgs with more than 1 host the host is chosen as soon as the ticket enters the queue. This shouldn\u2019t work like this. perhaps a different agent clears first and now the session is waiting to start when it could have started on a different host.\n\nAnd if Auto is turned off items can remove themselves from the queue without messing with already created sessions.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-33",
+   "commit": "880b476fb2e562ec54c277c1e9b4b0cf5296181d",
+   "kind": "change",
+   "lang": "py",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-33",
+    "repo": "turma",
+    "transcript": "33cfa78d-f7d8-4071-bd29-c2f12a678a93.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py",
+    "turma/public/chat.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/chat.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-33. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-33: Make the model selector chip more accurate.\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-33\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nCurrently the model selector on the chat sessions page just says \u2018default' I wanna know the actual model, and I want to ensure that the list only has actually available models, and that it reliably switches between them.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-73",
+   "commit": "bd148c40dd5cb52d711af9ebec8e1559f6a2aba0",
+   "kind": "feature",
+   "lang": "unknown",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-73",
+    "repo": "turma",
+    "transcript": "164267e7-bc5f-443d-9314-c5ae3f046546.jsonl"
+   },
+   "revert_paths": [
+    ".trivyignore",
+    "agent/hub-agent.py",
+    "android/app/src/main/java/com/xerktech/turma/ui/SessionsScreen.kt"
+   ],
+   "test_cmd": [
+    "python3",
+    "-m",
+    "unittest",
+    "agent.tests.test_hub_agent"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-73. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-73: Session sort enforcement\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-73\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nSessions on the session page need to be sorted by the last new message received times. New messages at the top of the session list. This needs to be enforced across ended sessions as well. And the accuracy needs to be checked. Some ended sessions from a week ago say they were edited recently and are at the top. Still respect the active, idle, and ended sections. The sorting needs to be with8n each section.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "turma-xerk-98",
+   "commit": "abd87e7aeb61de97a083052392fc2729c8db17dd",
+   "kind": "change",
+   "lang": "kotlin",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-98",
+    "repo": "turma",
+    "transcript": "6fed4138-9f3d-4a10-83c2-74606bd66fa8.jsonl"
+   },
+   "revert_paths": [
+    "agent/hub-agent.py",
+    "android/app/src/main/java/com/xerktech/turma/model/Models.kt",
+    "android/app/src/main/java/com/xerktech/turma/push/Notifications.kt",
+    "android/app/src/main/java/com/xerktech/turma/ui/FleetScreen.kt",
+    "turma/public/index.html",
+    "turma/server.js"
+   ],
+   "test_cmd": [
+    "node",
+    "--test",
+    "turma/tests/server.test.js"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-98. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-98: Claude Login Detection\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-98\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Turma\n\n## Description\n\nWe need a way to determine when claude auth expires for an agent or the main turma app and re login is required, and then to push a notification so the user knows to go and login where it\u2019s needed.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  },
+  {
+   "id": "veiller-xerk-225",
+   "commit": "a84c56f1472701248a32ff85e2feca798afdc645",
+   "kind": "bugfix",
+   "lang": "ts",
+   "sensitivity": "shareable",
+   "source": {
+    "ticket": "XERK-225",
+    "repo": "veiller",
+    "transcript": "074ab166-083a-4ff7-9da5-22807a30a8b2.jsonl"
+   },
+   "revert_paths": [
+    "mobile/src/app/miniapps/store.tsx",
+    "mobile/src/config/veillerMiniapps.ts",
+    "mobile/src/i18n/en.ts",
+    "mobile/src/services/miniapps/veillerMiniappSync.ts"
+   ],
+   "test_cmd": [
+    "npx",
+    "vitest",
+    "run",
+    "mobile/src/services/miniapps/veillerMiniappSync.test.ts"
+   ],
+   "test_timeout": 900,
+   "prompt": "Work Jira ticket XERK-225. Its full text, as fetched from Jira when this session spawned, follows. That is a snapshot \u2014 if something looks stale or contradictory, the ticket's own URL below is the live copy.\n\n# XERK-225: App Updates\n\n- URL: https://<INTERNAL_HOST>/browse/XERK-225\n- Status: To Do\n- Type: Task\n- Priority: Medium\n- Assignee: <REDACTED_NAME>\n- Reporter: <REDACTED_NAME>\n- Project: XerkTech (XERK)\n- Labels: Veiller\n\n## Description\n\nOn the mini app store page I can see that both of the apps have updates available, but clicking 'update' doesn't do anything. I need some way of knowing if the update is happening, or it failed.\n\n## Comments (0)\n\n_No comments._\n\nStart by working out what this ticket actually asks for, then do it. If the ticket is ambiguous enough that you'd be guessing at the goal, ask rather than guess."
+  }
+ ]
+}
