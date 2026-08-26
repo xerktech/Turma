@@ -183,19 +183,18 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
   written during the seconds-long restart window is not re-projected (the native log keeps it).
   A claude session needs none of this (its tmux + transcript are self-sufficient). Tests:
   `test_adopts_dsh_reattaches_control_and_tail`, `test_reattach_dsh_*` in `TestResumeOnBootAdopt`.
-- **The dsh runtime files must ship + update in LOCKSTEP with `hub-agent.py`.** `dsh_session.py` and
-  `dsh_transcript.py` are siblings `hub-agent.py` imports; `dsh-session-driver/` and `dsh/guard/` are
-  the plugin trees `_ensure_dsh_profile` composes. All four were missing from `release.yml`'s tarball
-  staging, `install.sh`'s `install_files`, AND the updater's `install_payload`, so an update advanced
-  `hub-agent.py` while freezing `dsh_session.py` — and a new `hub-agent.py` call into the old sibling
-  (`tail.title()`, absent pre-4ff323b) raised `AttributeError` on the BEAT, which is the agent's main
-  process: it crash-looped every dsh host (~15s), and the repeated `agents.resume` on each restart
-  corrupted dsh's own store (a `session/end-seed` reseed re-using seq numbers → "seq gap in committed
-  region"). All three lists now carry them and the updater REFUSES a payload missing the `.py`
-  siblings (like `hooks/`). Belt-and-suspenders: `_seed_summaries` guards the `tail.title()` call so a
-  sibling skew degrades to "unnamed this beat" instead of crashing the fleet (the XERK-395/402
-  beat-loop contract). Tests: `test_seed_summaries_survives_a_dsh_tail_without_title`, the
-  dsh-payload cases in `test_turma_agent_update.sh`.
+- **A dsh-sibling version SKEW must not crash the beat.** `dsh_session.py`/`dsh_transcript.py` are
+  siblings `hub-agent.py` imports; the native install ships + updates them in lockstep with it
+  (XERK-496, `agent-native.md`). But before that landed, an update advanced `hub-agent.py` while
+  freezing `dsh_session.py`, and a new `hub-agent.py` call into the old sibling (`tail.title()`,
+  absent pre-4ff323b) raised `AttributeError` on the BEAT — the agent's MAIN process — crash-looping
+  every dsh host (~15s), and the repeated `agents.resume` on each restart corrupted dsh's own store
+  (a `session/end-seed` reseed re-using seq numbers → "corrupt session log: seq gap in committed
+  region", the dsh web-UI error). Packaging keeps the files in step; the belt-and-suspenders is that
+  `_seed_summaries` GUARDS the `tail.title()` call so ANY sibling skew (a partial update, a rollback)
+  degrades to "unnamed this beat" instead of taking the host down — the XERK-395/402 beat-loop
+  contract that an uncaught exception on the beat is the whole host, not a skipped cycle. Tests:
+  `test_seed_summaries_survives_a_dsh_tail_without_title`.
 
 ## Tests
 

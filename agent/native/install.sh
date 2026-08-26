@@ -21,24 +21,47 @@ UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 TTYD_VERSION="1.7.7"          # pinned static ttyd binary
 GLAB_VERSION="1.111.0"        # pinned static glab binary
 NODE_MAJOR_MIN=24            # standardized on Node 24 (tunnel-agent.js needs the global WebSocket, Node 22+)
+# dsh (DeepSeek Harness) toolchain — see the "dsh runtime" section below.
+# The dsh CLI is installed at LATEST and kept current on every agent restart by
+# turma-agent-update --dsh-only, exactly like Claude Code (XERK-496).
+# npm >= 11 blocks install scripts by default; dsh's native sandbox/subprocess
+# layer needs these to compile. Without them a dsh spawn is broken at runtime.
+DSH_ALLOW_SCRIPTS="koffi,node-pty,@deepseek-ai/dsh-subprocess-local"
+# Written into $PREFIX when the dsh toolchain is laid down; turma-agent-update
+# reads it to keep the toolchain in step with a payload swap (and to stop
+# managing it once a host has it no more).
+DSH_MARKER="$PREFIX/.dsh"
 
 DO=install
 INSTALL_DEPS=yes
 AUTOSTART=no
+WITH_DSH=no
 while [ $# -gt 0 ]; do
   case "$1" in
     --verify)          DO=verify ;;
     --uninstall)       DO=uninstall ;;
     --no-install-deps) INSTALL_DEPS=no ;;
     --autostart)       AUTOSTART=yes ;;
+    --with-dsh)        WITH_DSH=yes ;;
     --prefix)          shift; PREFIX="$1" ;;
     -h|--help)
-      echo "usage: install.sh [--prefix DIR] [--no-install-deps] [--autostart] [--verify] [--uninstall]"
+      echo "usage: install.sh [--prefix DIR] [--no-install-deps] [--autostart] [--with-dsh] [--verify] [--uninstall]"
       exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+# Whether to lay down the dsh toolchain (CLI @latest + driver/guard plugins +
+# Python sibling modules) beside hub-agent.py. --with-dsh is the explicit name;
+# TURMA_DSH=1 in the *environment* also opts in (convenient for an unattended
+# re-run on a host whose config already enables the runtime). This is a SHIPPING
+# gate: it decides whether the native install carries the dsh bits at all. The
+# RUNTIME gate hub-agent.py reads is the separate TURMA_DSH in the config file.
+dsh_wanted() {
+  [ "$WITH_DSH" = yes ] && return 0
+  case "${TURMA_DSH:-}" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+}
 
 info() { echo "[install] $*"; }
 warn() { echo "[install] WARN: $*" >&2; }
@@ -191,6 +214,28 @@ ensure_claude() {
   fi
 }
 
+ensure_dsh() {
+  # Install the LATEST dsh CLI into ~/.local — the prefix the launcher already
+  # puts on PATH (XERK-94), so `dsh` just works for the agent. npm >= 11 blocks
+  # install scripts by default; dsh's native build deps (koffi, node-pty,
+  # @deepseek-ai/dsh-subprocess-local) must be allowed or dsh's sandbox /
+  # subprocess layer is broken at runtime even though the package "installs".
+  # A present CLI is left alone here; turma-agent-update --dsh-only keeps it
+  # current on every agent restart (the same model as Claude Code).
+  have npm || { warn "npm not found — cannot install the dsh CLI"; return 0; }
+  if have dsh; then
+    info "dsh present: $(dsh --version 2>/dev/null)"; return 0
+  fi
+  info "installing @deepseek-ai/dsh@latest (npm -g --prefix ~/.local)"
+  if ! npm install -g --prefix "$HOME/.local" \
+       --allow-scripts="$DSH_ALLOW_SCRIPTS" \
+       "@deepseek-ai/dsh" 2>/dev/null; then
+    warn "dsh CLI install failed. npm >= 11 needs the native-build scripts allowed"
+    warn "  so koffi / node-pty / @deepseek-ai/dsh-subprocess-local compile:"
+    warn "  npm install -g --prefix ~/.local --allow-scripts=$DSH_ALLOW_SCRIPTS @deepseek-ai/dsh"
+  fi
+}
+
 ensure_gh() {
   have gh && { info "gh present"; return 0; }
   # gh powers auto-update against the private repo and private git ops.
@@ -233,15 +278,6 @@ install_files() {
   cp "$SRC_DIR/tunnel-agent.js"  "$PREFIX/tunnel-agent.js"
   cp "$SRC_DIR/tmux.conf"        "$PREFIX/tmux.conf"
   cp "$SRC_DIR"/hooks/*.py       "$PREFIX/hooks/"        # sibling to hub-agent.py (load-bearing)
-  # dsh runtime: the two sibling modules hub-agent.py imports (kept in lockstep
-  # with it — a skew crash-loops every dsh host) plus the driver + guard plugin
-  # trees _ensure_dsh_profile composes. Best-effort dirs (feature-gated on
-  # TURMA_DSH), but the .py siblings must land whenever hub-agent.py does.
-  cp "$SRC_DIR/dsh_session.py"    "$PREFIX/dsh_session.py"
-  cp "$SRC_DIR/dsh_transcript.py" "$PREFIX/dsh_transcript.py"
-  rm -rf "$PREFIX/dsh-session-driver" "$PREFIX/dsh"
-  [ -d "$SRC_DIR/dsh-session-driver" ] && cp -r "$SRC_DIR/dsh-session-driver" "$PREFIX/dsh-session-driver"
-  [ -d "$SRC_DIR/dsh" ] && cp -r "$SRC_DIR/dsh" "$PREFIX/dsh"
   cp "$SELF_DIR/turma-agent"        "$PREFIX/bin/turma-agent"
   cp "$SELF_DIR/turma-agentctl"     "$PREFIX/bin/turma-agentctl"
   cp "$SELF_DIR/turma-agent-update" "$PREFIX/bin/turma-agent-update"
@@ -262,6 +298,34 @@ install_files() {
   info "installed version $(cat "$PREFIX/VERSION")"
 }
 
+# Lay the dsh toolchain beside hub-agent.py. Its paths resolve relative to that
+# file's own dir — DSH_PLUGIN_DIR = <dir>/dsh-session-driver, the guard at
+# <dir>/dsh/guard, and _launch_dsh imports dsh_session/dsh_transcript as Python
+# siblings — so they must live in $PREFIX exactly as in repo's agent/:
+#   dsh_session.py, dsh_transcript.py       beside hub-agent.py
+#   dsh-session-driver/ (with the committed dist/)   -> $PREFIX/dsh-session-driver
+#   dsh/guard/                               -> $PREFIX/dsh/guard
+# The CLI is a separate dependency install (ensure_dsh, in the deps pass).
+install_dsh_files() {
+  info "installing dsh toolchain into $PREFIX (driver + guard + python siblings)"
+  mkdir -p "$PREFIX/dsh-session-driver" "$PREFIX/dsh/guard"
+  cp "$SRC_DIR/dsh_session.py"      "$PREFIX/dsh_session.py"
+  cp "$SRC_DIR/dsh_transcript.py"   "$PREFIX/dsh_transcript.py"
+  cp -a "$SRC_DIR/dsh-session-driver/"* "$PREFIX/dsh-session-driver/"
+  cp -a "$SRC_DIR/dsh/guard/"*           "$PREFIX/dsh/guard/"
+  # The driver plugin is npm-installed into the dsh profile as-is, with NO build
+  # step, so the compiled dist/ must be present or _ensure_dsh_profile refuses
+  # every dsh spawn. Failing loudly here beats a host that ships a broken driver.
+  if [ ! -f "$PREFIX/dsh-session-driver/dist/index.js" ]; then
+    warn "dsh-session-driver/dist/index.js is MISSING — _ensure_dsh_profile will"
+    warn "  refuse every dsh spawn. Build it:"
+    warn "  npm --prefix $SRC_DIR/dsh-session-driver install"
+    warn "  npm --prefix $SRC_DIR/dsh-session-driver run build"
+  fi
+  echo "1" >"$DSH_MARKER"
+  info "dsh toolchain installed (CLI @latest, kept current by turma-agent-update)"
+}
+
 install_config() {
   mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR" 2>/dev/null || true
   if [ -f "$CFG" ]; then
@@ -270,6 +334,13 @@ install_config() {
   fi
   info "writing config template $CFG (edit TURMA_URL/TURMA_TOKEN)"
   sed "s/^DEVICE_NAME=.*/DEVICE_NAME=$(hostname)/" "$SELF_DIR/turma-agent.env" >"$CFG"
+  # A --with-dsh install WANTS the runtime on this host, so seed TURMA_DSH=1 in a
+  # FRESH config — that is the switch hub-agent.py's dsh_configured() reads (the
+  # install-time gate already decided to ship the bits). A preserved config is
+  # left alone; the operator toggles it by editing this one line.
+  if dsh_wanted; then
+    printf '# dsh runtime (DeepSeek Harness) — client plugins + CLI were installed by install.sh --with-dsh\nTURMA_DSH=1\n' >>"$CFG"
+  fi
   chmod 600 "$CFG" 2>/dev/null || true   # holds a bearer token
 }
 
@@ -398,7 +469,6 @@ do_verify() {
   echo "prefix: $PREFIX (version $( [ -f "$PREFIX/VERSION" ] && cat "$PREFIX/VERSION" || echo MISSING))"
   for f in hub-agent.py tunnel-agent.js hooks/guard.py hooks/fileguard.py \
            hooks/ask.py hooks/statusline.py \
-           dsh_session.py dsh_transcript.py \
            bin/turma-agent bin/turma-agentctl bin/turma-agent-update; do
     if [ -e "$PREFIX/$f" ]; then echo "  file $f: ok"; else echo "  file $f: MISSING"; ok=1; fi
   done
@@ -407,6 +477,17 @@ do_verify() {
   done
   # Optional — only GitLab MR creation needs it, so absence doesn't fail verify.
   have glab && echo "  tool glab: $(command -v glab)" || echo "  tool glab: none (GitLab MR chips need it)"
+  # dsh (when this host has the toolchain laid down): the driver dist + guard are
+  # what _ensure_dsh_profile refuses a spawn without, and `dsh` is the CLI.
+  if [ -f "$DSH_MARKER" ]; then
+    for f in dsh_session.py dsh_transcript.py \
+             dsh-session-driver/dist/index.js dsh/guard/index.mjs; do
+      if [ -e "$PREFIX/$f" ]; then echo "  file $f: ok"; else echo "  file $f: MISSING"; ok=1; fi
+    done
+    if have dsh; then echo "  tool dsh: $(command -v dsh) ($(dsh --version 2>/dev/null))"; else echo "  tool dsh: MISSING"; ok=1; fi
+  else
+    echo "  dsh toolchain: not installed (run install.sh --with-dsh to enable)"
+  fi
   echo "  node major: $(node_major) (need >= $NODE_MAJOR_MIN)"
   if [ -f "$CFG" ]; then
     echo "  config: $CFG"
@@ -442,6 +523,12 @@ do_uninstall() {
   warn "already-running sessions are NOT stopped (tmux/ttyd outlive the manager)."
   warn "  sweep them with:  tmux ls | sed 's/:.*//' | grep '^agent-' | xargs -r -n1 tmux kill-session -t"
   info "remove config manually if desired:  rm -rf $CFG_DIR"
+  # The dsh CLI was installed into ~/.local (outside the prefix) by --with-dsh;
+  # flag it rather than silently leaving a ~150 MB npm tree behind.
+  if have dsh; then
+    warn "the dsh CLI stays installed in ~/.local. Remove it too with:"
+    warn "  npm uninstall -g --prefix ~/.local @deepseek-ai/dsh"
+  fi
 }
 
 # ---- main -----------------------------------------------------------------
@@ -458,10 +545,12 @@ if [ "$INSTALL_DEPS" = yes ]; then
   ensure_gh
   ensure_glab
   ensure_claude
+  if dsh_wanted; then ensure_dsh; fi
 else
   info "--no-install-deps: skipping prerequisite installation"
 fi
 install_files
+if dsh_wanted; then install_dsh_files; fi
 install_config
 install_tmux_conf
 install_service
@@ -480,4 +569,8 @@ elif systemd_system_ok; then
   info "  4) It's running under systemd (system):  systemctl status turma-agent"
 else
   info "  4) Start it:  $PREFIX/bin/turma-agentctl start"
+fi
+if dsh_wanted; then
+  info "  5) dsh is ready. A dsh session needs a model route in $CFG —"
+  info "     set DSH_MODEL_BASE_URL + DSH_MODEL (fall back to LOCAL_MODEL_*) before spawning one."
 fi

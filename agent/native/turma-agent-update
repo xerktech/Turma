@@ -18,6 +18,9 @@
 #   --boot         the same, rate-limited; fired detached by the launcher
 #   --claude-only  the Claude Code check, rate-limited; fired by the launcher
 #                  and awaited, before it execs the manager
+#   --dsh-only     the dsh CLI check (XERK-496), rate-limited; fired by the
+#                  launcher and awaited, before it execs the manager — the same
+#                  placement as --claude-only, for the same reason
 # The rate limit is not optional — see throttled().
 #
 # Two release schemes, tried in order:
@@ -57,15 +60,25 @@ INTERVAL="${TURMA_UPDATE_INTERVAL:-3600}"   # 1h default for --loop
 LOG="$HOME/.turma/update.log"
 LOCK="$HOME/.turma/update.lock"
 # When each kind of check last ran (epoch seconds), read only by the start-fired
-# runs. Two files, because the agent check and the Claude Code check are fired
-# separately by the launcher and must not throttle each other. See throttled().
+# runs. Three files, because the agent check, the Claude Code check and the dsh
+# check are fired separately by the launcher and must not throttle each other.
+# See throttled().
 STAMP="$HOME/.turma/last-update-check"
 CLAUDE_STAMP="$HOME/.turma/last-claude-check"
+DSH_STAMP="$HOME/.turma/last-dsh-check"
 # The raw `claude --version` output of a repair that did NOT make it readable,
 # so the same futile reinstall isn't attempted on every start forever.
 CLAUDE_UNPARSEABLE="$HOME/.turma/claude-unparseable"
 BOOT_MIN_INTERVAL="${TURMA_BOOT_UPDATE_MIN_INTERVAL:-300}"
 CLAUDE_PKG="@anthropic-ai/claude-code"
+# dsh (DeepSeek Harness) toolchain. The CLI is installed at LATEST and updated on
+# every agent restart (turma-agent-update --dsh-only), mirroring Claude Code — see
+# the dsh section. npm>=11 blocks install scripts by default; the native build
+# deps must be allowed or dsh's sandbox/subprocess layer stays broken.
+DSH_ALLOW_SCRIPTS="koffi,node-pty,@deepseek-ai/dsh-subprocess-local"
+# install.sh --with-dsh writes this marker so BOTH the file swap below and the
+# CLI update know this host wants dsh (it is the "when dsh is wanted" gate).
+DSH_MARKER="$PREFIX/.dsh"
 mkdir -p "$HOME/.turma" 2>/dev/null || true
 
 # The log lives in ~/.turma, which the identity the SESSIONS run as can write.
@@ -413,6 +426,105 @@ update_claude() {
   install_claude "$cur" "$latest"
 }
 
+# ---- dsh CLI (XERK-496) ------------------------------------------------------
+# dsh is updated EXACTLY like Claude Code: at LATEST, and only at agent start via
+# --dsh-only (the launcher runs it before the manager exists, so no dsh session
+# can be launching while the package is replaced). NEVER on the hourly timer or
+# in --loop — replacing the package briefly removes `dsh` from PATH and a
+# session launched in that window dies on exec, the same reason Claude Code's
+# check only runs at start. Gated on $PREFIX/.dsh (install.sh --with-dsh wrote
+# it), so a non-dsh host pays nothing. The CLI lives in ~/.local — outside the
+# prefix the updater swaps — so it needs its own update; the driver/guard plugin
+# FILES ride the payload swap in install_payload instead.
+#
+# dsh is always npm-managed into ~/.local (unlike claude, which can be owned by
+# a separate installer), so there is no "who owns this" branch: npm is the only
+# mechanism.
+# The bare version `dsh` reports. Empty when it can't be parsed or is absent.
+dsh_version() {
+  command -v dsh >/dev/null 2>&1 || return 0
+  bounded "${TURMA_CLAUDE_PROBE_TIMEOUT:-30}" dsh --version 2>/dev/null \
+    | head -n1 | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true
+}
+
+# Latest published version, per the npm registry. Empty when unreachable or
+# unparseable — both read as "stay put" (see claude_latest for the sort -V trap).
+dsh_latest() {
+  command -v npm >/dev/null 2>&1 || return 0
+  local out
+  out="$(bounded "${TURMA_NPM_VIEW_TIMEOUT:-45}" npm view "@deepseek-ai/dsh" version \
+         --fetch-retries=1 --fetch-timeout=20000 2>/dev/null | tr -d '[:space:]' || true)"
+  printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' || return 0
+  printf '%s' "$out"
+}
+
+# Install the LATEST dsh CLI into ~/.local (the prefix the launcher exports on
+# PATH), with npm's native-build scripts allowed — without them dsh's sandbox /
+# subprocess layer stays broken while the package "installs".
+npm_install_dsh() {
+  local budget
+  budget="$(num "${TURMA_NPM_INSTALL_TIMEOUT:-300}" 300)"
+  bounded "$budget" \
+    npm install -g --prefix "$HOME/.local" \
+    --allow-scripts="$DSH_ALLOW_SCRIPTS" "@deepseek-ai/dsh@latest" >>"$LOG" 2>&1
+}
+
+install_dsh() {  # <version_before>
+  local before="$1" after
+  if npm_install_dsh; then
+    after="$(dsh_version)"
+    if [ -n "$after" ] && [ "$after" != "$before" ]; then
+      logmsg "dsh: now $after"
+    elif [ -n "$after" ]; then
+      logmsg "dsh: install reported success but still resolves $after — that copy is not the one updated"
+    else
+      logmsg "dsh: install finished but $(command -v dsh 2>/dev/null || echo 'dsh') reports no readable version"
+    fi
+    return 0
+  fi
+  logmsg "dsh: install FAILED (see npm output above)"
+  return 1
+}
+
+update_dsh() {
+  # The runtime gate: only a host that opted into dsh (marker present) is
+  # managed here. Only reachable from --dsh-only, which the launcher fires at
+  # agent start.
+  [ -f "$DSH_MARKER" ] || return 0
+  command -v npm >/dev/null 2>&1 || { logmsg "dsh: npm not installed; cannot update"; return 0; }
+
+  local cur latest
+  if ! command -v dsh >/dev/null 2>&1; then
+    logmsg "dsh: MISSING — installing @deepseek-ai/dsh"
+    install_dsh ""
+    return 0
+  fi
+
+  cur="$(dsh_version)"
+  if [ -z "$cur" ]; then
+    # Present but can't say what it is — normally a half-written install, which
+    # reinstalling repairs. Keep it simple (dsh has no unparseable-memory
+    # marker); a repair that leaves the same unreadable output just runs again
+    # next start, bounded by the same install budget.
+    logmsg "dsh: reports no readable version ($(command -v dsh) ) — reinstalling"
+    install_dsh "$cur"
+    return 0
+  fi
+
+  latest="$(dsh_latest)"
+  if [ -z "$latest" ]; then
+    logmsg "dsh: registry unreachable or unreadable; staying at $cur"
+    return 0
+  fi
+  if ! newer_than "$latest" "$cur"; then
+    logmsg "dsh up to date ($cur)"
+    return 0
+  fi
+
+  logmsg "dsh update available: $cur -> $latest"
+  install_dsh "$cur"
+}
+
 # The Authorization header to send with a plain-curl GitHub call, as an array —
 # empty when there is no token, which is a SUPPORTED state (see all_tags).
 auth_header() {  # -> sets AUTH_HDR
@@ -533,14 +645,8 @@ install_payload() {  # <tgz> <version>
   # would leave the host with no guard hook at all, and a missing hook command
   # is a non-blocking hook — the safety guard would fail OPEN while VERSION,
   # the restart and the log all reported a clean update.
-  # dsh_session.py / dsh_transcript.py are siblings hub-agent.py imports and must
-  # stay in lockstep with it: a payload that swapped hub-agent.py but not these
-  # left the old modules in place, and a new hub-agent call into an old sibling
-  # crash-looped the manager (an AttributeError on the beat takes the host down).
-  # Refuse an incomplete payload rather than install a skew, same as hooks/.
   if [ ! -f "$src/hub-agent.py" ] || [ ! -f "$src/tunnel-agent.js" ] \
-     || [ ! -d "$src/hooks" ] \
-     || [ ! -f "$src/dsh_session.py" ] || [ ! -f "$src/dsh_transcript.py" ]; then
+     || [ ! -d "$src/hooks" ]; then
     logmsg "staged payload incomplete; refusing to install"; return 1
   fi
 
@@ -551,17 +657,32 @@ install_payload() {  # <tgz> <version>
   rm -rf "$PREFIX/hooks"; mv -f "$src/hooks" "$PREFIX/hooks"
   mv -f "$src/tunnel-agent.js" "$PREFIX/tunnel-agent.js"
   [ -f "$src/tmux.conf" ] && mv -f "$src/tmux.conf" "$PREFIX/tmux.conf"
-  # dsh runtime siblings (checked complete above) + the driver/guard plugin
-  # trees, moved together with hub-agent.py so they can never drift from it.
-  mv -f "$src/dsh_session.py" "$PREFIX/dsh_session.py"
-  mv -f "$src/dsh_transcript.py" "$PREFIX/dsh_transcript.py"
-  [ -d "$src/dsh-session-driver" ] && { rm -rf "$PREFIX/dsh-session-driver"; mv -f "$src/dsh-session-driver" "$PREFIX/dsh-session-driver"; }
-  [ -d "$src/dsh" ] && { rm -rf "$PREFIX/dsh"; mv -f "$src/dsh" "$PREFIX/dsh"; }
   local b
   for b in turma-agent turma-agentctl turma-agent-update; do
     [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }
   done
   chmod +x "$PREFIX/hooks/"*.py 2>/dev/null || true
+  # dsh toolchain: keep it in step with the payload, on a host that wants dsh
+  # (install.sh --with-dsh wrote $PREFIX/.dsh). The plugins sit OUTSIDE the
+  # shared files this swap used to own, so unreferenced here they silently froze
+  # on the last install.sh run — the fragility XERK-496 exists to remove. Refresh
+  # from the staged payload when it ships them, else drop them (payload no
+  # longer ships dsh -> the installed copy is stale and must not linger).
+  if [ -f "$DSH_MARKER" ]; then
+    if [ -f "$src/dsh_session.py" ] && [ -d "$src/dsh-session-driver" ] \
+       && [ -f "$src/dsh-session-driver/dist/index.js" ] && [ -d "$src/dsh/guard" ]; then
+      cp -f "$src/dsh_session.py" "$PREFIX/dsh_session.py"
+      cp -f "$src/dsh_transcript.py" "$PREFIX/dsh_transcript.py"
+      rm -rf "$PREFIX/dsh-session-driver"; cp -a "$src/dsh-session-driver" "$PREFIX/dsh-session-driver"
+      mkdir -p "$PREFIX/dsh"; rm -rf "$PREFIX/dsh/guard"; cp -a "$src/dsh/guard" "$PREFIX/dsh/guard"
+      logmsg "dsh toolchain refreshed from payload (driver + guard + python siblings)"
+    else
+      rm -rf "$PREFIX/dsh_session.py" "$PREFIX/dsh_transcript.py" \
+             "$PREFIX/dsh-session-driver" "$PREFIX/dsh/guard"
+      rm -f "$DSH_MARKER"
+      logmsg "payload no longer ships the dsh toolchain; removed the installed dsh files"
+    fi
+  fi
   # An unstampable VERSION means the next check sees the OLD version and does the
   # whole download, swap and restart again, every hour, forever. Say so instead
   # of reporting a clean update.
@@ -662,8 +783,8 @@ try_legacy() {  # <cur> <stage>
   verify_and_install "$dl" "$latest" || true
 }
 
-# The agent self-update. Claude Code is NOT part of this — see the Claude Code
-# section for why it only ever runs at agent start.
+# The agent self-update. Claude Code and dsh are NOT part of this — see the
+# Claude Code / dsh sections for why they only ever run at agent start.
 run_once() {
   local cur stage
   # Stamp FIRST, so a run that then wedges or dies still bounds the next
@@ -760,7 +881,7 @@ with_lock() {  # <cmd...>
 }
 
 usage() {
-  echo "usage: turma-agent-update [--loop [--interval SECONDS]] [--boot] [--claude-only]" >&2
+  echo "usage: turma-agent-update [--loop [--interval SECONDS]] [--boot] [--claude-only] [--dsh-only]" >&2
   exit 2
 }
 
@@ -769,8 +890,13 @@ claude_check() {
   update_claude || logmsg "claude update check errored (continuing)"
 }
 
+dsh_check() {
+  stamp_now "$DSH_STAMP"
+  update_dsh || logmsg "dsh update check errored (continuing)"
+}
+
 main() {
-  local loop=no boot=no claude_only=no
+  local loop=no boot=no claude_only=no dsh_only=no
   # `sleep 0` in the poller loop is not "no delay", it is a HOT loop — a full
   # release check several times a second, which rate-limits the host against
   # api.github.com. A malformed value is worse in the other direction: `sleep
@@ -782,6 +908,7 @@ main() {
       --loop) loop=yes ;;
       --boot) boot=yes ;;
       --claude-only) claude_only=yes ;;
+      --dsh-only) dsh_only=yes ;;
       --interval) shift; INTERVAL="$(num "${1:-}" 3600)" ;;
       *) usage ;;
     esac
@@ -795,6 +922,16 @@ main() {
   if [ "$claude_only" = yes ]; then
     if throttled "$CLAUDE_STAMP" "claude check"; then return 0; fi
     with_lock claude_check || return 0
+    return 0
+  fi
+
+  # --dsh-only: the same start-time check for the dsh CLI (XERK-496), for the
+  # same reason — a session launched into a replaced `dsh` dies on exec, so it
+  # runs only before the manager exists. Its own stamp so it doesn't throttle on
+  # (or get throttled by) the claude or agent checks.
+  if [ "$dsh_only" = yes ]; then
+    if throttled "$DSH_STAMP" "dsh check"; then return 0; fi
+    with_lock dsh_check || return 0
     return 0
   fi
 

@@ -28,24 +28,26 @@ assert_eq() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$4"; fi; }
 
 # --- Build a valid native tarball + sha256 sidecar for a given version -------
 # The payload must satisfy install_payload's completeness check (hub-agent.py +
-# tunnel-agent.js + hooks/ + the dsh_*.py siblings).
-make_tarball() {  # <version> <outdir> [nohooks|nodsh]
+# tunnel-agent.js + hooks/). [4th arg = withdsh] adds the dsh toolchain flat in
+# the payload (dsh_session.py + dsh-session-driver/dist + dsh/guard), the layout
+# release.yml's build-agent-native now ships.
+make_tarball() {  # <version> <outdir> [nohooks] [withdsh]
   local version="$1" out="$2" staged
   staged="$(mktemp -d)"
   mkdir -p "$staged/hooks"
   echo "# hub-agent $version" >"$staged/hub-agent.py"
   echo "// tunnel $version" >"$staged/tunnel-agent.js"
   echo "# guard" >"$staged/hooks/guard.py"
-  # The dsh runtime siblings hub-agent.py imports — kept in lockstep with it, so
-  # install_payload refuses a payload missing them (a skew crash-looped the host).
-  echo "# dsh_session $version" >"$staged/dsh_session.py"
-  echo "# dsh_transcript $version" >"$staged/dsh_transcript.py"
   # A payload missing hooks/ — the swap DELETES the installed hooks before it
   # moves the staged ones in, so this must be refused outright.
   [ "${3:-}" = nohooks ] && rm -rf "$staged/hooks"
-  # A payload that swapped hub-agent.py but not the dsh siblings — the exact skew
-  # that crash-looped every dsh host — must be refused for the same reason.
-  [ "${3:-}" = nodsh ] && rm -f "$staged/dsh_session.py" "$staged/dsh_transcript.py"
+  if [ "${4:-}" = withdsh ]; then
+    echo "# dsh_session $version" >"$staged/dsh_session.py"
+    echo "# dsh_transcript $version" >"$staged/dsh_transcript.py"
+    mkdir -p "$staged/dsh-session-driver/dist" "$staged/dsh/guard"
+    echo "// driver $version" >"$staged/dsh-session-driver/dist/index.js"
+    echo "// guard $version" >"$staged/dsh/guard/index.mjs"
+  fi
   echo "$version" >"$staged/VERSION"
   local tgz="$out/turma-agent-native-v${version}.tar.gz"
   tar czf "$tgz" -C "$staged" .
@@ -161,7 +163,7 @@ new_gh_dir() { local d; d="$(mktemp -d)"; mkdir -p "$d/manifests" "$d/assets"; e
 
 # Add a unified release: tag, native component version, and (optionally) the
 # tarball on a possibly-DIFFERENT release_tag (for the carried-asset case).
-add_unified_release() {  # <ghdir> <tag> <native_version> <asset_release_tag>
+add_unified_release() {  # <ghdir> <tag> <native_version> <asset_release_tag> [withdsh]
   local d="$1" tag="$2" nver="$3" atag="$4"
   echo "$tag" >> "$d/tags"
   cat > "$d/manifests/$tag.json" <<EOF
@@ -180,7 +182,7 @@ EOF
   cp "$d/manifests/$tag.json" "$d/assets/$tag/manifest.json"
   # Put the tarball on the release the manifest points at (may be an older tag).
   mkdir -p "$d/assets/$atag"
-  make_tarball "$nver" "$d/assets/$atag" >/dev/null
+  make_tarball "$nver" "$d/assets/$atag" "" "${5:-}" >/dev/null
 }
 
 echo "test_turma_agent_update.sh"
@@ -475,6 +477,68 @@ run_claude_case() {  # <installed_claude|none> <latest|none> <yes|no|elsewhere> 
 
   cat "$root/claude.log" 2>/dev/null || true
   # The updater's own log lines, so a case can assert on what it REPORTED.
+  sed 's/^/LOG /' "$root/out.log" 2>/dev/null || true
+  rm -rf "$root" "$ghdir"
+}
+
+# --- dsh CLI update at agent start (XERK-496) --------------------------------
+# dsh is updated exactly like Claude Code: at LATEST, and only at agent start via
+# --dsh-only — never on the timer/loop (replacing `dsh` under a live spawn window
+# is the claude analog). Gated on $PREFIX/.dsh (install.sh --with-dsh wrote it).
+
+# A `dsh` that reports a version and an `npm` serving a canned registry, both
+# recording what they were asked to do in $DSH_LOG (the assertion).
+install_fake_dsh_toolchain() {  # <bindir> <installed|none> <latest|none>
+  local bin="$1" installed="$2" latest="$3"
+  if [ "$installed" != "none" ]; then
+    cat > "$bin/dsh" <<STUB
+#!/bin/sh
+case "\$1" in
+  --version) [ -n "\${STUB_DSH_HANG:-}" ] && sleep "\$STUB_DSH_HANG"
+             echo "\$(cat "$bin/.dsh-version")" ;;
+  *) exit 2 ;;
+esac
+STUB
+    chmod +x "$bin/dsh"
+    printf '%s\n' "$installed" > "$bin/.dsh-version"
+  else
+    rm -f "$bin/dsh" "$bin/.dsh-version"
+  fi
+  cat > "$bin/npm" <<STUB
+#!/bin/sh
+case "\$1 \$2" in
+  "view @deepseek-ai/dsh") [ "$latest" = none ] && exit 1; echo "$latest" ;;
+  "install -g") echo "npm-install \$*" >> "\$DSH_LOG"
+                printf '%s\n' "$latest" > "$bin/.dsh-version" ;;
+  *) exit 2 ;;
+esac
+STUB
+  chmod +x "$bin/npm"
+}
+
+# Run the dsh check the way the launcher does (--dsh-only). Echoes the recorded
+# npm calls, one per line, then the updater's own log.
+run_dsh_case() {  # <installed|none> <latest|none> <wanted yes|no> [env=val...]
+  local installed="$1" latest="$2" wanted="$3"; shift 3
+  local root prefix bin ghdir
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  echo "0.3.0" >"$prefix/VERSION"
+  # A dsh WANTING host has the marker install.sh --with-dsh writes.
+  [ "$wanted" = yes ] && echo "1" >"$prefix/.dsh"
+  install_fake_restart "$bin"
+  install_fake_dsh_toolchain "$bin" "$installed" "$latest"
+  ghdir="$(new_gh_dir)"
+  add_unified_release "$ghdir" "v0.3.0" "0.3.0" "v0.3.0"
+
+  # A NARROW PATH, like run_claude_case: the stubs in $bin + coreutils.
+  env FAKE_GH_DIR="$ghdir" HOME="$root/home" PATH="$bin:/usr/bin:/bin" \
+    TURMA_REPO="xerktech/turma" DSH_LOG="$root/dsh.log" "$@" \
+    "$bin/turma-agent-update" --dsh-only >"$root/out.log" 2>&1 || true
+
+  cat "$root/dsh.log" 2>/dev/null || true
   sed 's/^/LOG /' "$root/out.log" 2>/dev/null || true
   rm -rf "$root" "$ghdir"
 }
@@ -1103,80 +1167,144 @@ fi
 unset TURMA_TEST_RESTART_LOG
 rm -rf "$root" "$d"
 
-# --- A payload missing the dsh siblings is refused; a complete one installs them
-# The skew that crash-looped every dsh host: hub-agent.py swapped, dsh_session.py
-# left stale. install_payload must refuse a payload that omits them, and a
-# complete payload must land them beside hub-agent.py.
-d="$(mktemp -d)"; mkdir -p "$d/manifests"
-cat > "$d/tags" <<'EOF'
-v0.4.0
-EOF
-cat > "$d/manifests/v0.4.0.json" <<'EOF'
-{ "version":"0.4.0",
-  "components": { "agent-native": {
-      "version":"0.4.0", "kind":"asset",
-      "asset":"turma-agent-native-v0.4.0.tar.gz",
-      "sha256_asset":"turma-agent-native-v0.4.0.tar.gz.sha256",
-      "release_tag":"v0.4.0", "built":true } } }
-EOF
-mkdir -p "$d/assets/v0.4.0"
-cp "$d/manifests/v0.4.0.json" "$d/assets/v0.4.0/manifest.json"
-make_tarball "0.4.0" "$d/assets/v0.4.0" nodsh >/dev/null
+# --- dsh toolchain (XERK-496) ------------------------------------------------
+# The dsh plugins live beside hub-agent.py and are NOT part of the shared files
+# the updater historically swapped, so they silently froze on the last install.sh
+# run. install.sh --with-dsh writes $PREFIX/.dsh; on that marker the updater must
+# keep the toolchain in step with the payload (refresh when shipped, drop when the
+# payload stops shipping it), and never introduce it on a host that didn't opt in.
+
+# 26. dsh host + payload that ships dsh -> the installed dsh files are refreshed
+#     from the payload (driver picks up the newer dist/index.js), VERSION moves.
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.4.1" "0.4.1" "v0.4.1" withdsh
 root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
 cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
-echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+echo "# old hub" >"$prefix/hub-agent.py"; echo "// old tunnel" >"$prefix/tunnel-agent.js"
 mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
-echo "# dsh_session old" >"$prefix/dsh_session.py"
 echo "0.3.0" >"$prefix/VERSION"
+# A dsh-enabled host: marker present + the toolchain laid down by a past install.
+echo "0.1.1-rc.2" >"$prefix/.dsh"
+mkdir -p "$prefix/dsh-session-driver/dist" "$prefix/dsh/guard" "$prefix/dsh"
+echo "// OLD driver" >"$prefix/dsh-session-driver/dist/index.js"
+echo "// OLD guard" >"$prefix/dsh/guard/index.mjs"
+echo "# OLD dsh_session" >"$prefix/dsh_session.py"
+echo "# OLD dsh_transcript" >"$prefix/dsh_transcript.py"
 install_fake_restart "$bin"; install_fake_gh "$bin"
-export TURMA_TEST_RESTART_LOG="$root/restart.log"; : > "$TURMA_TEST_RESTART_LOG"
 FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
   TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
 got="$(tr -d '[:space:]' < "$prefix/VERSION")"
-assert_eq "0.3.0" "$got" "a payload without the dsh siblings is refused (stayed $got)" \
-  "installed a dsh-less payload, VERSION now $got"
-if grep -q old "$prefix/dsh_session.py"; then
-  pass "the stale dsh_session.py is left untouched by a refused payload"
+assert_eq "0.4.1" "$got" "dsh host: update installs the newer version (-> $got)" "dsh host update failed, VERSION $got"
+if grep -q "driver 0.4.1" "$prefix/dsh-session-driver/dist/index.js" \
+   && grep -q "guard 0.4.1" "$prefix/dsh/guard/index.mjs" \
+   && grep -q "dsh_session 0.4.1" "$prefix/dsh_session.py" \
+   && grep -q "dsh_transcript 0.4.1" "$prefix/dsh_transcript.py"; then
+  pass "dsh host: the toolchain is refreshed from the payload (driver + guard + python siblings)"
 else
-  fail "a refused payload still swapped dsh_session.py"
+  fail "dsh toolchain NOT refreshed on a dsh host after an update"
 fi
-unset TURMA_TEST_RESTART_LOG
+if [ -f "$prefix/.dsh" ]; then
+  pass "dsh marker survives a payload that still ships dsh"
+else
+  fail "dsh marker lost on a dsh-shipping update"
+fi
 rm -rf "$root" "$d"
 
-# A COMPLETE payload lands the dsh siblings beside hub-agent.py (in lockstep).
-d="$(mktemp -d)"; mkdir -p "$d/manifests"
-cat > "$d/tags" <<'EOF'
-v0.4.0
-EOF
-cat > "$d/manifests/v0.4.0.json" <<'EOF'
-{ "version":"0.4.0",
-  "components": { "agent-native": {
-      "version":"0.4.0", "kind":"asset",
-      "asset":"turma-agent-native-v0.4.0.tar.gz",
-      "sha256_asset":"turma-agent-native-v0.4.0.tar.gz.sha256",
-      "release_tag":"v0.4.0", "built":true } } }
-EOF
-mkdir -p "$d/assets/v0.4.0"
-cp "$d/manifests/v0.4.0.json" "$d/assets/v0.4.0/manifest.json"
-make_tarball "0.4.0" "$d/assets/v0.4.0" >/dev/null
+# 27. dsh host + payload that NO LONGER ships dsh -> installed dsh files are
+#     dropped and the marker removed, so a stale toolchain cannot linger on a
+#     release that stopped shipping it.
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.4.2" "0.4.2" "v0.4.2"   # payload WITHOUT dsh
 root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
 cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
-echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+echo "# old hub" >"$prefix/hub-agent.py"; echo "// old tunnel" >"$prefix/tunnel-agent.js"
 mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
-echo "# dsh_session old" >"$prefix/dsh_session.py"
 echo "0.3.0" >"$prefix/VERSION"
+echo "0.1.1-rc.2" >"$prefix/.dsh"
+mkdir -p "$prefix/dsh-session-driver/dist" "$prefix/dsh/guard"
+echo "// OLD driver" >"$prefix/dsh-session-driver/dist/index.js"
+echo "// OLD guard" >"$prefix/dsh/guard/index.mjs"
+echo "# OLD dsh_session" >"$prefix/dsh_session.py"
+echo "# OLD dsh_transcript" >"$prefix/dsh_transcript.py"
 install_fake_restart "$bin"; install_fake_gh "$bin"
 FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
   TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
-got="$(tr -d '[:space:]' < "$prefix/VERSION")"
-assert_eq "0.4.0" "$got" "a complete payload installs (VERSION now $got)" \
-  "a complete payload did not install, VERSION $got"
-if grep -q "0.4.0" "$prefix/dsh_session.py" && [ -f "$prefix/dsh_transcript.py" ]; then
-  pass "the dsh siblings are swapped in lockstep with hub-agent.py"
+if [ ! -e "$prefix/dsh-session-driver" ] && [ ! -e "$prefix/dsh/guard" ] \
+   && [ ! -e "$prefix/dsh_session.py" ] && [ ! -e "$prefix/dsh_transcript.py" ] \
+   && [ ! -e "$prefix/.dsh" ]; then
+  pass "dsh host: a payload without dsh drops the stale installed toolchain + marker"
 else
-  fail "hub-agent.py updated but the dsh siblings did not — the crash-loop skew"
+  fail "dsh toolchain lingered after a payload that stopped shipping it"
 fi
 rm -rf "$root" "$d"
+
+# 28. A NON-dsh host (no marker) + payload WITH dsh -> the toolchain is NOT
+#     introduced unilaterally; the update carries the dsh bits in the payload but
+#     leaves the host exactly as it was (still no dsh).
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.4.3" "0.4.3" "v0.4.3" withdsh
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old hub" >"$prefix/hub-agent.py"; echo "// old tunnel" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+# No $PREFIX/.dsh marker, no dsh files.
+install_fake_restart "$bin"; install_fake_gh "$bin"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 "$bin/turma-agent-update" >/dev/null 2>&1 || true
+if [ ! -e "$prefix/dsh-session-driver" ] && [ ! -e "$prefix/dsh/guard" ] \
+   && [ ! -e "$prefix/dsh_session.py" ] && [ ! -e "$prefix/.dsh" ]; then
+  pass "non-dsh host: a dsh-shipping payload does NOT introduce the toolchain"
+else
+  fail "a dsh-shipping payload introduced the toolchain on a non-dsh host"
+fi
+rm -rf "$root" "$d"
+
+# --- dsh CLI updated at agent restart (--dsh-only), the claude model --------
+
+# 29. dsh host + newer published -> installs @latest.
+got="$(run_dsh_case "0.1.1-rc.2" "0.3.0" yes)"
+if printf '%s' "$got" | grep -q 'npm-install .*@deepseek-ai/dsh@latest'; then
+  pass "a newer dsh is installed at --dsh-only"
+else
+  fail "newer dsh was not installed at --dsh-only (log: $got)"
+fi
+
+# 30. dsh host + already current -> a true no-op (no reinstall under live
+#     spawns), the load-bearing property that makes the every-restart check safe.
+got="$(run_dsh_case "0.3.0" "0.3.0" yes)"
+if printf '%s' "$got" | grep -q 'npm-install'; then
+  fail "reinstalled an already-current dsh (log: $got)"
+else
+  pass "an up-to-date dsh is a no-op at --dsh-only"
+fi
+
+# 31. dsh host + installed AHEAD of the registry (pinned/unpublished) -> not
+#     downgraded.
+got="$(run_dsh_case "0.4.0" "0.3.0" yes)"
+if printf '%s' "$got" | grep -q 'npm-install'; then
+  fail "downgraded dsh installed-ahead of the registry (log: $got)"
+else
+  pass "an installed-ahead dsh is never downgraded"
+fi
+
+# 32. dsh host + dsh MISSING -> installed (a dsh host without the CLI refuses
+#     every spawn).
+got="$(run_dsh_case "none" "0.3.0" yes)"
+if printf '%s' "$got" | grep -q 'npm-install .*@deepseek-ai/dsh@latest'; then
+  pass "a missing dsh is installed at --dsh-only on a dsh host"
+else
+  fail "a missing dsh was not installed on a dsh host (log: $got)"
+fi
+
+# 33. NON-dsh host (no marker) + newer published -> never installed. The check
+#     must not introduce the CLI on a host that never opted in.
+got="$(run_dsh_case "none" "0.3.0" no)"
+if printf '%s' "$got" | grep -q 'npm-install'; then
+  fail "--dsh-only installed dsh on a host without the marker (log: $got)"
+else
+  pass "a non-dsh host is never given the dsh CLI"
+fi
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$FAILED"

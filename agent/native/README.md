@@ -71,7 +71,7 @@ Or, from a repo checkout / an extracted release tarball:
 
 ```sh
 ./install.sh
-# options: --prefix DIR  --no-install-deps  --autostart  --verify  --uninstall
+# options: --prefix DIR  --no-install-deps  --autostart  --with-dsh  --verify  --uninstall
 ```
 
 Default install prefix is `~/.local/share/turma-agent`; config is
@@ -188,6 +188,38 @@ one-liner these run through `bootstrap.sh` — both modes act on the existing
 ```sh
 curl -fsSL .../bootstrap.sh | bash -s -- --verify
 ```
+
+## DeepSeek Harness (dsh) — optional per-session runtime
+
+dsh is an opt-in runtime alongside Claude Code (XERK-460): a session can pick
+`dsh` in the composer. A host must ship the dsh toolchain before it can offer
+that choice. Install it with:
+
+```sh
+./install.sh --with-dsh     # or: TURMA_DSH=1 ./install.sh
+```
+
+`--with-dsh` does three things, all tracked by the updater so they stay current
+across agent updates (XERK-496):
+
+- Lays the **plugins + Python siblings** beside `hub-agent.py` in the prefix:
+  `dsh_session.py`, `dsh_transcript.py`, `dsh-session-driver/` (built `dist/`),
+  and `dsh/guard/` — at the exact paths the agent resolves from its own file.
+- Installs the **latest `@deepseek-ai/dsh` CLI** into `~/.local` (the prefix the
+  launcher already puts on PATH), allowing npm's native-build scripts (`koffi`,
+  `node-pty`, `@deepseek-ai/dsh-subprocess-local`) so dsh's sandbox/subprocess
+  layer actually works.
+- Seeds `TURMA_DSH=1` into a **fresh** config, which is what makes the host
+  *offer* dsh (editing an existing config is left to you). Give the runtime a
+  model route too — `DSH_MODEL_BASE_URL` + `DSH_MODEL` (falls back to the
+  `LOCAL_MODEL_*` keys).
+
+**Updates are handled exactly like Claude Code**: on a dsh host the CLI is updated
+to the latest at every **agent restart** (before the manager starts, so no dsh
+session can launch into a replaced `dsh`) — never on the hourly timer. The
+driver/guard plugin files ride each native-payload swap, so the whole toolchain
+stays current on a dsh host. `--verify` checks the dsh files and CLI;
+`--uninstall` notes the CLI it leaves in `~/.local`.
 
 ## Known limitations (graceful degradation)
 
