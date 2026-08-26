@@ -173,6 +173,22 @@ class AgentDecodeTest {
         assertEquals("", closed[2].agentType)
     }
 
+    // XERK-473 [I]/[M]: the top-level ticketRuntimes map — which runtime a ticket
+    // is pinned to. Newly typed on AgentsResponse, so it must decode the well-formed
+    // shape and default cleanly when a pre-XERK-473 hub omits it (never a throw that
+    // would hide the whole fleet).
+    @Test fun `the ticketRuntimes map decodes and defaults when absent`() {
+        val withPin = """
+            { "now": 1, "agents": [],
+              "ticketRuntimes": { "org.atlassian.net/X-1": { "runtime": "dsh", "at": 5 } } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(withPin)
+        assertEquals("dsh", resp.ticketRuntimes["org.atlassian.net/X-1"]?.runtime)
+        // A hub predating the field sends none; it defaults to an empty map.
+        val bare = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [] }""")
+        assertTrue(bare.ticketRuntimes.isEmpty())
+    }
+
     // XERK-489: the discovered model list + defaultModel on the block, and the
     // per-session localModelName/localModelContext. Both are typed now, so the
     // hub coerces them (normalizeLocalModel / normalizeSessions) and this decode

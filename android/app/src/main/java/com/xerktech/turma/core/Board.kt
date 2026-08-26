@@ -150,6 +150,11 @@ data class BoardSite(
     // `models`, XERK-123): the ticket model picker's options, unioned across the
     // org's hosts, freshest default label winning.
     val models: BoardModels = BoardModels(),
+    // Whether ANY host reporting this org offers the dsh runtime (board.js
+    // mergeSites `dshAvailable`, XERK-473): the org-level capability the Runtime
+    // row's "dsh" option is gated on, so the picker can't name a runtime the hub
+    // would refuse. An existing dsh pin is always releasable even when false.
+    val dshAvailable: Boolean = false,
 )
 
 /** One org host the agent picker can pin a ticket to (board.js hostOpts entry). */
@@ -221,6 +226,32 @@ fun agentPinOf(
     ticketAgents["$siteKey/$issueKey"]?.takeIf { it.host.isNotBlank() }
 
 /**
+ * The ticket's pinned RUNTIME out of the hub's ticketRuntimes map, keyed
+ * "<siteKey>/<issueKey>" — a port of board.js `runtimePinOf` (XERK-473). Null
+ * means the ticket runs the default (claude); a "claude" value is treated as no
+ * pin too, matching the web (the hub only ever stores a non-default "dsh").
+ */
+fun runtimePinOf(
+    ticketRuntimes: Map<String, com.xerktech.turma.model.TicketRuntimePin>,
+    siteKey: String,
+    issueKey: String,
+): com.xerktech.turma.model.TicketRuntimePin? =
+    ticketRuntimes["$siteKey/$issueKey"]?.takeIf { it.runtime.isNotBlank() && it.runtime != "claude" }
+
+/** Human form of a runtime signal — a port of board.js `prettyRuntime`. */
+fun prettyRuntime(v: String): String = if (v == "dsh") "dsh (DeepSeek Harness)" else "Claude Code"
+
+/**
+ * Whether the Runtime row can offer a change — a port of the web's
+ * `editable: !!(o.runtimePin || o.dshAvailable)` (board.js `runtimeFieldHtml`
+ * call site). Editable when the org offers dsh OR a pin already exists, so an
+ * existing dsh pin can always be RELEASED even after the last dsh-capable host
+ * left — mirroring the hub, which still lets a pin clear.
+ */
+fun runtimeEditable(dshAvailable: Boolean, pin: com.xerktech.turma.model.TicketRuntimePin?): Boolean =
+    dshAvailable || pin != null
+
+/**
  * Whether the Status row can offer a change (XERK-138) — a port of board.js
  * `canChangeStatus`. The status write rides the heartbeat command path, so it
  * needs an ONLINE host to deliver it AND the fetched detail's `statusOptions`
@@ -273,6 +304,9 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     // probe's default label. Collected over EVERY reporting host, like hostOpts.
     val modelAvail = LinkedHashMap<String, LinkedHashSet<String>>()
     val modelDefault = LinkedHashMap<String, Pair<String, String>>()  // site -> (at, defaultLabel)
+    // Whether any reporting host offers the dsh runtime (XERK-473): an org-level
+    // OR over every host, like the web's `if (a.dsh?.available) rep.dshAvailable`.
+    val dshBySite = LinkedHashMap<String, Boolean>()
     // site -> repo name -> picker option, collected over EVERY reporting host —
     // like hostOpts above, and for the same reason board.js gives: the blocks
     // that survive the byUser dedupe are one per (site, user), and the COMMON
@@ -284,6 +318,7 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
         val j = a.jira ?: continue
         if (j.siteKey.isBlank()) continue
         reporterOnline[j.siteKey] = (reporterOnline[j.siteKey] ?: false) || a.online
+        if (a.dsh?.available == true) dshBySite[j.siteKey] = true
         val hk = a.key.ifBlank { a.device }
         if (hk.isNotBlank()) {
             hostOpts.getOrPut(j.siteKey) { LinkedHashMap() }[hk] =
@@ -378,6 +413,7 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                     available = (modelAvail[site]?.toList() ?: emptyList()).sorted(),
                     defaultLabel = modelDefault[site]?.second ?: "",
                 ),
+                dshAvailable = dshBySite[site] ?: false,
             ),
         )
     }

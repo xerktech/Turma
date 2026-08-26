@@ -268,6 +268,17 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): OkResponse
 
+    // Pin which RUNTIME a ticket's session spawns on (XERK-473): claude or dsh.
+    // Hub-owned and durable like the model pin, so an authoritative 200. Body:
+    // {runtime:"dsh"} to pin, {runtime:"claude"} (or {auto:true}) to release. A
+    // "dsh" pin is refused unless the org offers dsh.
+    @POST("api/jira/{siteKey}/{issueKey}/runtime")
+    suspend fun setTicketRuntime(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
     // Change a ticket's status and push it to the board (XERK-138) — the one
     // thing Turma writes back. Body: {value:"<transition id / state name>"}
     // from the detail's statusOptions. Needs an online host (it's a write);

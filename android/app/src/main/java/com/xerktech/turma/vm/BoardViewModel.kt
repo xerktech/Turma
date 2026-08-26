@@ -281,6 +281,22 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Pin which RUNTIME a ticket's session spawns on (XERK-473), or release it
+     * back to Claude Code (`runtime = null`). Hub-owned and durable — the POST is
+     * authoritative, and the fleet payload's ticketRuntimes reflects it on the
+     * next poll/SSE event. Mirrors the web board: "claude" is the release, sent
+     * as the value rather than {auto:true}.
+     */
+    fun setTicketRuntime(siteKey: String, issueKey: String, runtime: String?) {
+        viewModelScope.launch {
+            val body = buildJsonObject { put("runtime", JsonPrimitive(runtime ?: "claude")) }
+            val ok = runCatching { container.client.api.setTicketRuntime(siteKey, issueKey, body) }.isSuccess
+            _messages.tryEmit(if (ok) "✓ runtime updated" else "✗ hub unreachable")
+            container.fleet.nudge()
+        }
+    }
+
+    /**
      * Change a ticket's status and push it to the board (XERK-138) — the one
      * thing Turma writes back. The hub queues a command on an online host and
      * reports the outcome keyed by the returned cmdId, which we poll with backoff
