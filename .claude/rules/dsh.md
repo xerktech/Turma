@@ -364,6 +364,21 @@ the same spawn path — no new session model.
   `test_handle_commands_carries_the_runtime_pin`) agent-side; the `/runtime` route + the dsh
   `findTicketHost` cases in `server.test.js`; the `runtime*` cases in `board.test.js`.
 
+## [J] (XERK-474) shipped: background-agent / workflow rows + subagentHistory for dsh
+
+The projection philosophy (D3/S1) applied to DELEGATION: a dsh session that spawns sub-agents /
+workflows shows the picker + per-agent transcripts IDENTICALLY to Claude Code because the launcher
+SYNTHESIZES the Claude-Code on-disk shapes — so `_scan_agent_entry`, `_resolve_subagent`,
+`_resolve_workflow_run`, `_workflow_agents` and the usage/archive walks read a dsh delegation with NO
+reader change (the XERK-304 contract, no new field). The subagent lifecycle (ctx-bus) is forwarded
+into the parent log; the workflow's own `tool-workflow/*` are already there; each child's native log
+is captured and projected into the Claude `subagents/` + `workflows/` layout.
+
+**Mechanics + invariants (the projector, the tail's run-record/child synthesis, the driver's forward
++ capture, and the residual gaps) are in `.claude/rules/dsh-delegation.md`**, scoped to the
+delegation files. Verified by unit test through hub-agent's real readers, not against real dsh (as
+[D]/[E]); the `ctx.on('subagent/start', {global:true})` scope is the one thing live dsh must confirm.
+
 ## [L] (XERK-476) shipped: peer roster + cross-session messaging for dsh
 
 XERK-348 matched for dsh. The ROSTER was already runtime-independent (`_peer_rows`/

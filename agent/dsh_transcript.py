@@ -52,8 +52,19 @@ kept dependency-free like the rest of `agent/`.
 """
 
 import json
+import re
 import uuid as _uuidlib
 from datetime import datetime, timezone
+
+# A synthesized launch's child id / run id names a LIVE-AGENT id and (for a run)
+# a directory, and is embedded verbatim into the `agentId:`/`<task-id>` text the
+# scan matches on — so it is held to the ASCII grammar hub-agent's own
+# VALID_WORKFLOW_AGENT_ID_RE / VALID_WORKFLOW_RUN_ID_RE accept (NOT `str.isalnum`,
+# which is Unicode-aware and would pass a char those readers reject, yielding a
+# row that never resolves — and it also refuses an id carrying XML / newlines that
+# could otherwise break the `<task-notification>` the stop edge rides). dsh mints
+# UUIDs, so this never rejects a real id.
+_VALID_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # A fixed namespace so a given (session id, event seq, sub-index) always projects
 # to the SAME entry uuid. Determinism matters: the launcher appends the projection
@@ -84,6 +95,53 @@ INTERRUPT_MARKER = "[Request interrupted by user]"
 # Claude tool the name would imply, so a rename would misrepresent the call. They
 # still render as generic tool cards, correctly.
 _TOOL_NAME_MAP = {"bash": "Bash"}
+
+# dsh's delegation tools whose RAW tool-call + result the projection REPLACES with
+# a synthesized launch/stop pair (XERK-474 [J]). dsh spawns a subagent through the
+# `subagent` tool and a workflow through the `workflow` tool; each also fires
+# lifecycle events (`turma/subagent-*` from the driver, `tool-workflow/*` in the
+# parent log) that carry the child session id the pickers resolve on. The
+# synthesized launch reads to hub-agent EXACTLY like a Claude-Code `Agent`/
+# `Workflow` background launch — so `_scan_agent_entry`, `_resolve_subagent` and
+# `_resolve_workflow_run` all work with no reader change, which is the whole
+# projection philosophy (D3). Keeping the raw tool-call TOO would show two launch
+# cards for one delegation, so it is dropped. Keyed on dsh's DEFAULT tool names;
+# a host that renames them (both are configurable) sees the raw card as well —
+# cosmetic, never a broken read.
+_DELEGATION_TOOL_NAMES = frozenset({"subagent", "workflow"})
+
+# dsh stop reasons -> the Claude-Code task-notification <status>. Every dsh
+# terminal reason maps to one Claude Code writes, ALL of which retire the agent
+# from the live set (hub-agent's AGENT_DONE_STATUSES). "completed" is the clean
+# finish; the rest are surfaced as they happened rather than flattened to done,
+# since a killed/failed child is worth seeing.
+_SUBAGENT_STOP_STATUS = {
+    "completed": "completed", "aborted": "stopped", "error": "failed",
+    "max-tokens": "failed", "refusal": "failed",
+}
+_WORKFLOW_STOP_STATUS = {
+    "completed": "completed", "cancelled": "stopped", "error": "failed",
+}
+
+
+def workflow_run_id(dsh_run_id):
+    """The Claude-Code-shaped run id for a dsh `WorkflowRunId`, or "" if it can't
+    be one. Claude Code names a run `wf_<...>` and hub-agent's
+    VALID_WORKFLOW_RUN_ID_RE / `_resolve_workflow_run` both REQUIRE that prefix,
+    while dsh mints a bare UUID — so the projection (this module) and the run
+    directory the tail writes BOTH go through here, keeping them one name. The
+    body is charset-checked against the reader's own grammar
+    (`^wf_[A-Za-z0-9_-]{1,64}$`): a run id that can't satisfy it would resolve to
+    nothing, so it is refused here rather than emitted as a row that never opens."""
+    raw = str(dsh_run_id or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith("wf_"):
+        raw = "wf_" + raw
+    body = raw[len("wf_"):]
+    if not _VALID_ID_RE.match(body):
+        return ""
+    return raw
 
 
 def _iso(ms):
@@ -230,6 +288,11 @@ class DshProjector:
         # it. Not parsed by any reader.
         self.version = version or "dsh"
         self._parent = None
+        # Call ids of the raw delegation tool-calls (subagent/workflow) whose
+        # paired tool/result must also be dropped — the launch is synthesized
+        # from the lifecycle events instead. Populated in _assistant_message,
+        # consumed once each in _tool_result.
+        self._skip_calls = set()
 
     def _envelope(self, entry_type, seq, index=0):
         e = {
@@ -270,8 +333,23 @@ class DshProjector:
             return self._tool_result(data, seq, ts)
         if etype == "turn/end":
             return self._turn_end(data, seq, ts)
+        # Delegation launch/stop (XERK-474 [J]) — projected into the Claude-Code
+        # background-launch shapes the pickers and the live-agent scan read, so a
+        # dsh session that delegates surfaces IDENTICALLY to a Claude one.
+        # `turma/subagent-*` are the driver's forward of dsh's ctx-bus
+        # `subagent/start`/`subagent/end`; `tool-workflow/*` are the workflow
+        # tool's OWN durable events, already in the parent log.
+        if etype == "turma/subagent-start":
+            return self._subagent_start(data, seq, ts)
+        if etype == "turma/subagent-end":
+            return self._subagent_end(data, seq, ts)
+        if etype == "tool-workflow/run-start":
+            return self._workflow_run_start(data, seq, ts)
+        if etype == "tool-workflow/run-end":
+            return self._workflow_run_end(data, seq, ts)
         # Every other event (turn/step boundaries, assistant/chunk, request/*,
-        # todo/write, session/*, tool/call — see the docstring) is log-only.
+        # todo/write, session/*, tool/call, tool-workflow/agent-* — see the
+        # docstring and DshWorkflowRuns) is log-only for the TRANSCRIPT.
         return []
 
     def _user_message(self, data, seq, ts):
@@ -288,6 +366,21 @@ class DshProjector:
         data = data if isinstance(data, dict) else {}
         msg = data.get("message") if isinstance(data.get("message"), dict) else {}
         blocks = _assistant_content(msg.get("content"))
+        # Drop the raw delegation tool-call (subagent/workflow): its launch is
+        # synthesized from the lifecycle events, so keeping the tool_use too would
+        # render two launch cards for one delegation. Remember the call id so the
+        # paired tool/result is dropped as well. Other content (the model's text
+        # around the call) is kept — only the one block is removed.
+        if blocks:
+            kept = []
+            for b in blocks:
+                if (b.get("type") == "tool_use"
+                        and b.get("name") in _DELEGATION_TOOL_NAMES):
+                    if b.get("id"):
+                        self._skip_calls.add(str(b["id"]))
+                    continue
+                kept.append(b)
+            blocks = kept
         if not blocks:
             return []
         entry = self._envelope("assistant", seq)
@@ -324,6 +417,11 @@ class DshProjector:
         # on a malformed event, so guard with isinstance like the sibling handlers.
         src = msg.get("source") if isinstance(msg.get("source"), dict) else {}
         call_id = trb.get("toolCallId") or src.get("callId")
+        # The result of a dropped delegation tool-call is dropped too (its launch
+        # was synthesized). Consumed once — a call id pairs with one result.
+        if call_id and str(call_id) in self._skip_calls:
+            self._skip_calls.discard(str(call_id))
+            return []
         inner = _content_to_text_blocks(trb.get("content"))
         result_block = {"type": "tool_result"}
         if call_id:
@@ -352,6 +450,224 @@ class DshProjector:
         entry["timestamp"] = ts
         entry["message"] = {"role": "user", "content": INTERRUPT_MARKER}
         return [self._emit(entry)]
+
+    # ---- delegation launch/stop (XERK-474 [J]) -----------------------------
+    # These synthesize the on-disk shape a Claude-Code BACKGROUND launch writes,
+    # so hub-agent's existing readers resolve a dsh delegation with no change:
+    #   * `_scan_agent_entry`/`asyncLaunch` fold the launch's structured
+    #     `toolUseResult{status:"async_launched", …}` into the live-agent set
+    #     (the row the operator clicks), and retire it on the `<task-notification>`;
+    #   * `_resolve_subagent` maps a clicked Agent row to `subagents/agent-<id>.jsonl`
+    #     via the Agent tool_use's `subagent_type`/`description` + the `agentId:` in
+    #     its result text;
+    #   * `_resolve_workflow_run` maps a workflow row to its run dir via the
+    #     `toolUseResult`'s `taskType`/`runId`.
+    # A launch is TWO entries (the assistant tool_use, then the user tool_result
+    # carrying the structured record) exactly as Claude Code writes it — the type
+    # of a subagent row is read off the tool_use's `subagent_type` and the row's
+    # live-id off the result's `agentId`, so both halves have to be present.
+
+    def _launch_pair(self, seq, tool_name, tool_input, result_text, tur, ts):
+        """The assistant tool_use + user tool_result pair that IS a background
+        launch. `tur` is the structured `toolUseResult` the readers key on; the
+        call id links the two entries and is derived from the launch's own handle
+        so a re-projection is byte-stable."""
+        call_id = "dsh-" + str(tur.get("agentId") or tur.get("runId") or seq)
+        asst = self._envelope("assistant", seq, 0)
+        asst["timestamp"] = ts
+        asst["message"] = {"id": "dsh-msg-%s" % seq, "type": "message",
+                           "role": "assistant",
+                           "content": [{"type": "tool_use", "id": call_id,
+                                        "name": tool_name, "input": tool_input}]}
+        out = [self._emit(asst)]
+        res = self._envelope("user", seq, 1)
+        res["timestamp"] = ts
+        res["message"] = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": call_id, "content": result_text}]}
+        res["toolUseResult"] = tur
+        out.append(self._emit(res))
+        return out
+
+    def _task_notification(self, seq, ts, task_id, status):
+        """The `<task-notification>` user turn that retires a background launch
+        (its `<task-id>` is the launch's `agentId`/run id). A plain string
+        message content, like Claude Code's own — hub-agent's `_parse_task_notification`
+        / `parseTaskNotification` read it, and `_entry_blocks` renders it as a card."""
+        entry = self._envelope("user", seq)
+        entry["timestamp"] = ts
+        entry["message"] = {"role": "user", "content": (
+            "<task-notification><task-id>%s</task-id><status>%s</status>"
+            "</task-notification>" % (task_id, status))}
+        return [self._emit(entry)]
+
+    def _subagent_start(self, data, seq, ts):
+        data = data if isinstance(data, dict) else {}
+        child = str(data.get("childId") or data.get("id") or "").strip()
+        if not _VALID_ID_RE.match(child):
+            return []
+        # The row's label AND the tool_use description come from ONE value, so
+        # `_resolve_subagent` (which matches the clicked row's label against the
+        # tool_use description) always resolves. A real label rides the event when
+        # the driver knows it; else the child id keeps resolution self-consistent.
+        label = str(data.get("label") or "").strip() or child
+        tur = {"status": "async_launched", "agentId": child,
+               "agentType": "subagent", "description": label}
+        return self._launch_pair(
+            seq, "Agent", {"subagent_type": "subagent", "description": label},
+            "Async agent launched successfully. agentId: %s" % child, tur, ts)
+
+    def _subagent_end(self, data, seq, ts):
+        data = data if isinstance(data, dict) else {}
+        child = str(data.get("childId") or data.get("id") or "").strip()
+        if not _VALID_ID_RE.match(child):
+            return []
+        status = _SUBAGENT_STOP_STATUS.get(
+            str(data.get("stopReason") or "").strip(), "completed")
+        return self._task_notification(seq, ts, child, status)
+
+    def _workflow_run_start(self, data, seq, ts):
+        data = data if isinstance(data, dict) else {}
+        run_id = workflow_run_id(data.get("runId"))
+        if not run_id:
+            return []
+        name = str(data.get("name") or "").strip()
+        # taskId == runId: `_async_launch` keys the live row on `taskId` while
+        # `_resolve_workflow_run` keys the run dir on `runId`, so they are one id.
+        tur = {"status": "async_launched", "taskType": "local_workflow",
+               "workflowName": name, "runId": run_id, "taskId": run_id}
+        return self._launch_pair(
+            seq, "Workflow", {"name": name},
+            "Workflow run started. runId: %s" % run_id, tur, ts)
+
+    def _workflow_run_end(self, data, seq, ts):
+        data = data if isinstance(data, dict) else {}
+        run_id = workflow_run_id(data.get("runId"))
+        if not run_id:
+            return []
+        status = _WORKFLOW_STOP_STATUS.get(
+            str(data.get("stopReason") or "").strip(), "completed")
+        return self._task_notification(seq, ts, run_id, status)
+
+
+class DshWorkflowRuns:
+    """Folds a dsh session's durable `tool-workflow/*` events into the per-run
+    account the Claude-Code workflow pickers read (XERK-304, XERK-474 [J]): the
+    run RECORD (`workflows/<runId>.json` — `workflowProgress[]`), the finished
+    set (`journal.jsonl`), and which child agents belong to which run (so the
+    tail files each agent's transcript under the run dir rather than flat).
+
+    Fed the SAME parent event stream as `DshProjector` (in file order). Pure and
+    in-memory; `agent/dsh_session.py`'s tail turns its output into the files
+    hub-agent's `_workflow_run_record` / `_workflow_agents` / `_workflow_finished_agents`
+    already parse. dsh's workflow tool is FOREGROUND, but it appends these events
+    as the run progresses, so the record exists and carries live states WHILE the
+    run is on-screen — unlike Claude Code, which writes its record only at the end.
+
+    Agents are keyed by `seq` (1-based per run): `tool-workflow/agent-start`
+    carries `{seq, label, phase?, childId}` and `tool-workflow/agent-end` carries
+    `{seq, outcome}` with NO childId, so seq is the only join between the two."""
+
+    # dsh WorkflowAgentOutcome -> the state a Claude workflow record row carries.
+    _OUTCOME = {"completed": "done", "failed": "failed", "cancelled": "skipped"}
+
+    def __init__(self):
+        # claude runId -> {"name", "agents": {seq: {childId,label,phase,state,startedAt}}}
+        self.runs = {}
+        self._child_run = {}   # childId -> claude runId
+        self._dirty = set()    # runIds whose record/journal the tail should rewrite
+
+    def _run(self, run_id):
+        return self.runs.setdefault(run_id, {"name": "", "agents": {}})
+
+    def feed(self, event):
+        """Fold one parent event. Tolerant of a malformed event (does nothing)."""
+        if not isinstance(event, dict):
+            return
+        etype = event.get("type")
+        data = event.get("data")
+        data = data if isinstance(data, dict) else {}
+        if etype == "tool-workflow/run-start":
+            run_id = workflow_run_id(data.get("runId"))
+            if run_id:
+                self._run(run_id)["name"] = str(data.get("name") or "").strip()
+                self._dirty.add(run_id)
+        elif etype == "tool-workflow/agent-start":
+            run_id = workflow_run_id(data.get("runId"))
+            child = str(data.get("childId") or "").strip()
+            seq = data.get("seq")
+            if not run_id or not child or not isinstance(seq, int):
+                return
+            run = self._run(run_id)
+            prev = run["agents"].get(seq) or {}
+            run["agents"][seq] = {
+                "childId": child,
+                "label": str(data.get("label") or "").strip(),
+                "phase": str(data.get("phase") or "").strip(),
+                "state": prev.get("state") or "running",
+                "startedAt": event.get("time"),
+            }
+            self._child_run[child] = run_id
+            self._dirty.add(run_id)
+        elif etype == "tool-workflow/agent-end":
+            run_id = workflow_run_id(data.get("runId"))
+            seq = data.get("seq")
+            if not run_id or not isinstance(seq, int):
+                return
+            run = self._run(run_id)
+            row = run["agents"].get(seq)
+            if not row:
+                return
+            row["state"] = self._OUTCOME.get(
+                str(data.get("outcome") or "").strip(), row.get("state") or "running")
+            self._dirty.add(run_id)
+        # tool-workflow/run-end needs no record change: per-agent end states carry
+        # the outcome, and the run's own stop is the transcript task-notification.
+
+    def run_of_child(self, child_id):
+        """The claude runId a workflow agent belongs to, or None for an ordinary
+        (non-workflow) subagent — which decides where the tail files its transcript."""
+        return self._child_run.get(str(child_id or "").strip())
+
+    def take_dirty(self):
+        """The runIds whose record/journal changed since the last call, clearing
+        the set — the tail rewrites exactly those files."""
+        d, self._dirty = self._dirty, set()
+        return d
+
+    def record(self, run_id):
+        """The run's `workflows/<runId>.json` body, in the shape
+        `_workflow_run_record`/`_workflow_progress_rows` parse, or None if unknown.
+        `startedAt` stays epoch ms — `_epoch_ms_iso` normalizes it, and the record
+        must not diverge from Claude's (a number there, ISO on the transcript)."""
+        run = self.runs.get(run_id)
+        if not run:
+            return None
+        rows = []
+        for seq in sorted(run["agents"]):
+            a = run["agents"][seq]
+            row = {"type": "workflow_agent", "agentId": a["childId"],
+                   "label": a["label"], "index": seq, "state": a["state"]}
+            if a.get("startedAt") is not None:
+                row["startedAt"] = a["startedAt"]
+            if a.get("phase"):
+                row["phase"] = a["phase"]
+            rows.append(row)
+        return {"runId": run_id, "workflowName": run["name"], "workflowProgress": rows}
+
+    def finished(self, run_id):
+        """The `journal.jsonl` lines for a run — one `{"type":"result","agentId":…}`
+        per agent that reached a TERMINAL state — as a list of dicts. The record's
+        per-agent `state` already covers the picker, so the journal is the fallback
+        `_workflow_finished_agents` reads; writing it keeps the layout complete."""
+        run = self.runs.get(run_id)
+        if not run:
+            return []
+        out = []
+        for seq in sorted(run["agents"]):
+            a = run["agents"][seq]
+            if a["state"] in ("done", "failed", "skipped"):
+                out.append({"type": "result", "agentId": a["childId"]})
+        return out
 
 
 def project_log(events, session_id, cwd=None, git_branch=None, version=None):
