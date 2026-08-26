@@ -172,6 +172,29 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
   world-readable) — the local-model-credential discipline. Same-uid sessions can already read the
   manager's `/proc/<pid>/environ`, so this adds no exposure; a `[F]` guard read-deny on
   `~/.turma/dsh/*.env` would be defence-in-depth.
+- **An ADOPTED dsh session must be REATTACHED, not just re-ttyd'd.** `resume_on_boot`'s adopt path
+  (the tmux survived a manager-only restart — the in-place-update case) leaves the live dsh PROCESS
+  alone, but its control socket + projection tail live IN the manager and died with it. Without
+  `_reattach_dsh(sess)` (reconnect the still-bound `~/.turma/dsh/<sid>.sock`, restart the tail at
+  the event log's **current EOF** — `resume=True`, since the history was projected pre-restart and
+  re-reading from 0 would double the transcript) an adopted dsh session runs DARK: input dropped
+  ("no control socket"), transcript frozen. Best-effort by contract — it never raises (adopt would
+  else `_set_error` a live session) and never kills the adopted process. Bounded cost: an event
+  written during the seconds-long restart window is not re-projected (the native log keeps it).
+  A claude session needs none of this (its tmux + transcript are self-sufficient). Tests:
+  `test_adopts_dsh_reattaches_control_and_tail`, `test_reattach_dsh_*` in `TestResumeOnBootAdopt`.
+- **A dsh-sibling version SKEW must not crash the beat.** `dsh_session.py`/`dsh_transcript.py` are
+  siblings `hub-agent.py` imports; the native install ships + updates them in lockstep with it
+  (XERK-496, `agent-native.md`). But before that landed, an update advanced `hub-agent.py` while
+  freezing `dsh_session.py`, and a new `hub-agent.py` call into the old sibling (`tail.title()`,
+  absent pre-4ff323b) raised `AttributeError` on the BEAT — the agent's MAIN process — crash-looping
+  every dsh host (~15s), and the repeated `agents.resume` on each restart corrupted dsh's own store
+  (a `session/end-seed` reseed re-using seq numbers → "corrupt session log: seq gap in committed
+  region", the dsh web-UI error). Packaging keeps the files in step; the belt-and-suspenders is that
+  `_seed_summaries` GUARDS the `tail.title()` call so ANY sibling skew (a partial update, a rollback)
+  degrades to "unnamed this beat" instead of taking the host down — the XERK-395/402 beat-loop
+  contract that an uncaught exception on the beat is the whole host, not a skipped cycle. Tests:
+  `test_seed_summaries_survives_a_dsh_tail_without_title`.
 
 ## Tests
 
