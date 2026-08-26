@@ -33,6 +33,7 @@ that component's files.
 | `.claude/rules/android.md` | `android/**` | Kotlin client, page→screen map, in-app update |
 | `.claude/rules/glasses.md` | `glasses/**` | G2 client |
 | `.claude/rules/release.md` | `.github/**`, `VERSION`, `turma/Dockerfile` | releases, PR gates, the hub image |
+| `.claude/rules/routing-eval.md` | `bench/archive/**`, the routing docs | archive-sourced replay eval: the requestId turn unit, curation gates, why routing is per-session |
 | `.claude/rules/dsh.md` | `poc/turma-2.0-poc/**`, `agent/**` | dsh integration ADR (XERK-460 G0): the five architecture decisions |
 | `.claude/rules/dsh-input.md` | `agent/dsh_session.py`, `agent/dsh-session-driver/**`, `agent/hub-agent.py` | driving a dsh session (XERK-467 [C]): control socket, driver plugin, `_launch_dsh`, input/interaction |
 | `.claude/rules/dsh-guard.md` | `agent/dsh/guard/**`, `agent/hub-agent.py` | dsh safety guard (XERK-470 [F]): the deny policy mapped onto dsh's tool pipeline |
