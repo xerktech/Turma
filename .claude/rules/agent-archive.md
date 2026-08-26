@@ -231,9 +231,12 @@ paths:
   - **Only APPEND-ONLY bytes belong under `<tid>/dsh/`.** The per-file cursor ships bytes past an
     offset — correct for dsh's event-sourced JSONL log, wrong for a page-mutating SQLite (an in-place
     rewrite leaves the archived early bytes stale). dsh's SQLite is a derived index it rebuilds from
-    the log, so it is not archived. Migration ([K]) is the other consumer and is NOT free yet:
-    `_pack_bytes` names `subagents/`+`workflows/`, not the whole `<tid>/` tree, so [K] adds one
-    `tar.add(<tid>/dsh)`. Tests: `TestDshArchiveSync`.
+    the log, so it is not archived. This `<tid>/dsh/` log is the DISPLAY/metrics feed, and migration
+    ([K], XERK-475) does NOT carry it — dsh resumes from its OWN store under `DSH_SESSIONS_ROOT`
+    (a separate file), which the bundle carries instead; the target rebuilds this feed from new
+    events (the resumed dsh does not replay history). The earlier note that [K] would
+    `tar.add(<tid>/dsh)` was based on a false premise (that this feed was resumable). Tests:
+    `TestDshArchiveSync`.
   - The raw pass runs in its **own try/except** off the same reply: a raw failure must never cost the
     rendered transcript, which is what every other surface reads. Its read window must stay at or
     under the hub's `ARCHIVE_RAW_CHUNK_MAX`, which bounds its gunzip — a larger window is refused on

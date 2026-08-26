@@ -60,6 +60,7 @@ interface Context {
 }
 interface AgentRegistry {
     create(options: CreateAgentOptions): Promise<AgentHandle>;
+    resume(options: ResumeAgentOptions): Promise<AgentHandle>;
     get(id: string): Agent | undefined;
 }
 interface CreateAgentOptions {
@@ -68,6 +69,15 @@ interface CreateAgentOptions {
         cwd?: string;
         agentPreset?: string;
     };
+    agentOptions?: {
+        provider?: string;
+        model?: string;
+        maxTokens?: number;
+    };
+    setup?: (agentCtx: unknown) => void | Promise<void>;
+}
+interface ResumeAgentOptions {
+    resumeSessionId: string;
     agentOptions?: {
         provider?: string;
         model?: string;

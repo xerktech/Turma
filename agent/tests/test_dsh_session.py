@@ -279,6 +279,48 @@ class DshProjectionTailTest(unittest.TestCase):
         time.sleep(0.4)
         self.assertEqual(self._read_transcript(), [])
 
+    def test_resume_starts_past_already_projected_history(self):
+        """On RESUME the kept event log's history is ALREADY in the transcript
+        (projected before the restart / on the migration source), and dsh does
+        NOT re-emit seeded events — so a resumed tail must start at the log's EOF
+        and project only NEW events, or it DOUBLES the transcript (XERK-475)."""
+        # A pre-existing event, as if projected before a restart.
+        self._append_event({
+            "type": "user/message", "seq": 1, "time": 1_700_000_000_000,
+            "data": {"content": [{"type": "text", "text": "old turn"}]}})
+        # A resumed tail: offset starts at the log's current size, so pumping
+        # projects nothing from the history.
+        resumed = ds.DshProjectionTail(
+            self.events_path, self.transcript, "sid-1",
+            cwd="/work", log=lambda m: None, resume=True)
+        self.addCleanup(resumed.stop)
+        resumed._pump()
+        self.assertEqual(self._read_transcript(), [],
+                         "resume must not re-project the kept history")
+        # A NEW event after resume DOES project.
+        self._append_event({
+            "type": "user/message", "seq": 2, "time": 1_700_000_000_001,
+            "data": {"content": [{"type": "text", "text": "new turn"}]}})
+        resumed._pump()
+        entries = self._read_transcript()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["message"]["content"][0]["text"], "new turn")
+
+    def test_fresh_tail_projects_the_whole_log_from_zero(self):
+        # The contrast: a non-resume tail starts at 0 and projects existing
+        # events (a fresh launch truncates the log, so this never doubles).
+        self._append_event({
+            "type": "user/message", "seq": 1, "time": 1_700_000_000_000,
+            "data": {"content": [{"type": "text", "text": "from zero"}]}})
+        fresh = ds.DshProjectionTail(
+            self.events_path, self.transcript, "sid-1",
+            cwd="/work", log=lambda m: None, resume=False)
+        self.addCleanup(fresh.stop)
+        fresh._pump()
+        entries = self._read_transcript()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["message"]["content"][0]["text"], "from zero")
+
 
 class DshDelegationTailTest(unittest.TestCase):
     """XERK-474 [J]: the tail turns a dsh session's delegation events + captured

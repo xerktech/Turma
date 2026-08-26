@@ -414,23 +414,24 @@ ARCHIVE_RAW_COMPONENT_MAX = 255
 ARCHIVE_RAW_REL_DEPTH_MAX = 10
 ARCHIVE_RAW_REL_LEN_MAX = 400
 
-# Where a dsh session's canonical native event log lives on disk (XERK-469,
-# [dsh][E]). It sits UNDER the project-slug session directory
-# (`<slug>/<sessionId>/dsh/`), NOT in the worktree, precisely so it rides the
-# raw archive layer with no new code: `_session_files` walks `<tid>/**`, the same
-# way it carries subagents/, workflows/ and tool-results/. D3's retention
-# obligation (`.claude/rules/dsh.md`) is that the native, event-sourced log is
-# kept in full for metrics/resume/migration; that is only true if it is archived,
-# and the raw layer archives the project-slug tree, never the worktree (worktree
+# Where the DRIVER writes its copy of a dsh session's native event log — the
+# PROJECTION FEED (XERK-469, [dsh][E]). It sits UNDER the project-slug session
+# directory (`<slug>/<sessionId>/dsh/`), NOT in the worktree, precisely so it
+# rides the raw archive layer with no new code: `_session_files` walks
+# `<tid>/**`, the same way it carries subagents/, workflows/ and tool-results/.
+# The raw layer archives the project-slug tree, never the worktree (worktree
 # contents are what prune/delete key on and the raw layer excludes on purpose).
 # This RECONCILES the [B] design-of-record (docs/dsh-session-lifecycle.md), which
 # proposed the worktree — a location the raw archive reaches into for nothing.
 #
-# Migration ([K], a separate follow-up already flagged out of scope for [B] v1)
-# is the OTHER consumer of these bytes and is NOT free yet: `_pack_bytes` packs
-# `<tid>.jsonl` + `<tid>/subagents/` + `<tid>/workflows/` by name, not the whole
-# `<tid>/` subtree, so [K] adds one `tar.add(<tid>/dsh)` in the same convention.
-# Placing the store here is what makes that a one-liner rather than a new path.
+# This feed is NOT what dsh RESUMES from, and the earlier framing here (and in
+# [E]'s docs) that called it "kept for resume/migration" was WRONG (XERK-475).
+# dsh's `agents.resume` reloads its OWN durable store, `session-persistence-jsonl`
+# rooted at DSH_SESSIONS_ROOT (== $DSH_HOME/sessions) — a SEPARATE file from this
+# feed. So migration ([K]) carries the STORE, not `<tid>/dsh/`: `export_session`
+# packs `_dsh_store_dir(worktree, sid)` under `.dsh-store/` and the target
+# re-keys it to its own cwd. The feed itself is deliberately NOT migrated — the
+# target rebuilds it from new events (the resumed dsh does not replay history).
 #
 # Only APPEND-ONLY files belong here. The raw layer's per-file cursor ships new
 # bytes past a byte offset, which is correct for an event-sourced JSONL log and
@@ -1141,17 +1142,95 @@ DSH_BIN = os.environ.get("DSH_BIN", "dsh")
 # env value into a generated config). Same grammar as a local model name.
 DSH_IDENT_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
 
+# dsh's DURABLE, resumable session store — dsh's own `session-persistence-jsonl`
+# backend, rooted at `dshHomePath('sessions')` == $DSH_HOME/sessions (verified
+# against real dsh 0.1.1-rc.2). This is what `ctx.agents.resume` reloads, and it
+# is DISTINCT from the driver's `<tid>/dsh/events.jsonl` projection feed [E]:
+# that feed builds the display transcript and is NOT what dsh resumes from.
+# Migration ([K], XERK-475) must carry THIS store, not the feed.
+DSH_SESSIONS_ROOT = os.path.join(DSH_HOME, "sessions")
+# Reserved tar arcname carrying the dsh store into a migration bundle. It sits
+# beside the slug-relative members (`<tid>.jsonl`, `<tid>/...`) and can never
+# collide with one: a claude session id is never a dotfile. `_unpack_transcript`
+# routes members under it to the target's own DSH_SESSIONS_ROOT, not the slug.
+DSH_STORE_ARCNAME = ".dsh-store"
+
+
+def _dsh_project_key(cwd):
+    """Port of `session-persistence-jsonl`'s `projectKey(cwd)`: the per-project
+    directory name dsh derives from a session's cwd, under DSH_SESSIONS_ROOT.
+
+    dsh validates a loaded session's on-disk PATH against `logPath(root,
+    header.cwd, id)` and refuses a mismatch as a corrupt log — so a migrated
+    store must live at the key of the cwd recorded in its header, which is why
+    this must reproduce dsh's encoding byte-for-byte (golden-tested against a
+    real store dir in `TestDshProjectKey`). Separators (`/ \\ :`) collapse to a
+    single `-`; each other char is kept literal only if it is ASCII
+    `[A-Za-z0-9._-]` and not `~`, else escaped `~XXXX` (upper hex, 4-wide). The
+    body has leading `-` stripped, defaults to `root` when empty, is capped at
+    251 chars, and is wrapped in `--…--`.
+
+    Operates on code points; dsh operates on UTF-16 code units, so an astral
+    char (never in a worktree path here) could diverge — a divergence dsh then
+    REFUSES loudly at load rather than resuming wrong, so it can't corrupt."""
+    if not cwd:
+        raise ValueError("cannot encode an empty project path")
+    out = []
+    separator_run = False
+    for ch in cwd:
+        if ch in ("/", "\\", ":"):
+            if not separator_run:
+                out.append("-")
+            separator_run = True
+        elif ch != "~" and ch.isascii() and (ch.isalnum() or ch in "._-"):
+            out.append(ch)
+            separator_run = False
+        else:
+            out.append("~" + format(ord(ch), "04X"))
+            separator_run = False
+    body = "".join(out).lstrip("-") or "root"
+    return "--" + body[:251] + "--"
+
+
+def _dsh_store_dir(cwd, session_id):
+    """The directory holding a dsh session's durable log:
+    $DSH_HOME/sessions/<projectKey(cwd)>/<session_id>/ (holds `session.jsonl`).
+    `cwd` is the session's worktree; `session_id` is the pinned claude_sid."""
+    return os.path.join(DSH_SESSIONS_ROOT, _dsh_project_key(cwd), session_id)
+
 
 def _dsh_cordis_patch(provider, model, base_url, api_key_env, context,
                       guard_config=None):
     """The profile's cordis.patch.yml: the driver-plugin entry, a hand-declared
     pi-ai provider route (dsh has no Claude failover — this route is the whole
-    model story, D5), an agent-default-model fallback, and — when `guard_config`
-    is given — the `@turma/dsh-guard` safety guard (XERK-470 [F]), the dsh
-    equivalent of the Claude `--settings` guard the launcher MUST compose.
-    `base_url`/`api_key_env` place NO secret on disk — the credential rides the
-    named env var. `provider`/`model` are charset-validated by the caller.
-    Mirrors poc/turma-2.0-poc/test-real-dsh.sh's proven patch."""
+    model story, D5), an agent-default-model fallback, a session-persistence
+    override (plaintext, so migration can re-key a moved store — XERK-475), and
+    — when `guard_config` is given — the `@turma/dsh-guard` safety guard
+    (XERK-470 [F]), the dsh equivalent of the Claude `--settings` guard the
+    launcher MUST compose. `base_url`/`api_key_env` place NO secret on disk —
+    the credential rides the named env var. `provider`/`model` are
+    charset-validated by the caller. Mirrors poc/turma-2.0-poc/test-real-dsh.sh's
+    proven patch."""
+    # Override the base profile's session-persistence backend to write PLAINTEXT
+    # (`compression: none`) instead of its zstd default (XERK-475). The store's
+    # first line is a JSON header carrying the session's `cwd`, and a migration
+    # onto a host that mounts REPOS_ROOT elsewhere must REWRITE that cwd (dsh
+    # refuses a store whose path disagrees with its header cwd) and re-key the
+    # dir — trivial on a plaintext line, a zstd round-trip otherwise (and Python
+    # has no stdlib zstd). A patch entry REPLACES the config, so `root` must be
+    # re-stated; the base uses `!!js dshHomePath('sessions')`, which is exactly
+    # DSH_SESSIONS_ROOT under the DSH_HOME the launcher exports. `packChunks` is
+    # left at the backend default — it packs event ROWS, never the header line,
+    # so it does not affect the re-key. New fleet: no pre-existing zstd stores.
+    persistence = (
+        "# Written by hub-agent.py (_ensure_dsh_profile): plaintext store so a\n"
+        "# migrated session can be re-keyed to the target's cwd (XERK-475).\n"
+        "- id: session-persistence-jsonl\n"
+        "  name: '@deepseek-ai/dsh-session-persistence-jsonl'\n"
+        "  config:\n"
+        f"    root: {json.dumps(DSH_SESSIONS_ROOT)}\n"
+        "    compression: none\n"
+    )
     guard = ""
     if guard_config is not None:
         # The safety guard (XERK-470 [F]) is INSERTed via the patch, not a bundle:
@@ -1165,7 +1244,7 @@ def _dsh_cordis_patch(provider, model, base_url, api_key_env, context,
             "      name: '@turma/dsh-guard'\n"
             f"      config: {json.dumps(guard_config)}\n"
         )
-    return guard + (
+    return persistence + guard + (
         "# Written by hub-agent.py (_ensure_dsh_profile) — loads the Turma driver\n"
         "# plugin and points dsh's model selector at an OpenAI-compatible gateway.\n"
         "- id: turma-dsh-session-driver\n"
@@ -12785,7 +12864,8 @@ class SessionManager:
                                "(the dsh process failed to start or bind)")
         self.dsh_controls[sid] = ctl
         tail = dsh_session.DshProjectionTail(
-            events_path, transcript_path, claude_sid, cwd=worktree, log=log)
+            events_path, transcript_path, claude_sid, cwd=worktree, log=log,
+            resume=resume)
         tail.start()
         self.dsh_tails[sid] = tail
         # 7. Deliver the initial prompt (spawn only) as the first user input, now
@@ -14178,8 +14258,22 @@ class SessionManager:
         if not path or not os.path.isfile(path):
             refuse(f"session {session_id} has no transcript to move")
             return
+        # A dsh session ALSO carries its durable native store (XERK-475): the
+        # transcript above is the DISPLAY projection, which dsh cannot resume
+        # from. `ctx.agents.resume` reloads $DSH_HOME/sessions/<key>/<sid>/, so
+        # that dir must ride the bundle or the target resumes with no context.
+        # The `<tid>/dsh/` projection FEED is deliberately NOT carried — the
+        # target rebuilds it from new events alone (see _launch_dsh / the tail).
+        dsh_store = None
+        if sess.get("agentType") == "dsh":
+            worktree = sess.get("worktreePath") or ""
+            sid = sess.get("claudeSessionId") or ""
+            if worktree and sid:
+                cand = _dsh_store_dir(worktree, sid)
+                if os.path.isdir(cand):
+                    dsh_store = cand
         try:
-            blob = self._pack_transcript(path)
+            blob = self._pack_transcript(path, dsh_store=dsh_store)
         except Exception as e:
             refuse(f"packing the transcript failed: {e}")
             return
@@ -14231,9 +14325,24 @@ class SessionManager:
             return
         slug_dir = os.path.join(PROJECTS_ROOT,
                                 _project_slug(os.path.normpath(cwd)))
+        # A dsh session carries its durable store under `.dsh-store/`; unpack it
+        # into THIS host's DSH_SESSIONS_ROOT at the LOCALIZED cwd's project key
+        # so `ctx.agents.resume` finds it (XERK-475). Only when the target will
+        # actually launch dsh — a dsh session falling back to claude here (no
+        # dsh) has no resume to consume it, so the store is dropped. The store
+        # dir is keyed on the localized cwd; its header cwd is re-pointed to
+        # match, since dsh refuses a store whose path disagrees with its header.
+        want_dsh = cmd.get("agentType") == "dsh" and dsh_configured()
+        dsh_store_dest = (_dsh_store_dir(os.path.normpath(cwd), transcript_id)
+                          if want_dsh else None)
         try:
             os.makedirs(slug_dir, exist_ok=True)
-            self._unpack_transcript(blob, slug_dir)
+            if dsh_store_dest:
+                os.makedirs(dsh_store_dest, exist_ok=True)
+            self._unpack_transcript(blob, slug_dir, dsh_store_dest=dsh_store_dest)
+            if dsh_store_dest:
+                self._reconcile_dsh_store_cwd(dsh_store_dest,
+                                              os.path.normpath(cwd))
         except Exception as e:
             refuse(f"unpacking the transcript bundle failed: {e}")
             return
@@ -14253,10 +14362,18 @@ class SessionManager:
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
                             extra=extra, migration_id=migration_id)
 
-    def _pack_bytes(self, path, runs):
+    def _pack_bytes(self, path, runs, dsh_store=None):
         """The bundle itself: `<id>.jsonl` (truncated to its last complete line),
         plus `<id>/subagents/...` when present, plus the `runs` dir as
-        `<id>/workflows/...` when one is given. See _pack_transcript."""
+        `<id>/workflows/...` when one is given, plus a dsh session's durable
+        store as `.dsh-store/...` when one is given. See _pack_transcript.
+
+        The dsh store rides under the reserved `.dsh-store/` prefix (never a
+        slug-relative member) so `_unpack_transcript` routes it to the target's
+        own DSH_SESSIONS_ROOT rather than into the project-slug tree. Unlike the
+        workflow records, it is NOT droppable — it is the resumable data — so it
+        is packed on every path, and if that pushes the bundle over the ceiling
+        the move is refused (export_session) rather than shipped un-resumable."""
         tid = os.path.basename(path)[:-len(".jsonl")]
         with open(path, "rb") as f:
             raw = f.read()
@@ -14272,13 +14389,17 @@ class SessionManager:
                 tar.add(sub, arcname=os.path.join(tid, "subagents"))
             if runs:
                 tar.add(runs, arcname=os.path.join(tid, WORKFLOW_RUNS_SUBDIR))
+            if dsh_store and os.path.isdir(dsh_store):
+                tar.add(dsh_store, arcname=DSH_STORE_ARCNAME)
         return buf.getvalue()
 
-    def _pack_transcript(self, path):
+    def _pack_transcript(self, path, dsh_store=None):
         """Bundle a transcript file (+ its subagents/ and workflows/ dirs, if
         any) into gzipped tar bytes, laid out relative to the project-slug dir so
         the target unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and,
-        when present, `<id>/subagents/...` and `<id>/workflows/...`.
+        when present, `<id>/subagents/...` and `<id>/workflows/...`. A dsh
+        session also passes `dsh_store` — its durable native store — which rides
+        under `.dsh-store/` (outside the slug tree) so the target can resume it.
 
         `workflows/` is the SIBLING tree holding each run's record — the only
         place the picker's row labels exist (XERK-304). Without it a moved
@@ -14305,7 +14426,7 @@ class SessionManager:
                     f"{WORKFLOW_PACK_MAX_BYTES} bytes; not carrying them")
             else:
                 try:
-                    blob = self._pack_bytes(path, runs)
+                    blob = self._pack_bytes(path, runs, dsh_store=dsh_store)
                 except OSError as e:
                     # An unreadable file in the RECORDS tree (a leftover
                     # root-owned one after a PUID change, say) must not refuse
@@ -14333,24 +14454,41 @@ class SessionManager:
                         return blob
                     log(f"migration: workflow records for {tid} would put the "
                         f"bundle over {MIGRATION_BLOB_MAX} bytes; not carrying them")
-        return self._pack_bytes(path, None)
+        return self._pack_bytes(path, None, dsh_store=dsh_store)
 
-    def _unpack_transcript(self, blob, dest_dir):
-        """Extract a _pack_transcript bundle into dest_dir. A bundle crosses a
-        host boundary, so it is never trusted: each member is written by hand to
-        a path re-checked to stay inside dest_dir (no tar.extract/extractall,
-        which would honour an absolute path, a `..`, or a symlink), and only
-        regular files and directories are unpacked."""
+    def _unpack_transcript(self, blob, dest_dir, dsh_store_dest=None):
+        """Extract a _pack_transcript bundle. Slug-relative members go to
+        dest_dir; members under the reserved `.dsh-store/` prefix go to
+        `dsh_store_dest` instead (a dsh session's durable store, which lives
+        OUTSIDE the project-slug tree — XERK-475). A bundle crosses a host
+        boundary, so it is never trusted: each member is written by hand to a
+        path re-checked to stay inside its OWN destination root (no
+        tar.extract/extractall, which would honour an absolute path, a `..`, or
+        a symlink), and only regular files and directories are unpacked.
+
+        A `.dsh-store/` member with no `dsh_store_dest` (a claude import, or a
+        dsh session falling back to claude on a host without dsh) is skipped —
+        the store is useless without a dsh resume to consume it."""
         root = os.path.realpath(dest_dir)
+        store_root = os.path.realpath(dsh_store_dest) if dsh_store_dest else None
+        store_prefix = DSH_STORE_ARCNAME + "/"
         buf = io.BytesIO(blob)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
             for m in tar.getmembers():
                 parts = m.name.split("/")
                 if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
                     raise ValueError(f"unsafe tar member {m.name!r}")
-                out = os.path.join(dest_dir, m.name)
-                if os.path.realpath(out) != root and \
-                        not os.path.realpath(out).startswith(root + os.sep):
+                # Route .dsh-store/* to the dsh store dest; drop it if none.
+                if m.name == DSH_STORE_ARCNAME or m.name.startswith(store_prefix):
+                    if store_root is None:
+                        continue
+                    rel = m.name[len(store_prefix):] if m.name != DSH_STORE_ARCNAME else ""
+                    base, check_root = dsh_store_dest, store_root
+                else:
+                    rel, base, check_root = m.name, dest_dir, root
+                out = os.path.join(base, rel) if rel else base
+                if os.path.realpath(out) != check_root and \
+                        not os.path.realpath(out).startswith(check_root + os.sep):
                     raise ValueError(f"tar member escapes dest {m.name!r}")
                 if m.isdir():
                     os.makedirs(out, exist_ok=True)
@@ -14362,6 +14500,39 @@ class SessionManager:
                     with src, open(out, "wb") as f:
                         shutil.copyfileobj(src, f)
                 # anything else (symlink/device/fifo) is silently skipped
+
+    def _reconcile_dsh_store_cwd(self, store_dir, cwd):
+        """Rewrite a migrated dsh store's header `cwd` to the localized worktree
+        (XERK-475). dsh refuses a store whose on-disk path disagrees with the
+        cwd in its `session.jsonl` header (a corrupt-log guard), and a migration
+        onto a host mounting REPOS_ROOT elsewhere placed the store at the TARGET
+        cwd's project key — so the header must be re-pointed to match, or resume
+        throws. Plaintext store (see _dsh_cordis_patch): the header is the first
+        JSON line, edited in place with no zstd round-trip. A no-op when the cwd
+        already matches (same-mount move) or the store shape is unexpected —
+        never raises the migration over a store detail resume will re-validate."""
+        path = os.path.join(store_dir, "session.jsonl")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                first = f.readline()
+                rest = f.read()
+        except OSError:
+            return
+        try:
+            header = json.loads(first)
+        except ValueError:
+            return
+        if not isinstance(header, dict) or header.get("type") != "session":
+            return
+        if header.get("cwd") == cwd:
+            return
+        header["cwd"] = cwd
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(header, separators=(",", ":")) + "\n")
+                f.write(rest)
+        except OSError as e:
+            log(f"migration: could not re-key dsh store cwd for {store_dir}: {e}")
 
     # A bundle is the largest thing an agent ever sends, so it is the body most
     # likely to meet the hub's in-flight budget (XERK-258) and be told 503 "busy,
