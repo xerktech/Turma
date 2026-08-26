@@ -80,7 +80,9 @@ class DshControl:
     `{evt:"interaction", ...}` the plugin raises — the hub writes it to the
     AskUserQuestion rendezvous file. `on_state(payload)` and
     `on_interaction_end(payload)` are called for `{evt:"state"}` / `{evt:
-    "interaction_end"}`. All three run on the READER THREAD.
+    "interaction_end"}`. `on_peer_send(payload)` / `on_peer_inbound(payload)`
+    are called for `{evt:"peer_send"}` / `{evt:"peer_inbound"}` — cross-session
+    peer messaging (XERK-476). All run on the READER THREAD.
 
     **A callback MUST NOT call input()/answer()/state()/kill()**: those block
     waiting for an ack that only the reader thread delivers, so calling one from
@@ -91,11 +93,20 @@ class DshControl:
     """
 
     def __init__(self, sock_path, on_interaction=None, on_state=None,
-                 on_interaction_end=None, log=None):
+                 on_interaction_end=None, on_peer_send=None, on_peer_inbound=None,
+                 log=None):
         self.sock_path = sock_path
         self._on_interaction = on_interaction
         self._on_state = on_state
         self._on_interaction_end = on_interaction_end
+        # Cross-session peer messaging (XERK-476): `peer_send` is the dsh session's
+        # send_message tool asking to reach a roster name; `peer_inbound` is a
+        # native Claude-peer SendMessage that arrived at the driver's forged inbox
+        # socket. Both run on the READER THREAD like the others, so the hub only
+        # STAGES them (delivery — a write to another session's socket — happens on
+        # the beat), holding the "a callback must not send" invariant.
+        self._on_peer_send = on_peer_send
+        self._on_peer_inbound = on_peer_inbound
         self._log = log or _noop_log
         self._sock = None
         self._io_lock = threading.Lock()     # one op in flight at a time
@@ -213,6 +224,12 @@ class DshControl:
             return
         if evt == "interaction_end":
             self._safe_cb(self._on_interaction_end, obj)
+            return
+        if evt == "peer_send":
+            self._safe_cb(self._on_peer_send, obj)
+            return
+        if evt == "peer_inbound":
+            self._safe_cb(self._on_peer_inbound, obj)
             return
         if evt is not None:
             return  # an event kind we don't handle — ignore, never treat as ack

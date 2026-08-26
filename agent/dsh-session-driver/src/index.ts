@@ -39,6 +39,7 @@
 
 import * as net from 'node:net'
 import * as fs from 'node:fs'
+import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 
 // ------------------------------------------------------------- dsh surface
@@ -53,6 +54,10 @@ interface Context {
   userQuestions?: UserQuestionService
   approval?: ApprovalService
   systemPrompt?: SystemPromptService
+  // The dsh tool registry (@deepseek-ai/dsh-tools). register() adds a model-
+  // facing tool and returns its disposer. Used for the peer `send_message` tool
+  // (XERK-476); optional so the plugin compiles/loads without it.
+  tools?: { register(definition: unknown): () => void }
   get(name: string): any
   on(name: string, listener: (...args: any[]) => any,
      options?: boolean | { global?: boolean }): Disposable
@@ -193,6 +198,12 @@ export function apply(ctx: Context, config: Config) {
   const provider = env.TURMA_DSH_PROVIDER || config.provider
   const model = env.TURMA_DSH_MODEL || config.model
   const sysPromptFile = env.TURMA_DSH_SYSTEM_PROMPT_FILE || ''
+  // Peer messaging (XERK-476): this session's roster NAME (what a peer addresses
+  // and what the forged Claude-inbox record is registered under) and Claude
+  // Code's session-registry dir (where that record goes). Absent -> peer
+  // messaging is off for this session (older hub, or the fields unset).
+  const rcName = env.TURMA_DSH_RCNAME || ''
+  const claudeSessionsDir = env.TURMA_DSH_CLAUDE_SESSIONS_DIR || ''
 
   if (!sessionId || !socketPath) {
     ctx.logger.error('[turma-dsh] TURMA_DSH_SESSION_ID and TURMA_DSH_SOCKET are '
@@ -348,6 +359,7 @@ export function apply(ctx: Context, config: Config) {
       case 'kill': {
         ack(sock, true)
         try { if (handle) await handle.dispose() } catch (e) { ctx.logger.warn(`[turma-dsh] dispose: ${e}`) }
+        try { cleanupPeerInbox() } catch { /* */ }   // drop the forged inbox record + socket
         try { server.close() } catch { /* */ }
         try { fs.unlinkSync(socketPath) } catch { /* */ }
         // The dsh process exists to run this one session; tear it down with it.
@@ -395,6 +407,182 @@ export function apply(ctx: Context, config: Config) {
     try { fs.chmodSync(socketPath, 0o600) } catch { /* best effort */ }
     ctx.logger.info(`[turma-dsh] control socket bound at ${socketPath}`)
   })
+
+  // ---- peer messaging: SEND (dsh -> peer) ----------------------------------
+  // A dsh session has no ListAgents/SendMessage — those are Claude Code's own
+  // per-session tools (XERK-339/348). The `send_message` tool is the dsh
+  // equivalent of SendMessage: it emits a `peer_send` control event, and the
+  // hub resolves the roster NAME against the host's running sessions and
+  // delivers it (XERK-476). Fire-and-forget from the model's view (best-effort,
+  // like SendMessage); the hub logs an undeliverable name. `defineTool` is
+  // dynamic-imported (the sandbox-policy pattern) so the plugin stays standalone.
+  ;(async () => {
+    if (!ctx.tools || typeof ctx.tools.register !== 'function') return
+    let defineTool: (o: unknown) => unknown
+    try {
+      // Indirect specifier (the sandbox-policy pattern): resolved at runtime from
+      // the dsh process's node_modules, not statically by the driver's own build.
+      const pkg = '@deepseek-ai/dsh-tools'
+      const mod: any = await import(pkg)
+      defineTool = mod.defineTool
+      if (typeof defineTool !== 'function') return
+    } catch (e) {
+      ctx.logger.warn(`[turma-dsh] send_message tool unavailable (no dsh-tools): ${e}`)
+      return
+    }
+    try {
+      ctx.tools.register(defineTool({
+        name: 'send_message',
+        description: 'Send a short message to another session in your organisation, '
+          + 'addressed by its `name` exactly as it appears in ~/.turma/peers.tsv. '
+          + 'A message costs the receiver a turn and sits in their context, so send '
+          + 'one only when it is worth that: to ask before working something out the '
+          + 'expensive way, or to warn a peer about to lose work. Not for status or '
+          + 'progress. Delivery is best-effort.',
+        parameters: {
+          to: { type: 'string', required: true,
+            description: "The peer's `name` from ~/.turma/peers.tsv (its second column)." },
+          message: { type: 'string', required: true,
+            description: 'The message. One or two sentences of fact.' },
+        },
+        output: {
+          schema: { type: 'string' },
+          render: (_a: unknown, v: string) => [{ type: 'text', text: v }],
+        },
+        async execute(args: { to?: unknown; message?: unknown }): Promise<string> {
+          const to = String(args.to || '').trim()
+          const text = String(args.message || '')
+          if (!to || !text.trim()) return 'No recipient or message; nothing sent.'
+          emit({ evt: 'peer_send', name: to, text })
+          return `Message queued to ${to}. Delivery is best-effort; a name not `
+            + `currently running on this host is dropped.`
+        },
+      }))
+      ctx.logger.info('[turma-dsh] send_message tool registered')
+    } catch (e) {
+      ctx.logger.warn(`[turma-dsh] could not register send_message tool: ${e}`)
+    }
+  })()
+
+  // ---- peer messaging: RECEIVE (native Claude peer -> dsh) ------------------
+  // For a Claude peer's native SendMessage to reach this dsh session, the
+  // session must be addressable in Claude Code's OWN session registry: it
+  // resolves a name to a `~/.claude/sessions/<pid>.json` record and posts one
+  // LDJSON line to that record's messagingSocketPath (XERK-476). A dsh process
+  // is not in that registry, so this DRIVER registers a record under its OWN
+  // live pid and binds the inbox socket — the pid must be a live process the
+  // registry's liveness/peercred checks accept, which the single-pid hub cannot
+  // masquerade as per-session, so the driver holds it while the hub still owns
+  // resolution, policy and delivery. Received messages are forwarded as
+  // `peer_inbound`; the hub applies crossSessionInbound policy before injecting.
+  //
+  // This depends on Claude Code's PRIVATE, versioned peer-record format (no CI;
+  // may drift across Claude releases) — host-verified, not unit-tested.
+  let cleanupPeerInbox: () => void = () => { /* not set up */ }
+  if (rcName && claudeSessionsDir) {
+    try {
+      cleanupPeerInbox = setupPeerInbox()
+    } catch (e) {
+      ctx.logger.warn(`[turma-dsh] peer inbox setup failed (Claude peers cannot `
+        + `reach this dsh session by name): ${e}`)
+    }
+  }
+
+  function setupPeerInbox(): () => void {
+    // Claude Code binds inbox sockets under a `cc-socks` dir (see the record's
+    // messagingSocketPath) and validates the path shape `cc-socks*/<pid>.sock`;
+    // match the dir it uses in this environment.
+    const ccDir = env.XDG_RUNTIME_DIR
+      ? path.join(env.XDG_RUNTIME_DIR, 'cc-socks') : '/tmp/cc-socks'
+    const inboxSock = path.join(ccDir, `${process.pid}.sock`)
+    const recordPath = path.join(claudeSessionsDir, `${process.pid}.json`)
+    fs.mkdirSync(ccDir, { recursive: true })
+    fs.mkdirSync(claudeSessionsDir, { recursive: true })
+    try { fs.unlinkSync(inboxSock) } catch { /* no stale socket */ }
+
+    const inbox = net.createServer((sock) => {
+      let buf = ''
+      sock.on('data', (d) => {
+        buf += d.toString('utf8')
+        const nl = buf.indexOf('\n')
+        if (nl < 0) {
+          if (buf.length > LINE_MAX_BYTES) { try { sock.destroy() } catch { /* */ } }
+          return
+        }
+        const line = buf.slice(0, nl).trim()
+        buf = buf.slice(nl + 1)
+        try { sock.end() } catch { /* */ }
+        if (!line) return
+        let msg: any
+        try { msg = JSON.parse(line) } catch { return }
+        if (!msg || typeof msg !== 'object') return
+        // Drop a message for a different conversation — the wire session_id
+        // names who it is FOR, and a socket at a recycled pid could otherwise
+        // deliver a stray. This is the receiver half of what _post_to_inbox's
+        // session_id carries.
+        if (msg.session_id && msg.session_id !== sessionId) return
+        const text = typeof msg.message?.content === 'string' ? msg.message.content
+          : (typeof msg.message === 'string' ? msg.message : '')
+        if (!text.trim()) return
+        emit({ evt: 'peer_inbound', from: String(msg.from || 'a peer'), text })
+      })
+      sock.on('error', () => { /* dropped */ })
+    })
+    inbox.on('error', (e) => ctx.logger.warn(`[turma-dsh] peer inbox error: ${e}`))
+    inbox.listen(inboxSock, () => {
+      try { fs.chmodSync(inboxSock, 0o600) } catch { /* best effort */ }
+      writePeerRecord(inboxSock, recordPath)
+      ctx.logger.info(`[turma-dsh] peer inbox bound for '${rcName}' at ${inboxSock}`)
+    })
+    return () => {
+      try { inbox.close() } catch { /* */ }
+      try { fs.unlinkSync(inboxSock) } catch { /* */ }
+      try { fs.unlinkSync(recordPath) } catch { /* */ }
+    }
+  }
+
+  // Write the forged Claude-Code session-registry record for this dsh session so
+  // a Claude peer's SendMessage resolves its `name` to our inbox socket. The
+  // shape mirrors a live Claude record; version/peerFeatures are copied from a
+  // real peer record when one exists (Claude may check peer-protocol compat).
+  function writePeerRecord(inboxSock: string, recordPath: string): void {
+    let version = '2.1.0'
+    let peerFeatures: unknown = ['notify_idle']
+    try {
+      for (const f of fs.readdirSync(claudeSessionsDir)) {
+        if (!f.endsWith('.json')) continue
+        const r = JSON.parse(fs.readFileSync(path.join(claudeSessionsDir, f), 'utf8'))
+        if (r && r.peerProtocol === 1 && typeof r.version === 'string') {
+          version = r.version
+          if (Array.isArray(r.peerFeatures)) peerFeatures = r.peerFeatures
+          break
+        }
+      }
+    } catch { /* fall back to defaults */ }
+    let procStart = '0'
+    try {
+      // field 22 (starttime) of /proc/self/stat, after the ')' that closes comm.
+      const stat = fs.readFileSync('/proc/self/stat', 'utf8')
+      procStart = stat.slice(stat.lastIndexOf(') ') + 2).split(' ')[19] || '0'
+    } catch { /* not Linux / no procfs */ }
+    let pidDomain = `linux::pid:[0]`
+    try { pidDomain = 'linux::' + fs.readlinkSync('/proc/self/ns/pid') } catch { /* */ }
+    const now = Date.now()
+    const record = {
+      pid: process.pid, sessionId, cwd, startedAt: now,
+      procStart, version, peerProtocol: 1, peerFeatures,
+      kind: 'interactive', entrypoint: 'cli', pidDomain,
+      messagingSocketPath: inboxSock, name: rcName, nameSince: now,
+      updatedAt: now, status: 'idle', statusUpdatedAt: now,
+    }
+    try {
+      const tmp = `${recordPath}.tmp.${process.pid}`
+      fs.writeFileSync(tmp, JSON.stringify(record))
+      fs.renameSync(tmp, recordPath)
+    } catch (e) {
+      ctx.logger.warn(`[turma-dsh] could not write peer record: ${e}`)
+    }
+  }
 
   // ---- HITL: bridge dsh's register-as-answerer model to the socket ---------
   // A pending interaction blocks the dsh answerer on a Promise the hub resolves
@@ -539,6 +727,7 @@ export function apply(ctx: Context, config: Config) {
   ctx.effect(() => () => {
     try { server.close() } catch { /* */ }
     try { fs.unlinkSync(socketPath) } catch { /* */ }
+    try { cleanupPeerInbox() } catch { /* */ }   // drop the forged inbox record + socket
     for (const [rid, resolve] of pending) { emit({ evt: 'interaction_end', requestId: rid }); resolve(null) }
     pending.clear()
   }, 'turma-dsh.cleanup')
