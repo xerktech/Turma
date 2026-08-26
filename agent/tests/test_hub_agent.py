@@ -3860,8 +3860,17 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
 
     def test_dsh_state_records_working_signal(self):
         sm, sess, ctl = self._dsh_session()
-        sm._on_dsh_state("dsh1", {"evt": "state", "status": "running"})
-        self.assertEqual(sm.dsh_status["dsh1"], "running")
+        sm._on_dsh_state("dsh1", {"evt": "state", "status": "running",
+                                  "eventCount": 2})
+        # The reader must store the PARSED snapshot (a dict), never the bare
+        # status string: dsh_pane_busy is dict-only, so a string read back as
+        # paneBusy=None and the [D] liveness signal never reached the wire —
+        # a real dsh session mid-turn read idle. Assert through the real
+        # consumer so the string form cannot slip back in.
+        self.assertEqual(sm.dsh_status["dsh1"],
+                         {"status": "running", "eventCount": 2,
+                          "pendingInteraction": False})
+        self.assertTrue(ha.dsh_pane_busy(sm.dsh_status["dsh1"]))
 
     # --- cross-session peer messaging (XERK-476) -------------------------
 

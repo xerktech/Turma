@@ -16014,15 +16014,14 @@ class SessionManager:
 
     def _on_dsh_state(self, sid, payload):
         """Reader-thread callback for {evt:"state"}: a dsh agent turn/status edge.
-        Recorded as the dsh session's live "working" signal for [D] (XERK-468) to
-        surface; [C] does not itself wire the six "Working" mirrors. Absent = the
-        session hasn't reported, which reads as not-working, matching an idle pane."""
-        try:
-            status = payload.get("status")
-            if status in ("running", "idle"):
-                self.dsh_status[sid] = status
-        except Exception:
-            pass
+        Folds through `_ingest_dsh_event` — the canonical [D] (XERK-468) seam —
+        which parses the payload into the {status, eventCount, pendingInteraction}
+        SNAPSHOT that `dsh_pane_busy` maps to paneBusy. Storing the bare status
+        STRING here instead left `dsh_pane_busy` (dict-only) returning None for
+        every real dsh session, so the [D] liveness signal never reached the wire
+        and a mid-turn dsh session read idle. [C] does not itself wire the six
+        "Working" mirrors; absent = not reported, which reads as an idle pane."""
+        self._ingest_dsh_event(sid, payload)
 
     # --- dsh cross-session peer messaging (XERK-476) -----------------------
     #

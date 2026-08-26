@@ -80,11 +80,17 @@ dsh gates tool calls **inside the agent process**, not with an external hook. Th
   ungated set includes **`cordis_run`** and **`ralph`** (arbitrary code / autonomous loops, from
   `@deepseek-ai/dsh-tool-cordis` / `-tool-ralph`) plus `glob`/`grep`/`web_fetch`/`web_search`. A
   code-exec tool's own nested tool calls re-enter the pipeline and ARE re-gated, but direct
-  fs/network from inside it is **dsh's sandbox's job, not this guard's** — which is why
+  fs access from inside it is **dsh's sandbox's job, not this guard's** — which is why
   `build_dsh_guard_config` pins `sandboxMode: workspace-write` + `approvalPolicy: ask`. This is the
   dsh analogue of Claude's "Bash is not covered by fileguard" caveat, and it is the reason those
   pins are load-bearing: **`_launch_dsh` MUST set them on every launch** (dsh enforces the sandbox;
   the launcher only supplies the value) — a standing invariant, exercised by XERK-479's real-dsh QA.
+  - **`workspace-write` gates the FILESYSTEM only, NOT network egress** (verified on real dsh under
+    XERK-479: landlock blocks a HOME/system write — "file access denied under workspace-write mode" —
+    but a `curl` from inside a code-exec tool reaches the network with no prompt). So `web_fetch` /
+    outbound requests are NOT sandbox-contained; that is deliberate parity with Claude's own Bash
+    (whose egress is likewise ungated), not a hole this pin closes. An SSRF-sensitive deployment
+    needs a network policy dsh does not express here — do not describe the sandbox as an egress guard.
 - **`pwsh` routes to the bash-syntax classifier.** A PowerShell tool call goes to `guard.py` as a
   `Bash` tool, but `guard.py` matches bash-oriented destructive patterns, so `Remove-Item -Recurse
   -Force /` would likely not match. Low risk (Linux agent image; pwsh is niche) and still ahead of
