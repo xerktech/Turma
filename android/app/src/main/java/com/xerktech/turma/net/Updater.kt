@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import androidx.core.content.FileProvider
 import com.xerktech.turma.core.AvailableUpdate
 import com.xerktech.turma.core.ReleaseAssetView
@@ -80,7 +81,15 @@ class Updater(
     private var dismissedVersion: String? = null
 
     @Volatile private var checking = false
-    @Volatile private var lastCheckAt = 0L
+
+    // Wall-clock of the last check that actually PROCEEDED (0 = never). Set only
+    // once check() is past its guards, so a test can tell a real check apart
+    // from the XERK-281 no-op — a check that merely ran and failed still leaves
+    // state Hidden, so state alone cannot.
+    @get:VisibleForTesting
+    @Volatile
+    internal var lastCheckAt = 0L
+        private set
 
     /**
      * Check for an update. Throttled to [CHECK_THROTTLE_MS] so it's cheap to call
@@ -89,6 +98,14 @@ class Updater(
      * into an error nag — leaving the state Hidden and logging.
      */
     fun check(force: Boolean = false) {
+        // Test seam (XERK-281): the Robolectric harness builds a fresh
+        // Application per test METHOD, so the ~15-min throttle never applies and
+        // TurmaApplication.onCreate's fire-and-forget check hits live GitHub on
+        // every one — ~33 anonymous api.github.com calls per suite run against a
+        // shared-IP CI runner. android/app/build.gradle.kts's testOptions sets
+        // this property so the whole test JVM stays quiet; nothing in production
+        // sets it. Mirrors the recordCoercion seam XERK-262 added hub-side.
+        if (System.getProperty(DISABLE_PROPERTY) == "true") return
         val now = System.currentTimeMillis()
         if (!force && (checking || now - lastCheckAt < CHECK_THROTTLE_MS)) return
         checking = true
@@ -263,5 +280,8 @@ class Updater(
         private const val REPO = "xerktech/turma"
         private const val RELEASES_PAGE = 20
         private const val CHECK_THROTTLE_MS = 15 * 60 * 1000L // 15 min
+
+        /** System property (XERK-281) that no-ops [check]; set only by the test harness. */
+        const val DISABLE_PROPERTY = "turma.updater.disabled"
     }
 }
