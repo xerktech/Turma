@@ -44,6 +44,9 @@ interface Context {
     userQuestions?: UserQuestionService;
     approval?: ApprovalService;
     systemPrompt?: SystemPromptService;
+    tools?: {
+        register(definition: unknown): () => void;
+    };
     get(name: string): any;
     on(name: string, listener: (...args: any[]) => any, options?: boolean | {
         global?: boolean;

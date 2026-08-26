@@ -3768,6 +3768,124 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
         sm._on_dsh_state("dsh1", {"evt": "state", "status": "running"})
         self.assertEqual(sm.dsh_status["dsh1"], "running")
 
+    # --- cross-session peer messaging (XERK-476) -------------------------
+
+    def _peer_pair(self, target_type="dsh"):
+        """A src dsh session and a target session (dsh or claude) on one host."""
+        sm = self.make_manager()
+        src = {"id": "src", "status": "running", "agentType": "dsh",
+               "rcName": "host-Repo-SRC", "summary": "named", "summaryAttempts": 1,
+               "worktreePath": os.path.join(self.tmp, "src")}
+        tgt = {"id": "tgt", "status": "running", "agentType": target_type,
+               "rcName": "host-Repo-TGT", "claudeSessionId": "cs-tgt",
+               "summary": "named", "summaryAttempts": 1,
+               "worktreePath": os.path.join(self.tmp, "tgt")}
+        sm.registry = [src, tgt]
+        src_ctl = _FakeDshControl(); sm.dsh_controls["src"] = src_ctl
+        tgt_ctl = None
+        if target_type == "dsh":
+            tgt_ctl = _FakeDshControl(); sm.dsh_controls["tgt"] = tgt_ctl
+        return sm, src_ctl, tgt_ctl
+
+    def test_peer_send_to_dsh_target_frames_and_names_sender(self):
+        sm, src_ctl, tgt_ctl = self._peer_pair("dsh")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._on_dsh_peer_send("src", {"name": "host-Repo-TGT", "text": "check foo.py"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(len(tgt_ctl.inputs), 1)
+        text, kind = tgt_ctl.inputs[0]
+        self.assertEqual(kind, "peer")
+        self.assertIn("host-Repo-SRC", text)     # the message names its sender
+        self.assertIn("check foo.py", text)
+        self.assertEqual(src_ctl.inputs, [])      # never echoed back to the sender
+
+    def test_peer_send_to_claude_target_posts_as_native_peer(self):
+        sm, src_ctl, _ = self._peer_pair("claude")
+        posts = []
+
+        def fake_post(sp, pid, cs, text, sender=ha.INBOX_SENDER):
+            posts.append((cs, text, sender))
+            return True
+
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
+             mock.patch.object(ha, "_session_inbox", lambda cs: ("/s.sock", 42, cs)), \
+             mock.patch.object(ha, "_post_to_inbox", fake_post):
+            sm._on_dsh_peer_send("src", {"name": "host-Repo-TGT", "text": "hi peer"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(len(posts), 1)
+        cs, text, sender = posts[0]
+        self.assertEqual(cs, "cs-tgt")
+        # `from` is the dsh session's own name (a native peer), NOT turma, and the
+        # body carries no INBOX_PREFIX — it reads as a real peer message.
+        self.assertEqual(sender, "host-Repo-SRC")
+        self.assertEqual(text, "hi peer")
+        self.assertFalse(text.startswith(ha.INBOX_PREFIX))
+
+    def test_peer_send_unknown_name_is_dropped(self):
+        sm, src_ctl, tgt_ctl = self._peer_pair("dsh")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._on_dsh_peer_send("src", {"name": "host-Repo-NOBODY", "text": "hi"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(tgt_ctl.inputs, [])
+
+    def test_peer_send_to_own_name_is_not_echoed(self):
+        # A session addressing its OWN rcName must not deliver to itself — the
+        # `id != src_sid` guard drops it (rcNames are unique per _unique_rc_name,
+        # so this is defence, not the common case).
+        sm, src_ctl, _ = self._peer_pair("dsh")
+        src = sm._find("src")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._on_dsh_peer_send("src", {"name": src["rcName"], "text": "to myself"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(src_ctl.inputs, [])
+
+    def test_peer_send_ambiguous_name_is_dropped(self):
+        # Two running sessions sharing an rcName make the name unaddressable
+        # (SendMessage refuses an ambiguous name too) — drop rather than guess.
+        sm, src_ctl, tgt_ctl = self._peer_pair("dsh")
+        dup = {"id": "tgt2", "status": "running", "agentType": "dsh",
+               "rcName": "host-Repo-TGT", "summary": "named", "summaryAttempts": 1,
+               "worktreePath": os.path.join(self.tmp, "tgt2")}
+        sm.registry.append(dup)
+        dup_ctl = _FakeDshControl(); sm.dsh_controls["tgt2"] = dup_ctl
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._on_dsh_peer_send("src", {"name": "host-Repo-TGT", "text": "which one?"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(tgt_ctl.inputs, [])
+        self.assertEqual(dup_ctl.inputs, [])
+
+    def test_peer_send_to_opted_out_target_is_dropped(self):
+        sm, src_ctl, tgt_ctl = self._peer_pair("dsh")
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: True):
+            sm._on_dsh_peer_send("src", {"name": "host-Repo-TGT", "text": "hi"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(tgt_ctl.inputs, [])
+
+    def test_peer_inbound_injects_peer_framed(self):
+        sm, sess, ctl = self._dsh_session()
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: False):
+            sm._on_dsh_peer_inbound("dsh1", {"from": "host-Repo-A", "text": "heads up"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(len(ctl.inputs), 1)
+        text, kind = ctl.inputs[0]
+        self.assertEqual(kind, "peer")
+        self.assertIn("host-Repo-A", text)
+        self.assertIn("heads up", text)
+
+    def test_peer_inbound_honours_crossSessionInbound_opt_out(self):
+        sm, sess, ctl = self._dsh_session()
+        with mock.patch.object(ha, "_inbox_opted_out", lambda wt: True):
+            sm._on_dsh_peer_inbound("dsh1", {"from": "x", "text": "hi"})
+            sm._drain_dsh_peer_traffic()
+        self.assertEqual(ctl.inputs, [])
+
+    def test_staged_peer_traffic_dropped_on_teardown(self):
+        sm, sess, ctl = self._dsh_session()
+        sm._on_dsh_peer_send("dsh1", {"name": "someone", "text": "hi"})
+        self.assertTrue(sm.dsh_peer_traffic)
+        sm._forget_session_caches("dsh1")
+        self.assertEqual(sm.dsh_peer_traffic, [])
+
 
 class TestDshPrAttribution(ManagerMixin, unittest.TestCase):
     """XERK-472 [dsh][H]: a dsh session that opens a PR gets the SAME chips,

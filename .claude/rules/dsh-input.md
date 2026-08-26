@@ -34,9 +34,49 @@ file is the [C] layer over that seam; the runtime-selection field and capability
 hub→plugin (each acked `{ok:true|false,error?}`): `input{source:{kind:user|peer|machine},text}`,
 `answer{requestId,optionIndex?|optionIndices?|text?}`, `state{}`, `kill{}`.
 plugin→hub events: `state{status,eventCount}`, `interaction{requestId,kind,prompt,options,detail?}`,
-and `interaction_end{requestId}` (an interaction dsh aborted internally — clears the rendezvous file).
-**Answer indices are 0-based positions into the emitted `options[]`** (same as `answer_question`);
-the PLUGIN maps them to dsh's native answer — a question option LABEL, or an approval OUTCOME.
+`interaction_end{requestId}` (an interaction dsh aborted internally — clears the rendezvous file),
+and the two peer-messaging events (XERK-476) `peer_send{name,text}` (the session's `send_message`
+tool wants to reach a roster name) and `peer_inbound{from,text}` (a native Claude-peer SendMessage
+arrived at the forged inbox socket). **Answer indices are 0-based positions into the emitted
+`options[]`** (same as `answer_question`); the PLUGIN maps them to dsh's native answer — a question
+option LABEL, or an approval OUTCOME.
+
+## Cross-session peer messaging (XERK-476)
+
+Match XERK-348 for dsh: the org-scoped roster and its messaging. The ROSTER half is
+runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list any running session,
+`_launch_dsh` appends `PEERS_SYSTEM_PROMPT` (+ `DSH_PEERS_ADDENDUM`, since dsh's send tool is
+`send_message` and it has no `ListAgents`), and `build_dsh_guard_config` grants the read of
+`~/.turma/peers.tsv`. What [L] adds is the MESSAGING, hub-routed both ways:
+
+- **SEND (dsh → peer).** The driver registers a `send_message` tool (`ctx.tools.register(defineTool
+  {name:'send_message', to, message})`, dynamic-imported like the sandbox policy) that emits
+  `peer_send`. `_on_dsh_peer_send` STAGES it; `_drain_dsh_peer_traffic` (on the beat, never the
+  reader thread — a callback may not do a socket write to another session) resolves the name against
+  THIS host's running sessions and delivers peer-framed: a Claude target via `_post_to_inbox` with
+  the dsh session's own `rcName` as `from` and NO `INBOX_PREFIX` (indistinguishable from a native
+  SendMessage — it is the same inbox socket), a dsh target via `ctl.input(kind="peer")`. Same-host
+  only, which is same-org by construction and matches Claude's own per-machine (`isolatePeerMachines`)
+  delivery; an unknown/ambiguous/cross-host name is dropped best-effort, as Claude's is.
+- **RECEIVE (native Claude peer → dsh).** Claude's SendMessage only delivers to a socket its OWN
+  registry lists by name (`~/.claude/sessions/<pid>.json` → `messagingSocketPath`). A dsh process is
+  not there, so the DRIVER forges that record under its OWN live pid and binds `cc-socks/<pid>.sock`
+  (the pid must be a live process the registry's liveness/peercred checks accept — the single-pid
+  hub cannot masquerade as N sessions, which is why the driver holds it while the hub still owns
+  resolution, policy and delivery). Inbound is verified against the wire `session_id`, forwarded as
+  `peer_inbound`, and `_deliver_dsh_peer_inbound` applies `crossSessionInbound` opt-out before
+  `ctl.input(kind="peer")`.
+- **This depends on Claude Code's PRIVATE, versioned peer-record format** (`peerProtocol`,
+  `procStart`/`pidDomain` liveness) — no CI, host-verified only, and it may drift across Claude
+  releases. The SEND path and the roster have no such dependency. A hard-killed dsh session may leave
+  a stale forged record until Claude Code's own registry reaper drops it (harmless — the socket the
+  hub's `cc-socks` sweep reaps once the pid is dead, and the stale record is undeliverable).
+- Tests: `test_dsh_session.py` (`peer_send`/`peer_inbound` dispatch), `TestDshRouting` in
+  `test_hub_agent.py` (send resolution to a Claude vs dsh target, `from`/framing, opt-out, unknown
+  name, inbound inject, teardown drops staged). The SEND path and roster are fully unit-covered; the
+  RECEIVE path's native Claude delivery is HOST-PROOF only (a real dsh session exchanging messages
+  with a Claude peer) because it rides Claude Code's private record format — and note this sandbox's
+  own guard blocks forging a session record, so that leg is verified on a real host, not in CI.
 
 ## Reconciliations (why the Claude mechanics do NOT copy)
 
@@ -67,6 +107,12 @@ the PLUGIN maps them to dsh's native answer — a question option LABEL, or an a
 - **The control socket path must stay short (< ~108 bytes, `sun_path`).** `~/.turma/dsh/<uuid>.sock`
   (~58) is fine; a long base path silently truncates bind/connect and the driver "cannot connect"
   while the socket file exists. Never move the socket under a deep path.
+- **The forged peer inbox socket MUST be `cc-socks*/<pid>.sock` under the driver's OWN pid**
+  (XERK-476). Claude Code validates that path shape before connecting (`_canonical_inbox_path`
+  mirrors it) and re-checks the listener's `SO_PEERCRED` against the record's pid, so the record's
+  `pid`, the socket-holder, and the `<pid>.sock` name must all be the dsh node process. A record
+  written under any other pid, or a socket at a non-`cc-socks` path, is refused and the dsh session
+  is unreachable by a Claude peer while the file sits there looking fine.
 - **`inject` must include `agentLoop`.** `@deepseek-ai/dsh-agent-loop` registers the agent factory
   (`agents.setFactory`); without injecting it the driver can load first and `agents.create()` throws
   "no agent factory registered".

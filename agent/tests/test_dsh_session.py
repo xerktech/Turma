@@ -117,11 +117,15 @@ class DshControlTest(unittest.TestCase):
         self.events = []
         self.ends = []
         self.states = []
+        self.peer_sends = []
+        self.peer_inbound = []
         self.ctl = ds.DshControl(
             self.sock,
             on_interaction=self.events.append,
             on_state=self.states.append,
             on_interaction_end=self.ends.append,
+            on_peer_send=self.peer_sends.append,
+            on_peer_inbound=self.peer_inbound.append,
             log=lambda m: None)
         self.assertTrue(self.ctl.start(), "control should connect to the plugin")
         # A round-trip guarantees the plugin's accept() has set its connection
@@ -196,6 +200,24 @@ class DshControlTest(unittest.TestCase):
         self.plugin.push({"evt": "interaction_end", "requestId": "q1"})
         self.assertTrue(self._wait(lambda: self.ends))
         self.assertEqual(self.ends[-1]["requestId"], "q1")
+
+    def test_peer_send_event_dispatched(self):
+        # A dsh session's send_message tool emits peer_send; it must reach the
+        # on_peer_send callback, not be mistaken for an ack (XERK-476).
+        self.plugin.push({"evt": "peer_send", "name": "k8x-Repo-XERK-1",
+                          "text": "check foo.py"})
+        self.assertTrue(self._wait(lambda: self.peer_sends))
+        self.assertEqual(self.peer_sends[-1]["name"], "k8x-Repo-XERK-1")
+        self.assertEqual(self.peer_sends[-1]["text"], "check foo.py")
+        self.assertEqual(self.peer_inbound, [])
+
+    def test_peer_inbound_event_dispatched(self):
+        self.plugin.push({"evt": "peer_inbound", "from": "k8x-Repo-XERK-2",
+                          "text": "heads up"})
+        self.assertTrue(self._wait(lambda: self.peer_inbound))
+        self.assertEqual(self.peer_inbound[-1]["from"], "k8x-Repo-XERK-2")
+        self.assertEqual(self.peer_inbound[-1]["text"], "heads up")
+        self.assertEqual(self.peer_sends, [])
 
     def test_no_ack_returns_false_and_never_raises(self):
         self.plugin.ack = False

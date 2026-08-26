@@ -379,6 +379,23 @@ is captured and projected into the Claude `subagents/` + `workflows/` layout.
 delegation files. Verified by unit test through hub-agent's real readers, not against real dsh (as
 [D]/[E]); the `ctx.on('subagent/start', {global:true})` scope is the one thing live dsh must confirm.
 
+## [L] (XERK-476) shipped: peer roster + cross-session messaging for dsh
+
+XERK-348 matched for dsh. The ROSTER was already runtime-independent (`_peer_rows`/
+`_write_peers_file` list any running session; `_launch_dsh` appends `PEERS_SYSTEM_PROMPT`;
+`build_dsh_guard_config` grants the `peers.tsv` read). [L] adds the MESSAGING, HUB-ROUTED both ways
+so the Claude-inbox protocol and the crossSessionInbound policy stay in ONE Python home:
+
+- **SEND**: a driver `send_message` tool emits `peer_send`; the hub resolves the roster name against
+  this host's running sessions and delivers peer-framed (Claude target via `_post_to_inbox` with the
+  dsh session's own name as `from`; dsh target via `ctl.input(kind="peer")`).
+- **RECEIVE**: the driver forges a `~/.claude/sessions/<pid>.json` record + `cc-socks/<pid>.sock`
+  under its own live pid so a Claude peer's native SendMessage lands, forwarding it as `peer_inbound`
+  for the hub to policy-check and inject. This is the ONE piece that depends on Claude Code's private,
+  versioned peer-record format — host-verified, not CI.
+- Both events STAGE on the reader thread and DELIVER off the beat on a worker (a callback may not
+  socket-write to another session). Mechanics + pitfalls: `.claude/rules/dsh-input.md`.
+
 ## Open questions flagged to Malcolm (recorded on XERK-462)
 
 1. **Image + resource + retention sizing.** Is growing the agent image with dsh's node/npm tree
