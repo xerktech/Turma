@@ -244,10 +244,16 @@ not undo:
   the [B] design note's "all mirrors branch on agentType" was the rejected alternative — do not
   restore it (it multiplies the very mirror edits S1 exists to avoid).
 - **Everything OTHER than liveness stays transcript-derived**, from the S1 projection: `lastRole`,
-  `lastHasToolUse`, `transcriptAgeSec`, the PR scan and the summary seed all read the projected
-  `<claudeSessionId>.jsonl` with no change. This is what makes `readyForReview`'s finished-turn branch
-  and summaries work identically for a dsh session — the only signal that is not transcript-derived is
-  liveness, exactly as S1's "liveness is deliberately NOT in the projection" note carves out.
+  `lastHasToolUse`, `transcriptAgeSec` and the PR scan all read the projected `<claudeSessionId>.jsonl`
+  with no change. This is what makes `readyForReview`'s finished-turn branch work identically for a
+  dsh session — the only signal that is not transcript-derived is liveness, exactly as S1's "liveness
+  is deliberately NOT in the projection" note carves out.
+- **A dsh session's NAME comes from dsh's OWN auto-generated title, never `claude -p`.** dsh writes
+  the title as a `session/title` event (log-only — not a transcript entry); the projection tail
+  (`dsh_session.py`) captures `data.title`, and hub-agent's `_seed_summaries` names the session from
+  it on the beat. `_start_summary` refuses a `agentType=="dsh"` session, so the spawn / dsh-input
+  paths never spend a Claude summarizer turn on a runtime that has no Claude login. Until dsh derives
+  a title (from the first user turn) the session stays unnamed and is looked at again next beat.
 - **`dsh_pane_busy` is a tri-state and deliberately NOT time-expired.** running→True, idle→False,
   unknown/missing→None ("can't tell", so downstream falls back to transcript freshness exactly like an
   uncapturable Claude pane). A pending interaction reads False (blocked on a human, not its own turn —

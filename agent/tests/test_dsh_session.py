@@ -321,6 +321,40 @@ class DshProjectionTailTest(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["message"]["content"][0]["text"], "from zero")
 
+    def test_captures_dsh_auto_title_from_session_title_event(self):
+        # dsh writes the session's auto-generated title as a `session/title`
+        # event; the tail captures data.title so hub-agent's _seed_summaries can
+        # name the session from dsh's own title. It is log-only (projects to no
+        # transcript entry) — capture is in the tail, not the projection.
+        self._append_event({
+            "type": "session/title", "seq": 1, "time": 1_700_000_000_000,
+            "data": {"title": "Adding Compose Flag", "source": {"kind": "auto"},
+                     "messageSeqs": [1]}})
+        self.tail._pump()
+        self.assertEqual(self.tail.title(), "Adding Compose Flag")
+        self.assertEqual(self._read_transcript(), [],  # log-only, not an entry
+                         "a title is not a transcript entry")
+
+    def test_title_is_None_until_an_event_and_latest_wins(self):
+        self.assertIsNone(self.tail.title())
+        self._append_event({
+            "type": "session/title", "seq": 2, "time": 1_700_000_000_001,
+            "data": {"title": "First", "source": {"kind": "auto"},
+                     "messageSeqs": [1]}})
+        self._append_event({
+            "type": "session/title", "seq": 3, "time": 1_700_000_000_002,
+            "data": {"title": "Second", "source": {"kind": "user"},
+                     "messageSeqs": []}})
+        self.tail._pump()
+        self.assertEqual(self.tail.title(), "Second")  # latest event wins
+
+    def test_blank_or_malformed_title_is_ignored(self):
+        self._append_event({"type": "session/title", "seq": 1,
+                            "time": 1_700_000_000_000, "data": {"title": "   "}})
+        self._append_event({"type": "not-even-a-dict"})
+        self.tail._pump()
+        self.assertIsNone(self.tail.title())
+
 
 class DshDelegationTailTest(unittest.TestCase):
     """XERK-474 [J]: the tail turns a dsh session's delegation events + captured
