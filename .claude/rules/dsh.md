@@ -306,34 +306,17 @@ native log needs no new WRITER.
   code to the beat or the archive functions, only the store-dir contract. Tests: `TestDshArchiveSync`
   (agent), and the existing `TestArchiveSyncWorker` / `TestBeatLoopBudget`.
 
-## [K] (XERK-475) shipped: session migration + resume for dsh
+## [G] (XERK-471) shipped: usage aggregates, attribution ledger, subscription limits
 
-XERK-101 extended to dsh, and it corrected a false premise [B]/[E] carried: that `<sid>/dsh/` was
-dsh's resumable log and migration was `tar.add(<tid>/dsh)`. Verified against real dsh 0.1.1-rc.2:
-`<sid>/dsh/` is the driver's projection FEED; dsh resumes from its own `session-persistence-jsonl`
-store, a distinct file. So [K] is the STORE plus the resume the driver never wired.
-
-- **dsh's durable store is `$DSH_HOME/sessions/<projectKey(cwd)>/<sid>/session.jsonl`**
-  (`DSH_SESSIONS_ROOT`, `_dsh_store_dir`). `agents.create` on an already-persisted id THROWS
-  ("load/resume it instead"); the driver honors `TURMA_DSH_RESUME` → `ctx.agents.resume(
-  {resumeSessionId})` (falling back to create only if no store exists). This also fixes host-local
-  dsh resume, which [B] left as design-of-record — the driver had always called `create`.
-- **Migration carries the STORE, not the feed.** `export_session` packs `_dsh_store_dir` under the
-  reserved `.dsh-store/` tar prefix; `import_session` unpacks it to THIS host's key and re-points its
-  header `cwd` to the localized worktree (`_reconcile_dsh_store_cwd`) — dsh refuses a store whose
-  on-disk path disagrees with its header cwd, so a cross-mount move MUST re-key. The `<sid>/dsh/`
-  feed is deliberately NOT migrated: the resumed dsh does not replay history (verified — "constructor
-  seeds do not emit"), so the target rebuilds the feed from new events alone, and the projection tail
-  starts at the kept log's EOF (`resume=True`) so it never re-projects/doubles the transcript.
-- **The store is PLAINTEXT.** `_dsh_cordis_patch` overrides the base profile's persistence to
-  `compression: none` (re-stating `root` as DSH_SESSIONS_ROOT, since a patch REPLACES config) so the
-  header cwd is edited in place — Python has no stdlib zstd. A patch entry can't merge, so the whole
-  config is re-stated. New fleet: no pre-existing zstd stores to convert.
-- **`_dsh_project_key` ports dsh's `projectKey(cwd)` byte-for-byte** — golden-tested against a real
-  store dir name, because the corruption guard compares the store's path to `logPath(root,
-  header.cwd, id)`. Tests: `TestDshProjectKey`, `TestDshCordisPatchPersistence`, the dsh cases in
-  `TestMigrateSession`, `DshProjectionTailTest` resume cases. Verified end to end by QA driving a
-  real cross-host move.
+D4's usage obligation made concrete — a dsh session's spend charts on the Usage page and the
+dashboard token tiles IDENTICALLY to a Claude session, with no schema change and no `agentType`
+branch in the aggregation, because [S1]'s projection already writes `message.usage`/`message.model`
+in the shape the ledger reads. The full contract (why token aggregates + the attribution ledger cost
+dsh nothing, why local/DeepSeek ids appear in the per-model breakdown and may dominate, why the
+native log is never double-counted, and why the subscription `limits`/probe stay Claude-only) lives
+in **`.claude/rules/agent-usage.md`** ("dsh sessions ride this half unchanged"), whose `paths:` now
+loads for the dsh modules. The one code change was hardening `_map_usage` to drop an all-zero block.
+Tests: `TestDshUsageReportEndToEnd`, `TestDshProjectionAccounting` in `test_dsh_transcript.py`.
 
 ## [H] (XERK-472) shipped: PR/MR chips, ledgers & attribution for dsh sessions
 
@@ -405,6 +388,35 @@ is captured and projected into the Claude `subagents/` + `workflows/` layout.
 + capture, and the residual gaps) are in `.claude/rules/dsh-delegation.md`**, scoped to the
 delegation files. Verified by unit test through hub-agent's real readers, not against real dsh (as
 [D]/[E]); the `ctx.on('subagent/start', {global:true})` scope is the one thing live dsh must confirm.
+
+## [K] (XERK-475) shipped: session migration + resume for dsh
+
+XERK-101 extended to dsh, and it corrected a false premise [B]/[E] carried: that `<sid>/dsh/` was
+dsh's resumable log and migration was `tar.add(<tid>/dsh)`. Verified against real dsh 0.1.1-rc.2:
+`<sid>/dsh/` is the driver's projection FEED; dsh resumes from its own `session-persistence-jsonl`
+store, a distinct file. So [K] is the STORE plus the resume the driver never wired.
+
+- **dsh's durable store is `$DSH_HOME/sessions/<projectKey(cwd)>/<sid>/session.jsonl`**
+  (`DSH_SESSIONS_ROOT`, `_dsh_store_dir`). `agents.create` on an already-persisted id THROWS
+  ("load/resume it instead"); the driver honors `TURMA_DSH_RESUME` → `ctx.agents.resume(
+  {resumeSessionId})` (falling back to create only if no store exists). This also fixes host-local
+  dsh resume, which [B] left as design-of-record — the driver had always called `create`.
+- **Migration carries the STORE, not the feed.** `export_session` packs `_dsh_store_dir` under the
+  reserved `.dsh-store/` tar prefix; `import_session` unpacks it to THIS host's key and re-points its
+  header `cwd` to the localized worktree (`_reconcile_dsh_store_cwd`) — dsh refuses a store whose
+  on-disk path disagrees with its header cwd, so a cross-mount move MUST re-key. The `<sid>/dsh/`
+  feed is deliberately NOT migrated: the resumed dsh does not replay history (verified — "constructor
+  seeds do not emit"), so the target rebuilds the feed from new events alone, and the projection tail
+  starts at the kept log's EOF (`resume=True`) so it never re-projects/doubles the transcript.
+- **The store is PLAINTEXT.** `_dsh_cordis_patch` overrides the base profile's persistence to
+  `compression: none` (re-stating `root` as DSH_SESSIONS_ROOT, since a patch REPLACES config) so the
+  header cwd is edited in place — Python has no stdlib zstd. A patch entry can't merge, so the whole
+  config is re-stated. New fleet: no pre-existing zstd stores to convert.
+- **`_dsh_project_key` ports dsh's `projectKey(cwd)` byte-for-byte** — golden-tested against a real
+  store dir name, because the corruption guard compares the store's path to `logPath(root,
+  header.cwd, id)`. Tests: `TestDshProjectKey`, `TestDshCordisPatchPersistence`, the dsh cases in
+  `TestMigrateSession`, `DshProjectionTailTest` resume cases. Verified end to end by QA driving a
+  real cross-host move.
 
 ## [L] (XERK-476) shipped: peer roster + cross-session messaging for dsh
 

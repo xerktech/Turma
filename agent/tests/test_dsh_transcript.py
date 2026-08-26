@@ -16,8 +16,11 @@ stdlib unittest only — mirrors the image's no-pip runtime, like test_hub_agent
 import importlib.util
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENT_DIR = os.path.dirname(HERE)
@@ -206,6 +209,94 @@ class TestDshProjectionEdgeCases(unittest.TestCase):
         ev = {"type": "user/message", "seq": 1, "time": 0,
               "data": {"role": "user", "source": {"kind": "user"}, "content": []}}
         self.assertEqual(proj.feed(ev), [])
+
+    def test_all_zero_usage_projects_no_usage_key(self):
+        """A usage block that is PRESENT but all-zero (a local endpoint that
+        reports no counts) must project no `usage` key — else it plants a
+        phantom zero-token model in the usage page's per-model table, the defect
+        the `<synthetic>` guard removes for Claude ([G0]/XERK-471)."""
+        proj = dt.DshProjector(SID)
+        ev = {"type": "assistant/message", "seq": 1, "time": 0, "data": {
+            "turn": 1, "step": 1,
+            "usage": {"inputTokens": 0, "outputTokens": 0,
+                      "cacheReadTokens": 0, "cacheWriteTokens": 0},
+            "message": {
+                "id": "m", "role": "assistant",
+                "source": {"kind": "model", "model": "qwen2.5-coder"},
+                "content": [{"type": "text", "text": "hi"}]}}}
+        entry = proj.feed(ev)[0]
+        self.assertNotIn("usage", entry["message"])
+
+
+class TestDshUsageReportEndToEnd(unittest.TestCase):
+    """[G] (XERK-471): a dsh session's spend charts on the Usage page IDENTICALLY
+    to a Claude session, because the projection writes the same `message.usage` /
+    `message.model` shape the aggregation reads — no schema change (D4). This
+    proves the whole chain one layer above _accumulate_usage: a projected dsh
+    transcript on disk, named by the pinned session id like any conversation,
+    folds through repo_usage_report into the host + per-repo totals AND the
+    per-model breakdown, with LOCAL/DeepSeek model ids appearing beside Claude's
+    rather than being filtered as synthetic (they may dominate — [G0] D5)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dsh-usage-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "PROJECTS_ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _assistant(self, seq, model, inp, out, cw=0, cr=0):
+        return {"type": "assistant/message", "seq": seq, "time": 1_750_000_000_000, "data": {
+            "turn": 1, "step": seq,
+            "usage": {"inputTokens": inp, "outputTokens": out,
+                      "cacheReadTokens": cr, "cacheWriteTokens": cw},
+            "message": {"id": f"m{seq}", "role": "assistant",
+                        "source": {"kind": "model", "model": model},
+                        "content": [{"type": "text", "text": "ok"}]}}}
+
+    def _write_projection(self, worktree, events):
+        slug = ha._project_slug(worktree)
+        d = os.path.join(self.tmp, slug)
+        os.makedirs(d, exist_ok=True)
+        # Named by the pinned conversation id, exactly as _launch_dsh writes it.
+        lines = dt.project_log_lines(events, session_id=SID, cwd=worktree)
+        with open(os.path.join(d, f"{SID}.jsonl"), "w") as f:
+            f.writelines(lines)
+        return slug
+
+    def _fold_full(self, slug):
+        acc = ha._UsageAcc()
+        ha._aggregate_project(os.path.join(self.tmp, slug), acc)
+        return acc
+
+    def test_dsh_spend_and_local_models_flow_into_the_report(self):
+        worktree = "/repos/.turma/worktrees/Turma/dsh01"
+        # Two turns on a local model, one on the DeepSeek API — both non-Claude.
+        slug = self._write_projection(worktree, [
+            self._assistant(1, "qwen2.5-coder-32b", 1000, 200, cw=50, cr=4000),
+            self._assistant(2, "qwen2.5-coder-32b", 300, 40),
+            self._assistant(3, "deepseek-chat", 500, 90),
+        ])
+        ledger = {worktree: {"repo": "Turma",
+                             "remote": "git@github.com:xerktech/Turma.git",
+                             "slug": slug}}
+        repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
+
+        # The dsh session's spend is a real host block — "charts identically".
+        self.assertIsNotNone(host)
+        self.assertEqual(host["totals"]["input"], 1800)
+        self.assertEqual(host["totals"]["output"], 330)
+        self.assertEqual(host["totals"]["cacheRead"], 4000)
+        self.assertEqual(host["totals"]["cacheWrite"], 50)
+
+        turma = next(r for r in repo_usage if r["repo"] == "Turma")
+        self.assertEqual(turma["usage"]["totals"]["input"], 1800)
+
+        # Local + DeepSeek ids appear in the per-model breakdown, NOT filtered.
+        models = {m["model"]: m for m in host["models"]}
+        self.assertEqual(models["qwen2.5-coder-32b"]["totals"]["input"], 1300)
+        self.assertEqual(models["deepseek-chat"]["totals"]["input"], 500)
+        self.assertNotIn("<synthetic>", models)
 
 
 class TestDshToolNameMapping(unittest.TestCase):
