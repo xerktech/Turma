@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -1770,4 +1770,51 @@ test("entryBlocks: dsh projection renders equal to the Python side (XERK-464)", 
   );
   const got = projected.map((e) => entryBlocks(e, BLOCK_CAPS));
   assert.deepEqual(got, expected);
+});
+
+// --- XERK-474 [dsh][J]: the delegation launch/stop the Python projector
+// synthesizes are STANDARD Claude-Code background-launch shapes, so the JS
+// scanAgentEntry mirror folds them into the live-agent set exactly as the Python
+// _scan_agent_entry does (test_dsh_transcript.py's TestDshSubagentProjection /
+// TestDshWorkflowProjection). These fixtures are the entries that projector emits.
+const CHILD = "a1b2c3d4-0000-1111-2222-333344445555";
+const RUN = "wf_7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+function scan(entries) {
+  const state = {};
+  for (const e of entries) scanAgentEntry(e, state);
+  return liveAgentsReport(state);
+}
+
+test("scanAgentEntry: a synthesized dsh subagent launch registers, its stop retires (XERK-474)", () => {
+  const launch = [
+    { type: "assistant", message: { role: "assistant", content: [
+      { type: "tool_use", id: "dsh-" + CHILD, name: "Agent",
+        input: { subagent_type: "subagent", description: "Investigate the flake" } }] } },
+    { type: "user", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "dsh-" + CHILD,
+        content: "Async agent launched successfully. agentId: " + CHILD }] },
+      toolUseResult: { status: "async_launched", agentId: CHILD,
+        agentType: "subagent", description: "Investigate the flake" } },
+  ];
+  assert.deepEqual(scan(launch),
+    [{ type: "subagent", label: "Investigate the flake" }]);
+  const stop = { type: "user", message: { role: "user", content:
+    "<task-notification><task-id>" + CHILD + "</task-id><status>completed</status></task-notification>" } };
+  assert.deepEqual(scan(launch.concat([stop])), []);
+});
+
+test("scanAgentEntry: a synthesized dsh workflow launch is a workflow row, its stop retires (XERK-474)", () => {
+  const launch = [
+    { type: "assistant", message: { role: "assistant", content: [
+      { type: "tool_use", id: "dsh-" + RUN, name: "Workflow", input: { name: "review" } }] } },
+    { type: "user", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "dsh-" + RUN, content: "Workflow run started. runId: " + RUN }] },
+      toolUseResult: { status: "async_launched", taskType: "local_workflow",
+        workflowName: "review", runId: RUN, taskId: RUN } },
+  ];
+  assert.deepEqual(scan(launch), [{ type: "workflow", label: "review" }]);
+  const stop = { type: "user", message: { role: "user", content:
+    "<task-notification><task-id>" + RUN + "</task-id><status>completed</status></task-notification>" } };
+  assert.deepEqual(scan(launch.concat([stop])), []);
 });

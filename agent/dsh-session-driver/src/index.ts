@@ -39,6 +39,7 @@
 
 import * as net from 'node:net'
 import * as fs from 'node:fs'
+import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 
 // ------------------------------------------------------------- dsh surface
@@ -141,6 +142,17 @@ interface SessionEvent {
   data: unknown
 }
 
+// Observe-only payload of dsh's `subagent/start` / `subagent/end` lifecycle
+// events (ctx-bus, NOT session-log entries — @deepseek-ai/dsh-subagent
+// SubagentRunInfo / SubagentRunEndInfo). `id` is the child agent's SessionId.
+interface SubagentRunInfo {
+  runId: string
+  provider: string
+  id: string
+  local: boolean
+  stopReason?: string
+}
+
 export interface Config {
   provider?: string
   model?: string
@@ -220,6 +232,71 @@ export function apply(ctx: Context, config: Config) {
     } catch (e) {
       ctx.logger.warn(`[turma-dsh] event log write failed: ${e}`)
     }
+  }
+
+  // ---- delegation capture (XERK-474 [J]) -----------------------------------
+  // A dsh session that delegates to sub-agents / workflows must surface the same
+  // picker + per-agent transcripts a Claude session does. The hub-side [S1]
+  // projector builds those Claude-Code shapes from two extra streams this driver
+  // writes: (1) each descendant session's own native log, beside the parent's;
+  // (2) a `turma/subagent-*` forward of dsh's ctx-bus subagent lifecycle events
+  // into the parent log, since those are not session-log entries the tail sees.
+  const childEventsDir = eventsPath ? path.join(path.dirname(eventsPath), 'subagents') : ''
+  // A child SessionId names a file and rides a path on the hub side, so it is
+  // validated to hub-agent's own VALID_WORKFLOW_AGENT_ID_RE grammar before use.
+  const CHILD_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
+  // childId -> its durable label, folded from the child's `subagent/descriptor`
+  // event, so a forwarded launch carries a real name rather than the bare id.
+  const childLabels = new Map<string, string>()
+  // childIds belonging to a WORKFLOW run (seen on a parent `tool-workflow/agent-start`):
+  // their launch is the run's, so the subagent forward is skipped for them.
+  const workflowChildIds = new Set<string>()
+
+  function writeParentEvent(type: string, seq: string, data: Record<string, unknown>): void {
+    if (!eventsPath) return
+    try {
+      fs.appendFileSync(eventsPath, JSON.stringify({ type, seq, time: Date.now(), data }) + '\n')
+    } catch (e) {
+      ctx.logger.warn(`[turma-dsh] parent event forward failed: ${e}`)
+    }
+  }
+
+  function writeChildEvent(childId: string, event: SessionEvent): void {
+    if (!childEventsDir || !CHILD_ID_RE.test(childId)) return
+    if (event.type === 'subagent/descriptor') {
+      const d = event.data as { label?: unknown } | null
+      if (d && typeof d.label === 'string' && d.label) childLabels.set(childId, d.label)
+    }
+    try {
+      fs.mkdirSync(childEventsDir, { recursive: true })
+      fs.appendFileSync(path.join(childEventsDir, `${childId}.jsonl`),
+        JSON.stringify({ type: event.type, seq: event.seq, time: event.time, data: event.data }) + '\n')
+    } catch (e) {
+      ctx.logger.warn(`[turma-dsh] child event log write failed: ${e}`)
+    }
+  }
+
+  // Forward one subagent lifecycle edge into the parent log. DEFERRED a tick so a
+  // near-simultaneous `tool-workflow/agent-start` lands first: that ordering is
+  // what lets a workflow agent be told apart from an ordinary subagent (its
+  // launch is the run's, so it is skipped here — the hub tail re-checks the same).
+  function forwardSubagentEdge(kind: 'start' | 'end', info: SubagentRunInfo): void {
+    if (!info) return
+    const childId = String(info.id || '')
+    const runId = String(info.runId || '')
+    if (!childId) return
+    setImmediate(() => {
+      if (workflowChildIds.has(childId)) return
+      if (kind === 'start') {
+        const data: Record<string, unknown> = { runId, childId, provider: String(info.provider || '') }
+        const label = childLabels.get(childId)
+        if (label) data.label = label
+        writeParentEvent('turma/subagent-start', `sa-start-${runId || childId}`, data)
+      } else {
+        writeParentEvent('turma/subagent-end', `sa-end-${runId || childId}`,
+          { runId, childId, stopReason: String(info.stopReason || '') })
+      }
+    })
   }
 
   // ---- one agent, on the pinned session id ---------------------------------
@@ -523,16 +600,46 @@ export function apply(ctx: Context, config: Config) {
 
   // ---- forward session events + turn/status edges --------------------------
   ctx.on('session/event', (session: { id: string; events: unknown[] }, event: SessionEvent) => {
-    if (!session || session.id !== sessionId) return   // only THIS session's log
-    writeEvent(event)
-    if (event.type === 'turn/start' || event.type === 'turn/end') {
-      const agent = ctx.agents.get(sessionId)
-      emit({
-        evt: 'state',
-        status: agent ? agent.status : 'idle',
-        eventCount: session.events.length,
-      })
+    if (!session) return
+    if (session.id === sessionId) {
+      writeEvent(event)
+      // Learn which children are WORKFLOW agents, so their subagent lifecycle is
+      // not ALSO forwarded as a top-level Agent row (they are the run's members).
+      if (event.type === 'tool-workflow/agent-start') {
+        const d = event.data as { childId?: unknown } | null
+        if (d && typeof d.childId === 'string' && d.childId) workflowChildIds.add(d.childId)
+      }
+      if (event.type === 'turn/start' || event.type === 'turn/end') {
+        const agent = ctx.agents.get(sessionId)
+        emit({
+          evt: 'state',
+          status: agent ? agent.status : 'idle',
+          eventCount: session.events.length,
+        })
+      }
+      return
     }
+    // A descendant (subagent / workflow-agent) session — capture its native log
+    // so the hub projects a per-agent transcript (XERK-474 [J]). In-process
+    // providers reach here; a worker-thread workflow agent runs in its own ctx
+    // and does NOT (its run RECORD still works from the parent events — see
+    // .claude/rules/dsh.md [J]).
+    writeChildEvent(session.id, event)
+  }, { global: true })
+
+  // ---- subagent lifecycle -> parent-log forward (XERK-474 [J]) --------------
+  // dsh's subagent/start & subagent/end are ctx-bus events (they carry the live
+  // parent Agent), NOT session-log entries — so they never reach the tail on
+  // their own. Forwarded here into the parent native log so [S1] can synthesize
+  // the background Agent launch/stop. Global + parent-id filter: the emitter uses
+  // scoped dispatch, and we want only OUR session's direct subagents.
+  ctx.on('subagent/start', (info: SubagentRunInfo, parent: Agent) => {
+    if (!info || !parent || parent.id !== sessionId) return
+    forwardSubagentEdge('start', info)
+  }, { global: true })
+  ctx.on('subagent/end', (info: SubagentRunInfo, parent: Agent) => {
+    if (!info || !parent || parent.id !== sessionId) return
+    forwardSubagentEdge('end', info)
   }, { global: true })
 
   // ---- teardown ------------------------------------------------------------
