@@ -139,6 +139,32 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   reports none (`url:null`) and the link stays hidden rather than pointing nowhere. Web-first
   (`android/PARITY.md`).
 
+### The spawn composer's runtime + model (XERK-503)
+
+- **ONE `Runtime` picker, not four selectors.** It collapses the old `Runtime` (claude/dsh) +
+  `Run against` (subscription/local) pair into "Claude Code" / "Claude Code Local" (when
+  `localModel.available`) / "dsh" (when `dsh.available`), shown only when more than one runtime
+  exists. It maps onto the UNCHANGED wire fields in `startSession` — local → `modelSource:local` +
+  `localModel`; dsh → `agentType:dsh` + a discovered dsh `model` — so no backend contract moved.
+  `onOptChange` toggles the per-runtime controls in place (no re-render). "Run against" is gone.
+- **A dsh session offers the endpoint's DISCOVERED models, never Claude aliases.** `dsh.models[]`/
+  `defaultModel` ride the heartbeat exactly like `localModel.models[]` (agent `_dsh_payload`, hub
+  `normalizeDsh`), so dsh and a local session share the SAME list when pointed at one LiteLLM URL.
+  Agent-side (`hub-agent.py`): the pi-ai provider route (`_dsh_cordis_patch`) lists EVERY discovered
+  model + the configured default + the session's pick — a single-model route rejected every other id
+  with pi-ai's "no configured model" error (the lock this fixes); the route is rewritten per launch
+  (`_write_dsh_cordis_patch`) because discovery lands after boot-time profile prep; and spawn resolves
+  a dsh model via `resolve_dsh_model` (validate against the discovered set) NOT `resolve_model` (the
+  Claude-alias allowlist, which was the cause of the lock). dsh still needs `DSH_MODEL` set as the
+  default; discovery only widens the per-session choice.
+- **Permission modes are consistent, and `auto` is MODEL-gated, not provider-gated.** Claude Code and
+  Claude Code Local share the full list (`auto` needs Sonnet 5 / Opus 4.7+ / Fable 5 and downgrades
+  to Manual otherwise — a graceful Claude Code behavior, so it is offered with a hint, never hidden
+  per-runtime). dsh uses `ask`/`never` + a sandbox mode, NOT Claude's modes, so the composer shows an
+  "approvals managed by dsh" note instead of the permission dropdown for dsh. Android in
+  `android/PARITY.md`. Tests: the `Runtime`/`dsh model list` cases in `sessions.test.js`,
+  `normalizeDsh` in `server.test.js`, `TestDshModelDiscovery` in `test_hub_agent.py`.
+
 ### The model and mode chips
 
 - A third selector — **"Run against"** (`cc-source`, XERK-246) — moves the session between the Claude

@@ -1928,67 +1928,10 @@ test("local mark: absent when the session never left the subscription", () => {
   assert.doesNotMatch(els.active.innerHTML, /local-mark/);
 });
 
-test("composer: 'Run against' appears only when the host reports a local model", () => {
-  // Without this control an operator can fail EXISTING sessions over but cannot
-  // start any new work once usage is gone, which is half the point.
-  const open = (h) => {
-    const page = loadPage();
-    const { now } = host([]);
-    page.setCache({ now, agents: [h] });
-    page.render({ now, agents: [h] });
-    page.toggleComposer("hostA::repoX", "repoX");    // open the repo's composer
-    return page.els.spawn.innerHTML;
-  };
-  const withLocal = open({
-    key: "hostA", device: "hostA", online: true, terminalOnline: true,
-    lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
-    localModel: { available: true, model: "gpt-oss:120b" },
-  });
-  assert.match(withLocal, /Run against/);
-  // The source selector reads "Other", not the raw model id — the model is named
-  // in its own revealed dropdown (covered by the discovered-models test below).
-  assert.match(withLocal, />Other</, "the local source reads 'Other'");
-  assert.doesNotMatch(withLocal, /gpt-oss:120b/, "the raw model id is not in the source selector");
-
-  const without = open({
-    key: "hostA", device: "hostA", online: true, terminalOnline: true,
-    lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
-    localModel: { available: false },
-  });
-  assert.doesNotMatch(without, /Run against/);
-});
-
-test("composer: the chosen 'Run against' actually reaches the spawn request", () => {
-  // Rendering the select is not the same as sending it. Without this, the
-  // composer silently ignores the choice and new work always starts on the
-  // subscription — the half of the feature that matters once usage is gone.
-  const spawnWith = (value) => {
-    const page = loadPage();
-    const now = Date.now();
-    const h = {
-      key: "hostA", device: "hostA", online: true, terminalOnline: true,
-      lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
-      localModel: { available: true, model: "gpt-oss:120b" },
-    };
-    page.setCache({ now, agents: [h] });
-    page.render({ now, agents: [h] });
-    page.toggleComposer("hostA::repoX", "repoX");
-    // The page reads its options straight off the DOM by id.
-    // cid(rk, field) => "cmp-<field>-<rk with non-alnum replaced by _>".
-    // The shim creates elements lazily, so seed the select the page will read.
-    page.els["cmp-source-hostA__repoX"] = { value };
-    page.startSession("hostA", "repoX");
-    return page.posts.find((p) => p.url.endsWith("/sessions"));
-  };
-  assert.equal(spawnWith("local").body.modelSource, "local");
-  // The default is not sent at all, so a host without a local model is unaffected.
-  assert.equal(spawnWith("subscription").body.modelSource, undefined);
-});
-
-test("composer: 'Runtime' appears only when the host reports the dsh capability (XERK-465)", () => {
-  // The selector is gated on the dsh capability exactly like 'Run against' is on
-  // localModel — a host that cannot launch dsh renders no choice, so nobody can
-  // pick a runtime the host would only ack and drop.
+test("composer: the Runtime picker appears with more than one runtime (XERK-503)", () => {
+  // The single Runtime picker collapses the old Runtime + 'Run against' pair.
+  // It shows only when the host offers a second runtime (a local endpoint or
+  // dsh) — a plain subscription host has one runtime, so nothing to choose.
   const open = (h) => {
     const page = loadPage();
     const { now } = host([]);
@@ -2001,31 +1944,84 @@ test("composer: 'Runtime' appears only when the host reports the dsh capability 
     key: "hostA", device: "hostA", online: true, terminalOnline: true,
     lastSeen: Date.now(), repos: [{ name: "repoX" }], sessions: [],
   };
-  assert.match(open({ ...base, dsh: { available: true } }), /Runtime/);
-  // Absent block or false capability -> no selector at all.
-  assert.doesNotMatch(open({ ...base, dsh: { available: false } }), /Runtime/);
+  // A local endpoint -> the picker offers Claude Code + Claude Code Local.
+  const withLocal = open({ ...base, localModel: { available: true, model: "gpt-oss:120b" } });
+  assert.match(withLocal, /Runtime/);
+  assert.match(withLocal, />Claude Code Local</);
+  assert.match(withLocal, />Claude Code</);
+  // "Run against" is gone — its subscription-vs-local choice is the runtime now.
+  assert.doesNotMatch(withLocal, /Run against/);
+  // dsh available -> the picker offers dsh too.
+  assert.match(open({ ...base, dsh: { available: true } }), />dsh</);
+  // Plain subscription host (no local, no dsh) -> no picker at all.
   assert.doesNotMatch(open(base), /Runtime/);
 });
 
-test("composer: the chosen Runtime actually reaches the spawn request (XERK-465)", () => {
-  const spawnWith = (value) => {
+test("composer: each Runtime maps onto the right spawn wire fields (XERK-503)", () => {
+  // The three runtime choices map onto the existing agentType/modelSource wire
+  // fields — the backend contract is unchanged; only the UI collapsed.
+  const spawnWith = (seed) => {
     const page = loadPage();
     const now = Date.now();
     const h = {
       key: "hostA", device: "hostA", online: true, terminalOnline: true,
       lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
-      dsh: { available: true },
+      localModel: { available: true, defaultModel: "gpt-oss:120b",
+        models: [{ id: "gpt-oss:120b", contextTokens: 120000 }] },
+      dsh: { available: true, defaultModel: "deepseek-chat",
+        models: [{ id: "deepseek-chat", contextTokens: 128000 }] },
     };
     page.setCache({ now, agents: [h] });
     page.render({ now, agents: [h] });
     page.toggleComposer("hostA::repoX", "repoX");
-    page.els["cmp-type-hostA__repoX"] = { value };
+    // cid(rk, field) => "cmp-<field>-<rk with non-alnum -> _>"; seed each select.
+    for (const [k, v] of Object.entries(seed)) page.els[`cmp-${k}-hostA__repoX`] = { value: v };
     page.startSession("hostA", "repoX");
-    return page.posts.find((p) => p.url.endsWith("/sessions"));
+    return page.posts.find((p) => p.url.endsWith("/sessions")).body;
   };
-  assert.equal(spawnWith("dsh").body.agentType, "dsh");
-  // claude is the default and is never sent, so a non-dsh host is unaffected.
-  assert.equal(spawnWith("claude").body.agentType, undefined);
+  // Claude Code: subscription, no agentType/modelSource, a Claude alias + mode.
+  const claude = spawnWith({ runtime: "claude", model: "opus", perm: "plan" });
+  assert.equal(claude.agentType, undefined);
+  assert.equal(claude.modelSource, undefined);
+  assert.equal(claude.model, "opus");
+  assert.equal(claude.permissionMode, "plan");
+  // Claude Code Local: modelSource local + the discovered model + context.
+  const local = spawnWith({ runtime: "local", lmodel: "gpt-oss:120b", lctx: "16000" });
+  assert.equal(local.modelSource, "local");
+  assert.equal(local.localModel, "gpt-oss:120b");
+  assert.equal(local.localContext, 16000);
+  assert.equal(local.agentType, undefined);
+  // dsh: agentType dsh + a discovered DSH model, and NO permission mode (dsh
+  // manages approvals itself) and NO modelSource.
+  const dsh = spawnWith({ runtime: "dsh", dmodel: "deepseek-chat", perm: "bypassPermissions" });
+  assert.equal(dsh.agentType, "dsh");
+  assert.equal(dsh.model, "deepseek-chat");
+  assert.equal(dsh.modelSource, undefined);
+  assert.equal(dsh.permissionMode, undefined);
+});
+
+test("composer: the dsh runtime offers the discovered model list, not Claude aliases (XERK-503)", () => {
+  // The fix for the `pi-ai provider has no configured model` lock: a dsh session
+  // picks a DISCOVERED endpoint model, the same list a local session gets.
+  const page = loadPage();
+  const now = Date.now();
+  const h = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: now, repos: [{ name: "repoX" }], sessions: [],
+    dsh: { available: true, defaultModel: "deepseek-chat",
+      models: [{ id: "deepseek-chat", contextTokens: 128000 },
+               { id: "qwen3-coder", contextTokens: 32768 }] },
+  };
+  page.setCache({ now, agents: [h] });
+  page.render({ now, agents: [h] });
+  page.toggleComposer("hostA::repoX", "repoX");
+  const html = page.els.spawn.innerHTML;
+  // The discovered ids with windows are in the dsh model dropdown.
+  assert.match(html, /deepseek-chat · 128k/);
+  assert.match(html, /qwen3-coder · 33k/);
+  // dsh manages approvals itself, so the composer shows a note, not the Claude
+  // permission dropdown's Claude-mode options as the dsh control.
+  assert.match(html, /managed by dsh/);
 });
 
 test("session card shows a dsh runtime badge, and none for claude (XERK-465)", () => {
@@ -2050,9 +2046,9 @@ test("composer: the local model dropdown + context reach the spawn request (XERK
   const html = page.els.spawn.innerHTML;
   // The dropdown lists the discovered models with windows, and the context field.
   assert.match(html, /qwen:32b · 33k/);
-  assert.match(html, /Self-hosted model/);
-  // Choose local + a specific model + a shrunk context; all reach the spawn body.
-  page.els["cmp-source-hostA__repoX"] = { value: "local" };
+  assert.match(html, /self-hosted/);
+  // Choose the Claude Code Local runtime + a specific model + a shrunk context.
+  page.els["cmp-runtime-hostA__repoX"] = { value: "local" };
   page.els["cmp-lmodel-hostA__repoX"] = { value: "qwen:32b" };
   page.els["cmp-lctx-hostA__repoX"] = { value: "16000" };
   page.startSession("hostA", "repoX");
@@ -2074,8 +2070,8 @@ test("composer: a subscription spawn sends no local model fields (XERK-489)", ()
   page.setCache({ now, agents: [h] });
   page.render({ now, agents: [h] });
   page.toggleComposer("hostA::repoX", "repoX");
-  // The local fields are present in the DOM but source is subscription.
-  page.els["cmp-source-hostA__repoX"] = { value: "subscription" };
+  // The local fields are present in the DOM but the runtime is Claude Code.
+  page.els["cmp-runtime-hostA__repoX"] = { value: "claude" };
   page.els["cmp-lmodel-hostA__repoX"] = { value: "gpt-oss:120b" };
   page.els["cmp-lctx-hostA__repoX"] = { value: "16000" };
   page.startSession("hostA", "repoX");

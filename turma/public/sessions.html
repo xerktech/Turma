@@ -1350,17 +1350,28 @@ function restoreComposerScrolls() {
 function onOptChange(rk, repo) {
   const v = id => { const el = document.getElementById(cid(rk, id)); return el ? el.value : ""; };
   const o = loadOpts(repo);
-  o.baseRef = v("base"); o.model = v("model"); o.permissionMode = v("perm");
-  o.modelSource = v("source"); o.agentType = v("type");
-  // XERK-489: the chosen self-hosted model + context override (persisted so the
-  // repo's composer reopens on them). Only meaningful when source is local.
+  o.baseRef = v("base");
+  // The single Runtime picker (XERK-503); absent when the host offers only
+  // Claude Code, in which case the runtime stays "claude".
+  const rtEl = document.getElementById(cid(rk, "runtime"));
+  const runtime = rtEl ? rtEl.value : "claude";
+  o.runtime = runtime;
+  o.model = v("model"); o.permissionMode = v("perm");
   o.localModel = v("lmodel");
   const lctx = parseInt(v("lctx"), 10);
   o.localContext = lctx > 0 ? lctx : 0;
-  // Reveal / hide the local-model fields the instant "Run against" flips, rather
-  // than waiting for the next beat's repaint.
-  const wrap = document.getElementById(cid(rk, "lmwrap"));
-  if (wrap) wrap.style.display = o.modelSource === "local" ? "" : "none";
+  o.dshModel = v("dmodel");
+  // Reveal the controls for the chosen runtime immediately, rather than waiting
+  // for the next beat's repaint: Claude aliases + the permission dropdown for
+  // Claude Code / Claude Code Local, the endpoint model dropdowns for the two
+  // self-hosted runtimes, and the dsh approval note in place of the permission
+  // dropdown for dsh (dsh manages approvals itself).
+  const show = (sfx, on) => { const el = document.getElementById(cid(rk, sfx)); if (el) el.style.display = on ? "" : "none"; };
+  show("modelclaude", runtime === "claude");
+  show("lmwrap", runtime === "local");
+  show("dmwrap", runtime === "dsh");
+  show("permwrap", runtime !== "dsh");
+  show("dshnote", runtime === "dsh");
   saveOpts(repo, o);
 }
 // The "New session" composer panel: Task (autofocused, Cmd/Ctrl+Enter submits),
@@ -1380,21 +1391,30 @@ function composer(a, repo, rk, spawning) {
     ? o.baseRef : (repo.defaultBranch || repo.branch || "");
   const selModel = o.model || "default";
   const selPerm = o.permissionMode || "auto";
-  // Which model a NEW session runs against (XERK-246). Only offered when this
-  // host reports one, on the same capability contract as everything else here —
-  // and it matters most exactly when usage has run out, since without it an
-  // operator can fail EXISTING sessions over but cannot start any new work.
+  const ctxK = n => (typeof n === "number" && n > 0) ? (n >= 1000 ? Math.round(n / 1000) + "k" : String(n)) : "";
+  // The RUNTIME picker (XERK-503) collapses the old Runtime + "Run against" pair
+  // into one control: "Claude Code" (the mounted subscription), "Claude Code
+  // Local" (this host's self-hosted endpoint, when it reports one) and "dsh"
+  // (the DeepSeek Harness runtime, when the host offers it). Each maps onto the
+  // existing agentType/modelSource wire fields in startSession, so the backend
+  // contract for the claude/local split is unchanged. Both endpoint-backed
+  // runtimes (local + dsh) offer the SAME discovered LiteLLM model list when the
+  // host points them at one URL. Every option follows the host's capability
+  // flags exactly as the individual controls did.
   const localModel = (a.localModel && a.localModel.available) ? a.localModel : null;
-  const selSource = (localModel && o.modelSource === "local") ? "local" : "subscription";
-  // Which RUNTIME a new session runs on (XERK-460). Only offered when this host
-  // reports the dsh capability, the same contract as the local-model control
-  // above — a host that cannot launch dsh renders no selector, so the choice
-  // can't be made where it would only be acked and dropped.
   const dsh = (a.dsh && a.dsh.available) ? a.dsh : null;
-  const selType = (dsh && o.agentType === "dsh") ? "dsh" : "claude";
-  // The endpoint's discovered models (XERK-489). When local is chosen the
-  // composer reveals a model dropdown + an optional context override — the same
-  // shape as the live chat footer. Empty when an older agent reports no list.
+  const runtimeOpts = [{ v: "claude", label: "Claude Code" }];
+  if (localModel) runtimeOpts.push({ v: "local", label: "Claude Code Local" });
+  if (dsh) runtimeOpts.push({ v: "dsh", label: "dsh" });
+  // Selected runtime: the stored `runtime`, else derived from the legacy
+  // agentType/modelSource a pre-XERK-503 composer persisted, else claude. A
+  // stored value whose runtime the host no longer offers falls back to claude.
+  const legacyRuntime = o.agentType === "dsh" ? "dsh"
+    : (o.modelSource === "local" ? "local" : "claude");
+  const selRuntime = runtimeOpts.some(r => r.v === o.runtime) ? o.runtime
+    : (runtimeOpts.some(r => r.v === legacyRuntime) ? legacyRuntime : "claude");
+  // The Claude-local endpoint's discovered models (XERK-489): id + optional
+  // context override, revealed when the "Claude Code Local" runtime is chosen.
   const lModels = (localModel && Array.isArray(localModel.models)) ? localModel.models : [];
   const lDefault = (localModel && (localModel.defaultModel || localModel.model)) || "";
   const selLModel = (o.localModel && lModels.some(m => m && m.id === o.localModel))
@@ -1402,7 +1422,14 @@ function composer(a, repo, rk, spawning) {
   const servedCtx = (() => { const m = lModels.find(x => x && x.id === selLModel);
     return m && typeof m.contextTokens === "number" ? m.contextTokens : null; })();
   const selLCtx = (o.localContext && o.localContext > 0) ? o.localContext : (servedCtx || "");
-  const ctxK = n => (typeof n === "number" && n > 0) ? (n >= 1000 ? Math.round(n / 1000) + "k" : String(n)) : "";
+  // The dsh endpoint's discovered models (XERK-503) — the SAME shape, so a dsh
+  // session is no longer locked to one model. Its served window rides the "id ·
+  // 128k" option label (dsh has no per-session context override; the route
+  // supplies the window), so there is no dsh context field.
+  const dModels = (dsh && Array.isArray(dsh.models)) ? dsh.models : [];
+  const dDefault = (dsh && dsh.defaultModel) || "";
+  const selDModel = (o.dshModel && dModels.some(m => m && m.id === o.dshModel))
+    ? o.dshModel : dDefault;
   const optsExpanded = optionsOpen.has(rk);
   const opt = (val, label, sel) => `<option value="${esc(val)}"${val === sel ? " selected" : ""}>${esc(label)}</option>`;
   const submit = `startSession('${key}','${rn}')`;
@@ -1429,34 +1456,40 @@ function composer(a, repo, rk, spawning) {
             ${bases.map(b => opt(b, b, selBase)).join("")}
           </select>
         </div>`}
-        ${dsh ? `<div>
+        ${runtimeOpts.length > 1 ? `<div>
           <label>Runtime</label>
-          <select id="${cid(rk, "type")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
-            ${opt("claude", "Claude Code", selType)}${opt("dsh", "dsh", selType)}
+          <select id="${cid(rk, "runtime")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
+            ${runtimeOpts.map(r => opt(r.v, r.label, selRuntime)).join("")}
           </select>
         </div>` : ""}
-        <div>
+        <div id="${cid(rk, "modelclaude")}"${selRuntime === "claude" ? "" : ' style="display:none"'}>
           <label>Model</label>
           <select id="${cid(rk, "model")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${opt("default", "Default", selModel)}${opt("opus", "Opus", selModel)}${opt("sonnet", "Sonnet", selModel)}${opt("haiku", "Haiku", selModel)}
           </select>
         </div>
-        <div>
-          <label>Permission mode</label>
-          <select id="${cid(rk, "perm")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
-            ${opt("auto", "auto", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
-          </select>
-        </div>
-        ${localModel ? `<div>
-          <label>Run against</label>
-          <select id="${cid(rk, "source")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
-            ${opt("subscription", "Claude subscription", selSource)}${opt("local", "Other", selSource)}
+        ${dsh ? `<div id="${cid(rk, "dmwrap")}"${selRuntime === "dsh" ? "" : ' style="display:none"'}>
+          <label>Model <span class="hint">(dsh)</span></label>
+          <select id="${cid(rk, "dmodel")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
+            ${dModels.length
+              ? dModels.map(m => opt(m.id, m.id + (ctxK(m.contextTokens) ? " · " + ctxK(m.contextTokens) : ""), selDModel)).join("")
+              : `<option value="">${esc(dDefault || "endpoint default")}</option>`}
           </select>
         </div>` : ""}
-        ${localModel && lModels.length ? `<div id="${cid(rk, "lmwrap")}" class="full lm-wrap"${selSource === "local" ? "" : ' style="display:none"'}>
+        <div id="${cid(rk, "permwrap")}"${selRuntime === "dsh" ? ' style="display:none"' : ""}>
+          <label>Permission mode</label>
+          <select id="${cid(rk, "perm")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
+            ${opt("auto", "auto", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}
+          </select>
+          <div class="hint" style="margin-top:3px">auto needs a recent model (Sonnet 5 / Opus 4.7+ / Fable 5); older models run in default.</div>
+        </div>
+        ${dsh ? `<div id="${cid(rk, "dshnote")}" class="full"${selRuntime === "dsh" ? "" : ' style="display:none"'}>
+          <div class="hint">Approvals are managed by dsh — it asks before risky actions and confines writes to the worktree.</div>
+        </div>` : ""}
+        ${localModel && lModels.length ? `<div id="${cid(rk, "lmwrap")}" class="full lm-wrap"${selRuntime === "local" ? "" : ' style="display:none"'}>
           <div class="lm-grid">
             <div>
-              <label>Self-hosted model</label>
+              <label>Model <span class="hint">(self-hosted)</span></label>
               <select id="${cid(rk, "lmodel")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
                 ${lModels.map(m => opt(m.id, m.id + (ctxK(m.contextTokens) ? " · " + ctxK(m.contextTokens) : ""), selLModel)).join("")}
               </select>
@@ -2291,34 +2324,40 @@ function startSession(key, repo) {
   const defBranch = repoInfo ? (repoInfo.defaultBranch || repoInfo.branch) : "";
   const prompt = v("task").trim(), label = v("label").trim();
   const baseRef = v("base");
-  const model = v("model"), perm = v("perm"), modelSource = v("source");
-  const agentType = v("type");
+  const rtEl = document.getElementById(cid(rk, "runtime"));
+  const runtime = rtEl ? rtEl.value : "claude";
+  const model = v("model"), perm = v("perm");
   const localModel = v("lmodel");
   const localContext = parseInt(v("lctx"), 10);
+  const dshModel = v("dmodel");
   const body = { repo };
   if (prompt) body.prompt = prompt;
   if (label) body.label = label;
   // Omitted base = the agent forks the latest default branch (main). Only send an
   // explicit base when the operator picked something other than that.
   if (baseRef && baseRef !== defBranch) body.baseRef = baseRef;
-  if (model && model !== "default") body.model = model;
-  if (perm && perm !== "auto") body.permissionMode = perm;
-  // Only send a non-default source; a host with no local model renders no such
-  // control, so this stays absent there.
-  if (modelSource === "local") {
-    body.modelSource = modelSource;
-    // The chosen endpoint model + optional context override (XERK-489). The
-    // agent validates membership and clamps the window; both stay absent for a
-    // subscription spawn.
-    if (localModel) body.localModel = localModel;
-    if (localContext > 0) body.localContext = localContext;
+  // The one Runtime picker (XERK-503) maps onto the existing wire fields:
+  //  - claude → the mounted subscription + a Claude model alias + permission mode
+  //  - local  → agentType claude, modelSource local, a discovered endpoint model
+  //  - dsh    → agentType dsh, a discovered dsh model (permission is dsh-managed)
+  if (runtime === "dsh") {
+    body.agentType = "dsh";
+    // A discovered dsh id (blank = the host default); NOT a Claude alias.
+    if (dshModel) body.model = dshModel;
+  } else {
+    if (runtime === "local") {
+      body.modelSource = "local";
+      if (localModel) body.localModel = localModel;
+      if (localContext > 0) body.localContext = localContext;
+    } else if (model && model !== "default") {
+      body.model = model;
+    }
+    if (perm && perm !== "auto") body.permissionMode = perm;
   }
-  // Only send a non-default runtime; a host that doesn't offer dsh renders no
-  // such control, so this stays absent (and defaults to claude) there.
-  if (agentType === "dsh") body.agentType = agentType;
-  saveOpts(repo, { baseRef, model, permissionMode: perm, modelSource, agentType,
-    localModel: modelSource === "local" ? localModel : "",
-    localContext: modelSource === "local" && localContext > 0 ? localContext : 0,
+  saveOpts(repo, { baseRef, runtime, model, permissionMode: perm,
+    localModel: runtime === "local" ? localModel : "",
+    localContext: runtime === "local" && localContext > 0 ? localContext : 0,
+    dshModel: runtime === "dsh" ? dshModel : "",
     optionsExpanded: optionsOpen.has(rk) });
   composerOpen.delete(rk);
   composerDraft.delete(rk);

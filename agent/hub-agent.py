@@ -1265,7 +1265,7 @@ def _dsh_store_dir(cwd, session_id):
     return os.path.join(DSH_SESSIONS_ROOT, _dsh_project_key(cwd), session_id)
 
 
-def _dsh_cordis_patch(provider, model, base_url, api_key_env, context,
+def _dsh_cordis_patch(provider, models, base_url, api_key_env, default_model,
                       guard_config=None):
     """The profile's cordis.patch.yml: the driver-plugin entry, a hand-declared
     pi-ai provider route (dsh has no Claude failover — this route is the whole
@@ -1274,9 +1274,43 @@ def _dsh_cordis_patch(provider, model, base_url, api_key_env, context,
     — when `guard_config` is given — the `@turma/dsh-guard` safety guard
     (XERK-470 [F]), the dsh equivalent of the Claude `--settings` guard the
     launcher MUST compose. `base_url`/`api_key_env` place NO secret on disk —
-    the credential rides the named env var. `provider`/`model` are
+    the credential rides the named env var.
+
+    `models` is a list of `{id, contextTokens?}` — EVERY model the endpoint
+    serves, so a dsh session can run any one the composer offered (XERK-503); a
+    route with a single model rejected every other id with pi-ai's "no configured
+    model" error, which is what locked dsh to one model. `default_model` is the
+    id a session with no explicit pick runs. `provider`/model ids are
     charset-validated by the caller. Mirrors poc/turma-2.0-poc/test-real-dsh.sh's
     proven patch."""
+    # Deterministic order + de-dup; drop any id that fails the charset gate (an
+    # endpoint's list is untrusted input into a generated config).
+    seen, model_rows = set(), []
+    for m in (models or []):
+        mid = (m or {}).get("id")
+        if not (isinstance(mid, str) and DSH_IDENT_RE.fullmatch(mid)) or mid in seen:
+            continue
+        seen.add(mid)
+        ctx = (m or {}).get("contextTokens")
+        if not (isinstance(ctx, int) and 0 < ctx <= MAX_LOCAL_MODEL_CONTEXT):
+            ctx = DSH_MODEL_CONTEXT
+        model_rows.append((mid, ctx))
+    # The default is interpolated into the route the SAME way each list id is, so
+    # it gets the SAME charset gate — the callers pass a validated value today, but
+    # a config generator must not trust one interpolated value while checking the
+    # rest (an unchecked id here is YAML injection into cordis.patch.yml). An
+    # invalid/empty default falls back to the first listed model, so the
+    # agent-default-model line always names a real, charset-safe id.
+    valid_default = default_model if (default_model and DSH_IDENT_RE.fullmatch(default_model)) else ""
+    if valid_default and valid_default not in seen:
+        model_rows.append((valid_default, DSH_MODEL_CONTEXT))
+        seen.add(valid_default)
+    effective_default = valid_default or (model_rows[0][0] if model_rows else "")
+    models_yaml = "".join(
+        f"          - id: '{mid}'\n"
+        f"            contextWindow: {int(ctx)}\n"
+        "            maxTokens: 4096\n"
+        for mid, ctx in model_rows)
     # Override the base profile's session-persistence backend to write PLAINTEXT
     # (`compression: none`) instead of its zstd default (XERK-475). The store's
     # first line is a JSON header carrying the session's `cwd`, and a migration
@@ -1328,14 +1362,12 @@ def _dsh_cordis_patch(provider, model, base_url, api_key_env, context,
         "          supportsDeveloperRole: false\n"
         "          maxTokensField: max_tokens\n"
         "        models:\n"
-        f"          - id: '{model}'\n"
-        f"            contextWindow: {int(context)}\n"
-        "            maxTokens: 4096\n"
-        "- id: agent-default-model\n"
+        + models_yaml
+        + "- id: agent-default-model\n"
         "  name: '@deepseek-ai/dsh-agent-default-model'\n"
         "  config:\n"
         f"    provider: '{provider}'\n"
-        f"    model: '{model}'\n"
+        f"    model: '{effective_default}'\n"
     )
 
 # --- endpoint model discovery (XERK-489) ----------------------------------
@@ -1358,6 +1390,16 @@ LOCAL_MODEL_MODELS_MAX = 200
 _local_model_lock = threading.Lock()
 _local_model_discovered = None            # None until the first poll completes
 _local_model_discovery_started = False
+
+# The dsh runtime's endpoint is discovered by the SAME code (below), so a dsh
+# session offers the same model list a Claude-local session does when both point
+# at one LiteLLM URL — the intended one-endpoint deployment. Separate cache: a
+# host may point dsh at a DIFFERENT base than the Claude failover, and when the
+# two roots coincide discovered_dsh_models mirrors the local cache with no extra
+# polling (see start_dsh_model_discovery).
+_dsh_model_lock = threading.Lock()
+_dsh_model_discovered = None
+_dsh_model_discovery_started = False
 
 
 def discovered_local_models():
@@ -1480,14 +1522,17 @@ def _discovery_root():
     return _messages_api_base(LOCAL_MODEL_BASE_URL)
 
 
-def _discovery_get_json(url):
+def _discovery_get_json(url, key=None):
     """GET `url` with the gateway key, bounded timeout, parsed JSON or None.
 
-    Never raises — a discovery failure must leave the last good list in place,
-    not take down the worker (which would stop refreshes for the process life)."""
+    `key` is the bearer token to authenticate with (the local-model key by
+    default; the dsh runtime passes its own so the SAME discovery code serves
+    both endpoints — see discovered_dsh_models). Never raises — a discovery
+    failure must leave the last good list in place, not take down the worker
+    (which would stop refreshes for the process life)."""
     try:
         req = urllib.request.Request(url, headers={
-            "Authorization": f"Bearer {LOCAL_MODEL_API_KEY}",
+            "Authorization": f"Bearer {key or LOCAL_MODEL_API_KEY}",
             "Accept": "application/json",
         })
         with urllib.request.urlopen(
@@ -1498,9 +1543,9 @@ def _discovery_get_json(url):
         return None
 
 
-def _discovery_model_ids(root):
+def _discovery_model_ids(root, key=None):
     """The model ids from OpenAI-style GET {root}/v1/models (`data[].id`)."""
-    data = _discovery_get_json(f"{root}/v1/models")
+    data = _discovery_get_json(f"{root}/v1/models", key)
     ids = []
     for item in ((data or {}).get("data") or []):
         mid = (item or {}).get("id")
@@ -1509,15 +1554,15 @@ def _discovery_model_ids(root):
     return ids
 
 
-def _discovery_contexts(root):
+def _discovery_contexts(root, key=None):
     """Per-model context windows from LiteLLM GET {root}/model/info, keyed by id.
 
     LiteLLM returns `data[].model_info.max_input_tokens` (fall back to
     `max_tokens`). A bare OpenAI-compatible endpoint has no such route, so a
     failure here just leaves every window null and the fallback applies. Both
     `/model/info` and `/v1/model/info` are tried (LiteLLM serves both)."""
-    data = (_discovery_get_json(f"{root}/model/info")
-            or _discovery_get_json(f"{root}/v1/model/info"))
+    data = (_discovery_get_json(f"{root}/model/info", key)
+            or _discovery_get_json(f"{root}/v1/model/info", key))
     ctx = {}
     for item in ((data or {}).get("data") or []):
         mid = (item or {}).get("model_name") or (item or {}).get("id")
@@ -1571,6 +1616,136 @@ def start_local_model_discovery():
     _local_model_discovery_started = True
     threading.Thread(target=_local_model_discovery_loop,
                      name="local-model-discovery", daemon=True).start()
+
+
+# --- dsh model discovery (XERK-503) ---------------------------------------
+# dsh has NO Claude-style failover (D5): its pi-ai provider route IS the whole
+# model story. To let a dsh session pick ANY model the LiteLLM endpoint serves
+# (not the single hardcoded DSH_MODEL), the endpoint's model list is discovered
+# exactly as the Claude-local one is, and the composer offers it. When dsh and
+# the Claude failover point at the SAME base (the intended one-URL deployment),
+# discovered_dsh_models mirrors the local cache so the endpoint is polled once.
+
+def _dsh_discovery_key():
+    """The bearer token the dsh endpoint authenticates with — the env var named
+    by DSH_MODEL_API_KEY_ENV (defaults to LOCAL_MODEL_API_KEY's var)."""
+    return os.environ.get(DSH_MODEL_API_KEY_ENV) or ""
+
+
+def _dsh_discovery_root():
+    """The dsh endpoint root the discovery routes hang off (base with a trailing
+    `/v1` trimmed), or "" when no dsh base is configured."""
+    if not DSH_MODEL_BASE_URL:
+        return ""
+    return _messages_api_base(DSH_MODEL_BASE_URL)
+
+
+def _dsh_shares_local_endpoint():
+    """True when the dsh endpoint is the SAME as the Claude-failover one AND the
+    local discovery worker is running — so the dsh model list can mirror the
+    local cache without polling the endpoint twice."""
+    return bool(_dsh_discovery_root()
+                and _dsh_discovery_root() == _discovery_root()
+                and _local_model_discovery_started)
+
+
+def discovered_dsh_models():
+    """The dsh endpoint's discovered models as [{id, contextTokens|null}], or [].
+
+    Mirrors discovered_local_models when the two endpoints coincide (no double
+    polling); otherwise the dsh worker's own cache. [] means 'not discovered yet
+    OR the endpoint served none' — a configured DSH_MODEL default still makes the
+    host usable in the meantime (dsh_model_default)."""
+    if _dsh_shares_local_endpoint():
+        return discovered_local_models()
+    with _dsh_model_lock:
+        return list(_dsh_model_discovered or ())
+
+
+def dsh_model_default():
+    """The model a NEW dsh session starts on when the operator picks none.
+
+    A configured DSH_MODEL wins (an operator naming one means it); else the first
+    discovered id (zero-config: point dsh at an endpoint and it offers what that
+    endpoint serves). None when neither exists yet — a dsh spawn is then refused
+    rather than launched blind (_ensure_dsh_profile)."""
+    if DSH_MODEL and DSH_IDENT_RE.fullmatch(DSH_MODEL):
+        return DSH_MODEL
+    models = discovered_dsh_models()
+    return models[0]["id"] if models else None
+
+
+def dsh_model_context(model):
+    """The served context window for a dsh `model`: the discovered figure when
+    the endpoint reports one, else the DSH_MODEL_CONTEXT fallback (a bare
+    OpenAI-style endpoint exposes no per-model window)."""
+    for m in discovered_dsh_models():
+        if m.get("id") == model and isinstance(m.get("contextTokens"), int):
+            return m["contextTokens"]
+    return DSH_MODEL_CONTEXT
+
+
+def dsh_model_member(model):
+    """True when a dsh session can actually run `model`.
+
+    In the discovered set, or the configured DSH_MODEL default (which stands even
+    before discovery lands). An EMPTY discovered set cannot DISPROVE membership
+    (the worker may not have polled yet), so a charset-valid name is accepted and
+    the launch's provider route includes it explicitly — mirrors local_model_member."""
+    if not model or not DSH_IDENT_RE.fullmatch(model):
+        return False
+    if DSH_MODEL and model == DSH_MODEL:
+        return True
+    models = discovered_dsh_models()
+    if not models:
+        return True                        # can't refute; accept charset-valid
+    return any(m.get("id") == model for m in models)
+
+
+def discover_dsh_models_once():
+    """One dsh discovery pass. A no-op when the dsh endpoint coincides with the
+    local one (that worker covers it). Bounded to LOCAL_MODEL_MODELS_MAX."""
+    global _dsh_model_discovered
+    if _dsh_shares_local_endpoint():
+        return
+    root = _dsh_discovery_root()
+    key = _dsh_discovery_key()
+    if not (root and key):
+        return
+    ids = _discovery_model_ids(root, key)
+    contexts = _discovery_contexts(root, key) if ids else {}
+    out = [{"id": mid, "contextTokens": contexts.get(mid)}
+           for mid in ids[:LOCAL_MODEL_MODELS_MAX]]
+    if not out and _dsh_model_discovered:
+        return                             # keep the last good list on a blip
+    with _dsh_model_lock:
+        _dsh_model_discovered = out
+    log(f"dsh model discovery: {len(out)} model(s) from {root}")
+
+
+def _dsh_model_discovery_loop():
+    while True:
+        try:
+            discover_dsh_models_once()
+        except Exception as e:
+            log(f"dsh model discovery loop: {type(e).__name__}: {e}")
+        time.sleep(LOCAL_MODEL_DISCOVERY_EVERY_SEC)
+
+
+def start_dsh_model_discovery():
+    """Start the dsh discovery worker once, iff dsh has its OWN endpoint (a base
+    + key) that does NOT coincide with the already-running local one. Idempotent;
+    called from run_forever, never in unit tests."""
+    global _dsh_model_discovery_started
+    if _dsh_model_discovery_started:
+        return
+    if not (_dsh_discovery_root() and _dsh_discovery_key()):
+        return
+    if _dsh_shares_local_endpoint():
+        return                             # the local worker already covers it
+    _dsh_model_discovery_started = True
+    threading.Thread(target=_dsh_model_discovery_loop,
+                     name="dsh-model-discovery", daemon=True).start()
 
 
 def resolve_model_source(source):
@@ -1936,6 +2111,25 @@ def resolve_model(model, extra=()):
     if model in extra and SPAWN_MODEL_RE.fullmatch(model):
         return model
     raise ValueError(f"unknown model {model!r}")
+
+
+def resolve_dsh_model(model):
+    """Validate a dsh session's model choice against the endpoint's DISCOVERED
+    set (XERK-503), returning the id to store — or "" to run the host default.
+
+    A dsh model is a DISCOVERED endpoint id (e.g. `deepseek-chat`), NOT a Claude
+    alias, so it must NOT go through resolve_model (whose allowlist is Claude's
+    and would reject every LiteLLM id — the cause of the "no configured model"
+    lock). Blank/"default" defers to dsh_model_default at launch. Membership is
+    validated like local_model_member: an empty discovered set can't refute a
+    charset-valid id (discovery may not have landed), and the launch's provider
+    route includes the chosen id explicitly so it is always runnable."""
+    model = (model or "").strip()
+    if not model or model.lower() == "default":
+        return ""
+    if not dsh_model_member(model):
+        raise ValueError(f"dsh model {model!r} is not served by this host")
+    return model
 
 
 def resolve_permission_mode(mode):
@@ -12792,23 +12986,42 @@ class SessionManager:
                 log(f"dsh: installing the driver + guard plugins failed: "
                     f"{(r.stderr or '').strip()[:200]}")
                 return None
-            # 3. Write the profile patch (driver entry + pi-ai route + default +
-            # the guard, configured with the host-fixed deny/allow policy).
-            base_url = DSH_MODEL_BASE_URL.rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url += "/v1"
-            with open(os.path.join(profile_dir, "cordis.patch.yml"), "w",
-                      encoding="utf-8") as f:
-                f.write(_dsh_cordis_patch(DSH_PROVIDER, DSH_MODEL, base_url,
-                                          DSH_MODEL_API_KEY_ENV, DSH_MODEL_CONTEXT,
-                                          guard_config=guard_cfg["plugin"]))
+            # 3. Write the profile patch (driver entry + pi-ai route listing
+            # EVERY discovered model + default + the guard). Rewritten again at
+            # each launch (below), since discovery lands after this boot-time prep.
+            self._write_dsh_cordis_patch(profile_dir, guard_cfg["plugin"])
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             log(f"dsh: profile preparation failed: {e}")
             return None
         self._dsh_profile_ready = DSH_PROFILE
         log(f"dsh: profile {DSH_PROFILE!r} ready under {DSH_HOME} "
-            f"(provider {DSH_PROVIDER}, model {DSH_MODEL})")
+            f"(provider {DSH_PROVIDER}, default model {dsh_model_default()})")
         return DSH_PROFILE
+
+    def _write_dsh_cordis_patch(self, profile_dir, guard_plugin, extra_model=None):
+        """(Re)write the profile's cordis.patch.yml with the pi-ai provider route
+        listing EVERY currently-discovered dsh model (XERK-503). Called at profile
+        prep AND before each dsh launch, because discovery lands after boot — a
+        route written once at startup lists only the pre-discovery default and
+        rejects every model the composer later offered. `extra_model` forces one
+        id into the route (the session's selected model, in case discovery has not
+        yet listed it). Atomic whole-file write; a running dsh read its copy at
+        start, so a rewrite never disturbs it."""
+        base_url = DSH_MODEL_BASE_URL.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url += "/v1"
+        models = list(discovered_dsh_models())
+        if extra_model and not any(m.get("id") == extra_model for m in models):
+            models.append({"id": extra_model,
+                           "contextTokens": dsh_model_context(extra_model)})
+        body = _dsh_cordis_patch(DSH_PROVIDER, models, base_url,
+                                 DSH_MODEL_API_KEY_ENV, dsh_model_default(),
+                                 guard_config=guard_plugin)
+        path = os.path.join(profile_dir, "cordis.patch.yml")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.replace(tmp, path)
 
     # --- Host-wide read-only `dsh web` viewer (XERK-501) ------------------
     # A single supervised `dsh web` per host over the SHARED store, so a dsh
@@ -12970,8 +13183,21 @@ class SessionManager:
         read-only web viewer's {running, port, url} ONLY when it is up. The web
         key is OMITTED when down (dsh off, or the viewer not running) — absent =
         'no dsh web here', the same capability-flag discipline `available` uses,
-        so a pre-viewer agent and a down viewer read identically."""
-        d = {"available": dsh_configured()}
+        so a pre-viewer agent and a down viewer read identically.
+
+        Carries the endpoint's DISCOVERED models (XERK-503) so the composer
+        offers the SAME list a Claude-local session gets when both point at one
+        LiteLLM URL — `models`/`defaultModel`/`contextTokens` mirror the
+        `localModel` block. Empty `models` with a `defaultModel` set is the
+        zero-config / pre-discovery case (a single configured DSH_MODEL)."""
+        available = dsh_configured()
+        default = dsh_model_default() if available else None
+        d = {
+            "available": available,
+            "models": discovered_dsh_models() if available else [],
+            "defaultModel": default,
+            "contextTokens": dsh_model_context(default) if default else None,
+        }
         web = self._dsh_web_payload()
         if web is not None:
             d["web"] = web
@@ -13000,6 +13226,16 @@ class SessionManager:
             # usable here yet. Refuse rather than run the heavy setup on the beat.
             raise RuntimeError("dsh runtime is not ready on this host "
                                "(no model route, plugin unbuilt, or still preparing)")
+        # Refresh the pi-ai provider route to list every CURRENTLY-discovered
+        # model plus this session's chosen one (XERK-503) — discovery lands after
+        # the boot-time profile prep, so a route written only then would reject
+        # any model the composer offered from the discovered list. A fresh dsh
+        # reads these files at process start, so this launch picks up the rewrite;
+        # a running dsh already read its copy and is undisturbed.
+        self._write_dsh_cordis_patch(
+            os.path.join(DSH_HOME, "profiles", profile),
+            self._dsh_guard_config()["plugin"],
+            extra_model=(sess.get("model") or None))
         sid = sess["id"]
         worktree = sess["worktreePath"]
         # 1. Pin the conversation id — it NAMES the projection transcript, exactly
@@ -13075,7 +13311,7 @@ class SessionManager:
             "TURMA_DSH_CWD": worktree,
             "TURMA_DSH_EVENTS": events_path,
             "TURMA_DSH_PROVIDER": DSH_PROVIDER,
-            "TURMA_DSH_MODEL": sess.get("model") or DSH_MODEL,
+            "TURMA_DSH_MODEL": sess.get("model") or dsh_model_default() or DSH_MODEL,
             # Peer messaging (XERK-476): the session's roster NAME is what a peer
             # addresses and what the driver registers its forged Claude-inbox
             # record under; the sessions dir is where that record goes (shared
@@ -13838,10 +14074,17 @@ class SessionManager:
         # or permission mode fails the spawn cleanly whether it runs now or waits
         # in the queue. Model and permission mode apply to root too.
         try:
-            sess["model"] = resolve_model(model, self.models_available())
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
-            sess["modelSource"] = resolve_model_source(model_source)
             sess["agentType"] = resolve_agent_type(agent_type)
+            if sess["agentType"] == "dsh":
+                # A dsh session's model is a DISCOVERED endpoint id, not a Claude
+                # alias, and dsh has no subscription/local split (D5) — so it does
+                # NOT go through resolve_model / resolve_model_source (XERK-503).
+                sess["model"] = resolve_dsh_model(model)
+                sess["modelSource"] = "subscription"
+            else:
+                sess["model"] = resolve_model(model, self.models_available())
+                sess["modelSource"] = resolve_model_source(model_source)
             # Spawning straight onto a CHOSEN local model (XERK-489). Validated
             # like the switch; the launch resolves its served window. Ignored
             # unless this is actually a local spawn.
@@ -21162,6 +21405,10 @@ class SessionManager:
         # heartbeat past OFFLINE_AFTER_MS, the same reason archive-sync/prune
         # moved off-beat (XERK-395). No-op unless base+key are configured.
         start_local_model_discovery()
+        # dsh model discovery (XERK-503): a no-op when dsh shares the local
+        # endpoint (that worker covers it) or has none configured, else its own
+        # off-beat poller so a dsh session offers the endpoint's full model list.
+        start_dsh_model_discovery()
         # Prepare the dsh profile (driver plugin + model route) on a WORKER THREAD
         # when this host offers dsh — the npm/dsh setup is far too heavy for the
         # beat (XERK-395), so a dsh spawn before it finishes is refused and retried

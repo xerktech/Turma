@@ -2869,6 +2869,32 @@ function normalizeDsh(payload) {
     return;
   }
   const out = { available: d.available === true };
+  // The endpoint's discovered dsh models (XERK-503), the exact shape and
+  // coercion as normalizeLocalModel's — [{id, contextTokens|null}], bound the
+  // length first, sanitize each id (drop a nameless row), dedupe. A dsh session
+  // offers this so it isn't locked to one model. `defaultModel` is kept whenever
+  // it sanitizes (see below — unlike localModel's, it may sit outside the list).
+  // Every field is TYPED on Android, so an unusable value must degrade, not
+  // decode-fail the whole fleet array.
+  const models = [];
+  const seen = new Set();
+  if (Array.isArray(d.models)) {
+    for (const m of d.models) {
+      if (models.length >= LOCAL_MODEL_LIST_MAX) break;
+      if (!m || typeof m !== "object" || Array.isArray(m)) continue;
+      const id = sanitizeModelName(m.id);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      models.push({ id, contextTokens: sanitizeContextTokens(m.contextTokens) });
+    }
+  }
+  out.models = models;
+  // Unlike localModel's, a dsh default may legitimately sit OUTSIDE the
+  // discovered list — the zero-config case is a single configured DSH_MODEL with
+  // discovery not landed — so it is kept whenever it sanitizes, not gated on the
+  // list carrying it.
+  out.defaultModel = sanitizeModelName(d.defaultModel) || null;
+  out.contextTokens = sanitizeContextTokens(d.contextTokens);
   // The host-wide read-only `dsh web` viewer (XERK-501, agent `_dsh_web_payload`): kept
   // only when the agent reports it UP, as a whitelisted {running, port, url}.
   // A new sub-key a newer agent adds is dropped unless added here (like every
