@@ -161,7 +161,7 @@ private fun TrajectoryHeader(d: DshTrajectory) {
 }
 
 @Composable
-private fun TurnCard(tn: TrajTurn) {
+internal fun TurnCard(tn: TrajTurn) {
     TurmaCard {
         Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             TrajTags {
