@@ -228,6 +228,27 @@ paths:
     is the wrong home: the raw layer excludes it on purpose (its contents are what prune/delete key
     on), so a native log there is D3's canonical record retained by NOTHING. This reconciles the
     `docs/dsh-session-lifecycle.md` design, which had proposed the worktree.
+  - **A RUNNING dsh session is NOT excluded from the manifest** (`_running_slugs` subtracts
+    `_live_dsh_slugs`), and that exception is what makes the Trajectory work at all. Every other
+    running session is excluded ("sync it once it ends"), but the in-dashboard Trajectory (XERK-498)
+    is the ONLY viewer a headless dsh session has, and it reads the native log back through THIS raw
+    layer — so a running dsh session that did not sync would 404 for its whole life, which is exactly
+    when the operator needs it. So a running dsh session syncs live: its projected `<tid>.jsonl` and
+    its `<tid>/dsh/` native log both ship every beat.
+    - **The rendered layer MUST ship too, not just the raw one.** The raw layer is hung off the
+      rendered `sessions` row: `rawCursors`/`ingestRaw` (`turma/archive.js`) `skip` any transcript
+      with no `filePath`, i.e. one that has never had a rendered chunk. So a raw-only push for a
+      running dsh session would be refused — the projection transcript has to create the row first.
+      This is why the exception is at the SLUG level (both layers) rather than a raw-only carve-out.
+    - **A dsh session's slug is unique to it** (its own worktree), so un-excluding it archives
+      exactly that one session. A ROOT session (shared slug, no worktree) is never included —
+      `_live_dsh_slugs` requires `worktreePath` — so the shared root slug's other transcripts are
+      never dragged in.
+    - Accepted minor effect: a running dsh session now has an archive row, so it can appear in the
+      archive BROWSER (`GET /api/archive`) / hub search while still running. The Ended-sessions
+      SIDEBAR does not show it (it dedupes against running `transcriptId`s), and Restore refuses a
+      running conversation, so this is cosmetic. Tests:
+      `test_manifest_keeps_a_running_dsh_session_so_its_trajectory_populates`.
   - **Only APPEND-ONLY bytes belong under `<tid>/dsh/`.** The per-file cursor ships bytes past an
     offset — correct for dsh's event-sourced JSONL log, wrong for a page-mutating SQLite (an in-place
     rewrite leaves the archived early bytes stale). dsh's SQLite is a derived index it rebuilds from

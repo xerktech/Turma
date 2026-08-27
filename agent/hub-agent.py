@@ -17377,12 +17377,37 @@ class SessionManager:
 
     def _running_slugs(self):
         """Project slugs backing a currently-RUNNING session — excluded from the
-        archive (their transcript is still being written; sync it once it ends)."""
+        archive (their transcript is still being written; sync it once it ends).
+
+        A running DSH session is the one exception (`_live_dsh_slugs`): its native
+        event log is the ONLY viewer a headless dsh session has (there is no ttyd —
+        XERK-498), and the in-dashboard Trajectory reads that log back through the
+        raw archive layer. So it must sync WHILE it runs, or the Trajectory 404s for
+        the whole life of the session — which is exactly when the operator wants it.
+        Excluding it here (as every other running session is) is what breaks that."""
+        return self._running_slugs_all() - self._live_dsh_slugs()
+
+    def _running_slugs_all(self):
+        """Every project slug backing a running session, dsh included."""
         slugs = set()
         for s in self.registry:
             if s.get("status") != "running":
                 continue
             wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
+            if wt:
+                slugs.add(_project_slug(wt))
+        return slugs
+
+    def _live_dsh_slugs(self):
+        """Slugs backing a running dsh session with its OWN worktree — the ones the
+        archive keeps syncing while running so the Trajectory populates live. A dsh
+        session's worktree is unique to it, so a slug here backs only that session;
+        a root session (shared slug, no worktree) is deliberately never included."""
+        slugs = set()
+        for s in self.registry:
+            if s.get("status") != "running" or s.get("agentType") != "dsh":
+                continue
+            wt = s.get("worktreePath")
             if wt:
                 slugs.add(_project_slug(wt))
         return slugs
