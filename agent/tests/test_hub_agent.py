@@ -15951,10 +15951,10 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
         start.assert_not_called()  # never a claude -p for a dsh session
         self.assertEqual(sm.registry[0]["summary"], "Adding Compose Flag")
 
-    def test_dsh_session_without_title_yet_waits(self):
-        # No `session/title` event has landed yet (dsh derives it from the first
-        # user turn): the session stays unnamed and NO attempt is spent / no
-        # claude -p runs — it is looked at again next beat.
+    def test_dsh_session_without_title_or_prompt_yet_waits(self):
+        # No `session/title` AND no prompt in the transcript yet (a bare dsh spawn
+        # before its first turn): nothing to name it from, so it stays unnamed and
+        # NO attempt is spent / no claude -p runs — looked at again next beat.
         sm = self.make_manager()
         sm.registry = [self._session(agentType="dsh")]
         sm.dsh_tails = {"abcde": self._Tail(None)}
@@ -15963,8 +15963,32 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
         start.assert_not_called()
         self.assertIsNone(sm.registry[0]["summary"])
         # dsh spends no claude summary attempts, so it keeps its full retry budget
-        # until dsh's own title actually arrives.
+        # until it has something to name it from.
         self.assertEqual(sm.registry[0].get("summaryAttempts", 0), 0)
+
+    def test_dsh_names_from_first_prompt_when_dsh_emits_no_title(self):
+        # The reported "titles never reach the card" case: dsh emits NO
+        # `session/title` at all (an older dsh, a title-route failure, a profile
+        # without the title plugin), so the tail has no title. The card must still
+        # be named — provisionally, from the first user prompt in the projected
+        # transcript, the SAME source a Claude session uses — never left blank, and
+        # never a claude -p (a dsh host has no summarizer).
+        sm = self.make_manager()
+        sess = self._session(agentType="dsh")
+        sm.registry = [sess]
+        sm.dsh_tails = {"abcde": self._Tail(None)}   # dsh wrote no title
+        self._transcript("Add a docker compose flag to the widget")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()
+        self.assertEqual(sess["summary"],
+                         "Add a docker compose flag to the widget"[:ha.SUMMARY_MAX_CHARS])
+        self.assertTrue(sess.get("summaryProvisional"))
+        # If dsh LATER emits its generated title, it overrides the prompt name.
+        sm.dsh_tails = {"abcde": self._Tail("Compose Flag on Widget")}
+        sm._seed_summaries()
+        self.assertEqual(sess["summary"], "Compose Flag on Widget")
+        self.assertNotIn("summaryProvisional", sess)
 
     def test_dsh_fallback_title_is_provisional_then_upgraded(self):
         # dsh writes the crude FALLBACK title (a slice of the raw prompt) the

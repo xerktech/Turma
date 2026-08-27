@@ -116,15 +116,25 @@ is `.claude/rules/dsh.md` [D]). The tail (`dsh_session.py`) captures `data.title
 - **`title()` returns the latest; `title_final()` says whether it is the generated one** — any
   non-`fallback` source (`provider`/`user`, or a missing source) reads as final. Both are set
   together on each `session/title` event; a `fallback` reads non-final.
-- **`_seed_dsh_summary` applies a fallback only PROVISIONALLY (`summaryProvisional`) and OVERRIDES
-  that with the generated title.** It runs BEFORE the `_summary_due` gate (which returns False the
-  moment `summary` is set, and so never re-checks once named) — that ordering is what lets a later
-  beat replace the fallback. A `final` title is applied/kept in sync (a no-op once equal, so it does
-  not re-save every beat) and drops the provisional flag; a fallback is applied only when nothing is
-  named. **Pinning the fallback forever was the bug** — "the generated title is never pulled".
-  - **The override is SCOPED to this seeder's own provisional fallback — it never clobbers a name
-    from another source.** A TICKET session's `<key> <summary>` (set at record-build with
-    `summaryManual` unset), a migrated name, or an operator rename (`summaryManual`) all read as
+- **`_seed_dsh_summary` names in THREE tiers, weakest first, a later one overriding an earlier**, and
+  runs BEFORE the `_summary_due` gate (which returns False the moment `summary` is set, and so never
+  re-checks once named) — that ordering is what lets a later beat replace a weaker name:
+  - **Tier 1 — dsh's GENERATED title** (`session/title`, `source.kind != "fallback"`): authoritative,
+    applied/kept in sync (a no-op once equal, so it does not re-save every beat) and drops the
+    provisional flag.
+  - **Tier 2 — dsh's deterministic FALLBACK title** (`source.kind == "fallback"`): the crude slice of
+    the raw prompt dsh writes as the first turn starts, before its title-llm returns. Provisional.
+  - **Tier 3 — the first user PROMPT** from the projected transcript (`_first_user_text`, capped by
+    `clean_manual_summary`): the SAME source a Claude session is named from. Provisional. **This tier
+    is what keeps the card from going blank when dsh emits NO `session/title` at all** — an older dsh,
+    a title-route failure, a profile without the title plugin. XERK-460's first cut named dsh sessions
+    ONLY from tiers 1/2 and took no `claude -p`, so a dsh session on such a host had no name on any
+    beat: the reported "titles never reach the card". A dsh host still spends no Claude summarizer turn.
+  - **Pinning tier 2 forever was a separate bug** — "the generated title is never pulled" — which the
+    tier-1 override fixes.
+  - **The override is SCOPED to this seeder's own PROVISIONAL name (`summaryProvisional`) — it never
+    clobbers a name from another source.** A TICKET session's `<key> <summary>` (set at record-build
+    with `summaryManual` unset), a migrated name, or an operator rename (`summaryManual`) all read as
     non-provisional and are left alone, so a dsh ticket session keeps its ticket name exactly as a
     Claude one does (`.claude/rules/agent-board.md`). Guarding only `summaryManual` — and thus
     clobbering the ticket name — was a first-cut regression caught in QA.

@@ -257,9 +257,9 @@ not undo:
   (not a transcript entry); the projection tail (`dsh_session.py`) captures `data.title`, and
   `_seed_dsh_summary` names the session from it on the beat. `_start_summary` refuses a
   `agentType=="dsh"` session, so no Claude summarizer turn is spent on a runtime with no Claude login.
-  - dsh writes TWO `session/title` events (a crude `fallback` then the real generated one); the
-    seeder applies the fallback provisionally and overrides it with the generated title. Mechanics
-    in `.claude/rules/dsh-input.md`.
+  - `_seed_dsh_summary` names in three tiers — dsh's generated `session/title`, else its fallback
+    title, else the first prompt — so the card is never blank when dsh emits no title, and a
+    generated title overrides a provisional one. Mechanics in `.claude/rules/dsh-input.md`.
 - **`dsh_pane_busy` is a tri-state and deliberately NOT time-expired.** running→True, idle→False,
   unknown/missing→None ("can't tell", so downstream falls back to transcript freshness exactly like an
   uncapturable Claude pane). A pending interaction reads False (blocked on a human, not its own turn —
