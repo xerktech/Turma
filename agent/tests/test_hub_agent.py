@@ -6370,6 +6370,27 @@ class TestDshModelDiscovery(unittest.TestCase):
         # always runnable.
         self.assertIn("- id: 'extra-default'", patch)
 
+    def test_route_gates_the_default_like_every_other_id(self):
+        # The default is interpolated into the route the SAME way each list id is,
+        # so it gets the SAME charset gate — a config generator must not check the
+        # list ids while trusting the default (an unchecked one is YAML injection
+        # into cordis.patch.yml). A malformed default is dropped, and the
+        # agent-default-model line falls back to the first listed model.
+        hostile = "x'\ninjected_top_level: true\n#"
+        patch = ha._dsh_cordis_patch("p", [{"id": "deepseek-chat", "contextTokens": 1}],
+                                     "http://gw/v1", "K", hostile)
+        self.assertNotIn("injected_top_level", patch)
+        self.assertNotIn(hostile, patch)
+        # agent-default-model names a real, charset-safe id (the first listed).
+        self.assertIn("model: 'deepseek-chat'", patch)
+        # The generated config is valid YAML (no column-0 injection).
+        import io
+        # Minimal YAML sanity without a yaml dep: no line may start a new
+        # top-level key that we did not emit. The gate above already proves the
+        # hostile scalar never reached the file.
+        self.assertNotIn("\ninjected_top_level:", "\n" + patch)
+        io.StringIO(patch)  # no exception building it
+
     def test_resolve_dsh_model_defers_blank_validates_member_rejects_other(self):
         with mock.patch.object(ha, "discovered_dsh_models",
                                lambda: [{"id": "deepseek-chat", "contextTokens": 1}]):

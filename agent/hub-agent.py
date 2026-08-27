@@ -1295,9 +1295,17 @@ def _dsh_cordis_patch(provider, models, base_url, api_key_env, default_model,
         if not (isinstance(ctx, int) and 0 < ctx <= MAX_LOCAL_MODEL_CONTEXT):
             ctx = DSH_MODEL_CONTEXT
         model_rows.append((mid, ctx))
-    if default_model and default_model not in seen:
-        model_rows.append((default_model, DSH_MODEL_CONTEXT))
-        seen.add(default_model)
+    # The default is interpolated into the route the SAME way each list id is, so
+    # it gets the SAME charset gate — the callers pass a validated value today, but
+    # a config generator must not trust one interpolated value while checking the
+    # rest (an unchecked id here is YAML injection into cordis.patch.yml). An
+    # invalid/empty default falls back to the first listed model, so the
+    # agent-default-model line always names a real, charset-safe id.
+    valid_default = default_model if (default_model and DSH_IDENT_RE.fullmatch(default_model)) else ""
+    if valid_default and valid_default not in seen:
+        model_rows.append((valid_default, DSH_MODEL_CONTEXT))
+        seen.add(valid_default)
+    effective_default = valid_default or (model_rows[0][0] if model_rows else "")
     models_yaml = "".join(
         f"          - id: '{mid}'\n"
         f"            contextWindow: {int(ctx)}\n"
@@ -1359,7 +1367,7 @@ def _dsh_cordis_patch(provider, models, base_url, api_key_env, default_model,
         "  name: '@deepseek-ai/dsh-agent-default-model'\n"
         "  config:\n"
         f"    provider: '{provider}'\n"
-        f"    model: '{default_model}'\n"
+        f"    model: '{effective_default}'\n"
     )
 
 # --- endpoint model discovery (XERK-489) ----------------------------------

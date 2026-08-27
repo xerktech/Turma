@@ -2872,10 +2872,10 @@ function normalizeDsh(payload) {
   // The endpoint's discovered dsh models (XERK-503), the exact shape and
   // coercion as normalizeLocalModel's — [{id, contextTokens|null}], bound the
   // length first, sanitize each id (drop a nameless row), dedupe. A dsh session
-  // offers this so it isn't locked to one model. `defaultModel` must be one the
-  // sanitized list carries (else the composer would preselect an unshowable id),
-  // falling back to null. Every field is TYPED on Android, so an unusable value
-  // must degrade, not decode-fail the whole fleet array.
+  // offers this so it isn't locked to one model. `defaultModel` is kept whenever
+  // it sanitizes (see below — unlike localModel's, it may sit outside the list).
+  // Every field is TYPED on Android, so an unusable value must degrade, not
+  // decode-fail the whole fleet array.
   const models = [];
   const seen = new Set();
   if (Array.isArray(d.models)) {
