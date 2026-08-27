@@ -133,7 +133,10 @@ class AgentDecodeTest {
         val body = """
             { "now": 1, "agents": [
               { "key": "on", "device": "on", "online": true,
-                "dsh": { "available": true },
+                "dsh": { "available": true, "defaultModel": "deepseek-chat",
+                         "contextTokens": 128000,
+                         "models": [ { "id": "deepseek-chat", "contextTokens": 128000 },
+                                     { "id": "qwen3-coder", "contextTokens": 32768 } ] },
                 "sessions": [ { "id": "s1", "agentType": "dsh" } ] },
               { "key": "off", "device": "off", "online": true,
                 "dsh": { "available": false },
@@ -144,6 +147,13 @@ class AgentDecodeTest {
         """.trimIndent()
         val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
         assertEquals(true, resp.agents[0].dsh?.available)
+        // XERK-503: the discovered dsh model list decodes (typed like localModel's).
+        assertEquals("deepseek-chat", resp.agents[0].dsh?.defaultModel)
+        assertEquals(128000, resp.agents[0].dsh?.contextTokens)
+        assertEquals(
+            listOf("deepseek-chat", "qwen3-coder"),
+            resp.agents[0].dsh?.models?.map { it.id },
+        )
         assertEquals("dsh", resp.agents[0].sessions[0].agentType)
         assertEquals(false, resp.agents[1].dsh?.available)
         assertEquals("claude", resp.agents[1].sessions[0].agentType)

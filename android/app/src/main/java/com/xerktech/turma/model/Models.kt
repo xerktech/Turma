@@ -220,11 +220,20 @@ data class AgentInfo(
 
 /**
  * A host's dsh-runtime capability (hub-agent's `dsh` block). Mirrors
- * [LocalModelInfo]'s role: [available] is the whole flag the composer gates on.
+ * [LocalModelInfo]'s role: [available] is the flag the composer gates on.
+ *
+ * [models] + [defaultModel]/[contextTokens] are the XERK-503 additions: the dsh
+ * endpoint's DISCOVERED models (each with its window) and the default, so a dsh
+ * session offers the same live model list a Claude-local session does instead of
+ * being locked to one id. The hub bounds and coerces them (`normalizeDsh`), so
+ * this decode is safe against a rogue host.
  */
 @Serializable
 data class DshInfo(
     val available: Boolean = false,
+    val models: List<LocalModelOption> = emptyList(),
+    val defaultModel: String? = null,
+    val contextTokens: Int? = null,
 )
 
 /**

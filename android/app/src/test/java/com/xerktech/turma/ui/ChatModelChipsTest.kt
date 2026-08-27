@@ -84,7 +84,7 @@ class ChatModelChipsTest {
             modelSource = "subscription",
             localModel = """{"available":true,"model":"qwen3-coder","contextTokens":128000}""",
         )
-        compose.onNodeWithText("☁ run: Subscription").assertIsDisplayed()
+        compose.onNodeWithText("☁ run: Claude Code").assertIsDisplayed()
     }
 
     /**
@@ -95,15 +95,16 @@ class ChatModelChipsTest {
     @Test
     fun `the run chip stays for a local session whose host stopped reporting one`() {
         openChat(modelSource = "local", localModel = null)
-        // The source chip reads "Other" (the model is named in the model chip).
-        compose.onNodeWithText("🏠 run: Other").assertIsDisplayed()
+        // The runtime chip reads the composer's runtime name (XERK-504); the
+        // model is named in the model chip, not here.
+        compose.onNodeWithText("🏠 run: Claude Code Local").assertIsDisplayed()
     }
 
     /** No capability, no session on it — no chip. */
     @Test
     fun `no run chip when neither the host nor the session has a local model`() {
         openChat(modelSource = "subscription", localModel = null)
-        compose.onNodeWithText("☁ run: Subscription").assertDoesNotExist()
+        compose.onNodeWithText("☁ run: Claude Code").assertDoesNotExist()
     }
 
     /**
@@ -151,5 +152,64 @@ class ChatModelChipsTest {
             localModel = """{"available":true,"model":"qwen3-coder","contextTokens":128000}""",
         )
         compose.onNodeWithText("model: default").assertIsDisplayed()
+    }
+
+    /** Seed a dsh session and open its chat (XERK-504 footer). */
+    private fun openDshChat(dsh: String, sessionModel: String) {
+        hub.json(
+            "/api/agents/$host/sessions/$session/history",
+            """{"entries":[],"truncated":false,"pending":false}""",
+        )
+        hub.json("/api/ws-token", """{"token":"t"}""")
+        hub.seedFleet(
+            HubHarness.fleetJson(
+                host = host, dsh = dsh,
+                sessions = """{ "id": "$session", "repo": "Turma", "status": "running",
+                                "worktree": "wt", "agentType": "dsh",
+                                "model": "$sessionModel", "modelSource": "subscription" }""",
+            )
+        )
+        compose.setContent {
+            ChatScreen(host = host, sessionId = session, onBack = {}, onTerminal = {})
+        }
+        compose.waitForIdle()
+    }
+
+    /**
+     * XERK-504: a dsh session's footer reflects its RUNTIME, not the Claude
+     * subscription/local split. It shows a read-only "⚙ dsh" chip, a live dsh
+     * model dropdown of the host's discovered models, and NO permission-mode chip
+     * (dsh manages approvals itself). It must NEVER read "Claude Code" or offer
+     * the Claude alias picker.
+     */
+    @Test
+    fun `a dsh session shows the dsh runtime chip and its discovered model dropdown`() {
+        openDshChat(
+            dsh = """{"available":true,"defaultModel":"deepseek-chat",
+                "models":[{"id":"deepseek-chat","contextTokens":128000},
+                          {"id":"qwen3-coder","contextTokens":32768}]}""",
+            sessionModel = "deepseek-chat",
+        )
+        // The read-only runtime chip, matching the web footer's "⚙ dsh".
+        compose.onNodeWithText("⚙ dsh").assertIsDisplayed()
+        // The dsh model dropdown lists the discovered ids with windows.
+        compose.onNodeWithText("model: deepseek-chat · 128k").assertIsDisplayed()
+        compose.onNodeWithText("model: deepseek-chat · 128k").performClick()
+        compose.onNodeWithText("qwen3-coder · 33k").assertIsDisplayed()
+        // NOT the Claude subscription/local chip, and no permission-mode chip.
+        compose.onNodeWithText("☁ run: Claude Code").assertDoesNotExist()
+        compose.onNodeWithText("mode: auto").assertDoesNotExist()
+    }
+
+    /** With no discovered dsh list the model chip degrades to a fixed read-only
+     *  label, never a broken dropdown. */
+    @Test
+    fun `a dsh session with no discovered list shows a fixed model label`() {
+        openDshChat(
+            dsh = """{"available":true,"defaultModel":"deepseek-v4-flash","models":[]}""",
+            sessionModel = "deepseek-v4-flash",
+        )
+        compose.onNodeWithText("⚙ dsh").assertIsDisplayed()
+        compose.onNodeWithText("model: deepseek-v4-flash").assertIsDisplayed()
     }
 }

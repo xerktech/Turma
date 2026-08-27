@@ -2,6 +2,9 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.DshInfo
+import com.xerktech.turma.model.LocalModelInfo
+import com.xerktech.turma.model.LocalModelOption
+import com.xerktech.turma.model.SessionInfo
 
 /**
  * Which runtime a session runs on, and how the spawn composer offers the choice
@@ -13,6 +16,35 @@ object Runtime {
 
     const val CLAUDE = "claude"
     const val DSH = "dsh"
+
+    // The spawn composer collapses the old Runtime (claude/dsh) + "Run against"
+    // (subscription/local) pair into ONE Runtime picker (XERK-503), matching web
+    // `sessions.html`. Its three values map onto the existing agentType/modelSource
+    // wire fields (spawnAgentType/spawnModelSource), so the backend contract for
+    // the claude/local split is unchanged. LOCAL is a UI-only runtime value here,
+    // distinct from an `agentType` (which is only ever "claude"/"dsh").
+    const val LOCAL = "local"
+
+    /**
+     * The composer's Runtime rows: "Claude Code" always, "Claude Code Local" when
+     * the host reports a local endpoint, "dsh" when it offers dsh. The caller
+     * shows the picker only when there is more than one row (a plain subscription
+     * host has one runtime, so nothing to choose).
+     */
+    fun composerRuntimes(local: LocalModelInfo?, dsh: DshInfo?): List<Pair<String, String>> =
+        buildList {
+            add(CLAUDE to "Claude Code")
+            if (local?.available == true) add(LOCAL to "Claude Code Local")
+            if (dsh?.available == true) add(DSH to "dsh")
+        }
+
+    /** The `agentType` a chosen composer runtime spawns as, or null to omit it
+     *  (only "dsh" is ever sent; "claude"/"local" are Claude sessions). */
+    fun spawnAgentType(runtime: String): String? = if (runtime == DSH) DSH else null
+
+    /** The `modelSource` a chosen composer runtime spawns as, or null to omit it
+     *  (only "local" is sent; a bare/dsh spawn carries no source). */
+    fun spawnModelSource(runtime: String): String? = if (runtime == LOCAL) LOCAL else null
 
     /**
      * Should the spawn composer offer a "Runtime" row at all? Gated on the
@@ -49,4 +81,45 @@ object Runtime {
      * the field, which reports "") gets none, so the common card is unchanged.
      */
     fun isDsh(agentType: String?): Boolean = agentType == DSH
+
+    // ---- dsh model list (XERK-503/504) --------------------------------------
+    // A dsh session offers the endpoint's DISCOVERED models (DshInfo.models), not
+    // Claude aliases — the same shape [ModelSource]'s local helpers use, so the
+    // spawn composer and the chat footer render a dsh model dropdown the same way
+    // they render the local one.
+
+    /** The discovered dsh models, or empty for an older agent / pre-discovery. */
+    fun dshModels(dsh: DshInfo?): List<LocalModelOption> = dsh?.models ?: emptyList()
+
+    /** Is there a discovered dsh list to pick from? Empty keeps a fixed label. */
+    fun dshModelPickable(dsh: DshInfo?): Boolean = dshModels(dsh).isNotEmpty()
+
+    /** The dsh model this session runs: its stored pick, else the host default. */
+    fun currentDshModel(session: SessionInfo?, dsh: DshInfo?): String =
+        session?.model?.takeIf { it.isNotBlank() }
+            ?: dsh?.defaultModel?.takeIf { it.isNotBlank() }
+            ?: ""
+
+    /** "128k"-style short window, matching [ModelSource.fmtCtx]. */
+    private fun fmtCtx(n: Int?): String = ModelSource.fmtCtx(n)
+
+    /** Menu rows for the dsh dropdown as (id, "id · 128k") pairs. */
+    fun dshOptions(dsh: DshInfo?): List<Pair<String, String>> =
+        dshModels(dsh).map { m ->
+            val k = fmtCtx(m.contextTokens)
+            m.id to (m.id + if (k.isNotEmpty()) " · $k" else "")
+        }
+
+    /** The chip label for a dsh session: its model + window (dsh has no
+     *  per-session context override, so the window is the model's served one). */
+    fun dshModelLabel(session: SessionInfo?, dsh: DshInfo?): String {
+        val id = currentDshModel(session, dsh).ifBlank { "dsh model" }
+        val ctx = dshModels(dsh).firstOrNull { it.id == id }?.contextTokens ?: dsh?.contextTokens
+        val k = fmtCtx(ctx)
+        return if (k.isNotEmpty()) "$id · $k" else id
+    }
+
+    /** The dsh runtime capability of the host a chat session runs on. */
+    fun hostDshFor(agents: List<AgentInfo>, host: String): DshInfo? =
+        agents.firstOrNull { it.key == host }?.dsh
 }

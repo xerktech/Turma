@@ -269,6 +269,7 @@ fun ChatScreen(
                     onModel = vm::setModel,
                     onMode = vm::setMode,
                     localModel = state.localModel,
+                    dsh = state.dsh,
                     modelSource = state.modelSource(),
                     canSwitchModelSource = state.canSwitchModelSource(),
                     onModelSource = vm::setModelSource,
@@ -590,6 +591,7 @@ private fun ChatFooter(
     onModel: (String) -> Unit,
     onMode: (String) -> Unit,
     localModel: com.xerktech.turma.model.LocalModelInfo?,
+    dsh: com.xerktech.turma.model.DshInfo?,
     modelSource: String,
     canSwitchModelSource: Boolean,
     onModelSource: (String) -> Unit,
@@ -610,6 +612,32 @@ private fun ChatFooter(
         // shows (newest first — the freshest link leads), matching the web footer
         // chip (chat.js prFooterChip); FlowRow wraps them on a narrow phone.
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+          // A dsh session runs a DIFFERENT runtime, not the Claude subscription/
+          // local split (XERK-504): a read-only "⚙ dsh" runtime chip (a dsh
+          // conversation can't switch to a Claude runtime live) + a live dropdown
+          // of the host's DISCOVERED dsh models, and NO permission-mode chip (dsh
+          // manages its own approvals).
+          if (com.xerktech.turma.core.Runtime.isDsh(session?.agentType)) {
+            if (com.xerktech.turma.core.Runtime.dshModelPickable(dsh)) {
+                val dopts = com.xerktech.turma.core.Runtime.dshOptions(dsh)
+                MenuChip(
+                    label = "model: " + com.xerktech.turma.core.Runtime.dshModelLabel(session, dsh),
+                    options = dopts.map { it.first },
+                    onSelect = onModel,
+                    optionLabel = { v -> dopts.firstOrNull { it.first == v }?.second ?: v },
+                    accent = true,
+                )
+            } else {
+                StaticChip(
+                    "model: ${com.xerktech.turma.core.Runtime.currentDshModel(session, dsh).ifBlank { "dsh model" }}",
+                    why = "This host's dsh model. Its model list has not been discovered yet.",
+                )
+            }
+            // The runtime chip: read-only, matching the web footer's "⚙ dsh".
+            StaticChip("⚙ dsh", why = "Runs on the dsh (DeepSeek Harness) runtime, not Claude Code")
+            session?.prs?.asReversed()?.forEach { PrBadge(it) }
+            return@FlowRow
+          }
             // On the local model the Claude alias picker is useless — every alias
             // it offers is one that endpoint refuses. Instead a LOCAL session
             // picks from the endpoint's DISCOVERED models (XERK-489), a live

@@ -81,6 +81,10 @@ data class ChatUiState(
     // off it. Null localModel = its agent can't fail over, which is what hides
     // the "run against" chip rather than offering a command the host would drop.
     val localModel: com.xerktech.turma.model.LocalModelInfo? = null,
+    // This host's dsh runtime + its discovered models (XERK-504), so a dsh
+    // session's footer shows a live dsh model dropdown instead of the Claude
+    // subscription/local chips. Null = not a dsh host (the common case).
+    val dsh: com.xerktech.turma.model.DshInfo? = null,
     val modelSourcePending: ModelSource.Pending? = null,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
@@ -122,6 +126,7 @@ data class ChatUiState(
         tunnelOnline = tunnelOnlineOf(agent),
         uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
         localModel = agent?.localModel,
+        dsh = agent?.dsh,
     )
 }
 

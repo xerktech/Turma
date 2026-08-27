@@ -94,7 +94,7 @@ class SessionsPaneSpawnTest {
     @Test
     fun `the composer offers the target host's self-hosted model`() {
         openComposer(targetHasModel = true)
-        compose.onNodeWithText("Run against").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Runtime").performScrollTo().assertIsDisplayed()
     }
 
     /** It does not, so the row is hidden rather than shown-and-refused. */
@@ -102,7 +102,7 @@ class SessionsPaneSpawnTest {
     fun `the composer hides the row for a host reporting none`() {
         openComposer(targetHasModel = false)
         compose.onNodeWithText("Permission mode").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Run against").assertDoesNotExist()
+        compose.onNodeWithText("Runtime").assertDoesNotExist()
     }
 
     /**

@@ -167,12 +167,13 @@ object ModelSource {
         agents.firstOrNull { it.key == host }?.localModel
 
     /**
-     * Human label for a source. The selector is subscription vs the host's own
-     * endpoint; it does NOT name the model (the adjacent model dropdown does, and
-     * the raw discovered id is noise here), so a local source reads "Other".
+     * Human label for a source — the composer's Runtime names (XERK-504), so the
+     * chat footer reads like the spawn composer's Runtime picker. It does NOT
+     * name the model (the adjacent model dropdown does, and the raw discovered id
+     * is noise here).
      */
     fun label(source: String, local: LocalModelInfo?): String =
-        if (source == LOCAL) "Other" else "Subscription"
+        if (source == LOCAL) "Claude Code Local" else "Claude Code"
 
     /**
      * The chip's leading glyph, matching the web's ☁ / 🏠 (`chat.js`). It is the
@@ -181,11 +182,12 @@ object ModelSource {
      */
     fun glyph(source: String): String = if (source == LOCAL) "🏠" else "☁"
 
-    /** Menu rows as (value, label) pairs, in the web menu's order. */
+    /** Menu rows as (value, label) pairs, in the web menu's order — the
+     *  composer's Runtime names (XERK-504). */
     fun options(local: LocalModelInfo?): List<Pair<String, String>> =
         listOf(
-            SUBSCRIPTION to "Claude subscription",
-            LOCAL to "Other",
+            SUBSCRIPTION to "Claude Code",
+            LOCAL to "Claude Code Local",
         )
 
     /**
