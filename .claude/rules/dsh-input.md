@@ -102,6 +102,42 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
   `self.dsh_status`; [C] does not wire the six "Working" mirrors. The guard equivalent is [F]
   (XERK-470); [C] owns only the AskUserQuestion side of `agent-hooks.md`.
 
+## Session naming — dsh's OWN title, and the two-title race
+
+A dsh session is named from dsh's `session/title` event, never a `claude -p` summary (the decision
+is `.claude/rules/dsh.md` [D]). The tail (`dsh_session.py`) captures `data.title`; `_seed_dsh_summary`
+(`hub-agent.py`) applies it on the beat. The trap the read side MUST handle:
+
+- **dsh writes TWO `session/title` events for one session.** A crude `source.kind=="fallback"` slice
+  of the raw prompt lands the instant the first turn starts (an immediate deterministic name), then
+  the real `source.kind=="provider"` title lands once dsh's title-llm call returns — a separate short
+  LLM call that can outlast one `INTERVAL` (20s) on a busy/slow local model. Verified against real
+  dsh 0.1.1-rc.2: a `bash`-tool turn produced `fallback` at seq 10 and `provider` at seq 54.
+- **`title()` returns the latest; `title_final()` says whether it is the generated one** — any
+  non-`fallback` source (`provider`/`user`, or a missing source) reads as final. Both are set
+  together on each `session/title` event; a `fallback` reads non-final.
+- **`_seed_dsh_summary` applies a fallback only PROVISIONALLY (`summaryProvisional`) and OVERRIDES
+  that with the generated title.** It runs BEFORE the `_summary_due` gate (which returns False the
+  moment `summary` is set, and so never re-checks once named) — that ordering is what lets a later
+  beat replace the fallback. A `final` title is applied/kept in sync (a no-op once equal, so it does
+  not re-save every beat) and drops the provisional flag; a fallback is applied only when nothing is
+  named. **Pinning the fallback forever was the bug** — "the generated title is never pulled".
+  - **The override is SCOPED to this seeder's own provisional fallback — it never clobbers a name
+    from another source.** A TICKET session's `<key> <summary>` (set at record-build with
+    `summaryManual` unset), a migrated name, or an operator rename (`summaryManual`) all read as
+    non-provisional and are left alone, so a dsh ticket session keeps its ticket name exactly as a
+    Claude one does (`.claude/rules/agent-board.md`). Guarding only `summaryManual` — and thus
+    clobbering the ticket name — was a first-cut regression caught in QA.
+- **Cost of a manager restart mid-naming**: `_reattach_dsh` restarts the tail at the log's EOF
+  (`resume=True`), so a `session/title` written before the restart is behind EOF and not re-read. A
+  session named provisionally just before an in-place update keeps the fallback until dsh writes a
+  fresh title. Narrow (the seconds between the two title events) and self-heals on any later title.
+- Guarded on the beat (the agent's MAIN process): a sibling-module skew where `hub-agent.py` calls
+  `title()`/`title_final()` on an OLD `dsh_session.py` degrades to "unnamed this beat", never a
+  fleet-wide crash (the XERK-395/402 contract). Tests:
+  `test_dsh_fallback_title_is_provisional_then_upgraded`/`test_dsh_generated_title_lands_first_no_provisional`
+  (hub), `test_title_final_*`/`test_captures_dsh_auto_title_*` (`test_dsh_session.py`).
+
 ## Pitfalls (each cost real time; do not re-learn)
 
 - **A BOUND control socket is not proof the session is alive** (XERK-492). The driver binds the

@@ -355,6 +355,37 @@ class DshProjectionTailTest(unittest.TestCase):
         self.tail._pump()
         self.assertIsNone(self.tail.title())
 
+    def test_title_final_distinguishes_fallback_from_generated(self):
+        # dsh writes a crude `source.kind=="fallback"` title the instant the first
+        # turn starts, then the real `source.kind=="provider"` one once its
+        # title-llm returns. title_final() lets _seed_summaries name the card from
+        # the fallback only provisionally and still override it with the generated
+        # title — the fix for 'the generated title is never pulled'.
+        self._append_event({
+            "type": "session/title", "seq": 1, "time": 1_700_000_000_000,
+            "data": {"title": "add a compose flag to",
+                     "source": {"kind": "fallback"}, "messageSeqs": [1]}})
+        self.tail._pump()
+        self.assertEqual(self.tail.title(), "add a compose flag to")
+        self.assertFalse(self.tail.title_final())  # fallback is provisional
+        self._append_event({
+            "type": "session/title", "seq": 5, "time": 1_700_000_000_001,
+            "data": {"title": "Add Compose Flag to Widget",
+                     "source": {"kind": "provider"}, "messageSeqs": [1]}})
+        self.tail._pump()
+        self.assertEqual(self.tail.title(), "Add Compose Flag to Widget")
+        self.assertTrue(self.tail.title_final())  # generated title is authoritative
+
+    def test_title_with_no_source_reads_as_final(self):
+        # A `session/title` with no readable source is treated as final (not the
+        # provisional fallback), so an unusual dsh build still names the session.
+        self._append_event({
+            "type": "session/title", "seq": 1, "time": 1_700_000_000_000,
+            "data": {"title": "Some Title", "messageSeqs": [1]}})
+        self.tail._pump()
+        self.assertEqual(self.tail.title(), "Some Title")
+        self.assertTrue(self.tail.title_final())
+
 
 class DshDelegationTailTest(unittest.TestCase):
     """XERK-474 [J]: the tail turns a dsh session's delegation events + captured

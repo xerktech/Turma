@@ -399,6 +399,17 @@ class DshProjectionTail:
         # dsh's OWN title rather than a `claude -p` call (a title is NOT a
         # transcript entry, so it is captured here in the tail, never projected).
         self._title = None
+        # Whether that latest title is dsh's GENERATED (or user-set) one rather
+        # than its deterministic FALLBACK. dsh writes two `session/title` events
+        # for one session: a crude `source.kind=="fallback"` slice of the raw
+        # prompt the instant the first turn starts, then the real
+        # `source.kind=="provider"` title once its title-llm call returns. The
+        # seeder must be able to tell them apart so a beat landing between the two
+        # (the title-llm can be slower than one INTERVAL on a busy local model)
+        # names the session from the fallback only PROVISIONALLY and still pulls
+        # the generated title when it lands. Any non-"fallback" source (provider /
+        # user / a missing source) reads as final.
+        self._title_final = False
         # Per-child tail state: childId -> {"proj","offset","partial","dest"}.
         self._children = {}
         # childIds we projected a top-level Agent launch for, so one later claimed
@@ -422,6 +433,13 @@ class DshProjectionTail:
         None until the driver has written one. Read on the beat by _seed_summaries
         so a dsh session is named from dsh's own title instead of a claude -p."""
         return self._title
+
+    def title_final(self):
+        """Whether the latest title (`title()`) is dsh's GENERATED / user-set one
+        rather than its deterministic fallback slice of the raw prompt. False
+        while only the fallback has arrived, so _seed_summaries can apply that
+        fallback provisionally yet still override it with the generated title."""
+        return self._title_final
 
     def stop(self):
         self._stop.set()
@@ -520,6 +538,14 @@ class DshProjectionTail:
                     title = data.get("title")
                     if isinstance(title, str) and title.strip():
                         self._title = title.strip()
+                        # Track whether this is the GENERATED title or the crude
+                        # fallback, so the seeder can override a provisional
+                        # fallback name once the generated one lands. Only an
+                        # explicit "fallback" source is provisional; provider /
+                        # user / a missing source all read as final.
+                        src = data.get("source")
+                        kind = src.get("kind") if isinstance(src, dict) else None
+                        self._title_final = (kind != "fallback")
             projected = self._proj.feed(event)
             # Remember which children we projected a top-level launch for, so the
             # reclaim above can retire one later found to be a workflow agent.
