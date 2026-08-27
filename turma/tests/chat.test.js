@@ -247,6 +247,56 @@ test("buildItems/render: an ExitPlanMode plan renders as prose, open by default"
   assert.doesNotMatch(html, /allowedPrompts/);
 });
 
+test("buildItems/render: a todo_write snapshot renders as a checklist with a count summary", () => {
+  const entries = [{ id: "td1", role: "assistant", blocks: [{
+    t: "tool_use", id: "t1", name: "todo_write", input: "{}",
+    todos: [
+      { content: "Understand the code", status: "in_progress" },
+      { content: "Write the fix", status: "pending" },
+      { content: "Ship it", status: "pending" },
+      { content: "Read the ticket", status: "completed" },
+    ],
+  }] }];
+  const items = buildItems(entries);
+  assert.equal(items[0].todos.length, 4);
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /class="action-card todo-card"/);
+  assert.match(html, /tool-name">To-dos</);
+  // Count summary reads at a glance (in progress · pending · done).
+  assert.match(html, /tool-arg">1 in progress · 2 pending · 1 done</);
+  // Each state styles its row; in-progress is accented, done is struck.
+  assert.match(html, /todo-item prog"><span class="todo-glyph">◐<\/span><span class="todo-text">Understand the code</);
+  assert.match(html, /todo-item done"><span class="todo-glyph">✓<\/span><span class="todo-text">Read the ticket</);
+  // The raw input JSON is NOT shown — the checklist replaces it.
+  assert.doesNotMatch(html, /tool-label">input</);
+});
+
+test("render: an in-progress todo prefers activeForm (Claude); a bad status coerces to pending", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([{
+    id: "td2", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "TodoWrite", input: "{}",
+      todos: [
+        { content: "Wire it", status: "in_progress", activeForm: "Wiring it" },
+        { content: "Later", status: "mystery" },
+      ] }],
+  }])));
+  assert.match(html, /todo-text">Wiring it</); // present-tense activeForm
+  assert.doesNotMatch(html, /todo-text">Wire it</);
+  assert.match(html, /todo-item todo"><span class="todo-glyph">○<\/span><span class="todo-text">Later</);
+});
+
+test("compose bar: a dsh working status (noStop) shows the verb but keeps Stop hidden", () => {
+  // A dsh turn has no pane-Escape interrupt, so its status carries noStop: the
+  // bar still shows "Deep diving…" but composeBusy() must not offer Stop.
+  __setQuestionActive(false);
+  __setPanePromptActive(false);
+  __stopPending(0);
+  __setLiveStatus({ verb: "Deep diving", noStop: true });
+  assert.equal(isBusy(), false, "Stop hidden for a dsh noStop turn");
+  __setLiveStatus({ verb: "Deep diving" }); // a claude turn (no flag) offers Stop
+  assert.equal(isBusy(), true);
+  __setLiveStatus(null);
+});
+
 test("buildItems/render: a compact_boundary block -> a centred marker with token counts", () => {
   const items = buildItems([{ id: "cb1", role: "assistant",
     blocks: [{ t: "compact_boundary", trigger: "auto", preTokens: 123380, postTokens: 5920 }] }]);

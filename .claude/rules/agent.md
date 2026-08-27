@@ -368,9 +368,11 @@ working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the pa
   (**every other system subtype stays dropped**); `tool_reference` inside a tool_result → `[tool:
   <name>]`.
 - **A known tool call carries its reviewable payload on the tool_use block** (`_tool_use_detail` /
-  `toolUseDetail`): Edit → `edit`, Write → `content`, ExitPlanMode → `plan`, any tool's
-  `description` → `desc`. An AskUserQuestion card is titled with its question text(s), not the input
-  JSON.
+  `toolUseDetail`): Edit → `edit`, Write → `content`, ExitPlanMode → `plan`, TodoWrite / dsh
+  `todo_write` → `todos` (a sanitized/capped `[{content, status, activeForm?}]` the chat renders as
+  a checklist — one branch for both runtimes, since dsh's snapshot projects as a `todo_write`
+  tool_use), any tool's `description` → `desc`. An AskUserQuestion card is titled with its question
+  text(s), not the input JSON.
   - **SendUserFile → `files[]`+`caption`** (XERK-221): image/SVG as a base64 data URI
     (`kind:"image"`), a `render` HTML page as raw markup (`kind:"html"`), else a name chip
     (`kind:"file"` — attach/oversize past `SEND_FILE_MAX_BYTES`/missing/other, **never opened**).

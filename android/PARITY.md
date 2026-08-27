@@ -484,6 +484,16 @@ those are marked `[MODEL]`.
   replaced with the same Trajectory view. The endpoint is platform-agnostic JSON, so the port is a
   screen that fetches + renders it; suppressing the terminal entry for `agentType == "dsh"` is the
   minimum. Glasses (`hub-client.ts`) likewise still exposes the terminal for dsh — same suppression.
+- **P2 To-do checklist card + the dsh "Deep diving…" verb (Enable DSH To-Dos).** The web renders a
+  `TodoWrite` / dsh `todo_write` tool call as a CHECKLIST (state glyph per row + a `1 in progress ·
+  6 pending` count on the summary) instead of raw-JSON input — `renderTodoCard` in `chat.js`, fed by
+  the `todos` the agent attaches to the block (`toolUseDetail`). `core/ChatItems.kt` currently
+  renders it as a plain tool card; the port is a checklist branch reading the same `todos`. Also:
+  a generating dsh turn frame now carries a working `status` (`{verb:"Deep diving", noStop:true}` +
+  an elapsed clock past 15s) so the web chat shows the verb; `noStop` keeps Stop hidden (a dsh turn
+  has no pane-Escape interrupt). Android's chat working bar should read the same `status.verb`/
+  `elapsed` and suppress its Stop control on `status.noStop`. Glasses gets the checklist free (the
+  vendored `chat.cjs`/`chat.css`); its live bar should honour `noStop` too.
 - ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Done (XERK-477, see Done below):
   the web's `⚙ dsh` chip on live and ended session cards, so a glance says which sessions run on dsh.
 - ~~P2 board ticket "Runtime" row (XERK-473 → XERK-477).~~ Done (XERK-477, see Done below): the board

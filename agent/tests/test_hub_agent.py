@@ -2505,6 +2505,36 @@ class TestEntryBlocks(unittest.TestCase):
         ]}}, ha.BLOCK_CAPS)[0]
         self.assertEqual(block["plan"], "## Plan\n1. do it")
 
+    def test_todowrite_and_dsh_todo_write_carry_a_sanitized_checklist(self):
+        # Claude's TodoWrite (with activeForm) and dsh's todo_write (without) both
+        # attach block.todos, mirror of tunnel-agent.js todoItems. This is what the
+        # chat renders as a checklist instead of raw-JSON input.
+        cc = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "TodoWrite", "input": {"todos": [
+                {"content": "Wire it", "status": "in_progress", "activeForm": "Wiring it"},
+                {"content": "Test it", "status": "pending"},
+            ]}},
+        ]}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(cc["todos"], [
+            {"content": "Wire it", "status": "in_progress", "activeForm": "Wiring it"},
+            {"content": "Test it", "status": "pending"},
+        ])
+        dsh = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "todo_write", "input": {"todos": [
+                {"content": "Do A", "status": "completed"}]}},
+        ]}}, ha.BLOCK_CAPS)[0]
+        self.assertEqual(dsh["todos"], [{"content": "Do A", "status": "completed"}])
+
+    def test_todo_items_drops_junk_and_coerces_status(self):
+        # Non-dict rows, empty content and a bad status are dropped/coerced; a
+        # non-list yields nothing (no todos key attached).
+        self.assertEqual(
+            ha._todo_items(["x", {"status": "in_progress"}, {"content": " "},
+                            {"content": "Real", "status": "nope"}], ha.BLOCK_CAPS),
+            [{"content": "Real", "status": "pending"}])
+        self.assertIsNone(ha._todo_items({"todos": []}, ha.BLOCK_CAPS))
+        self.assertIsNone(ha._todo_items([], ha.BLOCK_CAPS))
+
     def test_send_user_file_embeds_images_svg_html_and_degrades_the_rest(self):
         # XERK-221: SendUserFile reads the delivered files and embeds image/SVG as
         # data URIs + HTML raw, so the chat renders them; other/missing → a chip.

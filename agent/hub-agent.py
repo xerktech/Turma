@@ -5332,6 +5332,38 @@ def _block_payload_bytes(blocks):
     return total
 
 
+TODO_ITEMS_MAX = 100
+_TODO_STATUSES = ("pending", "in_progress", "completed")
+
+
+def _todo_items(raw, caps):
+    """A TodoWrite/todo_write snapshot -> a sanitized, capped [{content, status,
+    activeForm?}] the chat renders as a checklist. Claude's TodoWrite and dsh's
+    todo_write share the whole-list {content, status} shape (dsh has no
+    activeForm); both write a fresh snapshot per call, last-wins. Bounded so a
+    hostile/oversized list can't bloat a frame. Mirror of tunnel-agent.js
+    todoItems(). Returns None when nothing usable is present."""
+    if not isinstance(raw, list):
+        return None
+    out = []
+    for it in raw[:TODO_ITEMS_MAX]:
+        if not isinstance(it, dict):
+            continue
+        content = it.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        status = it.get("status")
+        if status not in _TODO_STATUSES:
+            status = "pending"
+        item = {"content": _clip(ANSI_RE.sub("", content).strip(), caps["input"])[0],
+                "status": status}
+        active = it.get("activeForm")
+        if isinstance(active, str) and active.strip():
+            item["activeForm"] = _clip(ANSI_RE.sub("", active).strip(), caps["input"])[0]
+        out.append(item)
+    return out or None
+
+
 def _tool_use_detail(block, name, inp, caps):
     """Attach the reviewable payload of a known tool call to its tool_use block,
     beyond the one-line `input` summary — the part an operator otherwise opens
@@ -5343,6 +5375,8 @@ def _tool_use_detail(block, name, inp, caps):
       Write         -> content: the file body written
       ExitPlanMode  -> plan: the plan markdown the operator was asked to approve
       SendUserFile  -> files: [{name, kind, src|html}] + caption  (inline preview)
+      TodoWrite     -> todos: [{content, status, activeForm?}]  (rendered as a checklist)
+      todo_write    -> todos: same (dsh's shell tool for the same snapshot)
       any tool      -> desc: its human `description` arg (Bash, Agent, Monitor, …)
 
     Mirror of tunnel-agent.js toolUseDetail()."""
@@ -5378,6 +5412,10 @@ def _tool_use_detail(block, name, inp, caps):
             cap = inp.get("caption")
             if isinstance(cap, str) and cap.strip():
                 block["caption"] = _clip(ANSI_RE.sub("", cap).strip(), caps["input"])[0]
+    elif name in ("TodoWrite", "todo_write"):
+        todos = _todo_items(inp.get("todos"), caps)
+        if todos:
+            block["todos"] = todos
     desc = inp.get("description")
     if isinstance(desc, str) and desc.strip():
         block["desc"] = _clip(ANSI_RE.sub("", desc).strip(), caps["input"])[0]

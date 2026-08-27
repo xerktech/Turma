@@ -467,8 +467,33 @@ function sendUserFileDetail(inp) {
 // the part an operator otherwise opens the raw terminal to see. Returns true
 // when a payload was clipped by its cap. Mirror of hub-agent.py
 // _tool_use_detail(): Edit -> edit {old, new, replaceAll?}; Write -> content;
+// A TodoWrite/todo_write snapshot -> a sanitized, capped [{content, status,
+// activeForm?}] the chat renders as a checklist. Mirror of hub-agent.py
+// _todo_items(): Claude's TodoWrite and dsh's todo_write share the whole-list
+// {content, status} shape (dsh has no activeForm), both write a fresh snapshot
+// per call (last-wins). Bounded so a hostile/oversized list can't bloat a frame.
+const TODO_ITEMS_MAX = 100;
+const TODO_STATUSES = ["pending", "in_progress", "completed"];
+function todoItems(raw, caps) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const it of raw.slice(0, TODO_ITEMS_MAX)) {
+    if (!it || typeof it !== "object" || Array.isArray(it)) continue;
+    const content = it.content;
+    if (typeof content !== "string" || !content.trim()) continue;
+    let status = it.status;
+    if (!TODO_STATUSES.includes(status)) status = "pending";
+    const item = { content: clip(content.replace(ANSI_RE, "").trim(), caps.input)[0], status };
+    if (typeof it.activeForm === "string" && it.activeForm.trim()) {
+      item.activeForm = clip(it.activeForm.replace(ANSI_RE, "").trim(), caps.input)[0];
+    }
+    out.push(item);
+  }
+  return out.length ? out : null;
+}
+
 // ExitPlanMode -> plan; SendUserFile -> files + caption (inline preview);
-// any tool's human `description` arg -> desc.
+// TodoWrite/todo_write -> todos (checklist); any tool's `description` arg -> desc.
 function toolUseDetail(block, name, inp, caps) {
   if (!inp || typeof inp !== "object" || Array.isArray(inp)) return false;
   let truncated = false;
@@ -502,6 +527,9 @@ function toolUseDetail(block, name, inp, caps) {
         block.caption = clip(inp.caption.replace(ANSI_RE, "").trim(), caps.input)[0];
       }
     }
+  } else if (name === "TodoWrite" || name === "todo_write") {
+    const todos = todoItems(inp.todos, caps);
+    if (todos) block.todos = todos;
   }
   if (typeof inp.description === "string" && inp.description.trim()) {
     block.desc = clip(inp.description.replace(ANSI_RE, "").trim(), caps.input)[0];
@@ -1262,6 +1290,38 @@ function dshEventsPath(worktreePath, transcriptId) {
   return fs.existsSync(p) ? p : null;
 }
 
+// dsh's working verb is a fixed cosmetic gerund (its own web UI hardcodes
+// "Deep diving…"), and the elapsed clock only appears once a turn has run a
+// while — matching dsh-client-ui-conversation's `showClock = elapsedMs >= 15e3`.
+const DSH_VERB = "Deep diving";
+const DSH_CLOCK_AFTER_MS = 15000;
+
+// Whole-seconds elapsed, formatted like dsh's formatRunDuration: "47s" under a
+// minute, "1m 03s" beyond. Pure and time-input-only (elapsed comes from dsh's
+// own event timestamps, never a wall clock), so the frame stays deterministic.
+function fmtDshElapsed(ms) {
+  const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m > 0 ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+
+// The working-status a dsh `turn` frame carries while generating, or null when
+// idle. It REUSES the claude status shape the chat's working bar already reads
+// {verb, elapsed}, plus `noStop: true` — a dsh turn has no pane-Escape interrupt
+// (kill ends the whole session), so the chat must keep Stop hidden for it even
+// though the bar now shows the verb. Elapsed is dsh's own turn duration and only
+// once past DSH_CLOCK_AFTER_MS, matching its web UI.
+function dshStatus(view, startMs, lastMs) {
+  if (!view || !view.generating) return null;
+  const st = { verb: DSH_VERB, noStop: true };
+  if (typeof startMs === "number" && typeof lastMs === "number") {
+    const elapsed = lastMs - startMs;
+    if (elapsed >= DSH_CLOCK_AFTER_MS) st.elapsed = fmtDshElapsed(elapsed);
+  }
+  return st;
+}
+
 // Fold one dsh native event into the live streaming view {text, generating}.
 // This is the dsh analogue of the pane-scrape classifier (XERK-19/251) — it
 // turns the raw LLM stream into a monotonic bubble for the chat page:
@@ -1318,6 +1378,7 @@ function pollDshTurn(w, sessionId) {
       // The log was truncated/rewritten (a fresh launch / clear-context) — start
       // over, like DshProjectionTail's defensive reset.
       w.dshOffset = 0; w.dshPartial = ""; w.dshView = { text: "", generating: false };
+      w.dshTurnStartMs = null; w.dshLastEventMs = null;
     }
     const len = size - w.dshOffset;
     let buf = "";
@@ -1335,22 +1396,28 @@ function pollDshTurn(w, sessionId) {
       w.dshPartial = w.dshPartial.slice(idx + 1);
       if (line) lines.push(line);
     }
-    let changed = false;
+    if (!lines.length) return; // nothing new appended — no frame to recompute
     for (const raw of lines) {
       let event;
       try { event = JSON.parse(raw); } catch { continue; }
-      const before = { text: w.dshView.text, generating: w.dshView.generating };
+      const t = event && typeof event === "object" ? event.type : null;
+      // A turn opens on turn/start (or a fresh user/message); stamp its start
+      // from dsh's own clock so the elapsed is that turn's real duration.
+      if (t === "turn/start" || t === "user/message") {
+        const tm = event.time;
+        w.dshTurnStartMs = typeof tm === "number" ? tm : null;
+        w.dshLastEventMs = w.dshTurnStartMs;
+      } else if (event && typeof event.time === "number") {
+        w.dshLastEventMs = event.time;
+      }
       w.dshView = foldDshView(w.dshView, event);
-      if (w.dshView.text !== before.text || w.dshView.generating !== before.generating) changed = true;
     }
-    if (!changed) return;
-    // dsh carries NO working status here: the Stop button and the working-status
-    // bar are driven by `frame.status`, and Stop for a dsh session would send
-    // Escape into its (non-Claude) tmux pane — a no-op, so surfacing it would
-    // present a Stop that does nothing. dsh's working read stays on the
-    // heartbeat's `paneBusy` (dsh_pane_busy, [D]), as today. The streaming text
-    // alone is this frame's job.
-    const status = null;
+    // dsh DOES carry a working status now — the fixed "Deep diving…" verb + an
+    // elapsed clock (dshStatus) — but with `noStop: true`, because Stop for a
+    // dsh session would send Escape into its (non-Claude) tmux pane, a no-op:
+    // the chat's composeBusy() hides Stop on that flag while the bar still shows
+    // the verb. The heartbeat's `paneBusy` (dsh_pane_busy, [D]) is unchanged.
+    const status = dshStatus(w.dshView, w.dshTurnStartMs, w.dshLastEventMs);
     // NUL separator: a byte that cannot occur in stream text (same escape as the
     // claude branch — a literal NUL makes grep treat this file as binary).
     const key = String(w.dshView.text || "") + "\u0000" + (status ? JSON.stringify(status) : "");
@@ -1474,6 +1541,10 @@ function startWatch(sessionId, worktreePath, transcriptId) {
     // history (which could echo a completed turn's stale text into the bubble).
     dshEvents: dshEventsPath(worktreePath, transcriptId || null),
     dshOffset: 0, dshPartial: "", dshView: { text: "", generating: false },
+    // dsh working-status timing: the current turn's start and newest event
+    // times (dsh's OWN epoch-ms clock, from the native events — no wall clock,
+    // so the "Deep diving…" elapsed is deterministic). See pollDshTurn.
+    dshTurnStartMs: null, dshLastEventMs: null,
     // Live background agents, accumulated from the transcript across polls
     // (scanAgentEntry). Not derived from the pane — see that function.
     agentState: { live: new Map(), tasks: new Map() },
@@ -1763,5 +1834,6 @@ if (require.main === module) {
 } else {
   module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; }, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS,
+    toolUseDetail, todoItems, fmtDshElapsed, dshStatus,
     usableHostname, deviceName };
 }

@@ -57,6 +57,15 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
 - It renders chat bubbles — **user right, agent left** — with collapsible tool-action cards
   (tool_use + its paired tool_result, error-styled) and collapsed thinking traces, and the
   in-progress turn as a trailing bubble.
+  - **A `TodoWrite` / dsh `todo_write` tool call renders as a CHECKLIST, not raw-JSON input**
+    (`renderTodoCard`): a state glyph per row (○ pending / ◐ in-progress / ✓ done) and a one-line
+    count on the summary (`1 in progress · 6 pending`) so it reads even collapsed. Both runtimes
+    share the `{content, status, activeForm?}` snapshot the AGENT attaches to the block
+    (`_tool_use_detail`/`toolUseDetail` → `todos`, capped `TODO_ITEMS_MAX`); dsh's todos ride the S1
+    projection's `todo_write` tool_use, so this is one renderer for Claude and dsh with no new
+    reader. Each call is a fresh whole-list snapshot (last-wins), so the newest card is the current
+    list. Tests: the `todo_write`/`TodoWrite` cases in `chat.test.js`, `tunnel-agent.test.js`,
+    `test_hub_agent.py`.
   - **No text ever types in** (XERK-251): a capture is painted whole the frame it arrives, in this
     and every other client. The typewriter was animation over an already-~1s-delayed pane scrape —
     it delayed the text further and bought nothing. Don't reintroduce one.
@@ -65,11 +74,18 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
     scrape produces (`pollDshTurn`/`foldDshView`), so a dsh response grows in the live bubble as it
     generates instead of appearing whole when `assistant/message` commits. It is a real-time stream
     over the existing `/live` socket, NOT a reintroduced typewriter — the committed
-    `assistant/message` clears the bubble and the projected transcript tail owns it. dsh turn frames
-    carry NO `status` (Stop for dsh would send Escape into a non-Claude pane — a no-op — so the
-    working bar/Stop stay on the heartbeat `paneBusy` as today). This reads the native events file
-    directly; the S1 projection is untouched, per the ADR. Tests: the `pollDshTurn`/`foldDshView`/
-    `dshEventsPath` cases in `tunnel-agent.test.js`.
+    `assistant/message` clears the bubble and the projected transcript tail owns it. This reads the
+    native events file directly; the S1 projection is untouched, per the ADR. Tests: the
+    `pollDshTurn`/`foldDshView`/`dshEventsPath` cases in `tunnel-agent.test.js`.
+  - **A generating dsh turn frame carries a working `status`** (`dshStatus`): the fixed
+    **"Deep diving…"** verb dsh's own web UI uses, plus an elapsed clock that appears only once the
+    turn passes **15s** (`fmtDshElapsed`, matching dsh's `showClock = elapsedMs >= 15e3`). Elapsed
+    is dsh's OWN event timestamps (`turn/start` → newest event), never a wall clock, so the frame
+    stays deterministic. The status carries **`noStop: true`**, because a dsh turn has no
+    pane-Escape interrupt (kill ends the whole session) — `composeBusy()` hides Stop on that flag
+    while the bar still shows the verb. This REPLACES the earlier "dsh frames carry no status"; the
+    six-mirror "Working" contract is unchanged (that keys on the heartbeat `paneBusy`/`dsh_pane_busy`,
+    not the chat's `liveStatus` bar). Tests: the Deep-diving cases in `tunnel-agent.test.js`.
   - The live turn is the tmux **pane scrape's "last ● bullet"**, NOT monotonic (XERK-19): it SWAPS
     blocks mid-turn, so every `turn` frame is CLASSIFIED by `applyTurn` before it reaches the bubble
     — an empty frame or a tool-use bullet (`isToolBullet`, biased toward matching since a miss

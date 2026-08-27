@@ -766,6 +766,9 @@
           if (b.edit) act.edit = { old: b.edit.old || "", new: b.edit.new || "", replaceAll: !!b.edit.replaceAll };
           if (b.content) act.content = b.content;
           if (b.plan) act.plan = b.plan;
+          // TodoWrite / dsh todo_write: the checklist snapshot the agent
+          // attached (hub-agent _todo_items / tunnel-agent todoItems).
+          if (Array.isArray(b.todos) && b.todos.length) act.todos = b.todos;
           // SendUserFile inline preview (XERK-221): rendered images/SVG/HTML the
           // session delivered, embedded on the block by the agent.
           if (Array.isArray(b.files) && b.files.length) act.files = b.files;
@@ -931,7 +934,56 @@
     return out;
   }
 
+  // A TodoWrite / dsh todo_write snapshot, rendered as a checklist rather than
+  // a raw-JSON tool card — one glyph per state, and a one-line count on the
+  // summary so the card reads at a glance even collapsed. Claude and dsh share
+  // the {content, status, activeForm?} shape the agent attaches (see
+  // hub-agent _todo_items / tunnel-agent todoItems).
+  var TODO_STATUS = {
+    completed:   { glyph: "✓", cls: "done" },   // ✓
+    in_progress: { glyph: "◐", cls: "prog" },   // ◐
+    pending:     { glyph: "○", cls: "todo" },   // ○
+  };
+  function todoCounts(todos) {
+    var c = { in_progress: 0, pending: 0, completed: 0 };
+    for (var i = 0; i < todos.length; i++) {
+      var s = todos[i] && todos[i].status;
+      if (c[s] === undefined) s = "pending";
+      c[s]++;
+    }
+    return c;
+  }
+  function todoSummaryText(c) {
+    var parts = [];
+    if (c.in_progress) parts.push(c.in_progress + " in progress");
+    if (c.pending) parts.push(c.pending + " pending");
+    if (c.completed) parts.push(c.completed + " done");
+    return parts.length ? parts.join(" · ") : "empty";
+  }
+  function renderTodoCard(it, key) {
+    var todos = it.todos;
+    var summary = todoSummaryText(todoCounts(todos));
+    var rows = "";
+    for (var i = 0; i < todos.length; i++) {
+      var t = todos[i] || {};
+      var meta = TODO_STATUS[t.status] || TODO_STATUS.pending;
+      // In progress prefers the present-tense activeForm when the agent sent it
+      // (Claude does; dsh does not), else the imperative content.
+      var text = (t.status === "in_progress" && t.activeForm) ? t.activeForm : (t.content || "");
+      rows += '<li class="todo-item ' + meta.cls + '"><span class="todo-glyph">' +
+        meta.glyph + '</span><span class="todo-text">' + esc(text) + "</span></li>";
+    }
+    var body = '<ul class="todo-list">' + rows + "</ul>";
+    return '<details class="action-card todo-card" data-dkey="' + esc(key) +
+      '" data-uuid="' + esc(it.entryId) + '"' + openAttr(key, verbosity.show.outputs) + ">" +
+      "<summary><span class=\"tool-glyph todo-head\">☑</span>" +
+      '<span class="tool-name">To-dos</span>' +
+      '<span class="tool-arg">' + esc(summary) + "</span></summary>" +
+      '<div class="tool-body">' + body + "</div></details>";
+  }
+
   function renderActionCard(it, key) {
+    if (Array.isArray(it.todos) && it.todos.length) return renderTodoCard(it, key);
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
     // A plan card's salient line is the plan itself; a SendUserFile card's is its
     // caption or a file count — not the raw input JSON either would fall back to.
@@ -1254,6 +1306,11 @@
     // and a Stop there would cancel the decision rather than a running turn.
     if (panePromptActive) { stopPendingAt = 0; return false; }
     if (!liveStatus) { stopPendingAt = 0; return false; }
+    // A dsh session's working status carries `noStop` — its turn has no
+    // pane-Escape interrupt (kill would end the whole session), so Stop stays
+    // hidden even though the bar shows the "Deep diving…" verb. See
+    // tunnel-agent dshStatus / .claude/rules/turma-sessions.md.
+    if (liveStatus.noStop) { stopPendingAt = 0; return false; }
     // A clicked Stop only lands on the agent's next beat, so the pane keeps
     // reporting the turn for a second or two afterwards. Hide Stop immediately
     // anyway — the operator asked for the turn to end and shouldn't watch a
