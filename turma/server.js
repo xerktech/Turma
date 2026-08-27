@@ -171,6 +171,7 @@ const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted 
 // the restore.
 const LIVE_AGENTS_MAX = 32;
 const LIVE_AGENT_FIELD_MAX = 400;
+const DSH_WEB_URL_MAX = 512;   // the host-wide dsh-web viewer URL, capped on the wire
 // Up HERE with the live-agent caps rather than beside sanitizeWorkflowAgents
 // where they are used, and that placement is LOAD-BEARING (XERK-304). The
 // state.json restore calls normalizeRecord ~700 lines below this and ~1000
@@ -2867,7 +2868,26 @@ function normalizeDsh(payload) {
     if ("dsh" in payload) payload.dsh = null;
     return;
   }
-  payload.dsh = { available: d.available === true };
+  const out = { available: d.available === true };
+  // The host-wide read-only `dsh web` viewer (XERK-501, agent `_dsh_web_payload`): kept
+  // only when the agent reports it UP, as a whitelisted {running, port, url}.
+  // A new sub-key a newer agent adds is dropped unless added here (like every
+  // normalize*). `url` is length-capped on the wire (the XERK-348 peer-cell
+  // lesson: an uncapped agent-set string is a memory hazard); a non-string or
+  // an absent url becomes null, which the clients render as host-only text.
+  const w = d.web;
+  if (w && typeof w === "object" && !Array.isArray(w) && w.running === true) {
+    // The url flows to an anchor href on the client, so accept ONLY http(s):
+    // — an agent-set javascript:/data: value is dropped to null here rather
+    // than trusted downstream (defence in depth; not a live XSS on Chromium).
+    const rawUrl = typeof w.url === "string" ? w.url.slice(0, DSH_WEB_URL_MAX) : "";
+    out.web = {
+      running: true,
+      port: Number.isFinite(w.port) ? w.port : null,
+      url: /^https?:\/\//i.test(rawUrl) ? rawUrl : null,
+    };
+  }
+  payload.dsh = out;
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)

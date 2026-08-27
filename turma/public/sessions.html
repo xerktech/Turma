@@ -951,6 +951,11 @@
                above is hidden for them and this Trajectory toggle takes its place,
                a read-only view over the dsh D3 native event log. -->
           <button class="seg-toggle" id="chatTrajBtn" hidden onclick="chatToTrajectory()" title="Open the read-only dsh Trajectory (turns, tool calls, tokens)">Trajectory ▸</button>
+          <!-- The host-wide `dsh web` viewer (XERK-501; opens dsh's OWN read-only UI over
+               the shared store, so this chat can be confirmed in both places).
+               Shown only for a dsh session whose host advertises a reachable
+               URL; a loopback-only host reports none and this stays hidden. -->
+          <a class="seg-toggle" id="chatDshWeb" hidden target="_blank" rel="noopener" title="Open this host's dsh web UI (read-only) to confirm this chat in dsh's own viewer">dsh web ↗</a>
           <button class="kill-btn" id="chatKill" onclick="killCurrentChat()">Kill</button>
         </div>
         <div class="chat-scroll-wrap">
@@ -2634,6 +2639,16 @@ function selectSession(id) {
   if (chatTermBtn) chatTermBtn.style.display = isDsh ? "none" : "";
   const chatTrajBtn = document.getElementById("chatTrajBtn");
   if (chatTrajBtn) chatTrajBtn.hidden = !isDsh;
+  // The host-wide `dsh web` link: a dsh session whose host reports a reachable
+  // viewer URL. A loopback-only host reports none (dsh.web.url == null), so the
+  // link stays hidden rather than pointing nowhere.
+  const chatDshWeb = document.getElementById("chatDshWeb");
+  if (chatDshWeb) {
+    const web = isDsh && hit.a && hit.a.dsh && hit.a.dsh.web;
+    const url = (web && web.url) || "";
+    if (url) { chatDshWeb.href = url; chatDshWeb.hidden = false; }
+    else { chatDshWeb.href = ""; chatDshWeb.hidden = true; }
+  }
   disarmChatKill();
   currentHostKey = hit.a.key;
   stageTunnelReset();   // this session's tunnel is up — it's how we reached it

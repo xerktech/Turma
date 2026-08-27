@@ -173,12 +173,13 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
   real bash tool call completed, and NO port bound. The old "removing `dsh-web-app` makes the process
   die" observation was really the DRIVER exiting(1) because removing web-app also removed
   `agent-presets` (its tools) — kept apart here, base carries the tools (next pitfall).
-  - **The host-wide read-only viewer is the Turma-native Trajectory view** (over the D3 native log,
+  - **The IN-DASHBOARD viewer is the Turma-native Trajectory view** (over the D3 native log,
     `.claude/rules/turma-sessions.md`), NOT a `dsh web` proxied through the tunnel: `dsh web` has no
     base-path flag (only `--host`/`--port`/`--trusted-host`/`--no-open`), so it cannot be sub-path
     -proxied per host under one domain the way ttyd's `-b /term/<id>` allows. The dsh-web fallback in
-    `docs/dsh-session-lifecycle.md` is superseded by that blocker; Q1 (dsh web CAN list foreign
-    sessions off the shared store) is moot against it.
+    `docs/dsh-session-lifecycle.md` is superseded by that blocker for the PROXY role. XERK-501 adds a
+    SECOND, DIRECT-ACCESS viewer beside it — one host-wide `dsh web` (the "Host-wide dsh web viewer"
+    section below) — which sidesteps the blocker precisely because it is not proxied per session.
 - **Profile prep is off the beat.** `_ensure_dsh_profile` (npm/dsh setup) is primed on a worker
   thread at startup when `dsh_configured()`; `_launch_dsh` only reads the cached `_dsh_profile_ready`
   and refuses if not ready — it never runs the heavy setup on the beat (XERK-395).
@@ -209,6 +210,56 @@ runtime-independent and already worked — `_peer_rows`/`_write_peers_file` list
   degrades to "unnamed this beat" instead of taking the host down — the XERK-395/402 beat-loop
   contract that an uncaught exception on the beat is the whole host, not a skipped cycle. Tests:
   `test_seed_summaries_survives_a_dsh_tail_without_title`.
+
+## Host-wide `dsh web` viewer (XERK-501)
+
+ONE supervised `dsh web` per host over the SHARED store (`DSH_HOME/sessions`), so a dsh session's
+chat can be confirmed in dsh's OWN read-only UI beside Turma's native Trajectory. The DECISION and
+why it is legal where XERK-498's per-session web server was not are in `.claude/rules/dsh.md`; the
+mechanics and the invariants a change must not undo:
+
+- **It only READS the on-disk store; it never connects to the live per-session dsh processes.** They
+  are SEPARATE processes with their own service registries, so the per-session HITL / userQuestions
+  provider-displacement pitfalls above DO NOT apply to it — never add HITL/driver wiring to it. Its
+  one job is to browse the shared store.
+- **It reads the per-session PLAINTEXT stores via a persistence `--patch`** (`_ensure_dsh_web_patch`:
+  `compression: none` + a restated `root` == `DSH_SESSIONS_ROOT`), matching what the drivers write
+  (XERK-475). The `web` profile's zstd default cannot read them — this is the ONE real integration
+  risk, host-verified against real dsh, not CI. `_launch_dsh_web` runs
+  `dsh --profile web --patch <p> --no-open --host <DSH_WEB_HOST> --port <DSH_WEB_PORT>`, `DSH_HOME`
+  exported into the command (a routable var, not a secret — the viewer needs no model key to browse).
+- **Exposure is a DIRECT host port, LOOPBACK by default** (`DSH_WEB_HOST`), because `dsh web` is
+  unauthenticated (only a browser-trust fence). A LAN bind is a deliberate opt-in and the launch log
+  says so. `_dsh_web_url` advertises a URL only for a routable bind host or an explicit `DSH_WEB_URL`;
+  a loopback host reports none, and the Sessions chat header hides the "dsh web ↗" link rather than
+  point it nowhere.
+- **Always-on when `_dsh_web_enabled()`** (dsh configured AND `DSH_WEB` not turned off), **supervised
+  OFF THE BEAT** (`_dsh_web_loop` on a daemon thread — the beat only READS the cached status via
+  `_dsh_payload`/`_dsh_web_payload`, XERK-395). `_dsh_web_running` (`tmux has-session`) says the tmux
+  is alive; the loop relaunches a crashed one with capped backoff.
+- **`running` means SERVING, not just launched** — `has-session` alone is NOT enough (the XERK-492
+  "a bound thing is not a live thing" lesson, on the port). A tmux that STARTED is not proof the dsh
+  process bound its port: EADDRINUSE / a crash-on-boot ends it a moment later. So the loop reports up
+  only after `_confirm_dsh_web` sees the port ACCEPT a connection (`_dsh_web_port_open`), and the
+  steady-state check pairs `has-session` with the port too (a bound-then-wedged instance is torn down
+  and relaunched). Reporting up off the tmux rc alone both misreported the heartbeat AND skipped the
+  backoff on the dominant failure mode — a flat relaunch of a doomed process.
+  - **Residual gap (LOW, XERK-502): `_dsh_web_port_open` is a blind TCP connect**, so an UNRELATED
+    process holding `DSH_WEB_PORT` reads as "up" and the loop relaunches a doomed dsh flat. Benign for
+    the realistic EADDRINUSE cause (a stale dsh over the SAME store — "up" is correct); only wrong on
+    a deployment misconfig, and the loopback default hides the URL anyway. Closing it needs an
+    HTTP-level check that the served thing is actually dsh, not a bare connect.
+- **It ADOPTS an instance that survived an in-place update** — `has-session` True → leave it, for a
+  zero-downtime viewer — and `_handle_shutdown` deliberately does NOT kill it (unlike the limits
+  probe), exactly like a dsh session's tmux (`KillMode=process`). A container recreate takes it down
+  with the rest of the stack.
+- **Wire: `dsh.web = {running, port, url}`, OMITTED when down** (`_dsh_payload` — same capability-flag
+  discipline `available` uses, so a pre-viewer agent and a down viewer read identically). The hub's
+  `normalizeDsh` whitelists it and length-caps `url` (the XERK-348 peer-cell memory lesson). Android
+  is untyped for now (decode-safe, `android/PARITY.md`).
+- Tests: `TestDshWeb` in `test_hub_agent.py` (URL advertise rule, enable gate, payload, launch
+  command, persistence patch). The adopt/relaunch/restart cycle and the plaintext-store read are
+  REAL-dsh QA — no launcher-driven `dsh web` runs in CI.
 
 ## Tests
 

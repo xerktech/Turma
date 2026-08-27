@@ -1125,12 +1125,18 @@ DSH_HOME = os.environ.get("DSH_HOME") or os.path.join(REGISTRY_DIR, "dsh-home")
 # base's global host layer (a rosterless deployment — `agent-presets`/the mount
 # is a web-app concern), verified end to end against real dsh 0.1.1-rc.2.
 DSH_PROFILE = os.environ.get("DSH_PROFILE", "turma")
-# The host-wide read-only viewer is Turma-NATIVE (XERK-498), not a `dsh web`: a
-# Trajectory over the D3 native event log the raw archive already holds, served
-# by the hub at GET /api/dsh/<tid>/trajectory (turma/archive.js dshTrajectory).
-# `dsh web` was ruled out — it has no base-path flag, so it can't be sub-path
-# -proxied per host the way ttyd's `-b` allows — so there is NO viewer profile or
-# port here; see .claude/rules/dsh.md (XERK-498) and turma-sessions.md.
+# TWO read-only viewers over dsh sessions, deliberately different in reach:
+#  1. The in-DASHBOARD one is Turma-NATIVE (XERK-498) — a Trajectory over the D3
+#     native event log the raw archive already holds, served by the hub at
+#     GET /api/dsh/<tid>/trajectory (turma/archive.js dshTrajectory). `dsh web`
+#     was ruled out FOR THAT ROLE: it has no base-path flag, so it can't be
+#     sub-path-proxied per host the way ttyd's `-b` allows.
+#  2. A single host-wide `dsh web` service (DSH_WEB_* below) runs directly on the
+#     host over the SHARED store, so a dsh session's chat can be confirmed in
+#     dsh's OWN UI beside Turma's Trajectory. That per-session-proxy blocker does
+#     not apply to ONE host-wide instance: it lists every session off the shared
+#     store (no per-session sub-path), reached directly (loopback/LAN), not
+#     proxied. See .claude/rules/dsh.md and turma-sessions.md.
 # The provider ROUTE key == agentOptions.provider the driver passes per session.
 DSH_PROVIDER = os.environ.get("DSH_PROVIDER", "turma-dsh")
 DSH_MODEL = (os.environ.get("DSH_MODEL")
@@ -1166,6 +1172,54 @@ DSH_SESSIONS_ROOT = os.path.join(DSH_HOME, "sessions")
 # collide with one: a claude session id is never a dotfile. `_unpack_transcript`
 # routes members under it to the target's own DSH_SESSIONS_ROOT, not the slug.
 DSH_STORE_ARCNAME = ".dsh-store"
+
+# --- Host-wide read-only `dsh web` viewer (XERK-501) ----------------------
+# ONE `dsh web` per host (never one per session — that was XERK-498's blocker),
+# supervised off the beat, over the SHARED store (DSH_HOME/sessions), so every
+# dsh session on this host is browsable in dsh's own UI beside Turma's native
+# Trajectory. It only READS the on-disk store; it does not connect to or drive
+# the live per-session dsh processes (they are separate processes), so the
+# per-session HITL/provider-displacement concerns do not apply to it.
+DSH_WEB_TMUX = "turma-dsh-web"                       # its own tmux; not a session
+# Always-on when this host offers dsh, unless explicitly turned off. Off = the
+# in-dashboard Trajectory is the only viewer (unchanged from before this).
+DSH_WEB_ENABLED = (os.environ.get("DSH_WEB", "1").strip().lower()
+                   not in ("0", "false", "no", "off"))
+# Bind host: LOOPBACK by default — `dsh web` is UNAUTHENTICATED (it has only a
+# browser-trust fence), so exposing it on a LAN address is a deliberate opt-in.
+DSH_WEB_HOST = os.environ.get("DSH_WEB_HOST", "127.0.0.1")
+DSH_WEB_PORT = int(os.environ.get("DSH_WEB_PORT") or "7788")
+# The URL the UI links to. Explicit override wins (a reverse proxy / hostname);
+# otherwise a concrete routable bind host yields one, and loopback/wildcard
+# yields none (the operator reaches it themselves — SSH-forward / on-host).
+DSH_WEB_URL = os.environ.get("DSH_WEB_URL", "").strip()
+DSH_WEB_POLL_SEC = float(os.environ.get("DSH_WEB_POLL_SEC") or "10")
+DSH_WEB_RESTART_SEC = float(os.environ.get("DSH_WEB_RESTART_SEC") or "5")
+DSH_WEB_RESTART_MAX_SEC = float(os.environ.get("DSH_WEB_RESTART_MAX_SEC") or "60")
+# After a tmux launch, how long to wait for the viewer to actually BIND its port
+# before reporting it up. A tmux that started is NOT proof the dsh process
+# survived (EADDRINUSE, crash-on-boot) — the XERK-492 "a bound thing is not a
+# live thing" lesson, applied to the port instead of a control socket.
+DSH_WEB_CONFIRM_SEC = float(os.environ.get("DSH_WEB_CONFIRM_SEC") or "8")
+DSH_WEB_CONFIRM_POLL_SEC = float(os.environ.get("DSH_WEB_CONFIRM_POLL_SEC") or "0.3")
+
+
+def _dsh_web_enabled():
+    """Whether to run the host-wide read-only `dsh web` viewer: this host offers
+    dsh AND DSH_WEB is not turned off."""
+    return dsh_configured() and DSH_WEB_ENABLED
+
+
+def _dsh_web_url():
+    """The advertised URL for the host-wide viewer, or None when it can only be
+    reached from the host itself (loopback/wildcard bind, no explicit override).
+    None means the UI shows host:port as info text rather than a dead link."""
+    if DSH_WEB_URL:
+        return DSH_WEB_URL
+    if DSH_WEB_HOST and DSH_WEB_HOST not in (
+            "127.0.0.1", "0.0.0.0", "localhost", "::", "::1"):
+        return f"http://{DSH_WEB_HOST}:{DSH_WEB_PORT}"
+    return None
 
 
 def _dsh_project_key(cwd):
@@ -12756,6 +12810,173 @@ class SessionManager:
             f"(provider {DSH_PROVIDER}, model {DSH_MODEL})")
         return DSH_PROFILE
 
+    # --- Host-wide read-only `dsh web` viewer (XERK-501) ------------------
+    # A single supervised `dsh web` per host over the SHARED store, so a dsh
+    # session's chat can be confirmed in dsh's own UI beside Turma's Trajectory.
+    # Everything here runs on a WORKER THREAD, never the beat (XERK-395): the
+    # supervisor drives tmux and the beat only ever READS the cached status.
+
+    def _ensure_dsh_web_patch(self):
+        """Write the persistence overlay that points `dsh web` at the per-session
+        PLAINTEXT stores (`compression: none`) the drivers write (XERK-475),
+        instead of the web profile's zstd default which cannot read them. A patch
+        entry REPLACES config, so `root` is restated — exactly as _dsh_cordis_patch
+        does for the per-session profile. Written once under DSH_HOME."""
+        os.makedirs(DSH_HOME, exist_ok=True)
+        path = os.path.join(DSH_HOME, "turma-dsh-web.patch.yml")
+        body = (
+            "# Written by hub-agent.py (_ensure_dsh_web_patch): the host-wide\n"
+            "# `dsh web` must read the per-session PLAINTEXT stores (XERK-475),\n"
+            "# not the web profile's zstd default. A patch REPLACES config, so\n"
+            "# `root` is restated (== DSH_SESSIONS_ROOT under the DSH_HOME below).\n"
+            "- id: session-persistence-jsonl\n"
+            "  name: '@deepseek-ai/dsh-session-persistence-jsonl'\n"
+            "  config:\n"
+            f"    root: {json.dumps(DSH_SESSIONS_ROOT)}\n"
+            "    compression: none\n"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return path
+
+    def _dsh_web_running(self):
+        """True when the viewer's tmux is alive. `dsh web` IS the tmux's command,
+        so a crash ends the session and this goes False — the has-session liveness
+        the limits probe relies on. NOT sufficient alone: a tmux that started is
+        not proof the port bound (D1), and a bound-then-wedged process keeps the
+        tmux alive — so callers pair it with _dsh_web_port_open."""
+        rc, _ = run_ok(["tmux", "has-session", "-t", DSH_WEB_TMUX], timeout=5)
+        return rc == 0
+
+    def _dsh_web_port_open(self):
+        """Whether the viewer is actually ACCEPTING connections — the real
+        'serving' signal has-session cannot give. Connects to the bind host
+        (loopback for a wildcard bind, which is not a connectable target)."""
+        host = DSH_WEB_HOST if DSH_WEB_HOST not in (
+            "0.0.0.0", "::", "") else "127.0.0.1"
+        try:
+            with socket.create_connection((host, DSH_WEB_PORT), timeout=2):
+                return True
+        except OSError:
+            return False
+
+    def _confirm_dsh_web(self):
+        """After a tmux launch, wait a bounded window for the viewer to BIND its
+        port before reporting it up (D1). A tmux that started is not proof the
+        dsh process survived — EADDRINUSE / crash-on-boot ends it a moment later,
+        and reporting `running:True` off the tmux rc alone both misreports the
+        heartbeat and skips the backoff. Bails fast when the tmux is already gone
+        (the XERK-492 lesson, on the port)."""
+        deadline = time.time() + DSH_WEB_CONFIRM_SEC
+        while time.time() < deadline and not self._dsh_web_stop.is_set():
+            if not self._dsh_web_running():
+                return False              # the dsh process exited (tmux gone)
+            if self._dsh_web_port_open():
+                return True
+            self._dsh_web_stop.wait(DSH_WEB_CONFIRM_POLL_SEC)
+        return False
+
+    def _launch_dsh_web(self, patch):
+        """(Re)launch the host-wide `dsh web` in its own tmux. Clean-slate kill
+        first (a dead session may linger); DSH_HOME rides the command (a routable
+        var, not a secret — the viewer needs no model key, it only BROWSES the
+        store). Returns True on a successful tmux launch."""
+        cmd = (
+            f"DSH_HOME={shlex.quote(DSH_HOME)} "
+            + shlex.join([
+                DSH_BIN, "--profile", "web", "--patch", patch,
+                "--no-open", "--host", DSH_WEB_HOST, "--port", str(DSH_WEB_PORT)]))
+        run(["tmux", "kill-session", "-t", DSH_WEB_TMUX])
+        rc, err = run_ok([
+            "tmux", "new-session", "-d", "-s", DSH_WEB_TMUX,
+            "-c", DSH_HOME, "-x", "200", "-y", "50", cmd])
+        if rc != 0:
+            log(f"dsh web launch failed: {err}")
+            return False
+        log(f"dsh web: serving the shared store on {DSH_WEB_HOST}:{DSH_WEB_PORT}"
+            + (" (LAN-exposed; unauthenticated)"
+               if DSH_WEB_HOST not in ("127.0.0.1", "localhost", "::1") else ""))
+        return True
+
+    def _start_dsh_web(self):
+        """Start the viewer supervisor on a daemon thread, single-flight. No-op
+        unless this host offers dsh (and DSH_WEB is not turned off)."""
+        if not _dsh_web_enabled():
+            return
+        t = getattr(self, "_dsh_web_thread", None)
+        if t is not None and t.is_alive():
+            return
+        if not hasattr(self, "_dsh_web_stop"):
+            self._dsh_web_stop = threading.Event()
+        self.dsh_web = None
+        self._dsh_web_thread = threading.Thread(
+            target=self._dsh_web_loop, name="dsh-web", daemon=True)
+        self._dsh_web_thread.start()
+
+    def _dsh_web_loop(self):
+        """Keep exactly one `dsh web` alive over the shared store. Adopts an
+        instance that SURVIVED an in-place update (has-session True → leave it),
+        relaunches a crashed one with capped backoff. Off the beat entirely; the
+        beat reads only the status this loop caches (a whole-dict rebind, so the
+        unlocked cross-thread read is safe, like dsh_status/discovered models)."""
+        patch = None
+        backoff = DSH_WEB_RESTART_SEC
+        while not self._dsh_web_stop.is_set():
+            try:
+                if self._dsh_web_running():
+                    # tmux alive AND actually serving -> healthy (this is also
+                    # the ADOPT path across an in-place update). A tmux that is
+                    # alive but NOT serving (bound-then-wedged, or a stale shell)
+                    # is torn down and relaunched below, never reported up.
+                    if self._dsh_web_port_open():
+                        self._set_dsh_web_status(True)
+                        backoff = DSH_WEB_RESTART_SEC
+                        self._dsh_web_stop.wait(DSH_WEB_POLL_SEC)
+                        continue
+                    run(["tmux", "kill-session", "-t", DSH_WEB_TMUX])
+                if patch is None:
+                    patch = self._ensure_dsh_web_patch()
+                # `running` means SERVING: confirm the port bound before reporting
+                # it up, so a launch-then-die (EADDRINUSE / crash) engages the
+                # backoff instead of a flat 10s relaunch of a doomed process (D1).
+                if self._launch_dsh_web(patch) and self._confirm_dsh_web():
+                    self._set_dsh_web_status(True)
+                    backoff = DSH_WEB_RESTART_SEC
+                    self._dsh_web_stop.wait(DSH_WEB_POLL_SEC)
+                else:
+                    self._set_dsh_web_status(False, "viewer did not come up")
+                    self._dsh_web_stop.wait(backoff)
+                    backoff = min(backoff * 2, DSH_WEB_RESTART_MAX_SEC)
+            except Exception as e:                       # never let the loop die
+                log(f"dsh web supervisor error: {e}")
+                self._set_dsh_web_status(False, str(e)[:200])
+                self._dsh_web_stop.wait(backoff)
+                backoff = min(backoff * 2, DSH_WEB_RESTART_MAX_SEC)
+
+    def _set_dsh_web_status(self, running, error=None):
+        """Cache the viewer's status for the beat (whole-dict rebind)."""
+        self.dsh_web = {"running": bool(running), "error": error}
+
+    def _dsh_web_payload(self):
+        """The heartbeat `dsh.web` sub-block, or None when the viewer isn't up.
+        Absent = 'no host-wide dsh web here' (the capability-flag discipline)."""
+        st = getattr(self, "dsh_web", None)
+        if not st or not st.get("running"):
+            return None
+        return {"running": True, "port": DSH_WEB_PORT, "url": _dsh_web_url()}
+
+    def _dsh_payload(self):
+        """The heartbeat `dsh` block: the capability flag, plus the host-wide
+        read-only web viewer's {running, port, url} ONLY when it is up. The web
+        key is OMITTED when down (dsh off, or the viewer not running) — absent =
+        'no dsh web here', the same capability-flag discipline `available` uses,
+        so a pre-viewer agent and a down viewer read identically."""
+        d = {"available": dsh_configured()}
+        web = self._dsh_web_payload()
+        if web is not None:
+            d["web"] = web
+        return d
+
     def _launch_dsh(self, sess, resume=False, prompt=None, resume_id=None):
         """Launch a session on the dsh runtime: a headless per-session dsh process
         in the session's own tmux, driven over a per-session UNIX control socket
@@ -20625,9 +20846,7 @@ class SessionManager:
             # runtime selector rather than queue a spawn the host would ack and
             # then refuse to launch. Absent (a pre-dsh agent) reads the same as
             # false, coerced hub-side.
-            "dsh": {
-                "available": dsh_configured(),
-            },
+            "dsh": self._dsh_payload(),
             # The largest file this agent will take as a message attachment
             # (XERK-234). Doubles as the capability flag, exactly like
             # inputMaxChars above: an agent predating attachments reports nothing
@@ -20913,6 +21132,11 @@ class SessionManager:
         # through this exit — so its tmux (and the claude in it) is reaped here
         # instead. Sessions are deliberately left alone; this is only ours.
         self._kill_limits_probe()
+        # The host-wide dsh web viewer is DELIBERATELY left running: like a dsh
+        # session's tmux it outlives an in-place update (KillMode=process), and
+        # the next boot's supervisor adopts the surviving instance (has-session
+        # True) for a zero-downtime viewer. A container recreate takes it down
+        # with the rest of the stack anyway.
         raise SystemExit(0)
 
     def run_forever(self):
@@ -20951,6 +21175,12 @@ class SessionManager:
         # by an already-running worker; the queue is in-memory, so it parks on an
         # empty queue at boot until a session stages something.
         self._start_dsh_peer_worker()
+        # The host-wide read-only `dsh web` viewer: ONE `dsh web` per host over
+        # the shared store, supervised on a worker thread (never the beat), so a
+        # dsh session's chat can be confirmed in dsh's own UI beside Turma's
+        # Trajectory. No-op unless dsh is configured and DSH_WEB is not turned
+        # off; it adopts an instance that survived an in-place update.
+        self._start_dsh_web()
         beat = 0
         while True:
             # Clear before the beat so a poke that lands *during* it (a command

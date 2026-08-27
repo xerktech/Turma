@@ -484,6 +484,12 @@ those are marked `[MODEL]`.
   replaced with the same Trajectory view. The endpoint is platform-agnostic JSON, so the port is a
   screen that fetches + renders it; suppressing the terminal entry for `agentType == "dsh"` is the
   minimum. Glasses (`hub-client.ts`) likewise still exposes the terminal for dsh — same suppression.
+- **P3 host-wide "dsh web ↗" link in the dsh chat header (XERK-501).** The web shows a link to the
+  host's single host-wide `dsh web` viewer for a dsh session whose host reports a reachable
+  `dsh.web.url` (`AgentInfo.dsh.web = {running, port, url}`, hub-whitelisted; absent/`url:null` on a
+  loopback-only host, so the link hides). Android's `DshInfo` does not yet type a `web` field (which
+  is decode-SAFE — `ignoreUnknownKeys` skips it until typed); to reach parity, type `DshInfo.web:
+  DshWebInfo?` and add an equivalent link/affordance on the dsh session/chat screen.
 - **P2 To-do checklist card + the dsh "Deep diving…" verb (Enable DSH To-Dos).** The web renders a
   `TodoWrite` / dsh `todo_write` tool call as a CHECKLIST (state glyph per row + a `1 in progress ·
   6 pending` count on the summary) instead of raw-JSON input — `renderTodoCard` in `chat.js`, fed by
