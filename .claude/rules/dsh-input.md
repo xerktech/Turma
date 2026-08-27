@@ -235,9 +235,15 @@ mechanics and the invariants a change must not undo:
   point it nowhere.
 - **Always-on when `_dsh_web_enabled()`** (dsh configured AND `DSH_WEB` not turned off), **supervised
   OFF THE BEAT** (`_dsh_web_loop` on a daemon thread — the beat only READS the cached status via
-  `_dsh_payload`/`_dsh_web_payload`, XERK-395). `_dsh_web_running` (`tmux has-session`) is the
-  supervision signal: `dsh web` IS the tmux's command, so a crash ends the session and the loop
-  relaunches with capped backoff.
+  `_dsh_payload`/`_dsh_web_payload`, XERK-395). `_dsh_web_running` (`tmux has-session`) says the tmux
+  is alive; the loop relaunches a crashed one with capped backoff.
+- **`running` means SERVING, not just launched** — `has-session` alone is NOT enough (the XERK-492
+  "a bound thing is not a live thing" lesson, on the port). A tmux that STARTED is not proof the dsh
+  process bound its port: EADDRINUSE / a crash-on-boot ends it a moment later. So the loop reports up
+  only after `_confirm_dsh_web` sees the port ACCEPT a connection (`_dsh_web_port_open`), and the
+  steady-state check pairs `has-session` with the port too (a bound-then-wedged instance is torn down
+  and relaunched). Reporting up off the tmux rc alone both misreported the heartbeat AND skipped the
+  backoff on the dominant failure mode — a flat relaunch of a doomed process.
 - **It ADOPTS an instance that survived an in-place update** — `has-session` True → leave it, for a
   zero-downtime viewer — and `_handle_shutdown` deliberately does NOT kill it (unlike the limits
   probe), exactly like a dsh session's tmux (`KillMode=process`). A container recreate takes it down

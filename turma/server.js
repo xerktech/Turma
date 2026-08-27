@@ -2877,10 +2877,14 @@ function normalizeDsh(payload) {
   // an absent url becomes null, which the clients render as host-only text.
   const w = d.web;
   if (w && typeof w === "object" && !Array.isArray(w) && w.running === true) {
+    // The url flows to an anchor href on the client, so accept ONLY http(s):
+    // — an agent-set javascript:/data: value is dropped to null here rather
+    // than trusted downstream (defence in depth; not a live XSS on Chromium).
+    const rawUrl = typeof w.url === "string" ? w.url.slice(0, DSH_WEB_URL_MAX) : "";
     out.web = {
       running: true,
       port: Number.isFinite(w.port) ? w.port : null,
-      url: (typeof w.url === "string" && w.url) ? w.url.slice(0, DSH_WEB_URL_MAX) : null,
+      url: /^https?:\/\//i.test(rawUrl) ? rawUrl : null,
     };
   }
   payload.dsh = out;

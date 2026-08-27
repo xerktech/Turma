@@ -2127,6 +2127,46 @@ class TestDshWeb(unittest.TestCase):
         t = getattr(sm, "_dsh_web_thread", None)
         self.assertFalse(t is not None and t.is_alive())
 
+    def test_port_open_reads_a_real_listener(self):
+        sm = ha.SessionManager()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        self.addCleanup(srv.close)
+        with mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", port):
+            self.assertTrue(sm._dsh_web_port_open())
+        srv.close()
+        with mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", port):
+            self.assertFalse(sm._dsh_web_port_open())   # nothing listening now
+        # A wildcard bind is not a connectable target -> connect via loopback.
+        with mock.patch.object(ha, "DSH_WEB_HOST", "0.0.0.0"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", port):
+            self.assertFalse(sm._dsh_web_port_open())
+
+    def test_confirm_requires_the_port_bound_not_just_the_tmux(self):
+        # D1: a tmux that started is NOT proof the viewer bound its port
+        # (EADDRINUSE / crash-on-boot). `running` must mean SERVING, so confirm
+        # returns False when the port never opens — which is what engages the
+        # backoff instead of a flat relaunch of a doomed process.
+        sm = ha.SessionManager()
+        sm._dsh_web_stop = threading.Event()
+        with mock.patch.object(ha, "DSH_WEB_CONFIRM_SEC", 0.2), \
+             mock.patch.object(ha, "DSH_WEB_CONFIRM_POLL_SEC", 0.02), \
+             mock.patch.object(sm, "_dsh_web_running", lambda: True), \
+             mock.patch.object(sm, "_dsh_web_port_open", lambda: False):
+            self.assertFalse(sm._confirm_dsh_web())      # tmux up, port never binds
+        # Port comes up -> confirmed.
+        with mock.patch.object(sm, "_dsh_web_running", lambda: True), \
+             mock.patch.object(sm, "_dsh_web_port_open", lambda: True):
+            self.assertTrue(sm._confirm_dsh_web())
+        # tmux already gone (the dsh process exited) -> bail fast, do not wait.
+        with mock.patch.object(sm, "_dsh_web_running", lambda: False), \
+             mock.patch.object(sm, "_dsh_web_port_open", lambda: True):
+            self.assertFalse(sm._confirm_dsh_web())
+
 
 class TestDshQueryState(unittest.TestCase):
     """dsh_query_state speaks the control-socket contract

@@ -1196,6 +1196,12 @@ DSH_WEB_URL = os.environ.get("DSH_WEB_URL", "").strip()
 DSH_WEB_POLL_SEC = float(os.environ.get("DSH_WEB_POLL_SEC") or "10")
 DSH_WEB_RESTART_SEC = float(os.environ.get("DSH_WEB_RESTART_SEC") or "5")
 DSH_WEB_RESTART_MAX_SEC = float(os.environ.get("DSH_WEB_RESTART_MAX_SEC") or "60")
+# After a tmux launch, how long to wait for the viewer to actually BIND its port
+# before reporting it up. A tmux that started is NOT proof the dsh process
+# survived (EADDRINUSE, crash-on-boot) — the XERK-492 "a bound thing is not a
+# live thing" lesson, applied to the port instead of a control socket.
+DSH_WEB_CONFIRM_SEC = float(os.environ.get("DSH_WEB_CONFIRM_SEC") or "8")
+DSH_WEB_CONFIRM_POLL_SEC = float(os.environ.get("DSH_WEB_CONFIRM_POLL_SEC") or "0.3")
 
 
 def _dsh_web_enabled():
@@ -12834,11 +12840,41 @@ class SessionManager:
         return path
 
     def _dsh_web_running(self):
-        """True when the viewer's tmux is alive. This is the supervision signal:
-        `dsh web` IS the tmux's command, so a crash ends the session and this
-        goes False — the same has-session liveness the limits probe relies on."""
+        """True when the viewer's tmux is alive. `dsh web` IS the tmux's command,
+        so a crash ends the session and this goes False — the has-session liveness
+        the limits probe relies on. NOT sufficient alone: a tmux that started is
+        not proof the port bound (D1), and a bound-then-wedged process keeps the
+        tmux alive — so callers pair it with _dsh_web_port_open."""
         rc, _ = run_ok(["tmux", "has-session", "-t", DSH_WEB_TMUX], timeout=5)
         return rc == 0
+
+    def _dsh_web_port_open(self):
+        """Whether the viewer is actually ACCEPTING connections — the real
+        'serving' signal has-session cannot give. Connects to the bind host
+        (loopback for a wildcard bind, which is not a connectable target)."""
+        host = DSH_WEB_HOST if DSH_WEB_HOST not in (
+            "0.0.0.0", "::", "") else "127.0.0.1"
+        try:
+            with socket.create_connection((host, DSH_WEB_PORT), timeout=2):
+                return True
+        except OSError:
+            return False
+
+    def _confirm_dsh_web(self):
+        """After a tmux launch, wait a bounded window for the viewer to BIND its
+        port before reporting it up (D1). A tmux that started is not proof the
+        dsh process survived — EADDRINUSE / crash-on-boot ends it a moment later,
+        and reporting `running:True` off the tmux rc alone both misreports the
+        heartbeat and skips the backoff. Bails fast when the tmux is already gone
+        (the XERK-492 lesson, on the port)."""
+        deadline = time.time() + DSH_WEB_CONFIRM_SEC
+        while time.time() < deadline and not self._dsh_web_stop.is_set():
+            if not self._dsh_web_running():
+                return False              # the dsh process exited (tmux gone)
+            if self._dsh_web_port_open():
+                return True
+            self._dsh_web_stop.wait(DSH_WEB_CONFIRM_POLL_SEC)
+        return False
 
     def _launch_dsh_web(self, patch):
         """(Re)launch the host-wide `dsh web` in its own tmux. Clean-slate kill
@@ -12888,18 +12924,27 @@ class SessionManager:
         while not self._dsh_web_stop.is_set():
             try:
                 if self._dsh_web_running():
-                    self._set_dsh_web_status(True)
-                    backoff = DSH_WEB_RESTART_SEC
-                    self._dsh_web_stop.wait(DSH_WEB_POLL_SEC)
-                    continue
+                    # tmux alive AND actually serving -> healthy (this is also
+                    # the ADOPT path across an in-place update). A tmux that is
+                    # alive but NOT serving (bound-then-wedged, or a stale shell)
+                    # is torn down and relaunched below, never reported up.
+                    if self._dsh_web_port_open():
+                        self._set_dsh_web_status(True)
+                        backoff = DSH_WEB_RESTART_SEC
+                        self._dsh_web_stop.wait(DSH_WEB_POLL_SEC)
+                        continue
+                    run(["tmux", "kill-session", "-t", DSH_WEB_TMUX])
                 if patch is None:
                     patch = self._ensure_dsh_web_patch()
-                if self._launch_dsh_web(patch):
+                # `running` means SERVING: confirm the port bound before reporting
+                # it up, so a launch-then-die (EADDRINUSE / crash) engages the
+                # backoff instead of a flat 10s relaunch of a doomed process (D1).
+                if self._launch_dsh_web(patch) and self._confirm_dsh_web():
                     self._set_dsh_web_status(True)
                     backoff = DSH_WEB_RESTART_SEC
                     self._dsh_web_stop.wait(DSH_WEB_POLL_SEC)
                 else:
-                    self._set_dsh_web_status(False, "launch failed")
+                    self._set_dsh_web_status(False, "viewer did not come up")
                     self._dsh_web_stop.wait(backoff)
                     backoff = min(backoff * 2, DSH_WEB_RESTART_MAX_SEC)
             except Exception as e:                       # never let the loop die

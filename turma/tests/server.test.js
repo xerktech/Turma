@@ -11823,6 +11823,13 @@ test("normalizeDsh whitelists the host-wide web viewer sub-block (XERK-501)", ()
   const long = "http://box/" + "a".repeat(5000);
   assert.ok(norm({ available: true, web: { running: true, port: 1, url: long } })
               .web.url.length <= 512);
+  // The url must be http(s): — it flows to an anchor href on the client, so an
+  // agent-set javascript:/data: is dropped to null (defence in depth).
+  const u = (url) => norm({ available: true, web: { running: true, port: 1, url } }).web.url;
+  assert.equal(u("javascript:alert(1)"), null);
+  assert.equal(u("data:text/html,<script>x</script>"), null);
+  assert.equal(u("HTTP://box:7788/"), "HTTP://box:7788/");   // scheme case-insensitive
+  assert.equal(u("https://box:7788/"), "https://box:7788/");
   // A junk web block on an otherwise-good dsh block drops the web, keeps the flag.
   assert.deepEqual(norm({ available: true, web: "yes" }), { available: true });
   assert.deepEqual(norm({ available: true, web: [1] }), { available: true });
