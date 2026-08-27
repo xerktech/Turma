@@ -19309,38 +19309,16 @@ class SessionManager:
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue
+            # A dsh session is named from dsh's OWN title, never claude -p, so it
+            # runs BEFORE the _summary_due gate: that gate returns False the moment
+            # a name is set, and a dsh session's FIRST title is a crude fallback
+            # that a later beat must be allowed to override (see _seed_dsh_summary).
+            if sess.get("agentType") == "dsh":
+                self._seed_dsh_summary(sess)
+                continue
             if not _summary_due(sess, now):
                 continue
             if sess["id"] in self.summaries:
-                continue
-            # A dsh session is named from dsh's OWN auto-generated title — the
-            # `session/title` event the projection tail captured — never claude -p
-            # (_start_summary also refuses a dsh session, but the title seeding
-            # lives HERE, on the beat, where session-record mutation is safe).
-            # dsh writes the title once it can derive one from the first user
-            # turn; until it lands the session stays unnamed and we look again
-            # next beat (no attempt spent, no `claude -p`).
-            if sess.get("agentType") == "dsh":
-                tail = self.dsh_tails.get(sess["id"])
-                # Guarded because this runs on the beat, which is the agent's MAIN
-                # process: an uncaught exception here does not skip a cycle, it
-                # takes the host and every session on it down (the XERK-395/402
-                # beat-loop contract). A packaging skew that shipped a NEW
-                # hub-agent.py beside an OLD dsh_session.py — one with no title()
-                # — did exactly that, crash-looping every dsh host on an
-                # AttributeError. A sibling-module mismatch must degrade to
-                # "unnamed this beat", never crash the fleet.
-                try:
-                    title = tail.title() if tail else None
-                except Exception as e:
-                    log(f"dsh title lookup failed for {sess['id']}: {e}")
-                    title = None
-                if not title or sess.get("summary"):
-                    continue
-                sess["summary"] = title
-                sess.pop("summaryRetryAt", None)
-                self.save()
-                log(f"named dsh session {sess['id']}: {title!r}")
                 continue
             path = _session_transcript_path(sess)
             if not path:
@@ -19348,6 +19326,55 @@ class SessionManager:
             text = _first_user_text(path)
             if text:
                 self._start_summary(sess, text)
+
+    def _seed_dsh_summary(self, sess):
+        """Name a running dsh session from dsh's OWN `session/title` event (the
+        projection tail captured it — never a `claude -p`, which a dsh host has no
+        summarizer for). dsh writes the title in TWO passes for one session: a
+        crude deterministic FALLBACK slice of the raw prompt the instant the first
+        turn starts, then the real GENERATED title once its title-llm call returns
+        — and that call can take longer than one INTERVAL on a busy local model.
+
+        So the generated title is authoritative and OVERRIDES a fallback name a
+        prior beat applied, while a fallback (before any generated title) names the
+        card provisionally rather than leaving it blank. Without the override the
+        session pinned the fallback forever (`_summary_due` stops re-checking once
+        `summary` is set), which is exactly 'the generated title is never pulled'.
+
+        A manual rename (`summaryManual`) wins over both. Guarded because this runs
+        on the beat — the agent's MAIN process — where an uncaught exception is the
+        whole host, not a skipped cycle (XERK-395/402): a packaging skew that
+        shipped a NEW hub-agent.py beside an OLD dsh_session.py with no
+        `title()`/`title_final()` must degrade to 'unnamed this beat', never crash
+        the fleet."""
+        if sess.get("summaryManual"):
+            return
+        tail = self.dsh_tails.get(sess["id"])
+        try:
+            title = tail.title() if tail else None
+            final = tail.title_final() if tail else False
+        except Exception as e:
+            log(f"dsh title lookup failed for {sess['id']}: {e}")
+            return
+        if not title:
+            return
+        if final:
+            # dsh's generated (or user-set) title: apply it, overriding a
+            # fallback a prior beat pinned. A no-op once already in sync, so it
+            # does not re-save every beat.
+            if sess.get("summary") != title:
+                sess["summary"] = title
+                sess.pop("summaryRetryAt", None)
+                self.save()
+                log(f"named dsh session {sess['id']}: {title!r}")
+        elif not sess.get("summary"):
+            # Only the fallback has arrived and nothing is named yet — apply it so
+            # the card is not blank; the generated title overrides it above.
+            sess["summary"] = title
+            sess.pop("summaryRetryAt", None)
+            self.save()
+            log(f"named dsh session {sess['id']}: {title!r} "
+                "(fallback; awaiting dsh's generated title)")
 
     def _poll_summaries(self):
         """Reap finished summary subprocesses (one poll() per active job each

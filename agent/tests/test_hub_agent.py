@@ -15932,11 +15932,15 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
     # `session/title` event the projection tail captures), never claude -p.
 
     class _Tail:
-        def __init__(self, title):
+        def __init__(self, title, final=True):
             self._t = title
+            self._final = final
 
         def title(self):
             return self._t
+
+        def title_final(self):
+            return self._final
 
     def test_dsh_session_named_from_dsh_title_not_claude(self):
         sm = self.make_manager()
@@ -15962,9 +15966,46 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
         # until dsh's own title actually arrives.
         self.assertEqual(sm.registry[0].get("summaryAttempts", 0), 0)
 
+    def test_dsh_fallback_title_is_provisional_then_upgraded(self):
+        # dsh writes the crude FALLBACK title (a slice of the raw prompt) the
+        # instant the first turn starts, and the real GENERATED title once its
+        # title-llm returns — which can be slower than one beat. A beat that lands
+        # between the two names the card provisionally from the fallback, then a
+        # later beat OVERRIDES it with dsh's generated title (the reported bug was
+        # pinning the fallback forever).
+        sm = self.make_manager()
+        sess = self._session(agentType="dsh")
+        sm.registry = [sess]
+        fallback = self._Tail("add a compose flag to", final=False)
+        sm.dsh_tails = {"abcde": fallback}
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()             # only the fallback has landed
+        start.assert_not_called()
+        self.assertEqual(sess["summary"], "add a compose flag to")
+        # The generated (provider-source) title lands; the next beat replaces the
+        # provisional fallback with it.
+        sm.dsh_tails = {"abcde": self._Tail("Add Compose Flag to Widget")}
+        sm._seed_summaries()
+        self.assertEqual(sess["summary"], "Add Compose Flag to Widget")
+
+    def test_dsh_generated_title_lands_first_no_provisional(self):
+        # When the generated title is the first (or only) one seen, it is applied
+        # directly — no fallback churn.
+        sm = self.make_manager()
+        sess = self._session(agentType="dsh")
+        sm.registry = [sess]
+        sm.dsh_tails = {"abcde": self._Tail("Add Compose Flag to Widget")}
+        sm._seed_summaries()
+        self.assertEqual(sess["summary"], "Add Compose Flag to Widget")
+        # A second beat is a no-op (does not re-save an unchanged name).
+        with mock.patch.object(sm, "save") as save:
+            sm._seed_summaries()
+        save.assert_not_called()
+
     def test_dsh_session_title_does_not_override_manual_name(self):
         sm = self.make_manager()
-        sm.registry = [self._session(agentType="dsh", summary="Operator Name")]
+        sm.registry = [self._session(
+            agentType="dsh", summary="Operator Name", summaryManual=True)]
         sm.dsh_tails = {"abcde": self._Tail("Adding Compose Flag")}
         with mock.patch.object(sm, "_start_summary") as start:
             sm._seed_summaries()

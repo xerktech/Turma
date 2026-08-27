@@ -253,12 +253,13 @@ not undo:
   with no change. This is what makes `readyForReview`'s finished-turn branch work identically for a
   dsh session — the only signal that is not transcript-derived is liveness, exactly as S1's "liveness
   is deliberately NOT in the projection" note carves out.
-- **A dsh session's NAME comes from dsh's OWN auto-generated title, never `claude -p`.** dsh writes
-  the title as a `session/title` event (log-only — not a transcript entry); the projection tail
-  (`dsh_session.py`) captures `data.title`, and hub-agent's `_seed_summaries` names the session from
-  it on the beat. `_start_summary` refuses a `agentType=="dsh"` session, so the spawn / dsh-input
-  paths never spend a Claude summarizer turn on a runtime that has no Claude login. Until dsh derives
-  a title (from the first user turn) the session stays unnamed and is looked at again next beat.
+- **A dsh session's NAME comes from dsh's OWN `session/title` event, never `claude -p`.** Log-only
+  (not a transcript entry); the projection tail (`dsh_session.py`) captures `data.title`, and
+  `_seed_dsh_summary` names the session from it on the beat. `_start_summary` refuses a
+  `agentType=="dsh"` session, so no Claude summarizer turn is spent on a runtime with no Claude login.
+  - dsh writes TWO `session/title` events (a crude `fallback` then the real generated one); the
+    seeder applies the fallback provisionally and overrides it with the generated title. Mechanics
+    in `.claude/rules/dsh-input.md`.
 - **`dsh_pane_busy` is a tri-state and deliberately NOT time-expired.** running→True, idle→False,
   unknown/missing→None ("can't tell", so downstream falls back to transcript freshness exactly like an
   uncapturable Claude pane). A pending interaction reads False (blocked on a human, not its own turn —
