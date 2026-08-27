@@ -1125,12 +1125,12 @@ DSH_HOME = os.environ.get("DSH_HOME") or os.path.join(REGISTRY_DIR, "dsh-home")
 # base's global host layer (a rosterless deployment — `agent-presets`/the mount
 # is a web-app concern), verified end to end against real dsh 0.1.1-rc.2.
 DSH_PROFILE = os.environ.get("DSH_PROFILE", "turma")
-# The ONE host-wide read-only viewer profile (XERK-498): a single long-running
-# `dsh --profile web` per host, over the SHARED DSH_HOME/sessions store, exposed
-# through the tunnel once per host. dsh-session-query.listSessions() reads that
-# store off disk, so this viewer renders sessions every per-session dsh process
-# created — the dsh-web path the lifecycle doc left to verify, now confirmed.
-DSH_VIEWER_PROFILE = os.environ.get("DSH_VIEWER_PROFILE", "web")
+# The host-wide read-only viewer is Turma-NATIVE (XERK-498), not a `dsh web`: a
+# Trajectory over the D3 native event log the raw archive already holds, served
+# by the hub at GET /api/dsh/<tid>/trajectory (turma/archive.js dshTrajectory).
+# `dsh web` was ruled out — it has no base-path flag, so it can't be sub-path
+# -proxied per host the way ttyd's `-b` allows — so there is NO viewer profile or
+# port here; see .claude/rules/dsh.md (XERK-498) and turma-sessions.md.
 # The provider ROUTE key == agentOptions.provider the driver passes per session.
 DSH_PROVIDER = os.environ.get("DSH_PROVIDER", "turma-dsh")
 DSH_MODEL = (os.environ.get("DSH_MODEL")
@@ -1143,11 +1143,6 @@ DSH_MODEL_CONTEXT = int(os.environ.get("DSH_MODEL_CONTEXT")
 # The built driver plugin (agent/dsh-session-driver/dist), installed into the
 # profile as a bundle by _ensure_dsh_profile.
 DSH_PLUGIN_DIR = os.path.join(_AGENT_DIR, "dsh-session-driver")
-# The loopback port the ONE host-wide read-only dsh viewer binds (XERK-498).
-# Not per session any more — a single viewer serves the whole host over the
-# shared store, exposed through the tunnel like ttyd but once per host.
-DSH_VIEWER_PORT = int(os.environ.get("DSH_VIEWER_PORT")
-                      or os.environ.get("DSH_WEB_PORT_BASE") or "7900")
 # Where per-session control sockets live: ~/.turma/dsh/<id>.sock, under the
 # agent-owned ~/.turma the guard already governs — never a worktree.
 DSH_SOCKET_DIR = os.path.join(REGISTRY_DIR, "dsh")
@@ -12732,8 +12727,9 @@ class SessionManager:
         projection transcript), the new-work / ticket-branch / peers directive —
         but dsh has NO pane and (XERK-498) NO per-session ttyd or web server:
         input, answers and liveness ride the control socket, and the transcript
-        is a projection of dsh's own event log (dsh_session.py + [S1]). A single
-        host-wide read-only `dsh web` viewer serves observation instead.
+        is a projection of dsh's own event log (dsh_session.py + [S1]). A Turma
+        -native read-only Trajectory view over the D3 native log serves
+        observation instead (GET /api/dsh/<tid>/trajectory).
 
         Raises RuntimeError on a hard failure, like _launch_tmux, so the caller's
         error handling (provision's _set_error, the resume paths) marks the
