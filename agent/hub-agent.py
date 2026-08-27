@@ -15332,6 +15332,49 @@ class SessionManager:
             self._set_error(sess, e)
         self.save()
 
+    def _switch_dsh_model(self, sess, model):
+        """Change which DISCOVERED model a RUNNING dsh session uses (XERK-504),
+        keeping its conversation.
+
+        The dsh analogue of _switch_local_model: a dsh session's model rides
+        TURMA_DSH_MODEL and the pi-ai provider route (both read at process
+        start), so a switch relaunches the dsh process via --resume — dsh reloads
+        its own durable store (the conversation) and the new model applies to
+        subsequent turns. Membership is validated against the discovered set
+        before the relaunch; the record reverts if the launch throws, so a stored
+        model never outlives a launch that failed on it."""
+        if not sess or sess.get("status") != "running":
+            return
+        if not dsh_configured():
+            self._set_error(sess, ValueError(
+                "this host has no dsh runtime configured"))
+            return
+        if not dsh_model_member(model):
+            self._set_error(sess, ValueError(
+                f"dsh model {model!r} is not served by this host"))
+            return
+        if sess.get("model") == model:
+            return                                  # nothing changed; no relaunch
+        prev = sess.get("model")
+        sess["model"] = model
+        sess.pop("pendingModel", None)
+        try:
+            self._kill_tmux(sess)
+            self._clear_question_files(sess["id"])
+            # _launch_tmux dispatches to _launch_dsh(resume=True) at its choke
+            # point; _launch_dsh rewrites the route with the new model and sets
+            # TURMA_DSH_RESUME so dsh reloads its store. _launch_ttyd is a no-op
+            # for dsh (it early-returns), kept for symmetry with the local path.
+            self._launch_tmux(sess, resume=True)
+            self._launch_ttyd(sess)
+            sess["errorMsg"] = None
+            sess["restartCount"] = sess.get("restartCount", 0) + 1
+            log(f"session {sess['id']} switched dsh model -> {model}")
+        except Exception as e:
+            sess["model"] = prev
+            self._set_error(sess, e)
+        self.save()
+
     def set_model_source(self, sid, source, model=None):
         """Move a running session between the subscription and the self-hosted
         model, KEEPING its conversation (XERK-246).
@@ -16011,6 +16054,14 @@ class SessionManager:
         into the pane, so it checks the pane NOW rather than trusting the
         beat-old paneBusy."""
         sess_early = self._find(sid)
+        # A dsh session has NO Claude TUI pane and its model is a DISCOVERED
+        # endpoint id, not a Claude alias, so driving the /model picker is
+        # impossible (XERK-504). A dsh model change relaunches the dsh process via
+        # --resume with the new model — the _switch_local_model machinery for a
+        # different runtime.
+        if sess_early and sess_early.get("agentType") == "dsh":
+            self._switch_dsh_model(sess_early, model)
+            return
         # A session on the self-hosted model takes its model from ANTHROPIC_MODEL,
         # not from the /model picker — the picker only lists the LOGIN's Claude
         # aliases, none of which the gateway serves. So a model change for a local

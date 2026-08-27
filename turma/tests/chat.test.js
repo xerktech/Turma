@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1809,20 +1809,22 @@ test("model source: an in-flight switch paints the target, not the stale beat", 
   __setAgent({ localModel: { available: true, model: "gpt-oss:120b" } });
   __setModelSourcePending({ value: "local", at: Date.now(), sessionId: "s1" });
   assert.equal(currentModelSource(), "local");
-  assert.equal(modelSourceLabel(), "Other");   // the model is named in its own dropdown, not here
+  assert.equal(modelSourceLabel(), "Claude Code Local");   // the runtime, matching the composer (XERK-504)
   // A stale memo must not pin the chip forever if the switch never lands.
   __setModelSourcePending({ value: "local", at: Date.now() - 120000, sessionId: "s1" });
   assert.equal(currentModelSource(), "subscription");
   __setModelSourcePending(null);
 });
 
-test("model source: the local option reads 'Other', not the raw model id", () => {
+test("model source: the runtime chip reads the composer's runtime names, not the model id (XERK-504)", () => {
   __setModelSourcePending(null);
   __setSess({ id: "s1", modelSource: "subscription" });
   __setAgent({ localModel: { available: true, model: "bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0" } });
+  // The footer runtime chip matches the spawn composer's Runtime picker labels
+  // (it never names the model — the adjacent dropdown does).
   assert.deepEqual(modelSourceOpts().map((o) => o.value), ["subscription", "local"]);
-  assert.deepEqual(modelSourceOpts().map((o) => o.label), ["Claude subscription", "Other"]);
-  assert.equal(modelSourceLabel(), "Subscription");
+  assert.deepEqual(modelSourceOpts().map((o) => o.label), ["Claude Code", "Claude Code Local"]);
+  assert.equal(modelSourceLabel(), "Claude Code");
 });
 
 test("local model (XERK-489): the dropdown lists the discovered models with windows", () => {
@@ -1845,6 +1847,50 @@ test("local model (XERK-489): the dropdown lists the discovered models with wind
   assert.match(html, /id="ccLocalModelMenu"/);
   assert.match(html, /id="ccLocalCtx"/);           // the advanced override field
   assert.doesNotMatch(html, /cc-model-fixed/);
+});
+
+test("dsh footer (XERK-504): the runtime chip is read-only and the model dropdown lists discovered dsh models", () => {
+  __setDshModelPending(null);
+  __setSess({ id: "s1", agentType: "dsh", model: "deepseek-reasoner", modelSource: "subscription" });
+  __setAgent({ dsh: { available: true, defaultModel: "deepseek-chat",
+    models: [{ id: "deepseek-chat", contextTokens: 128000 },
+             { id: "deepseek-reasoner", contextTokens: 64000 }] } });
+  assert.equal(isDshSession(), true);
+  // The session's own dsh model wins over the host default.
+  assert.equal(currentDshModel(), "deepseek-reasoner");
+  // The model dropdown lists the discovered dsh ids with windows.
+  assert.deepEqual(dshModelOpts().map((o) => o.value), ["deepseek-chat", "deepseek-reasoner"]);
+  assert.equal(dshModelOpts()[1].label, "deepseek-reasoner · 64k");
+  const model = dshModelChipHtml();
+  assert.match(model, /id="ccDshModelBtn"/);
+  assert.match(model, /id="ccDshModelMenu"/);
+  assert.match(model, /deepseek-reasoner/);
+  assert.doesNotMatch(model, /cc-model-fixed/);
+  // The runtime chip says "dsh" (matching the card badge) and is NOT a picker —
+  // a running dsh session can't switch to a Claude runtime live.
+  const runtime = dshRuntimeChipHtml();
+  assert.match(runtime, />dsh</);
+  assert.doesNotMatch(runtime, /cc-caret/);          // no dropdown affordance
+  assert.doesNotMatch(runtime, /Subscription/);      // NOT the Claude source chip
+});
+
+test("dsh footer (XERK-504): with no discovered list the model chip degrades to a fixed label", () => {
+  __setDshModelPending(null);
+  __setSess({ id: "s1", agentType: "dsh", model: "deepseek-v4-flash", modelSource: "subscription" });
+  __setAgent({ dsh: { available: true, defaultModel: "deepseek-v4-flash", models: [] } });
+  assert.equal(currentDshModel(), "deepseek-v4-flash");
+  const html = dshModelChipHtml();
+  assert.match(html, /cc-model-fixed/);
+  assert.match(html, /deepseek-v4-flash/);
+  assert.doesNotMatch(html, /ccDshModelMenu/);       // no live dropdown to offer
+});
+
+test("dsh footer (XERK-504): a non-dsh session is not treated as dsh", () => {
+  __setSess({ id: "s1", modelSource: "subscription" });
+  __setAgent({ localModel: { available: false } });
+  assert.equal(isDshSession(), false);
+  __setSess({ id: "s1", agentType: "claude", modelSource: "local" });
+  assert.equal(isDshSession(), false);
 });
 
 test("local model (XERK-489): a stored context override wins, and shrinks the readout", () => {

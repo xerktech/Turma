@@ -243,6 +243,23 @@ function sessionModelSource(hostKey, sessionId) {
   return (s && s.modelSource) || "";
 }
 
+// The runtime a host reports for one of its sessions ("claude"|"dsh", "" when
+// unknown / a pre-dsh agent that reads as claude).
+function sessionAgentType(hostKey, sessionId) {
+  const s = (agents[hostKey]?.sessions || []).find((x) => x.id === sessionId);
+  return (s && s.agentType) || "";
+}
+
+// Does this host's dsh runtime serve `model`? Mirrors localModelServes — an
+// empty discovered set can't refute (discovery may not have landed), so accept.
+function dshServes(agent, model) {
+  if (!model) return true;
+  const d = agent && agent.dsh;
+  const list = (d && Array.isArray(d.models)) ? d.models : [];
+  if (!list.length) return true;
+  return list.some((m) => m && m.id === model);
+}
+
 // Validate a spawn's optional modelSource the same way the switch route does.
 // Returns null when fine, else {status, error}. Spawning onto the local model is
 // how you start NEW work once usage is gone, so it gets the same enum check and
@@ -8987,6 +9004,18 @@ const server = http.createServer(async (req, res) => {
         // so accept it here — but against the endpoint charset (ids carry `:`/`/`
         // that the Claude-alias regex forbids) and only when the host's
         // discovered set actually serves it (409, mirroring the switch route).
+        // A dsh session's model is a DISCOVERED endpoint id, not a Claude alias
+        // (XERK-504): the agent relaunches the dsh process on the new model
+        // rather than driving the (non-existent) /model picker, so accept the
+        // endpoint charset and validate against the host's discovered dsh set.
+        if (sessionAgentType(key, sessionId) === "dsh") {
+          if (model.length > 60 || !/^[A-Za-z0-9._:/-]+$/.test(model))
+            return json(res, 400, { error: "invalid model" });
+          if (!dshServes(agents[key], model))
+            return json(res, 409, { error: "host does not serve that dsh model" });
+          const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
+          return json(res, 200, { ok: true, cmdId });
+        }
         if (sessionModelSource(key, sessionId) === "local") {
           if (model.length > 60 || !/^[A-Za-z0-9._:/-]+$/.test(model))
             return json(res, 400, { error: "invalid model" });
