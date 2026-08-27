@@ -126,12 +126,18 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
   which the raw archive layer already holds (`<tid>/dsh/*.jsonl`, XERK-469). `chatToTrajectory` fetches
   `GET /api/dsh/<transcriptId>/trajectory` (parsed server-side by `archive.dshTrajectory` into
   turns/steps/tool-calls/token-usage/timings — the richer telemetry the S1 projection flattens) and
-  renders newest-turn-first. This REPLACES the removed per-session dsh terminal/web-server; there is
-  no ttyd or dsh web server for a dsh session. A running session's log syncs to the archive within a
+  renders newest-turn-first. This REPLACES the removed PER-SESSION dsh terminal/web-server; there is
+  no ttyd and no per-session dsh web server. A running session's log syncs to the archive within a
   few beats, so a just-opened dsh session may 404 until the first sync (the pane says so, ↻ Refresh).
-  The dsh-web-through-tunnel path was ruled out — `dsh web` has no base-path flag, so it cannot be
-  sub-path-proxied per host. Web-first; Android (`TerminalScreen`) + glasses in `android/PARITY.md`.
+  The dsh-web-through-tunnel PROXY path was ruled out — `dsh web` has no base-path flag, so it cannot
+  be sub-path-proxied per host. Web-first; Android (`TerminalScreen`) + glasses in `android/PARITY.md`.
   Tests: the `dshTrajectory` cases in `archive.test.js`, `/api/dsh/<id>/trajectory` in `server.test.js`.
+- **Beside the in-dashboard Trajectory, a dsh session's chat header shows a "dsh web ↗" link**
+  (XERK-501) to the host's SINGLE host-wide `dsh web` (a DIRECT-access read-only viewer over the
+  shared store — `.claude/rules/dsh-input.md`), so the chat can be confirmed in dsh's own UI too.
+  Shown only for a dsh session whose host reports a reachable `dsh.web.url`; a loopback-only host
+  reports none (`url:null`) and the link stays hidden rather than pointing nowhere. Web-first
+  (`android/PARITY.md`).
 
 ### The model and mode chips
 

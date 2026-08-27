@@ -11793,6 +11793,41 @@ test("normalizeDsh coerces the capability flag strictly boolean (XERK-465)", () 
   assert.ok(!("dsh" in old));
 });
 
+test("normalizeDsh whitelists the host-wide web viewer sub-block (XERK-501)", () => {
+  const norm = (dsh) => {
+    const p = { device: "h", dsh };
+    hub.normalizeDsh(p);
+    return p.dsh;
+  };
+  // A viewer that is UP passes through as {running, port, url}.
+  assert.deepEqual(
+    norm({ available: true, web: { running: true, port: 7788, url: "http://box:7788" } }),
+    { available: true, web: { running: true, port: 7788, url: "http://box:7788" } });
+  // Kept only when running:true — a launch-failed / absent viewer carries no
+  // web block (the capability-absence the client reads as "no dsh web here").
+  assert.deepEqual(norm({ available: true, web: { running: false } }),
+                   { available: true });
+  assert.deepEqual(norm({ available: true }), { available: true });
+  // A non-string / absent url -> null (host-only reachable), never a dead link.
+  assert.deepEqual(
+    norm({ available: true, web: { running: true, port: 7788 } }),
+    { available: true, web: { running: true, port: 7788, url: null } });
+  assert.deepEqual(
+    norm({ available: true, web: { running: true, port: 7788, url: 42 } }),
+    { available: true, web: { running: true, port: 7788, url: null } });
+  // A non-finite port -> null.
+  assert.equal(
+    norm({ available: true, web: { running: true, port: "80" } }).web.port, null);
+  // The url is length-capped on the wire (the PEER_CELL_MAX / retiredUsage
+  // memory-hazard class): an uncapped agent-set string must not ride /api/agents.
+  const long = "http://box/" + "a".repeat(5000);
+  assert.ok(norm({ available: true, web: { running: true, port: 1, url: long } })
+              .web.url.length <= 512);
+  // A junk web block on an otherwise-good dsh block drops the web, keeps the flag.
+  assert.deepEqual(norm({ available: true, web: "yes" }), { available: true });
+  assert.deepEqual(norm({ available: true, web: [1] }), { available: true });
+});
+
 test("normalizeLocalModel bounds and sanitizes the discovered models[] (XERK-489)", () => {
   // The discovered set rides the heartbeat and Android decodes /api/agents
   // ATOMICALLY into `List<LocalModelInfo>` — so an endpoint answering thousands

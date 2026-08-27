@@ -2019,6 +2019,115 @@ class TestDshState(unittest.TestCase):
             {"status": "running", "pendingInteraction": True}), False)
 
 
+class TestDshWeb(unittest.TestCase):
+    """The host-wide read-only `dsh web` viewer supervisor (XERK-501): the URL
+    advertise rule, the enable gate, the payload, the launch command and the
+    persistence patch. The adopt/relaunch/restart cycle is REAL-dsh QA."""
+
+    def test_web_url_advertises_only_a_reachable_host(self):
+        # An explicit override wins outright (a reverse proxy / hostname).
+        with mock.patch.object(ha, "DSH_WEB_URL", "https://box.lan/dsh"):
+            self.assertEqual(ha._dsh_web_url(), "https://box.lan/dsh")
+        # A concrete routable bind host yields a usable http URL...
+        with mock.patch.object(ha, "DSH_WEB_URL", ""), \
+             mock.patch.object(ha, "DSH_WEB_HOST", "10.0.0.5"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", 7788):
+            self.assertEqual(ha._dsh_web_url(), "http://10.0.0.5:7788")
+        # ...but loopback/wildcard yields NONE — reachable only from the host
+        # itself, so the UI shows host-only text, never a dead link.
+        for h in ("127.0.0.1", "0.0.0.0", "localhost", "::1", "::"):
+            with mock.patch.object(ha, "DSH_WEB_URL", ""), \
+                 mock.patch.object(ha, "DSH_WEB_HOST", h):
+                self.assertIsNone(ha._dsh_web_url())
+
+    def test_web_enabled_gates_on_dsh_and_the_off_switch(self):
+        with mock.patch.object(ha, "dsh_configured", lambda: False), \
+             mock.patch.object(ha, "DSH_WEB_ENABLED", True):
+            self.assertFalse(ha._dsh_web_enabled())   # no dsh -> no viewer
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "DSH_WEB_ENABLED", False):
+            self.assertFalse(ha._dsh_web_enabled())   # explicitly turned off
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "DSH_WEB_ENABLED", True):
+            self.assertTrue(ha._dsh_web_enabled())
+
+    def test_payload_is_none_until_up_then_carries_port_and_url(self):
+        sm = ha.SessionManager()
+        # No status cached / a launch failure -> None (capability-absence, the
+        # client renders nothing rather than a stale link).
+        self.assertIsNone(sm._dsh_web_payload())
+        sm._set_dsh_web_status(False, "launch failed")
+        self.assertIsNone(sm._dsh_web_payload())
+        with mock.patch.object(ha, "DSH_WEB_URL", "http://box:7788"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", 7788):
+            sm._set_dsh_web_status(True)
+            self.assertEqual(
+                sm._dsh_web_payload(),
+                {"running": True, "port": 7788, "url": "http://box:7788"})
+
+    def test_launch_builds_the_web_tmux_over_the_shared_store(self):
+        sm = ha.SessionManager()
+        calls = {"run": [], "run_ok": []}
+        with mock.patch.object(ha, "run",
+                               lambda cmd, **k: calls["run"].append(cmd) or ""), \
+             mock.patch.object(ha, "run_ok",
+                               lambda cmd, **k: calls["run_ok"].append(cmd) or (0, "")), \
+             mock.patch.object(ha, "DSH_WEB_HOST", "127.0.0.1"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", 7788), \
+             mock.patch.object(ha, "DSH_BIN", "dsh"):
+            self.assertTrue(sm._launch_dsh_web("/tmp/patch.yml"))
+        # Clean-slate kill first, then a detached new-session running dsh web.
+        self.assertEqual(calls["run"][0][:2], ["tmux", "kill-session"])
+        new = calls["run_ok"][0]
+        self.assertEqual(new[:3], ["tmux", "new-session", "-d"])
+        cmd = new[-1]
+        self.assertIn("--profile web", cmd)
+        self.assertIn("--patch /tmp/patch.yml", cmd)   # reads the plaintext stores
+        self.assertIn("--no-open", cmd)                # never opens a browser
+        self.assertIn("--host 127.0.0.1", cmd)
+        self.assertIn("--port 7788", cmd)
+        self.assertIn("DSH_HOME=" + ha.DSH_HOME, cmd)  # the SHARED store
+        # It is the HOST-wide instance — no per-session identity leaks in.
+        self.assertNotIn("--session-id", cmd)
+        self.assertNotIn("TURMA_DSH_SESSION_ID", cmd)
+
+    def test_launch_reports_failure_without_raising(self):
+        sm = ha.SessionManager()
+        with mock.patch.object(ha, "run", lambda *a, **k: ""), \
+             mock.patch.object(ha, "run_ok", lambda *a, **k: (1, "boom")):
+            self.assertFalse(sm._launch_dsh_web("/tmp/p.yml"))
+
+    def test_running_reads_has_session(self):
+        sm = ha.SessionManager()
+        with mock.patch.object(ha, "run_ok", lambda cmd, **k: (0, "")):
+            self.assertTrue(sm._dsh_web_running())
+        with mock.patch.object(ha, "run_ok", lambda cmd, **k: (1, "")):
+            self.assertFalse(sm._dsh_web_running())
+
+    def test_persistence_patch_matches_the_plaintext_stores(self):
+        sm = ha.SessionManager()
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        with mock.patch.object(ha, "DSH_HOME", d), \
+             mock.patch.object(ha, "DSH_SESSIONS_ROOT", os.path.join(d, "sessions")):
+            path = sm._ensure_dsh_web_patch()
+            with open(path, encoding="utf-8") as f:
+                body = f.read()
+        self.assertTrue(path.startswith(d))
+        # A patch REPLACES config, so `root` is restated, and compression:none
+        # is what lets it read the per-session plaintext stores (XERK-475).
+        self.assertIn("session-persistence-jsonl", body)
+        self.assertIn("compression: none", body)
+        self.assertIn(os.path.join(d, "sessions"), body)
+
+    def test_start_is_a_noop_when_disabled(self):
+        sm = ha.SessionManager()
+        with mock.patch.object(ha, "_dsh_web_enabled", lambda: False):
+            sm._start_dsh_web()   # must not spawn the supervisor thread
+        t = getattr(sm, "_dsh_web_thread", None)
+        self.assertFalse(t is not None and t.is_alive())
+
+
 class TestDshQueryState(unittest.TestCase):
     """dsh_query_state speaks the control-socket contract
     (docs/dsh-session-lifecycle.md) against a real fake UNIX-socket server."""
@@ -6846,8 +6955,19 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
         with mock.patch.object(ha, "dsh_configured", lambda: False):
             self.assertEqual(sm.build_payload(1)["dsh"], {"available": False})
+        # No viewer running -> the `web` key is OMITTED (XERK-501), so a host
+        # without the host-wide viewer reads exactly as before.
         with mock.patch.object(ha, "dsh_configured", lambda: True):
             self.assertEqual(sm.build_payload(1)["dsh"], {"available": True})
+        # Viewer up -> the web sub-block rides the same dsh capability block.
+        with mock.patch.object(ha, "dsh_configured", lambda: True), \
+             mock.patch.object(ha, "DSH_WEB_URL", "http://box:7788"), \
+             mock.patch.object(ha, "DSH_WEB_PORT", 7788):
+            sm._set_dsh_web_status(True)
+            self.assertEqual(
+                sm.build_payload(1)["dsh"],
+                {"available": True,
+                 "web": {"running": True, "port": 7788, "url": "http://box:7788"}})
 
     def test_spawn_echoes_the_hub_command_id_onto_the_session(self):
         # The hub can't name the session it asked for — we mint the id here — so
