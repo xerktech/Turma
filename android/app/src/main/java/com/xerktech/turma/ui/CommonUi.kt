@@ -350,18 +350,6 @@ fun PrBadge(pr: PrInfo, modifier: Modifier = Modifier) {
     }
 }
 
-/**
- * The dsh runtime badge (web `runtimeMarkHtml` / `.runtime-mark`, XERK-460) —
- * a neutral accent pill shown ONLY on a non-default (dsh) session card, so a
- * glance at the list says which sessions run on the dsh runtime. A Claude
- * session — the default, and every session predating the field — carries none,
- * so the common card is unchanged; the caller gates on [Runtime.isDsh].
- */
-@Composable
-fun RuntimeBadge(modifier: Modifier = Modifier) {
-    Pill("⚙ dsh", modifier, color = MaterialTheme.colorScheme.primary)
-}
-
 /** Neutral or colored pill/chip (web `.pill`). Set [dashed] for the "clonable but not present" repo chip. */
 @Composable
 fun Pill(

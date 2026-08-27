@@ -10,7 +10,7 @@
 // view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
 import type { AgentInfo, PrInfo, SessionInfo } from "../types.ts";
-import { filterAgents, isDsh, liveState, readyForReview, sessionName, siteKeyOf, type LiveState } from "../sessions.ts";
+import { filterAgents, liveState, readyForReview, sessionName, siteKeyOf, type LiveState } from "../sessions.ts";
 import { LIVE_TURN_ID } from "../render.ts";
 import { Board } from "../vendor/engines.ts";
 
@@ -113,15 +113,6 @@ function prChips(s: SessionInfo): string {
   return `<span class="ph-pr-list">${prs.map((p) => prBadgeHtml(p)).join("")}</span>`;
 }
 
-// The runtime chip (XERK-460): shown only for a non-default (dsh) runtime, so a
-// Claude session — the default, and every session predating the field — carries
-// none and the common card is unchanged. The 1:1 counterpart of the web card's
-// `.runtime-mark` "⚙ dsh" chip (turma/public/sessions.html). Presentational.
-function runtimeChip(s: SessionInfo): string {
-  if (!isDsh(s)) return "";
-  return `<span class="ph-runtime" title="Runs on the dsh (DeepSeek Harness) runtime, not Claude Code">⚙ dsh</span>`;
-}
-
 const QUEUED_REASON: Record<string, string> = {
   capacity: "waiting for a free session slot",
   "awaiting-clone": "cloning the repo first",
@@ -144,7 +135,6 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
   const stateRow =
     `<span class="ph-state-row">` +
     `<span class="ph-state st-${st}">${STATE_LABEL[st]}</span>` +
-    runtimeChip(s) +
     prChips(s) +
     `</span>`;
   return (
@@ -185,7 +175,6 @@ function endedCardHtml(hostLabel: string, s: SessionInfo, tint: string): string 
     `<span class="ph-card-body">` +
     `<span class="ph-card-title">${esc(sessionName(s))}</span>` +
     `<span class="ph-card-meta">${esc(hostLabel)} · ${esc(s.repo)}${s.ticket?.key ? " · " + `<span class="ph-ticket">${esc(s.ticket.key)}</span>` : ""}</span>` +
-    runtimeChip(s) +
     prChips(s) +
     `</span>` +
     `</div>`

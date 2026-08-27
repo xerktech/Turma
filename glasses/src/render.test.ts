@@ -111,7 +111,7 @@ describe("render: home", () => {
     expect(lines.some((l) => l.includes("repoB-abcdef"))).toBe(true);
   });
 
-  it("tags a dsh session row, and only a dsh one (XERK-460)", () => {
+  it("carries no runtime tag on a dsh session row (XERK-460)", () => {
     const agents: AgentInfo[] = [
       agent({
         key: "alpha",
@@ -123,9 +123,8 @@ describe("render: home", () => {
       }),
     ];
     const lines = asLines(render(base({ agents, home: { cursor: 0 } })));
-    // The dsh row carries the compact suffix; the Claude default row carries none.
-    expect(lines.some((l) => l.includes("repoA-dsh one ·dsh"))).toBe(true);
-    expect(lines.some((l) => l.includes("repoB-claude one") && !l.includes("·dsh"))).toBe(true);
+    expect(lines.some((l) => l.includes("repoA-dsh one"))).toBe(true);
+    expect(lines.some((l) => l.includes("·dsh"))).toBe(false);
   });
 
   it("marks a cursor'd session row with '>' and renders its glyph as pending overlay", () => {
