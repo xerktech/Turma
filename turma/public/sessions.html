@@ -613,6 +613,22 @@
   .action-card .tool-plan { padding: 8px 11px; border: 1px solid var(--border);
     border-radius: var(--radius-sm); background: var(--page); overflow-wrap: anywhere; font-size: 12.5px;
     white-space: pre-wrap; }
+  /* A TodoWrite / dsh todo_write snapshot, rendered as a checklist: a state
+     glyph per row (○ pending, ◐ in-progress, ✓ done), the in-progress line
+     accented, done lines muted + struck. The summary's ☑ head + count line
+     reads even when collapsed. */
+  .action-card.todo-card .todo-head { color: var(--accent); }
+  .action-card .todo-list { list-style: none; margin: 0; padding: 2px 0; display: flex;
+    flex-direction: column; gap: 5px; }
+  .action-card .todo-item { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px;
+    line-height: 1.4; color: var(--ink-2); }
+  .action-card .todo-item .todo-glyph { flex: none; font-size: 12px; line-height: 1.4;
+    width: 1.1em; text-align: center; color: var(--muted); }
+  .action-card .todo-item.prog .todo-glyph { color: var(--accent); }
+  .action-card .todo-item.prog .todo-text { color: var(--ink); font-weight: 600; }
+  .action-card .todo-item.done .todo-glyph { color: var(--good); }
+  .action-card .todo-item.done .todo-text { color: var(--muted); text-decoration: line-through; }
+  .action-card .todo-item .todo-text { overflow-wrap: anywhere; }
 
   /* Slash command the operator ran (/compact, /clear, …), with its output folded
      in when it produced any. Sits on the operator's side like the bubble it

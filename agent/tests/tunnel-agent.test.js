@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn, toolUseDetail, todoItems, fmtDshElapsed, dshStatus } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -1775,9 +1775,13 @@ test("pollDshTurn: streams dsh assistant text as turn frames and clears on commi
     let turn = frames.find((f) => f.turn === "sess-dsh");
     assert.ok(turn, "a dsh turn frame was emitted");
     assert.equal(turn.text, "Gentle rain falls", "streamed deltas are folded into the frame text");
-    // dsh turn frames carry no working status (Stop would send Escape into a
-    // non-Claude pane), so the frame is text-only — see pollDshTurn.
-    assert.equal(turn.status, null, "no working status on a dsh turn frame");
+    // A generating dsh turn now carries the fixed "Deep diving…" verb, marked
+    // noStop so the chat keeps Stop hidden (no pane-Escape interrupt). Under 15s
+    // there is no elapsed clock yet — matching dsh's own web UI (showClock >= 15s).
+    assert.ok(turn.status, "a dsh turn frame carries a working status");
+    assert.equal(turn.status.verb, "Deep diving", "the dsh working verb");
+    assert.equal(turn.status.noStop, true, "Stop stays hidden for a dsh turn");
+    assert.equal(turn.status.elapsed, undefined, "no clock under 15s (turn started 2ms ago)");
 
     // Appending a chunk grows the next frame's text.
     frames.length = 0;
@@ -1802,6 +1806,94 @@ test("pollDshTurn: streams dsh assistant text as turn frames and clears on commi
     mod.stopWatch("sess-dsh");
     mod.__setControlSink(null);
   }
+});
+
+test("pollDshTurn: the Deep-diving clock appears once a turn passes 15s", async () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dshclock-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const slug = mod.projectSlug(work);
+  const tid = "cccccccc-2222-3333-4444-555555555555";
+  const dshDir = path.join(PROJECTS_ROOT, slug, tid, "dsh");
+  fs.mkdirSync(dshDir, { recursive: true });
+  const events = path.join(dshDir, "events.jsonl");
+  const ev = (...objs) => fs.appendFileSync(events, objs.map((o) => JSON.stringify(o)).join("\n") + "\n");
+  const frames = [];
+  mod.__setControlSink((o) => frames.push(o));
+  try {
+    fs.writeFileSync(events, "");
+    mod.startWatch("sess-clock", work, tid);
+    // Turn starts at t=1000ms; a chunk 20s later. Elapsed comes from dsh's OWN
+    // event timestamps (no wall clock), so the clock is deterministic.
+    ev(
+      { type: "turn/start", time: 1000, data: {} },
+      { type: "assistant/chunk", time: 21000, data: { chunk: { type: "text-delta", text: "thinking" } } },
+    );
+    mod.pollWatcher("sess-clock");
+    const turn = frames.find((f) => f.turn === "sess-clock");
+    assert.ok(turn && turn.status, "a status frame was emitted");
+    assert.equal(turn.status.verb, "Deep diving");
+    assert.equal(turn.status.noStop, true);
+    assert.equal(turn.status.elapsed, "20s", "the 20s clock shows once past the 15s threshold");
+  } finally {
+    mod.stopWatch("sess-clock");
+    mod.__setControlSink(null);
+  }
+});
+
+test("fmtDshElapsed / dshStatus: formatting and the noStop working shape", () => {
+  // formatRunDuration parity: whole seconds, "Nm SSs" past a minute.
+  assert.equal(fmtDshElapsed(0), "0s");
+  assert.equal(fmtDshElapsed(47000), "47s");
+  assert.equal(fmtDshElapsed(63000), "1m 03s");
+  assert.equal(fmtDshElapsed(600000), "10m 00s");
+  assert.equal(fmtDshElapsed(-5), "0s"); // clamps negatives
+  // Idle turn -> no status.
+  assert.equal(dshStatus({ generating: false }, 0, 100), null);
+  // Generating, under 15s -> verb + noStop, no clock.
+  let st = dshStatus({ generating: true }, 1000, 5000);
+  assert.deepEqual(st, { verb: "Deep diving", noStop: true });
+  // Generating, past 15s -> the clock joins.
+  st = dshStatus({ generating: true }, 1000, 48000);
+  assert.equal(st.elapsed, "47s");
+  assert.equal(st.noStop, true);
+});
+
+test("toolUseDetail/todoItems: TodoWrite and dsh todo_write both attach a sanitized checklist", () => {
+  // Claude's TodoWrite (with activeForm) and dsh's todo_write (without) share
+  // the {content, status} shape and both land on block.todos. Parity with
+  // hub-agent.py _todo_items.
+  const caps = BLOCK_CAPS;
+  const cc = {};
+  toolUseDetail(cc, "TodoWrite", { todos: [
+    { content: "Wire the thing", status: "in_progress", activeForm: "Wiring the thing" },
+    { content: "Test it", status: "pending" },
+  ] }, caps);
+  assert.deepEqual(cc.todos, [
+    { content: "Wire the thing", status: "in_progress", activeForm: "Wiring the thing" },
+    { content: "Test it", status: "pending" },
+  ]);
+  const dsh = {};
+  toolUseDetail(dsh, "todo_write", { todos: [{ content: "Do A", status: "completed" }] }, caps);
+  assert.deepEqual(dsh.todos, [{ content: "Do A", status: "completed" }]);
+  // Junk is dropped: non-object rows, empty content, and an unknown status
+  // coerces to pending.
+  const clean = todoItems([
+    "nope", { status: "in_progress" }, { content: "   " },
+    { content: "Real", status: "bogus" },
+  ], caps);
+  assert.deepEqual(clean, [{ content: "Real", status: "pending" }]);
+  // A non-list is nothing.
+  assert.equal(todoItems({ todos: [] }, caps), null);
+  // The item cap (TODO_ITEMS_MAX) bounds an oversized list so it can't bloat a
+  // frame — the one guard the "hostile/oversized" comment relies on.
+  const many = [];
+  for (let i = 0; i < 250; i++) many.push({ content: "t" + i, status: "pending" });
+  assert.equal(todoItems(many, caps).length, 100, "an oversized todo list is capped");
+  // Very long content is clipped to the input cap.
+  const long = todoItems([{ content: "x".repeat(caps.input + 500), status: "pending" }], caps);
+  assert.equal(long[0].content.length, caps.input, "long content clips to caps.input");
 });
 
 // --- device name: parity with hub-agent.py's _usable_hostname ---------------
