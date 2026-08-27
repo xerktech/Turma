@@ -15,6 +15,10 @@ Split out of `.claude/rules/turma.md` (which covers the rest of the hub UI) to k
 
 ## The page
 
+- **`turma/public/chat.js` is VENDORED into glasses byte-identical** as `glasses/src/vendor/chat.cjs`
+  (like `board.js` → `board.cjs`), asserted by `glasses`'s `vendor.test.ts` and gated by `glasses-ci.yml`.
+  Any edit to `chat.js` must be re-copied there in the SAME change (`cp turma/public/chat.js
+  glasses/src/vendor/chat.cjs`), or glasses CI fails on the byte-identical check.
 - **The fleet payload is polled ONCE, at load, whenever SSE is healthy** — `fastPoll` returns early
   and the fallback interval only fires when it isn't. So anything on `cache` that must MOVE in the
   browser needs its own `es.addEventListener` in `connectSSE`; `agent`, `removed`, `orgColors` and
