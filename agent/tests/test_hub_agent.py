@@ -6321,8 +6321,8 @@ class TestDshCordisPatchPersistence(unittest.TestCase):
     round-trip (Python has no stdlib zstd)."""
 
     def test_override_pins_plaintext_and_restates_the_root(self):
-        patch = ha._dsh_cordis_patch("prov", "model", "http://x/v1",
-                                     "KEY_ENV", 200000)
+        patch = ha._dsh_cordis_patch("prov", [{"id": "model", "contextTokens": 200000}],
+                                     "http://x/v1", "KEY_ENV", "model")
         # A patch entry REPLACES config, so `root` must be re-stated — as the
         # absolute DSH_SESSIONS_ROOT, not the base's `!!js dshHomePath(...)`.
         self.assertIn("- id: session-persistence-jsonl", patch)
@@ -6331,6 +6331,66 @@ class TestDshCordisPatchPersistence(unittest.TestCase):
         # It leads the composed patch (the base entry it modifies loads first).
         self.assertLess(patch.index("session-persistence-jsonl"),
                         patch.index("turma-dsh-session-driver"))
+
+
+class TestDshModelDiscovery(unittest.TestCase):
+    """A dsh session offers the endpoint's DISCOVERED models, not one hardcoded
+    id (XERK-503) — the fix for the `pi-ai provider has no configured model`
+    lock. The provider route lists EVERY model, and a dsh model choice is
+    validated against the discovered set, never through resolve_model (Claude's
+    alias allowlist, which rejected every LiteLLM id)."""
+
+    def setUp(self):
+        # Isolate from the host's own DSH_* env and any live cache.
+        self.enterContext(mock.patch.object(ha, "DSH_MODEL", ""))
+        self.enterContext(mock.patch.object(ha, "DSH_MODEL_BASE_URL", ""))
+        self.enterContext(mock.patch.object(ha, "_dsh_model_discovered", None))
+
+    def test_route_lists_every_discovered_model_with_windows(self):
+        models = [{"id": "deepseek-chat", "contextTokens": 128000},
+                  {"id": "qwen3", "contextTokens": None}]
+        patch = ha._dsh_cordis_patch("turma-dsh", models, "http://gw/v1",
+                                     "KEY", "deepseek-chat")
+        self.assertIn("- id: 'deepseek-chat'", patch)
+        self.assertIn("contextWindow: 128000", patch)
+        # A model with no discovered window falls back to DSH_MODEL_CONTEXT.
+        self.assertIn("- id: 'qwen3'", patch)
+        self.assertIn(f"contextWindow: {ha.DSH_MODEL_CONTEXT}", patch)
+        # agent-default-model names the default.
+        self.assertIn("model: 'deepseek-chat'", patch)
+
+    def test_route_dedups_and_drops_offcharset_and_forces_default(self):
+        models = [{"id": "deepseek-chat", "contextTokens": 128000},
+                  {"id": "deepseek-chat", "contextTokens": 128000},   # dup
+                  {"id": "bad id!", "contextTokens": 100}]            # off-charset
+        patch = ha._dsh_cordis_patch("p", models, "http://gw/v1", "K", "extra-default")
+        self.assertEqual(patch.count("- id: 'deepseek-chat'"), 1)
+        self.assertNotIn("bad id!", patch)
+        # A default not in the discovered list is forced into the route so it is
+        # always runnable.
+        self.assertIn("- id: 'extra-default'", patch)
+
+    def test_resolve_dsh_model_defers_blank_validates_member_rejects_other(self):
+        with mock.patch.object(ha, "discovered_dsh_models",
+                               lambda: [{"id": "deepseek-chat", "contextTokens": 1}]):
+            self.assertEqual(ha.resolve_dsh_model(""), "")
+            self.assertEqual(ha.resolve_dsh_model("default"), "")
+            self.assertEqual(ha.resolve_dsh_model("deepseek-chat"), "deepseek-chat")
+            with self.assertRaises(ValueError):
+                ha.resolve_dsh_model("opus")           # a Claude alias is NOT a dsh model
+
+    def test_member_accepts_charset_valid_when_discovery_empty(self):
+        # An empty discovered set can't DISPROVE membership (not polled yet).
+        with mock.patch.object(ha, "discovered_dsh_models", lambda: []):
+            self.assertTrue(ha.dsh_model_member("some-model"))
+            self.assertFalse(ha.dsh_model_member("bad id!"))
+
+    def test_default_prefers_configured_else_first_discovered(self):
+        with mock.patch.object(ha, "discovered_dsh_models",
+                               lambda: [{"id": "first", "contextTokens": 1}]):
+            self.assertEqual(ha.dsh_model_default(), "first")
+            with mock.patch.object(ha, "DSH_MODEL", "configured"):
+                self.assertEqual(ha.dsh_model_default(), "configured")
 
 
 class TestSpawnFailures(ManagerMixin, unittest.TestCase):
@@ -6993,12 +7053,22 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
     def test_heartbeat_reports_the_dsh_capability_flag(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
+        # Isolate the capability flag from whatever DSH_MODEL the host env carries
+        # (XERK-503 adds the discovered-model block; a configured default would
+        # otherwise leak the box's own model into this assertion).
+        self.enterContext(mock.patch.object(ha, "DSH_MODEL", ""))
+        self.enterContext(mock.patch.object(ha, "discovered_dsh_models", lambda: []))
         with mock.patch.object(ha, "dsh_configured", lambda: False):
-            self.assertEqual(sm.build_payload(1)["dsh"], {"available": False})
+            self.assertEqual(sm.build_payload(1)["dsh"],
+                             {"available": False, "models": [],
+                              "defaultModel": None, "contextTokens": None})
         # No viewer running -> the `web` key is OMITTED (XERK-501), so a host
-        # without the host-wide viewer reads exactly as before.
+        # without the host-wide viewer reads exactly as before. The discovered
+        # model list rides the block (XERK-503): empty until discovery lands.
         with mock.patch.object(ha, "dsh_configured", lambda: True):
-            self.assertEqual(sm.build_payload(1)["dsh"], {"available": True})
+            self.assertEqual(sm.build_payload(1)["dsh"],
+                             {"available": True, "models": [],
+                              "defaultModel": None, "contextTokens": None})
         # Viewer up -> the web sub-block rides the same dsh capability block.
         with mock.patch.object(ha, "dsh_configured", lambda: True), \
              mock.patch.object(ha, "DSH_WEB_URL", "http://box:7788"), \
@@ -7006,7 +7076,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             sm._set_dsh_web_status(True)
             self.assertEqual(
                 sm.build_payload(1)["dsh"],
-                {"available": True,
+                {"available": True, "models": [], "defaultModel": None,
+                 "contextTokens": None,
                  "web": {"running": True, "port": 7788, "url": "http://box:7788"}})
 
     def test_spawn_echoes_the_hub_command_id_onto_the_session(self):
@@ -11487,7 +11558,7 @@ class TestLocalModelConfig(unittest.TestCase):
         off-charset id is dropped (it would reach a launch command line)."""
         root = "https://gw.example.com"
 
-        def fake_get(url):
+        def fake_get(url, key=None):
             if url == f"{root}/v1/models":
                 return {"data": [{"id": "gpt-oss:120b"}, {"id": "qwen:32b"},
                                  {"id": "bad name!"}]}
@@ -11511,7 +11582,7 @@ class TestLocalModelConfig(unittest.TestCase):
         good = [{"id": "gpt-oss:120b", "contextTokens": 81920}]
         with self._configured(), \
              mock.patch.object(ha, "_local_model_discovered", list(good)), \
-             mock.patch.object(ha, "_discovery_get_json", lambda url: None):
+             mock.patch.object(ha, "_discovery_get_json", lambda url, key=None: None):
             ha.discover_local_models_once()
             self.assertEqual(ha.discovered_local_models(), good)
 
@@ -11523,7 +11594,7 @@ class TestLocalModelConfig(unittest.TestCase):
              mock.patch.object(ha, "_local_model_discovered", None), \
              mock.patch.object(
                  ha, "_discovery_get_json",
-                 lambda url: {"data": [{"id": "llama3"}]}
+                 lambda url, key=None: {"data": [{"id": "llama3"}]}
                  if url.endswith("/v1/models") else None):
             ha.discover_local_models_once()
             self.assertEqual(ha.discovered_local_models(),

@@ -490,6 +490,28 @@ those are marked `[MODEL]`.
   loopback-only host, so the link hides). Android's `DshInfo` does not yet type a `web` field (which
   is decode-SAFE — `ignoreUnknownKeys` skips it until typed); to reach parity, type `DshInfo.web:
   DshWebInfo?` and add an equivalent link/affordance on the dsh session/chat screen.
+- **P1 Unified Runtime picker + dsh model list in the spawn composer (XERK-503).** The web collapsed
+  the composer's separate `Runtime` (Claude Code / dsh) and `Run against` (subscription / local) rows
+  into ONE **Runtime** picker — "Claude Code" / "Claude Code Local" / "dsh" — and dropped "Run
+  against" entirely (`sessions.html` `composer`/`onOptChange`/`startSession`, `SpawnComposerTest`).
+  Android's `SpawnDialog` (`ui/FleetDialogs.kt`) still shows the two separate rows. Three parts to
+  the port, none decode-breaking (the backend contract for claude/local is unchanged — the runtime
+  choice just maps onto the same `agentType`/`modelSource` `SpawnRequest` fields):
+  - Fold `core/Runtime.kt` + `core/ModelSource.kt` into one runtime selection: options are
+    `claude`/`local` (when `localModel.available`)/`dsh` (when `dsh.available`); `local` sends
+    `modelSource=local` + the discovered local model, `dsh` sends `agentType=dsh` + a discovered dsh
+    model. Show the picker only when there is more than one runtime (`RuntimeTest`/`ModelSourceTest`).
+  - A dsh session now offers the ENDPOINT's DISCOVERED models, not Claude aliases — type
+    `DshInfo.models: List<LocalModel>` + `defaultModel`/`contextTokens` (the hub coerces them in
+    `normalizeDsh`, so typing is safe) and render a model dropdown for the dsh runtime, mirroring the
+    local one. This is the fix for the `pi-ai provider has no configured model` lock; **the backend
+    fix already resolves it for Android spawns** (a dsh spawn that leaves the model at Default runs
+    the host default; a Claude alias sent for dsh now errors cleanly instead of the confusing pi-ai
+    error), so this port is UX unification, not a correctness gap.
+  - Permission modes are now consistent: Claude Code and Claude Code Local share the full list (with
+    a hint that `auto` needs a recent model — it is model-gated, not provider-gated, and downgrades
+    to Manual otherwise); dsh shows an "approvals managed by dsh" note instead of the Claude-mode
+    dropdown (dsh's approval policy is `ask`/`never`, not Claude's modes). Mirror that in `SpawnDialog`.
 - **P2 To-do checklist card + the dsh "Deep diving…" verb (Enable DSH To-Dos).** The web renders a
   `TodoWrite` / dsh `todo_write` tool call as a CHECKLIST (state glyph per row + a `1 in progress ·
   6 pending` count on the summary) instead of raw-JSON input — `renderTodoCard` in `chat.js`, fed by

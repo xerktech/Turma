@@ -11773,16 +11773,19 @@ test("normalizeDsh coerces the capability flag strictly boolean (XERK-465)", () 
     hub.normalizeDsh(p);
     return p.dsh;
   };
+  // The discovered-model fields (XERK-503) ride every block; empty until
+  // discovery lands. A helper keeps these tests focused on the flag.
+  const M = { models: [], defaultModel: null, contextTokens: null };
   // A good block passes through.
-  assert.deepEqual(norm({ available: true }), { available: true });
+  assert.deepEqual(norm({ available: true }), { available: true, ...M });
   // Strictly boolean: a truthy non-true value reads as "cannot do dsh", so the
   // composer hides the selector rather than queue a spawn the host refuses.
-  assert.deepEqual(norm({ available: "yes" }), { available: false });
-  assert.deepEqual(norm({ available: 1 }), { available: false });
-  assert.deepEqual(norm({ available: false }), { available: false });
-  // Any extra keys a newer agent adds are dropped down to the one flag Android
-  // types — the block is rebuilt, not spread.
-  assert.deepEqual(norm({ available: true, model: "deepseek" }), { available: true });
+  assert.deepEqual(norm({ available: "yes" }), { available: false, ...M });
+  assert.deepEqual(norm({ available: 1 }), { available: false, ...M });
+  assert.deepEqual(norm({ available: false }), { available: false, ...M });
+  // Any UNKNOWN extra key a newer agent adds is dropped — the block is rebuilt,
+  // not spread (a bogus `model` field is not the typed `defaultModel`).
+  assert.deepEqual(norm({ available: true, model: "deepseek" }), { available: true, ...M });
   // Not an object at all -> null, which every client reads as "cannot do dsh".
   assert.equal(norm("yes"), null);
   assert.equal(norm([1]), null);
@@ -11799,22 +11802,23 @@ test("normalizeDsh whitelists the host-wide web viewer sub-block (XERK-501)", ()
     hub.normalizeDsh(p);
     return p.dsh;
   };
+  const M = { models: [], defaultModel: null, contextTokens: null };
   // A viewer that is UP passes through as {running, port, url}.
   assert.deepEqual(
     norm({ available: true, web: { running: true, port: 7788, url: "http://box:7788" } }),
-    { available: true, web: { running: true, port: 7788, url: "http://box:7788" } });
+    { available: true, ...M, web: { running: true, port: 7788, url: "http://box:7788" } });
   // Kept only when running:true — a launch-failed / absent viewer carries no
   // web block (the capability-absence the client reads as "no dsh web here").
   assert.deepEqual(norm({ available: true, web: { running: false } }),
-                   { available: true });
-  assert.deepEqual(norm({ available: true }), { available: true });
+                   { available: true, ...M });
+  assert.deepEqual(norm({ available: true }), { available: true, ...M });
   // A non-string / absent url -> null (host-only reachable), never a dead link.
   assert.deepEqual(
     norm({ available: true, web: { running: true, port: 7788 } }),
-    { available: true, web: { running: true, port: 7788, url: null } });
+    { available: true, ...M, web: { running: true, port: 7788, url: null } });
   assert.deepEqual(
     norm({ available: true, web: { running: true, port: 7788, url: 42 } }),
-    { available: true, web: { running: true, port: 7788, url: null } });
+    { available: true, ...M, web: { running: true, port: 7788, url: null } });
   // A non-finite port -> null.
   assert.equal(
     norm({ available: true, web: { running: true, port: "80" } }).web.port, null);
@@ -11831,8 +11835,37 @@ test("normalizeDsh whitelists the host-wide web viewer sub-block (XERK-501)", ()
   assert.equal(u("HTTP://box:7788/"), "HTTP://box:7788/");   // scheme case-insensitive
   assert.equal(u("https://box:7788/"), "https://box:7788/");
   // A junk web block on an otherwise-good dsh block drops the web, keeps the flag.
-  assert.deepEqual(norm({ available: true, web: "yes" }), { available: true });
-  assert.deepEqual(norm({ available: true, web: [1] }), { available: true });
+  assert.deepEqual(norm({ available: true, web: "yes" }), { available: true, ...M });
+  assert.deepEqual(norm({ available: true, web: [1] }), { available: true, ...M });
+});
+
+test("normalizeDsh coerces the discovered model list (XERK-503)", () => {
+  const norm = (dsh) => {
+    const p = { device: "h", dsh };
+    hub.normalizeDsh(p);
+    return p.dsh;
+  };
+  // A good list passes through with defaultModel + contextTokens.
+  assert.deepEqual(
+    norm({ available: true, defaultModel: "deepseek-chat", contextTokens: 128000,
+           models: [{ id: "deepseek-chat", contextTokens: 128000 },
+                    { id: "qwen3", contextTokens: null }] }),
+    { available: true, defaultModel: "deepseek-chat", contextTokens: 128000,
+      models: [{ id: "deepseek-chat", contextTokens: 128000 },
+               { id: "qwen3", contextTokens: null }] });
+  // A nameless / off-charset id is DROPPED; a doubled id is deduped.
+  const d = norm({ available: true,
+                   models: [{ id: "a", contextTokens: 1 }, { id: "a", contextTokens: 1 },
+                            { id: "" }, { id: 42 }, "junk", null] });
+  assert.deepEqual(d.models, [{ id: "a", contextTokens: 1 }]);
+  // A non-array models -> [] (Android types it; a bad shape must not decode-fail
+  // the whole fleet array).
+  assert.deepEqual(norm({ available: true, models: "lots" }).models, []);
+  // defaultModel outside the list is kept (the zero-config single-DSH_MODEL case).
+  assert.equal(norm({ available: true, defaultModel: "solo", models: [] }).defaultModel,
+               "solo");
+  // A bad contextTokens is dropped to null, never a plausible default.
+  assert.equal(norm({ available: true, contextTokens: "big" }).contextTokens, null);
 });
 
 test("normalizeLocalModel bounds and sanitizes the discovered models[] (XERK-489)", () => {
@@ -12074,7 +12107,8 @@ test("the restore actually RUNS — it must not throw into its own catch", () =>
     "the restore did not run — it threw into its own catch");
   const rec = JSON.parse(out.slice(out.indexOf("<<<") + 3, out.lastIndexOf(">>>"))).h1;
   assert.deepEqual(rec.localModel, { available: false, model: null, contextTokens: null, models: [], defaultModel: null });
-  assert.deepEqual(rec.dsh, { available: false });
+  assert.deepEqual(rec.dsh, { available: false, models: [], defaultModel: null,
+                              contextTokens: null });
   assert.equal(rec.limits, null);
   assert.equal(rec.sessions.length, 1, "non-object session elements must be dropped");
   assert.equal(rec.sessions[0].modelSource, "");
