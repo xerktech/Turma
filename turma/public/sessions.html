@@ -821,10 +821,6 @@
      a subscription one at a glance (XERK-246). */
   .local-mark { font-size: 10.5px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
     border: 1px solid var(--warn, #d98f2b); color: var(--warn, #d98f2b); white-space: nowrap; }
-  /* Runtime marker (XERK-460): a neutral chip, shown only for a non-default (dsh)
-     runtime — a claude session carries none, so it never clutters the common card. */
-  .runtime-mark { font-size: 10.5px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
-    border: 1px solid var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); white-space: nowrap; }
   .cc-source-local .cc-btn { border-color: var(--warn, #d98f2b); color: var(--warn, #d98f2b); }
   .cc-source-local .cc-btn .cc-val { color: var(--warn, #d98f2b); }
   .cc-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -1888,14 +1884,6 @@ function sessName(s) {
 // explicit label, then the worktree dir, and only the raw id as a last resort.
 // This is what leads every card — the 5-digit id is demoted to a small
 // secondary tag.
-// The session's runtime chip (XERK-460), shown only for a non-default (dsh)
-// runtime — a claude session (the default, and every session predating the
-// field) carries no chip, so the common card is unchanged. Presentational.
-function runtimeMarkHtml(s) {
-  if (s.agentType !== "dsh") return "";
-  return `<span class="runtime-mark" title="${
-    esc("Runs on the dsh (DeepSeek Harness) runtime, not Claude Code")}">⚙ dsh</span>`;
-}
 function sessTitle(s) {
   const name = sessName(s);
   if (name) return name;
@@ -2125,7 +2113,6 @@ function activeCard({ a, s, live }) {
         <div class="meta">${meta}</div>
         <div class="state-row">
           <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
-          ${runtimeMarkHtml(s)}
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
             esc("Running on this host's self-hosted model, not the Claude subscription"
                 + (s.modelSourceAt ? ` — since ${new Date(s.modelSourceAt).toLocaleString()}` : ""))
@@ -2224,7 +2211,6 @@ function endedRow(e) {
         <div class="meta"><span class="id">${esc(endedRowId(e))}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
         <div class="state-row">
           <div class="state">${esc(state)}</div>
-          ${runtimeMarkHtml(s)}
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
             esc("Ran on this host's self-hosted model, not the Claude subscription")
           }">🏠 local</span>` : ""}

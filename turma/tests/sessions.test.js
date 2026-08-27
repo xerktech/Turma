@@ -192,7 +192,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " openSubagentView, transcriptBack,"
-      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, runtimeMarkHtml,"
+      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -2022,13 +2022,6 @@ test("composer: the dsh runtime offers the discovered model list, not Claude ali
   // dsh manages approvals itself, so the composer shows a note, not the Claude
   // permission dropdown's Claude-mode options as the dsh control.
   assert.match(html, /managed by dsh/);
-});
-
-test("session card shows a dsh runtime badge, and none for claude (XERK-465)", () => {
-  const { runtimeMarkHtml } = loadPage();
-  assert.match(runtimeMarkHtml({ agentType: "dsh" }), /dsh/);
-  assert.equal(runtimeMarkHtml({ agentType: "claude" }), "");
-  assert.equal(runtimeMarkHtml({}), "");
 });
 
 test("composer: the local model dropdown + context reach the spawn request (XERK-489)", () => {

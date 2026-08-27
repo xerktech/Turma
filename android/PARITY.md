@@ -401,26 +401,17 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   (`LaunchedEffect`), the same reset the local-model row has.
 - Pure half in `core/Runtime.kt` (`RuntimeTest.kt`); the composer call site in
   `ui/SpawnComposerTest.kt`; the wire body in `vm/SpawnRequestTest.kt`.
-- **The dsh runtime BADGE on live/ended session CARDS** — done (XERK-477, see Done below).
+## Done (XERK-477 — board runtime row; runtime badge on cards removed)
 
-## Done (XERK-477 — dsh runtime badge on session cards)
-
-- **The `⚙ dsh` runtime badge** (web `runtimeMarkHtml` / `.runtime-mark` in `sessions.html`) now
-  shows on both the live session cards (`SessionListCard`) and the ended rows (`EndedSessionRow`) in
-  `ui/SessionsScreen.kt`, so a glance at the Sessions list says which sessions run on dsh. A Claude
-  session — the default, and every session predating the field — carries none, exactly as the web
-  gates on `s.agentType === "dsh"`. `RuntimeBadge` (`ui/CommonUi.kt`) is the shared render; the card
-  gates it on `Runtime.isDsh(agentType)` and shows the badge even on a card with no PR.
-- **Deliberately Sessions-page only**, matching the web: `runtimeMarkHtml` lives only in
-  `sessions.html`, so the Dashboard's (`index.html`) session cards carry no badge and neither does
-  `FleetScreen`'s.
-- **The ended card reads the runtime from the record it came on.** `EndedSession` now carries
-  `agentType`, sourced from the stopped channel (`SessionInfo.agentType`) and the closed channel
-  (`ClosedSessionInfo.agentType`, newly typed — the hub already serves it on `_closed_payload`). The
-  resumable channel is a bare transcript scan that records no runtime, so it stays `""` and reads as
-  Claude Code — the same omission the web's `resumableSession` makes.
-- Tests: the closed-`agentType` decode in `model/AgentDecodeTest.kt`, the projection carry-through in
-  `ui/SessionsFlattenTest.kt`, and the existing `Runtime.isDsh` cases in `core/RuntimeTest.kt`.
+- **The `⚙ dsh` session-card runtime badge is GONE, on every surface.** The web dropped it
+  (`runtimeMarkHtml` / `.runtime-mark` removed from `sessions.html`), so Android dropped it too:
+  `RuntimeBadge` is removed from `ui/CommonUi.kt` and no longer rendered on the live session cards or
+  the ended rows in `ui/SessionsScreen.kt`. The glasses analogues (the phone companion's `ph-runtime`
+  chip and the G2 row's `·dsh` suffix) are gone as well. `Runtime.isDsh` stays as the shared runtime
+  predicate; the Trajectory viewer and composer still tell a dsh session apart.
+- **`EndedSession`/`ClosedSessionInfo.agentType` stay typed** — the hub serves them and they decode
+  cleanly; they are simply no longer read for a card badge. Tests: the closed-`agentType` decode in
+  `model/AgentDecodeTest.kt`, the `Runtime.isDsh` cases in `core/RuntimeTest.kt`.
 - **The board ticket "Runtime" row** (web `board.js` `runtimePinOf`/`runtimeFieldHtml`/
   `runtimePickerHtml`, XERK-473) — the fifth tap-to-change row in the ticket detail sheet
   (`RuntimeSection` in `ui/BoardScreen.kt`), beside Status/Repo/Agent/Model, pinning which runtime a
@@ -534,8 +525,8 @@ those are marked `[MODEL]`.
   has no pane-Escape interrupt). Android's chat working bar should read the same `status.verb`/
   `elapsed` and suppress its Stop control on `status.noStop`. Glasses gets the checklist free (the
   vendored `chat.cjs`/`chat.css`); its live bar should honour `noStop` too.
-- ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Done (XERK-477, see Done below):
-  the web's `⚙ dsh` chip on live and ended session cards, so a glance says which sessions run on dsh.
+- ~~P2 dsh runtime badge on session CARDS (XERK-465 remainder).~~ Removed: the `⚙ dsh` session-card
+  chip was dropped from every surface (web, Android, glasses) — see the Done section below.
 - ~~P2 board ticket "Runtime" row (XERK-473 → XERK-477).~~ Done (XERK-477, see Done below): the board
   ticket detail sheet's fifth tap-to-change row, pinning which runtime a ticket's session spawns on.
 - ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).

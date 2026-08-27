@@ -54,11 +54,11 @@ invariants a later child must not undo:
   `if sess.agentType == "dsh": self._launch_dsh(sess); return`. `_launch_dsh` performs the real
   per-session dsh launch (XERK-466 [B]); the dispatch line and choke point stay.
   Do not hoist the dispatch to the ~6 callers — they all funnel through `_launch_tmux`.
-- **Composer + card**: `sessions.html` gates a "Runtime" `<select>` on `a.dsh.available` and sends
-  `agentType` only when "dsh" (a bare spawn is unchanged); `runtimeMarkHtml` badges a dsh card.
-  Android mirrors the composer (`core/Runtime.kt`, `SpawnDialog`'s Runtime row) AND the dsh card
-  badge (`RuntimeBadge` on live + ended session cards, XERK-477 — the local-model card mark is the
-  one still deferred in `android/PARITY.md`).
+- **Composer only, no card badge**: `sessions.html` gates a "Runtime" `<select>` on `a.dsh.available`,
+  sending `agentType` only for "dsh" (a bare spawn is unchanged); Android mirrors just that composer
+  row (`core/Runtime.kt`, `SpawnDialog`). There is deliberately **no dsh runtime chip on the session
+  card** — the web `⚙ dsh` marker, the glasses `ph-runtime`/G2 `·dsh` suffix and Android's
+  `RuntimeBadge` were removed.
 - Tests: `TestSpawnOptionHelpers`/`TestSessionLifecycle` (agent), `normalizeDsh`/spawn-route/restore
   cases (`server.test.js`), the Runtime cases in `sessions.test.js`, `RuntimeTest`/`SpawnRequestTest`/
   `SpawnComposerTest`/`AgentDecodeTest` (android).

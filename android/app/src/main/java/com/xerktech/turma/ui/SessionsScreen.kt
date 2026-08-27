@@ -860,13 +860,11 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
                         maxLines = 2,
                     )
                 }
-                val isDsh = com.xerktech.turma.core.Runtime.isDsh(e.agentType)
-                if (isDsh || e.prs.isNotEmpty()) {
+                if (e.prs.isNotEmpty()) {
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        if (isDsh) RuntimeBadge()
                         e.prs.forEach { PrBadge(it) }
                     }
                 }
@@ -1052,16 +1050,13 @@ private fun SessionListCard(
                         )
                     }
                 }
-                // The runtime badge + PRs share a marks row at the BOTTOM of the
-                // card (web sessions.html state-row), rendered when either has
-                // something — a dsh session shows its badge even with no PR.
-                val isDsh = com.xerktech.turma.core.Runtime.isDsh(r.session.agentType)
-                if (isDsh || r.session.prs.isNotEmpty()) {
+                // The PRs share a marks row at the BOTTOM of the card (web
+                // sessions.html state-row), rendered when there is at least one.
+                if (r.session.prs.isNotEmpty()) {
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        if (isDsh) RuntimeBadge()
                         r.session.prs.forEach { PrBadge(it) }
                     }
                 }
