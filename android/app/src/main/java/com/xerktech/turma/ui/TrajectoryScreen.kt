@@ -146,7 +146,7 @@ private fun TrajectoryHeader(d: DshTrajectory) {
                 TrajTag("${trajNum(t.turns)} turns")
                 TrajTag("${trajNum(t.toolCalls)} tool calls")
                 if (t.errors > 0) TrajTag("${trajNum(t.errors)} errors", error = true)
-                TrajTag("↑${trajNum(tok.input.toInt())} ↓${trajNum(tok.output.toInt())} tok")
+                TrajTag("↑${trajNum(tok.input)} ↓${trajNum(tok.output)} tok")
                 d.durationMs?.let { TrajTag(trajMs(it)) }
             }
             if (d.truncated) {
@@ -173,7 +173,7 @@ private fun TurnCard(tn: TrajTurn) {
                 TrajTag("${trajNum(tn.steps)} steps")
                 TrajTag("${tn.calls.size} calls")
                 if (tn.tokens.input > 0 || tn.tokens.output > 0) {
-                    TrajTag("↑${trajNum(tn.tokens.input.toInt())} ↓${trajNum(tn.tokens.output.toInt())}")
+                    TrajTag("↑${trajNum(tn.tokens.input)} ↓${trajNum(tn.tokens.output)}")
                 }
                 if (tn.startedAt != null && tn.endedAt != null) TrajTag(trajMs(tn.endedAt - tn.startedAt))
                 tn.reason?.takeIf { it.isNotBlank() }?.let { TrajTag(it, error = it == "error") }
@@ -260,11 +260,16 @@ private fun TrajMessage(text: String) {
 }
 
 /**
- * Web `trajNum`: a thousands-grouped non-negative count, "0" for anything the
- * hub could not produce a finite number for.
+ * Web `trajNum`: a thousands-grouped count. The hub floors every count it emits
+ * non-negative, so a negative here is nonsense and renders "0" (the web renders
+ * the raw number; the difference is unreachable). Token counts are [Long] — the
+ * cache windows genuinely can exceed [Int.MAX_VALUE] — so this must NOT narrow
+ * them; the [Int] overload only exists for the step/turn/call counts.
  */
-internal fun trajNum(n: Int): String =
+internal fun trajNum(n: Long): String =
     if (n < 0) "0" else "%,d".format(n)
+
+internal fun trajNum(n: Int): String = trajNum(n.toLong())
 
 /**
  * Web `trajMs`: a compact duration. Under 1s → "Nms"; under 60s → "N.Ns" / "Ns";

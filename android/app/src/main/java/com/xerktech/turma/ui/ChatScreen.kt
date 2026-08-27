@@ -219,7 +219,13 @@ fun ChatScreen(
                     // than to an empty terminal. A claude session keeps Terminal.
                     val sess = state.session
                     if (com.xerktech.turma.core.Runtime.isDsh(sess?.agentType)) {
-                        IconButton(onClick = { onTrajectory(sess?.transcriptId.orEmpty()) }) {
+                        // A dsh session pins its id at launch (D3), so transcriptId
+                        // is present in practice; guard anyway — navigating with an
+                        // empty {tid} segment would not match the route.
+                        IconButton(onClick = {
+                            val tid = sess?.transcriptId.orEmpty()
+                            if (tid.isNotBlank()) onTrajectory(tid)
+                        }) {
                             Icon(Icons.Filled.Analytics, "Trajectory")
                         }
                     } else {
