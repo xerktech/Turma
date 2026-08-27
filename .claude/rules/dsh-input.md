@@ -244,6 +244,11 @@ mechanics and the invariants a change must not undo:
   steady-state check pairs `has-session` with the port too (a bound-then-wedged instance is torn down
   and relaunched). Reporting up off the tmux rc alone both misreported the heartbeat AND skipped the
   backoff on the dominant failure mode — a flat relaunch of a doomed process.
+  - **Residual gap (LOW, XERK-502): `_dsh_web_port_open` is a blind TCP connect**, so an UNRELATED
+    process holding `DSH_WEB_PORT` reads as "up" and the loop relaunches a doomed dsh flat. Benign for
+    the realistic EADDRINUSE cause (a stale dsh over the SAME store — "up" is correct); only wrong on
+    a deployment misconfig, and the loopback default hides the URL anyway. Closing it needs an
+    HTTP-level check that the served thing is actually dsh, not a bare connect.
 - **It ADOPTS an instance that survived an in-place update** — `has-session` True → leave it, for a
   zero-downtime viewer — and `_handle_shutdown` deliberately does NOT kill it (unlike the limits
   probe), exactly like a dsh session's tmux (`KillMode=process`). A container recreate takes it down
