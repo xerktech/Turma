@@ -190,7 +190,11 @@ fun SpawnDialog(
                     else -> model
                 }
                 val outLocal = if (runtime == Runtime.LOCAL) localModelId else ""
-                onSpawn(prompt, label, baseRef, outModel, mode, outModelSource, outLocal, outAgentType)
+                // dsh has no Claude permission mode (its approvals are dsh-managed
+                // and the dropdown is hidden), so omit it — web's dsh spawn sends
+                // no permissionMode either. spawnRequest drops a blank to null.
+                val outMode = if (runtime == Runtime.DSH) "" else mode
+                onSpawn(prompt, label, baseRef, outModel, outMode, outModelSource, outLocal, outAgentType)
             }) {
                 Text("Spawn")
             }

@@ -151,6 +151,9 @@ class SpawnComposerTest {
         assertEquals("dsh", got?.agentType)
         assertEquals("qwen3-coder", got?.model)     // the dsh id rides `model`
         assertEquals("subscription", got?.source)   // never a modelSource
+        // No permission mode: dsh's approvals are dsh-managed and web omits it,
+        // so the body must not carry a stray "auto" (spawnRequest drops blank).
+        assertEquals("", got?.mode)
     }
 
     // ---- resets when a runtime leaves the picker ----------------------------
