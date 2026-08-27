@@ -15982,11 +15982,29 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
             sm._seed_summaries()             # only the fallback has landed
         start.assert_not_called()
         self.assertEqual(sess["summary"], "add a compose flag to")
+        self.assertTrue(sess.get("summaryProvisional"))  # marked overridable
         # The generated (provider-source) title lands; the next beat replaces the
-        # provisional fallback with it.
+        # provisional fallback with it and drops the provisional flag.
         sm.dsh_tails = {"abcde": self._Tail("Add Compose Flag to Widget")}
         sm._seed_summaries()
         self.assertEqual(sess["summary"], "Add Compose Flag to Widget")
+        self.assertNotIn("summaryProvisional", sess)
+
+    def test_dsh_title_never_clobbers_a_ticket_name(self):
+        # A dsh TICKET session is named "<key> <summary>" at record-build, with
+        # summaryManual UNSET. dsh's generated title must NOT overwrite it — it is
+        # not a provisional fallback this seeder applied (regression guard: the
+        # first cut of _seed_dsh_summary guarded only summaryManual and clobbered
+        # the ticket name; parity with Claude ticket sessions, agent-board.md).
+        sm = self.make_manager()
+        sess = self._session(agentType="dsh", summary="PROJ-123 Fix the widget",
+                             ticket={"key": "PROJ-123"})
+        sm.registry = [sess]
+        sm.dsh_tails = {"abcde": self._Tail("Add Compose Flag to Widget")}
+        with mock.patch.object(sm, "save") as save:
+            sm._seed_summaries()
+        self.assertEqual(sess["summary"], "PROJ-123 Fix the widget")
+        save.assert_not_called()  # no override, no churn
 
     def test_dsh_generated_title_lands_first_no_provisional(self):
         # When the generated title is the first (or only) one seen, it is applied

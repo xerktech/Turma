@@ -116,12 +116,18 @@ is `.claude/rules/dsh.md` [D]). The tail (`dsh_session.py`) captures `data.title
 - **`title()` returns the latest; `title_final()` says whether it is the generated one** — any
   non-`fallback` source (`provider`/`user`, or a missing source) reads as final. Both are set
   together on each `session/title` event; a `fallback` reads non-final.
-- **`_seed_dsh_summary` applies a fallback only PROVISIONALLY and OVERRIDES it with the generated
-  title.** It runs BEFORE the `_summary_due` gate (which returns False the moment `summary` is set,
-  and so never re-checked once named) — that ordering is what lets a later beat replace the fallback.
-  A `final` title is applied/kept in sync (a no-op once equal, so it does not re-save every beat); a
-  fallback is applied only when nothing is named yet. **Pinning the fallback forever was the bug** —
-  "the generated title is never pulled". `summaryManual` (an operator rename) wins over both.
+- **`_seed_dsh_summary` applies a fallback only PROVISIONALLY (`summaryProvisional`) and OVERRIDES
+  that with the generated title.** It runs BEFORE the `_summary_due` gate (which returns False the
+  moment `summary` is set, and so never re-checks once named) — that ordering is what lets a later
+  beat replace the fallback. A `final` title is applied/kept in sync (a no-op once equal, so it does
+  not re-save every beat) and drops the provisional flag; a fallback is applied only when nothing is
+  named. **Pinning the fallback forever was the bug** — "the generated title is never pulled".
+  - **The override is SCOPED to this seeder's own provisional fallback — it never clobbers a name
+    from another source.** A TICKET session's `<key> <summary>` (set at record-build with
+    `summaryManual` unset), a migrated name, or an operator rename (`summaryManual`) all read as
+    non-provisional and are left alone, so a dsh ticket session keeps its ticket name exactly as a
+    Claude one does (`.claude/rules/agent-board.md`). Guarding only `summaryManual` — and thus
+    clobbering the ticket name — was a first-cut regression caught in QA.
 - **Cost of a manager restart mid-naming**: `_reattach_dsh` restarts the tail at the log's EOF
   (`resume=True`), so a `session/title` written before the restart is behind EOF and not re-read. A
   session named provisionally just before an in-place update keeps the fallback until dsh writes a

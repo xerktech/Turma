@@ -19335,19 +19335,33 @@ class SessionManager:
         turn starts, then the real GENERATED title once its title-llm call returns
         — and that call can take longer than one INTERVAL on a busy local model.
 
-        So the generated title is authoritative and OVERRIDES a fallback name a
-        prior beat applied, while a fallback (before any generated title) names the
-        card provisionally rather than leaving it blank. Without the override the
-        session pinned the fallback forever (`_summary_due` stops re-checking once
-        `summary` is set), which is exactly 'the generated title is never pulled'.
+        So the generated title is authoritative and OVERRIDES a fallback name THIS
+        seeder applied on a prior beat, while a fallback (before any generated
+        title) names the card provisionally rather than leaving it blank. Without
+        the override the session pinned the fallback forever (`_summary_due` stops
+        re-checking once `summary` is set), which is exactly 'the generated title
+        is never pulled'.
 
-        A manual rename (`summaryManual`) wins over both. Guarded because this runs
-        on the beat — the agent's MAIN process — where an uncaught exception is the
-        whole host, not a skipped cycle (XERK-395/402): a packaging skew that
-        shipped a NEW hub-agent.py beside an OLD dsh_session.py with no
-        `title()`/`title_final()` must degrade to 'unnamed this beat', never crash
-        the fleet."""
+        The override is scoped by `summaryProvisional`: it replaces ONLY a name
+        this seeder set from a fallback, NEVER a name from another source — a
+        TICKET session's `<key> <summary>` (set at record-build, `summaryManual`
+        unset), a migrated name, or an operator rename (`summaryManual`). A dsh
+        ticket session therefore keeps its ticket name exactly as a Claude one
+        does (`_summary_due` stops on any set `summary`), which is the contract in
+        `.claude/rules/agent-board.md`.
+
+        Guarded because this runs on the beat — the agent's MAIN process — where an
+        uncaught exception is the whole host, not a skipped cycle (XERK-395/402): a
+        packaging skew that shipped a NEW hub-agent.py beside an OLD dsh_session.py
+        with no `title()`/`title_final()` must degrade to 'unnamed this beat',
+        never crash the fleet."""
         if sess.get("summaryManual"):
+            return
+        current = sess.get("summary")
+        provisional = bool(sess.get("summaryProvisional"))
+        # A name from any source OTHER than this seeder's own fallback is left
+        # alone — ticket / migrated / operator names must not be clobbered.
+        if current and not provisional:
             return
         tail = self.dsh_tails.get(sess["id"])
         try:
@@ -19359,18 +19373,25 @@ class SessionManager:
         if not title:
             return
         if final:
-            # dsh's generated (or user-set) title: apply it, overriding a
-            # fallback a prior beat pinned. A no-op once already in sync, so it
-            # does not re-save every beat.
-            if sess.get("summary") != title:
+            # dsh's generated (or user-set) title is authoritative: apply it and
+            # drop the provisional flag so no later title can move it (only a
+            # manual rename can, via the summaryManual guard above).
+            if current != title:
                 sess["summary"] = title
+                sess.pop("summaryProvisional", None)
                 sess.pop("summaryRetryAt", None)
                 self.save()
                 log(f"named dsh session {sess['id']}: {title!r}")
-        elif not sess.get("summary"):
+            elif provisional:
+                # Text already matches (a fallback that happened to equal the
+                # generated title); finalize so we stop revisiting it.
+                sess.pop("summaryProvisional", None)
+                self.save()
+        elif not current:
             # Only the fallback has arrived and nothing is named yet — apply it so
             # the card is not blank; the generated title overrides it above.
             sess["summary"] = title
+            sess["summaryProvisional"] = True
             sess.pop("summaryRetryAt", None)
             self.save()
             log(f"named dsh session {sess['id']}: {title!r} "
