@@ -1886,6 +1886,14 @@ test("toolUseDetail/todoItems: TodoWrite and dsh todo_write both attach a saniti
   assert.deepEqual(clean, [{ content: "Real", status: "pending" }]);
   // A non-list is nothing.
   assert.equal(todoItems({ todos: [] }, caps), null);
+  // The item cap (TODO_ITEMS_MAX) bounds an oversized list so it can't bloat a
+  // frame — the one guard the "hostile/oversized" comment relies on.
+  const many = [];
+  for (let i = 0; i < 250; i++) many.push({ content: "t" + i, status: "pending" });
+  assert.equal(todoItems(many, caps).length, 100, "an oversized todo list is capped");
+  // Very long content is clipped to the input cap.
+  const long = todoItems([{ content: "x".repeat(caps.input + 500), status: "pending" }], caps);
+  assert.equal(long[0].content.length, caps.input, "long content clips to caps.input");
 });
 
 // --- device name: parity with hub-agent.py's _usable_hostname ---------------

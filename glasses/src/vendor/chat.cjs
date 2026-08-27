@@ -948,8 +948,10 @@
     var c = { in_progress: 0, pending: 0, completed: 0 };
     for (var i = 0; i < todos.length; i++) {
       var s = todos[i] && todos[i].status;
-      if (c[s] === undefined) s = "pending";
-      c[s]++;
+      // Only ever index one of the three literal keys — never the raw status,
+      // so an Object.prototype key ("toString", "__proto__") in unsanitized
+      // input can't touch an inherited property instead of coercing to pending.
+      c[s === "in_progress" || s === "completed" ? s : "pending"]++;
     }
     return c;
   }
@@ -966,10 +968,15 @@
     var rows = "";
     for (var i = 0; i < todos.length; i++) {
       var t = todos[i] || {};
-      var meta = TODO_STATUS[t.status] || TODO_STATUS.pending;
+      // Normalize to one of the three literal keys first, so TODO_STATUS is only
+      // ever indexed by an own-key — an Object.prototype key ("toString") in
+      // unsanitized input would otherwise resolve to an inherited value and
+      // render an "undefined" glyph/class (same guard as todoCounts).
+      var status = (t.status === "in_progress" || t.status === "completed") ? t.status : "pending";
+      var meta = TODO_STATUS[status];
       // In progress prefers the present-tense activeForm when the agent sent it
       // (Claude does; dsh does not), else the imperative content.
-      var text = (t.status === "in_progress" && t.activeForm) ? t.activeForm : (t.content || "");
+      var text = (status === "in_progress" && t.activeForm) ? t.activeForm : (t.content || "");
       rows += '<li class="todo-item ' + meta.cls + '"><span class="todo-glyph">' +
         meta.glyph + '</span><span class="todo-text">' + esc(text) + "</span></li>";
     }

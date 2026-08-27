@@ -2535,6 +2535,16 @@ class TestEntryBlocks(unittest.TestCase):
         self.assertIsNone(ha._todo_items({"todos": []}, ha.BLOCK_CAPS))
         self.assertIsNone(ha._todo_items([], ha.BLOCK_CAPS))
 
+    def test_todo_items_bounds_an_oversized_list_and_clips_content(self):
+        # The item cap (TODO_ITEMS_MAX) is the one guard the "hostile/oversized
+        # list can't bloat a frame" comment relies on — pin it on both sides.
+        many = [{"content": f"t{i}", "status": "pending"} for i in range(250)]
+        self.assertEqual(len(ha._todo_items(many, ha.BLOCK_CAPS)), 100)
+        cap = ha.BLOCK_CAPS["input"]
+        long = ha._todo_items([{"content": "x" * (cap + 500), "status": "pending"}],
+                              ha.BLOCK_CAPS)
+        self.assertEqual(len(long[0]["content"]), cap)
+
     def test_send_user_file_embeds_images_svg_html_and_degrades_the_rest(self):
         # XERK-221: SendUserFile reads the delivered files and embeds image/SVG as
         # data URIs + HTML raw, so the chat renders them; other/missing → a chip.

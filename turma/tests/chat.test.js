@@ -271,6 +271,18 @@ test("buildItems/render: a todo_write snapshot renders as a checklist with a cou
   assert.doesNotMatch(html, /tool-label">input</);
 });
 
+test("render: a todo status that is an Object.prototype key can't corrupt the count", () => {
+  // Defence in depth: even if an unsanitized status like "toString" reached the
+  // renderer, todoCounts must coerce it to pending (never touch an inherited
+  // property) and the count summary must stay correct.
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([{
+    id: "td3", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "todo_write", input: "{}",
+      todos: [{ content: "Odd", status: "toString" }, { content: "Real", status: "completed" }] }],
+  }])));
+  assert.match(html, /tool-arg">1 pending · 1 done</);
+  assert.match(html, /todo-item todo"><span class="todo-glyph">○<\/span><span class="todo-text">Odd</);
+});
+
 test("render: an in-progress todo prefers activeForm (Claude); a bad status coerces to pending", () => {
   const html = withVerbosity("normal", () => itemsToHtml(buildItems([{
     id: "td2", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "TodoWrite", input: "{}",
