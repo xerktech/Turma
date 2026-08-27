@@ -347,6 +347,10 @@ fun SessionsRoute(
     wide: Boolean,
     onNavigate: (TopDest) -> Unit,
     onTerminal: (String, String) -> Unit,
+    // A dsh session routes here instead of to the terminal (XERK-498): (host,
+    // transcriptId). Default no-op keeps previews/tests that only drive the
+    // terminal path happy.
+    onTrajectory: (String, String) -> Unit = { _, _ -> },
 ) {
     var selHost by rememberSaveable { mutableStateOf<String?>(null) }
     var selId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -418,6 +422,7 @@ fun SessionsRoute(
                     sessionId = selId.orEmpty(),
                     onBack = clear,
                     onTerminal = { onTerminal(selHost.orEmpty(), selId.orEmpty()) },
+                    onTrajectory = { tid -> onTrajectory(selHost.orEmpty(), tid) },
                     showBack = !wide,
                     onOpenSubagent = { t, l -> subType = t; subLabel = l; subAgentId = "" },
                 )

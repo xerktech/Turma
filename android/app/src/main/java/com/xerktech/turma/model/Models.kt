@@ -1127,3 +1127,79 @@ data class ArchiveTranscript(
     val createdAt: String = "",
     val entries: List<TailEntry> = emptyList(),
 )
+
+/**
+ * A dsh session's read-only Trajectory (XERK-498) — the richer telemetry the S1
+ * projection flattens away, parsed hub-side from the D3 native event log in the
+ * raw archive (`GET /api/dsh/<tid>/trajectory`, `turma/archive.js` dshTrajectory).
+ * The web renders the SAME shape in `sessions.html` `renderTrajectory`. This is
+ * the ONLY viewer a headless dsh session has — it replaces the ttyd terminal a
+ * claude session gets, which a dsh session has none of.
+ *
+ * Timestamps ([startedAt]/[endedAt]/[at]/[durationMs]) are dsh's own event
+ * epoch-ms numbers and can be fractional, so they decode as Double. Token counts
+ * are floored non-negative integers hub-side (`dshTrajNum`), so Long is safe.
+ * This is NOT part of the atomic `/api/agents` decode (it is its own fetch), so
+ * a wrong-typed field only breaks this screen, never the fleet.
+ */
+@Serializable
+data class DshTrajectory(
+    val transcriptId: String = "",
+    val title: String? = null,
+    val model: String? = null,
+    val startedAt: Double? = null,
+    val endedAt: Double? = null,
+    val durationMs: Double? = null,
+    val totals: TrajTotals = TrajTotals(),
+    val turns: List<TrajTurn> = emptyList(),
+    val truncated: Boolean = false,
+    val turnsDropped: Int = 0,
+    val callsDropped: Int = 0,
+)
+
+@Serializable
+data class TrajTotals(
+    val turns: Int = 0,
+    val steps: Int = 0,
+    val toolCalls: Int = 0,
+    val errors: Int = 0,
+    val tokens: TrajTokens = TrajTokens(),
+)
+
+@Serializable
+data class TrajTokens(
+    val input: Long = 0,
+    val output: Long = 0,
+    val cacheRead: Long = 0,
+    val cacheWrite: Long = 0,
+)
+
+@Serializable
+data class TrajTurn(
+    val turn: Int = 0,
+    val startedAt: Double? = null,
+    val endedAt: Double? = null,
+    // The dsh `turn/end` reason kind ("stop"/"error"/…); null while running.
+    val reason: String? = null,
+    val steps: Int = 0,
+    val calls: List<TrajCall> = emptyList(),
+    val tokens: TrajTurnTokens = TrajTurnTokens(),
+)
+
+@Serializable
+data class TrajTurnTokens(
+    val input: Long = 0,
+    val output: Long = 0,
+)
+
+@Serializable
+data class TrajCall(
+    val name: String = "?",
+    val callId: String? = null,
+    val at: Double? = null,
+    // null until the tool/result lands (still running); true ok, false errored.
+    val ok: Boolean? = null,
+    val error: Boolean = false,
+    val args: String = "",
+    val durationMs: Double? = null,
+)
